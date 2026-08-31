@@ -254,3 +254,45 @@ pub(super) fn map_error(error: &FluxError) -> ProviderError {
         retry,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::protocol::SystemSegment;
+
+    #[test]
+    fn stable_system_stays_cached_and_runtime_state_stays_in_conversation() {
+        let converted = convert_request(ModelRequest {
+            model: "test".to_owned(),
+            system: vec![SystemSegment {
+                text: "stable system".to_owned(),
+                cache: true,
+            }],
+            messages: vec![Message::User(vec![
+                UserContent::Text {
+                    text: "hello".to_owned(),
+                },
+                UserContent::Runtime {
+                    text: "<skyhook_state>{}</skyhook_state>".to_owned(),
+                },
+            ])],
+            tools: Vec::new(),
+            reasoning: None,
+            max_output_tokens: None,
+            correlation: Some("session/agent".to_owned()),
+        })
+        .unwrap();
+
+        assert_eq!(converted.system, None);
+        assert_eq!(converted.system_segments.len(), 1);
+        assert_eq!(converted.system_segments[0].text, "stable system");
+        assert!(converted.system_segments[0].cache);
+        assert_eq!(converted.messages.len(), 1);
+        assert_eq!(converted.messages[0].role, Role::User);
+        assert_eq!(converted.messages[0].content.len(), 2);
+        assert!(matches!(
+            &converted.messages[0].content[1],
+            ContentBlock::Text { text } if text.contains("<skyhook_state>")
+        ));
+    }
+}

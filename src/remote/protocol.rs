@@ -26,10 +26,10 @@ pub enum Request {
     AgentStart {
         id: String,
         spec: RemoteAgentSpec,
-        prompt: String,
     },
     AgentProvider {
         id: String,
+        message: Option<Message>,
         chunks: Vec<ResponseChunk>,
     },
     AgentTools {
@@ -116,9 +116,12 @@ pub struct RemoteClock {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemoteAgentStep {
-    Provider {
+    Started {
         request: ModelRequest,
         clock: RemoteClock,
+    },
+    Provider {
+        request: ModelRequest,
     },
     Tools {
         blocks: Vec<AssistantContent>,
@@ -201,10 +204,17 @@ mod tests {
     #[tokio::test]
     async fn frames_round_trip() {
         let (mut left, mut right) = tokio::io::duplex(4096);
-        let sent = Request::Hello { version: 1 };
+        let sent = Request::Hello {
+            version: PROTOCOL_VERSION,
+        };
         let write = tokio::spawn(async move { write_frame(&mut left, &sent).await.unwrap() });
         let received: Request = read_frame(&mut right).await.unwrap().unwrap();
         write.await.unwrap();
-        assert!(matches!(received, Request::Hello { version: 1 }));
+        assert!(matches!(
+            received,
+            Request::Hello {
+                version: PROTOCOL_VERSION
+            }
+        ));
     }
 }

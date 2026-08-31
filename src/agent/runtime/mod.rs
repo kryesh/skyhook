@@ -27,13 +27,13 @@ use crate::{
     provider::profile::ModelProfile,
     provider::protocol::{
         AssistantContent, Message, ModelRequest, ResponseChunk, SystemSegment, ToolCall,
-        ToolResult, Usage, UserContent,
+        ToolDefinition, ToolResult, Usage, UserContent,
     },
     remote::protocol::{RemoteAgentSpec, RemoteAgentStep},
     remote::{RejectSensitivePrompts, RemoteManager, SensitivePromptHandler},
     session::{EventRecord, SessionError, SessionEvent, SessionStore},
     target::{TargetDefinition, TargetRegistry, TargetsConfig, import_ssh_targets},
-    tool::builtins::{HostSkills, install_script_tool, register_coding_tools},
+    tool::builtins::{HostSkills, install_script_tool_weak, register_coding_tools},
     tool::policy::{AllowAll, Policy},
     tool::{ToolRegistry, ToolRegistryBuilder, executor::ToolExecutor},
 };
@@ -404,6 +404,9 @@ struct SessionRuntime {
     store: SessionStore,
     jobs: JobManager,
     executor: ToolExecutor,
+    // Keeps the script tool's weak executor lookup alive without an executor/registry cycle.
+    _executor_slot: Arc<OnceLock<ToolExecutor>>,
+    tool_definitions: Vec<ToolDefinition>,
     remote: RemoteManager,
     targets: TargetRegistry,
     agents: RwLock<HashMap<AgentId, mpsc::Sender<AgentCommand>>>,
@@ -460,7 +463,7 @@ impl SessionRuntime {
             targets.clone(),
             remote.clone(),
         )?;
-        install_script_tool(&mut builder, executor_slot.clone())?;
+        install_script_tool_weak(&mut builder, Arc::downgrade(&executor_slot))?;
         tools::register(&mut builder, runtime_slot.clone())?;
         builder.extend(&harness.extra_tools)?;
         let executor = ToolExecutor::new(
@@ -472,6 +475,7 @@ impl SessionRuntime {
         executor_slot
             .set(executor.clone())
             .map_err(|_| HarnessError::Initialization("executor already set".to_owned()))?;
+        let tool_definitions = executor.registry().definitions();
         let (events, _) = broadcast::channel(1024);
         let mut child_counters = HashMap::new();
         for record in &prior_records {
@@ -490,6 +494,8 @@ impl SessionRuntime {
             store: store.clone(),
             jobs: jobs.clone(),
             executor,
+            _executor_slot: executor_slot,
+            tool_definitions,
             remote,
             targets,
             agents: RwLock::new(HashMap::new()),
@@ -597,7 +603,7 @@ impl SessionRuntime {
         if id.depth() > self.harness.max_child_depth {
             return Err(HarnessError::ChildDepth);
         }
-        self.resolve_agent(
+        let (profile, system) = self.resolve_agent(
             &model_profile,
             agent_profile.as_deref(),
             &id,
@@ -631,8 +637,8 @@ impl SessionRuntime {
                     id,
                     owner_job,
                     interrupted,
-                    model_profile,
-                    agent_profile,
+                    profile,
+                    system,
                     history,
                     one_shot,
                     rx,
@@ -686,18 +692,11 @@ impl SessionRuntime {
                 .append(child.clone(), SessionEvent::TodoReplaced { items: todo })
                 .await?;
         }
-        self.commit(
-            &child,
-            Message::User(vec![UserContent::Text {
-                text: prompt.clone(),
-            }]),
-        )
-        .await?;
         let spec = RemoteAgentSpec {
             model: profile.model.clone(),
             provider: profile.provider.clone(),
             system,
-            tools: self.executor.registry().definitions(),
+            tools: self.tool_definitions.clone(),
             reasoning: profile.reasoning.clone(),
             max_output_tokens: profile.max_output_tokens,
             history: Vec::new(),
@@ -706,58 +705,53 @@ impl SessionRuntime {
         let result = async {
             let mut step = self
                 .remote
-                .agent_start(
-                    &target,
-                    workspace.as_deref(),
-                    id.clone(),
-                    spec,
-                    prompt,
-                )
+                .agent_start(&target, workspace.as_deref(), id.clone(), spec)
                 .await
                 .map_err(|error| HarnessError::Agent(error.to_string()))?;
             loop {
                 step = match step {
-                    RemoteAgentStep::Provider { mut request, clock } => {
-                        request
-                            .messages
-                            .push(prompt::state_message(&self.jobs, &child, Some(clock)).await);
-                        self.hydrate_images(&mut request.messages).await?;
-                        let provider = self
-                            .harness
-                            .providers
-                            .get(&profile.provider)
-                            .cloned()
-                            .ok_or_else(|| HarnessError::UnknownProvider(profile.provider.clone()))?;
-                        let mut response = provider.invoke(request).await?;
-                        let mut chunks = Vec::new();
-                        let cancelled = context.cancellation();
-                        loop {
-                            let chunk = tokio::select! {
-                                chunk = poll_fn(|cx| response.as_mut().poll_chunk(cx)) => chunk,
-                                () = wait_for_interrupt(&cancelled) => return Err(HarnessError::Interrupted),
-                            };
-                            let Some(chunk) = chunk else { break };
-                            let chunk = chunk?;
-                            match &chunk {
-                                ResponseChunk::TextDelta { text } => {
-                                    let _ = self.events.send(RuntimeEvent::TextDelta { agent: child.clone(), text: text.clone() });
-                                }
-                                ResponseChunk::ReasoningDelta { text } => {
-                                    let _ = self.events.send(RuntimeEvent::ReasoningDelta { agent: child.clone(), text: text.clone() });
-                                }
-                                _ => {}
-                            }
-                            chunks.push(chunk);
-                        }
+                    RemoteAgentStep::Started { mut request, clock } => {
+                        let message = Message::User(vec![
+                            UserContent::Text {
+                                text: prompt.clone(),
+                            },
+                            prompt::state_content(&self.jobs, &child, Some(clock)).await,
+                        ]);
+                        self.commit(&child, message.clone()).await?;
+                        request.messages.push(message.clone());
+                        let chunks = self
+                            .invoke_remote_provider(context, &child, &profile, request)
+                            .await?;
                         self.remote
-                            .agent_provider(&target, workspace.as_deref(), id.clone(), chunks)
+                            .agent_provider(
+                                &target,
+                                workspace.as_deref(),
+                                id.clone(),
+                                Some(message),
+                                chunks,
+                            )
                             .await
                             .map_err(|error| HarnessError::Agent(error.to_string()))?
                     }
-                    RemoteAgentStep::Tools { blocks, usage, calls } => {
+                    RemoteAgentStep::Provider { request } => {
+                        let chunks = self
+                            .invoke_remote_provider(context, &child, &profile, request)
+                            .await?;
+                        self.remote
+                            .agent_provider(&target, workspace.as_deref(), id.clone(), None, chunks)
+                            .await
+                            .map_err(|error| HarnessError::Agent(error.to_string()))?
+                    }
+                    RemoteAgentStep::Tools {
+                        blocks,
+                        usage,
+                        calls,
+                    } => {
                         let assistant = Message::Assistant(blocks);
                         self.commit(&child, assistant).await?;
-                        self.store.append(child.clone(), SessionEvent::Usage { usage }).await?;
+                        self.store
+                            .append(child.clone(), SessionEvent::Usage { usage })
+                            .await?;
                         let results = join_all(calls.iter().map(|call| {
                             self.execute_remote_call(
                                 &child,
@@ -766,17 +760,27 @@ impl SessionRuntime {
                                 &target,
                                 workspace.as_deref(),
                             )
-                        })).await;
+                        }))
+                        .await;
                         self.commit(&child, Message::Tool(results.clone())).await?;
                         self.remote
                             .agent_tools(&target, workspace.as_deref(), id.clone(), results)
                             .await
                             .map_err(|error| HarnessError::Agent(error.to_string()))?
                     }
-                    RemoteAgentStep::Complete { blocks, usage, text } => {
+                    RemoteAgentStep::Complete {
+                        blocks,
+                        usage,
+                        text,
+                    } => {
                         self.commit(&child, Message::Assistant(blocks)).await?;
-                        self.store.append(child.clone(), SessionEvent::Usage { usage }).await?;
-                        let _ = self.events.send(RuntimeEvent::TurnCompleted { agent: child.clone(), text: text.clone() });
+                        self.store
+                            .append(child.clone(), SessionEvent::Usage { usage })
+                            .await?;
+                        let _ = self.events.send(RuntimeEvent::TurnCompleted {
+                            agent: child.clone(),
+                            text: text.clone(),
+                        });
                         return Ok(json!({"agent": child, "target": target, "result": text}));
                     }
                 };
@@ -790,6 +794,50 @@ impl SessionRuntime {
         };
         let _ = self.store.append(child, terminal).await;
         result
+    }
+
+    async fn invoke_remote_provider(
+        &self,
+        context: &crate::tool::ToolContext,
+        child: &AgentId,
+        profile: &ModelProfile,
+        mut request: ModelRequest,
+    ) -> Result<Vec<ResponseChunk>, HarnessError> {
+        self.hydrate_images(&mut request.messages).await?;
+        let provider = self
+            .harness
+            .providers
+            .get(&profile.provider)
+            .cloned()
+            .ok_or_else(|| HarnessError::UnknownProvider(profile.provider.clone()))?;
+        let mut response = provider.invoke(request).await?;
+        let mut chunks = Vec::new();
+        let cancelled = context.cancellation();
+        loop {
+            let chunk = tokio::select! {
+                chunk = poll_fn(|cx| response.as_mut().poll_chunk(cx)) => chunk,
+                () = wait_for_interrupt(&cancelled) => return Err(HarnessError::Interrupted),
+            };
+            let Some(chunk) = chunk else { break };
+            let chunk = chunk?;
+            match &chunk {
+                ResponseChunk::TextDelta { text } => {
+                    let _ = self.events.send(RuntimeEvent::TextDelta {
+                        agent: child.clone(),
+                        text: text.clone(),
+                    });
+                }
+                ResponseChunk::ReasoningDelta { text } => {
+                    let _ = self.events.send(RuntimeEvent::ReasoningDelta {
+                        agent: child.clone(),
+                        text: text.clone(),
+                    });
+                }
+                _ => {}
+            }
+            chunks.push(chunk);
+        }
+        Ok(chunks)
     }
 
     async fn execute_remote_call(
@@ -917,12 +965,7 @@ impl SessionRuntime {
         workspace: &Path,
     ) -> Result<(ModelProfile, Vec<SystemSegment>), HarnessError> {
         let mut selected_model = model_profile.to_owned();
-        let mut system = vec![prompt::base_segment()];
-        system.extend(self.harness.instructions.iter().map(|text| SystemSegment {
-            text: text.clone(),
-            cache: true,
-        }));
-        if let Some(name) = agent_profile {
+        let profile_instructions = if let Some(name) = agent_profile {
             let profile = self
                 .harness
                 .agent_profiles
@@ -931,26 +974,25 @@ impl SessionRuntime {
             if let Some(name) = &profile.model_profile {
                 selected_model.clone_from(name);
             }
-            if !profile.instructions.is_empty() {
-                system.push(SystemSegment {
-                    text: profile.instructions.clone(),
-                    cache: true,
-                });
-            }
-        }
-        system.push(prompt::context_segment(
-            agent,
-            target,
-            target_kind,
-            workspace,
-            self.harness.max_child_depth,
-        ));
+            Some(profile.instructions.as_str())
+        } else {
+            None
+        };
         let profile = self
             .harness
             .model_profiles
             .get(&selected_model)
             .cloned()
             .ok_or(HarnessError::UnknownModelProfile(selected_model))?;
+        let system = vec![prompt::system_segment(
+            &self.harness.instructions,
+            profile_instructions,
+            agent,
+            target,
+            target_kind,
+            workspace,
+            self.harness.max_child_depth,
+        )];
         Ok((profile, system))
     }
 
@@ -959,8 +1001,8 @@ impl SessionRuntime {
         id: AgentId,
         owner_job: Option<JobId>,
         interrupted: Arc<AtomicBool>,
-        model_profile: String,
-        agent_profile: Option<String>,
+        profile: ModelProfile,
+        system: Vec<SystemSegment>,
         mut history: Vec<Message>,
         one_shot: bool,
         mut rx: mpsc::Receiver<AgentCommand>,
@@ -974,8 +1016,9 @@ impl SessionRuntime {
                         .await;
                     break;
                 }
-                AgentCommand::Input { content, done } => {
+                AgentCommand::Input { mut content, done } => {
                     interrupted.store(false, Ordering::Relaxed);
+                    content.push(prompt::state_content(&self.jobs, &id, None).await);
                     let message = Message::User(content);
                     if let Err(error) = self.commit(&id, message.clone()).await {
                         if let Some(done) = done {
@@ -987,8 +1030,8 @@ impl SessionRuntime {
                     let result = self
                         .run_turn(
                             &id,
-                            &model_profile,
-                            agent_profile.as_deref(),
+                            &profile,
+                            &system,
                             owner_job,
                             &interrupted,
                             &mut history,
@@ -1016,12 +1059,15 @@ impl SessionRuntime {
                         _ => continue,
                     };
                     interrupted.store(false, Ordering::Relaxed);
-                    let message = Message::User(vec![UserContent::Runtime {
-                        text: format!(
-                            "<skyhook_job_events>\n{}\n</skyhook_job_events>",
-                            serde_json::to_string(&pending).unwrap_or_else(|_| "[]".to_owned())
-                        ),
-                    }]);
+                    let message = Message::User(vec![
+                        UserContent::Runtime {
+                            text: format!(
+                                "<skyhook_job_events>\n{}\n</skyhook_job_events>",
+                                serde_json::to_string(&pending).unwrap_or_else(|_| "[]".to_owned())
+                            ),
+                        },
+                        prompt::state_content(&self.jobs, &id, None).await,
+                    ]);
                     if self.commit(&id, message.clone()).await.is_err() {
                         continue;
                     }
@@ -1029,8 +1075,8 @@ impl SessionRuntime {
                     let _ = self
                         .run_turn(
                             &id,
-                            &model_profile,
-                            agent_profile.as_deref(),
+                            &profile,
+                            &system,
                             owner_job,
                             &interrupted,
                             &mut history,
@@ -1053,22 +1099,14 @@ impl SessionRuntime {
     async fn run_turn(
         &self,
         agent: &AgentId,
-        model_profile_name: &str,
-        agent_profile_name: Option<&str>,
+        profile: &ModelProfile,
+        system: &[SystemSegment],
         owner_job: Option<JobId>,
         interrupted: &Arc<AtomicBool>,
         history: &mut Vec<Message>,
     ) -> Result<String, HarnessError> {
-        let (profile, system) = self.resolve_agent(
-            model_profile_name,
-            agent_profile_name,
-            agent,
-            crate::target::ROOT_TARGET,
-            "local",
-            &self.harness.workspace,
-        )?;
         if !profile.supports_images && contains_images(history) {
-            return Err(HarnessError::ImagesUnsupported(profile.model));
+            return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
         }
         let provider = self
             .harness
@@ -1082,13 +1120,12 @@ impl SessionRuntime {
                 return Err(HarnessError::Interrupted);
             }
             let mut request_messages = history.clone();
-            request_messages.push(prompt::state_message(&self.jobs, agent, None).await);
             self.hydrate_images(&mut request_messages).await?;
             let request = ModelRequest {
                 model: profile.model.clone(),
-                system: system.clone(),
+                system: system.to_vec(),
                 messages: request_messages,
-                tools: self.executor.registry().definitions(),
+                tools: self.tool_definitions.clone(),
                 reasoning: profile.reasoning.clone(),
                 max_output_tokens: profile.max_output_tokens,
                 correlation: Some(agent.to_string()),
@@ -1409,11 +1446,13 @@ async fn wait_for_interrupt(interrupted: &AtomicBool) {
 #[cfg(test)]
 mod tests {
     use std::{
+        future::Future,
         pin::Pin,
         sync::{
             Mutex as StdMutex,
             atomic::{AtomicUsize, Ordering},
         },
+        task::Poll,
     };
 
     use futures_util::stream;
@@ -1426,12 +1465,42 @@ mod tests {
 
     struct ToolCallingProvider {
         calls: AtomicUsize,
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
     }
 
     struct HangingProvider;
 
     struct CapturingProvider {
         requests: Arc<StdMutex<Vec<ModelRequest>>>,
+    }
+
+    struct BlockingFirstProvider {
+        calls: AtomicUsize,
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    struct GatedResponse {
+        release: Pin<Box<dyn Future<Output = ()> + Send>>,
+        emitted: bool,
+    }
+
+    impl ResponseHandle for GatedResponse {
+        fn poll_chunk(
+            mut self: Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> Poll<Option<Result<ResponseChunk, crate::provider::ProviderError>>> {
+            if self.emitted {
+                return Poll::Ready(None);
+            }
+            if self.release.as_mut().poll(context).is_pending() {
+                return Poll::Pending;
+            }
+            self.emitted = true;
+            Poll::Ready(Some(Ok(ResponseChunk::TextDelta {
+                text: "initial".to_owned(),
+            })))
+        }
     }
 
     impl Provider for HangingProvider {
@@ -1456,8 +1525,33 @@ mod tests {
         }
     }
 
+    impl Provider for BlockingFirstProvider {
+        fn invoke(&self, request: ModelRequest) -> ProviderFuture {
+            self.requests.lock().unwrap().push(request);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let release = self.release.clone();
+            Box::pin(async move {
+                let response: Pin<Box<dyn ResponseHandle>> = if call == 0 {
+                    Box::pin(GatedResponse {
+                        release: Box::pin(async move {
+                            let permit = release.acquire_owned().await.unwrap();
+                            permit.forget();
+                        }),
+                        emitted: false,
+                    })
+                } else {
+                    Box::pin(stream::iter(vec![Ok(ResponseChunk::TextDelta {
+                        text: "jobs handled".to_owned(),
+                    })]))
+                };
+                Ok(response)
+            })
+        }
+    }
+
     impl Provider for ToolCallingProvider {
-        fn invoke(&self, _request: ModelRequest) -> ProviderFuture {
+        fn invoke(&self, request: ModelRequest) -> ProviderFuture {
+            self.requests.lock().unwrap().push(request);
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 let chunks = if call == 0 {
@@ -1465,6 +1559,13 @@ mod tests {
                         Ok(ResponseChunk::Block {
                             block: AssistantContent::ToolCall(ToolCall {
                                 id: "read-1".to_owned(),
+                                name: "read".to_owned(),
+                                arguments: json!({"path": "note.txt"}),
+                            }),
+                        }),
+                        Ok(ResponseChunk::Block {
+                            block: AssistantContent::ToolCall(ToolCall {
+                                id: "read-2".to_owned(),
                                 name: "read".to_owned(),
                                 arguments: json!({"path": "note.txt"}),
                             }),
@@ -1488,17 +1589,36 @@ mod tests {
         }
     }
 
+    fn runtime_state_count(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(content) => Some(content),
+                Message::Assistant(_) | Message::Tool(_) => None,
+            })
+            .flatten()
+            .filter(|content| {
+                matches!(
+                    content,
+                    UserContent::Runtime { text } if text.contains("<skyhook_state>")
+                )
+            })
+            .count()
+    }
+
     #[tokio::test]
     async fn provider_tool_loop_runs_through_the_shared_registry() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("note.txt"), "hello").unwrap();
         let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
         let harness = HarnessBuilder::new(workspace.path())
             .session_root(sessions.path())
             .provider(
                 "test",
                 Arc::new(ToolCallingProvider {
                     calls: AtomicUsize::new(0),
+                    requests: requests.clone(),
                 }),
             )
             .model_profile(
@@ -1519,6 +1639,17 @@ mod tests {
         assert_eq!(session.prompt("read the note").await.unwrap(), "finished");
         assert!(session.tools().get("script").is_some());
         assert!(session.tools().get("jobs").is_some());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].system, requests[1].system);
+        assert_eq!(requests[0].tools, requests[1].tools);
+        assert!(requests[1].messages.starts_with(&requests[0].messages));
+        assert_eq!(requests[1].messages.len(), requests[0].messages.len() + 2);
+        let Message::Tool(results) = requests[1].messages.last().unwrap() else {
+            panic!("parallel calls must be committed as one tool-result message");
+        };
+        assert_eq!(results.len(), 2);
+        assert_eq!(runtime_state_count(&requests[1].messages), 1);
     }
 
     #[tokio::test]
@@ -1630,7 +1761,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requests_have_cached_context_and_transient_runtime_state() {
+    async fn requests_have_one_cached_system_and_durable_runtime_state() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
         let requests = Arc::new(StdMutex::new(Vec::new()));
@@ -1660,24 +1791,186 @@ mod tests {
         assert_eq!(session.prompt("hello").await.unwrap(), "done");
         let requests = requests.lock().unwrap();
         let request = &requests[0];
-        assert_eq!(request.system[0].text, prompt::BASE_PROMPT);
-        assert!(request.system.iter().all(|segment| segment.cache));
-        assert!(
-            request
-                .system
-                .last()
-                .unwrap()
-                .text
-                .contains("<skyhook_context>")
-        );
-        let Message::User(state) = request.messages.last().unwrap() else {
-            panic!("runtime state must be the final user message");
+        assert_eq!(request.system.len(), 1);
+        assert!(request.system[0].cache);
+        assert!(request.system[0].text.starts_with(prompt::BASE_PROMPT));
+        assert!(request.system[0].text.contains("<skyhook_context>"));
+        let Message::User(content) = request.messages.last().unwrap() else {
+            panic!("external input and runtime state must share a user message");
         };
-        let UserContent::Runtime { text } = &state[0] else {
-            panic!("runtime state must use runtime content");
+        assert!(matches!(&content[0], UserContent::Text { text } if text == "hello"));
+        let UserContent::Runtime { text } = &content[1] else {
+            panic!("runtime state must follow external input as runtime content");
         };
         assert!(text.contains("<skyhook_state>"));
         assert!(text.contains("\"active_jobs\":[]"));
+        assert_eq!(runtime_state_count(&request.messages), 1);
+    }
+
+    #[tokio::test]
+    async fn resumed_sessions_append_state_without_rewriting_history() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let harness = HarnessBuilder::new(workspace.path())
+            .session_root(sessions.path())
+            .provider(
+                "test",
+                Arc::new(CapturingProvider {
+                    requests: requests.clone(),
+                }),
+            )
+            .model_profile(
+                "test",
+                ModelProfile {
+                    provider: "test".to_owned(),
+                    model: "test".to_owned(),
+                    reasoning: None,
+                    max_output_tokens: None,
+                    supports_images: false,
+                },
+            )
+            .default_model_profile("test")
+            .build()
+            .await
+            .unwrap();
+        let session = harness.new_session().await.unwrap();
+        let session_id = session.id();
+        assert_eq!(session.prompt("first").await.unwrap(), "done");
+        session.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session
+                .runtime
+                .agents
+                .read()
+                .await
+                .contains_key(&session.root)
+                || session
+                    .runtime
+                    .interrupts
+                    .read()
+                    .await
+                    .contains_key(&session.root)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(session);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let resumed = harness.resume_session(session_id).await.unwrap();
+        assert_eq!(resumed.prompt("second").await.unwrap(), "done");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].messages.starts_with(&requests[0].messages));
+        assert_eq!(runtime_state_count(&requests[0].messages), 1);
+        assert_eq!(runtime_state_count(&requests[1].messages), 2);
+    }
+
+    #[tokio::test]
+    async fn background_completions_batch_events_with_one_state_snapshot() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let harness = HarnessBuilder::new(workspace.path())
+            .session_root(sessions.path())
+            .provider(
+                "test",
+                Arc::new(BlockingFirstProvider {
+                    calls: AtomicUsize::new(0),
+                    requests: requests.clone(),
+                    release: release.clone(),
+                }),
+            )
+            .model_profile(
+                "test",
+                ModelProfile {
+                    provider: "test".to_owned(),
+                    model: "test".to_owned(),
+                    reasoning: None,
+                    max_output_tokens: None,
+                    supports_images: false,
+                },
+            )
+            .default_model_profile("test")
+            .build()
+            .await
+            .unwrap();
+        let session = harness.new_session().await.unwrap();
+        let prompt = tokio::spawn({
+            let session = session.clone();
+            async move { session.prompt("start").await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while requests.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        for value in ["first", "second"] {
+            let lease = session
+                .runtime
+                .jobs
+                .create(
+                    session.root.clone(),
+                    None,
+                    "test".to_owned(),
+                    json!({}),
+                    false,
+                    true,
+                )
+                .await
+                .unwrap();
+            session
+                .runtime
+                .jobs
+                .transition(lease.id, crate::job::JobState::Running)
+                .await
+                .unwrap();
+            session
+                .runtime
+                .jobs
+                .finish(
+                    lease.id,
+                    Ok(crate::tool::ToolOutput::new(json!({"value": value}))),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+        release.add_permits(1);
+        assert_eq!(prompt.await.unwrap().unwrap(), "initial");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while requests.lock().unwrap().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "redundant wakeups must commit nothing");
+        assert!(requests[1].messages.starts_with(&requests[0].messages));
+        let Message::User(content) = requests[1].messages.last().unwrap() else {
+            panic!("job wakeup must append one runtime user message");
+        };
+        assert_eq!(content.len(), 2);
+        let UserContent::Runtime { text: events } = &content[0] else {
+            panic!("job events must be runtime content");
+        };
+        assert_eq!(events.matches("\"job_id\"").count(), 2);
+        assert!(matches!(
+            &content[1],
+            UserContent::Runtime { text } if text.contains("<skyhook_state>")
+        ));
+        assert_eq!(runtime_state_count(&requests[1].messages), 2);
     }
 
     #[tokio::test]

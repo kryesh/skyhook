@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::{
     identity::AgentId,
     job::JobManager,
-    provider::protocol::{Message, SystemSegment, UserContent},
+    provider::protocol::{SystemSegment, UserContent},
     remote::protocol::RemoteClock,
 };
 
@@ -47,14 +47,9 @@ struct ActiveJob {
     state: crate::job::JobState,
 }
 
-pub(super) fn base_segment() -> SystemSegment {
-    SystemSegment {
-        text: BASE_PROMPT.to_owned(),
-        cache: true,
-    }
-}
-
-pub(super) fn context_segment(
+pub(super) fn system_segment(
+    instructions: &[String],
+    profile_instructions: Option<&str>,
     agent: &AgentId,
     target: &str,
     target_kind: &str,
@@ -74,20 +69,27 @@ pub(super) fn context_segment(
             max_depth,
         },
     };
+    let mut parts = Vec::with_capacity(instructions.len().saturating_add(3));
+    parts.push(BASE_PROMPT.to_owned());
+    parts.extend(instructions.iter().cloned());
+    if let Some(instructions) = profile_instructions.filter(|value| !value.is_empty()) {
+        parts.push(instructions.to_owned());
+    }
+    parts.push(format!(
+        "<skyhook_context>\n{}\n</skyhook_context>",
+        serde_json::to_string(&context).expect("Skyhook context is serializable")
+    ));
     SystemSegment {
-        text: format!(
-            "<skyhook_context>\n{}\n</skyhook_context>",
-            serde_json::to_string(&context).expect("Skyhook context is serializable")
-        ),
+        text: parts.join("\n\n"),
         cache: true,
     }
 }
 
-pub(super) async fn state_message(
+pub(super) async fn state_content(
     jobs: &JobManager,
     agent: &AgentId,
     remote_clock: Option<RemoteClock>,
-) -> Message {
+) -> UserContent {
     let local = Local::now();
     let (date, timezone, utc_offset) = remote_clock.map_or_else(
         || {
@@ -116,10 +118,10 @@ pub(super) async fn state_message(
         utc_offset,
         active_jobs,
     };
-    Message::User(vec![UserContent::Runtime {
+    UserContent::Runtime {
         text: format!(
             "<skyhook_state>\n{}\n</skyhook_state>",
             serde_json::to_string(&state).expect("Skyhook state is serializable")
         ),
-    }])
+    }
 }

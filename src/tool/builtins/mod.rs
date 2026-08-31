@@ -17,6 +17,7 @@ use crate::{
 
 pub use process::ProcessOutput;
 pub use script::install_script_tool;
+pub(crate) use script::install_script_tool_weak;
 pub use skills::HostSkills;
 
 /// Register the standard workspace, process, and job-control tool set.

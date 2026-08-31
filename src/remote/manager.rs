@@ -104,9 +104,8 @@ impl RemoteManager {
         workspace: Option<&Path>,
         id: String,
         spec: RemoteAgentSpec,
-        prompt: String,
     ) -> Result<RemoteAgentStep, RemoteError> {
-        self.agent_call(target, workspace, Request::AgentStart { id, spec, prompt })
+        self.agent_call(target, workspace, Request::AgentStart { id, spec })
             .await
     }
 
@@ -139,10 +138,19 @@ impl RemoteManager {
         target: &str,
         workspace: Option<&Path>,
         id: String,
+        message: Option<crate::provider::protocol::Message>,
         chunks: Vec<crate::provider::protocol::ResponseChunk>,
     ) -> Result<RemoteAgentStep, RemoteError> {
-        self.agent_call(target, workspace, Request::AgentProvider { id, chunks })
-            .await
+        self.agent_call(
+            target,
+            workspace,
+            Request::AgentProvider {
+                id,
+                message,
+                chunks,
+            },
+        )
+        .await
     }
 
     pub async fn agent_tools(

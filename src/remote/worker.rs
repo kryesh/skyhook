@@ -14,7 +14,7 @@ use crate::{
     identity::AgentId,
     job::JobManager,
     provider::protocol::{
-        AssistantContent, Message, ModelRequest, ResponseChunk, ToolResult, Usage, UserContent,
+        AssistantContent, Message, ModelRequest, ResponseChunk, ToolResult, Usage,
     },
     remote::protocol::{
         PROTOCOL_VERSION, ProcessRequest, RemoteAgentSpec, RemoteAgentStep, RemoteClock, Request,
@@ -24,7 +24,7 @@ use crate::{
     tool::builtins::ProcessOutput,
     tool::{
         ToolRegistryBuilder,
-        builtins::{install_script_tool, register_worker_tools},
+        builtins::{install_script_tool_weak, register_worker_tools},
         executor::ToolExecutor,
         policy::AllowAll,
     },
@@ -45,7 +45,7 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let slot = Arc::new(OnceLock::new());
     let mut builder = ToolRegistryBuilder::default();
     register_worker_tools(&mut builder, store.clone(), jobs.clone())?;
-    install_script_tool(&mut builder, slot.clone())?;
+    install_script_tool_weak(&mut builder, Arc::downgrade(&slot))?;
     let executor = ToolExecutor::new(
         builder.build(),
         Arc::new(AllowAll),
@@ -79,12 +79,16 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 Response::Tool { result }
             }
-            Request::AgentStart { id, spec, prompt } => {
-                let result = start_agent(&mut agents, id, spec, prompt);
+            Request::AgentStart { id, spec } => {
+                let result = start_agent(&mut agents, id, spec);
                 Response::Agent { result }
             }
-            Request::AgentProvider { id, chunks } => Response::Agent {
-                result: continue_provider(&mut agents, &id, chunks),
+            Request::AgentProvider {
+                id,
+                message,
+                chunks,
+            } => Response::Agent {
+                result: continue_provider(&mut agents, &id, message, chunks),
             },
             Request::AgentTools { id, results } => Response::Agent {
                 result: continue_tools(&mut agents, &id, results),
@@ -129,25 +133,24 @@ struct RemoteAgentState {
     spec: RemoteAgentSpec,
     history: Vec<Message>,
     text: String,
+    awaiting_initial_message: bool,
 }
 
 fn start_agent(
     agents: &mut HashMap<String, RemoteAgentState>,
     id: String,
     spec: RemoteAgentSpec,
-    prompt: String,
 ) -> Result<RemoteAgentStep, String> {
     if agents.contains_key(&id) {
         return Err(format!("remote agent `{id}` already exists"));
     }
-    let mut history = spec.history.clone();
-    history.push(Message::User(vec![UserContent::Text { text: prompt }]));
     let state = RemoteAgentState {
+        history: spec.history.clone(),
         spec,
-        history,
         text: String::new(),
+        awaiting_initial_message: true,
     };
-    let step = provider_step(&id, &state);
+    let step = started_step(&id, &state);
     agents.insert(id, state);
     Ok(step)
 }
@@ -155,11 +158,25 @@ fn start_agent(
 fn continue_provider(
     agents: &mut HashMap<String, RemoteAgentState>,
     id: &str,
+    message: Option<Message>,
     chunks: Vec<ResponseChunk>,
 ) -> Result<RemoteAgentStep, String> {
     let state = agents
         .get_mut(id)
         .ok_or_else(|| format!("unknown remote agent `{id}`"))?;
+    match (state.awaiting_initial_message, message) {
+        (true, Some(message)) => {
+            state.history.push(message);
+            state.awaiting_initial_message = false;
+        }
+        (true, None) => {
+            return Err("initial remote provider response omitted its user message".to_owned());
+        }
+        (false, Some(_)) => {
+            return Err("remote user message was synchronized more than once".to_owned());
+        }
+        (false, None) => {}
+    }
     let mut blocks = Vec::new();
     let mut streamed = String::new();
     let mut usage = Usage::default();
@@ -228,23 +245,33 @@ fn continue_tools(
 }
 
 fn provider_step(id: &str, state: &RemoteAgentState) -> RemoteAgentStep {
-    let now = chrono::Local::now();
     RemoteAgentStep::Provider {
-        request: ModelRequest {
-            model: state.spec.model.clone(),
-            system: state.spec.system.clone(),
-            messages: state.history.clone(),
-            tools: state.spec.tools.clone(),
-            reasoning: state.spec.reasoning.clone(),
-            max_output_tokens: state.spec.max_output_tokens,
-            correlation: Some(id.to_owned()),
-        },
+        request: model_request(id, state),
+    }
+}
+
+fn started_step(id: &str, state: &RemoteAgentState) -> RemoteAgentStep {
+    let now = chrono::Local::now();
+    RemoteAgentStep::Started {
+        request: model_request(id, state),
         clock: RemoteClock {
             date: now.format("%Y-%m-%d").to_string(),
             timezone: iana_time_zone::get_timezone()
                 .unwrap_or_else(|_| now.format("%Z").to_string()),
             utc_offset: now.format("%:z").to_string(),
         },
+    }
+}
+
+fn model_request(id: &str, state: &RemoteAgentState) -> ModelRequest {
+    ModelRequest {
+        model: state.spec.model.clone(),
+        system: state.spec.system.clone(),
+        messages: state.history.clone(),
+        tools: state.spec.tools.clone(),
+        reasoning: state.spec.reasoning.clone(),
+        max_output_tokens: state.spec.max_output_tokens,
+        correlation: Some(id.to_owned()),
     }
 }
 
@@ -377,10 +404,22 @@ mod tests {
     #[test]
     fn remote_agent_state_machine_pauses_for_host_services() {
         let mut agents = HashMap::new();
-        assert!(matches!(
-            start_agent(&mut agents, "agent".to_owned(), spec(), "work".to_owned()).unwrap(),
-            RemoteAgentStep::Provider { .. }
-        ));
+        let RemoteAgentStep::Started {
+            request: initial_request,
+            ..
+        } = start_agent(&mut agents, "agent".to_owned(), spec()).unwrap()
+        else {
+            panic!("remote agent must expose its clock before the first provider call");
+        };
+        assert_eq!(initial_request.messages, Vec::<Message>::new());
+        let initial_message = Message::User(vec![
+            crate::provider::protocol::UserContent::Text {
+                text: "work".to_owned(),
+            },
+            crate::provider::protocol::UserContent::Runtime {
+                text: "<skyhook_state>{}</skyhook_state>".to_owned(),
+            },
+        ]);
         let call = ToolCall {
             id: "call".to_owned(),
             name: "read".to_owned(),
@@ -389,30 +428,50 @@ mod tests {
         let step = continue_provider(
             &mut agents,
             "agent",
+            Some(initial_message.clone()),
             vec![ResponseChunk::Block {
                 block: AssistantContent::ToolCall(call.clone()),
             }],
         )
         .unwrap();
         assert!(matches!(step, RemoteAgentStep::Tools { .. }));
-        assert!(matches!(
-            continue_tools(
-                &mut agents,
-                "agent",
-                vec![ToolResult {
-                    call_id: call.id,
-                    name: call.name,
-                    result: serde_json::json!({"ok":true}),
-                    images: Vec::new(),
-                    is_error: false,
-                }]
-            )
-            .unwrap(),
-            RemoteAgentStep::Provider { .. }
-        ));
+        let RemoteAgentStep::Provider { request } = continue_tools(
+            &mut agents,
+            "agent",
+            vec![ToolResult {
+                call_id: call.id,
+                name: call.name,
+                result: serde_json::json!({"ok":true}),
+                images: Vec::new(),
+                is_error: false,
+            }],
+        )
+        .unwrap() else {
+            panic!("tool results must resume the provider");
+        };
+        assert_eq!(request.messages.first(), Some(&initial_message));
+        assert_eq!(request.messages.len(), 3);
+        assert_eq!(
+            request
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User(content) => Some(content),
+                    Message::Assistant(_) | Message::Tool(_) => None,
+                })
+                .flatten()
+                .filter(|content| matches!(
+                    content,
+                    crate::provider::protocol::UserContent::Runtime { text }
+                        if text.contains("<skyhook_state>")
+                ))
+                .count(),
+            1
+        );
         let step = continue_provider(
             &mut agents,
             "agent",
+            None,
             vec![ResponseChunk::TextDelta {
                 text: "done".to_owned(),
             }],
