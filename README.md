@@ -18,11 +18,15 @@ export OPENAI_API_KEY=...
 cargo run -- --prompt "inspect this repository"
 ```
 
-Use `--config path.toml` to use an explicit config instead of the user config, `--workspace PATH`
+Use `--config path.toml` to use an explicit config instead of the user config, `-m/--model PROFILE`
+to override the root model profile, `--approve-all` to skip all tool approval prompts, and `--workspace PATH`
 to choose the tool root, and `--resume SESSION_ID` to reopen a durable session. Pass a one-shot
 prompt with `-p/--prompt`, or run a JavaScript workflow file through the registered script tool with
 `-s/--script`. Without either option, the CLI reads prompts interactively. Its default policy allows workspace reads and agent
 state operations, while workspace writes and process execution require confirmation.
+Set top-level `approve_all = true` in the config for the same non-interactive approval behavior.
+Streamed assistant messages and concise tool-start summaries are prefixed with their source agent ID,
+so root and child-agent activity remains distinguishable during concurrent workflows.
 
 ## SSH targets
 
@@ -68,6 +72,7 @@ local endpoint can be keyless. Its `api` is either `chat_completions` or `respon
 ```toml
 version = 1
 default_model_profile = "local"
+approve_all = false
 
 [providers.local]
 kind = "openai_compatible"

@@ -27,6 +27,9 @@ pub struct Config {
     pub default_model_profile: String,
     pub default_agent_profile: Option<String>,
     pub session_root: Option<PathBuf>,
+    /// Approve all tool calls without consulting an interactive policy.
+    #[serde(default)]
+    pub approve_all: bool,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -156,6 +159,7 @@ mod tests {
         .unwrap();
         let config = Config::load(Some(&path)).await.unwrap();
         assert_eq!(config.default_model_profile, "local");
+        assert!(!config.approve_all);
     }
 
     #[test]
@@ -201,5 +205,20 @@ path = "~/.ssh/build"
             Some("bastion")
         );
         assert_eq!(config.targets.entries["build"].auth.kind(), "key");
+    }
+
+    #[test]
+    fn approve_all_is_opt_in() {
+        let disabled: Config = toml::from_str(
+            "version=1\ndefault_model_profile='test'\n[models.test]\nprovider='test'\nmodel='test'\nsupports_images=false\n",
+        )
+        .unwrap();
+        assert!(!disabled.approve_all);
+
+        let enabled: Config = toml::from_str(
+            "version=1\ndefault_model_profile='test'\napprove_all=true\n[models.test]\nprovider='test'\nmodel='test'\nsupports_images=false\n",
+        )
+        .unwrap();
+        assert!(enabled.approve_all);
     }
 }

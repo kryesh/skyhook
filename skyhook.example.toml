@@ -1,5 +1,7 @@
 version = 1
 default_model_profile = "openai"
+# Set to true to skip interactive approval for every tool call.
+approve_all = false
 
 [providers.openai]
 kind = "openai"

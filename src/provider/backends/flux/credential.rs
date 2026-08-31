@@ -22,16 +22,7 @@ pub fn openai_compatible(
     api: OpenAiApi,
     api_key: Option<String>,
 ) -> FluxProvider {
-    let base_url = base_url.into();
-    let suffix = match api {
-        OpenAiApi::ChatCompletions => "/v1/chat/completions",
-        OpenAiApi::Responses => "/v1/responses",
-    };
-    let endpoint = if base_url.ends_with(suffix) {
-        base_url
-    } else {
-        format!("{}{suffix}", base_url.trim_end_matches('/'))
-    };
+    let endpoint = endpoint(base_url.into(), api);
     let codec: Arc<dyn flux_provider::WireCodec> = match api {
         OpenAiApi::ChatCompletions => Arc::new(OpenAiChat),
         OpenAiApi::Responses => Arc::new(OpenAiResponses { codex: false }),
@@ -41,6 +32,23 @@ pub fn openai_compatible(
         codec,
         Arc::new(HttpCredential { endpoint, api_key }),
     ))
+}
+
+fn endpoint(base_url: String, api: OpenAiApi) -> String {
+    let suffix = match api {
+        OpenAiApi::ChatCompletions => "/v1/chat/completions",
+        OpenAiApi::Responses => "/v1/responses",
+    };
+    if base_url.ends_with(suffix) {
+        base_url
+    } else {
+        let base_url = base_url.trim_end_matches('/');
+        if base_url.ends_with("/v1") {
+            format!("{base_url}{}", suffix.trim_start_matches("/v1"))
+        } else {
+            format!("{base_url}{suffix}")
+        }
+    }
 }
 
 struct HttpCredential {
@@ -62,5 +70,42 @@ impl Credential for HttpCredential {
             Some(key) => Ok(request.header("authorization", format!("Bearer {key}"))),
             None => Ok(request),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compatible_base_urls_accept_host_version_or_full_endpoint() {
+        let cases = [
+            (
+                "http://localhost:8000",
+                "http://localhost:8000/v1/chat/completions",
+            ),
+            (
+                "http://localhost:8000/v1",
+                "http://localhost:8000/v1/chat/completions",
+            ),
+            (
+                "http://localhost:8000/v1/",
+                "http://localhost:8000/v1/chat/completions",
+            ),
+            (
+                "http://localhost:8000/v1/chat/completions",
+                "http://localhost:8000/v1/chat/completions",
+            ),
+        ];
+        for (base, expected) in cases {
+            assert_eq!(
+                endpoint(base.to_owned(), OpenAiApi::ChatCompletions),
+                expected
+            );
+        }
+        assert_eq!(
+            endpoint("http://localhost:8000/v1".to_owned(), OpenAiApi::Responses),
+            "http://localhost:8000/v1/responses"
+        );
     }
 }
