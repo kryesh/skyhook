@@ -1,0 +1,79 @@
+[package]
+name = "skyhook"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "AGPL-3.0-only"
+description = "A programmable coding-agent harness with embedded JavaScript orchestration"
+default-run = "skyhook"
+
+[features]
+default = ["embed-shims"]
+embed-shims = ["dep:rust-embed"]
+
+[dependencies]
+async-stream = "0.3.6"
+async-trait = "0.1.89"
+base64 = "0.23"
+chrono = { version = "0.4.42", default-features = false, features = [
+    "clock",
+    "serde",
+] }
+clap = { version = "4.6.6", features = ["derive"] }
+diffy = "0.5.1"
+flux-core = { package = "codewandler-flux-core", version = "=0.59.3" }
+flux-credentials = { package = "codewandler-flux-credentials", version = "=0.59.3" }
+flux-provider = { package = "codewandler-flux-provider", version = "=0.59.3" }
+flux-providers = { package = "codewandler-flux-providers", version = "=0.59.3" }
+fs2 = "0.4.3"
+futures-util = "0.3.34"
+getrandom = "0.4.3"
+glob = "0.3.3"
+grep-matcher = "0.1.8"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
+ignore = "0.4.31"
+iana-time-zone = "0.1.65"
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "rustls",
+] }
+rquickjs = { version = "=0.12.2", features = ["futures", "parallel"] }
+rust-embed = { version = "8.12.0", features = [
+    "debug-embed",
+    "include-exclude",
+], optional = true }
+schemars = "1.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_yaml = "0.9.34"
+sha2 = "0.10"
+thiserror = "2.0.20"
+tempfile = "3.24.0"
+tokio = { version = "1.53.1", features = [
+    "fs",
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+toml = "1.1.4"
+zeroize = "1.8.2"
+
+[dev-dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"

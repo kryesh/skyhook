@@ -1,0 +1,79 @@
+version = 1
+default_model_profile = "openai"
+
+[providers.openai]
+kind = "openai"
+api = "responses"
+api_key_env = "OPENAI_API_KEY"
+
+[providers.anthropic]
+kind = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+
+# Subscription providers import credentials from the official CLIs (or Flux's credential store).
+[providers.codex]
+kind = "codex"
+
+[providers.claude]
+kind = "claude"
+
+# Keyless local endpoint example:
+[providers.local]
+kind = "openai_compatible"
+base_url = "http://127.0.0.1:11434"
+api = "chat_completions"
+
+[models.openai]
+provider = "openai"
+model = "gpt-5.6"
+reasoning = "high"
+max_output_tokens = 16384
+supports_images = true
+
+[models.sonnet]
+provider = "anthropic"
+model = "sonnet"
+reasoning = "high"
+max_output_tokens = 16384
+supports_images = true
+
+[models.codex]
+provider = "codex"
+model = "gpt-5.6-sol"
+reasoning = "high"
+supports_images = true
+
+[models.claude]
+provider = "claude"
+model = "sonnet"
+reasoning = "high"
+max_output_tokens = 16384
+supports_images = true
+
+[models.local]
+provider = "local"
+model = "qwen3-coder"
+max_output_tokens = 8192
+supports_images = false
+
+# Importing concrete aliases from ~/.ssh/config is opt-in.
+[targets]
+import_ssh_config = false
+
+# [targets.bastion]
+# host = "bastion.example.com"
+# user = "gateway"
+#
+# [targets.build]
+# host = "build.internal"
+# user = "builder"
+# workspace = "/srv/project"
+# via = "bastion"
+#
+# [targets.build.auth]
+# kind = "key"
+# path = "~/.ssh/build_ed25519"
+
+[agents.reviewer]
+instructions = "Review changes critically. Do not edit files unless explicitly asked."
+model_profile = "sonnet"
