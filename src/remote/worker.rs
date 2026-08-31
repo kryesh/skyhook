@@ -241,13 +241,9 @@ fn continue_tools(
         .get_mut(id)
         .ok_or_else(|| format!("unknown remote agent `{id}`"))?;
     state.history.push(Message::Tool(results));
-    Ok(provider_step(id, state))
-}
-
-fn provider_step(id: &str, state: &RemoteAgentState) -> RemoteAgentStep {
-    RemoteAgentStep::Provider {
+    Ok(RemoteAgentStep::Provider {
         request: model_request(id, state),
-    }
+    })
 }
 
 fn started_step(id: &str, state: &RemoteAgentState) -> RemoteAgentStep {
@@ -389,25 +385,26 @@ mod tests {
     use super::*;
     use crate::provider::protocol::{AssistantContent, ResponseChunk, ToolCall, ToolResult};
 
-    fn spec() -> RemoteAgentSpec {
-        RemoteAgentSpec {
-            model: "test".to_owned(),
-            provider: "host".to_owned(),
-            system: Vec::new(),
-            tools: Vec::new(),
-            reasoning: None,
-            max_output_tokens: None,
-            history: Vec::new(),
-        }
-    }
-
     #[test]
     fn remote_agent_state_machine_pauses_for_host_services() {
         let mut agents = HashMap::new();
         let RemoteAgentStep::Started {
             request: initial_request,
             ..
-        } = start_agent(&mut agents, "agent".to_owned(), spec()).unwrap()
+        } = start_agent(
+            &mut agents,
+            "agent".to_owned(),
+            RemoteAgentSpec {
+                model: "test".to_owned(),
+                provider: "host".to_owned(),
+                system: Vec::new(),
+                tools: Vec::new(),
+                reasoning: None,
+                max_output_tokens: None,
+                history: Vec::new(),
+            },
+        )
+        .unwrap()
         else {
             panic!("remote agent must expose its clock before the first provider call");
         };

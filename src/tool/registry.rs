@@ -27,6 +27,36 @@ type ToolHandler = Arc<
 >;
 type EffectResolver = Arc<dyn Fn(&Value) -> Result<Vec<ToolEffect>, ToolError> + Send + Sync>;
 
+#[derive(Clone, Debug, Default)]
+pub struct ToolOptions {
+    pub effects: Vec<ToolEffect>,
+    pub supports_background: bool,
+    pub accepts_input: bool,
+}
+
+impl ToolOptions {
+    #[must_use]
+    pub const fn new(effects: Vec<ToolEffect>) -> Self {
+        Self {
+            effects,
+            supports_background: false,
+            accepts_input: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn background(mut self) -> Self {
+        self.supports_background = true;
+        self
+    }
+
+    #[must_use]
+    pub const fn input(mut self) -> Self {
+        self.accepts_input = true;
+        self
+    }
+}
+
 impl RegisteredTool {
     pub async fn call(
         &self,
@@ -117,25 +147,14 @@ impl ToolRegistryBuilder {
         name: impl Into<String>,
         description: impl Into<String>,
         input_schema: Value,
-        effects: Vec<ToolEffect>,
-        supports_background: bool,
-        accepts_input: bool,
+        options: ToolOptions,
         handler: F,
     ) -> Result<&mut Self, RegistryError>
     where
         F: Fn(ToolContext, Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
     {
-        self.register_dynamic_inner(
-            name,
-            description,
-            input_schema,
-            effects,
-            None,
-            supports_background,
-            accepts_input,
-            handler,
-        )
+        self.register_dynamic_inner(name, description, input_schema, options, None, handler)
     }
 
     pub fn register_dynamic_effects<F, Fut, E>(
@@ -143,10 +162,8 @@ impl ToolRegistryBuilder {
         name: impl Into<String>,
         description: impl Into<String>,
         input_schema: Value,
-        effects: Vec<ToolEffect>,
+        options: ToolOptions,
         effect_resolver: E,
-        supports_background: bool,
-        accepts_input: bool,
         handler: F,
     ) -> Result<&mut Self, RegistryError>
     where
@@ -158,10 +175,8 @@ impl ToolRegistryBuilder {
             name,
             description,
             input_schema,
-            effects,
+            options,
             Some(Arc::new(effect_resolver)),
-            supports_background,
-            accepts_input,
             handler,
         )
     }
@@ -171,10 +186,8 @@ impl ToolRegistryBuilder {
         name: impl Into<String>,
         description: impl Into<String>,
         input_schema: Value,
-        effects: Vec<ToolEffect>,
+        options: ToolOptions,
         effect_resolver: Option<EffectResolver>,
-        supports_background: bool,
-        accepts_input: bool,
         handler: F,
     ) -> Result<&mut Self, RegistryError>
     where
@@ -190,6 +203,11 @@ impl ToolRegistryBuilder {
         let handler = Arc::new(move |context, arguments| {
             Box::pin(handler(context, arguments)) as BoxFuture<'static, _>
         });
+        let ToolOptions {
+            effects,
+            supports_background,
+            accepts_input,
+        } = options;
         self.tools.insert(
             name.clone(),
             Arc::new(RegisteredTool {
@@ -210,9 +228,7 @@ impl ToolRegistryBuilder {
         &mut self,
         name: impl Into<String>,
         description: impl Into<String>,
-        effects: Vec<ToolEffect>,
-        supports_background: bool,
-        accepts_input: bool,
+        options: ToolOptions,
         handler: F,
     ) -> Result<&mut Self, RegistryError>
     where
@@ -227,9 +243,7 @@ impl ToolRegistryBuilder {
             name,
             description,
             schema,
-            effects,
-            supports_background,
-            accepts_input,
+            options,
             move |context, arguments| {
                 let parsed = serde_json::from_value(arguments);
                 let future = parsed.map(|input| handler(context, input));
@@ -247,10 +261,8 @@ impl ToolRegistryBuilder {
         &mut self,
         name: impl Into<String>,
         description: impl Into<String>,
-        effects: Vec<ToolEffect>,
+        options: ToolOptions,
         effect_resolver: E,
-        supports_background: bool,
-        accepts_input: bool,
         handler: F,
     ) -> Result<&mut Self, RegistryError>
     where
@@ -266,14 +278,12 @@ impl ToolRegistryBuilder {
             name,
             description,
             schema,
-            effects,
+            options,
             move |arguments| {
                 let input: I = serde_json::from_value(arguments.clone())
                     .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
                 Ok(effect_resolver(&input))
             },
-            supports_background,
-            accepts_input,
             move |context, arguments| {
                 let parsed = serde_json::from_value(arguments);
                 let future = parsed.map(|input| handler(context, input));
@@ -381,9 +391,11 @@ mod tests {
             .register::<Args, String, _, _>(
                 "echo",
                 "Echo input",
-                Vec::new(),
-                true,
-                false,
+                ToolOptions {
+                    effects: Vec::new(),
+                    supports_background: true,
+                    accepts_input: false,
+                },
                 |_context, args| async move { Ok(args.value) },
             )
             .unwrap();

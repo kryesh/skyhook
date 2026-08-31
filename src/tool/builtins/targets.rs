@@ -9,7 +9,7 @@ use crate::{
     target::{
         TargetAuth, TargetConfig, TargetDefinition, TargetRecord, TargetRegistry, TargetSource,
     },
-    tool::{RegistryError, ToolError, ToolRegistryBuilder, policy::ToolEffect},
+    tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::ToolEffect},
 };
 
 #[derive(Deserialize, JsonSchema)]
@@ -45,9 +45,7 @@ pub(super) fn register(
     builder.register::<TargetsArgs, TargetsOutput, _, _>(
         "targets",
         "List the local root and named SSH targets available in this session.",
-        vec![ToolEffect::SessionState],
-        false,
-        false,
+        ToolOptions::new(vec![ToolEffect::SessionState]),
         move |_context, _args| {
             let targets = listed.clone();
             async move {
@@ -60,9 +58,7 @@ pub(super) fn register(
     builder.register::<TargetAddArgs, TargetRecord, _, _>(
         "target_add",
         "Add or replace a named SSH target for this session. This does not connect to it.",
-        vec![ToolEffect::ManageTargets, ToolEffect::SessionState],
-        false,
-        false,
+        ToolOptions::new(vec![ToolEffect::ManageTargets, ToolEffect::SessionState]),
         move |context, args| {
             let targets = targets.clone();
             let store = store.clone();

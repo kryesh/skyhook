@@ -430,6 +430,27 @@ enum AgentCommand {
     Shutdown,
 }
 
+struct AgentLaunch {
+    id: AgentId,
+    parent: Option<AgentId>,
+    owner_job: Option<JobId>,
+    model_profile: String,
+    agent_profile: Option<String>,
+    history: Vec<Message>,
+    one_shot: bool,
+}
+
+struct AgentLoop {
+    id: AgentId,
+    owner_job: Option<JobId>,
+    interrupted: Arc<AtomicBool>,
+    profile: ModelProfile,
+    system: Vec<SystemSegment>,
+    history: Vec<Message>,
+    one_shot: bool,
+    rx: mpsc::Receiver<AgentCommand>,
+}
+
 impl SessionRuntime {
     async fn build(
         harness: Arc<HarnessInner>,
@@ -518,15 +539,15 @@ impl SessionRuntime {
     ) -> Result<SessionHandle, HarnessError> {
         let root = AgentId::root(self.store.id());
         let root_tx = self
-            .spawn_agent(
-                root.clone(),
-                None,
-                None,
-                self.harness.default_model_profile.clone(),
-                self.harness.default_agent_profile.clone(),
+            .spawn_agent(AgentLaunch {
+                id: root.clone(),
+                parent: None,
+                owner_job: None,
+                model_profile: self.harness.default_model_profile.clone(),
+                agent_profile: self.harness.default_agent_profile.clone(),
                 history,
-                false,
-            )
+                one_shot: false,
+            })
             .await?;
         Ok(SessionHandle {
             runtime: self.clone(),
@@ -592,14 +613,17 @@ impl SessionRuntime {
 
     async fn spawn_agent(
         self: &Arc<Self>,
-        id: AgentId,
-        parent: Option<AgentId>,
-        owner_job: Option<JobId>,
-        model_profile: String,
-        agent_profile: Option<String>,
-        history: Vec<Message>,
-        one_shot: bool,
+        launch: AgentLaunch,
     ) -> Result<mpsc::Sender<AgentCommand>, HarnessError> {
+        let AgentLaunch {
+            id,
+            parent,
+            owner_job,
+            model_profile,
+            agent_profile,
+            history,
+            one_shot,
+        } = launch;
         if id.depth() > self.harness.max_child_depth {
             return Err(HarnessError::ChildDepth);
         }
@@ -633,7 +657,7 @@ impl SessionRuntime {
         let runtime = self.clone();
         tokio::spawn(async move {
             runtime
-                .run_agent(
+                .run_agent(AgentLoop {
                     id,
                     owner_job,
                     interrupted,
@@ -642,7 +666,7 @@ impl SessionRuntime {
                     history,
                     one_shot,
                     rx,
-                )
+                })
                 .await;
         });
         Ok(tx)
@@ -996,19 +1020,19 @@ impl SessionRuntime {
         Ok((profile, system))
     }
 
-    async fn run_agent(
-        self: Arc<Self>,
-        id: AgentId,
-        owner_job: Option<JobId>,
-        interrupted: Arc<AtomicBool>,
-        profile: ModelProfile,
-        system: Vec<SystemSegment>,
-        mut history: Vec<Message>,
-        one_shot: bool,
-        mut rx: mpsc::Receiver<AgentCommand>,
-    ) {
+    async fn run_agent(self: Arc<Self>, agent_loop: AgentLoop) {
+        let AgentLoop {
+            id,
+            owner_job,
+            interrupted,
+            profile,
+            system,
+            mut history,
+            one_shot,
+            mut rx,
+        } = agent_loop;
         while let Some(command) = rx.recv().await {
-            match command {
+            let (content, done) = match command {
                 AgentCommand::Shutdown => {
                     let _ = self
                         .store
@@ -1017,79 +1041,62 @@ impl SessionRuntime {
                     break;
                 }
                 AgentCommand::Input { mut content, done } => {
-                    interrupted.store(false, Ordering::Relaxed);
                     content.push(prompt::state_content(&self.jobs, &id, None).await);
-                    let message = Message::User(content);
-                    if let Err(error) = self.commit(&id, message.clone()).await {
-                        if let Some(done) = done {
-                            let _ = done.send(Err(error.to_string()));
-                        }
-                        continue;
-                    }
-                    history.push(message);
-                    let result = self
-                        .run_turn(
-                            &id,
-                            &profile,
-                            &system,
-                            owner_job,
-                            &interrupted,
-                            &mut history,
-                        )
-                        .await;
-                    if let Some(done) = done {
-                        let _ = done.send(
-                            result
-                                .as_ref()
-                                .map(Clone::clone)
-                                .map_err(ToString::to_string),
-                        );
-                    }
-                    if one_shot && !self.jobs.has_running(&id).await {
-                        let _ = self
-                            .store
-                            .append(id.clone(), SessionEvent::AgentCompleted)
-                            .await;
-                        break;
-                    }
+                    (content, done)
                 }
                 AgentCommand::JobsReady => {
                     let pending = match self.jobs.take_pending(&id).await {
                         Ok(pending) if !pending.is_empty() => pending,
                         _ => continue,
                     };
-                    interrupted.store(false, Ordering::Relaxed);
-                    let message = Message::User(vec![
-                        UserContent::Runtime {
-                            text: format!(
-                                "<skyhook_job_events>\n{}\n</skyhook_job_events>",
-                                serde_json::to_string(&pending).unwrap_or_else(|_| "[]".to_owned())
-                            ),
-                        },
-                        prompt::state_content(&self.jobs, &id, None).await,
-                    ]);
-                    if self.commit(&id, message.clone()).await.is_err() {
-                        continue;
-                    }
-                    history.push(message);
-                    let _ = self
-                        .run_turn(
-                            &id,
-                            &profile,
-                            &system,
-                            owner_job,
-                            &interrupted,
-                            &mut history,
-                        )
-                        .await;
-                    if one_shot && !self.jobs.has_running(&id).await {
-                        let _ = self
-                            .store
-                            .append(id.clone(), SessionEvent::AgentCompleted)
-                            .await;
-                        break;
-                    }
+                    (
+                        vec![
+                            UserContent::Runtime {
+                                text: format!(
+                                    "<skyhook_job_events>\n{}\n</skyhook_job_events>",
+                                    serde_json::to_string(&pending)
+                                        .unwrap_or_else(|_| "[]".to_owned())
+                                ),
+                            },
+                            prompt::state_content(&self.jobs, &id, None).await,
+                        ],
+                        None,
+                    )
                 }
+            };
+            interrupted.store(false, Ordering::Relaxed);
+            let message = Message::User(content);
+            if let Err(error) = self.commit(&id, message.clone()).await {
+                if let Some(done) = done {
+                    let _ = done.send(Err(error.to_string()));
+                }
+                continue;
+            }
+            history.push(message);
+            let result = self
+                .run_turn(
+                    &id,
+                    &profile,
+                    &system,
+                    owner_job,
+                    &interrupted,
+                    &mut history,
+                )
+                .await;
+            if let Some(done) = done {
+                let _ = done.send(
+                    result
+                        .as_ref()
+                        .map(Clone::clone)
+                        .map_err(ToString::to_string),
+                );
+            }
+            if one_shot && !self.jobs.has_running(&id).await {
+                let _ = self
+                    .store
+                    .append(id.clone(), SessionEvent::AgentCompleted)
+                    .await;
+                break;
             }
         }
         self.agents.write().await.remove(&id);
@@ -1468,7 +1475,10 @@ mod tests {
         requests: Arc<StdMutex<Vec<ModelRequest>>>,
     }
 
-    struct HangingProvider;
+    #[derive(Default)]
+    struct HangingProvider {
+        invocations: Option<Arc<AtomicUsize>>,
+    }
 
     struct CapturingProvider {
         requests: Arc<StdMutex<Vec<ModelRequest>>>,
@@ -1505,6 +1515,9 @@ mod tests {
 
     impl Provider for HangingProvider {
         fn invoke(&self, _request: ModelRequest) -> ProviderFuture {
+            if let Some(invocations) = &self.invocations {
+                invocations.fetch_add(1, Ordering::SeqCst);
+            }
             Box::pin(async { Ok(Box::pin(stream::pending()) as Pin<Box<dyn ResponseHandle>>) })
         }
     }
@@ -1606,21 +1619,14 @@ mod tests {
             .count()
     }
 
-    #[tokio::test]
-    async fn provider_tool_loop_runs_through_the_shared_registry() {
-        let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(workspace.path().join("note.txt"), "hello").unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
-        let harness = HarnessBuilder::new(workspace.path())
-            .session_root(sessions.path())
-            .provider(
-                "test",
-                Arc::new(ToolCallingProvider {
-                    calls: AtomicUsize::new(0),
-                    requests: requests.clone(),
-                }),
-            )
+    async fn test_harness(
+        workspace: &Path,
+        sessions: &Path,
+        provider: Arc<dyn Provider>,
+    ) -> Harness {
+        HarnessBuilder::new(workspace)
+            .session_root(sessions)
+            .provider("test", provider)
             .model_profile(
                 "test",
                 ModelProfile {
@@ -1634,7 +1640,24 @@ mod tests {
             .default_model_profile("test")
             .build()
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn provider_tool_loop_runs_through_the_shared_registry() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("note.txt"), "hello").unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(ToolCallingProvider {
+                calls: AtomicUsize::new(0),
+                requests: requests.clone(),
+            }),
+        )
+        .await;
         let session = harness.new_session().await.unwrap();
         assert_eq!(session.prompt("read the note").await.unwrap(), "finished");
         assert!(session.tools().get("script").is_some());
@@ -1643,6 +1666,19 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].system, requests[1].system);
         assert_eq!(requests[0].tools, requests[1].tools);
+        assert_eq!(requests[0].system.len(), 1);
+        assert!(requests[0].system[0].cache);
+        assert!(requests[0].system[0].text.starts_with(prompt::BASE_PROMPT));
+        assert!(requests[0].system[0].text.contains("<skyhook_context>"));
+        let Message::User(content) = requests[0].messages.last().unwrap() else {
+            panic!("external input and runtime state must share a user message");
+        };
+        assert!(matches!(&content[0], UserContent::Text { text } if text == "read the note"));
+        assert!(matches!(
+            &content[1],
+            UserContent::Runtime { text }
+                if text.contains("<skyhook_state>") && text.contains("\"active_jobs\":[]")
+        ));
         assert!(requests[1].messages.starts_with(&requests[0].messages));
         assert_eq!(requests[1].messages.len(), requests[0].messages.len() + 2);
         let Message::Tool(results) = requests[1].messages.last().unwrap() else {
@@ -1656,29 +1692,27 @@ mod tests {
     async fn interrupt_stops_a_pending_provider_turn() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
-        let harness = HarnessBuilder::new(workspace.path())
-            .session_root(sessions.path())
-            .provider("test", Arc::new(HangingProvider))
-            .model_profile(
-                "test",
-                ModelProfile {
-                    provider: "test".to_owned(),
-                    model: "test".to_owned(),
-                    reasoning: None,
-                    max_output_tokens: None,
-                    supports_images: false,
-                },
-            )
-            .default_model_profile("test")
-            .build()
-            .await
-            .unwrap();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(HangingProvider {
+                invocations: Some(invocations.clone()),
+            }),
+        )
+        .await;
         let session = harness.new_session().await.unwrap();
         let pending = tokio::spawn({
             let session = session.clone();
             async move { session.prompt("wait forever").await }
         });
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while invocations.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         session.interrupt().await;
         let error = tokio::time::timeout(Duration::from_secs(1), pending)
             .await
@@ -1692,23 +1726,12 @@ mod tests {
     async fn host_scripts_use_the_registered_script_tool() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
-        let harness = HarnessBuilder::new(workspace.path())
-            .session_root(sessions.path())
-            .provider("test", Arc::new(HangingProvider))
-            .model_profile(
-                "test",
-                ModelProfile {
-                    provider: "test".to_owned(),
-                    model: "test".to_owned(),
-                    reasoning: None,
-                    max_output_tokens: None,
-                    supports_images: false,
-                },
-            )
-            .default_model_profile("test")
-            .build()
-            .await
-            .unwrap();
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(HangingProvider::default()),
+        )
+        .await;
         let session = harness.new_session().await.unwrap();
         let output = session.run_script("return {value: 40 + 2};").await.unwrap();
         assert_eq!(output.value, json!({"value": 42}));
@@ -1718,23 +1741,12 @@ mod tests {
     async fn target_tools_use_generated_object_and_builder_apis() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
-        let harness = HarnessBuilder::new(workspace.path())
-            .session_root(sessions.path())
-            .provider("test", Arc::new(HangingProvider))
-            .model_profile(
-                "test",
-                ModelProfile {
-                    provider: "test".to_owned(),
-                    model: "test".to_owned(),
-                    reasoning: None,
-                    max_output_tokens: None,
-                    supports_images: false,
-                },
-            )
-            .default_model_profile("test")
-            .build()
-            .await
-            .unwrap();
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(HangingProvider::default()),
+        )
+        .await;
         let session = harness.new_session().await.unwrap();
         let added = session
             .run_script(
@@ -1761,79 +1773,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requests_have_one_cached_system_and_durable_runtime_state() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
-        let harness = HarnessBuilder::new(workspace.path())
-            .session_root(sessions.path())
-            .provider(
-                "test",
-                Arc::new(CapturingProvider {
-                    requests: requests.clone(),
-                }),
-            )
-            .model_profile(
-                "test",
-                ModelProfile {
-                    provider: "test".to_owned(),
-                    model: "test".to_owned(),
-                    reasoning: None,
-                    max_output_tokens: None,
-                    supports_images: false,
-                },
-            )
-            .default_model_profile("test")
-            .build()
-            .await
-            .unwrap();
-        let session = harness.new_session().await.unwrap();
-        assert_eq!(session.prompt("hello").await.unwrap(), "done");
-        let requests = requests.lock().unwrap();
-        let request = &requests[0];
-        assert_eq!(request.system.len(), 1);
-        assert!(request.system[0].cache);
-        assert!(request.system[0].text.starts_with(prompt::BASE_PROMPT));
-        assert!(request.system[0].text.contains("<skyhook_context>"));
-        let Message::User(content) = request.messages.last().unwrap() else {
-            panic!("external input and runtime state must share a user message");
-        };
-        assert!(matches!(&content[0], UserContent::Text { text } if text == "hello"));
-        let UserContent::Runtime { text } = &content[1] else {
-            panic!("runtime state must follow external input as runtime content");
-        };
-        assert!(text.contains("<skyhook_state>"));
-        assert!(text.contains("\"active_jobs\":[]"));
-        assert_eq!(runtime_state_count(&request.messages), 1);
-    }
-
-    #[tokio::test]
     async fn resumed_sessions_append_state_without_rewriting_history() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
         let requests = Arc::new(StdMutex::new(Vec::new()));
-        let harness = HarnessBuilder::new(workspace.path())
-            .session_root(sessions.path())
-            .provider(
-                "test",
-                Arc::new(CapturingProvider {
-                    requests: requests.clone(),
-                }),
-            )
-            .model_profile(
-                "test",
-                ModelProfile {
-                    provider: "test".to_owned(),
-                    model: "test".to_owned(),
-                    reasoning: None,
-                    max_output_tokens: None,
-                    supports_images: false,
-                },
-            )
-            .default_model_profile("test")
-            .build()
-            .await
-            .unwrap();
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(CapturingProvider {
+                requests: requests.clone(),
+            }),
+        )
+        .await;
         let session = harness.new_session().await.unwrap();
         let session_id = session.id();
         assert_eq!(session.prompt("first").await.unwrap(), "done");
@@ -1858,7 +1809,6 @@ mod tests {
         .await
         .unwrap();
         drop(session);
-        tokio::time::sleep(Duration::from_millis(10)).await;
 
         let resumed = harness.resume_session(session_id).await.unwrap();
         assert_eq!(resumed.prompt("second").await.unwrap(), "done");
@@ -1875,30 +1825,16 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let release = Arc::new(tokio::sync::Semaphore::new(0));
-        let harness = HarnessBuilder::new(workspace.path())
-            .session_root(sessions.path())
-            .provider(
-                "test",
-                Arc::new(BlockingFirstProvider {
-                    calls: AtomicUsize::new(0),
-                    requests: requests.clone(),
-                    release: release.clone(),
-                }),
-            )
-            .model_profile(
-                "test",
-                ModelProfile {
-                    provider: "test".to_owned(),
-                    model: "test".to_owned(),
-                    reasoning: None,
-                    max_output_tokens: None,
-                    supports_images: false,
-                },
-            )
-            .default_model_profile("test")
-            .build()
-            .await
-            .unwrap();
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(BlockingFirstProvider {
+                calls: AtomicUsize::new(0),
+                requests: requests.clone(),
+                release: release.clone(),
+            }),
+        )
+        .await;
         let session = harness.new_session().await.unwrap();
         let prompt = tokio::spawn({
             let session = session.clone();
@@ -1953,10 +1889,11 @@ mod tests {
         })
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        session.root_tx.send(AgentCommand::JobsReady).await.unwrap();
+        assert_eq!(session.prompt("barrier").await.unwrap(), "jobs handled");
 
         let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2, "redundant wakeups must commit nothing");
+        assert_eq!(requests.len(), 3);
         assert!(requests[1].messages.starts_with(&requests[0].messages));
         let Message::User(content) = requests[1].messages.last().unwrap() else {
             panic!("job wakeup must append one runtime user message");
@@ -1971,29 +1908,35 @@ mod tests {
             UserContent::Runtime { text } if text.contains("<skyhook_state>")
         ));
         assert_eq!(runtime_state_count(&requests[1].messages), 2);
+        let event_messages = requests[2]
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(content) => Some(content),
+                Message::Assistant(_) | Message::Tool(_) => None,
+            })
+            .flatten()
+            .filter(|content| {
+                matches!(
+                    content,
+                    UserContent::Runtime { text } if text.contains("<skyhook_job_events>")
+                )
+            })
+            .count();
+        assert_eq!(event_messages, 1, "redundant wakeups must commit nothing");
+        assert_eq!(runtime_state_count(&requests[2].messages), 3);
     }
 
     #[tokio::test]
     async fn child_questions_route_through_the_stable_agent_job() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
-        let harness = HarnessBuilder::new(workspace.path())
-            .session_root(sessions.path())
-            .provider("test", Arc::new(HangingProvider))
-            .model_profile(
-                "test",
-                ModelProfile {
-                    provider: "test".to_owned(),
-                    model: "test".to_owned(),
-                    reasoning: None,
-                    max_output_tokens: None,
-                    supports_images: false,
-                },
-            )
-            .default_model_profile("test")
-            .build()
-            .await
-            .unwrap();
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(HangingProvider::default()),
+        )
+        .await;
         let session = harness.new_session().await.unwrap();
         let root = session.root.clone();
         let child = root.child(1);
@@ -2060,23 +2003,12 @@ mod tests {
     async fn script_receive_requires_background_and_accepts_job_input() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
-        let harness = HarnessBuilder::new(workspace.path())
-            .session_root(sessions.path())
-            .provider("test", Arc::new(HangingProvider))
-            .model_profile(
-                "test",
-                ModelProfile {
-                    provider: "test".to_owned(),
-                    model: "test".to_owned(),
-                    reasoning: None,
-                    max_output_tokens: None,
-                    supports_images: false,
-                },
-            )
-            .default_model_profile("test")
-            .build()
-            .await
-            .unwrap();
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(HangingProvider::default()),
+        )
+        .await;
         let session = harness.new_session().await.unwrap();
         let error = session
             .run_script("return await receive();")

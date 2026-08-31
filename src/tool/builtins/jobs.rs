@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::{
     identity::JobId,
     job::{JobEnvelope, JobManager, JobProgressRecord, JobState},
-    tool::{RegistryError, ToolError, ToolRegistryBuilder, policy::ToolEffect},
+    tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::ToolEffect},
 };
 
 pub(super) fn register(
@@ -18,9 +18,7 @@ pub(super) fn register(
     builder.register::<NoArgs, Vec<JobEnvelope>, _, _>(
         "jobs",
         "List jobs owned by this agent.",
-        vec![ToolEffect::SessionState],
-        false,
-        false,
+        ToolOptions::new(vec![ToolEffect::SessionState]),
         move |context, _args| {
             let jobs = list.clone();
             async move { Ok(jobs.list(&context.agent).await) }
@@ -30,9 +28,7 @@ pub(super) fn register(
     builder.register::<JobArgs, JobEnvelope, _, _>(
         "job_inspect",
         "Inspect one job without claiming its result.",
-        vec![ToolEffect::SessionState],
-        false,
-        false,
+        ToolOptions::new(vec![ToolEffect::SessionState]),
         move |_context, args| {
             let jobs = inspect.clone();
             async move {
@@ -46,9 +42,7 @@ pub(super) fn register(
     builder.register::<JobWaitArgs, JobEnvelope, _, _>(
         "job_wait",
         "Wait for and claim the next question or terminal result from a job. A waiting_input result can be answered with job_send.",
-        vec![ToolEffect::SessionState],
-        false,
-        false,
+        ToolOptions::new(vec![ToolEffect::SessionState]),
         move |_context, args| {
             let jobs = wait.clone();
             async move {
@@ -70,9 +64,7 @@ pub(super) fn register(
     builder.register::<JobSendArgs, Value, _, _>(
         "job_send",
         "Send JSON input to a running job. For an agent in waiting_input, send answers to its stable agent job ID.",
-        vec![ToolEffect::SessionState],
-        false,
-        false,
+        ToolOptions::new(vec![ToolEffect::SessionState]),
         move |_context, args| {
             let jobs = send.clone();
             async move {
@@ -87,9 +79,7 @@ pub(super) fn register(
     builder.register::<JobArgs, JobEnvelope, _, _>(
         "job_cancel",
         "Request cancellation of a job.",
-        vec![ToolEffect::SessionState],
-        false,
-        false,
+        ToolOptions::new(vec![ToolEffect::SessionState]),
         move |_context, args| {
             let jobs = cancel.clone();
             async move {
@@ -102,9 +92,7 @@ pub(super) fn register(
     builder.register::<JobEventsArgs, JobEventsOutput, _, _>(
         "job_events",
         "Read typed progress events after a durable cursor.",
-        vec![ToolEffect::SessionState],
-        false,
-        false,
+        ToolOptions::new(vec![ToolEffect::SessionState]),
         move |_context, args| {
             let jobs = jobs.clone();
             async move {

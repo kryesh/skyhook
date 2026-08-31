@@ -708,7 +708,7 @@ mod tests {
     use serde::Deserialize;
 
     use super::*;
-    use crate::tool::{ToolRegistryBuilder, executor::ToolExecutor, policy::AllowAll};
+    use crate::tool::{ToolOptions, ToolRegistryBuilder, executor::ToolExecutor, policy::AllowAll};
 
     #[derive(Deserialize, JsonSchema)]
     struct Echo {
@@ -725,9 +725,7 @@ mod tests {
             .register::<Echo, String, _, _>(
                 "echo",
                 "echo",
-                Vec::new(),
-                true,
-                false,
+                ToolOptions::new(Vec::new()).background(),
                 |_context, input| async move { Ok(input.value) },
             )
             .unwrap();

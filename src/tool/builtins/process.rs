@@ -10,7 +10,8 @@ use tokio::{
 
 use super::workspace::resolve_directory;
 use crate::tool::{
-    RegistryError, ToolContext, ToolError, ToolOutput, ToolRegistryBuilder, policy::ToolEffect,
+    RegistryError, ToolContext, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder,
+    policy::ToolEffect,
 };
 use crate::{
     remote::{RemoteManager, protocol::ProcessRequest},
@@ -31,10 +32,10 @@ pub(super) fn register(
         "exec",
         "Run an exact argument vector without shell parsing.",
         exec_schema,
-        vec![ToolEffect::ExecuteProcess],
+        ToolOptions::new(vec![ToolEffect::ExecuteProcess])
+            .background()
+            .input(),
         remote_effects,
-        true,
-        true,
         move |context, arguments| {
             let remote = exec_remote.clone();
             async move {
@@ -80,10 +81,10 @@ pub(super) fn register(
         "shell",
         "Run /bin/sh -lc in the workspace.",
         shell_schema,
-        vec![ToolEffect::ExecuteProcess],
+        ToolOptions::new(vec![ToolEffect::ExecuteProcess])
+            .background()
+            .input(),
         remote_effects,
-        true,
-        true,
         move |context, arguments| {
             let remote = remote.clone();
             async move {

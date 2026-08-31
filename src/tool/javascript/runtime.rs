@@ -410,7 +410,9 @@ mod tests {
         job::JobManager,
         session::SessionStore,
         tool::policy::AllowAll,
-        tool::{ProgressFuture, ProgressSink, ToolRegistryBuilder, executor::ToolExecutor},
+        tool::{
+            ProgressFuture, ProgressSink, ToolOptions, ToolRegistryBuilder, executor::ToolExecutor,
+        },
     };
 
     struct Sink;
@@ -457,9 +459,7 @@ mod tests {
             .register::<Echo, String, _, _>(
                 "echo",
                 "echo",
-                Vec::new(),
-                false,
-                false,
+                ToolOptions::default(),
                 |_context, input| async move { Ok(input.value) },
             )
             .unwrap();
@@ -499,9 +499,7 @@ mod tests {
             .register::<Defaults, Defaults, _, _>(
                 "defaults",
                 "defaults",
-                Vec::new(),
-                false,
-                false,
+                ToolOptions::default(),
                 |_context, input| async move { Ok(input) },
             )
             .unwrap();
@@ -509,9 +507,7 @@ mod tests {
             .register::<SkillCall, Value, _, _>(
                 "skill",
                 "skill",
-                Vec::new(),
-                false,
-                false,
+                ToolOptions::default(),
                 |_context, input| async move {
                     Ok(serde_json::json!({
                         "name": input.name,

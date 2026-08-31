@@ -14,10 +14,10 @@ use crate::{
     agent::{Question, QuestionError, TodoItem},
     provider::protocol::UserContent,
     session::SessionEvent,
-    tool::{RegistryError, ToolError, ToolRegistryBuilder, policy::ToolEffect},
+    tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::ToolEffect},
 };
 
-use super::{AgentCommand, SessionRuntime};
+use super::{AgentCommand, AgentLaunch, SessionRuntime};
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -66,9 +66,7 @@ fn register_ask(
     builder.register::<AskArgs, Value, _, _>(
         "ask",
         "Ask the host (root agent) or owning parent agent (child agent) structured questions.",
-        vec![ToolEffect::Interaction],
-        false,
-        true,
+        ToolOptions::new(vec![ToolEffect::Interaction]).input(),
         move |context, input| {
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
             async move {
@@ -156,9 +154,7 @@ fn register_todo(
     builder.register::<TodoArgs, Vec<TodoItem>, _, _>(
         "todo",
         "Replace the current agent's complete todo snapshot.",
-        vec![ToolEffect::SessionState],
-        false,
-        false,
+        ToolOptions::new(vec![ToolEffect::SessionState]),
         move |context, input| {
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
             async move {
@@ -187,7 +183,9 @@ fn register_child_agent(
     builder.register_effectful::<AgentArgs, Value, _, _, _>(
         "agent",
         "Run a one-shot child agent locally or on a named SSH target.",
-        vec![ToolEffect::SessionState],
+        ToolOptions::new(vec![ToolEffect::SessionState])
+            .background()
+            .input(),
         |input| {
             let mut effects = vec![ToolEffect::SessionState];
             if input.target.as_deref().is_some_and(|target| target != crate::target::ROOT_TARGET) {
@@ -195,8 +193,6 @@ fn register_child_agent(
             }
             effects
         },
-        true,
-        true,
         move |context, input| {
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
             async move {
@@ -242,10 +238,15 @@ fn register_child_agent(
                         }
                     }
                 }
-                let sender = runtime.spawn_agent(
-                    child.clone(), Some(context.agent.clone()), Some(context.job), model,
-                    agent_profile, Vec::new(), true,
-                ).await.map_err(|error| tool_error(&error))?;
+                let sender = runtime.spawn_agent(AgentLaunch {
+                    id: child.clone(),
+                    parent: Some(context.agent.clone()),
+                    owner_job: Some(context.job),
+                    model_profile: model,
+                    agent_profile,
+                    history: Vec::new(),
+                    one_shot: true,
+                }).await.map_err(|error| tool_error(&error))?;
                 if !input.todo.is_empty() {
                     runtime.store.append(
                         child.clone(),

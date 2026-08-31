@@ -8,7 +8,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::workspace::{relative_path, resolve_existing};
-use crate::tool::{RegistryError, ToolError, ToolRegistryBuilder, policy::ToolEffect};
+use crate::tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::ToolEffect};
 
 const MAX_RESULTS: usize = 1_000;
 const MAX_LINE_BYTES: usize = 32 * 1024;
@@ -18,9 +18,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
     builder.register::<SearchArgs, SearchOutput, _, _>(
         "search",
         "Search files with ripgrep regex, glob, and ignore semantics.",
-        vec![ToolEffect::ReadWorkspace],
-        false,
-        false,
+        ToolOptions::new(vec![ToolEffect::ReadWorkspace]),
         |context, args| async move {
             validate_limit(args.limit)?;
             let root = resolve_existing(&context.workspace, &args.path).await?;
@@ -33,9 +31,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
     builder.register::<GlobArgs, GlobOutput, _, _>(
         "glob",
         "Find files with ripgrep glob and ignore semantics.",
-        vec![ToolEffect::ReadWorkspace],
-        false,
-        false,
+        ToolOptions::new(vec![ToolEffect::ReadWorkspace]),
         |context, args| async move {
             validate_limit(args.limit)?;
             let root = resolve_existing(&context.workspace, &args.path).await?;

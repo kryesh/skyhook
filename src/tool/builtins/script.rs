@@ -4,7 +4,8 @@ use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 
 use crate::tool::{
-    RegistryError, ToolError, ToolRegistryBuilder, executor::ToolExecutor, policy::ToolEffect,
+    RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, executor::ToolExecutor,
+    policy::ToolEffect,
 };
 
 pub fn install_script_tool(
@@ -37,9 +38,9 @@ where
         "script",
         SCRIPT_DESCRIPTION,
         schema,
-        vec![ToolEffect::SessionState],
-        true,
-        true,
+        ToolOptions::new(vec![ToolEffect::SessionState])
+            .background()
+            .input(),
         move |context, arguments| {
             let executor = executor.clone();
             async move {

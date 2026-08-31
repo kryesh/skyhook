@@ -12,7 +12,9 @@ use super::workspace::{
 use crate::{
     media::MAX_IMAGE_BYTES,
     session::SessionStore,
-    tool::{RegistryError, ToolError, ToolOutput, ToolRegistryBuilder, policy::ToolEffect},
+    tool::{
+        RegistryError, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder, policy::ToolEffect,
+    },
 };
 
 const MAX_READ_LINES: usize = 2_000;
@@ -36,9 +38,7 @@ fn register_read(
         "read",
         "Read UTF-8 lines, list a directory, or attach a supported image from the workspace.",
         schema,
-        vec![ToolEffect::ReadWorkspace],
-        false,
-        false,
+        ToolOptions::new(vec![ToolEffect::ReadWorkspace]),
         move |context, arguments| {
             let store = store.clone();
             async move {
@@ -143,9 +143,7 @@ fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryErro
     builder.register::<WriteArgs, WriteOutput, _, _>(
         "write",
         "Atomically create or replace a UTF-8 workspace file.",
-        vec![ToolEffect::WriteWorkspace],
-        false,
-        false,
+        ToolOptions::new(vec![ToolEffect::WriteWorkspace]),
         |context, args| async move {
             check_write_size(&args.content)?;
             let path = resolve_writable(&context.workspace, &args.path).await?;
@@ -159,9 +157,7 @@ fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryErro
     builder.register::<ReplaceArgs, EditOutput, _, _>(
         "replace",
         "Replace exact text in a UTF-8 workspace file with an expected match count.",
-        vec![ToolEffect::WriteWorkspace],
-        false,
-        false,
+        ToolOptions::new(vec![ToolEffect::WriteWorkspace]),
         |context, args| async move {
             if args.old.len().saturating_add(args.new.len()) > MAX_WRITE_BYTES {
                 return Err(ToolError::InvalidArguments(format!(
@@ -195,9 +191,7 @@ fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryErro
     builder.register::<PatchArgs, EditOutput, _, _>(
         "patch",
         "Apply a unified patch to one UTF-8 workspace file.",
-        vec![ToolEffect::WriteWorkspace],
-        false,
-        false,
+        ToolOptions::new(vec![ToolEffect::WriteWorkspace]),
         |context, args| async move {
             check_write_size(&args.patch)?;
             let path = resolve_existing(&context.workspace, &args.path).await?;
@@ -219,9 +213,7 @@ fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryErro
     builder.register::<RemoveArgs, RemoveOutput, _, _>(
         "remove",
         "Remove a workspace file, symlink, or directory.",
-        vec![ToolEffect::WriteWorkspace],
-        false,
-        false,
+        ToolOptions::new(vec![ToolEffect::WriteWorkspace]),
         |context, args| async move {
             let path = resolve_removable(&context.workspace, &args.path).await?;
             let metadata = fs::symlink_metadata(&path).await?;

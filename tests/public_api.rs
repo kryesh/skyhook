@@ -20,7 +20,7 @@ use skyhook::{
     },
     session::{EventRecord, SessionEvent, SessionStore},
     tool::{
-        ToolContext, ToolOutput, ToolRegistry, ToolRegistryBuilder,
+        ToolContext, ToolOptions, ToolOutput, ToolRegistry, ToolRegistryBuilder,
         executor::ToolExecutor,
         policy::{Policy, ToolEffect},
     },
@@ -61,6 +61,7 @@ fn canonical_public_modules_are_accessible() {
     same_type::<SessionEvent>();
     same_type::<SessionStore>();
     same_type::<ToolContext>();
+    same_type::<ToolOptions>();
     same_type::<ToolOutput>();
     same_type::<ToolRegistry>();
     same_type::<ToolRegistryBuilder>();

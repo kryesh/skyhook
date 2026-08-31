@@ -9,4 +9,4 @@ pub mod javascript;
 pub mod policy;
 
 pub use context::{ProgressFuture, ProgressSink, ToolContext, ToolError, ToolOutput};
-pub use registry::{RegisteredTool, RegistryError, ToolRegistry, ToolRegistryBuilder};
+pub use registry::{RegisteredTool, RegistryError, ToolOptions, ToolRegistry, ToolRegistryBuilder};

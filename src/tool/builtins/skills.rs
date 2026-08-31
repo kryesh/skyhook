@@ -10,7 +10,9 @@ use sha2::{Digest as _, Sha256};
 use tokio::fs;
 
 use super::workspace::{atomic_write, resolve_writable};
-use crate::tool::{RegistryError, ToolError, ToolOutput, ToolRegistryBuilder, policy::ToolEffect};
+use crate::tool::{
+    RegistryError, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder, policy::ToolEffect,
+};
 
 const MAX_INLINE_BYTES: u64 = 1024 * 1024;
 const MAX_COPY_BYTES: u64 = 8 * 1024 * 1024;
@@ -190,9 +192,7 @@ pub(super) fn register(
     builder.register::<NoArgs, Vec<SkillSummary>, _, _>(
         "skills",
         "List host-owned skills available to this agent.",
-        vec![ToolEffect::ReadHostResource],
-        false,
-        false,
+        ToolOptions::new(vec![ToolEffect::ReadHostResource]),
         move |_context, _args| {
             let output = list.summaries();
             async move { Ok(output) }
@@ -205,7 +205,7 @@ pub(super) fn register(
         "skill",
         "Load a host-owned skill or read/copy one of its assets.",
         schema,
-        vec![ToolEffect::ReadHostResource],
+        ToolOptions::new(vec![ToolEffect::ReadHostResource]),
         |arguments| {
             let args: SkillArgs = serde_json::from_value(arguments.clone())
                 .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
@@ -215,8 +215,6 @@ pub(super) fn register(
             }
             Ok(effects)
         },
-        false,
-        false,
         move |context, arguments| {
             let skills = skills.clone();
             async move {
