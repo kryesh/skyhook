@@ -1,5 +1,9 @@
 mod interaction;
 
+mod embedded_shims {
+    include!(concat!(env!("OUT_DIR"), "/embedded_shims.rs"));
+}
+
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use clap::Parser;
@@ -16,7 +20,7 @@ use tokio::io::AsyncBufReadExt as _;
 use interaction::{CliInteraction, CliPolicy, CliQuestions, CliSensitivePrompts};
 
 #[derive(Parser)]
-#[command(version, about = "Programmable coding-agent harness")]
+#[command(name = "skyhook", version, about = "Programmable coding-agent harness")]
 struct Args {
     /// Explicit TOML config used instead of the user config.
     #[arg(long)]
@@ -68,6 +72,8 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let mut config = Config::load(args.config.as_deref()).await?;
+    let shim_catalog =
+        skyhook::remote::EmbeddedShimCatalog::from_assets(embedded_shims::EMBEDDED_SHIMS)?;
     if let Some(profile) = args.model {
         config.default_model_profile = profile;
     }
@@ -77,7 +83,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let interaction = Arc::new(CliInteraction::default());
     // `Config::build_harness` is convenient for embedders; the CLI adds its interactive hooks.
     let approve_all = args.approve_all || config.approve_all;
-    let builder = config.harness_builder(args.workspace)?;
+    let builder = config
+        .harness_builder(args.workspace)?
+        .shim_catalog(shim_catalog);
     let builder = if approve_all {
         builder.policy(Arc::new(AllowAll))
     } else {
@@ -94,67 +102,69 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     eprintln!("session {}", session.id());
     let mut events = session.subscribe();
-    tokio::spawn(async move {
+    let (output_shutdown, mut output_shutdown_rx) = tokio::sync::oneshot::channel();
+    let output_task = tokio::spawn(async move {
         let mut output = AgentOutput::default();
         loop {
-            match events.recv().await {
-                Ok(RuntimeEvent::TextDelta { agent, text }) => {
-                    output.text(&agent, &text);
-                }
-                Ok(RuntimeEvent::TurnCompleted { agent, text }) => output.finish(&agent, &text),
-                Ok(RuntimeEvent::Record(record)) => {
-                    if let SessionEvent::JobCreated {
-                        job,
-                        tool,
-                        arguments,
-                        background,
-                        ..
-                    } = &record.event
-                    {
-                        output.tool(
-                            &record.agent,
-                            &format_tool_call(*job, tool, arguments, *background),
-                        );
+            tokio::select! {
+                event = events.recv() => match event {
+                    Ok(event) => output.event(event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        output.runtime("event stream lagged; some output was omitted");
                     }
-                }
-                Ok(RuntimeEvent::ReasoningDelta { .. }) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    output.runtime("event stream lagged; some output was omitted");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    output.finish_any();
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                _ = &mut output_shutdown_rx => {
+                    while let Ok(event) = events.try_recv() {
+                        output.event(event);
+                    }
                     break;
                 }
             }
         }
+        output.finish_any();
     });
 
     if let Some(script) = args.script {
         let source = tokio::fs::read_to_string(script).await?;
         let output = session.run_script(source).await?;
         println!("{}", serde_json::to_string_pretty(&output.value)?);
-        return Ok(());
-    }
-
-    if let Some(prompt) = args.prompt {
+    } else if let Some(prompt) = args.prompt {
         if args.images.is_empty() {
             let _ = session.prompt(prompt).await?;
         } else {
             let _ = session.prompt_with_images(prompt, &args.images).await?;
         }
-        return Ok(());
-    }
-
-    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-    eprintln!("Enter a prompt; Ctrl-D exits.");
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
+    } else {
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        eprintln!("Enter a prompt; Ctrl-D exits.");
+        while let Some(line) = lines.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let _ = session.prompt(line).await?;
         }
-        let _ = session.prompt(line).await?;
     }
     session.shutdown().await?;
+    let usage = session.usage().await;
+    let _ = output_shutdown.send(());
+    output_task.await?;
+    eprintln!(
+        "{}",
+        token_summary(
+            usage.output_tokens,
+            usage.input_tokens,
+            usage.cached_input_tokens
+        )
+    );
     Ok(())
+}
+
+fn token_summary(output_tokens: u64, input_tokens: u64, cached_input_tokens: u64) -> String {
+    let total_input_tokens = input_tokens.saturating_add(cached_input_tokens);
+    format!(
+        "tokens: {output_tokens} output, {total_input_tokens} total input, {input_tokens} uncached input"
+    )
 }
 
 #[derive(Default)]
@@ -165,12 +175,35 @@ struct AgentOutput {
 }
 
 impl AgentOutput {
+    fn event(&mut self, event: RuntimeEvent) {
+        match event {
+            RuntimeEvent::TextDelta { agent, text } => self.text(&agent, &text),
+            RuntimeEvent::TurnCompleted { agent, text } => self.finish(&agent, &text),
+            RuntimeEvent::Record(record) => {
+                if let SessionEvent::JobCreated {
+                    job,
+                    tool,
+                    arguments,
+                    background,
+                    ..
+                } = &record.event
+                {
+                    self.tool(
+                        &record.agent,
+                        &format_tool_call(*job, tool, arguments, *background),
+                    );
+                }
+            }
+            RuntimeEvent::ReasoningDelta { .. } => {}
+        }
+    }
+
     fn text(&mut self, agent: &AgentId, text: &str) {
         use std::io::Write as _;
 
         if self.active.as_ref() != Some(agent) {
             self.finish_any();
-            print!("[{agent}] ");
+            print!("[{}] ", agent_label(agent));
             self.active = Some(agent.clone());
             self.at_line_start = false;
         }
@@ -199,13 +232,25 @@ impl AgentOutput {
 
     fn tool(&mut self, agent: &AgentId, summary: &str) {
         self.finish_any();
-        println!("[{agent}] {summary}");
+        println!("[{}] {summary}", agent_label(agent));
     }
 
     fn runtime(&mut self, message: &str) {
         self.finish_any();
         eprintln!("[skyhook] {message}");
     }
+}
+
+fn agent_label(agent: &AgentId) -> String {
+    if agent.path().is_empty() {
+        return "root".to_owned();
+    }
+    agent
+        .path()
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 fn format_tool_call(
@@ -218,7 +263,7 @@ fn format_tool_call(
         "read" | "remove" => one_arg(arguments, "path"),
         "search" | "glob" => format!(
             "{} in {}",
-            quoted_arg(arguments, "pattern"),
+            quoted_brief_arg(arguments, "pattern", 80),
             arg(arguments, "path").unwrap_or(".")
         ),
         "exec" => {
@@ -254,8 +299,18 @@ fn format_tool_call(
             &format!("task {}", quoted_brief_arg(arguments, "prompt", 100)),
             arguments,
         ),
-        "ask" => format!("{} question(s)", array_len(arguments, "questions")),
-        "todo" => format!("{} item(s)", array_len(arguments, "items")),
+        "ask" => format!(
+            "question {}: {}",
+            arg(arguments, "id").unwrap_or("<id>"),
+            quoted_brief_arg(arguments, "prompt", 100)
+        ),
+        "todo" => format!(
+            "{} item(s)",
+            arguments
+                .get("items")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len)
+        ),
         "target_add" => format!(
             "{} ({})",
             arg(arguments, "name").unwrap_or("<target>"),
@@ -289,10 +344,6 @@ fn one_arg(arguments: &Value, name: &str) -> String {
     arg(arguments, name).unwrap_or("<unspecified>").to_owned()
 }
 
-fn quoted_arg(arguments: &Value, name: &str) -> String {
-    quoted_brief_arg(arguments, name, 80)
-}
-
 fn quoted_brief_arg(arguments: &Value, name: &str, limit: usize) -> String {
     format!("{:?}", brief(arg(arguments, name).unwrap_or(""), limit))
 }
@@ -306,13 +357,6 @@ fn with_target(detail: &str, arguments: &Value) -> String {
 
 fn string_len(arguments: &Value, name: &str) -> usize {
     arg(arguments, name).map_or(0, |value| value.chars().count())
-}
-
-fn array_len(arguments: &Value, name: &str) -> usize {
-    arguments
-        .get(name)
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len)
 }
 
 fn brief(value: &str, limit: usize) -> String {
@@ -347,9 +391,25 @@ fn safe_scalar_args(arguments: &Value) -> String {
 mod tests {
     use clap::Parser as _;
     use serde_json::json;
-    use skyhook::identity::JobId;
+    use skyhook::identity::{AgentId, JobId, SessionId};
 
-    use super::{Args, brief, format_tool_call};
+    use super::{Args, agent_label, brief, format_tool_call, token_summary};
+
+    #[test]
+    fn token_summary_reports_total_and_uncached_input() {
+        assert_eq!(
+            token_summary(12, 34, 56),
+            "tokens: 12 output, 90 total input, 34 uncached input"
+        );
+    }
+
+    #[test]
+    fn agent_labels_omit_the_session_id() {
+        let root = AgentId::root(SessionId::from_bytes([0xab; 16]));
+        assert_eq!(agent_label(&root), "root");
+        assert_eq!(agent_label(&root.child(2)), "2");
+        assert_eq!(agent_label(&root.child(2).child(3)), "2:3");
+    }
 
     #[test]
     fn prompt_and_script_are_explicit_and_exclusive() {

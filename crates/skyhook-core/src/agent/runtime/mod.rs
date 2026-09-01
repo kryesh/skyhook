@@ -1,0 +1,2751 @@
+//! Provider-neutral session runtime and agent loop.
+
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, OnceLock, RwLock as StdRwLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+
+use base64::Engine as _;
+use futures_util::{future::join_all, future::poll_fn};
+use serde_json::json;
+use tokio::{
+    fs,
+    sync::{Mutex, RwLock, broadcast, mpsc, oneshot},
+};
+
+use crate::{
+    agent::profile::AgentProfile,
+    identity::{AgentId, JobId, SessionId},
+    job::JobManager,
+    media::{MAX_IMAGE_BYTES, MAX_IMAGE_BYTES_PER_SUBMISSION, MAX_IMAGES_PER_SUBMISSION},
+    provider::Provider,
+    provider::profile::ModelProfile,
+    provider::protocol::{
+        AssistantContent, Message, ModelRequest, ResponseChunk, SystemSegment, ToolCall,
+        ToolResult, Usage, UserContent,
+    },
+    remote::{EmbeddedShimCatalog, RejectSensitivePrompts, RemoteManager, SensitivePromptHandler},
+    session::{EventRecord, SessionError, SessionEvent, SessionStore},
+    target::{TargetDefinition, TargetRegistry, TargetsConfig, import_ssh_targets},
+    tool::builtins::{HostSkills, install_script_tool_weak, register_coding_tools},
+    tool::policy::{AllowAll, Policy},
+    tool::{ToolRegistry, ToolRegistryBuilder, ToolVisibilityContext, executor::ToolExecutor},
+};
+
+pub use super::error::HarnessError;
+use super::interaction::{Question, QuestionError, QuestionHandler, RuntimeEvent};
+
+mod prompt;
+mod tools;
+
+const AGENT_CHANNEL_CAPACITY: usize = 64;
+
+pub struct HarnessBuilder {
+    workspace: PathBuf,
+    session_root: Option<PathBuf>,
+    providers: BTreeMap<String, Arc<dyn Provider>>,
+    model_profiles: BTreeMap<String, ModelProfile>,
+    agent_profiles: BTreeMap<String, AgentProfile>,
+    default_model_profile: Option<String>,
+    default_agent_profile: Option<String>,
+    policy: Arc<dyn Policy>,
+    questions: Option<Arc<dyn QuestionHandler>>,
+    extra_tools: ToolRegistry,
+    instructions: Vec<String>,
+    max_child_depth: usize,
+    targets: TargetsConfig,
+    shim_catalog: EmbeddedShimCatalog,
+    sensitive_prompts: Arc<dyn SensitivePromptHandler>,
+}
+
+impl HarnessBuilder {
+    #[must_use]
+    pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace: workspace.into(),
+            session_root: None,
+            providers: BTreeMap::new(),
+            model_profiles: BTreeMap::new(),
+            agent_profiles: BTreeMap::new(),
+            default_model_profile: None,
+            default_agent_profile: None,
+            policy: Arc::new(AllowAll),
+            questions: None,
+            extra_tools: ToolRegistry::default(),
+            instructions: Vec::new(),
+            max_child_depth: 4,
+            targets: TargetsConfig::default(),
+            shim_catalog: EmbeddedShimCatalog::default(),
+            sensitive_prompts: Arc::new(RejectSensitivePrompts),
+        }
+    }
+
+    #[must_use]
+    pub fn session_root(mut self, path: impl Into<PathBuf>) -> Self {
+        self.session_root = Some(path.into());
+        self
+    }
+
+    #[must_use]
+    pub fn provider(mut self, name: impl Into<String>, provider: Arc<dyn Provider>) -> Self {
+        self.providers.insert(name.into(), provider);
+        self
+    }
+
+    #[must_use]
+    pub fn model_profile(mut self, name: impl Into<String>, profile: ModelProfile) -> Self {
+        self.model_profiles.insert(name.into(), profile);
+        self
+    }
+
+    #[must_use]
+    pub fn agent_profile(mut self, name: impl Into<String>, profile: AgentProfile) -> Self {
+        self.agent_profiles.insert(name.into(), profile);
+        self
+    }
+
+    #[must_use]
+    pub fn default_model_profile(mut self, name: impl Into<String>) -> Self {
+        self.default_model_profile = Some(name.into());
+        self
+    }
+
+    #[must_use]
+    pub fn default_agent_profile(mut self, name: impl Into<String>) -> Self {
+        self.default_agent_profile = Some(name.into());
+        self
+    }
+
+    #[must_use]
+    pub fn policy(mut self, policy: Arc<dyn Policy>) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    #[must_use]
+    pub fn question_handler(mut self, handler: Arc<dyn QuestionHandler>) -> Self {
+        self.questions = Some(handler);
+        self
+    }
+
+    #[must_use]
+    pub fn tools(mut self, tools: ToolRegistry) -> Self {
+        self.extra_tools = tools;
+        self
+    }
+
+    #[must_use]
+    pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.instructions.push(instructions.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn max_child_depth(mut self, depth: usize) -> Self {
+        self.max_child_depth = depth;
+        self
+    }
+
+    #[must_use]
+    pub fn targets_config(mut self, targets: TargetsConfig) -> Self {
+        self.targets = targets;
+        self
+    }
+
+    /// Supplies the platform shims used for SSH-backed tools and agents.
+    #[must_use]
+    pub fn shim_catalog(mut self, catalog: EmbeddedShimCatalog) -> Self {
+        self.shim_catalog = catalog;
+        self
+    }
+
+    #[must_use]
+    pub fn sensitive_prompt_handler(mut self, handler: Arc<dyn SensitivePromptHandler>) -> Self {
+        self.sensitive_prompts = handler;
+        self
+    }
+
+    pub async fn build(self) -> Result<Harness, HarnessError> {
+        let workspace = fs::canonicalize(&self.workspace).await?;
+        let default_model_profile = self
+            .default_model_profile
+            .ok_or(HarnessError::MissingDefaultModelProfile)?;
+        validate_profiles(
+            &self.providers,
+            &self.model_profiles,
+            &self.agent_profiles,
+            &default_model_profile,
+            self.default_agent_profile.as_deref(),
+        )?;
+        let session_root = self
+            .session_root
+            .unwrap_or_else(|| workspace.join(".skyhook/sessions"));
+        let mut instructions = load_agent_instructions(&workspace).await?;
+        let skills = HostSkills::discover(&workspace).await;
+        let mut target_definitions = if self.targets.import_ssh_config {
+            import_ssh_targets().await?
+        } else {
+            Vec::new()
+        };
+        for definition in self.targets.definitions()? {
+            if let Some(existing) = target_definitions
+                .iter_mut()
+                .find(|target| target.name == definition.name)
+            {
+                *existing = definition;
+            } else {
+                target_definitions.push(definition);
+            }
+        }
+        TargetRegistry::from_definitions(target_definitions.clone())?;
+        instructions.extend(self.instructions);
+        Ok(Harness {
+            inner: Arc::new(HarnessInner {
+                workspace,
+                session_root,
+                providers: self.providers,
+                model_profiles: self.model_profiles,
+                agent_profiles: self.agent_profiles,
+                default_model_profile,
+                default_agent_profile: self.default_agent_profile,
+                policy: self.policy,
+                questions: self.questions,
+                extra_tools: self.extra_tools,
+                instructions,
+                skills,
+                max_child_depth: self.max_child_depth,
+                target_definitions,
+                shim_catalog: self.shim_catalog,
+                sensitive_prompts: self.sensitive_prompts,
+            }),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct Harness {
+    inner: Arc<HarnessInner>,
+}
+
+struct HarnessInner {
+    workspace: PathBuf,
+    session_root: PathBuf,
+    providers: BTreeMap<String, Arc<dyn Provider>>,
+    model_profiles: BTreeMap<String, ModelProfile>,
+    agent_profiles: BTreeMap<String, AgentProfile>,
+    default_model_profile: String,
+    default_agent_profile: Option<String>,
+    policy: Arc<dyn Policy>,
+    questions: Option<Arc<dyn QuestionHandler>>,
+    extra_tools: ToolRegistry,
+    instructions: Vec<String>,
+    skills: HostSkills,
+    max_child_depth: usize,
+    target_definitions: Vec<TargetDefinition>,
+    shim_catalog: EmbeddedShimCatalog,
+    sensitive_prompts: Arc<dyn SensitivePromptHandler>,
+}
+
+impl Harness {
+    pub async fn new_session(&self) -> Result<SessionHandle, HarnessError> {
+        let store = SessionStore::create(&self.inner.session_root).await?;
+        let root = AgentId::root(store.id());
+        store
+            .append(
+                root.clone(),
+                SessionEvent::SessionStarted {
+                    workspace: self.inner.workspace.clone(),
+                    root_model_profile: self.inner.default_model_profile.clone(),
+                    root_agent_profile: self.inner.default_agent_profile.clone(),
+                },
+            )
+            .await?;
+        store
+            .append(
+                root.clone(),
+                SessionEvent::TargetsSnapshot {
+                    targets: self.inner.target_definitions.clone(),
+                },
+            )
+            .await?;
+        let runtime = SessionRuntime::build(self.inner.clone(), store, Vec::new()).await?;
+        runtime.start_root(Vec::new()).await
+    }
+
+    pub async fn resume_session(&self, id: SessionId) -> Result<SessionHandle, HarnessError> {
+        let (store, records) = SessionStore::open(&self.inner.session_root, id).await?;
+        let root = AgentId::root(id);
+        let history = records
+            .iter()
+            .filter(|record| record.agent == root)
+            .filter_map(|record| match &record.event {
+                SessionEvent::MessageCommitted { message } => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+        let runtime = SessionRuntime::build(self.inner.clone(), store, records).await?;
+        runtime.start_root(history).await
+    }
+}
+
+#[derive(Clone)]
+pub struct SessionHandle {
+    runtime: Arc<SessionRuntime>,
+    root: AgentId,
+    root_tx: mpsc::Sender<AgentCommand>,
+}
+
+impl SessionHandle {
+    #[must_use]
+    pub fn id(&self) -> SessionId {
+        self.root.session()
+    }
+
+    #[must_use]
+    pub fn root_agent(&self) -> &AgentId {
+        &self.root
+    }
+
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
+        self.runtime.events.subscribe()
+    }
+
+    /// Returns cumulative model usage for the session, including usage restored on resume.
+    pub async fn usage(&self) -> Usage {
+        *self.runtime.usage.lock().await
+    }
+
+    #[must_use]
+    pub fn tools(&self) -> &ToolRegistry {
+        self.runtime.executor.registry()
+    }
+
+    pub async fn prompt(&self, text: impl Into<String>) -> Result<String, HarnessError> {
+        self.submit(vec![UserContent::Text { text: text.into() }])
+            .await
+    }
+
+    /// Execute a JavaScript workflow through the session's registered `script` tool.
+    pub async fn run_script(
+        &self,
+        source: impl Into<String>,
+    ) -> Result<crate::tool::ToolOutput, HarnessError> {
+        let result = self
+            .runtime
+            .executor
+            .execute(
+                self.root.clone(),
+                "script",
+                json!({"source": source.into()}),
+                None,
+            )
+            .await?;
+        Ok(result.output)
+    }
+
+    pub async fn prompt_with_images(
+        &self,
+        text: impl Into<String>,
+        paths: &[PathBuf],
+    ) -> Result<String, HarnessError> {
+        if paths.len() > MAX_IMAGES_PER_SUBMISSION {
+            return Err(HarnessError::ImageLimit);
+        }
+        let mut content = vec![UserContent::Text { text: text.into() }];
+        let mut total = 0_u64;
+        for path in paths {
+            let absolute = contained_path(&self.runtime.harness.workspace, path).await?;
+            let bytes = fs::read(&absolute).await?;
+            let length = u64::try_from(bytes.len()).map_err(|_| HarnessError::ImageLimit)?;
+            if length > MAX_IMAGE_BYTES {
+                return Err(HarnessError::ImageLimit);
+            }
+            total = total.saturating_add(length);
+            if total > MAX_IMAGE_BYTES_PER_SUBMISSION {
+                return Err(HarnessError::ImageLimit);
+            }
+            let media_type = image_media_type(&absolute).ok_or(HarnessError::UnsupportedImage)?;
+            let image = self
+                .runtime
+                .store
+                .import_blob(
+                    &bytes,
+                    absolute
+                        .file_name()
+                        .map_or_else(|| "image".to_owned(), |name| name.to_string_lossy().into()),
+                    media_type.to_owned(),
+                )
+                .await?;
+            content.push(UserContent::Image { image });
+        }
+        self.submit(content).await
+    }
+
+    async fn submit(&self, content: Vec<UserContent>) -> Result<String, HarnessError> {
+        let (done_tx, done_rx) = oneshot::channel();
+        self.root_tx
+            .send(AgentCommand::Input {
+                content,
+                done: Some(done_tx),
+            })
+            .await
+            .map_err(|_| HarnessError::AgentStopped)?;
+        done_rx
+            .await
+            .map_err(|_| HarnessError::AgentStopped)?
+            .map_err(HarnessError::Agent)
+    }
+
+    pub async fn shutdown(&self) -> Result<(), HarnessError> {
+        self.root_tx
+            .send(AgentCommand::Shutdown)
+            .await
+            .map_err(|_| HarnessError::AgentStopped)
+    }
+
+    pub async fn interrupt(&self) -> usize {
+        self.runtime.interrupt_tree(&self.root).await
+    }
+}
+
+struct SessionRuntime {
+    harness: Arc<HarnessInner>,
+    store: SessionStore,
+    jobs: JobManager,
+    executor: ToolExecutor,
+    // Keeps the script tool's weak executor lookup alive without an executor/registry cycle.
+    _executor_slot: Arc<OnceLock<ToolExecutor>>,
+    remote: RemoteManager,
+    targets: TargetRegistry,
+    agents: RwLock<HashMap<AgentId, mpsc::Sender<AgentCommand>>>,
+    interrupts: RwLock<HashMap<AgentId, Arc<AtomicBool>>>,
+    child_counters: RwLock<HashMap<AgentId, u32>>,
+    available_depths: StdRwLock<HashMap<AgentId, usize>>,
+    pending_questions: Mutex<HashMap<JobId, PendingQuestion>>,
+    ask_batches: Mutex<HashMap<AgentId, QuestionBatch>>,
+    usage: Mutex<Usage>,
+    events: broadcast::Sender<RuntimeEvent>,
+}
+
+#[derive(Clone)]
+struct PendingQuestion {
+    ask_jobs: Vec<(String, JobId)>,
+}
+
+struct PendingAsk {
+    context: crate::tool::ToolContext,
+    question: Question,
+    event_id: String,
+    result: oneshot::Sender<Result<serde_json::Value, String>>,
+}
+
+#[derive(Default)]
+struct QuestionBatch {
+    expected: Option<usize>,
+    pending: Vec<PendingAsk>,
+}
+
+enum AgentCommand {
+    Input {
+        content: Vec<UserContent>,
+        done: Option<oneshot::Sender<Result<String, String>>>,
+    },
+    JobsReady,
+    Shutdown,
+}
+
+struct AgentLaunch {
+    id: AgentId,
+    parent: Option<AgentId>,
+    owner_job: Option<JobId>,
+    model_profile: String,
+    agent_profile: Option<String>,
+    history: Vec<Message>,
+    one_shot: bool,
+    available_depth: usize,
+    target: Option<String>,
+    workspace: Option<PathBuf>,
+}
+
+struct AgentLoop {
+    id: AgentId,
+    owner_job: Option<JobId>,
+    interrupted: Arc<AtomicBool>,
+    profile: ModelProfile,
+    system: Vec<SystemSegment>,
+    history: Vec<Message>,
+    one_shot: bool,
+    location: AgentLocation,
+    rx: mpsc::Receiver<AgentCommand>,
+}
+
+struct TurnContext<'a> {
+    agent: &'a AgentId,
+    profile: &'a ModelProfile,
+    system: &'a [SystemSegment],
+    owner_job: Option<JobId>,
+    interrupted: &'a Arc<AtomicBool>,
+    location: &'a AgentLocation,
+}
+
+#[derive(Clone)]
+enum AgentLocation {
+    Local { workspace: PathBuf },
+    Remote { target: String, workspace: PathBuf },
+}
+
+impl AgentLocation {
+    fn target(&self) -> &str {
+        match self {
+            Self::Local { .. } => crate::target::ROOT_TARGET,
+            Self::Remote { target, .. } => target,
+        }
+    }
+
+    fn kind(&self) -> &str {
+        match self {
+            Self::Local { .. } => "local",
+            Self::Remote { .. } => "ssh",
+        }
+    }
+
+    fn workspace(&self) -> &Path {
+        match self {
+            Self::Local { workspace } | Self::Remote { workspace, .. } => workspace,
+        }
+    }
+}
+
+impl SessionRuntime {
+    async fn build(
+        harness: Arc<HarnessInner>,
+        store: SessionStore,
+        prior_records: Vec<EventRecord>,
+    ) -> Result<Arc<Self>, HarnessError> {
+        let jobs = JobManager::restore(store.clone(), &prior_records).await?;
+        let mut definitions = prior_records
+            .iter()
+            .find_map(|record| match &record.event {
+                SessionEvent::TargetsSnapshot { targets } => Some(targets.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| harness.target_definitions.clone());
+        let targets = TargetRegistry::from_definitions(std::mem::take(&mut definitions))?;
+        for record in &prior_records {
+            if let SessionEvent::TargetUpserted { target } = &record.event {
+                targets.upsert(target.clone()).await?;
+            }
+        }
+        let remote = RemoteManager::new(targets.clone())
+            .with_shim_catalog(harness.shim_catalog.clone())
+            .with_prompt_handler(harness.sensitive_prompts.clone())
+            .with_policy(harness.policy.clone());
+        let executor_slot = Arc::new(OnceLock::new());
+        let runtime_slot = Arc::new(OnceLock::<Weak<Self>>::new());
+        let mut builder = ToolRegistryBuilder::default();
+        register_coding_tools(
+            &mut builder,
+            store.clone(),
+            jobs.clone(),
+            harness.skills.clone(),
+            targets.clone(),
+            remote.clone(),
+        )?;
+        install_script_tool_weak(&mut builder, Arc::downgrade(&executor_slot))?;
+        tools::register(&mut builder, runtime_slot.clone())?;
+        builder.extend(&harness.extra_tools)?;
+        let executor = ToolExecutor::new(
+            builder.build(),
+            harness.policy.clone(),
+            jobs.clone(),
+            harness.workspace.clone(),
+        );
+        executor_slot
+            .set(executor.clone())
+            .map_err(|_| HarnessError::Initialization("executor already set".to_owned()))?;
+        let (events, _) = broadcast::channel(1024);
+        let mut usage = Usage::default();
+        for record in &prior_records {
+            if let SessionEvent::Usage { usage: value } = &record.event {
+                usage.accumulate(*value);
+            }
+        }
+        let mut child_counters = HashMap::new();
+        for record in &prior_records {
+            if let SessionEvent::AgentStarted {
+                parent: Some(parent),
+                ..
+            } = &record.event
+                && let Some(segment) = record.agent.path().last()
+            {
+                let counter = child_counters.entry(parent.clone()).or_insert(0_u32);
+                *counter = (*counter).max(*segment);
+            }
+        }
+        let runtime = Arc::new(Self {
+            harness,
+            store: store.clone(),
+            jobs: jobs.clone(),
+            executor,
+            _executor_slot: executor_slot,
+            remote,
+            targets,
+            agents: RwLock::new(HashMap::new()),
+            interrupts: RwLock::new(HashMap::new()),
+            child_counters: RwLock::new(child_counters),
+            available_depths: StdRwLock::new(HashMap::new()),
+            pending_questions: Mutex::new(HashMap::new()),
+            ask_batches: Mutex::new(HashMap::new()),
+            usage: Mutex::new(usage),
+            events,
+        });
+        runtime_slot
+            .set(Arc::downgrade(&runtime))
+            .map_err(|_| HarnessError::Initialization("runtime already set".to_owned()))?;
+        runtime.forward_store_events();
+        runtime.forward_job_completions();
+        Ok(runtime)
+    }
+
+    async fn start_root(
+        self: &Arc<Self>,
+        history: Vec<Message>,
+    ) -> Result<SessionHandle, HarnessError> {
+        let root = AgentId::root(self.store.id());
+        let root_tx = self
+            .spawn_agent(AgentLaunch {
+                id: root.clone(),
+                parent: None,
+                owner_job: None,
+                model_profile: self.harness.default_model_profile.clone(),
+                agent_profile: self.harness.default_agent_profile.clone(),
+                history,
+                one_shot: false,
+                available_depth: self.harness.max_child_depth,
+                target: None,
+                workspace: None,
+            })
+            .await?;
+        Ok(SessionHandle {
+            runtime: self.clone(),
+            root,
+            root_tx,
+        })
+    }
+
+    fn forward_store_events(self: &Arc<Self>) {
+        let mut source = self.store.subscribe();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            loop {
+                match source.recv().await {
+                    Ok(record) => {
+                        let _ = events.send(RuntimeEvent::Record(record));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    fn forward_job_completions(self: &Arc<Self>) {
+        let mut completions = self.jobs.subscribe_completions();
+        let runtime = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                let completion = match completions.recv().await {
+                    Ok(completion) => completion,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                let Some(runtime) = runtime.upgrade() else {
+                    break;
+                };
+                if let Some(sender) = runtime.agents.read().await.get(&completion.agent).cloned() {
+                    let _ = sender.send(AgentCommand::JobsReady).await;
+                }
+            }
+        });
+    }
+
+    async fn interrupt_tree(&self, root: &AgentId) -> usize {
+        let targets = self
+            .interrupts
+            .read()
+            .await
+            .iter()
+            .filter(|(agent, _)| {
+                agent.session() == root.session() && agent.path().starts_with(root.path())
+            })
+            .map(|(agent, interrupted)| (agent.clone(), interrupted.clone()))
+            .collect::<Vec<_>>();
+        let mut cancelled = 0;
+        for (agent, interrupted) in targets {
+            interrupted.store(true, Ordering::Relaxed);
+            cancelled += self.jobs.cancel_all(&agent).await;
+        }
+        cancelled
+    }
+
+    async fn spawn_agent(
+        self: &Arc<Self>,
+        launch: AgentLaunch,
+    ) -> Result<mpsc::Sender<AgentCommand>, HarnessError> {
+        let AgentLaunch {
+            id,
+            parent,
+            owner_job,
+            model_profile,
+            agent_profile,
+            history,
+            one_shot,
+            available_depth,
+            target,
+            workspace,
+        } = launch;
+        if id.depth() > self.harness.max_child_depth {
+            return Err(HarnessError::ChildDepth);
+        }
+        let remaining_depth = self.harness.max_child_depth.saturating_sub(id.depth());
+        if available_depth > remaining_depth {
+            return Err(HarnessError::ChildDepth);
+        }
+        let location = if let Some(target) = target
+            .as_deref()
+            .filter(|target| *target != crate::target::ROOT_TARGET)
+        {
+            let definition = self.targets.get(target).await?;
+            AgentLocation::Remote {
+                target: target.to_owned(),
+                workspace: workspace
+                    .clone()
+                    .unwrap_or_else(|| definition.workspace.clone()),
+            }
+        } else {
+            AgentLocation::Local {
+                workspace: workspace
+                    .clone()
+                    .unwrap_or_else(|| self.harness.workspace.clone()),
+            }
+        };
+        let (profile, system) = self.resolve_agent(
+            &model_profile,
+            agent_profile.as_deref(),
+            &id,
+            &location,
+            available_depth,
+        )?;
+        self.store
+            .append(
+                id.clone(),
+                SessionEvent::AgentStarted {
+                    parent,
+                    model_profile: model_profile.clone(),
+                    agent_profile: agent_profile.clone(),
+                    target: match &location {
+                        AgentLocation::Local { .. } => None,
+                        AgentLocation::Remote { target, .. } => Some(target.clone()),
+                    },
+                    workspace,
+                },
+            )
+            .await?;
+        let (tx, rx) = mpsc::channel(AGENT_CHANNEL_CAPACITY);
+        self.agents.write().await.insert(id.clone(), tx.clone());
+        let interrupted = Arc::new(AtomicBool::new(false));
+        self.interrupts
+            .write()
+            .await
+            .insert(id.clone(), interrupted.clone());
+        self.available_depths
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.clone(), available_depth);
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            runtime
+                .run_agent(AgentLoop {
+                    id,
+                    owner_job,
+                    interrupted,
+                    profile,
+                    system,
+                    history,
+                    one_shot,
+                    location,
+                    rx,
+                })
+                .await;
+        });
+        Ok(tx)
+    }
+
+    async fn execute_call(
+        &self,
+        agent: &AgentId,
+        parent: Option<JobId>,
+        call: &ToolCall,
+        location: &AgentLocation,
+    ) -> ToolResult {
+        let mut call = call.clone();
+        let result = if let AgentLocation::Remote { target, workspace } = location {
+            let workspace_tool = self
+                .executor
+                .registry()
+                .get(&call.name)
+                .is_some_and(|tool| tool.is_workspace_bound());
+            let selected_target = call
+                .arguments
+                .get("target")
+                .and_then(serde_json::Value::as_str);
+            if workspace_tool && selected_target.is_none_or(|selected| selected == target) {
+                if let Some(arguments) = call.arguments.as_object_mut() {
+                    arguments.remove("target");
+                }
+                let remote = self.remote.clone();
+                let store = self.store.clone();
+                let target = target.clone();
+                let workspace = workspace.clone();
+                let name = call.name.clone();
+                self.executor
+                    .execute_external_with_context(
+                        agent.clone(),
+                        &call.name,
+                        call.arguments.clone(),
+                        parent,
+                        vec![
+                            crate::tool::policy::ToolEffect::RemoteAccess,
+                            crate::tool::policy::ToolEffect::Network,
+                        ],
+                        move |context, arguments| async move {
+                            let result = remote
+                                .execute_tool_cancellable(
+                                    &target,
+                                    Some(&workspace),
+                                    name,
+                                    arguments,
+                                    &context,
+                                )
+                                .await;
+                            if context.is_cancelled() {
+                                return Err(crate::tool::ToolError::Cancelled);
+                            }
+                            import_remote_result(&store, result).await
+                        },
+                    )
+                    .await
+            } else {
+                if matches!(call.name.as_str(), "exec" | "shell" | "agent")
+                    && let Some(arguments) = call.arguments.as_object_mut()
+                {
+                    arguments
+                        .entry("target")
+                        .or_insert_with(|| serde_json::Value::String(target.clone()));
+                    if call.name == "agent" {
+                        arguments.entry("workspace").or_insert_with(|| {
+                            serde_json::Value::String(workspace.to_string_lossy().into_owned())
+                        });
+                    }
+                }
+                self.executor
+                    .execute_model(agent.clone(), &call.name, call.arguments.clone(), parent)
+                    .await
+            }
+        } else if let AgentLocation::Local { workspace } = location {
+            self.executor
+                .clone()
+                .with_workspace(workspace.clone())
+                .execute_model(agent.clone(), &call.name, call.arguments.clone(), parent)
+                .await
+        } else {
+            unreachable!("agent locations are local or remote")
+        };
+        match result {
+            Ok(result) => ToolResult {
+                call_id: call.id,
+                name: call.name,
+                result: result.output.value,
+                images: result.output.images,
+                is_error: false,
+            },
+            Err(error) => ToolResult {
+                call_id: call.id,
+                name: call.name,
+                result: json!({"error": error.to_string()}),
+                images: Vec::new(),
+                is_error: true,
+            },
+        }
+    }
+
+    fn resolve_agent(
+        &self,
+        model_profile: &str,
+        agent_profile: Option<&str>,
+        agent: &AgentId,
+        location: &AgentLocation,
+        available_depth: usize,
+    ) -> Result<(ModelProfile, Vec<SystemSegment>), HarnessError> {
+        let mut selected_model = model_profile.to_owned();
+        let profile_instructions = if let Some(name) = agent_profile {
+            let profile = self
+                .harness
+                .agent_profiles
+                .get(name)
+                .ok_or_else(|| HarnessError::UnknownAgentProfile(name.to_owned()))?;
+            if let Some(name) = &profile.model_profile {
+                selected_model.clone_from(name);
+            }
+            Some(profile.instructions.as_str())
+        } else {
+            None
+        };
+        let profile = self
+            .harness
+            .model_profiles
+            .get(&selected_model)
+            .cloned()
+            .ok_or(HarnessError::UnknownModelProfile(selected_model))?;
+        let system = vec![prompt::system_segment(
+            &self.harness.instructions,
+            profile_instructions,
+            agent,
+            location.target(),
+            location.kind(),
+            location.workspace(),
+            available_depth,
+        )];
+        Ok((profile, system))
+    }
+
+    async fn run_agent(self: Arc<Self>, agent_loop: AgentLoop) {
+        let AgentLoop {
+            id,
+            owner_job,
+            interrupted,
+            profile,
+            system,
+            mut history,
+            one_shot,
+            location,
+            mut rx,
+        } = agent_loop;
+        while let Some(command) = rx.recv().await {
+            let (content, done) = match command {
+                AgentCommand::Shutdown => {
+                    let _ = self
+                        .store
+                        .append(id.clone(), SessionEvent::AgentInterrupted)
+                        .await;
+                    break;
+                }
+                AgentCommand::Input { mut content, done } => {
+                    if let Some(state) = prompt::active_jobs_content(&self.jobs, &id).await {
+                        content.push(state);
+                    }
+                    (content, done)
+                }
+                AgentCommand::JobsReady => {
+                    let pending = match self.jobs.take_pending(&id).await {
+                        Ok(pending) if !pending.is_empty() => pending,
+                        _ => continue,
+                    };
+                    let mut content = vec![UserContent::Runtime {
+                        text: format!(
+                            "<skyhook_job_events>\n{}\n</skyhook_job_events>",
+                            serde_json::to_string(&pending).unwrap_or_else(|_| "[]".to_owned())
+                        ),
+                    }];
+                    if let Some(state) = prompt::active_jobs_content(&self.jobs, &id).await {
+                        content.push(state);
+                    }
+                    (content, None)
+                }
+            };
+            interrupted.store(false, Ordering::Relaxed);
+            let message = Message::User(content);
+            if let Err(error) = self.commit(&id, message.clone()).await {
+                if let Some(done) = done {
+                    let _ = done.send(Err(error.to_string()));
+                }
+                continue;
+            }
+            history.push(message);
+            let result = self
+                .run_turn(
+                    TurnContext {
+                        agent: &id,
+                        profile: &profile,
+                        system: &system,
+                        owner_job,
+                        interrupted: &interrupted,
+                        location: &location,
+                    },
+                    &mut history,
+                )
+                .await;
+            if let Some(done) = done {
+                let _ = done.send(
+                    result
+                        .as_ref()
+                        .map(Clone::clone)
+                        .map_err(ToString::to_string),
+                );
+            }
+            if one_shot && !self.jobs.has_running(&id).await {
+                let terminal = if result.is_ok() {
+                    SessionEvent::AgentCompleted
+                } else {
+                    SessionEvent::AgentInterrupted
+                };
+                let _ = self.store.append(id.clone(), terminal).await;
+                break;
+            }
+        }
+        self.agents.write().await.remove(&id);
+        self.interrupts.write().await.remove(&id);
+        self.available_depths
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+    }
+
+    async fn run_turn(
+        &self,
+        turn: TurnContext<'_>,
+        history: &mut Vec<Message>,
+    ) -> Result<String, HarnessError> {
+        let TurnContext {
+            agent,
+            profile,
+            system,
+            owner_job,
+            interrupted,
+            location,
+        } = turn;
+        if !profile.supports_images && contains_images(history) {
+            return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
+        }
+        let provider = self
+            .harness
+            .providers
+            .get(&profile.provider)
+            .cloned()
+            .ok_or_else(|| HarnessError::UnknownProvider(profile.provider.clone()))?;
+        let mut final_text = String::new();
+        loop {
+            if interrupted.load(Ordering::Relaxed) {
+                return Err(HarnessError::Interrupted);
+            }
+            let mut request_messages = history.clone();
+            self.hydrate_images(&mut request_messages).await?;
+            let request = ModelRequest {
+                model: profile.model.clone(),
+                system: system.to_vec(),
+                messages: request_messages,
+                tools: self
+                    .executor
+                    .registry()
+                    .definitions(&ToolVisibilityContext::new(agent.clone())),
+                reasoning: profile.reasoning.clone(),
+                max_output_tokens: profile.max_output_tokens,
+                correlation: Some(agent.to_string()),
+            };
+            let mut response = provider.invoke(request).await?;
+            let mut chunks = Vec::new();
+            loop {
+                let chunk = tokio::select! {
+                    chunk = poll_fn(|context| response.as_mut().poll_chunk(context)) => chunk,
+                    () = wait_for_interrupt(interrupted) => return Err(HarnessError::Interrupted),
+                };
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                let chunk = chunk?;
+                match &chunk {
+                    ResponseChunk::TextDelta { text } => {
+                        let _ = self.events.send(RuntimeEvent::TextDelta {
+                            agent: agent.clone(),
+                            text: text.clone(),
+                        });
+                    }
+                    ResponseChunk::ReasoningDelta { text } => {
+                        let _ = self.events.send(RuntimeEvent::ReasoningDelta {
+                            agent: agent.clone(),
+                            text: text.clone(),
+                        });
+                    }
+                    ResponseChunk::Block { .. }
+                    | ResponseChunk::Usage { .. }
+                    | ResponseChunk::MessageStart { .. }
+                    | ResponseChunk::ToolInputDelta { .. }
+                    | ResponseChunk::Diagnostic { .. }
+                    | ResponseChunk::Done { .. } => {}
+                }
+                chunks.push(chunk);
+            }
+            let response = fold_response(chunks)?;
+            final_text.push_str(&response.text);
+            let assistant = Message::Assistant(response.blocks);
+            self.commit(agent, assistant.clone()).await?;
+            history.push(assistant);
+            self.store
+                .append(
+                    agent.clone(),
+                    SessionEvent::Usage {
+                        usage: response.usage,
+                    },
+                )
+                .await?;
+            self.usage.lock().await.accumulate(response.usage);
+            if response.calls.is_empty() {
+                let _ = self.events.send(RuntimeEvent::TurnCompleted {
+                    agent: agent.clone(),
+                    text: final_text.clone(),
+                });
+                return Ok(final_text);
+            }
+            self.prepare_question_batch(agent, &response.calls).await;
+            let results = join_all(
+                response
+                    .calls
+                    .iter()
+                    .map(|call| self.execute_call(agent, owner_job, call, location)),
+            )
+            .await;
+            let tools = Message::Tool(results);
+            self.commit(agent, tools.clone()).await?;
+            history.push(tools);
+        }
+    }
+
+    async fn commit(&self, agent: &AgentId, message: Message) -> Result<(), SessionError> {
+        self.store
+            .append(agent.clone(), SessionEvent::MessageCommitted { message })
+            .await?;
+        Ok(())
+    }
+
+    async fn hydrate_images(&self, messages: &mut [Message]) -> Result<(), HarnessError> {
+        for message in messages {
+            match message {
+                Message::User(content) => {
+                    for item in content {
+                        if let UserContent::Image { image } = item {
+                            hydrate_image(&self.store, image).await?;
+                        }
+                    }
+                }
+                Message::Tool(results) => {
+                    for result in results {
+                        for image in &mut result.images {
+                            hydrate_image(&self.store, image).await?;
+                        }
+                    }
+                }
+                Message::Assistant(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn next_child(&self, parent: &AgentId) -> AgentId {
+        let mut counters = self.child_counters.write().await;
+        let counter = counters.entry(parent.clone()).or_insert(0);
+        *counter = counter.saturating_add(1);
+        parent.child(*counter)
+    }
+
+    fn available_depth(&self, agent: &AgentId) -> usize {
+        self.available_depths
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(agent)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    async fn owning_agent_job(&self, mut job: JobId) -> Result<JobId, HarnessError> {
+        loop {
+            let envelope = self.jobs.snapshot(job).await?;
+            if envelope.tool == "agent" {
+                return Ok(job);
+            }
+            job = envelope.parent.ok_or_else(|| {
+                HarnessError::Agent("child question has no owning agent job".to_owned())
+            })?;
+        }
+    }
+
+    async fn coordinate_question(
+        self: &Arc<Self>,
+        context: crate::tool::ToolContext,
+        question: Question,
+    ) -> Result<serde_json::Value, crate::tool::ToolError> {
+        let (result, received) = oneshot::channel();
+        let agent = context.agent.clone();
+        let launch = {
+            let mut batches = self.ask_batches.lock().await;
+            let batch = batches.entry(agent.clone()).or_default();
+            let first = batch.pending.is_empty();
+            batch.pending.push(PendingAsk {
+                event_id: format!("q-{}", context.job),
+                context,
+                question,
+                result,
+            });
+            batch
+                .expected
+                .map_or(first, |expected| batch.pending.len() >= expected)
+        };
+        if launch {
+            let runtime = self.clone();
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                let batch = runtime
+                    .ask_batches
+                    .lock()
+                    .await
+                    .remove(&agent)
+                    .unwrap_or_default()
+                    .pending;
+                runtime.present_question_batch(agent, batch).await;
+            });
+        }
+        received
+            .await
+            .map_err(|_| crate::tool::ToolError::Failed("question batch stopped".to_owned()))?
+            .map_err(crate::tool::ToolError::Failed)
+    }
+
+    async fn prepare_question_batch(&self, agent: &AgentId, calls: &[ToolCall]) {
+        let count = calls
+            .iter()
+            .filter(|call| {
+                call.name == "ask"
+                    && serde_json::from_value::<Question>(call.arguments.clone()).is_ok()
+            })
+            .count();
+        if count > 0 {
+            self.ask_batches
+                .lock()
+                .await
+                .entry(agent.clone())
+                .or_default()
+                .expected = Some(count);
+        }
+    }
+
+    async fn present_question_batch(&self, agent: AgentId, batch: Vec<PendingAsk>) {
+        if batch.is_empty() {
+            return;
+        }
+        let questions = batch
+            .iter()
+            .map(|pending| pending.question.clone())
+            .collect::<Vec<_>>();
+        if let Some(duplicate) = duplicate_question_id(&questions) {
+            send_question_error(batch, format!("duplicate question id `{duplicate}`"));
+            return;
+        }
+        if agent.parent().is_some() {
+            self.present_child_questions(batch, questions).await;
+        } else {
+            self.present_root_questions(agent, batch, questions).await;
+        }
+    }
+
+    async fn present_root_questions(
+        &self,
+        agent: AgentId,
+        batch: Vec<PendingAsk>,
+        questions: Vec<Question>,
+    ) {
+        let Some(handler) = self.harness.questions.clone() else {
+            send_question_error(batch, QuestionError::Unavailable.to_string());
+            return;
+        };
+        let cancellation = batch[0].context.cancellation();
+        let answer = handler.ask(agent, questions);
+        tokio::pin!(answer);
+        let answer = tokio::select! {
+            answer = &mut answer => answer.map_err(|error| error.to_string()),
+            () = wait_for_interrupt(&cancellation) => Err("tool was cancelled".to_owned()),
+        };
+        match answer {
+            Ok(answer) => distribute_question_answer(batch, answer),
+            Err(error) => send_question_error(batch, error),
+        }
+    }
+
+    async fn present_child_questions(&self, batch: Vec<PendingAsk>, questions: Vec<Question>) {
+        let event_ids = batch
+            .iter()
+            .map(|pending| pending.event_id.clone())
+            .collect::<Vec<_>>();
+        let ask_jobs = batch
+            .iter()
+            .map(|pending| (pending.question.id.clone(), pending.context.job))
+            .collect::<Vec<_>>();
+        let output = json!({
+            "kind": "questions",
+            "question_id": event_ids[0],
+            "question_ids": event_ids,
+            "questions": questions,
+        });
+        let owner_job = match self.open_child_questions(ask_jobs, output).await {
+            Ok(owner_job) => owner_job,
+            Err(error) => {
+                send_question_error(batch, error.to_string());
+                return;
+            }
+        };
+        let answers = join_all(batch.iter().map(|pending| pending.context.receive())).await;
+        let resolved = self.resolve_child_question(owner_job).await;
+        if let Err(error) = resolved {
+            send_question_error(batch, error.to_string());
+            return;
+        }
+        for (pending, answer) in batch.into_iter().zip(answers) {
+            let _ = pending
+                .result
+                .send(answer.map_err(|error| error.to_string()));
+        }
+    }
+
+    async fn open_child_questions(
+        &self,
+        ask_jobs: Vec<(String, JobId)>,
+        output: serde_json::Value,
+    ) -> Result<JobId, HarnessError> {
+        let ask_job = ask_jobs
+            .first()
+            .map(|(_, job)| *job)
+            .ok_or_else(|| HarnessError::Agent("question batch is empty".to_owned()))?;
+        let owner_job = self.owning_agent_job(ask_job).await?;
+        {
+            let mut pending = self.pending_questions.lock().await;
+            if pending.contains_key(&owner_job) {
+                return Err(HarnessError::Agent(
+                    "an agent job may only have one outstanding question batch".to_owned(),
+                ));
+            }
+            pending.insert(owner_job, PendingQuestion { ask_jobs });
+        }
+        if let Err(error) = self.jobs.request_input(owner_job, output).await {
+            self.pending_questions.lock().await.remove(&owner_job);
+            return Err(error.into());
+        }
+        Ok(owner_job)
+    }
+
+    async fn resolve_child_question(&self, owner_job: JobId) -> Result<(), HarnessError> {
+        self.pending_questions.lock().await.remove(&owner_job);
+        self.jobs.resume_input(owner_job).await?;
+        Ok(())
+    }
+
+    async fn answer_child_question(
+        &self,
+        owner_job: JobId,
+        value: serde_json::Value,
+    ) -> Result<bool, HarnessError> {
+        let pending = self.pending_questions.lock().await.get(&owner_job).cloned();
+        let Some(pending) = pending else {
+            return Ok(false);
+        };
+        let ids = pending
+            .ask_jobs
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let answers = split_answers(&ids, value)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(HarnessError::Agent)?;
+        for ((_, ask_job), answer) in pending.ask_jobs.iter().zip(answers) {
+            self.jobs.send(*ask_job, answer).await?;
+        }
+        Ok(true)
+    }
+
+    async fn cancel_child_question(&self, owner_job: JobId) {
+        let pending = self.pending_questions.lock().await.remove(&owner_job);
+        if let Some(pending) = pending {
+            for (_, ask_job) in pending.ask_jobs {
+                let _ = self.jobs.cancel(ask_job).await;
+            }
+        }
+    }
+}
+
+async fn import_remote_result(
+    store: &SessionStore,
+    result: Result<crate::tool::ToolOutput, crate::remote::RemoteError>,
+) -> Result<crate::tool::ToolOutput, crate::tool::ToolError> {
+    match result {
+        Ok(output) => import_remote_output(store, output).await,
+        Err(crate::remote::RemoteError::Remote {
+            message,
+            output: Some(output),
+        }) => Err(crate::tool::ToolError::with_output(
+            message,
+            import_remote_output(store, output).await?,
+        )),
+        Err(error) => Err(error.into_tool_error()),
+    }
+}
+
+async fn import_remote_output(
+    store: &SessionStore,
+    mut output: crate::tool::ToolOutput,
+) -> Result<crate::tool::ToolOutput, crate::tool::ToolError> {
+    let mut imported = Vec::with_capacity(output.images.len());
+    for image in output.images {
+        let encoded = image.data_base64.as_deref().ok_or_else(|| {
+            crate::tool::ToolError::Failed("remote image payload is missing".to_owned())
+        })?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|error| crate::tool::ToolError::Failed(error.to_string()))?;
+        let reference = store
+            .import_blob(&bytes, image.name, image.media_type)
+            .await
+            .map_err(|error| crate::tool::ToolError::Failed(error.to_string()))?;
+        if reference.sha256 != image.sha256 {
+            return Err(crate::tool::ToolError::Failed(
+                "remote image hash did not match its payload".to_owned(),
+            ));
+        }
+        imported.push(reference);
+    }
+    output.images = imported;
+    Ok(output)
+}
+
+fn send_question_error(batch: Vec<PendingAsk>, error: String) {
+    for pending in batch {
+        let _ = pending.result.send(Err(error.clone()));
+    }
+}
+
+fn distribute_question_answer(batch: Vec<PendingAsk>, answer: serde_json::Value) {
+    let ids = batch
+        .iter()
+        .map(|pending| pending.question.id.clone())
+        .collect::<Vec<_>>();
+    for (pending, result) in batch.into_iter().zip(split_answers(&ids, answer)) {
+        let _ = pending.result.send(result);
+    }
+}
+
+fn duplicate_question_id(questions: &[Question]) -> Option<&str> {
+    let mut seen = std::collections::HashSet::new();
+    questions
+        .iter()
+        .map(|question| question.id.as_str())
+        .find(|id| !seen.insert(*id))
+}
+
+fn split_answers(
+    ids: &[String],
+    answer: serde_json::Value,
+) -> Vec<Result<serde_json::Value, String>> {
+    if ids.len() == 1 {
+        return vec![Ok(answer)];
+    }
+    let Some(answers) = answer.as_object() else {
+        return ids
+            .iter()
+            .map(|_| Err("answers to multiple questions must be keyed by question id".to_owned()))
+            .collect();
+    };
+    ids.iter()
+        .map(|id| {
+            answers
+                .get(id)
+                .cloned()
+                .ok_or_else(|| format!("answer is missing question id `{id}`"))
+        })
+        .collect()
+}
+
+struct FoldedResponse {
+    blocks: Vec<AssistantContent>,
+    usage: Usage,
+    calls: Vec<ToolCall>,
+    text: String,
+}
+
+fn fold_response(chunks: Vec<ResponseChunk>) -> Result<FoldedResponse, HarnessError> {
+    let mut blocks = Vec::new();
+    let mut streamed_text = String::new();
+    let mut usage = Usage::default();
+    for chunk in chunks {
+        match chunk {
+            ResponseChunk::TextDelta { text } => streamed_text.push_str(&text),
+            ResponseChunk::Block { block } => blocks.push(block),
+            ResponseChunk::Usage { usage: value } => usage = value,
+            ResponseChunk::MessageStart { .. }
+            | ResponseChunk::ReasoningDelta { .. }
+            | ResponseChunk::ToolInputDelta { .. }
+            | ResponseChunk::Diagnostic { .. }
+            | ResponseChunk::Done { .. } => {}
+        }
+    }
+    if !streamed_text.is_empty()
+        && !blocks
+            .iter()
+            .any(|block| matches!(block, AssistantContent::Text { .. }))
+    {
+        blocks.insert(
+            0,
+            AssistantContent::Text {
+                text: streamed_text,
+            },
+        );
+    }
+    if blocks.is_empty() {
+        return Err(HarnessError::EmptyResponse);
+    }
+    let text = blocks
+        .iter()
+        .filter_map(|block| match block {
+            AssistantContent::Text { text } => Some(text.as_str()),
+            AssistantContent::Reasoning { .. } | AssistantContent::ToolCall(_) => None,
+        })
+        .collect::<String>();
+    let calls = blocks
+        .iter()
+        .filter_map(|block| match block {
+            AssistantContent::ToolCall(call) => Some(call.clone()),
+            AssistantContent::Text { .. } | AssistantContent::Reasoning { .. } => None,
+        })
+        .collect();
+    Ok(FoldedResponse {
+        blocks,
+        usage,
+        calls,
+        text,
+    })
+}
+
+fn validate_profiles(
+    providers: &BTreeMap<String, Arc<dyn Provider>>,
+    models: &BTreeMap<String, ModelProfile>,
+    agents: &BTreeMap<String, AgentProfile>,
+    default_model: &str,
+    default_agent: Option<&str>,
+) -> Result<(), HarnessError> {
+    if !models.contains_key(default_model) {
+        return Err(HarnessError::UnknownModelProfile(default_model.to_owned()));
+    }
+    if let Some(name) = default_agent
+        && !agents.contains_key(name)
+    {
+        return Err(HarnessError::UnknownAgentProfile(name.to_owned()));
+    }
+    for (name, profile) in models {
+        if !providers.contains_key(&profile.provider) {
+            return Err(HarnessError::InvalidProfile(format!(
+                "model profile `{name}` uses unknown provider `{}`",
+                profile.provider
+            )));
+        }
+    }
+    for (name, profile) in agents {
+        if let Some(model) = &profile.model_profile
+            && !models.contains_key(model)
+        {
+            return Err(HarnessError::InvalidProfile(format!(
+                "agent profile `{name}` uses unknown model profile `{model}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn load_agent_instructions(workspace: &Path) -> Result<Vec<String>, std::io::Error> {
+    let mut directories = workspace.ancestors().collect::<Vec<_>>();
+    directories.reverse();
+    let mut output = Vec::new();
+    for directory in directories {
+        let path = directory.join("AGENTS.md");
+        match fs::read_to_string(path).await {
+            Ok(text) if !text.trim().is_empty() => output.push(text),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(output)
+}
+
+async fn contained_path(workspace: &Path, requested: &Path) -> Result<PathBuf, HarnessError> {
+    let candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        workspace.join(requested)
+    };
+    let canonical = fs::canonicalize(candidate).await?;
+    if !canonical.starts_with(workspace) {
+        return Err(HarnessError::OutsideWorkspace);
+    }
+    Ok(canonical)
+}
+
+fn image_media_type(path: &Path) -> Option<&'static str> {
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn contains_images(messages: &[Message]) -> bool {
+    messages.iter().any(|message| match message {
+        Message::User(content) => content
+            .iter()
+            .any(|item| matches!(item, UserContent::Image { .. })),
+        Message::Tool(results) => results.iter().any(|result| !result.images.is_empty()),
+        Message::Assistant(_) => false,
+    })
+}
+
+async fn hydrate_image(
+    store: &SessionStore,
+    image: &mut crate::media::ImageReference,
+) -> Result<(), HarnessError> {
+    if image.data_base64.is_none() {
+        let bytes = store.read_blob(image).await?;
+        image.data_base64 = Some(base64::engine::general_purpose::STANDARD.encode(bytes));
+    }
+    Ok(())
+}
+
+async fn wait_for_interrupt(interrupted: &AtomicBool) {
+    while !interrupted.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        future::Future,
+        pin::Pin,
+        sync::{
+            Mutex as StdMutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::Poll,
+    };
+
+    use futures_util::stream;
+
+    use super::*;
+    use crate::{
+        provider::protocol::{StopReason, ToolCall},
+        provider::{ProviderFuture, ResponseHandle},
+    };
+
+    struct ScriptedProvider {
+        responses: StdMutex<VecDeque<Vec<ResponseChunk>>>,
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+    }
+
+    #[derive(Default)]
+    struct HangingProvider {
+        invocations: Option<Arc<AtomicUsize>>,
+    }
+
+    struct BlockingFirstProvider {
+        calls: AtomicUsize,
+        requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    struct RecordingQuestions {
+        batches: Arc<StdMutex<Vec<Vec<Question>>>>,
+        answer: serde_json::Value,
+    }
+
+    struct GatedResponse {
+        release: Pin<Box<dyn Future<Output = ()> + Send>>,
+        emitted: bool,
+    }
+
+    impl ResponseHandle for GatedResponse {
+        fn poll_chunk(
+            mut self: Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> Poll<Option<Result<ResponseChunk, crate::provider::ProviderError>>> {
+            if self.emitted {
+                return Poll::Ready(None);
+            }
+            if self.release.as_mut().poll(context).is_pending() {
+                return Poll::Pending;
+            }
+            self.emitted = true;
+            Poll::Ready(Some(Ok(ResponseChunk::TextDelta {
+                text: "initial".to_owned(),
+            })))
+        }
+    }
+
+    impl Provider for HangingProvider {
+        fn invoke(&self, _request: ModelRequest) -> ProviderFuture {
+            if let Some(invocations) = &self.invocations {
+                invocations.fetch_add(1, Ordering::SeqCst);
+            }
+            Box::pin(async { Ok(Box::pin(stream::pending()) as Pin<Box<dyn ResponseHandle>>) })
+        }
+    }
+
+    impl Provider for ScriptedProvider {
+        fn invoke(&self, request: ModelRequest) -> ProviderFuture {
+            self.requests.lock().unwrap().push(request);
+            let chunks = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted provider response");
+            Box::pin(async move {
+                Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok)))
+                    as Pin<Box<dyn ResponseHandle>>)
+            })
+        }
+    }
+
+    impl Provider for BlockingFirstProvider {
+        fn invoke(&self, request: ModelRequest) -> ProviderFuture {
+            self.requests.lock().unwrap().push(request);
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let release = self.release.clone();
+            Box::pin(async move {
+                let response: Pin<Box<dyn ResponseHandle>> = if call == 0 {
+                    Box::pin(GatedResponse {
+                        release: Box::pin(async move {
+                            let permit = release.acquire_owned().await.unwrap();
+                            permit.forget();
+                        }),
+                        emitted: false,
+                    })
+                } else {
+                    Box::pin(stream::iter(vec![Ok(ResponseChunk::TextDelta {
+                        text: "jobs handled".to_owned(),
+                    })]))
+                };
+                Ok(response)
+            })
+        }
+    }
+
+    impl QuestionHandler for RecordingQuestions {
+        fn ask(&self, _agent: AgentId, questions: Vec<Question>) -> crate::agent::QuestionFuture {
+            self.batches.lock().unwrap().push(questions);
+            let answer = self.answer.clone();
+            Box::pin(async move { Ok(answer) })
+        }
+    }
+
+    fn runtime_state_count(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(content) => Some(content),
+                Message::Assistant(_) | Message::Tool(_) => None,
+            })
+            .flatten()
+            .filter(|content| {
+                matches!(
+                    content,
+                    UserContent::Runtime { text } if text.contains("<skyhook_state>")
+                )
+            })
+            .count()
+    }
+
+    fn request_has_tool(request: &ModelRequest, name: &str) -> bool {
+        request.tools.iter().any(|tool| tool.name == name)
+    }
+
+    fn test_builder(
+        workspace: &Path,
+        sessions: &Path,
+        provider: Arc<dyn Provider>,
+    ) -> HarnessBuilder {
+        HarnessBuilder::new(workspace)
+            .session_root(sessions)
+            .provider("test", provider)
+            .model_profile(
+                "test",
+                ModelProfile {
+                    provider: "test".to_owned(),
+                    model: "test".to_owned(),
+                    reasoning: None,
+                    max_output_tokens: None,
+                    supports_images: false,
+                },
+            )
+            .default_model_profile("test")
+    }
+
+    async fn test_harness(
+        workspace: &Path,
+        sessions: &Path,
+        provider: Arc<dyn Provider>,
+    ) -> Harness {
+        test_builder(workspace, sessions, provider)
+            .build()
+            .await
+            .unwrap()
+    }
+
+    async fn question_harness(
+        workspace: &Path,
+        sessions: &Path,
+        provider: Arc<dyn Provider>,
+        questions: Arc<dyn QuestionHandler>,
+    ) -> Harness {
+        test_builder(workspace, sessions, provider)
+            .question_handler(questions)
+            .build()
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn response_folding_keeps_only_the_current_assistant_turn() {
+        let call = ToolCall {
+            id: "call-1".to_owned(),
+            name: "read".to_owned(),
+            arguments: json!({"path":"README.md"}),
+        };
+        let response = fold_response(vec![
+            ResponseChunk::TextDelta {
+                text: "working".to_owned(),
+            },
+            ResponseChunk::Block {
+                block: AssistantContent::ToolCall(call.clone()),
+            },
+            ResponseChunk::Usage {
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    ..Usage::default()
+                },
+            },
+        ])
+        .unwrap();
+        assert_eq!(response.text, "working");
+        assert_eq!(response.calls, vec![call]);
+        assert_eq!(response.blocks.len(), 2);
+        assert_eq!(response.usage.input_tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn provider_tool_loop_runs_through_the_shared_registry() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("note.txt"), "hello").unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(ScriptedProvider {
+                responses: StdMutex::new(VecDeque::from([
+                    vec![
+                        ResponseChunk::Block {
+                            block: AssistantContent::ToolCall(ToolCall {
+                                id: "read-1".to_owned(),
+                                name: "read".to_owned(),
+                                arguments: json!({"path": "note.txt"}),
+                            }),
+                        },
+                        ResponseChunk::Block {
+                            block: AssistantContent::ToolCall(ToolCall {
+                                id: "read-2".to_owned(),
+                                name: "read".to_owned(),
+                                arguments: json!({"path": "note.txt"}),
+                            }),
+                        },
+                        ResponseChunk::Done {
+                            stop_reason: Some(StopReason::ToolUse),
+                        },
+                    ],
+                    vec![
+                        ResponseChunk::TextDelta {
+                            text: "finished".to_owned(),
+                        },
+                        ResponseChunk::Done {
+                            stop_reason: Some(StopReason::Complete),
+                        },
+                    ],
+                ])),
+                requests: requests.clone(),
+            }),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(session.prompt("read the note").await.unwrap(), "finished");
+        assert!(session.tools().get("script").is_some());
+        assert!(session.tools().get("jobs").is_some());
+        assert!(session.tools().get("read").unwrap().is_workspace_bound());
+        assert!(!session.tools().get("jobs").unwrap().is_workspace_bound());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].system, requests[1].system);
+        assert_eq!(requests[0].tools, requests[1].tools);
+        assert_eq!(requests[0].system.len(), 1);
+        assert!(requests[0].system[0].cache);
+        assert!(requests[0].system[0].text.starts_with(prompt::ROOT_PROMPT));
+        assert!(requests[0].system[0].text.contains("<skyhook_context>"));
+        assert!(requests[0].system[0].text.contains("\"date\":"));
+        assert!(requests[0].system[0].text.contains("\"available_depth\":4"));
+        let agent = requests[0]
+            .tools
+            .iter()
+            .find(|tool| tool.name == "agent")
+            .unwrap();
+        assert_eq!(agent.input_schema["properties"]["depth"]["default"], 0);
+        let Message::User(content) = requests[0].messages.last().unwrap() else {
+            panic!("external input and runtime state must share a user message");
+        };
+        assert!(matches!(&content[0], UserContent::Text { text } if text == "read the note"));
+        assert_eq!(content.len(), 1, "empty runtime state must not be appended");
+        assert!(requests[1].messages.starts_with(&requests[0].messages));
+        assert_eq!(requests[1].messages.len(), requests[0].messages.len() + 2);
+        let Message::Tool(results) = requests[1].messages.last().unwrap() else {
+            panic!("parallel calls must be committed as one tool-result message");
+        };
+        assert_eq!(results.len(), 2);
+        assert_eq!(runtime_state_count(&requests[1].messages), 0);
+    }
+
+    #[tokio::test]
+    async fn remote_children_use_the_shared_host_agent_loop() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(ScriptedProvider {
+            responses: StdMutex::new(VecDeque::from([
+                vec![ResponseChunk::Block {
+                    block: AssistantContent::ToolCall(ToolCall {
+                        id: "agent-1".to_owned(),
+                        name: "agent".to_owned(),
+                        arguments: json!({"prompt":"inspect", "target":"build"}),
+                    }),
+                }],
+                vec![ResponseChunk::TextDelta {
+                    text: "child done".to_owned(),
+                }],
+                vec![ResponseChunk::TextDelta {
+                    text: "root done".to_owned(),
+                }],
+            ])),
+            requests: requests.clone(),
+        });
+        let mut targets = TargetsConfig::default();
+        targets.entries.insert(
+            "build".to_owned(),
+            crate::target::TargetConfig {
+                host: "build.example.com".to_owned(),
+                user: None,
+                port: None,
+                workspace: PathBuf::from("/srv/project"),
+                via: None,
+                auth: crate::target::TargetAuth::Openssh,
+            },
+        );
+        let harness = test_builder(workspace.path(), sessions.path(), provider)
+            .targets_config(targets)
+            .build()
+            .await
+            .unwrap();
+
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].system[0].text.contains("\"name\":\"build\""));
+        assert!(requests[1].system[0].text.contains("\"kind\":\"ssh\""));
+        assert!(requests[1].system[0].text.contains("/srv/project"));
+        assert!(requests[1].system[0].text.starts_with(prompt::CHILD_PROMPT));
+        assert!(!requests[1].system[0].text.contains("orchestration"));
+        assert!(!requests[1].system[0].text.contains("available_depth"));
+        assert!(!request_has_tool(&requests[1], "agent"));
+        let Message::Tool(results) = requests[2].messages.last().unwrap() else {
+            panic!("root must receive the child result");
+        };
+        assert_eq!(results[0].result["target"], "build");
+        assert_eq!(results[0].result["result"], "child done");
+    }
+
+    #[tokio::test]
+    async fn local_children_honor_absolute_workspace_overrides() {
+        let workspace = tempfile::tempdir().unwrap();
+        let child_workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            child_workspace.path().join("note.txt"),
+            "from child workspace",
+        )
+        .unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let child_path = std::fs::canonicalize(child_workspace.path()).unwrap();
+        let provider = Arc::new(ScriptedProvider {
+            responses: StdMutex::new(VecDeque::from([
+                vec![ResponseChunk::Block {
+                    block: AssistantContent::ToolCall(ToolCall {
+                        id: "agent-local".to_owned(),
+                        name: "agent".to_owned(),
+                        arguments: json!({"prompt":"inspect", "workspace": child_path}),
+                    }),
+                }],
+                vec![ResponseChunk::Block {
+                    block: AssistantContent::ToolCall(ToolCall {
+                        id: "read-child".to_owned(),
+                        name: "read".to_owned(),
+                        arguments: json!({"path":"note.txt"}),
+                    }),
+                }],
+                vec![ResponseChunk::TextDelta {
+                    text: "child done".to_owned(),
+                }],
+                vec![ResponseChunk::TextDelta {
+                    text: "root done".to_owned(),
+                }],
+            ])),
+            requests: requests.clone(),
+        });
+        let harness = test_harness(workspace.path(), sessions.path(), provider).await;
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests[1].system[0]
+                .text
+                .contains(&child_path.to_string_lossy().into_owned())
+        );
+        let Message::Tool(results) = requests[2].messages.last().unwrap() else {
+            panic!("child must receive its read result");
+        };
+        assert_eq!(results[0].result["content"], "from child workspace");
+    }
+
+    #[tokio::test]
+    async fn delegated_depth_controls_child_agent_visibility() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(ScriptedProvider {
+                responses: StdMutex::new(VecDeque::from([
+                    vec![ResponseChunk::Block {
+                        block: AssistantContent::ToolCall(ToolCall {
+                            id: "root-agent".to_owned(),
+                            name: "agent".to_owned(),
+                            arguments: json!({"prompt":"delegate once", "depth":1}),
+                        }),
+                    }],
+                    vec![ResponseChunk::Block {
+                        block: AssistantContent::ToolCall(ToolCall {
+                            id: "child-agent".to_owned(),
+                            name: "agent".to_owned(),
+                            arguments: json!({"prompt":"inspect directly"}),
+                        }),
+                    }],
+                    vec![ResponseChunk::TextDelta {
+                        text: "leaf done".to_owned(),
+                    }],
+                    vec![ResponseChunk::TextDelta {
+                        text: "child done".to_owned(),
+                    }],
+                    vec![ResponseChunk::TextDelta {
+                        text: "root done".to_owned(),
+                    }],
+                ])),
+                requests: requests.clone(),
+            }),
+        )
+        .await;
+
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert!(request_has_tool(&requests[0], "agent"));
+        assert!(requests[0].system[0].text.contains("\"available_depth\":4"));
+        assert!(requests[1].system[0].text.starts_with(prompt::CHILD_PROMPT));
+        assert!(requests[1].system[0].text.contains("\"available_depth\":1"));
+        assert!(request_has_tool(&requests[1], "agent"));
+        assert!(requests[2].system[0].text.starts_with(prompt::CHILD_PROMPT));
+        assert!(!requests[2].system[0].text.contains("available_depth"));
+        assert!(!request_has_tool(&requests[2], "agent"));
+    }
+
+    #[tokio::test]
+    async fn delegated_depth_cannot_exceed_the_callers_budget() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(ScriptedProvider {
+                responses: StdMutex::new(VecDeque::from([
+                    vec![ResponseChunk::Block {
+                        block: AssistantContent::ToolCall(ToolCall {
+                            id: "agent-too-deep".to_owned(),
+                            name: "agent".to_owned(),
+                            arguments: json!({"prompt":"too deep", "depth":4}),
+                        }),
+                    }],
+                    vec![ResponseChunk::TextDelta {
+                        text: "root done".to_owned(),
+                    }],
+                ])),
+                requests: requests.clone(),
+            }),
+        )
+        .await;
+
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(session.prompt("overdelegate").await.unwrap(), "root done");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "an over-budget child must not start");
+        let Message::Tool(results) = requests[1].messages.last().unwrap() else {
+            panic!("root must receive the failed agent result");
+        };
+        assert!(results[0].is_error);
+        assert!(
+            results[0].result["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("available depth of 4"))
+        );
+    }
+
+    #[tokio::test]
+    async fn leaf_children_cannot_invoke_agent_directly_or_from_scripts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(ScriptedProvider {
+                responses: StdMutex::new(VecDeque::from([
+                    vec![ResponseChunk::Block {
+                        block: AssistantContent::ToolCall(ToolCall {
+                            id: "root-agent".to_owned(),
+                            name: "agent".to_owned(),
+                            arguments: json!({"prompt":"try hidden delegation"}),
+                        }),
+                    }],
+                    vec![
+                        ResponseChunk::Block {
+                            block: AssistantContent::ToolCall(ToolCall {
+                                id: "hidden-agent".to_owned(),
+                                name: "agent".to_owned(),
+                                arguments: json!({"prompt":"escape"}),
+                            }),
+                        },
+                        ResponseChunk::Block {
+                            block: AssistantContent::ToolCall(ToolCall {
+                                id: "script-agent".to_owned(),
+                                name: "script".to_owned(),
+                                arguments: json!({
+                                    "source":"return tool.agent({prompt: 'escape'});"
+                                }),
+                            }),
+                        },
+                    ],
+                    vec![ResponseChunk::TextDelta {
+                        text: "child done".to_owned(),
+                    }],
+                    vec![ResponseChunk::TextDelta {
+                        text: "root done".to_owned(),
+                    }],
+                ])),
+                requests: requests.clone(),
+            }),
+        )
+        .await;
+
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4, "hidden delegation must not start agents");
+        let Message::Tool(results) = requests[2].messages.last().unwrap() else {
+            panic!("child must receive both failed tool results");
+        };
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.is_error));
+        assert!(
+            results[0].result["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("unavailable in this context"))
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_root_questions_are_merged_and_answers_are_split() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let batches = Arc::new(StdMutex::new(Vec::new()));
+        let harness = question_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(ScriptedProvider {
+                responses: StdMutex::new(VecDeque::from([
+                    vec![
+                        ResponseChunk::Block {
+                            block: AssistantContent::ToolCall(ToolCall {
+                                id: "ask-1".to_owned(),
+                                name: "ask".to_owned(),
+                                arguments: json!({"id":"first", "prompt":"First?", "options":[]}),
+                            }),
+                        },
+                        ResponseChunk::Block {
+                            block: AssistantContent::ToolCall(ToolCall {
+                                id: "ask-2".to_owned(),
+                                name: "ask".to_owned(),
+                                arguments: json!({"id":"second", "prompt":"Second?", "options":[]}),
+                            }),
+                        },
+                    ],
+                    vec![ResponseChunk::TextDelta {
+                        text: "done".to_owned(),
+                    }],
+                ])),
+                requests: requests.clone(),
+            }),
+            Arc::new(RecordingQuestions {
+                batches: batches.clone(),
+                answer: json!({"first":"yes", "second":{"value":2}, "extra":true}),
+            }),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        let ask = session
+            .tools()
+            .definitions(&ToolVisibilityContext::new(session.root.clone()))
+            .into_iter()
+            .find(|definition| definition.name == "ask")
+            .unwrap();
+        assert!(ask.input_schema["properties"]["id"].is_object());
+        assert!(ask.input_schema["properties"]["prompt"].is_object());
+        assert!(ask.input_schema["properties"]["options"].is_object());
+        assert!(ask.input_schema["properties"].get("questions").is_none());
+
+        assert_eq!(session.prompt("ask twice").await.unwrap(), "done");
+        let batches = batches.lock().unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0]
+                .iter()
+                .map(|question| question.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        let requests = requests.lock().unwrap();
+        let Message::Tool(results) = requests[1].messages.last().unwrap() else {
+            panic!("answers must be returned as tool results");
+        };
+        assert_eq!(results[0].result, "yes");
+        assert_eq!(results[1].result, json!({"value":2}));
+
+        let events =
+            std::fs::read_to_string(session.runtime.store.directory().join("events.jsonl"))
+                .unwrap();
+        let opened = events
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| record["event"]["type"] == "question_opened")
+            .collect::<Vec<_>>();
+        assert_eq!(opened.len(), 2);
+        assert!(opened.iter().all(|record| {
+            record["event"]["question_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("q-"))
+                && record["event"]["questions"]
+                    .as_array()
+                    .is_some_and(|items| items.len() == 1)
+        }));
+    }
+
+    #[tokio::test]
+    async fn interrupt_stops_a_pending_provider_turn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(HangingProvider {
+                invocations: Some(invocations.clone()),
+            }),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        let pending = tokio::spawn({
+            let session = session.clone();
+            async move { session.prompt("wait forever").await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while invocations.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        session.interrupt().await;
+        let error = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("interrupted"));
+    }
+
+    #[tokio::test]
+    async fn hidden_job_controls_are_documented_and_execute_only_through_scripts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(HangingProvider::default()),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        let definitions = session
+            .tools()
+            .definitions(&ToolVisibilityContext::new(session.root.clone()));
+        let names = definitions
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"jobs"));
+        assert!(names.contains(&"wait"));
+        for hidden in ["job_inspect", "job_send", "job_cancel", "job_events"] {
+            assert!(!names.contains(&hidden));
+        }
+        let description = &definitions
+            .iter()
+            .find(|definition| definition.name == "script")
+            .unwrap()
+            .description;
+        for signature in [
+            "tool.job(job).inspect()",
+            "tool.job(job).wait({timeout?",
+            "tool.job(job).send({value: JSON})",
+            "tool.job(job).cancel()",
+            "tool.job(job).events({after?",
+        ] {
+            assert!(
+                description.contains(signature),
+                "missing {signature}: {description}"
+            );
+        }
+        assert!(!description.contains("$schema"));
+
+        let direct = session
+            .runtime
+            .executor
+            .execute_model(session.root.clone(), "job_inspect", json!({"job": 1}), None)
+            .await
+            .err()
+            .unwrap();
+        assert!(direct.to_string().contains("not exposed"));
+
+        let running = session
+            .runtime
+            .executor
+            .execute(
+                session.root.clone(),
+                "script",
+                json!({"source":"return 7;", "bg":true}),
+                None,
+            )
+            .await
+            .unwrap();
+        let inspected = session
+            .run_script(format!(
+                "await tool.job({}).wait({{timeout:2}}); return tool.job({}).inspect();",
+                running.job, running.job
+            ))
+            .await
+            .unwrap();
+        assert_eq!(inspected.value["id"], running.job.get());
+    }
+
+    #[tokio::test]
+    async fn resumed_sessions_do_not_append_empty_state_or_rewrite_history() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(ScriptedProvider {
+                responses: StdMutex::new(VecDeque::from([
+                    vec![
+                        ResponseChunk::TextDelta {
+                            text: "done".to_owned(),
+                        },
+                        ResponseChunk::Usage {
+                            usage: Usage {
+                                input_tokens: 10,
+                                cached_input_tokens: 2,
+                                output_tokens: 3,
+                            },
+                        },
+                        ResponseChunk::Done {
+                            stop_reason: Some(StopReason::Complete),
+                        },
+                    ],
+                    vec![
+                        ResponseChunk::TextDelta {
+                            text: "done".to_owned(),
+                        },
+                        ResponseChunk::Usage {
+                            usage: Usage {
+                                input_tokens: 20,
+                                cached_input_tokens: 4,
+                                output_tokens: 5,
+                            },
+                        },
+                        ResponseChunk::Done {
+                            stop_reason: Some(StopReason::Complete),
+                        },
+                    ],
+                ])),
+                requests: requests.clone(),
+            }),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        let session_id = session.id();
+        assert_eq!(session.prompt("first").await.unwrap(), "done");
+        assert_eq!(
+            session.usage().await,
+            Usage {
+                input_tokens: 10,
+                cached_input_tokens: 2,
+                output_tokens: 3,
+            }
+        );
+        session.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session
+                .runtime
+                .agents
+                .read()
+                .await
+                .contains_key(&session.root)
+                || session
+                    .runtime
+                    .interrupts
+                    .read()
+                    .await
+                    .contains_key(&session.root)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(session);
+
+        let resumed = harness.resume_session(session_id).await.unwrap();
+        assert_eq!(
+            resumed.usage().await,
+            Usage {
+                input_tokens: 10,
+                cached_input_tokens: 2,
+                output_tokens: 3,
+            }
+        );
+        assert_eq!(resumed.prompt("second").await.unwrap(), "done");
+        assert_eq!(
+            resumed.usage().await,
+            Usage {
+                input_tokens: 30,
+                cached_input_tokens: 6,
+                output_tokens: 8,
+            }
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].messages.starts_with(&requests[0].messages));
+        assert_eq!(runtime_state_count(&requests[0].messages), 0);
+        assert_eq!(runtime_state_count(&requests[1].messages), 0);
+    }
+
+    #[tokio::test]
+    async fn background_completions_batch_events_with_one_state_snapshot() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(BlockingFirstProvider {
+                calls: AtomicUsize::new(0),
+                requests: requests.clone(),
+                release: release.clone(),
+            }),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        let prompt = tokio::spawn({
+            let session = session.clone();
+            async move { session.prompt("start").await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while requests.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        for value in ["first", "second"] {
+            let lease = session
+                .runtime
+                .jobs
+                .create(
+                    session.root.clone(),
+                    None,
+                    "test".to_owned(),
+                    json!({}),
+                    false,
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+            session
+                .runtime
+                .jobs
+                .transition(lease.id, crate::job::JobState::Running)
+                .await
+                .unwrap();
+            session
+                .runtime
+                .jobs
+                .finish(
+                    lease.id,
+                    Ok(crate::tool::ToolOutput::new(json!({"value": value}))),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+        release.add_permits(1);
+        assert_eq!(prompt.await.unwrap().unwrap(), "initial");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while requests.lock().unwrap().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        session.root_tx.send(AgentCommand::JobsReady).await.unwrap();
+        assert_eq!(session.prompt("barrier").await.unwrap(), "jobs handled");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].messages.starts_with(&requests[0].messages));
+        let Message::User(content) = requests[1].messages.last().unwrap() else {
+            panic!("job wakeup must append one runtime user message");
+        };
+        assert_eq!(content.len(), 1);
+        let UserContent::Runtime { text: events } = &content[0] else {
+            panic!("job events must be runtime content");
+        };
+        assert_eq!(events.matches("\"id\"").count(), 2);
+        assert_eq!(runtime_state_count(&requests[1].messages), 0);
+        let event_messages = requests[2]
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(content) => Some(content),
+                Message::Assistant(_) | Message::Tool(_) => None,
+            })
+            .flatten()
+            .filter(|content| {
+                matches!(
+                    content,
+                    UserContent::Runtime { text } if text.contains("<skyhook_job_events>")
+                )
+            })
+            .count();
+        assert_eq!(event_messages, 1, "redundant wakeups must commit nothing");
+        assert_eq!(runtime_state_count(&requests[2].messages), 0);
+    }
+
+    #[tokio::test]
+    async fn child_questions_route_through_the_stable_agent_job() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(HangingProvider::default()),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        let root = session.root.clone();
+        let child = root.child(1);
+        let agent = session
+            .runtime
+            .jobs
+            .create(root, None, "agent".to_owned(), json!({}), true, false, None)
+            .await
+            .unwrap();
+        session
+            .runtime
+            .jobs
+            .transition(agent.id, crate::job::JobState::Running)
+            .await
+            .unwrap();
+        let mut ask = session
+            .runtime
+            .jobs
+            .create(
+                child.clone(),
+                Some(agent.id),
+                "ask".to_owned(),
+                json!({}),
+                true,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        session
+            .runtime
+            .jobs
+            .transition(ask.id, crate::job::JobState::Running)
+            .await
+            .unwrap();
+        let mut ask_two = session
+            .runtime
+            .jobs
+            .create(
+                child.clone(),
+                Some(agent.id),
+                "ask".to_owned(),
+                json!({}),
+                true,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        session
+            .runtime
+            .jobs
+            .transition(ask_two.id, crate::job::JobState::Running)
+            .await
+            .unwrap();
+        let owner = session
+            .runtime
+            .open_child_questions(
+                vec![
+                    ("first".to_owned(), ask.id),
+                    ("second".to_owned(), ask_two.id),
+                ],
+                json!({"kind":"questions","question_ids":["q-one","q-two"],"questions":[]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner, agent.id);
+        assert_eq!(
+            session.runtime.jobs.snapshot(owner).await.unwrap().state,
+            crate::job::JobState::WaitingInput
+        );
+        assert!(
+            session
+                .runtime
+                .answer_child_question(owner, json!({"first": "yes", "second": 2}))
+                .await
+                .unwrap()
+        );
+        assert_eq!(ask.input.recv().await.unwrap(), json!("yes"));
+        assert_eq!(ask_two.input.recv().await.unwrap(), json!(2));
+        session.runtime.resolve_child_question(owner).await.unwrap();
+        assert_eq!(
+            session.runtime.jobs.snapshot(owner).await.unwrap().state,
+            crate::job::JobState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn script_receive_requires_background_and_accepts_job_input() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(HangingProvider::default()),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        let error = session
+            .run_script("return await receive();")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("requires the script tool"));
+
+        let running = session
+            .runtime
+            .executor
+            .execute(
+                session.root.clone(),
+                "script",
+                json!({"source":"return await receive();", "bg":true}),
+                None,
+            )
+            .await
+            .unwrap();
+        session
+            .runtime
+            .jobs
+            .send(running.job, json!("hello"))
+            .await
+            .unwrap();
+        let completed = session
+            .runtime
+            .jobs
+            .wait(running.job, Some(Duration::from_secs(2)), true)
+            .await
+            .unwrap();
+        assert_eq!(completed.output, Some(json!("hello")));
+    }
+}

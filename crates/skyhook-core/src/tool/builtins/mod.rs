@@ -1,0 +1,52 @@
+//! Built-in coding, helper, and job-control tools.
+
+mod filesystem;
+mod jobs;
+mod process;
+mod script;
+mod search;
+mod skills;
+mod targets;
+pub(crate) mod workspace;
+
+use crate::{
+    job::JobManager,
+    session::SessionStore,
+    tool::{RegistryError, ToolRegistryBuilder},
+};
+
+pub use process::ProcessOutput;
+pub use script::install_script_tool;
+pub(crate) use script::install_script_tool_weak;
+pub use skills::HostSkills;
+
+/// Register the standard workspace, process, and job-control tool set.
+pub fn register_coding_tools(
+    builder: &mut ToolRegistryBuilder,
+    store: SessionStore,
+    jobs: JobManager,
+    skills: HostSkills,
+    targets: crate::target::TargetRegistry,
+    remote: crate::remote::RemoteManager,
+) -> Result<(), RegistryError> {
+    filesystem::register(builder, store.clone())?;
+    search::register(builder)?;
+    process::register(builder, Some(remote.clone()))?;
+    jobs::register(builder, jobs)?;
+    skills::register(builder, skills)?;
+    targets::register(builder, store, targets, remote)?;
+    Ok(())
+}
+
+/// Register only tools whose effects are local to a worker workspace.
+pub fn register_worker_tools(
+    builder: &mut ToolRegistryBuilder,
+    store: SessionStore,
+    jobs: JobManager,
+) -> Result<(), RegistryError> {
+    filesystem::register(builder, store)?;
+    search::register(builder)?;
+    process::register(builder, None)?;
+    jobs::register(builder, jobs)?;
+    Ok(())
+}

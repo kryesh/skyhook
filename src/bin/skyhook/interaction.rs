@@ -1,14 +1,16 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
 use serde_json::Value;
 use skyhook::{
     agent::{Question, QuestionError, QuestionHandler},
-    identity::AgentId,
+    identity::{AgentId, SessionId},
     remote::{
         SecretValue, SensitivePrompt, SensitivePromptFuture, SensitivePromptHandler,
         SensitivePromptKind,
     },
-    tool::policy::{AuthorizationRequest, Policy, PolicyDecision, PolicyFuture, ToolEffect},
+    tool::policy::{
+        AuthorizationRequest, PathAccess, Policy, PolicyDecision, PolicyFuture, ToolEffect,
+    },
 };
 use tokio::sync::Mutex;
 
@@ -70,38 +72,120 @@ impl CliInteraction {
 
 pub(super) struct CliPolicy {
     interaction: Arc<CliInteraction>,
+    grants: Mutex<Vec<PathGrant>>,
+}
+
+#[derive(Clone)]
+struct PathGrant {
+    session: SessionId,
+    target: String,
+    access: PathAccess,
+    path: PathBuf,
+    subtree: bool,
+}
+
+impl PathGrant {
+    fn allows(
+        &self,
+        session: SessionId,
+        target: &str,
+        access: PathAccess,
+        path: &std::path::Path,
+    ) -> bool {
+        self.session == session
+            && self.target == target
+            && self.access == access
+            && if self.subtree {
+                path.starts_with(&self.path)
+            } else {
+                path == self.path
+            }
+    }
+}
+
+fn requires_prompt(effects: &[ToolEffect], has_missing_paths: bool) -> bool {
+    has_missing_paths
+        || effects.iter().any(|effect| {
+            matches!(
+                effect,
+                ToolEffect::WriteWorkspace
+                    | ToolEffect::ExecuteProcess
+                    | ToolEffect::ManageTargets
+                    | ToolEffect::RemoteAccess
+            )
+        })
 }
 
 impl CliPolicy {
     pub(super) const fn new(interaction: Arc<CliInteraction>) -> Self {
-        Self { interaction }
+        Self {
+            interaction,
+            grants: Mutex::const_new(Vec::new()),
+        }
     }
 }
 
 impl Policy for CliPolicy {
     fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
         let interaction = self.interaction.clone();
+        let grants = &self.grants;
         Box::pin(async move {
-            let risky = request.effects.iter().any(|effect| {
-                matches!(
-                    effect,
-                    ToolEffect::WriteWorkspace
-                        | ToolEffect::ExecuteProcess
-                        | ToolEffect::ManageTargets
-                        | ToolEffect::RemoteAccess
-                )
-            });
+            let session = request.agent.session();
+            let cached = grants.lock().await;
+            let missing_paths = request
+                .effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    ToolEffect::ExternalPath {
+                        path,
+                        access,
+                        directory,
+                    } => Some((path.clone(), *access, *directory)),
+                    _ => None,
+                })
+                .filter(|(path, access, _)| {
+                    !cached
+                        .iter()
+                        .any(|grant| grant.allows(session, &request.target, *access, path))
+                })
+                .collect::<Vec<_>>();
+            drop(cached);
+            let risky = requires_prompt(&request.effects, !missing_paths.is_empty());
             if !risky {
                 return PolicyDecision::Allow;
             }
             let arguments = serde_json::to_string_pretty(&request.arguments)
                 .unwrap_or_else(|_| "{}".to_owned());
+            let paths = missing_paths
+                .iter()
+                .map(|(path, access, directory)| {
+                    format!(
+                        "\n- {:?} {}{} on {}",
+                        access,
+                        path.display(),
+                        if *directory { " and descendants" } else { "" },
+                        request.target
+                    )
+                })
+                .collect::<String>();
             let prompt = format!(
-                "\nAllow tool `{}` for agent {}?\n{}\n[y/N] ",
-                request.tool, request.agent, arguments
+                "\nAllow tool `{}` for agent {} on {}?{}\n{}\n[y/N] ",
+                request.tool, request.agent, request.target, paths, arguments
             );
             match interaction.line(prompt).await {
                 Ok(answer) if matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes") => {
+                    if !missing_paths.is_empty() {
+                        let mut cached = grants.lock().await;
+                        cached.extend(missing_paths.into_iter().map(
+                            |(path, access, directory)| PathGrant {
+                                session,
+                                target: request.target.clone(),
+                                access,
+                                path,
+                                subtree: directory,
+                            },
+                        ));
+                    }
                     PolicyDecision::Allow
                 }
                 Ok(_) => PolicyDecision::Deny {
@@ -166,5 +250,73 @@ impl QuestionHandler for CliQuestions {
                 .map_err(QuestionError::Failed)?;
             Ok(serde_json::from_str(&line).unwrap_or(Value::String(line)))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_grants_are_scoped_by_session_target_access_and_subtree() {
+        let session = SessionId::from_bytes([1; 16]);
+        let grant = PathGrant {
+            session,
+            target: "build".to_owned(),
+            access: PathAccess::Read,
+            path: PathBuf::from("/srv/shared"),
+            subtree: true,
+        };
+        assert!(grant.allows(
+            session,
+            "build",
+            PathAccess::Read,
+            std::path::Path::new("/srv/shared/src/lib.rs")
+        ));
+        assert!(!grant.allows(
+            session,
+            "build",
+            PathAccess::Write,
+            std::path::Path::new("/srv/shared/src/lib.rs")
+        ));
+        assert!(!grant.allows(
+            session,
+            "other",
+            PathAccess::Read,
+            std::path::Path::new("/srv/shared/src/lib.rs")
+        ));
+        assert!(!grant.allows(
+            SessionId::from_bytes([2; 16]),
+            "build",
+            PathAccess::Read,
+            std::path::Path::new("/srv/shared/src/lib.rs")
+        ));
+
+        let file = PathGrant {
+            subtree: false,
+            ..grant
+        };
+        assert!(file.allows(
+            session,
+            "build",
+            PathAccess::Read,
+            std::path::Path::new("/srv/shared")
+        ));
+        assert!(!file.allows(
+            session,
+            "build",
+            PathAccess::Read,
+            std::path::Path::new("/srv/shared/child")
+        ));
+
+        assert!(!requires_prompt(
+            &[ToolEffect::ExternalPath {
+                path: PathBuf::from("/srv/shared"),
+                access: PathAccess::Write,
+                directory: true,
+            }],
+            false,
+        ));
+        assert!(requires_prompt(&[ToolEffect::ExecuteProcess], false));
     }
 }
