@@ -1,6 +1,5 @@
 use std::{borrow::Cow, sync::Arc};
 
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Clone, Debug)]
@@ -77,7 +76,7 @@ impl EmbeddedShimCatalog {
 impl EmbeddedShim {
     #[must_use]
     pub fn sha256(self) -> String {
-        format!("{:x}", Sha256::digest(&self.bytes))
+        crate::sha256_hex(&self.bytes)
     }
 
     #[must_use]

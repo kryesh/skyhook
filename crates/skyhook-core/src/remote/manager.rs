@@ -1,6 +1,5 @@
 use std::{collections::HashMap, io::Write as _, path::Path, process::Stdio, sync::Arc};
 
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _},
@@ -853,7 +852,7 @@ async fn ensure_shim(
 }
 
 fn route_fingerprint(route: &[TargetDefinition]) -> Result<String, RemoteError> {
-    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(route)?)))
+    Ok(crate::sha256_hex(serde_json::to_vec(route)?))
 }
 
 fn ssh_token(value: &str) -> Result<String, RemoteError> {

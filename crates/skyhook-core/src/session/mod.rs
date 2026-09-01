@@ -5,7 +5,6 @@ use chrono::Utc;
 use fs2::FileExt;
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::{
     fs::OpenOptions as StdOpenOptions,
     path::{Path, PathBuf},
@@ -267,7 +266,7 @@ impl SessionStore {
         name: String,
         media_type: String,
     ) -> Result<ImageReference, SessionError> {
-        let hash = format!("{:x}", Sha256::digest(bytes));
+        let hash = crate::sha256_hex(bytes);
         if !self.inner.durable {
             return Ok(ImageReference {
                 sha256: hash,
@@ -297,14 +296,14 @@ impl SessionStore {
                 .map_err(|error| {
                     SessionError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
                 })?;
-            let actual = format!("{:x}", Sha256::digest(&bytes));
+            let actual = crate::sha256_hex(&bytes);
             if actual != reference.sha256 {
                 return Err(SessionError::BlobHashMismatch(reference.sha256.clone()));
             }
             return Ok(bytes);
         }
         let bytes = fs::read(self.inner.directory.join("blobs").join(&reference.sha256)).await?;
-        let actual = format!("{:x}", Sha256::digest(&bytes));
+        let actual = crate::sha256_hex(&bytes);
         if actual != reference.sha256 {
             return Err(SessionError::BlobHashMismatch(reference.sha256.clone()));
         }

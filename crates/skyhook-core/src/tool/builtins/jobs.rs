@@ -17,16 +17,29 @@ pub(super) fn register(
     let list = jobs.clone();
     builder.register::<JobsArgs, Vec<JobEnvelope>, _, _>(
         "jobs",
-        "List active jobs owned by this agent. Set `all` to include completed history.",
+        "List active jobs owned by this agent, excluding this call and its containing script. Set `all` to include completed history.",
         ToolOptions::new(vec![ToolEffect::SessionState]),
         move |context, args| {
             let jobs = list.clone();
             async move {
+                let current = jobs
+                    .snapshot(context.job)
+                    .await
+                    .map_err(|error| job_error(&error))?;
+                let containing_script = if let Some(parent) = current.parent {
+                    let parent = jobs
+                        .snapshot(parent)
+                        .await
+                        .map_err(|error| job_error(&error))?;
+                    (parent.tool == "script").then_some(parent.id)
+                } else {
+                    None
+                };
                 Ok(jobs
                     .list(&context.agent)
                     .await
                     .into_iter()
-                    .filter(|job| job.id != context.job)
+                    .filter(|job| job.id != context.job && Some(job.id) != containing_script)
                     .filter(|job| args.all || !job.state.is_terminal())
                     .collect())
             }
@@ -249,7 +262,7 @@ mod tests {
         let executor = ToolExecutor::new(
             builder.build(),
             Arc::new(AllowAll),
-            jobs,
+            jobs.clone(),
             root.path().to_path_buf(),
         );
 
@@ -262,6 +275,27 @@ mod tests {
             current.iter().map(|job| job.id).collect::<Vec<_>>(),
             [active]
         );
+
+        let script = jobs
+            .create(
+                agent.clone(),
+                None,
+                "script".to_owned(),
+                serde_json::json!({}),
+                true,
+                true,
+                None,
+            )
+            .await
+            .unwrap()
+            .id;
+        let nested = executor
+            .execute(agent.clone(), "jobs", serde_json::json!({}), Some(script))
+            .await
+            .unwrap();
+        let nested: Vec<JobEnvelope> = serde_json::from_value(nested.output.value).unwrap();
+        assert!(nested.iter().any(|job| job.id == active));
+        assert!(nested.iter().all(|job| job.id != script));
 
         let all = executor
             .execute(agent, "jobs", serde_json::json!({"all": true}), None)

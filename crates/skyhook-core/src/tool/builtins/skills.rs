@@ -6,7 +6,6 @@ use std::{
 
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use tokio::fs;
 
 use super::workspace::{atomic_write, resolve_writable};
@@ -264,7 +263,7 @@ pub(super) fn register(
                             path: asset,
                             to: destination,
                             bytes: bytes.len(),
-                            sha256: hex_hash(&bytes),
+                            sha256: crate::sha256_hex(&bytes),
                         },
                     )?));
                 }
@@ -301,16 +300,6 @@ async fn resolve_asset(entry: &SkillEntry, asset: &str) -> Result<PathBuf, ToolE
         ));
     }
     Ok(source)
-}
-
-fn hex_hash(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    Sha256::digest(bytes)
-        .iter()
-        .fold(String::with_capacity(64), |mut output, byte| {
-            write!(output, "{byte:02x}").expect("writing to a string cannot fail");
-            output
-        })
 }
 
 #[derive(Deserialize, JsonSchema)]

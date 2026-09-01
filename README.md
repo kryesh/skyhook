@@ -117,7 +117,9 @@ from outermost ancestor to workspace, followed by instructions configured throug
 
 ## Embedded JavaScript
 
-Every `script` call gets a fresh, memory-limited QuickJS runtime. Tool calls are lazy and memoized:
+Every `script` call gets a fresh, memory-limited QuickJS runtime. Tool calls are lazy. Each builder
+instance memoizes its own execution, so reusing one builder executes it once while constructing an
+equivalent new builder creates a new call:
 
 ```js
 const packageFile = tool.read({ path: "Cargo.toml" });
@@ -140,13 +142,14 @@ The runtime also exposes:
   `failFast: false` for per-item `{ok, value|error}` results;
 - `new Queue()` as an async iterable queue;
 - `receive()` for input sent to the owning job (background scripts only);
-- `notify(value)` for durable job progress.
+- `await notify(value)` for durable job progress; notifications must be awaited before returning.
 
 Builder setters and object arguments come from the same strict JSON schema; omitted values receive
 the handler's normal defaults. Awaiting a builder executes it immediately. Returning builders recursively executes independent
 branches concurrently. All executions still pass through the same registry, policy hook, job
 supervisor, persistence, and path authorization checks as model-originated calls. Top-level
 `undefined` returns JSON `null`; nested `undefined` values are rejected with their result path.
+The `script` tool is deliberately omitted from the runtime, preventing recursive script invocation.
 
 ## Library architecture
 
@@ -187,8 +190,8 @@ stop active provider streams and cancel jobs across the session's agent tree.
 
 `read`, `search`, `glob`, `exec`, `shell`, `write`, `replace`, `patch`, `remove`, `script`, `targets`,
 `target_add`, `jobs`, `wait`, `ask`, `todo`, and `agent`. `jobs()` returns the current agent's active
-jobs and excludes the listing call itself; use `jobs({all:true})` to include terminal history. The
-remaining job controls are kept out of model tool definitions and exposed to scripts as
+jobs and excludes the listing call itself and, when called from a script, its containing script;
+use `jobs({all:true})` to include terminal history. The remaining job controls are kept out of model tool definitions and exposed to scripts as
 `tool.job(id).inspect()`, `.send({value})`, `.cancel()`, and `.events({after, limit})`;
 `.wait({timeout})` uses the same `wait` tool.
 Host-owned skills are exposed through `skills` and `skill`; they are discovered from the user

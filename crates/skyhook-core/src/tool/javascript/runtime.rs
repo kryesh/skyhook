@@ -312,14 +312,31 @@ tool.job = job => {{
   return Object.freeze(methods);
 }};
 
-tool.skill = name => {{
-  if (typeof name !== "string" || name.length === 0) throw new TypeError("tool.skill requires a non-empty name");
-  const operation = __operation("skill", {{name}});
+function __skillBuilder(input) {{
+  if (Object.prototype.hasOwnProperty.call(input, "name") &&
+      (typeof input.name !== "string" || input.name.length === 0)) {{
+    throw new TypeError("tool.skill requires a non-empty name");
+  }}
+  const operation = __operation("skill", input);
+  Object.defineProperty(operation, "name", {{
+    enumerable: false,
+    value(name) {{
+      if (typeof name !== "string" || name.length === 0) throw new TypeError("tool.skill requires a non-empty name");
+      return __skillBuilder(Object.assign(Object.create(null), input, {{name}}));
+    }},
+  }});
   Object.defineProperty(operation, "asset", {{
     enumerable: false,
-    value(options) {{ return __operation("skill", Object.assign({{name}}, __plainObject("skill.asset", options))); }},
+    value(options) {{ return __skillBuilder(Object.assign(Object.create(null), input, __plainObject("skill.asset", options))); }},
   }});
   return Object.freeze(operation);
+}}
+
+tool.skill = (...values) => {{
+  if (values.length === 0) return __skillBuilder(Object.create(null));
+  if (values.length !== 1) throw new TypeError("tool.skill accepts zero arguments, a name, or one argument object");
+  if (typeof values[0] === "string") return __skillBuilder({{name: values[0]}});
+  return __skillBuilder(__plainObject("skill", values[0]));
 }};
 
 async function __request(request) {{
@@ -463,6 +480,12 @@ mod tests {
 
     #[derive(Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
+    struct NestedScript {
+        source: String,
+    }
+
+    #[derive(Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
     struct TestJobArgs {
         job: u64,
     }
@@ -566,7 +589,10 @@ return {
   set: base.set("required", "y"),
   reused: [built, built],
   skill: tool.skill("alpha"),
+  skillObject: tool.skill({name:"beta"}),
+  skillFluent: tool.skill().name("gamma"),
   asset: tool.skill("alpha").asset({path:"template.txt"}),
+  fluentAsset: tool.skill().name("gamma").asset({path:"other.txt"}),
   hasLoad: typeof tool.skill("alpha").load,
 };
 "#
@@ -592,8 +618,48 @@ return {
             ])
         );
         assert_eq!(output.value["skill"]["path"], Value::Null);
+        assert_eq!(output.value["skillObject"]["name"], "beta");
+        assert_eq!(output.value["skillFluent"]["name"], "gamma");
         assert_eq!(output.value["asset"]["path"], "template.txt");
+        assert_eq!(output.value["fluentAsset"]["path"], "other.txt");
         assert_eq!(output.value["hasLoad"], "undefined");
+    }
+
+    #[tokio::test]
+    async fn script_tool_is_hidden_and_rejected_inside_scripts() {
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register::<NestedScript, Value, _, _>(
+                "script",
+                "script",
+                ToolOptions::default().script_unavailable(),
+                |_context, input| async move { Ok(serde_json::json!({"source": input.source})) },
+            )
+            .unwrap();
+        let (_root, executor, context) = test_runtime(builder).await;
+        let output = evaluate(
+            r#"
+const direct = JSON.parse(await __skyhookHostCall(JSON.stringify({
+  type: "call",
+  name: "script",
+  arguments: {source: "return null;"},
+})));
+return {visible: typeof tool.script, direct};
+"#
+            .to_owned(),
+            executor,
+            context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.value["visible"], "undefined");
+        assert_eq!(output.value["direct"]["ok"], false);
+        assert!(
+            output.value["direct"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("not available in scripts")
+        );
     }
 
     #[tokio::test]

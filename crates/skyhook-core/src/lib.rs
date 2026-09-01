@@ -11,3 +11,15 @@ pub mod remote;
 pub mod session;
 pub mod target;
 pub mod tool;
+
+pub(crate) fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    use digest::Digest as _;
+    use std::fmt::Write as _;
+
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing to a string cannot fail");
+            output
+        })
+}

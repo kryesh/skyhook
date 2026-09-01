@@ -1,5 +1,4 @@
 use base64::Engine as _;
-use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -345,7 +344,7 @@ async fn externalize_images(
 
 pub async fn self_check(expected: &str) -> Result<(), Box<dyn std::error::Error>> {
     let bytes = tokio::fs::read(std::env::current_exe()?).await?;
-    let actual = format!("{:x}", Sha256::digest(bytes));
+    let actual = crate::sha256_hex(bytes);
     if actual != expected {
         return Err(format!("shim hash mismatch: expected {expected}, got {actual}").into());
     }
