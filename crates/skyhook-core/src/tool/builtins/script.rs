@@ -6,7 +6,6 @@ use serde_json::Value;
 
 use crate::tool::{
     RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, executor::ToolExecutor,
-    policy::ToolEffect,
 };
 
 pub fn install_script_tool(
@@ -41,9 +40,8 @@ where
         "script",
         SCRIPT_DESCRIPTION,
         schema,
-        ToolOptions::new(vec![ToolEffect::SessionState])
+        ToolOptions::default()
             .output_schema(output_schema)
-            .workspace_bound()
             .background()
             .input()
             .script_unavailable(),
@@ -56,7 +54,8 @@ where
                     .ok_or_else(|| {
                         ToolError::Failed("script executor is not initialized".to_owned())
                     })?
-                    .with_workspace(context.workspace.clone());
+                    .with_location(context.caller_location.clone())
+                    .with_capabilities(context.capabilities.clone());
                 crate::tool::javascript::evaluate(args.source, executor, context)
                     .await
                     .map_err(|error| ToolError::Failed(error.to_string()))
@@ -80,4 +79,4 @@ Examples:
 `const {paths} = await tool.glob().pattern("src/**/*.rs"); const pool = new WorkPool(4); return pool.map(paths, path => tool.read({path}));`
 `const queue = new Queue(); queue.push("work"); queue.close(); const seen=[]; for await (const value of queue) seen.push(value); return seen;`
 
-`new WorkPool(n)` preserves input order and fails fast, returning direct values. Pass `{failFast:false}` to receive `{ok:true,value}` or `{ok:false,error}` per item instead. `Queue` is an async FIFO with `push`, `next`, `close`, and async iteration. Await a background builder before using its envelope: `const job = await tool.shell({command:"make test", bg:true}); return tool.job(job.id).wait({timeout:300});`. Job-control APIs are documented below from their registered schemas. Skills accept positional, object, or fluent-name forms: `tool.skill("name")`, `tool.skill({name:"name"})`, and `tool.skill().name("name")`; use `.asset({path})` to read an asset instead. `receive()` waits for input and is only valid when this script invocation has `bg:true`; always use `await notify(value)` to ensure durable progress is written before the script returns. The `script` tool is intentionally unavailable inside scripts, so recursive script invocation is blocked. The runtime does not provide Node.js APIs or `console`."#;
+`new WorkPool(n)` preserves input order and fails fast, returning direct values. Pass `{failFast:false}` to receive `{ok:true,value}` or `{ok:false,error}` per item instead. `Queue` is an async FIFO with `push`, `next`, `close`, and async iteration. Await a background builder before using its envelope: `const job = await tool.shell({command:"make test", bg:true}); return tool.job(job.id).wait({timeout:300});`. Job-control and skill APIs are generated from their registered schemas and documented below. `receive()` waits for input and is only valid when this script invocation has `bg:true`; always use `await notify(value)` to ensure durable progress is written before the script returns. The `script` tool is intentionally unavailable inside scripts, so recursive script invocation is blocked. The runtime does not provide Node.js APIs or `console`."#;

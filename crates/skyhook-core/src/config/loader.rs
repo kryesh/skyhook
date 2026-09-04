@@ -7,7 +7,7 @@ use std::{
 
 use tokio::fs;
 
-use super::{CONFIG_VERSION, Config, ConfigError};
+use super::{Config, ConfigError};
 
 pub(super) async fn load(explicit: Option<&Path>) -> Result<Config, ConfigError> {
     let value = match explicit {
@@ -20,11 +20,7 @@ pub(super) async fn load(explicit: Option<&Path>) -> Result<Config, ConfigError>
     if value.as_table().is_none_or(toml::Table::is_empty) {
         return Err(ConfigError::Missing);
     }
-    let config: Config = value.try_into()?;
-    if config.version != CONFIG_VERSION {
-        return Err(ConfigError::UnsupportedVersion(config.version));
-    }
-    Ok(config)
+    Ok(value.try_into()?)
 }
 
 fn user_config_path() -> Option<PathBuf> {

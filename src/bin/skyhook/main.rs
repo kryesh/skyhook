@@ -185,12 +185,13 @@ impl AgentOutput {
                     tool,
                     arguments,
                     background,
+                    location,
                     ..
                 } = &record.event
                 {
                     self.tool(
                         &record.agent,
-                        &format_tool_call(*job, tool, arguments, *background),
+                        &format_tool_call(*job, tool, arguments, *background, Some(location)),
                     );
                 }
             }
@@ -258,6 +259,7 @@ fn format_tool_call(
     tool: &str,
     arguments: &Value,
     bg: bool,
+    location: Option<&skyhook::execution::ExecutionLocation>,
 ) -> String {
     let detail = match tool {
         "read" | "remove" => one_arg(arguments, "path"),
@@ -329,10 +331,20 @@ fn format_tool_call(
         _ => safe_scalar_args(arguments),
     };
     let background = if bg { " [background]" } else { "" };
+    let location = location.map_or_else(
+        || "[target=unknown workspace=unknown]".to_owned(),
+        |location| {
+            format!(
+                "[target={} workspace={}]",
+                location.target,
+                location.workspace.display()
+            )
+        },
+    );
     if detail.is_empty() {
-        format!("tool #{job}: {tool}{background}")
+        format!("tool #{job}: {location} {tool}{background}")
     } else {
-        format!("tool #{job}: {tool} {detail}{background}")
+        format!("tool #{job}: {location} {tool} {detail}{background}")
     }
 }
 
@@ -391,7 +403,10 @@ fn safe_scalar_args(arguments: &Value) -> String {
 mod tests {
     use clap::Parser as _;
     use serde_json::json;
-    use skyhook::identity::{AgentId, JobId, SessionId};
+    use skyhook::{
+        execution::ExecutionLocation,
+        identity::{AgentId, JobId, SessionId},
+    };
 
     use super::{Args, agent_label, brief, format_tool_call, token_summary};
 
@@ -450,10 +465,11 @@ mod tests {
             "script",
             &json!({"source":"const secret = 'do not print'; return 42", "bg":true}),
             true,
+            None,
         );
         assert_eq!(
             script,
-            "tool #7: script JavaScript workflow (40 chars) [background]"
+            "tool #7: [target=unknown workspace=unknown] script JavaScript workflow (40 chars) [background]"
         );
         assert!(!script.contains("secret"));
 
@@ -462,11 +478,27 @@ mod tests {
             "agent",
             &json!({"prompt":"report the kernel version", "target":"lab-monitoring"}),
             false,
+            None,
         );
         assert_eq!(
             agent,
-            "tool #8: agent task \"report the kernel version\" on lab-monitoring"
+            "tool #8: [target=unknown workspace=unknown] agent task \"report the kernel version\" on lab-monitoring"
         );
         assert_eq!(brief("one\n two   three", 7), "one two…");
+
+        let located = format_tool_call(
+            JobId::new(9).unwrap(),
+            "read",
+            &json!({"path":"README.md"}),
+            false,
+            Some(&ExecutionLocation {
+                target: "root".to_owned(),
+                workspace: "/workspace".into(),
+            }),
+        );
+        assert_eq!(
+            located,
+            "tool #9: [target=root workspace=/workspace] read README.md"
+        );
     }
 }

@@ -19,7 +19,7 @@ use tokio::{
 };
 
 use crate::{
-    agent::profile::AgentProfile,
+    agent::AgentProfile,
     identity::{AgentId, JobId, SessionId},
     job::JobManager,
     media::{MAX_IMAGE_BYTES, MAX_IMAGE_BYTES_PER_SUBMISSION, MAX_IMAGES_PER_SUBMISSION},
@@ -33,8 +33,9 @@ use crate::{
     session::{EventRecord, SessionError, SessionEvent, SessionStore},
     target::{TargetDefinition, TargetRegistry, TargetsConfig, import_ssh_targets},
     tool::builtins::{HostSkills, install_script_tool_weak, register_coding_tools},
+    tool::policy::CapabilitySet,
     tool::policy::{AllowAll, Policy},
-    tool::{ToolRegistry, ToolRegistryBuilder, ToolVisibilityContext, executor::ToolExecutor},
+    tool::{ToolRegistry, ToolRegistryBuilder, executor::ToolExecutor},
 };
 
 pub use super::error::HarnessError;
@@ -58,6 +59,7 @@ pub struct HarnessBuilder {
     extra_tools: ToolRegistry,
     instructions: Vec<String>,
     max_child_depth: usize,
+    capabilities: CapabilitySet,
     targets: TargetsConfig,
     shim_catalog: EmbeddedShimCatalog,
     sensitive_prompts: Arc<dyn SensitivePromptHandler>,
@@ -79,6 +81,7 @@ impl HarnessBuilder {
             extra_tools: ToolRegistry::default(),
             instructions: Vec::new(),
             max_child_depth: 4,
+            capabilities: CapabilitySet::default(),
             targets: TargetsConfig::default(),
             shim_catalog: EmbeddedShimCatalog::default(),
             sensitive_prompts: Arc::new(RejectSensitivePrompts),
@@ -152,6 +155,12 @@ impl HarnessBuilder {
     }
 
     #[must_use]
+    pub fn capabilities(mut self, capabilities: CapabilitySet) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    #[must_use]
     pub fn targets_config(mut self, targets: TargetsConfig) -> Self {
         self.targets = targets;
         self
@@ -219,6 +228,7 @@ impl HarnessBuilder {
                 instructions,
                 skills,
                 max_child_depth: self.max_child_depth,
+                capabilities: self.capabilities,
                 target_definitions,
                 shim_catalog: self.shim_catalog,
                 sensitive_prompts: self.sensitive_prompts,
@@ -246,6 +256,7 @@ struct HarnessInner {
     instructions: Vec<String>,
     skills: HostSkills,
     max_child_depth: usize,
+    capabilities: CapabilitySet,
     target_definitions: Vec<TargetDefinition>,
     shim_catalog: EmbeddedShimCatalog,
     sensitive_prompts: Arc<dyn SensitivePromptHandler>,
@@ -255,25 +266,15 @@ impl Harness {
     pub async fn new_session(&self) -> Result<SessionHandle, HarnessError> {
         let store = SessionStore::create(&self.inner.session_root).await?;
         let root = AgentId::root(store.id());
-        store
+        let started = store
             .append(
                 root.clone(),
                 SessionEvent::SessionStarted {
-                    workspace: self.inner.workspace.clone(),
-                    root_model_profile: self.inner.default_model_profile.clone(),
-                    root_agent_profile: self.inner.default_agent_profile.clone(),
-                },
-            )
-            .await?;
-        store
-            .append(
-                root.clone(),
-                SessionEvent::TargetsSnapshot {
                     targets: self.inner.target_definitions.clone(),
                 },
             )
             .await?;
-        let runtime = SessionRuntime::build(self.inner.clone(), store, Vec::new()).await?;
+        let runtime = SessionRuntime::build(self.inner.clone(), store, vec![started]).await?;
         runtime.start_root(Vec::new()).await
     }
 
@@ -421,8 +422,7 @@ struct SessionRuntime {
     executor: ToolExecutor,
     // Keeps the script tool's weak executor lookup alive without an executor/registry cycle.
     _executor_slot: Arc<OnceLock<ToolExecutor>>,
-    remote: RemoteManager,
-    targets: TargetRegistry,
+    router: crate::target::TargetRouter,
     agents: RwLock<HashMap<AgentId, mpsc::Sender<AgentCommand>>>,
     interrupts: RwLock<HashMap<AgentId, Arc<AtomicBool>>>,
     child_counters: RwLock<HashMap<AgentId, u32>>,
@@ -469,8 +469,7 @@ struct AgentLaunch {
     history: Vec<Message>,
     one_shot: bool,
     available_depth: usize,
-    target: Option<String>,
-    workspace: Option<PathBuf>,
+    location: crate::execution::ExecutionLocation,
 }
 
 struct AgentLoop {
@@ -481,7 +480,8 @@ struct AgentLoop {
     system: Vec<SystemSegment>,
     history: Vec<Message>,
     one_shot: bool,
-    location: AgentLocation,
+    location: crate::execution::ExecutionLocation,
+    capabilities: CapabilitySet,
     rx: mpsc::Receiver<AgentCommand>,
 }
 
@@ -491,35 +491,8 @@ struct TurnContext<'a> {
     system: &'a [SystemSegment],
     owner_job: Option<JobId>,
     interrupted: &'a Arc<AtomicBool>,
-    location: &'a AgentLocation,
-}
-
-#[derive(Clone)]
-enum AgentLocation {
-    Local { workspace: PathBuf },
-    Remote { target: String, workspace: PathBuf },
-}
-
-impl AgentLocation {
-    fn target(&self) -> &str {
-        match self {
-            Self::Local { .. } => crate::target::ROOT_TARGET,
-            Self::Remote { target, .. } => target,
-        }
-    }
-
-    fn kind(&self) -> &str {
-        match self {
-            Self::Local { .. } => "local",
-            Self::Remote { .. } => "ssh",
-        }
-    }
-
-    fn workspace(&self) -> &Path {
-        match self {
-            Self::Local { workspace } | Self::Remote { workspace, .. } => workspace,
-        }
-    }
+    location: &'a crate::execution::ExecutionLocation,
+    capabilities: &'a CapabilitySet,
 }
 
 impl SessionRuntime {
@@ -529,23 +502,30 @@ impl SessionRuntime {
         prior_records: Vec<EventRecord>,
     ) -> Result<Arc<Self>, HarnessError> {
         let jobs = JobManager::restore(store.clone(), &prior_records).await?;
-        let mut definitions = prior_records
+        let definitions = prior_records
             .iter()
             .find_map(|record| match &record.event {
-                SessionEvent::TargetsSnapshot { targets } => Some(targets.clone()),
+                SessionEvent::SessionStarted { targets } => Some(targets.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| harness.target_definitions.clone());
-        let targets = TargetRegistry::from_definitions(std::mem::take(&mut definitions))?;
+            .ok_or_else(|| {
+                HarnessError::Initialization("session start event is missing".to_owned())
+            })?;
+        let targets = TargetRegistry::from_definitions(definitions)?;
         for record in &prior_records {
             if let SessionEvent::TargetUpserted { target } = &record.event {
                 targets.upsert(target.clone()).await?;
             }
         }
-        let remote = RemoteManager::new(targets.clone())
-            .with_shim_catalog(harness.shim_catalog.clone())
-            .with_prompt_handler(harness.sensitive_prompts.clone())
-            .with_policy(harness.policy.clone());
+        let authorization =
+            crate::tool::authorization::AuthorizationCoordinator::new(harness.policy.clone());
+        let remote = RemoteManager::new(
+            harness.shim_catalog.clone(),
+            harness.sensitive_prompts.clone(),
+            authorization.clone(),
+        );
+        let router =
+            crate::target::TargetRouter::new(targets.clone(), remote, authorization.clone());
         let executor_slot = Arc::new(OnceLock::new());
         let runtime_slot = Arc::new(OnceLock::<Weak<Self>>::new());
         let mut builder = ToolRegistryBuilder::default();
@@ -554,18 +534,18 @@ impl SessionRuntime {
             store.clone(),
             jobs.clone(),
             harness.skills.clone(),
-            targets.clone(),
-            remote.clone(),
+            router.clone(),
         )?;
         install_script_tool_weak(&mut builder, Arc::downgrade(&executor_slot))?;
         tools::register(&mut builder, runtime_slot.clone())?;
         builder.extend(&harness.extra_tools)?;
-        let executor = ToolExecutor::new(
+        let executor = ToolExecutor::with_authorization(
             builder.build(),
-            harness.policy.clone(),
+            authorization,
             jobs.clone(),
             harness.workspace.clone(),
-        );
+        )
+        .with_target_router(router.clone());
         executor_slot
             .set(executor.clone())
             .map_err(|_| HarnessError::Initialization("executor already set".to_owned()))?;
@@ -594,8 +574,7 @@ impl SessionRuntime {
             jobs: jobs.clone(),
             executor,
             _executor_slot: executor_slot,
-            remote,
-            targets,
+            router,
             agents: RwLock::new(HashMap::new()),
             interrupts: RwLock::new(HashMap::new()),
             child_counters: RwLock::new(child_counters),
@@ -628,8 +607,7 @@ impl SessionRuntime {
                 history,
                 one_shot: false,
                 available_depth: self.harness.max_child_depth,
-                target: None,
-                workspace: None,
+                location: crate::execution::ExecutionLocation::root(self.harness.workspace.clone()),
             })
             .await?;
         Ok(SessionHandle {
@@ -707,8 +685,7 @@ impl SessionRuntime {
             history,
             one_shot,
             available_depth,
-            target,
-            workspace,
+            location,
         } = launch;
         if id.depth() > self.harness.max_child_depth {
             return Err(HarnessError::ChildDepth);
@@ -717,30 +694,14 @@ impl SessionRuntime {
         if available_depth > remaining_depth {
             return Err(HarnessError::ChildDepth);
         }
-        let location = if let Some(target) = target
-            .as_deref()
-            .filter(|target| *target != crate::target::ROOT_TARGET)
-        {
-            let definition = self.targets.get(target).await?;
-            AgentLocation::Remote {
-                target: target.to_owned(),
-                workspace: workspace
-                    .clone()
-                    .unwrap_or_else(|| definition.workspace.clone()),
-            }
-        } else {
-            AgentLocation::Local {
-                workspace: workspace
-                    .clone()
-                    .unwrap_or_else(|| self.harness.workspace.clone()),
-            }
-        };
+        let capabilities = self.harness.capabilities.for_agent(available_depth);
         let (profile, system) = self.resolve_agent(
             &model_profile,
             agent_profile.as_deref(),
             &id,
             &location,
             available_depth,
+            &capabilities,
         )?;
         self.store
             .append(
@@ -749,11 +710,7 @@ impl SessionRuntime {
                     parent,
                     model_profile: model_profile.clone(),
                     agent_profile: agent_profile.clone(),
-                    target: match &location {
-                        AgentLocation::Local { .. } => None,
-                        AgentLocation::Remote { target, .. } => Some(target.clone()),
-                    },
-                    workspace,
+                    location: location.clone(),
                 },
             )
             .await?;
@@ -780,6 +737,7 @@ impl SessionRuntime {
                     history,
                     one_shot,
                     location,
+                    capabilities,
                     rx,
                 })
                 .await;
@@ -787,86 +745,39 @@ impl SessionRuntime {
         Ok(tx)
     }
 
+    async fn resolve_location(
+        &self,
+        target: &str,
+        workspace: Option<PathBuf>,
+    ) -> Result<crate::execution::ExecutionLocation, HarnessError> {
+        if target == crate::target::ROOT_TARGET {
+            return Ok(crate::execution::ExecutionLocation::root(
+                workspace.unwrap_or_else(|| self.harness.workspace.clone()),
+            ));
+        }
+        let definition = self.router.targets().get(target).await?;
+        Ok(crate::execution::ExecutionLocation::named(
+            target,
+            workspace.unwrap_or(definition.workspace),
+        ))
+    }
+
     async fn execute_call(
         &self,
         agent: &AgentId,
         parent: Option<JobId>,
         call: &ToolCall,
-        location: &AgentLocation,
+        location: &crate::execution::ExecutionLocation,
+        capabilities: &CapabilitySet,
     ) -> ToolResult {
-        let mut call = call.clone();
-        let result = if let AgentLocation::Remote { target, workspace } = location {
-            let workspace_tool = self
-                .executor
-                .registry()
-                .get(&call.name)
-                .is_some_and(|tool| tool.is_workspace_bound());
-            let selected_target = call
-                .arguments
-                .get("target")
-                .and_then(serde_json::Value::as_str);
-            if workspace_tool && selected_target.is_none_or(|selected| selected == target) {
-                if let Some(arguments) = call.arguments.as_object_mut() {
-                    arguments.remove("target");
-                }
-                let remote = self.remote.clone();
-                let store = self.store.clone();
-                let target = target.clone();
-                let workspace = workspace.clone();
-                let name = call.name.clone();
-                self.executor
-                    .execute_external_with_context(
-                        agent.clone(),
-                        &call.name,
-                        call.arguments.clone(),
-                        parent,
-                        vec![
-                            crate::tool::policy::ToolEffect::RemoteAccess,
-                            crate::tool::policy::ToolEffect::Network,
-                        ],
-                        move |context, arguments| async move {
-                            let result = remote
-                                .execute_tool_cancellable(
-                                    &target,
-                                    Some(&workspace),
-                                    name,
-                                    arguments,
-                                    &context,
-                                )
-                                .await;
-                            if context.is_cancelled() {
-                                return Err(crate::tool::ToolError::Cancelled);
-                            }
-                            import_remote_result(&store, result).await
-                        },
-                    )
-                    .await
-            } else {
-                if matches!(call.name.as_str(), "exec" | "shell" | "agent")
-                    && let Some(arguments) = call.arguments.as_object_mut()
-                {
-                    arguments
-                        .entry("target")
-                        .or_insert_with(|| serde_json::Value::String(target.clone()));
-                    if call.name == "agent" {
-                        arguments.entry("workspace").or_insert_with(|| {
-                            serde_json::Value::String(workspace.to_string_lossy().into_owned())
-                        });
-                    }
-                }
-                self.executor
-                    .execute_model(agent.clone(), &call.name, call.arguments.clone(), parent)
-                    .await
-            }
-        } else if let AgentLocation::Local { workspace } = location {
-            self.executor
-                .clone()
-                .with_workspace(workspace.clone())
-                .execute_model(agent.clone(), &call.name, call.arguments.clone(), parent)
-                .await
-        } else {
-            unreachable!("agent locations are local or remote")
-        };
+        let call = call.clone();
+        let result = self
+            .executor
+            .clone()
+            .with_location(location.clone())
+            .with_capabilities(capabilities.clone())
+            .execute_model(agent.clone(), &call.name, call.arguments.clone(), parent)
+            .await;
         match result {
             Ok(result) => ToolResult {
                 call_id: call.id,
@@ -890,8 +801,9 @@ impl SessionRuntime {
         model_profile: &str,
         agent_profile: Option<&str>,
         agent: &AgentId,
-        location: &AgentLocation,
+        location: &crate::execution::ExecutionLocation,
         available_depth: usize,
+        capabilities: &CapabilitySet,
     ) -> Result<(ModelProfile, Vec<SystemSegment>), HarnessError> {
         let mut selected_model = model_profile.to_owned();
         let profile_instructions = if let Some(name) = agent_profile {
@@ -917,10 +829,9 @@ impl SessionRuntime {
             &self.harness.instructions,
             profile_instructions,
             agent,
-            location.target(),
-            location.kind(),
-            location.workspace(),
+            location,
             available_depth,
+            capabilities,
         )];
         Ok((profile, system))
     }
@@ -935,6 +846,7 @@ impl SessionRuntime {
             mut history,
             one_shot,
             location,
+            capabilities,
             mut rx,
         } = agent_loop;
         while let Some(command) = rx.recv().await {
@@ -957,10 +869,15 @@ impl SessionRuntime {
                         Ok(pending) if !pending.is_empty() => pending,
                         _ => continue,
                     };
+                    let presented = pending
+                        .iter()
+                        .map(|job| job.presented(&capabilities))
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap_or_default();
                     let mut content = vec![UserContent::Runtime {
                         text: format!(
                             "<skyhook_job_events>\n{}\n</skyhook_job_events>",
-                            serde_json::to_string(&pending).unwrap_or_else(|_| "[]".to_owned())
+                            serde_json::to_string(&presented).unwrap_or_else(|_| "[]".to_owned())
                         ),
                     }];
                     if let Some(state) = prompt::active_jobs_content(&self.jobs, &id).await {
@@ -987,6 +904,7 @@ impl SessionRuntime {
                         owner_job,
                         interrupted: &interrupted,
                         location: &location,
+                        capabilities: &capabilities,
                     },
                     &mut history,
                 )
@@ -1029,6 +947,7 @@ impl SessionRuntime {
             owner_job,
             interrupted,
             location,
+            capabilities,
         } = turn;
         if !profile.supports_images && contains_images(history) {
             return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
@@ -1052,14 +971,18 @@ impl SessionRuntime {
                 messages: request_messages,
                 tools: self
                     .executor
-                    .registry()
-                    .definitions(&ToolVisibilityContext::new(agent.clone())),
+                    .clone()
+                    .with_capabilities(capabilities.clone())
+                    .surface()
+                    .definitions(),
                 reasoning: profile.reasoning.clone(),
                 max_output_tokens: profile.max_output_tokens,
                 correlation: Some(agent.to_string()),
             };
             let mut response = provider.invoke(request).await?;
-            let mut chunks = Vec::new();
+            let mut blocks = Vec::new();
+            let mut streamed_text = String::new();
+            let mut usage = Usage::default();
             loop {
                 let chunk = tokio::select! {
                     chunk = poll_fn(|context| response.as_mut().poll_chunk(context)) => chunk,
@@ -1068,30 +991,25 @@ impl SessionRuntime {
                 let Some(chunk) = chunk else {
                     break;
                 };
-                let chunk = chunk?;
-                match &chunk {
+                match chunk? {
                     ResponseChunk::TextDelta { text } => {
                         let _ = self.events.send(RuntimeEvent::TextDelta {
                             agent: agent.clone(),
                             text: text.clone(),
                         });
+                        streamed_text.push_str(&text);
                     }
                     ResponseChunk::ReasoningDelta { text } => {
                         let _ = self.events.send(RuntimeEvent::ReasoningDelta {
                             agent: agent.clone(),
-                            text: text.clone(),
+                            text,
                         });
                     }
-                    ResponseChunk::Block { .. }
-                    | ResponseChunk::Usage { .. }
-                    | ResponseChunk::MessageStart { .. }
-                    | ResponseChunk::ToolInputDelta { .. }
-                    | ResponseChunk::Diagnostic { .. }
-                    | ResponseChunk::Done { .. } => {}
+                    ResponseChunk::Block { block } => blocks.push(block),
+                    ResponseChunk::Usage { usage: value } => usage = value,
                 }
-                chunks.push(chunk);
             }
-            let response = fold_response(chunks)?;
+            let response = finish_response(blocks, streamed_text, usage)?;
             final_text.push_str(&response.text);
             let assistant = Message::Assistant(response.blocks);
             self.commit(agent, assistant.clone()).await?;
@@ -1117,7 +1035,7 @@ impl SessionRuntime {
                 response
                     .calls
                     .iter()
-                    .map(|call| self.execute_call(agent, owner_job, call, location)),
+                    .map(|call| self.execute_call(agent, owner_job, call, location, capabilities)),
             )
             .await;
             let tools = Message::Tool(results);
@@ -1272,12 +1190,11 @@ impl SessionRuntime {
             send_question_error(batch, QuestionError::Unavailable.to_string());
             return;
         };
-        let cancellation = batch[0].context.cancellation();
         let answer = handler.ask(agent, questions);
         tokio::pin!(answer);
         let answer = tokio::select! {
             answer = &mut answer => answer.map_err(|error| error.to_string()),
-            () = wait_for_interrupt(&cancellation) => Err("tool was cancelled".to_owned()),
+            () = batch[0].context.cancelled() => Err("tool was cancelled".to_owned()),
         };
         match answer {
             Ok(answer) => distribute_question_answer(batch, answer),
@@ -1386,50 +1303,6 @@ impl SessionRuntime {
     }
 }
 
-async fn import_remote_result(
-    store: &SessionStore,
-    result: Result<crate::tool::ToolOutput, crate::remote::RemoteError>,
-) -> Result<crate::tool::ToolOutput, crate::tool::ToolError> {
-    match result {
-        Ok(output) => import_remote_output(store, output).await,
-        Err(crate::remote::RemoteError::Remote {
-            message,
-            output: Some(output),
-        }) => Err(crate::tool::ToolError::with_output(
-            message,
-            import_remote_output(store, output).await?,
-        )),
-        Err(error) => Err(error.into_tool_error()),
-    }
-}
-
-async fn import_remote_output(
-    store: &SessionStore,
-    mut output: crate::tool::ToolOutput,
-) -> Result<crate::tool::ToolOutput, crate::tool::ToolError> {
-    let mut imported = Vec::with_capacity(output.images.len());
-    for image in output.images {
-        let encoded = image.data_base64.as_deref().ok_or_else(|| {
-            crate::tool::ToolError::Failed("remote image payload is missing".to_owned())
-        })?;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|error| crate::tool::ToolError::Failed(error.to_string()))?;
-        let reference = store
-            .import_blob(&bytes, image.name, image.media_type)
-            .await
-            .map_err(|error| crate::tool::ToolError::Failed(error.to_string()))?;
-        if reference.sha256 != image.sha256 {
-            return Err(crate::tool::ToolError::Failed(
-                "remote image hash did not match its payload".to_owned(),
-            ));
-        }
-        imported.push(reference);
-    }
-    output.images = imported;
-    Ok(output)
-}
-
 fn send_question_error(batch: Vec<PendingAsk>, error: String) {
     for pending in batch {
         let _ = pending.result.send(Err(error.clone()));
@@ -1484,22 +1357,11 @@ struct FoldedResponse {
     text: String,
 }
 
-fn fold_response(chunks: Vec<ResponseChunk>) -> Result<FoldedResponse, HarnessError> {
-    let mut blocks = Vec::new();
-    let mut streamed_text = String::new();
-    let mut usage = Usage::default();
-    for chunk in chunks {
-        match chunk {
-            ResponseChunk::TextDelta { text } => streamed_text.push_str(&text),
-            ResponseChunk::Block { block } => blocks.push(block),
-            ResponseChunk::Usage { usage: value } => usage = value,
-            ResponseChunk::MessageStart { .. }
-            | ResponseChunk::ReasoningDelta { .. }
-            | ResponseChunk::ToolInputDelta { .. }
-            | ResponseChunk::Diagnostic { .. }
-            | ResponseChunk::Done { .. } => {}
-        }
-    }
+fn finish_response(
+    mut blocks: Vec<AssistantContent>,
+    streamed_text: String,
+    usage: Usage,
+) -> Result<FoldedResponse, HarnessError> {
     if !streamed_text.is_empty()
         && !blocks
             .iter()
@@ -1655,7 +1517,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        provider::protocol::{StopReason, ToolCall},
+        provider::protocol::ToolCall,
         provider::{ProviderFuture, ResponseHandle},
     };
 
@@ -1833,21 +1695,15 @@ mod tests {
             name: "read".to_owned(),
             arguments: json!({"path":"README.md"}),
         };
-        let response = fold_response(vec![
-            ResponseChunk::TextDelta {
-                text: "working".to_owned(),
+        let response = finish_response(
+            vec![AssistantContent::ToolCall(call.clone())],
+            "working".to_owned(),
+            Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+                ..Usage::default()
             },
-            ResponseChunk::Block {
-                block: AssistantContent::ToolCall(call.clone()),
-            },
-            ResponseChunk::Usage {
-                usage: Usage {
-                    input_tokens: 10,
-                    output_tokens: 2,
-                    ..Usage::default()
-                },
-            },
-        ])
+        )
         .unwrap();
         assert_eq!(response.text, "working");
         assert_eq!(response.calls, vec![call]);
@@ -1881,18 +1737,10 @@ mod tests {
                                 arguments: json!({"path": "note.txt"}),
                             }),
                         },
-                        ResponseChunk::Done {
-                            stop_reason: Some(StopReason::ToolUse),
-                        },
                     ],
-                    vec![
-                        ResponseChunk::TextDelta {
-                            text: "finished".to_owned(),
-                        },
-                        ResponseChunk::Done {
-                            stop_reason: Some(StopReason::Complete),
-                        },
-                    ],
+                    vec![ResponseChunk::TextDelta {
+                        text: "finished".to_owned(),
+                    }],
                 ])),
                 requests: requests.clone(),
             }),
@@ -1900,10 +1748,46 @@ mod tests {
         .await;
         let session = harness.new_session().await.unwrap();
         assert_eq!(session.prompt("read the note").await.unwrap(), "finished");
+        let script_output = session
+            .run_script(r#"return tool.read().path("note.txt");"#)
+            .await
+            .unwrap();
+        assert_eq!(script_output.value["content"], "hello");
+        let background = session
+            .runtime
+            .executor
+            .execute_model(
+                session.root.clone(),
+                "script",
+                json!({"source": "return null;", "bg": true}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(background.output.value["location"].get("target").is_none());
         assert!(session.tools().get("script").is_some());
         assert!(session.tools().get("jobs").is_some());
-        assert!(session.tools().get("read").unwrap().is_workspace_bound());
-        assert!(!session.tools().get("jobs").unwrap().is_workspace_bound());
+        assert_eq!(
+            session.tools().get("read").unwrap().placement(),
+            crate::tool::ToolPlacement::TargetedWorkspace
+        );
+        assert_eq!(
+            session.tools().get("jobs").unwrap().placement(),
+            crate::tool::ToolPlacement::Host
+        );
+        let targeted = session
+            .tools()
+            .tools()
+            .filter(|tool| tool.placement() == crate::tool::ToolPlacement::TargetedWorkspace)
+            .map(|tool| tool.name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(targeted, ["exec", "glob", "read", "search", "shell"].into());
+        let mut capabilities = crate::tool::policy::CapabilitySet::default();
+        capabilities.insert(crate::tool::policy::Capability::Targets);
+        let surface = session.tools().surface(&capabilities);
+        assert!(targeted.iter().all(|name| {
+            surface.get(name).unwrap().input_schema["properties"]["target"].is_object()
+        }));
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].system, requests[1].system);
@@ -1914,6 +1798,23 @@ mod tests {
         assert!(requests[0].system[0].text.contains("<skyhook_context>"));
         assert!(requests[0].system[0].text.contains("\"date\":"));
         assert!(requests[0].system[0].text.contains("\"available_depth\":4"));
+        assert!(!requests[0].system[0].text.contains(prompt::TARGET_PROMPT));
+        let read = requests[0]
+            .tools
+            .iter()
+            .find(|tool| tool.name == "read")
+            .unwrap();
+        assert!(read.input_schema["properties"].get("target").is_none());
+        assert!(requests[0].tools.iter().all(|tool| {
+            tool.input_schema["properties"].get("target").is_none()
+                && !matches!(tool.name.as_str(), "targets" | "target_add")
+        }));
+        let script = requests[0]
+            .tools
+            .iter()
+            .find(|tool| tool.name == "script")
+            .unwrap();
+        assert!(!script.description.contains(".target("));
         let agent = requests[0]
             .tools
             .iter()
@@ -1970,6 +1871,11 @@ mod tests {
             },
         );
         let harness = test_builder(workspace.path(), sessions.path(), provider)
+            .capabilities({
+                let mut capabilities = CapabilitySet::default();
+                capabilities.insert(crate::tool::policy::Capability::Targets);
+                capabilities
+            })
             .targets_config(targets)
             .build()
             .await
@@ -1980,6 +1886,19 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
+        let tools_with_target = requests[0]
+            .tools
+            .iter()
+            .filter(|tool| tool.input_schema["properties"]["target"].is_object())
+            .map(|tool| tool.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            tools_with_target,
+            ["agent", "exec", "glob", "read", "search", "shell"].into()
+        );
+        assert!(request_has_tool(&requests[0], "targets"));
+        assert!(request_has_tool(&requests[0], "target_add"));
+        assert!(requests[0].system[0].text.contains(prompt::TARGET_PROMPT));
         assert!(requests[1].system[0].text.contains("\"name\":\"build\""));
         assert!(requests[1].system[0].text.contains("\"kind\":\"ssh\""));
         assert!(requests[1].system[0].text.contains("/srv/project"));
@@ -2204,7 +2123,7 @@ mod tests {
         assert!(
             results[0].result["error"]
                 .as_str()
-                .is_some_and(|error| error.contains("unavailable in this context"))
+                .is_some_and(|error| error.contains("unavailable"))
         );
     }
 
@@ -2250,7 +2169,8 @@ mod tests {
         let session = harness.new_session().await.unwrap();
         let ask = session
             .tools()
-            .definitions(&ToolVisibilityContext::new(session.root.clone()))
+            .surface(&CapabilitySet::default())
+            .definitions()
             .into_iter()
             .find(|definition| definition.name == "ask")
             .unwrap();
@@ -2342,7 +2262,8 @@ mod tests {
         let session = harness.new_session().await.unwrap();
         let definitions = session
             .tools()
-            .definitions(&ToolVisibilityContext::new(session.root.clone()));
+            .surface(&CapabilitySet::default())
+            .definitions();
         let names = definitions
             .iter()
             .map(|definition| definition.name.as_str())
@@ -2422,9 +2343,6 @@ mod tests {
                                 output_tokens: 3,
                             },
                         },
-                        ResponseChunk::Done {
-                            stop_reason: Some(StopReason::Complete),
-                        },
                     ],
                     vec![
                         ResponseChunk::TextDelta {
@@ -2436,9 +2354,6 @@ mod tests {
                                 cached_input_tokens: 4,
                                 output_tokens: 5,
                             },
-                        },
-                        ResponseChunk::Done {
-                            stop_reason: Some(StopReason::Complete),
                         },
                     ],
                 ])),
@@ -2537,15 +2452,10 @@ mod tests {
             let lease = session
                 .runtime
                 .jobs
-                .create(
-                    session.root.clone(),
-                    None,
-                    "test".to_owned(),
-                    json!({}),
-                    false,
-                    true,
-                    None,
-                )
+                .create(crate::job::JobSpec {
+                    background: true,
+                    ..crate::job::JobSpec::test(session.root.clone(), "test")
+                })
                 .await
                 .unwrap();
             session
@@ -2625,7 +2535,10 @@ mod tests {
         let agent = session
             .runtime
             .jobs
-            .create(root, None, "agent".to_owned(), json!({}), true, false, None)
+            .create(crate::job::JobSpec {
+                accepts_input: true,
+                ..crate::job::JobSpec::test(root, "agent")
+            })
             .await
             .unwrap();
         session
@@ -2637,15 +2550,11 @@ mod tests {
         let mut ask = session
             .runtime
             .jobs
-            .create(
-                child.clone(),
-                Some(agent.id),
-                "ask".to_owned(),
-                json!({}),
-                true,
-                false,
-                None,
-            )
+            .create(crate::job::JobSpec {
+                parent: Some(agent.id),
+                accepts_input: true,
+                ..crate::job::JobSpec::test(child.clone(), "ask")
+            })
             .await
             .unwrap();
         session
@@ -2657,15 +2566,11 @@ mod tests {
         let mut ask_two = session
             .runtime
             .jobs
-            .create(
-                child.clone(),
-                Some(agent.id),
-                "ask".to_owned(),
-                json!({}),
-                true,
-                false,
-                None,
-            )
+            .create(crate::job::JobSpec {
+                parent: Some(agent.id),
+                accepts_input: true,
+                ..crate::job::JobSpec::test(child.clone(), "ask")
+            })
             .await
             .unwrap();
         session

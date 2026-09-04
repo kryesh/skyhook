@@ -17,7 +17,6 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "A programmable coding-agent harness with embedded JavaScript orchestration"
-readme = "README.md"
 default-run = "skyhook"
 autobins = false
 build = "build.rs"

@@ -28,11 +28,6 @@ impl FluxProvider {
             inner: Arc::new(provider),
         }
     }
-
-    #[must_use]
-    pub fn from_arc(provider: Arc<dyn flux_provider::Provider>) -> Self {
-        Self { inner: provider }
-    }
 }
 
 impl Provider for FluxProvider {
@@ -44,8 +39,12 @@ impl Provider for FluxProvider {
                 .stream(request)
                 .await
                 .map_err(|error| map_error(&error))?;
-            let mapped =
-                stream.map(|item| item.map(convert_chunk).map_err(|error| map_error(&error)));
+            let mapped = stream.filter_map(|item| {
+                futures_util::future::ready(match item {
+                    Ok(chunk) => convert_chunk(chunk).map(Ok),
+                    Err(error) => Some(Err(map_error(&error))),
+                })
+            });
             Ok(Box::pin(mapped) as std::pin::Pin<Box<dyn crate::provider::ResponseHandle>>)
         })
     }

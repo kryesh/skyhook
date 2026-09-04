@@ -1,15 +1,10 @@
-use std::path::PathBuf;
-
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::{
-    remote::RemoteManager,
     session::{SessionEvent, SessionStore},
-    target::{
-        TargetAuth, TargetConfig, TargetDefinition, TargetRecord, TargetRegistry, TargetSource,
-    },
-    tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::ToolEffect},
+    target::{TargetConfig, TargetDefinition, TargetRecord, TargetRouter, TargetSource},
+    tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::Capability},
 };
 
 #[derive(Deserialize, JsonSchema)]
@@ -20,60 +15,39 @@ struct TargetsArgs {}
 #[serde(deny_unknown_fields)]
 struct TargetAddArgs {
     name: String,
-    host: String,
-    user: Option<String>,
-    port: Option<u16>,
-    #[serde(default = "default_workspace")]
-    workspace: PathBuf,
-    via: Option<String>,
-    #[serde(default)]
-    auth: TargetAuth,
+    #[serde(flatten)]
+    config: TargetConfig,
 }
 
 pub(super) fn register(
     builder: &mut ToolRegistryBuilder,
     store: SessionStore,
-    targets: TargetRegistry,
-    remote: RemoteManager,
+    router: TargetRouter,
 ) -> Result<(), RegistryError> {
-    let listed = targets.clone();
+    let listed = router.clone();
     builder.register::<TargetsArgs, Vec<TargetRecord>, _, _>(
         "targets",
-        "List the local root and named SSH targets available in this session.",
-        ToolOptions::new(vec![ToolEffect::SessionState]),
+        "List the built-in local `root` target and named SSH targets available in this session. Prefer named targets and target-aware tools’ target parameter over invoking ssh manually so Skyhook can apply configured authentication, jump routing, workspaces, cancellation, approvals, and audit metadata.",
+        ToolOptions::default().requires(Capability::Targets),
         move |_context, _args| {
-            let targets = listed.clone();
-            async move { Ok(targets.list().await) }
+            let router = listed.clone();
+            async move { Ok(router.targets().list().await) }
         },
     )?;
     builder.register::<TargetAddArgs, TargetRecord, _, _>(
         "target_add",
         "Add or replace a named SSH target for this session. This does not connect to it.",
-        ToolOptions::new(vec![ToolEffect::ManageTargets, ToolEffect::SessionState]),
+        ToolOptions::new(vec![Capability::Write])
+            .requires(Capability::Targets)
+            .permission_resource(crate::tool::policy::ResourceId::session("targets")),
         move |context, args| {
-            let targets = targets.clone();
+            let router = router.clone();
             let store = store.clone();
-            let remote = remote.clone();
             async move {
-                let definition = TargetDefinition::from_config(
-                    args.name,
-                    TargetConfig {
-                        host: args.host,
-                        user: args.user,
-                        port: args.port,
-                        workspace: args.workspace,
-                        via: args.via,
-                        auth: args.auth,
-                    },
-                    TargetSource::Session,
-                )
-                .map_err(target_error)?;
-                let invalidated = targets
-                    .upsert(definition.clone())
-                    .await
-                    .map_err(target_error)?;
-                remote.invalidate(&invalidated).await;
-                let persisted = targets.get(&definition.name).await.map_err(target_error)?;
+                let definition =
+                    TargetDefinition::from_config(args.name, args.config, TargetSource::Session)
+                        .map_err(target_error)?;
+                let persisted = router.upsert(definition).await.map_err(target_error)?;
                 store
                     .append(
                         context.agent,
@@ -88,10 +62,6 @@ pub(super) fn register(
         },
     )?;
     Ok(())
-}
-
-fn default_workspace() -> PathBuf {
-    PathBuf::from(".")
 }
 
 #[allow(clippy::needless_pass_by_value)]

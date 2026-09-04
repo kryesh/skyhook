@@ -3,7 +3,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::{
     media::ImageReference,
-    tool::{ToolOutput, policy::ToolEffect},
+    tool::{ToolOutput, policy::PermissionUse},
 };
 use serde_json::Value;
 
@@ -11,7 +11,7 @@ const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum Request {
+pub(crate) enum Request {
     Hello,
     Tool {
         request_id: u64,
@@ -31,7 +31,7 @@ pub enum Request {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum Response {
+pub(crate) enum Response {
     Ready,
     Tool {
         request_id: u64,
@@ -41,25 +41,25 @@ pub enum Response {
         request_id: u64,
         authorization_id: u64,
         tool: String,
-        effects: Vec<ToolEffect>,
+        permissions: Vec<PermissionUse>,
         arguments: Value,
     },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct RemoteToolOutput {
+pub(crate) struct RemoteToolOutput {
     pub value: Value,
     pub images: Vec<RemoteImage>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct RemoteToolError {
+pub(crate) struct RemoteToolError {
     pub message: String,
     pub output: Option<RemoteToolOutput>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct RemoteImage {
+pub(crate) struct RemoteImage {
     pub reference: ImageReference,
     pub data_base64: String,
 }
@@ -82,7 +82,7 @@ impl From<RemoteToolOutput> for ToolOutput {
     }
 }
 
-pub async fn write_frame<W, T>(writer: &mut W, value: &T) -> Result<(), std::io::Error>
+pub(crate) async fn write_frame<W, T>(writer: &mut W, value: &T) -> Result<(), std::io::Error>
 where
     W: AsyncWrite + Unpin,
     T: Serialize,
@@ -102,7 +102,7 @@ where
     writer.flush().await
 }
 
-pub async fn read_frame<R, T>(reader: &mut R) -> Result<Option<T>, std::io::Error>
+pub(crate) async fn read_frame<R, T>(reader: &mut R) -> Result<Option<T>, std::io::Error>
 where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,

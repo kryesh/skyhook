@@ -41,7 +41,7 @@ struct StoreInner {
     durable: bool,
     writer: Mutex<SessionWriter>,
     events: broadcast::Sender<EventRecord>,
-    _lock: Option<std::fs::File>,
+    _lock: Mutex<Option<std::fs::File>>,
 }
 
 #[derive(Clone)]
@@ -84,7 +84,7 @@ impl SessionStore {
             .rposition(|byte| *byte == b'\n')
             .map_or(0, |position| position + 1);
         let complete = &bytes[..complete_len];
-        let records = parse_records(complete)?;
+        let records = parse_lines(complete)?;
         event::validate_records(&records, id)?;
         if complete_len != bytes.len() {
             let file = OpenOptions::new().write(true).open(&path).await?;
@@ -137,7 +137,7 @@ impl SessionStore {
                     next_sequence,
                 }),
                 events,
-                _lock: lock,
+                _lock: Mutex::new(lock),
             }),
         })
     }
@@ -183,6 +183,21 @@ impl SessionStore {
         writer.next_sequence = writer.next_sequence.saturating_add(1);
         let _ = self.inner.events.send(record.clone());
         Ok(record)
+    }
+
+    /// Flushes this handle and releases its durable session lock even when
+    /// read-only clones remain alive briefly in supervised state.
+    #[cfg(test)]
+    pub(crate) async fn close(&self) -> Result<(), SessionError> {
+        let mut writer = self.inner.writer.lock().await;
+        if let Some(mut file) = writer.file.take() {
+            file.flush().await?;
+            file.get_ref().sync_data().await?;
+        }
+        if let Some(lock) = self.inner._lock.lock().await.take() {
+            FileExt::unlock(&lock)?;
+        }
+        Ok(())
     }
 
     pub async fn write_job_output(
@@ -311,10 +326,6 @@ impl SessionStore {
     }
 }
 
-fn parse_records(bytes: &[u8]) -> Result<Vec<EventRecord>, SessionError> {
-    parse_lines(bytes)
-}
-
 fn parse_lines<T>(bytes: &[u8]) -> Result<Vec<T>, SessionError>
 where
     T: for<'de> Deserialize<'de>,
@@ -397,14 +408,10 @@ mod tests {
         let id = store.id();
         let agent = AgentId::root(id);
         store
-            .append(
-                agent,
-                SessionEvent::Error {
-                    message: "test".to_owned(),
-                },
-            )
+            .append(agent, SessionEvent::AgentInterrupted)
             .await
             .unwrap();
+        store.close().await.unwrap();
         drop(store);
         let path = root.path().join(id.to_string()).join("events.jsonl");
         let mut file = OpenOptions::new().append(true).open(&path).await.unwrap();
@@ -421,12 +428,7 @@ mod tests {
         let store = SessionStore::create_ephemeral(root.path()).await.unwrap();
         let directory = store.directory().to_path_buf();
         store
-            .append(
-                AgentId::root(store.id()),
-                SessionEvent::Error {
-                    message: "transient".to_owned(),
-                },
-            )
+            .append(AgentId::root(store.id()), SessionEvent::AgentInterrupted)
             .await
             .unwrap();
         let image = store

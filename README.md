@@ -44,8 +44,9 @@ Use `--config path.toml` to use an explicit config instead of the user config, `
 to override the root model profile, `--approve-all` to skip all tool approval prompts, and `--workspace PATH`
 to choose the tool root, and `--resume SESSION_ID` to reopen a durable session. Pass a one-shot
 prompt with `-p/--prompt`, or run a JavaScript workflow file through the registered script tool with
-`-s/--script`. Without either option, the CLI reads prompts interactively. Its default policy allows workspace reads and agent
-state operations, while workspace writes and process execution require confirmation.
+`-s/--script`. Without either option, the CLI reads prompts interactively. Its default policy allows
+reads, agent state operations, and writes inside the root workspace. Process execution, remote
+access, target configuration changes, and writes outside the root workspace require confirmation.
 Set top-level `approve_all = true` in the config for the same non-interactive approval behavior.
 Streamed assistant messages and concise tool-start summaries are prefixed with their session-local
 agent ID (`root`, `1`, `1:1`, and so on), so root and child-agent activity remains distinguishable
@@ -53,6 +54,10 @@ during concurrent workflows. When the CLI closes the session, it prints cumulati
 input, and uncached input token counts.
 
 ## SSH targets
+
+Set top-level `targets_enabled = true` to grant the session's target capability. When it is false
+(the default), target-management tools, target arguments, JavaScript target setters, and target
+prompt guidance are all omitted from the model-visible surface.
 
 Targets are named directly under `[targets.<name>]`. Importing concrete aliases from the user's
 SSH configuration is disabled by default. Session tools can upsert targets without modifying TOML.
@@ -79,7 +84,21 @@ Authentication kinds are `openssh`, `agent`, `key`, and `interactive`. Interacti
 requested by the host with terminal echo disabled and never enter tool arguments or session logs.
 `via` references another named target and may form an acyclic jump chain.
 
-Use `target` with `exec`, `shell`, or `agent`; `root` explicitly selects the local invocation.
+`root` is the built-in local target, always the main Skyhook process rather than an SSH alias. The
+target-aware `read`, `search`, `glob`, `exec`, and `shell` tools use these rules:
+
+- Omitting `target` uses the calling agent's target and current workspace.
+- Setting `target: "root"` uses the local host and root workspace.
+- Setting another named target uses its configured workspace, except that explicitly selecting the
+  calling agent's current named target retains that agent's workspace override.
+
+Prefer these named targets to manually running `ssh`. The first tool in a session that needs an SSH
+route asks for approval before any probe, authentication, or shim deployment. Approval is shared
+across tools and workspace-specific pooled connections; reconnecting an unchanged route does not
+prompt again. Changing a target or any hop in its `via` route invalidates the affected approval.
+
+JavaScript remains host-owned while nested targeted tools inherit their caller's location. The
+`agent` tool also accepts a named target or `root`.
 Remote agent state machines, providers, approvals, message history, and canonical session logging
 remain host-owned. The shim retains only live remote tool/process execution state and unclaimed
 background-job results; its worker store is ephemeral.
@@ -95,9 +114,9 @@ they are not stored in the TOML file. `openai_compatible` accepts an optional `a
 local endpoint can be keyless. Its `api` is either `chat_completions` or `responses`.
 
 ```toml
-version = 1
 default_model_profile = "local"
 approve_all = false
+targets_enabled = false
 
 [providers.local]
 kind = "openai_compatible"
@@ -129,8 +148,8 @@ const matches = tool.search({ pattern: "TODO", path: "src" });
 const firstLines = tool.read().path("README.md").start(1).limit(40);
 
 // Selecting a skill loads its SKILL.md; selecting an asset changes the operation.
-const instructions = tool.skill("release");
-const template = tool.skill("release").asset({ path: "template.md" });
+const instructions = tool.skill({ name: "release" });
+const template = tool.skill({ name: "release", path: "template.md" });
 
 // Builders nested in the returned value are resolved concurrently.
 return { packageFile, matches, firstLines, instructions, template };
@@ -189,7 +208,7 @@ stop active provider streams and cancel jobs across the session's agent tree.
 ## Built-in tools
 
 `read`, `search`, `glob`, `exec`, `shell`, `write`, `replace`, `patch`, `remove`, `script`, `targets`,
-`target_add`, `jobs`, `wait`, `ask`, `todo`, and `agent`. `jobs()` returns the current agent's active
+`target_add`, `jobs`, `wait`, `ask`, and `agent`. `jobs()` returns the current agent's active
 jobs and excludes the listing call itself and, when called from a script, its containing script;
 use `jobs({all:true})` to include terminal history. The remaining job controls are kept out of model tool definitions and exposed to scripts as
 `tool.job(id).inspect()`, `.send({value})`, `.cancel()`, and `.events({after, limit})`;

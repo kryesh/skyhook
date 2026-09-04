@@ -1,4 +1,4 @@
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::Arc;
 
 use tokio::{
     fs,
@@ -9,7 +9,7 @@ use crate::session::{
     EventRecord, SessionError, SessionEvent, SessionStore, is_safe_artifact_path,
 };
 
-use super::{JOB_INPUT_CAPACITY, JobEntry, JobError, JobManager, JobState};
+use super::{CancellationToken, JOB_INPUT_CAPACITY, JobEntry, JobError, JobManager, JobState};
 
 pub(super) async fn restore(
     store: SessionStore,
@@ -25,6 +25,7 @@ pub(super) async fn restore(
                 tool,
                 accepts_input,
                 background,
+                location,
                 ..
             } => {
                 maximum = maximum.max(job.get());
@@ -41,8 +42,7 @@ pub(super) async fn restore(
                         error: None,
                         accepts_input: *accepts_input,
                         input,
-                        cancellation: Arc::new(AtomicBool::new(false)),
-                        cancellation_notify: Arc::new(Notify::new()),
+                        cancellation: CancellationToken::new(),
                         notify: Arc::new(Notify::new()),
                         operation: Arc::new(tokio::sync::Mutex::new(())),
                         task_abort: None,
@@ -52,6 +52,7 @@ pub(super) async fn restore(
                         injected: false,
                         background: *background,
                         authorization_scope: None,
+                        location: location.clone(),
                     },
                 );
             }

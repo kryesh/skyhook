@@ -1,5 +1,12 @@
-use std::{collections::HashMap, io::Write as _, path::Path, process::Stdio, sync::Arc};
+use std::{
+    collections::HashMap,
+    io::Write as _,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::Arc,
+};
 
+use futures_util::future::{BoxFuture, FutureExt as _, Shared};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _},
@@ -9,14 +16,13 @@ use tokio::{
 };
 
 use crate::{
-    remote::{
-        ArtifactError, EmbeddedShim, EmbeddedShimCatalog, RejectSensitivePrompts,
-        SensitivePromptHandler,
-    },
-    target::{TargetAuth, TargetDefinition, TargetError, TargetRegistry},
+    job::CancellationToken,
+    remote::{ArtifactError, EmbeddedShim, EmbeddedShimCatalog, SensitivePromptHandler},
+    target::{ResolvedRoute, RouteIdentity, TargetAuth, TargetDefinition, TargetError},
     tool::{
         ToolContext, ToolError, ToolOutput,
-        policy::{AllowAll, AuthorizationRequest, Policy, PolicyDecision},
+        authorization::{AuthorizationCoordinator, AuthorizationError},
+        policy::{PermissionUse, PolicyDecision},
     },
 };
 
@@ -25,25 +31,77 @@ use super::protocol::{
 };
 
 #[derive(Clone)]
-pub struct RemoteManager {
+pub(crate) struct RemoteManager {
     inner: Arc<RemoteInner>,
 }
 
 struct RemoteInner {
-    targets: TargetRegistry,
     catalog: EmbeddedShimCatalog,
-    pool: Mutex<HashMap<String, Arc<PooledConnection>>>,
+    pool: Mutex<HashMap<ConnectionKey, Arc<PooledSlot>>>,
     prompts: Arc<dyn SensitivePromptHandler>,
-    policy: Arc<dyn Policy>,
+    authorization: AuthorizationCoordinator,
+    #[cfg(test)]
+    factory: Option<Arc<dyn ConnectionFactory>>,
 }
 
-struct PooledConnection {
-    fingerprint: String,
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct ConnectionRequest {
+    pub target: String,
+    pub route: Vec<TargetDefinition>,
+    pub workspace: PathBuf,
+}
+
+#[cfg(test)]
+pub(crate) trait ConnectionFactory: Send + Sync {
+    fn connect(
+        &self,
+        request: ConnectionRequest,
+    ) -> BoxFuture<'static, Result<PooledConnection, RemoteError>>;
+}
+
+pub(crate) struct PooledConnection {
     writer: Arc<Mutex<RequestWriter>>,
     state: Arc<Mutex<ConnectionState>>,
     child: Mutex<Child>,
     reader: JoinHandle<()>,
     _config: tempfile::TempDir,
+}
+
+struct PooledSlot {
+    connection: Shared<BoxFuture<'static, Result<Arc<PooledConnection>, RemoteError>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ConnectionKey {
+    route: RouteIdentity,
+    workspace: PathBuf,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedConnection {
+    manager: RemoteManager,
+    key: ConnectionKey,
+    slot: Arc<PooledSlot>,
+    connection: Arc<PooledConnection>,
+}
+
+impl PreparedConnection {
+    pub(crate) async fn execute(
+        self,
+        name: String,
+        arguments: serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<ToolOutput, RemoteError> {
+        let result = call_tool(&self.connection, name, arguments, context).await;
+        if matches!(
+            result,
+            Err(RemoteError::Io { .. } | RemoteError::Protocol(_))
+        ) {
+            self.manager.discard(&self).await;
+        }
+        result
+    }
 }
 
 struct RequestWriter {
@@ -52,7 +110,7 @@ struct RequestWriter {
 }
 
 type RemoteToolResult = Result<RemoteToolOutput, RemoteToolError>;
-type PendingResult = Result<RemoteToolResult, ConnectionFailure>;
+type PendingResult = Result<RemoteToolResult, RemoteError>;
 
 struct PendingCall {
     sender: oneshot::Sender<PendingResult>,
@@ -61,184 +119,137 @@ struct PendingCall {
 
 struct ConnectionState {
     pending: HashMap<u64, PendingCall>,
-    failure: Option<ConnectionFailure>,
-}
-
-#[derive(Clone, Debug)]
-enum ConnectionFailure {
-    Io {
-        kind: std::io::ErrorKind,
-        message: String,
-    },
-    Protocol(String),
-}
-
-impl ConnectionFailure {
-    fn io(error: std::io::Error) -> Self {
-        Self::Io {
-            kind: error.kind(),
-            message: error.to_string(),
-        }
-    }
-
-    fn into_remote_error(self) -> RemoteError {
-        match self {
-            Self::Io { kind, message } => RemoteError::Io(std::io::Error::new(kind, message)),
-            Self::Protocol(message) => RemoteError::Protocol(message),
-        }
-    }
+    failure: Option<RemoteError>,
 }
 
 impl RemoteManager {
-    #[must_use]
-    pub fn new(targets: TargetRegistry) -> Self {
+    pub(crate) fn new(
+        catalog: EmbeddedShimCatalog,
+        prompts: Arc<dyn SensitivePromptHandler>,
+        authorization: AuthorizationCoordinator,
+    ) -> Self {
         Self {
             inner: Arc::new(RemoteInner {
-                targets,
-                catalog: EmbeddedShimCatalog::default(),
+                catalog,
                 pool: Mutex::new(HashMap::new()),
-                prompts: Arc::new(RejectSensitivePrompts),
-                policy: Arc::new(AllowAll),
+                prompts,
+                authorization,
+                #[cfg(test)]
+                factory: None,
             }),
         }
     }
 
-    /// Replaces the remote shim artifacts available to new connections.
-    #[must_use]
-    pub fn with_shim_catalog(mut self, catalog: EmbeddedShimCatalog) -> Self {
-        if let Some(inner) = Arc::get_mut(&mut self.inner) {
-            inner.catalog = catalog;
-        } else {
-            self = Self {
-                inner: Arc::new(RemoteInner {
-                    targets: self.inner.targets.clone(),
-                    catalog,
-                    pool: Mutex::new(HashMap::new()),
-                    prompts: self.inner.prompts.clone(),
-                    policy: self.inner.policy.clone(),
-                }),
-            };
-        }
+    #[cfg(test)]
+    pub(crate) fn with_connection_factory(mut self, factory: Arc<dyn ConnectionFactory>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("connection factories are installed before sharing a manager")
+            .factory = Some(factory);
         self
     }
 
-    #[must_use]
-    pub fn with_prompt_handler(mut self, prompts: Arc<dyn SensitivePromptHandler>) -> Self {
-        if let Some(inner) = Arc::get_mut(&mut self.inner) {
-            inner.prompts = prompts;
-        } else {
-            self = Self {
-                inner: Arc::new(RemoteInner {
-                    targets: self.inner.targets.clone(),
-                    catalog: self.inner.catalog.clone(),
-                    pool: Mutex::new(HashMap::new()),
-                    prompts,
-                    policy: self.inner.policy.clone(),
-                }),
-            };
-        }
-        self
-    }
-
-    #[must_use]
-    pub fn with_policy(mut self, policy: Arc<dyn Policy>) -> Self {
-        if let Some(inner) = Arc::get_mut(&mut self.inner) {
-            inner.policy = policy;
-        } else {
-            self = Self {
-                inner: Arc::new(RemoteInner {
-                    targets: self.inner.targets.clone(),
-                    catalog: self.inner.catalog.clone(),
-                    pool: Mutex::new(HashMap::new()),
-                    prompts: self.inner.prompts.clone(),
-                    policy,
-                }),
-            };
-        }
-        self
-    }
-
-    pub async fn invalidate(&self, names: &[String]) {
-        let mut pool = self.inner.pool.lock().await;
-        pool.retain(|key, _| {
-            !names
-                .iter()
-                .any(|name| key == name || key.starts_with(&format!("{name}\0")))
-        });
-    }
-
-    pub async fn execute_tool(
+    pub(crate) async fn connection(
         &self,
-        target: &str,
-        workspace: Option<&Path>,
-        name: String,
-        arguments: serde_json::Value,
-    ) -> Result<ToolOutput, RemoteError> {
-        let key = connection_key(target, workspace);
-        let connection = self.connection(target, workspace).await?;
-        let result = call_tool(&connection, name, arguments, None).await;
-        self.finish_call(key, connection, result).await
-    }
-
-    pub(crate) async fn execute_tool_cancellable(
-        &self,
-        target: &str,
-        workspace: Option<&Path>,
-        name: String,
-        arguments: serde_json::Value,
-        context: &ToolContext,
-    ) -> Result<ToolOutput, RemoteError> {
-        let key = connection_key(target, workspace);
-        let connection = self.connection(target, workspace).await?;
-        let result = call_tool(&connection, name, arguments, Some(context)).await;
-        self.finish_call(key, connection, result).await
-    }
-
-    async fn finish_call(
-        &self,
-        key: String,
-        connection: Arc<PooledConnection>,
-        result: Result<ToolOutput, RemoteError>,
-    ) -> Result<ToolOutput, RemoteError> {
-        if matches!(result, Err(RemoteError::Io(_) | RemoteError::Protocol(_))) {
+        route: ResolvedRoute,
+        workspace: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<PreparedConnection, RemoteError> {
+        let key = ConnectionKey {
+            route: route.identity.clone(),
+            workspace: workspace.to_path_buf(),
+        };
+        let slot = {
             let mut pool = self.inner.pool.lock().await;
-            if pool
-                .get(&key)
-                .is_some_and(|current| Arc::ptr_eq(current, &connection))
-            {
-                pool.remove(&key);
+            if let Some(existing) = pool.get(&key) {
+                existing.clone()
+            } else {
+                let manager = self.clone();
+                let target = route.identity.destination.clone();
+                let definitions = route.definitions;
+                let workspace = workspace.to_path_buf();
+                let startup = tokio::spawn(async move {
+                    #[cfg(test)]
+                    if let Some(factory) = manager.inner.factory.clone() {
+                        return factory
+                            .connect(ConnectionRequest {
+                                target: target.clone(),
+                                route: definitions.clone(),
+                                workspace: workspace.clone(),
+                            })
+                            .await
+                            .map(Arc::new);
+                    }
+                    manager
+                        .connect(&target, &definitions, &workspace)
+                        .await
+                        .map(Arc::new)
+                });
+                let connection = async move {
+                    startup
+                        .await
+                        .map_err(|error| RemoteError::ConnectionTask(error.to_string()))?
+                }
+                .boxed()
+                .shared();
+                let slot = Arc::new(PooledSlot { connection });
+                pool.insert(key.clone(), slot.clone());
+                slot
+            }
+        };
+        let result = tokio::select! {
+            result = slot.connection.clone() => result,
+            () = cancellation.cancelled() => return Err(RemoteError::Cancelled),
+        };
+        match result {
+            Ok(connection) => Ok(PreparedConnection {
+                manager: self.clone(),
+                key,
+                slot,
+                connection,
+            }),
+            Err(error) => {
+                self.remove_slot(&key, &slot).await;
+                Err(error)
             }
         }
-        result
     }
 
-    async fn connection(
-        &self,
-        target: &str,
-        workspace: Option<&Path>,
-    ) -> Result<Arc<PooledConnection>, RemoteError> {
-        let route = self.inner.targets.route(target).await?;
-        let workspace_key =
-            workspace.map_or_else(String::new, |path| path.to_string_lossy().into_owned());
-        let key = connection_key(target, workspace);
-        let fingerprint = format!("{}:{workspace_key}", route_fingerprint(&route)?);
+    pub(crate) async fn is_current(&self, prepared: &PreparedConnection) -> bool {
+        self.inner
+            .pool
+            .lock()
+            .await
+            .get(&prepared.key)
+            .is_some_and(|slot| Arc::ptr_eq(slot, &prepared.slot))
+    }
+
+    pub(crate) async fn discard(&self, prepared: &PreparedConnection) {
+        self.remove_slot(&prepared.key, &prepared.slot).await;
+    }
+
+    async fn remove_slot(&self, key: &ConnectionKey, slot: &Arc<PooledSlot>) {
         let mut pool = self.inner.pool.lock().await;
-        if let Some(existing) = pool.get(&key)
-            && existing.fingerprint == fingerprint
+        if pool
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, slot))
         {
-            return Ok(existing.clone());
+            pool.remove(key);
         }
-        let connection = Arc::new(self.connect(target, &route, workspace, fingerprint).await?);
-        pool.insert(key, connection.clone());
-        Ok(connection)
+    }
+
+    pub(crate) async fn invalidate(&self, names: &[String]) {
+        self.inner
+            .pool
+            .lock()
+            .await
+            .retain(|key, _| !names.contains(&key.route.destination));
     }
 
     async fn connect(
         &self,
         target: &str,
         route: &[TargetDefinition],
-        workspace_override: Option<&Path>,
-        fingerprint: String,
+        workspace: &Path,
     ) -> Result<PooledConnection, RemoteError> {
         let config = SshConfig::create(route, self.inner.prompts.clone()).await?;
         let destination = config.destination.clone();
@@ -246,7 +257,7 @@ impl RemoteManager {
         let mut lines = probe.lines();
         let os = lines.next().ok_or(RemoteError::InvalidProbe)?.trim();
         let arch = lines.next().ok_or(RemoteError::InvalidProbe)?.trim();
-        let shim = self.inner.catalog.find(arch, os)?.ok_or_else(|| {
+        let shim = self.inner.catalog.find(arch, os).ok_or_else(|| {
             if self.inner.catalog.is_empty() {
                 RemoteError::MissingShims
             } else {
@@ -258,9 +269,7 @@ impl RemoteManager {
         })?;
         let remote_path = ensure_shim(&config, &destination, &shim).await?;
         let target_workspace = &route.last().ok_or(RemoteError::EmptyRoute)?.workspace;
-        let workspace = workspace_override
-            .unwrap_or(target_workspace)
-            .to_string_lossy();
+        let workspace = workspace.to_string_lossy();
         let remote_command = format!(
             "r=$(cd -- {} && pwd -P) && cd -- {} && exec \"$HOME/{}\" --serve \"$r\"",
             shell_quote(&target_workspace.to_string_lossy()),
@@ -274,7 +283,7 @@ impl RemoteManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command.spawn().map_err(RemoteError::Start)?;
+        let mut child = command.spawn().map_err(RemoteError::start)?;
         let mut input = child
             .stdin
             .take()
@@ -319,20 +328,18 @@ impl RemoteManager {
         }));
         let reader_state = state.clone();
         let reader_writer = writer.clone();
-        let reader_policy = self.inner.policy.clone();
+        let reader_authorization = self.inner.authorization.clone();
         let reader_target = target.to_owned();
         let reader = tokio::spawn(async move {
             route_responses(
                 output,
                 &reader_state,
-                Some(&reader_writer),
-                Some(reader_policy),
+                Some((&reader_writer, &reader_authorization)),
                 reader_target,
             )
             .await;
         });
         Ok(PooledConnection {
-            fingerprint,
             writer,
             state,
             child: Mutex::new(child),
@@ -342,26 +349,19 @@ impl RemoteManager {
     }
 }
 
-fn connection_key(target: &str, workspace: Option<&Path>) -> String {
-    workspace.map_or_else(
-        || target.to_owned(),
-        |path| format!("{target}\0{}", path.to_string_lossy()),
-    )
-}
-
 async fn call_tool(
     connection: &PooledConnection,
     name: String,
     arguments: serde_json::Value,
-    context: Option<&ToolContext>,
+    context: &ToolContext,
 ) -> Result<ToolOutput, RemoteError> {
     let (request_id, receiver) = {
         let mut writer = connection.writer.lock().await;
         let Some(next_request_id) = writer.next_request_id.checked_add(1) else {
             drop(writer);
-            let failure = ConnectionFailure::Protocol("request ID space exhausted".to_owned());
+            let failure = RemoteError::Protocol("request ID space exhausted".to_owned());
             fail_connection(&connection.state, failure.clone()).await;
-            return Err(failure.into_remote_error());
+            return Err(failure);
         };
         let request_id = writer.next_request_id;
         writer.next_request_id = next_request_id;
@@ -369,13 +369,13 @@ async fn call_tool(
         {
             let mut state = connection.state.lock().await;
             if let Some(failure) = state.failure.clone() {
-                return Err(failure.into_remote_error());
+                return Err(failure);
             }
             state.pending.insert(
                 request_id,
                 PendingCall {
                     sender,
-                    context: context.cloned(),
+                    context: Some(context.clone()),
                 },
             );
         }
@@ -390,32 +390,25 @@ async fn call_tool(
         .await
         {
             drop(writer);
-            fail_connection(&connection.state, ConnectionFailure::io(error)).await;
+            fail_connection(&connection.state, RemoteError::io(error)).await;
         }
         (request_id, receiver)
     };
     let received = async {
-        receiver
-            .await
-            .map_err(|_| {
-                RemoteError::Protocol("remote response dispatcher stopped unexpectedly".to_owned())
-            })?
-            .map_err(ConnectionFailure::into_remote_error)
+        receiver.await.map_err(|_| {
+            RemoteError::Protocol("remote response dispatcher stopped unexpectedly".to_owned())
+        })?
     };
-    let result = if let Some(context) = context {
-        tokio::pin!(received);
-        tokio::select! {
-            result = &mut received => result?,
-            () = context.cancelled() => {
-                send_cancel(connection, request_id).await?;
-                return Err(RemoteError::Remote {
-                    message: "tool was cancelled".to_owned(),
-                    output: None,
-                });
-            }
+    tokio::pin!(received);
+    let result = tokio::select! {
+        result = &mut received => result?,
+        () = context.cancelled() => {
+            send_cancel(connection, request_id).await?;
+            return Err(RemoteError::Remote {
+                message: "tool was cancelled".to_owned(),
+                output: None,
+            });
         }
-    } else {
-        received.await?
     };
     match result {
         Ok(output) => Ok(output.into()),
@@ -432,9 +425,9 @@ async fn send_cancel(connection: &PooledConnection, request_id: u64) -> Result<(
         write_frame(&mut writer.input, &Request::Cancel { request_id }).await
     };
     if let Err(error) = result {
-        let failure = ConnectionFailure::io(error);
+        let failure = RemoteError::io(error);
         fail_connection(&connection.state, failure.clone()).await;
-        return Err(failure.into_remote_error());
+        return Err(failure);
     }
     Ok(())
 }
@@ -442,8 +435,7 @@ async fn send_cancel(connection: &PooledConnection, request_id: u64) -> Result<(
 async fn route_responses<R>(
     mut output: R,
     state: &Mutex<ConnectionState>,
-    writer: Option<&Mutex<RequestWriter>>,
-    policy: Option<Arc<dyn Policy>>,
+    host: Option<(&Mutex<RequestWriter>, &AuthorizationCoordinator)>,
     target: String,
 ) where
     R: AsyncRead + Unpin,
@@ -454,13 +446,13 @@ async fn route_responses<R>(
             Ok(None) => {
                 fail_connection(
                     state,
-                    ConnectionFailure::Protocol("shim closed before replying".to_owned()),
+                    RemoteError::Protocol("shim closed before replying".to_owned()),
                 )
                 .await;
                 return;
             }
             Err(error) => {
-                fail_connection(state, ConnectionFailure::io(error)).await;
+                fail_connection(state, RemoteError::io(error)).await;
                 return;
             }
         };
@@ -470,7 +462,7 @@ async fn route_responses<R>(
                 let Some(pending) = pending else {
                     fail_connection(
                         state,
-                        ConnectionFailure::Protocol(format!(
+                        RemoteError::Protocol(format!(
                             "response used unknown request ID {request_id}"
                         )),
                     )
@@ -483,31 +475,34 @@ async fn route_responses<R>(
                 request_id,
                 authorization_id,
                 tool,
-                effects,
+                mut permissions,
                 arguments,
             } => {
+                if let Err(error) = rebase_remote_permissions(&target, &mut permissions) {
+                    fail_connection(state, error).await;
+                    return;
+                }
                 let context = state
                     .lock()
                     .await
                     .pending
                     .get(&request_id)
                     .and_then(|pending| pending.context.clone());
-                let decision = if let (Some(context), Some(policy)) = (context, policy.as_ref()) {
-                    let authorization = policy.authorize(AuthorizationRequest {
-                        agent: context.agent.clone(),
-                        job: context.job,
-                        parent: None,
-                        scope: None,
-                        tool,
-                        target: target.clone(),
-                        effects,
-                        arguments,
-                    });
-                    tokio::pin!(authorization);
-                    tokio::select! {
-                        decision = &mut authorization => decision,
-                        () = context.cancelled() => PolicyDecision::Deny {
+                let decision = if let (Some(context), Some((_, coordinator))) = (context, host) {
+                    match coordinator
+                        .authorize(&context.authorization, tool, permissions, arguments)
+                        .await
+                    {
+                        Ok(()) => PolicyDecision::allow(),
+                        Err(AuthorizationError::Denied(reason)) => PolicyDecision::Deny { reason },
+                        Err(AuthorizationError::Cancelled) => PolicyDecision::Deny {
                             reason: "tool was cancelled".to_owned(),
+                        },
+                        Err(AuthorizationError::InvalidGrant(reason)) => {
+                            PolicyDecision::Deny { reason }
+                        }
+                        Err(AuthorizationError::Unavailable) => PolicyDecision::Deny {
+                            reason: "capability is unavailable".to_owned(),
                         },
                     }
                 } else {
@@ -516,13 +511,13 @@ async fn route_responses<R>(
                     }
                 };
                 let (allowed, reason) = match decision {
-                    PolicyDecision::Allow => (true, None),
+                    PolicyDecision::Allow { .. } => (true, None),
                     PolicyDecision::Deny { reason } => (false, Some(reason)),
                 };
-                let Some(writer) = writer else {
+                let Some((writer, _)) = host else {
                     fail_connection(
                         state,
-                        ConnectionFailure::Protocol(
+                        RemoteError::Protocol(
                             "remote authorization response writer is unavailable".to_owned(),
                         ),
                     )
@@ -541,16 +536,14 @@ async fn route_responses<R>(
                 )
                 .await
                 {
-                    fail_connection(state, ConnectionFailure::io(error)).await;
+                    fail_connection(state, RemoteError::io(error)).await;
                     return;
                 }
             }
             Response::Ready => {
                 fail_connection(
                     state,
-                    ConnectionFailure::Protocol(
-                        "received a second remote ready response".to_owned(),
-                    ),
+                    RemoteError::Protocol("received a second remote ready response".to_owned()),
                 )
                 .await;
                 return;
@@ -559,7 +552,41 @@ async fn route_responses<R>(
     }
 }
 
-async fn fail_connection(state: &Mutex<ConnectionState>, failure: ConnectionFailure) {
+fn rebase_remote_permissions(
+    target: &str,
+    permissions: &mut [PermissionUse],
+) -> Result<(), RemoteError> {
+    fn rebase_resource(
+        target: &str,
+        resource: &mut crate::tool::policy::ResourceId,
+    ) -> Result<(), RemoteError> {
+        if resource.namespace != "path" {
+            return Ok(());
+        }
+        let Some(origin) = resource.segments.first_mut() else {
+            return Err(RemoteError::Protocol(
+                "remote path permission omitted its execution target".to_owned(),
+            ));
+        };
+        if origin != "root" {
+            return Err(RemoteError::Protocol(format!(
+                "remote path permission used unexpected execution target `{origin}`"
+            )));
+        }
+        target.clone_into(origin);
+        Ok(())
+    }
+
+    for permission in permissions {
+        rebase_resource(target, &mut permission.resource)?;
+        if let Some(grant) = &mut permission.proposed_grant {
+            rebase_resource(target, &mut grant.resource)?;
+        }
+    }
+    Ok(())
+}
+
+async fn fail_connection(state: &Mutex<ConnectionState>, failure: RemoteError) {
     let pending = {
         let mut state = state.lock().await;
         if state.failure.is_some() {
@@ -577,6 +604,32 @@ impl Drop for PooledConnection {
     fn drop(&mut self) {
         self.reader.abort();
         let _ = self.child.get_mut().start_kill();
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn test_connection() -> PooledConnection {
+    let directory = tempfile::tempdir().unwrap();
+    let mut child = Command::new("sh")
+        .args(["-c", "sleep 60"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let input = child.stdin.take().unwrap();
+    PooledConnection {
+        writer: Arc::new(Mutex::new(RequestWriter {
+            input,
+            next_request_id: 1,
+        })),
+        state: Arc::new(Mutex::new(ConnectionState {
+            pending: HashMap::new(),
+            failure: None,
+        })),
+        child: Mutex::new(child),
+        reader: tokio::spawn(std::future::pending()),
+        _config: directory,
     }
 }
 
@@ -686,7 +739,7 @@ async fn resolve_openssh(
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())
         .kill_on_drop(true);
-    let output = command.output().await.map_err(RemoteError::Start)?;
+    let output = command.output().await.map_err(RemoteError::start)?;
     if !output.status.success() {
         return Err(RemoteError::Resolution(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
@@ -795,7 +848,7 @@ async fn run_ssh_output(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let output = command.output().await.map_err(RemoteError::Start)?;
+    let output = command.output().await.map_err(RemoteError::start)?;
     if !output.status.success() {
         return Err(RemoteError::Ssh(format!(
             "SSH exited with {}: {}",
@@ -811,8 +864,8 @@ async fn ensure_shim(
     destination: &str,
     shim: &EmbeddedShim,
 ) -> Result<String, RemoteError> {
-    let hash = shim.clone().sha256();
-    let name = shim.clone().installed_name();
+    let hash = shim.sha256();
+    let name = shim.installed_name();
     let directory = format!(".cache/skyhook/shims/{hash}");
     let path = format!("{directory}/{name}");
     let check = format!("test -x \"$HOME/{path}\" && \"$HOME/{path}\" --self-check {hash}");
@@ -832,7 +885,7 @@ async fn ensure_shim(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = command.spawn().map_err(RemoteError::Start)?;
+    let mut child = command.spawn().map_err(RemoteError::start)?;
     let mut input = child
         .stdin
         .take()
@@ -851,10 +904,6 @@ async fn ensure_shim(
     Ok(path)
 }
 
-fn route_fingerprint(route: &[TargetDefinition]) -> Result<String, RemoteError> {
-    Ok(crate::sha256_hex(serde_json::to_vec(route)?))
-}
-
 fn ssh_token(value: &str) -> Result<String, RemoteError> {
     if value.is_empty() || value.chars().any(char::is_control) {
         return Err(RemoteError::InvalidSshValue);
@@ -869,7 +918,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum RemoteError {
     #[error(transparent)]
     Target(#[from] TargetError),
@@ -881,10 +930,23 @@ pub enum RemoteError {
     MissingShims,
     #[error("unsupported remote platform {arch}-{os}: no matching shim is embedded")]
     UnsupportedPlatform { arch: String, os: String },
-    #[error("could not start SSH: {0}")]
-    Start(std::io::Error),
+    #[error("could not start SSH: {message}")]
+    Start {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
     #[error("SSH configuration resolution failed: {0}")]
     Resolution(String),
+    #[error("SSH target connection was denied: {0}")]
+    ApprovalDenied(String),
+    #[error("SSH target connection returned an invalid approval grant: {0}")]
+    ApprovalInvalidGrant(String),
+    #[error("SSH target connection requires an unavailable capability")]
+    ApprovalUnavailable,
+    #[error("target connection was cancelled")]
+    Cancelled,
+    #[error("remote connection startup task failed: {0}")]
+    ConnectionTask(String),
     #[error("SSH failed: {0}")]
     Ssh(String),
     #[error("remote shim deployment failed: {0}")]
@@ -904,13 +966,39 @@ pub enum RemoteError {
     InvalidProbe,
     #[error("SSH values cannot be empty or contain control characters")]
     InvalidSshValue,
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
+    #[error("{message}")]
+    Io {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+    #[error("{0}")]
+    Json(String),
 }
 
 impl RemoteError {
+    pub(crate) fn authorization(error: AuthorizationError) -> Self {
+        match error {
+            AuthorizationError::Denied(reason) => Self::ApprovalDenied(reason),
+            AuthorizationError::Cancelled => Self::Cancelled,
+            AuthorizationError::InvalidGrant(reason) => Self::ApprovalInvalidGrant(reason),
+            AuthorizationError::Unavailable => Self::ApprovalUnavailable,
+        }
+    }
+
+    fn start(error: std::io::Error) -> Self {
+        Self::Start {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+
+    fn io(error: std::io::Error) -> Self {
+        Self::Io {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+
     #[must_use]
     pub fn into_tool_error(self) -> ToolError {
         match self {
@@ -927,15 +1015,62 @@ impl RemoteError {
     }
 }
 
+impl From<std::io::Error> for RemoteError {
+    fn from(error: std::io::Error) -> Self {
+        Self::io(error)
+    }
+}
+
+impl From<serde_json::Error> for RemoteError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::policy::{ApprovalGrant, Capability, ResourceId};
 
     fn output(value: &str) -> RemoteToolResult {
         Ok(RemoteToolOutput {
             value: serde_json::json!(value),
             images: Vec::new(),
         })
+    }
+
+    #[test]
+    fn forwarded_path_permissions_are_rebased_to_the_destination() {
+        let path = ResourceId::new("path", ["root", "/", "outside"]);
+        let mut permissions = vec![
+            PermissionUse::new(Capability::Write, path.clone())
+                .with_grant(ApprovalGrant::descendants(Capability::Write, path)),
+        ];
+
+        rebase_remote_permissions("build", &mut permissions).unwrap();
+
+        assert_eq!(permissions[0].resource.segments[0], "build");
+        assert_eq!(
+            permissions[0]
+                .proposed_grant
+                .as_ref()
+                .unwrap()
+                .resource
+                .segments[0],
+            "build"
+        );
+    }
+
+    #[test]
+    fn forwarded_path_permissions_cannot_claim_another_target() {
+        let mut permissions = vec![PermissionUse::new(
+            Capability::Read,
+            ResourceId::new("path", ["other", "/", "outside"]),
+        )];
+        assert!(matches!(
+            rebase_remote_permissions("build", &mut permissions),
+            Err(RemoteError::Protocol(_))
+        ));
     }
 
     #[tokio::test]
@@ -966,7 +1101,7 @@ mod tests {
         }
         let reader_state = state.clone();
         let reader = tokio::spawn(async move {
-            route_responses(stream, &reader_state, None, None, "test".to_owned()).await;
+            route_responses(stream, &reader_state, None, "test".to_owned()).await;
         });
 
         write_frame(
@@ -1011,7 +1146,7 @@ mod tests {
         );
         let reader_state = state.clone();
         let reader = tokio::spawn(async move {
-            route_responses(stream, &reader_state, None, None, "test".to_owned()).await;
+            route_responses(stream, &reader_state, None, "test".to_owned()).await;
         });
 
         write_frame(
@@ -1026,7 +1161,7 @@ mod tests {
 
         assert!(matches!(
             receiver.await.unwrap(),
-            Err(ConnectionFailure::Protocol(message))
+            Err(RemoteError::Protocol(message))
                 if message.contains("unknown request ID 99")
         ));
         reader.await.unwrap();
@@ -1049,14 +1184,14 @@ mod tests {
         );
         let reader_state = state.clone();
         let reader = tokio::spawn(async move {
-            route_responses(stream, &reader_state, None, None, "test".to_owned()).await;
+            route_responses(stream, &reader_state, None, "test".to_owned()).await;
         });
 
         drop(peer);
 
         assert!(matches!(
             receiver.await.unwrap(),
-            Err(ConnectionFailure::Protocol(message))
+            Err(RemoteError::Protocol(message))
                 if message.contains("closed before replying")
         ));
         reader.await.unwrap();

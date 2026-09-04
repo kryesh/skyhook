@@ -6,8 +6,8 @@ use serde_json::Value;
 
 use crate::{
     identity::JobId,
-    job::{JobEnvelope, JobManager, JobProgressRecord, JobState},
-    tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::ToolEffect},
+    job::{JobManager, JobProgressRecord, JobState, presented_job_schema},
+    tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder},
 };
 
 pub(super) fn register(
@@ -15,10 +15,12 @@ pub(super) fn register(
     jobs: JobManager,
 ) -> Result<(), RegistryError> {
     let list = jobs.clone();
-    builder.register::<JobsArgs, Vec<JobEnvelope>, _, _>(
+    builder.register::<JobsArgs, Value, _, _>(
         "jobs",
         "List active jobs owned by this agent, excluding this call and its containing script. Set `all` to include completed history.",
-        ToolOptions::new(vec![ToolEffect::SessionState]),
+        ToolOptions::default().generated_output_schema(|capabilities| {
+            presented_job_schema(capabilities, true)
+        }),
         move |context, args| {
             let jobs = list.clone();
             async move {
@@ -35,38 +37,51 @@ pub(super) fn register(
                 } else {
                     None
                 };
-                Ok(jobs
+                let envelopes = jobs
                     .list(&context.agent)
                     .await
                     .into_iter()
                     .filter(|job| job.id != context.job && Some(job.id) != containing_script)
                     .filter(|job| args.all || !job.state.is_terminal())
-                    .collect())
+                    .collect::<Vec<_>>();
+                Ok(Value::Array(
+                    envelopes
+                        .iter()
+                        .map(|job| job.presented(&context.capabilities))
+                        .collect::<Result<_, _>>()?,
+                ))
             }
         },
     )?;
     let inspect = jobs.clone();
-    builder.register::<JobArgs, JobEnvelope, _, _>(
+    builder.register::<JobArgs, Value, _, _>(
         "job_inspect",
         "Inspect one job without claiming its result.",
-        ToolOptions::new(vec![ToolEffect::SessionState])
+        ToolOptions::default()
+            .generated_output_schema(|capabilities| presented_job_schema(capabilities, false))
             .script_only()
             .job_method("inspect", "job"),
-        move |_context, args| {
+        move |context, args| {
             let jobs = inspect.clone();
             async move {
                 jobs.snapshot(args.job)
                     .await
                     .map_err(|error| job_error(&error))
+                    .and_then(|job| {
+                        job.presented(&context.capabilities)
+                            .map_err(ToolError::from)
+                    })
             }
         },
     )?;
     let wait = jobs.clone();
-    builder.register::<JobWaitArgs, JobEnvelope, _, _>(
+    builder.register::<JobWaitArgs, Value, _, _>(
         "wait",
         "Wait for and claim the next question or terminal result from a job. A waiting_input result can be answered with job_send.",
-        ToolOptions::new(vec![ToolEffect::SessionState]).job_method("wait", "job"),
-        move |_context, args| {
+        ToolOptions::default()
+            .generated_output_schema(|capabilities| presented_job_schema(capabilities, false))
+            .job_method("wait", "job"),
+        move |context, args| {
             let jobs = wait.clone();
             async move {
                 if args
@@ -80,6 +95,7 @@ pub(super) fn register(
                 jobs.wait(args.job, args.timeout.map(Duration::from_secs), true)
                     .await
                     .map_err(|error| job_error(&error))
+                    .and_then(|job| job.presented(&context.capabilities).map_err(ToolError::from))
             }
         },
     )?;
@@ -87,7 +103,7 @@ pub(super) fn register(
     builder.register::<JobSendArgs, Value, _, _>(
         "job_send",
         "Send JSON input to a running job. For an agent in waiting_input, send answers to its stable agent job ID.",
-        ToolOptions::new(vec![ToolEffect::SessionState])
+        ToolOptions::default()
             .script_only()
             .job_method("send", "job"),
         move |_context, args| {
@@ -101,25 +117,30 @@ pub(super) fn register(
         },
     )?;
     let cancel = jobs.clone();
-    builder.register::<JobArgs, JobEnvelope, _, _>(
+    builder.register::<JobArgs, Value, _, _>(
         "job_cancel",
         "Request cancellation of a job.",
-        ToolOptions::new(vec![ToolEffect::SessionState])
+        ToolOptions::default()
+            .generated_output_schema(|capabilities| presented_job_schema(capabilities, false))
             .script_only()
             .job_method("cancel", "job"),
-        move |_context, args| {
+        move |context, args| {
             let jobs = cancel.clone();
             async move {
                 jobs.cancel(args.job)
                     .await
                     .map_err(|error| job_error(&error))
+                    .and_then(|job| {
+                        job.presented(&context.capabilities)
+                            .map_err(ToolError::from)
+                    })
             }
         },
     )?;
     builder.register::<JobEventsArgs, JobEventsOutput, _, _>(
         "job_events",
         "Read typed progress events after a durable cursor.",
-        ToolOptions::new(vec![ToolEffect::SessionState])
+        ToolOptions::default()
             .script_only()
             .job_method("events", "job"),
         move |_context, args| {
@@ -218,6 +239,8 @@ mod tests {
     use super::*;
     use crate::{
         identity::AgentId,
+        job::JobEnvelope,
+        job::JobSpec,
         session::SessionStore,
         tool::{ToolOutput, ToolRegistryBuilder, executor::ToolExecutor, policy::AllowAll},
     };
@@ -229,28 +252,18 @@ mod tests {
         let agent = AgentId::root(store.id());
         let jobs = JobManager::new(store);
         let active = jobs
-            .create(
-                agent.clone(),
-                None,
-                "active".to_owned(),
-                serde_json::json!({}),
-                false,
-                true,
-                None,
-            )
+            .create(JobSpec {
+                background: true,
+                ..JobSpec::test(agent.clone(), "active")
+            })
             .await
             .unwrap()
             .id;
         let completed = jobs
-            .create(
-                agent.clone(),
-                None,
-                "completed".to_owned(),
-                serde_json::json!({}),
-                false,
-                true,
-                None,
-            )
+            .create(JobSpec {
+                background: true,
+                ..JobSpec::test(agent.clone(), "completed")
+            })
             .await
             .unwrap()
             .id;
@@ -264,7 +277,12 @@ mod tests {
             Arc::new(AllowAll),
             jobs.clone(),
             root.path().to_path_buf(),
-        );
+        )
+        .with_capabilities({
+            let mut capabilities = crate::tool::policy::CapabilitySet::default();
+            capabilities.insert(crate::tool::policy::Capability::Targets);
+            capabilities
+        });
 
         let current = executor
             .execute(agent.clone(), "jobs", serde_json::json!({}), None)
@@ -277,15 +295,11 @@ mod tests {
         );
 
         let script = jobs
-            .create(
-                agent.clone(),
-                None,
-                "script".to_owned(),
-                serde_json::json!({}),
-                true,
-                true,
-                None,
-            )
+            .create(JobSpec {
+                accepts_input: true,
+                background: true,
+                ..JobSpec::test(agent.clone(), "script")
+            })
             .await
             .unwrap()
             .id;

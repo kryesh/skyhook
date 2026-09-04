@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    agent::todo::TodoItem,
+    execution::ExecutionLocation,
     identity::{AgentId, JobId, SessionId},
     job::JobState,
     media::ImageReference,
@@ -23,11 +23,6 @@ use super::{SESSION_FORMAT_VERSION, SessionError};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
     SessionStarted {
-        workspace: PathBuf,
-        root_model_profile: String,
-        root_agent_profile: Option<String>,
-    },
-    TargetsSnapshot {
         targets: Vec<TargetDefinition>,
     },
     TargetUpserted {
@@ -37,19 +32,13 @@ pub enum SessionEvent {
         parent: Option<AgentId>,
         model_profile: String,
         agent_profile: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        target: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        workspace: Option<PathBuf>,
+        location: ExecutionLocation,
     },
     MessageCommitted {
         message: Message,
     },
     Usage {
         usage: Usage,
-    },
-    TodoReplaced {
-        items: Vec<TodoItem>,
     },
     JobCreated {
         job: JobId,
@@ -58,6 +47,7 @@ pub enum SessionEvent {
         arguments: Value,
         accepts_input: bool,
         background: bool,
+        location: ExecutionLocation,
     },
     JobStateChanged {
         job: JobId,
@@ -88,10 +78,6 @@ pub enum SessionEvent {
     },
     AgentCompleted,
     AgentInterrupted,
-    SessionCompleted,
-    Error {
-        message: String,
-    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

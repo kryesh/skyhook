@@ -58,6 +58,23 @@ impl TargetDefinition {
             revision: 1,
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn test(name: &str, workspace: impl Into<PathBuf>, via: Option<&str>) -> Self {
+        Self::from_config(
+            name.to_owned(),
+            TargetConfig {
+                host: format!("{name}.example.com"),
+                user: None,
+                port: None,
+                workspace: workspace.into(),
+                via: via.map(str::to_owned),
+                auth: TargetAuth::Openssh,
+            },
+            TargetSource::Config,
+        )
+        .unwrap()
+    }
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize, PartialEq, Eq)]
@@ -106,10 +123,6 @@ impl TargetRegistry {
         })
     }
 
-    pub async fn snapshot(&self) -> Vec<TargetDefinition> {
-        self.entries.read().await.values().cloned().collect()
-    }
-
     pub async fn list(&self) -> Vec<TargetRecord> {
         let mut records = vec![TargetRecord {
             name: ROOT_TARGET.to_owned(),
@@ -139,22 +152,10 @@ impl TargetRegistry {
 
     pub async fn route(&self, name: &str) -> Result<Vec<TargetDefinition>, TargetError> {
         let entries = self.entries.read().await;
-        let mut route = Vec::new();
-        let mut current = name;
-        let mut visited = BTreeSet::new();
-        loop {
-            if !visited.insert(current.to_owned()) {
-                return Err(TargetError::Cycle(current.to_owned()));
-            }
-            let target = entries
-                .get(current)
-                .ok_or_else(|| TargetError::Unknown(current.to_owned()))?;
-            route.push(target.clone());
-            let Some(via) = target.via.as_deref() else {
-                break;
-            };
-            current = via;
-        }
+        let mut route = walk_route(&entries, name, TargetError::Unknown)?
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
         route.reverse();
         Ok(route)
     }
@@ -162,7 +163,7 @@ impl TargetRegistry {
     pub async fn upsert(
         &self,
         mut definition: TargetDefinition,
-    ) -> Result<Vec<String>, TargetError> {
+    ) -> Result<(TargetDefinition, Vec<String>), TargetError> {
         definition.source = TargetSource::Session;
         let mut entries = self.entries.write().await;
         definition.revision = entries
@@ -177,7 +178,8 @@ impl TargetRegistry {
             }
             return Err(error);
         }
-        Ok(dependants(&entries, &definition.name))
+        let invalidated = dependants(&entries, &definition.name);
+        Ok((definition, invalidated))
     }
 }
 
@@ -185,21 +187,8 @@ fn dependants(entries: &BTreeMap<String, TargetDefinition>, changed: &str) -> Ve
     entries
         .keys()
         .filter(|name| {
-            let mut current = name.as_str();
-            let mut visited = BTreeSet::new();
-            while let Some(target) = entries.get(current) {
-                if !visited.insert(current) {
-                    break;
-                }
-                if current == changed {
-                    return true;
-                }
-                let Some(via) = target.via.as_deref() else {
-                    break;
-                };
-                current = via;
-            }
-            false
+            walk_route(entries, name, TargetError::UnknownJump)
+                .is_ok_and(|route| route.iter().any(|target| target.name == changed))
         })
         .cloned()
         .collect()
@@ -207,25 +196,35 @@ fn dependants(entries: &BTreeMap<String, TargetDefinition>, changed: &str) -> Ve
 
 fn validate_graph(entries: &BTreeMap<String, TargetDefinition>) -> Result<(), TargetError> {
     for name in entries.keys() {
-        let mut current = name.as_str();
-        let mut visited = BTreeSet::new();
-        loop {
-            if !visited.insert(current) {
-                return Err(TargetError::Cycle(current.to_owned()));
-            }
-            let target = entries
-                .get(current)
-                .ok_or_else(|| TargetError::UnknownJump(current.to_owned()))?;
-            let Some(via) = target.via.as_deref() else {
-                break;
-            };
-            if via == ROOT_TARGET {
-                return Err(TargetError::RootCannotBeJump);
-            }
-            current = via;
-        }
+        walk_route(entries, name, TargetError::UnknownJump)?;
     }
     Ok(())
+}
+
+fn walk_route<'a>(
+    entries: &'a BTreeMap<String, TargetDefinition>,
+    name: &str,
+    unknown: fn(String) -> TargetError,
+) -> Result<Vec<&'a TargetDefinition>, TargetError> {
+    let mut route = Vec::new();
+    let mut current = name;
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(current) {
+            return Err(TargetError::Cycle(current.to_owned()));
+        }
+        let target = entries
+            .get(current)
+            .ok_or_else(|| unknown(current.to_owned()))?;
+        route.push(target);
+        let Some(via) = target.via.as_deref() else {
+            return Ok(route);
+        };
+        if via == ROOT_TARGET {
+            return Err(TargetError::RootCannotBeJump);
+        }
+        current = via;
+    }
 }
 
 fn validate_name(name: &str) -> Result<(), TargetError> {
@@ -258,7 +257,7 @@ fn validate_endpoint(host: &str, user: Option<&str>) -> Result<(), TargetError> 
     Ok(())
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum TargetError {
     #[error("invalid target name `{0}`")]
     InvalidName(String),
@@ -285,19 +284,7 @@ mod tests {
     use super::*;
 
     fn target(name: &str, via: Option<&str>) -> TargetDefinition {
-        TargetDefinition::from_config(
-            name.to_owned(),
-            TargetConfig {
-                host: format!("{name}.example.com"),
-                user: None,
-                port: None,
-                workspace: PathBuf::from("."),
-                via: via.map(str::to_owned),
-                auth: TargetAuth::Openssh,
-            },
-            TargetSource::Config,
-        )
-        .unwrap()
+        TargetDefinition::test(name, ".", via)
     }
 
     #[tokio::test]

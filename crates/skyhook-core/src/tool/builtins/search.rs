@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use super::workspace::{relative_path, resolve_existing};
 use crate::tool::{
     PathKind, RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
-    policy::{PathAccess, ToolEffect},
+    policy::{Capability, PathAccess},
 };
 
 const MAX_RESULTS: usize = 1_000;
@@ -18,31 +18,35 @@ const MAX_LINE_BYTES: usize = 32 * 1024;
 const MAX_OUTPUT_BYTES: usize = 512 * 1024;
 
 pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
-    builder.register::<SearchArgs, SearchOutput, _, _>(
+    builder.register_targeted::<SearchArgs, SearchOutput, _, _>(
         "search",
         "Search files with ripgrep regex, glob, and ignore semantics.",
-        ToolOptions::new(vec![ToolEffect::ReadWorkspace])
-            .workspace_bound()
-            .path_argument("path", PathAccess::Read, PathKind::Existing),
+        ToolOptions::new(vec![Capability::Read]).path_argument(
+            "path",
+            PathAccess::Read,
+            PathKind::Existing,
+        ),
         |context, args| async move {
             validate_limit(args.limit)?;
-            let root = resolve_existing(&context.workspace, &args.path).await?;
-            let workspace = context.workspace;
+            let root = resolve_existing(&context.execution_location.workspace, &args.path).await?;
+            let workspace = context.execution_location.workspace;
             tokio::task::spawn_blocking(move || search_blocking(&workspace, &root, &args))
                 .await
                 .map_err(|error| ToolError::Failed(error.to_string()))?
         },
     )?;
-    builder.register::<GlobArgs, GlobOutput, _, _>(
+    builder.register_targeted::<GlobArgs, GlobOutput, _, _>(
         "glob",
         "Find files with ripgrep glob and ignore semantics.",
-        ToolOptions::new(vec![ToolEffect::ReadWorkspace])
-            .workspace_bound()
-            .path_argument("path", PathAccess::Read, PathKind::Existing),
+        ToolOptions::new(vec![Capability::Read]).path_argument(
+            "path",
+            PathAccess::Read,
+            PathKind::Existing,
+        ),
         |context, args| async move {
             validate_limit(args.limit)?;
-            let root = resolve_existing(&context.workspace, &args.path).await?;
-            let workspace = context.workspace;
+            let root = resolve_existing(&context.execution_location.workspace, &args.path).await?;
+            let workspace = context.execution_location.workspace;
             tokio::task::spawn_blocking(move || glob_blocking(&workspace, &root, &args))
                 .await
                 .map_err(|error| ToolError::Failed(error.to_string()))?

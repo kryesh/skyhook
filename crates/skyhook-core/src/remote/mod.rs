@@ -4,11 +4,14 @@ mod artifact;
 mod askpass;
 mod manager;
 mod prompt;
-pub mod protocol;
+mod protocol;
 pub mod worker;
 
 pub use artifact::{ArtifactError, EmbeddedShim, EmbeddedShimCatalog};
-pub use manager::{RemoteError, RemoteManager};
+pub use manager::RemoteError;
+#[cfg(test)]
+pub(crate) use manager::{ConnectionFactory, ConnectionRequest, PooledConnection, test_connection};
+pub(crate) use manager::{PreparedConnection, RemoteManager};
 pub use prompt::{
     RejectSensitivePrompts, SecretValue, SensitivePrompt, SensitivePromptError,
     SensitivePromptFuture, SensitivePromptHandler, SensitivePromptKind,

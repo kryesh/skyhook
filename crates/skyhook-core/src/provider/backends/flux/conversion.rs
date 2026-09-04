@@ -1,15 +1,14 @@
 use flux_core::{
     Chunk, ContentBlock, Error as FluxError, ImageSource, Message as FluxMessage, Role,
-    StopReason as FluxStopReason, ToolResultContent,
+    ToolResultContent,
 };
 use flux_provider::{Effort, Request, RequestTrace};
 
 use crate::{
     provider::protocol::{
-        AssistantContent, Message, ModelRequest, ResponseChunk, StopReason, ToolCall, Usage,
-        UserContent,
+        AssistantContent, Message, ModelRequest, ResponseChunk, ToolCall, Usage, UserContent,
     },
-    provider::{ProviderError, ProviderErrorKind, RetryAdvice},
+    provider::{ProviderError, ProviderErrorKind},
 };
 
 pub(super) fn convert_request(request: ModelRequest) -> Result<Request, ProviderError> {
@@ -169,34 +168,24 @@ fn convert_assistant_content(content: AssistantContent) -> ContentBlock {
     }
 }
 
-pub(super) fn convert_chunk(chunk: Chunk) -> ResponseChunk {
+pub(super) fn convert_chunk(chunk: Chunk) -> Option<ResponseChunk> {
     match chunk {
-        Chunk::MessageStart { model } => ResponseChunk::MessageStart { model },
-        Chunk::TextDelta(text) => ResponseChunk::TextDelta { text },
-        Chunk::ThinkingDelta(text) => ResponseChunk::ReasoningDelta { text },
-        Chunk::ToolInputDelta { name, partial_json } => {
-            ResponseChunk::ToolInputDelta { name, partial_json }
-        }
-        Chunk::Block(block) => ResponseChunk::Block {
+        Chunk::TextDelta(text) => Some(ResponseChunk::TextDelta { text }),
+        Chunk::ThinkingDelta(text) => Some(ResponseChunk::ReasoningDelta { text }),
+        Chunk::Block(block) => Some(ResponseChunk::Block {
             block: convert_block(block),
-        },
-        Chunk::Usage(usage) => ResponseChunk::Usage {
+        }),
+        Chunk::Usage(usage) => Some(ResponseChunk::Usage {
             usage: Usage {
                 input_tokens: usage.input_tokens,
                 cached_input_tokens: usage.cache_read_input_tokens,
                 output_tokens: usage.output_tokens,
             },
-        },
-        Chunk::Done { stop_reason } => ResponseChunk::Done {
-            stop_reason: stop_reason.map(convert_stop_reason),
-        },
-        Chunk::StreamDiagnostic {
-            dropped_frames,
-            detail,
-        } => ResponseChunk::Diagnostic {
-            detail,
-            dropped_frames,
-        },
+        }),
+        Chunk::MessageStart { .. }
+        | Chunk::ToolInputDelta { .. }
+        | Chunk::Done { .. }
+        | Chunk::StreamDiagnostic { .. } => None,
     }
 }
 
@@ -225,16 +214,6 @@ fn convert_block(block: ContentBlock) -> AssistantContent {
     }
 }
 
-const fn convert_stop_reason(reason: FluxStopReason) -> StopReason {
-    match reason {
-        FluxStopReason::EndTurn | FluxStopReason::StopSequence => StopReason::Complete,
-        FluxStopReason::MaxTokens => StopReason::MaxTokens,
-        FluxStopReason::ToolUse | FluxStopReason::PauseTurn => StopReason::ToolUse,
-        FluxStopReason::Refusal => StopReason::Refusal,
-        FluxStopReason::Unknown => StopReason::Other,
-    }
-}
-
 pub(super) fn map_error(error: &FluxError) -> ProviderError {
     let kind = match error {
         FluxError::Auth(_) => ProviderErrorKind::Authentication,
@@ -244,14 +223,9 @@ pub(super) fn map_error(error: &FluxError) -> ProviderError {
         FluxError::Config(_) => ProviderErrorKind::InvalidRequest,
         _ => ProviderErrorKind::Response,
     };
-    let retry = match kind {
-        ProviderErrorKind::RateLimited | ProviderErrorKind::Transport => RetryAdvice::Backoff,
-        _ => RetryAdvice::Never,
-    };
     ProviderError {
         kind,
         message: error.to_string(),
-        retry,
     }
 }
 

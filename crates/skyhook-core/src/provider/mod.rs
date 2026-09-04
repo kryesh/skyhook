@@ -2,10 +2,8 @@ use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
-    time::Duration,
 };
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::provider::protocol::{ModelRequest, ResponseChunk};
@@ -29,8 +27,7 @@ pub trait ResponseHandle: Send {
     ) -> Poll<Option<Result<ResponseChunk, ProviderError>>>;
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderErrorKind {
     Authentication,
     RateLimited,
@@ -41,31 +38,11 @@ pub enum ProviderErrorKind {
     Response,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "kind", content = "seconds", rename_all = "snake_case")]
-pub enum RetryAdvice {
-    Never,
-    Backoff,
-    After(u64),
-}
-
-impl RetryAdvice {
-    #[must_use]
-    pub const fn duration(self) -> Option<Duration> {
-        match self {
-            Self::Never => None,
-            Self::Backoff => Some(Duration::from_millis(500)),
-            Self::After(seconds) => Some(Duration::from_secs(seconds)),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Error, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 #[error("{kind:?}: {message}")]
 pub struct ProviderError {
     pub kind: ProviderErrorKind,
     pub message: String,
-    pub retry: RetryAdvice,
 }
 
 impl ProviderError {
@@ -74,7 +51,6 @@ impl ProviderError {
         Self {
             kind: ProviderErrorKind::Protocol,
             message: message.into(),
-            retry: RetryAdvice::Never,
         }
     }
 }

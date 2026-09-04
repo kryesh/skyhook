@@ -21,20 +21,19 @@ pub(crate) use script::install_script_tool_weak;
 pub use skills::HostSkills;
 
 /// Register the standard workspace, process, and job-control tool set.
-pub fn register_coding_tools(
+pub(crate) fn register_coding_tools(
     builder: &mut ToolRegistryBuilder,
     store: SessionStore,
     jobs: JobManager,
     skills: HostSkills,
-    targets: crate::target::TargetRegistry,
-    remote: crate::remote::RemoteManager,
+    router: crate::target::TargetRouter,
 ) -> Result<(), RegistryError> {
     filesystem::register(builder, store.clone())?;
     search::register(builder)?;
-    process::register(builder, Some(remote.clone()))?;
+    process::register(builder)?;
     jobs::register(builder, jobs)?;
     skills::register(builder, skills)?;
-    targets::register(builder, store, targets, remote)?;
+    targets::register(builder, store, router)?;
     Ok(())
 }
 
@@ -46,7 +45,7 @@ pub fn register_worker_tools(
 ) -> Result<(), RegistryError> {
     filesystem::register(builder, store)?;
     search::register(builder)?;
-    process::register(builder, None)?;
+    process::register(builder)?;
     jobs::register(builder, jobs)?;
     Ok(())
 }

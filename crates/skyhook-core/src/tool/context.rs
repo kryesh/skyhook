@@ -1,20 +1,14 @@
-use std::{
-    future::Future,
-    path::PathBuf,
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::{
+    execution::ExecutionLocation,
     identity::{AgentId, JobId},
     media::ImageReference,
+    tool::policy::CapabilitySet,
 };
 
 pub type ProgressFuture = Pin<Box<dyn Future<Output = Result<(), ToolError>> + Send>>;
@@ -27,29 +21,29 @@ pub trait ProgressSink: Send + Sync {
 pub struct ToolContext {
     pub agent: AgentId,
     pub job: JobId,
-    pub workspace: PathBuf,
-    cancelled: Arc<AtomicBool>,
-    cancellation_notify: Arc<Notify>,
+    pub execution_location: ExecutionLocation,
+    pub caller_location: ExecutionLocation,
+    pub capabilities: CapabilitySet,
+    pub(crate) authorization: super::authorization::AuthorizationSubject,
     input: Arc<Mutex<mpsc::Receiver<Value>>>,
     progress: Arc<dyn ProgressSink>,
 }
 
 impl ToolContext {
     pub(crate) fn new(
-        agent: AgentId,
-        job: JobId,
-        workspace: PathBuf,
-        cancelled: Arc<AtomicBool>,
-        cancellation_notify: Arc<Notify>,
+        authorization: super::authorization::AuthorizationSubject,
+        execution_location: ExecutionLocation,
+        caller_location: ExecutionLocation,
         input: mpsc::Receiver<Value>,
         progress: Arc<dyn ProgressSink>,
     ) -> Self {
         Self {
-            agent,
-            job,
-            workspace,
-            cancelled,
-            cancellation_notify,
+            agent: authorization.agent.clone(),
+            job: authorization.job,
+            execution_location,
+            caller_location,
+            capabilities: authorization.capabilities.clone(),
+            authorization,
             input: Arc::new(Mutex::new(input)),
             progress,
         }
@@ -57,22 +51,12 @@ impl ToolContext {
 
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn cancellation(&self) -> Arc<AtomicBool> {
-        self.cancelled.clone()
+        self.authorization.cancellation.is_cancelled()
     }
 
     /// Wait until cancellation is requested for this tool invocation.
     pub async fn cancelled(&self) {
-        loop {
-            let notified = self.cancellation_notify.clone().notified_owned();
-            if self.is_cancelled() {
-                return;
-            }
-            notified.await;
-        }
+        self.authorization.cancellation.cancelled().await;
     }
 
     pub async fn receive(&self) -> Result<Value, ToolError> {

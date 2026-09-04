@@ -4,14 +4,14 @@ use std::{
     sync::Arc,
 };
 
-use schemars::{JsonSchema, schema_for};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use super::workspace::{atomic_write, resolve_writable};
 use crate::tool::{
-    PathKind, RegistryError, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder,
-    policy::{PathAccess, ToolEffect},
+    PathKind, RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
+    policy::{Capability, PathAccess},
 };
 
 const MAX_INLINE_BYTES: u64 = 1024 * 1024;
@@ -192,51 +192,41 @@ pub(super) fn register(
     builder.register::<NoArgs, Vec<SkillSummary>, _, _>(
         "skills",
         "List host-owned skills available to this agent.",
-        ToolOptions::new(vec![ToolEffect::ReadHostResource]),
+        ToolOptions::new(vec![Capability::Read]),
         move |_context, _args| {
             let output = list.summaries();
             async move { Ok(output) }
         },
     )?;
 
-    let schema = serde_json::to_value(schema_for!(SkillArgs))
-        .map_err(|error| RegistryError::Schema(error.to_string()))?;
-    let output_schema = serde_json::to_value(schema_for!(SkillOutput))
-        .map_err(|error| RegistryError::Schema(error.to_string()))?;
-    builder.register_dynamic_effects(
+    builder.register_capability_resolver::<SkillArgs, SkillOutput, _, _, _>(
         "skill",
         "Load a host-owned skill or read/copy one of its assets.",
-        schema,
-        ToolOptions::new(vec![ToolEffect::ReadHostResource])
-            .output_schema(output_schema)
-            .script_special()
-            .path_argument("to", PathAccess::Write, PathKind::Writable),
-        |arguments| {
-            let args: SkillArgs = serde_json::from_value(arguments.clone())
-                .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
-            let mut effects = vec![ToolEffect::ReadHostResource];
+        ToolOptions::new(vec![Capability::Read]).path_argument(
+            "to",
+            PathAccess::Write,
+            PathKind::Writable,
+        ),
+        |args| {
+            let mut effects = vec![Capability::Read];
             if args.to.is_some() {
-                effects.push(ToolEffect::WriteWorkspace);
+                effects.push(Capability::Write);
             }
-            Ok(effects)
+            effects
         },
-        move |context, arguments| {
+        move |context, args| {
             let skills = skills.clone();
             async move {
-                let args: SkillArgs = serde_json::from_value(arguments)
-                    .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
                 let entry = skills.get(&args.name)?;
                 let Some(asset) = args.path else {
                     if args.to.is_some() {
                         return Err(ToolError::InvalidArguments("to requires path".to_owned()));
                     }
-                    return Ok(ToolOutput::new(serde_json::to_value(
-                        SkillOutput::Instructions {
-                            name: entry.name.clone(),
-                            description: entry.description.clone(),
-                            content: entry.instructions.clone(),
-                        },
-                    )?));
+                    return Ok(SkillOutput::Instructions {
+                        name: entry.name.clone(),
+                        description: entry.description.clone(),
+                        content: entry.instructions.clone(),
+                    });
                 };
                 let source = resolve_asset(entry, &asset).await?;
                 let metadata = fs::metadata(&source).await?;
@@ -255,27 +245,27 @@ pub(super) fn register(
                 }
                 let bytes = fs::read(&source).await?;
                 if let Some(destination) = args.to {
-                    let target = resolve_writable(&context.workspace, &destination).await?;
+                    let target =
+                        resolve_writable(&context.execution_location.workspace, &destination)
+                            .await?;
                     atomic_write(&target, &bytes).await?;
-                    return Ok(ToolOutput::new(serde_json::to_value(
-                        SkillOutput::Copied {
-                            name: entry.name.clone(),
-                            path: asset,
-                            to: destination,
-                            bytes: bytes.len(),
-                            sha256: crate::sha256_hex(&bytes),
-                        },
-                    )?));
+                    return Ok(SkillOutput::Copied {
+                        name: entry.name.clone(),
+                        path: asset,
+                        to: destination,
+                        bytes: bytes.len(),
+                        sha256: crate::sha256_hex(&bytes),
+                    });
                 }
                 let content = String::from_utf8(bytes).map_err(|_| {
                     ToolError::Failed("binary skill assets require `to`".to_owned())
                 })?;
-                Ok(ToolOutput::new(serde_json::to_value(SkillOutput::Asset {
+                Ok(SkillOutput::Asset {
                     name: entry.name.clone(),
                     path: asset,
                     bytes: content.len(),
                     content,
-                })?))
+                })
             }
         },
     )?;
@@ -403,17 +393,17 @@ mod tests {
         let skill_tool = registry.get("skill").unwrap();
         assert_eq!(
             skill_tool
-                .effects_for(&serde_json::json!({"name":"common"}))
+                .capabilities_for(&serde_json::json!({"name":"common"}))
                 .unwrap(),
-            vec![ToolEffect::ReadHostResource]
+            vec![Capability::Read]
         );
         assert!(
             skill_tool
-                .effects_for(
+                .capabilities_for(
                     &serde_json::json!({"name":"common", "path":"asset.bin", "to":"copied.bin"})
                 )
                 .unwrap()
-                .contains(&ToolEffect::WriteWorkspace)
+                .contains(&Capability::Write)
         );
         let executor = ToolExecutor::new(registry, Arc::new(AllowAll), jobs, workspace.clone());
         let loaded = executor

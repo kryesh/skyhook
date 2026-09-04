@@ -14,7 +14,7 @@ use crate::{
     session::SessionStore,
     tool::{
         PathKind, RegistryError, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder,
-        policy::{PathAccess, ToolEffect},
+        policy::{Capability, PathAccess},
     },
 };
 
@@ -37,20 +37,20 @@ fn register_read(
     let schema = serde_json::to_value(schema_for!(ReadArgs)).expect("read schema serializes");
     let output_schema = serde_json::to_value(schema_for!(ReadOutput))
         .map_err(|error| RegistryError::Schema(error.to_string()))?;
-    builder.register_dynamic(
+    builder.register_dynamic_targeted(
         "read",
         "Read UTF-8 lines, list a directory, or attach a supported image from the workspace.",
         schema,
-        ToolOptions::new(vec![ToolEffect::ReadWorkspace])
+        ToolOptions::new(vec![Capability::Read])
             .output_schema(output_schema)
-            .workspace_bound()
             .path_argument("path", PathAccess::Read, PathKind::Existing),
         move |context, arguments| {
             let store = store.clone();
             async move {
                 let args: ReadArgs = serde_json::from_value(arguments)
                     .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
-                let path = resolve_existing(&context.workspace, &args.path).await?;
+                let path =
+                    resolve_existing(&context.execution_location.workspace, &args.path).await?;
                 if fs::metadata(&path).await?.is_dir() {
                     let mut directory = fs::read_dir(&path).await?;
                     let mut entries = Vec::new();
@@ -74,7 +74,8 @@ fn register_read(
                     }
                     entries.sort_by(|left, right| left.name.cmp(&right.name));
                     validate_read_range(args.start, args.limit)?;
-                    let directory_path = relative_path(&context.workspace, &path)?;
+                    let directory_path =
+                        relative_path(&context.execution_location.workspace, &path)?;
                     for entry in &mut entries {
                         if directory_path == "." {
                             entry.name.clone_into(&mut entry.path);
@@ -102,7 +103,7 @@ fn register_read(
                 }
 
                 validate_read_range(args.start, args.limit)?;
-                let output_path = relative_path(&context.workspace, &path)?;
+                let output_path = relative_path(&context.execution_location.workspace, &path)?;
                 match read_text_range(&path, output_path.clone(), args.start, args.limit).await {
                     Ok(output) => {
                         return Ok(ToolOutput::new(serde_json::to_value(output)?));
@@ -148,28 +149,32 @@ fn register_read(
 }
 
 fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
-    builder.register::<WriteArgs, WriteOutput, _, _>(
+    builder.register_workspace::<WriteArgs, WriteOutput, _, _>(
         "write",
         "Atomically create or replace a UTF-8 workspace file.",
-        ToolOptions::new(vec![ToolEffect::WriteWorkspace])
-            .workspace_bound()
-            .path_argument("path", PathAccess::Write, PathKind::Writable),
+        ToolOptions::new(vec![Capability::Write]).path_argument(
+            "path",
+            PathAccess::Write,
+            PathKind::Writable,
+        ),
         |context, args| async move {
             check_write_size(&args.content)?;
-            let path = resolve_writable(&context.workspace, &args.path).await?;
+            let path = resolve_writable(&context.execution_location.workspace, &args.path).await?;
             atomic_write(&path, args.content.as_bytes()).await?;
             Ok(WriteOutput {
-                path: relative_path(&context.workspace, &path)?,
+                path: relative_path(&context.execution_location.workspace, &path)?,
                 bytes: args.content.len(),
             })
         },
     )?;
-    builder.register::<ReplaceArgs, EditOutput, _, _>(
+    builder.register_workspace::<ReplaceArgs, EditOutput, _, _>(
         "replace",
         "Replace exact text in a UTF-8 workspace file with an expected match count.",
-        ToolOptions::new(vec![ToolEffect::WriteWorkspace])
-            .workspace_bound()
-            .path_argument("path", PathAccess::Write, PathKind::Existing),
+        ToolOptions::new(vec![Capability::Write]).path_argument(
+            "path",
+            PathAccess::Write,
+            PathKind::Existing,
+        ),
         |context, args| async move {
             if args.old.len().saturating_add(args.new.len()) > MAX_WRITE_BYTES {
                 return Err(ToolError::InvalidArguments(format!(
@@ -181,7 +186,7 @@ fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryErro
                     "old cannot be empty".to_owned(),
                 ));
             }
-            let path = resolve_existing(&context.workspace, &args.path).await?;
+            let path = resolve_existing(&context.execution_location.workspace, &args.path).await?;
             let text = fs::read_to_string(&path).await?;
             let replacements = text.matches(&args.old).count();
             if replacements != args.count {
@@ -194,21 +199,23 @@ fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryErro
             check_write_size(&output)?;
             atomic_write(&path, output.as_bytes()).await?;
             Ok(EditOutput {
-                path: relative_path(&context.workspace, &path)?,
+                path: relative_path(&context.execution_location.workspace, &path)?,
                 replacements,
                 bytes: output.len(),
             })
         },
     )?;
-    builder.register::<PatchArgs, EditOutput, _, _>(
+    builder.register_workspace::<PatchArgs, EditOutput, _, _>(
         "patch",
         "Apply a unified patch to one UTF-8 workspace file.",
-        ToolOptions::new(vec![ToolEffect::WriteWorkspace])
-            .workspace_bound()
-            .path_argument("path", PathAccess::Write, PathKind::Existing),
+        ToolOptions::new(vec![Capability::Write]).path_argument(
+            "path",
+            PathAccess::Write,
+            PathKind::Existing,
+        ),
         |context, args| async move {
             check_write_size(&args.patch)?;
-            let path = resolve_existing(&context.workspace, &args.path).await?;
+            let path = resolve_existing(&context.execution_location.workspace, &args.path).await?;
             let text = fs::read_to_string(&path).await?;
             let patch = Patch::from_str(&args.patch)
                 .map_err(|error| ToolError::Failed(error.to_string()))?;
@@ -218,20 +225,22 @@ fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryErro
             check_write_size(&output)?;
             atomic_write(&path, output.as_bytes()).await?;
             Ok(EditOutput {
-                path: relative_path(&context.workspace, &path)?,
+                path: relative_path(&context.execution_location.workspace, &path)?,
                 replacements,
                 bytes: output.len(),
             })
         },
     )?;
-    builder.register::<RemoveArgs, RemoveOutput, _, _>(
+    builder.register_workspace::<RemoveArgs, RemoveOutput, _, _>(
         "remove",
         "Remove a workspace file, symlink, or directory.",
-        ToolOptions::new(vec![ToolEffect::WriteWorkspace])
-            .workspace_bound()
-            .path_argument("path", PathAccess::Write, PathKind::Removable),
+        ToolOptions::new(vec![Capability::Write]).path_argument(
+            "path",
+            PathAccess::Write,
+            PathKind::Removable,
+        ),
         |context, args| async move {
-            let path = resolve_removable(&context.workspace, &args.path).await?;
+            let path = resolve_removable(&context.execution_location.workspace, &args.path).await?;
             let metadata = fs::symlink_metadata(&path).await?;
             let kind = if metadata.file_type().is_symlink() {
                 fs::remove_file(&path).await?;
@@ -250,7 +259,7 @@ fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryErro
                 return Err(ToolError::Failed("unsupported filesystem entry".to_owned()));
             };
             Ok(RemoveOutput {
-                path: relative_path(&context.workspace, &path)?,
+                path: relative_path(&context.execution_location.workspace, &path)?,
                 kind: kind.to_owned(),
             })
         },
@@ -488,8 +497,7 @@ mod tests {
             ToolRegistryBuilder,
             executor::ToolExecutor,
             policy::{
-                AllowAll, AuthorizationRequest, PathAccess, Policy, PolicyDecision, PolicyFuture,
-                ToolEffect,
+                AllowAll, AuthorizationRequest, Capability, Policy, PolicyDecision, PolicyFuture,
             },
         },
     };
@@ -504,7 +512,7 @@ mod tests {
         fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
             Box::pin(async move {
                 self.requests.lock().await.push(request);
-                PolicyDecision::Allow
+                PolicyDecision::allow()
             })
         }
     }
@@ -589,11 +597,12 @@ mod tests {
             outside.to_string_lossy().as_ref()
         );
         let requests = policy.requests.lock().await;
-        assert!(matches!(
-            requests.last().unwrap().effects.as_slice(),
-            [ToolEffect::ExternalPath { path, access: PathAccess::Read, directory: false }]
-                if path == &outside
-        ));
+        let permission = &requests.last().unwrap().permissions[0];
+        assert_eq!(permission.capability, Capability::Read);
+        assert_eq!(
+            permission.resource,
+            crate::tool::policy::ResourceId::path("root", &outside)
+        );
         drop(requests);
 
         let destination = root.path().join("new-outside.txt");
@@ -607,18 +616,18 @@ mod tests {
             .await
             .unwrap();
         let requests = policy.requests.lock().await;
-        assert!(matches!(
-            requests.last().unwrap().effects.as_slice(),
-            [ToolEffect::ExternalPath {
-                access: PathAccess::Write,
-                directory: false,
-                ..
-            }]
-        ));
+        let permission = &requests.last().unwrap().permissions[0];
+        assert_eq!(permission.capability, Capability::Write);
+        assert_eq!(permission.resource.namespace, "path");
         drop(requests);
 
         let child_workspace = std::fs::canonicalize(child_workspace).unwrap();
-        let child_executor = executor.clone().with_workspace(child_workspace.clone());
+        let child_executor =
+            executor
+                .clone()
+                .with_location(crate::execution::ExecutionLocation::root(
+                    child_workspace.clone(),
+                ));
         let read = child_executor
             .execute(
                 agent,
@@ -630,18 +639,14 @@ mod tests {
             .unwrap();
         assert_eq!(read.output.value["path"], "input.txt");
         let requests = policy.requests.lock().await;
-        assert!(
-            requests
-                .last()
-                .unwrap()
-                .effects
-                .iter()
-                .any(|effect| matches!(
-                    effect,
-                    ToolEffect::ExternalPath { path, access: PathAccess::Read, .. }
-                        if path == &child_workspace.join("input.txt")
-                ))
-        );
+        assert!(requests.last().unwrap().permissions.iter().any(
+            |permission| permission.capability == Capability::Read
+                && permission.resource
+                    == crate::tool::policy::ResourceId::path(
+                        "root",
+                        &child_workspace.join("input.txt"),
+                    )
+        ));
     }
 
     #[tokio::test]

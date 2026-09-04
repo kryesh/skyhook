@@ -50,11 +50,6 @@ impl EmbeddedShimCatalog {
         })
     }
 
-    /// Returns every artifact in canonical platform order.
-    pub fn all(&self) -> Result<Vec<EmbeddedShim>, ArtifactError> {
-        Ok(self.shims.to_vec())
-    }
-
     /// Reports whether this build supplied any remote artifacts.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -62,25 +57,24 @@ impl EmbeddedShimCatalog {
     }
 
     /// Finds an artifact after normalizing common architecture and OS aliases.
-    pub fn find(&self, arch: &str, os: &str) -> Result<Option<EmbeddedShim>, ArtifactError> {
+    pub fn find(&self, arch: &str, os: &str) -> Option<EmbeddedShim> {
         let arch = normalize_arch(arch);
         let os = normalize_os(os);
-        Ok(self
-            .shims
+        self.shims
             .iter()
             .find(|shim| shim.arch == arch && shim.os == os)
-            .cloned())
+            .cloned()
     }
 }
 
 impl EmbeddedShim {
     #[must_use]
-    pub fn sha256(self) -> String {
+    pub fn sha256(&self) -> String {
         crate::sha256_hex(&self.bytes)
     }
 
     #[must_use]
-    pub fn installed_name(self) -> String {
+    pub fn installed_name(&self) -> String {
         self.extension.as_deref().map_or_else(
             || "skyhook-shim".to_owned(),
             |extension| format!("skyhook-shim.{extension}"),
@@ -137,12 +131,10 @@ fn normalize_os(value: &str) -> &str {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum ArtifactError {
     #[error("invalid shim artifact name `{0}`; expected skyhook-shim-<arch>-<os>[.<extension>]")]
     InvalidName(String),
-    #[error("embedded shim `{0}` disappeared from the artifact catalog")]
-    Missing(String),
     #[error("multiple embedded shims target {arch}-{os}")]
     DuplicatePlatform { arch: String, os: String },
 }
@@ -153,8 +145,6 @@ mod tests {
 
     #[test]
     fn empty_catalog_is_valid_and_normalizes_platform_names() {
-        let catalog = EmbeddedShimCatalog::default();
-        let _ = catalog.all().unwrap();
         assert_eq!(normalize_arch("amd64"), "x86_64");
         assert_eq!(normalize_arch("arm64"), "aarch64");
         assert_eq!(normalize_os("Darwin"), "macos");
@@ -183,9 +173,9 @@ mod tests {
             ("skyhook-shim-aarch64-linux", b"arm"),
         ];
         let catalog = EmbeddedShimCatalog::from_assets(ASSETS).unwrap();
-        assert_eq!(catalog.all().unwrap()[0].arch, "aarch64");
+        assert_eq!(catalog.shims[0].arch, "aarch64");
         assert_eq!(
-            catalog.find("amd64", "Linux").unwrap().unwrap().bytes,
+            catalog.find("amd64", "Linux").unwrap().bytes,
             b"x86".as_slice()
         );
 

@@ -11,19 +11,13 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use crate::{
-    agent::{Question, TodoItem},
+    agent::Question,
     provider::protocol::UserContent,
     session::SessionEvent,
-    tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::ToolEffect},
+    tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::Capability},
 };
 
 use super::{AgentCommand, AgentLaunch, SessionRuntime};
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct TodoArgs {
-    items: Vec<TodoItem>,
-}
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -37,12 +31,10 @@ pub(super) struct AgentArgs {
     pub(super) model: Option<String>,
     /// Agent profile override.
     pub(super) profile: Option<String>,
-    /// Initial todo snapshot for the child.
-    #[serde(default)]
-    pub(super) todo: Vec<TodoItem>,
     /// Named SSH target. Omit or use `root` to run locally.
+    #[schemars(skip)]
     pub(super) target: Option<String>,
-    /// Workspace override on the selected target.
+    /// Initial workspace override for the child.
     pub(super) workspace: Option<PathBuf>,
 }
 
@@ -51,7 +43,6 @@ pub(super) fn register(
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
 ) -> Result<(), RegistryError> {
     register_ask(builder, runtime_slot.clone())?;
-    register_todo(builder, runtime_slot.clone())?;
     register_child_agent(builder, runtime_slot)
 }
 
@@ -62,7 +53,7 @@ fn register_ask(
     builder.register::<Question, Value, _, _>(
         "ask",
         "Ask one structured question. Issue independent questions concurrently; the runtime merges calls that become ready together.",
-        ToolOptions::new(vec![ToolEffect::Interaction]).input(),
+        ToolOptions::default().input(),
         move |context, input| {
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
             async move {
@@ -101,61 +92,25 @@ fn register_ask(
     Ok(())
 }
 
-fn register_todo(
-    builder: &mut ToolRegistryBuilder,
-    runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
-) -> Result<(), RegistryError> {
-    builder.register::<TodoArgs, Vec<TodoItem>, _, _>(
-        "todo",
-        "Replace the current agent's complete todo snapshot.",
-        ToolOptions::new(vec![ToolEffect::SessionState]),
-        move |context, input| {
-            let runtime = runtime_slot.get().and_then(Weak::upgrade);
-            async move {
-                let runtime = runtime.ok_or_else(runtime_unavailable)?;
-                runtime
-                    .store
-                    .append(
-                        context.agent,
-                        SessionEvent::TodoReplaced {
-                            items: input.items.clone(),
-                        },
-                    )
-                    .await
-                    .map_err(|error| tool_error(&error))?;
-                Ok(input.items)
-            }
-        },
-    )?;
-    Ok(())
-}
-
 fn register_child_agent(
     builder: &mut ToolRegistryBuilder,
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
 ) -> Result<(), RegistryError> {
-    let availability_slot = runtime_slot.clone();
-    builder.register_effectful::<AgentArgs, Value, _, _, _>(
+    builder.register::<AgentArgs, Value, _, _>(
         "agent",
-        "Run a one-shot child agent locally or on a named SSH target.",
-        ToolOptions::new(vec![ToolEffect::SessionState])
+        "Run a one-shot child agent.",
+        ToolOptions::default()
+            .requires(Capability::Agents)
+            .conditional_input(
+                "target",
+                Capability::Targets,
+                json!({
+                    "type": ["string", "null"],
+                    "description": "Named SSH target. Omit or use `root` to run locally."
+                }),
+            )
             .background()
-            .input()
-            .target_path_argument("workspace", crate::tool::policy::PathAccess::Read, crate::tool::PathKind::Existing)
-            .target_path_argument("workspace", crate::tool::policy::PathAccess::Write, crate::tool::PathKind::Existing)
-            .available_when(move |context| {
-                availability_slot
-                    .get()
-                    .and_then(Weak::upgrade)
-                    .is_some_and(|runtime| runtime.available_depth(&context.agent) > 0)
-            }),
-        |input| {
-            let mut effects = vec![ToolEffect::SessionState];
-            if input.target.as_deref().is_some_and(|target| target != crate::target::ROOT_TARGET) {
-                effects.extend([ToolEffect::RemoteAccess, ToolEffect::Network]);
-            }
-            effects
-        },
+            .input(),
         move |context, input| {
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
             async move {
@@ -173,11 +128,22 @@ fn register_child_agent(
                 let agent_profile = input
                     .profile
                     .or_else(|| runtime.harness.default_agent_profile.clone());
-                let target = input.target;
-                let result_target = target
-                    .as_deref()
-                    .filter(|target| *target != crate::target::ROOT_TARGET)
-                    .map(str::to_owned);
+                let target = input
+                    .target
+                    .unwrap_or_else(|| context.caller_location.target.clone());
+                let workspace = input.workspace.or_else(|| {
+                    (target == context.caller_location.target)
+                        .then(|| context.caller_location.workspace.clone())
+                });
+                let location = runtime
+                    .resolve_location(&target, workspace)
+                    .await
+                    .map_err(|error| tool_error(&error))?;
+                let result_target = context
+                    .capabilities
+                    .contains(Capability::Targets)
+                    .then_some(location.target.clone())
+                    .filter(|target| target != crate::target::ROOT_TARGET);
                 let sender = runtime.spawn_agent(AgentLaunch {
                     id: child.clone(),
                     parent: Some(context.agent.clone()),
@@ -187,15 +153,8 @@ fn register_child_agent(
                     history: Vec::new(),
                     one_shot: true,
                     available_depth: input.depth,
-                    target,
-                    workspace: input.workspace,
+                    location,
                 }).await.map_err(|error| tool_error(&error))?;
-                if !input.todo.is_empty() {
-                    runtime.store.append(
-                        child.clone(),
-                        SessionEvent::TodoReplaced { items: input.todo },
-                    ).await.map_err(|error| tool_error(&error))?;
-                }
                 let (done_tx, mut done_rx) = oneshot::channel();
                 sender.send(AgentCommand::Input {
                     content: vec![UserContent::Text { text: input.prompt }],

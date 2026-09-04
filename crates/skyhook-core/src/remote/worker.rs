@@ -22,7 +22,7 @@ use crate::{
         ToolRegistryBuilder,
         builtins::{install_script_tool_weak, register_worker_tools},
         executor::{ExecutionError, ExecutionResult, ToolExecutor},
-        policy::{AuthorizationRequest, Policy, PolicyDecision, PolicyFuture, ToolEffect},
+        policy::{AuthorizationRequest, Policy, PolicyDecision, PolicyFuture},
     },
 };
 
@@ -156,7 +156,7 @@ where
                             .remove(&(request_id, authorization_id))
                         {
                             let decision = if allowed {
-                                PolicyDecision::Allow
+                                PolicyDecision::allow()
                             } else {
                                 PolicyDecision::Deny {
                                     reason: reason.unwrap_or_else(|| "denied by host".to_owned()),
@@ -234,10 +234,10 @@ where
         };
         if request.parent.is_none() {
             request
-                .effects
-                .retain(|effect| matches!(effect, ToolEffect::ExternalPath { .. }));
-            if request.effects.is_empty() {
-                return Box::pin(async { PolicyDecision::Allow });
+                .permissions
+                .retain(|permission| permission.resource.namespace == "path");
+            if request.permissions.is_empty() {
+                return Box::pin(async { PolicyDecision::allow() });
             }
         }
         let authorization_id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -253,7 +253,7 @@ where
                 request_id,
                 authorization_id,
                 tool: request.tool,
-                effects: request.effects,
+                permissions: request.permissions,
                 arguments: request.arguments,
             };
             if let Err(error) = write_frame(&mut *output.lock().await, &response).await {
@@ -543,17 +543,18 @@ mod tests {
             Response::Authorization {
                 request_id: 10,
                 authorization_id,
-                effects,
+                permissions,
                 ..
             } => {
-                assert!(matches!(
-                    effects.as_slice(),
-                    [ToolEffect::ExternalPath {
-                        path: authorized,
-                        access: crate::tool::policy::PathAccess::Read,
-                        directory: false,
-                    }] if authorized == &path
-                ));
+                assert_eq!(permissions.len(), 1);
+                assert_eq!(
+                    permissions[0].capability,
+                    crate::tool::policy::Capability::Read
+                );
+                assert_eq!(
+                    permissions[0].resource,
+                    crate::tool::policy::ResourceId::path("root", &path),
+                );
                 authorization_id
             }
             response => panic!("unexpected response: {response:?}"),

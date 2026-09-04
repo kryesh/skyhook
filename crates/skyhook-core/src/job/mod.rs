@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -17,12 +17,17 @@ use tokio::{
     sync::{Mutex, Notify, broadcast, mpsc},
     task::AbortHandle,
 };
+pub(crate) use tokio_util::sync::CancellationToken;
 
 use crate::{
+    execution::ExecutionLocation,
     identity::{AgentId, JobId},
     media::ImageReference,
     session::{EventRecord, SessionError, SessionEvent, SessionStore},
-    tool::{ProgressSink, ToolOutput},
+    tool::{
+        ProgressSink, ToolOutput,
+        policy::{Capability, CapabilitySet},
+    },
 };
 
 mod persistence;
@@ -70,6 +75,96 @@ pub struct JobEnvelope {
     pub state: JobState,
     pub output: Option<Value>,
     pub error: Option<String>,
+    pub location: ExecutionLocation,
+}
+
+#[derive(Serialize)]
+struct JobEnvelopeView<'a, L: Serialize> {
+    id: JobId,
+    parent: Option<JobId>,
+    tool: &'a str,
+    state: JobState,
+    output: &'a Option<Value>,
+    error: &'a Option<String>,
+    location: L,
+}
+
+#[derive(Serialize)]
+struct LocationView<'a> {
+    target: &'a str,
+    workspace: &'a std::path::Path,
+}
+
+#[derive(Serialize)]
+struct LocalLocationView<'a> {
+    workspace: &'a std::path::Path,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct LocalExecutionLocationSchema {
+    workspace: std::path::PathBuf,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+struct LocalJobEnvelopeSchema {
+    id: JobId,
+    parent: Option<JobId>,
+    tool: String,
+    state: JobState,
+    output: Option<Value>,
+    error: Option<String>,
+    location: LocalExecutionLocationSchema,
+}
+
+impl JobEnvelope {
+    pub(crate) fn presented(
+        &self,
+        capabilities: &CapabilitySet,
+    ) -> Result<Value, serde_json::Error> {
+        if capabilities.contains(Capability::Targets) {
+            serde_json::to_value(JobEnvelopeView {
+                id: self.id,
+                parent: self.parent,
+                tool: &self.tool,
+                state: self.state,
+                output: &self.output,
+                error: &self.error,
+                location: LocationView {
+                    target: &self.location.target,
+                    workspace: &self.location.workspace,
+                },
+            })
+        } else {
+            serde_json::to_value(JobEnvelopeView {
+                id: self.id,
+                parent: self.parent,
+                tool: &self.tool,
+                state: self.state,
+                output: &self.output,
+                error: &self.error,
+                location: LocalLocationView {
+                    workspace: &self.location.workspace,
+                },
+            })
+        }
+    }
+}
+
+pub(crate) fn presented_job_schema(capabilities: &CapabilitySet, many: bool) -> Value {
+    if capabilities.contains(Capability::Targets) {
+        if many {
+            serde_json::to_value(schemars::schema_for!(Vec<JobEnvelope>))
+        } else {
+            serde_json::to_value(schemars::schema_for!(JobEnvelope))
+        }
+    } else if many {
+        serde_json::to_value(schemars::schema_for!(Vec<LocalJobEnvelopeSchema>))
+    } else {
+        serde_json::to_value(schemars::schema_for!(LocalJobEnvelopeSchema))
+    }
+    .expect("job presentation schemas serialize")
 }
 
 #[derive(Clone, Debug)]
@@ -88,8 +183,7 @@ struct JobEntry {
     error: Option<String>,
     accepts_input: bool,
     input: mpsc::Sender<Value>,
-    cancellation: Arc<AtomicBool>,
-    cancellation_notify: Arc<Notify>,
+    cancellation: CancellationToken,
     notify: Arc<Notify>,
     operation: Arc<Mutex<()>>,
     task_abort: Option<AbortHandle>,
@@ -99,6 +193,21 @@ struct JobEntry {
     injected: bool,
     background: bool,
     authorization_scope: Option<u64>,
+    location: ExecutionLocation,
+}
+
+impl JobEntry {
+    fn envelope(&self, id: JobId) -> JobEnvelope {
+        JobEnvelope {
+            id,
+            parent: self.parent,
+            tool: self.tool.clone(),
+            state: self.state,
+            output: self.output.clone(),
+            error: self.error.clone(),
+            location: self.location.clone(),
+        }
+    }
 }
 
 struct JobManagerInner {
@@ -115,9 +224,36 @@ pub struct JobManager {
 
 pub struct JobLease {
     pub id: JobId,
-    pub cancellation: Arc<AtomicBool>,
-    pub(crate) cancellation_notify: Arc<Notify>,
+    pub(crate) cancellation: CancellationToken,
     pub input: mpsc::Receiver<Value>,
+}
+
+#[derive(Clone, Debug)]
+pub struct JobSpec {
+    pub agent: AgentId,
+    pub parent: Option<JobId>,
+    pub tool: String,
+    pub arguments: Value,
+    pub accepts_input: bool,
+    pub background: bool,
+    pub authorization_scope: Option<u64>,
+    pub location: ExecutionLocation,
+}
+
+#[cfg(test)]
+impl JobSpec {
+    pub(crate) fn test(agent: AgentId, tool: impl Into<String>) -> Self {
+        Self {
+            agent,
+            parent: None,
+            tool: tool.into(),
+            arguments: Value::Object(serde_json::Map::new()),
+            accepts_input: false,
+            background: false,
+            authorization_scope: None,
+            location: ExecutionLocation::root(".".into()),
+        }
+    }
 }
 
 impl JobManager {
@@ -152,22 +288,21 @@ impl JobManager {
         &self.inner.store
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create(
-        &self,
-        agent: AgentId,
-        parent: Option<JobId>,
-        tool: String,
-        arguments: Value,
-        accepts_input: bool,
-        background: bool,
-        authorization_scope: Option<u64>,
-    ) -> Result<JobLease, JobError> {
+    pub async fn create(&self, spec: JobSpec) -> Result<JobLease, JobError> {
+        let JobSpec {
+            agent,
+            parent,
+            tool,
+            arguments,
+            accepts_input,
+            background,
+            authorization_scope,
+            location,
+        } = spec;
         let raw = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let id = JobId::new(raw).map_err(|error| JobError::Internal(error.to_string()))?;
         let (input, input_rx) = mpsc::channel(JOB_INPUT_CAPACITY);
-        let cancellation = Arc::new(AtomicBool::new(false));
-        let cancellation_notify = Arc::new(Notify::new());
+        let cancellation = CancellationToken::new();
         self.inner
             .store
             .append(
@@ -179,6 +314,7 @@ impl JobManager {
                     arguments,
                     accepts_input,
                     background,
+                    location: location.clone(),
                 },
             )
             .await?;
@@ -195,7 +331,6 @@ impl JobManager {
                 accepts_input,
                 input,
                 cancellation: cancellation.clone(),
-                cancellation_notify: cancellation_notify.clone(),
                 notify: Arc::new(Notify::new()),
                 operation: Arc::new(Mutex::new(())),
                 task_abort: None,
@@ -205,12 +340,12 @@ impl JobManager {
                 injected: false,
                 background,
                 authorization_scope,
+                location,
             },
         );
         Ok(JobLease {
             id,
             cancellation,
-            cancellation_notify,
             input: input_rx,
         })
     }
@@ -403,24 +538,7 @@ impl JobManager {
     pub async fn snapshot(&self, id: JobId) -> Result<JobEnvelope, JobError> {
         let jobs = self.inner.jobs.lock().await;
         let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
-        Ok(JobEnvelope {
-            id,
-            parent: entry.parent,
-            tool: entry.tool.clone(),
-            state: entry.state,
-            output: entry.output.clone(),
-            error: entry.error.clone(),
-        })
-    }
-
-    pub async fn owner(&self, id: JobId) -> Result<AgentId, JobError> {
-        self.inner
-            .jobs
-            .lock()
-            .await
-            .get(&id)
-            .map(|entry| entry.agent.clone())
-            .ok_or(JobError::Unknown(id))
+        Ok(entry.envelope(id))
     }
 
     pub(crate) async fn authorization_scope(&self, id: JobId) -> Result<Option<u64>, JobError> {
@@ -438,14 +556,7 @@ impl JobManager {
         let mut output = jobs
             .iter()
             .filter(|(_, entry)| &entry.agent == owner)
-            .map(|(id, entry)| JobEnvelope {
-                id: *id,
-                parent: entry.parent,
-                tool: entry.tool.clone(),
-                state: entry.state,
-                output: entry.output.clone(),
-                error: entry.error.clone(),
-            })
+            .map(|(id, entry)| entry.envelope(*id))
             .collect::<Vec<_>>();
         output.sort_by_key(|job| job.id);
         output
@@ -479,24 +590,11 @@ impl JobManager {
                 } else {
                     None
                 };
-                let output = if entry.state == JobState::WaitingInput && !deliverable {
-                    None
-                } else {
-                    entry.output.clone()
-                };
-                (
-                    JobEnvelope {
-                        id,
-                        parent: entry.parent,
-                        tool: entry.tool.clone(),
-                        state: entry.state,
-                        output,
-                        error: entry.error.clone(),
-                    },
-                    notified,
-                    deliverable,
-                    claimed_agent,
-                )
+                let mut snapshot = entry.envelope(id);
+                if entry.state == JobState::WaitingInput && !deliverable {
+                    snapshot.output = None;
+                }
+                (snapshot, notified, deliverable, claimed_agent)
             };
             if deliverable {
                 if let Some(agent) = claimed_agent {
@@ -531,14 +629,7 @@ impl JobManager {
                         None
                     };
                 (
-                    JobEnvelope {
-                        id,
-                        parent: entry.parent,
-                        tool: entry.tool.clone(),
-                        state: entry.state,
-                        output: entry.output.clone(),
-                        error: entry.error.clone(),
-                    },
+                    entry.envelope(id),
                     notified,
                     entry.background,
                     claimed_agent,
@@ -619,7 +710,7 @@ impl JobManager {
     }
 
     pub async fn cancel(&self, id: JobId) -> Result<JobEnvelope, JobError> {
-        let (terminal, cancellation, cancellation_notify, launch_watchdog) = {
+        let (terminal, cancellation, launch_watchdog) = {
             let mut jobs = self.inner.jobs.lock().await;
             let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
             let terminal = entry.state.is_terminal();
@@ -627,16 +718,10 @@ impl JobManager {
             if launch_watchdog {
                 entry.cancellation_watchdog_started = true;
             }
-            (
-                terminal,
-                entry.cancellation.clone(),
-                entry.cancellation_notify.clone(),
-                launch_watchdog,
-            )
+            (terminal, entry.cancellation.clone(), launch_watchdog)
         };
         if !terminal {
-            cancellation.store(true, Ordering::Relaxed);
-            cancellation_notify.notify_waiters();
+            cancellation.cancel();
         }
         if launch_watchdog {
             let jobs = self.clone();
@@ -798,18 +883,7 @@ impl JobManager {
                 })
                 .map(|(id, entry)| {
                     entry.injected = true;
-                    (
-                        *id,
-                        entry.agent.clone(),
-                        JobEnvelope {
-                            id: *id,
-                            parent: entry.parent,
-                            tool: entry.tool.clone(),
-                            state: entry.state,
-                            output: entry.output.clone(),
-                            error: entry.error.clone(),
-                        },
-                    )
+                    (*id, entry.agent.clone(), entry.envelope(*id))
                 })
                 .collect::<Vec<_>>();
             pending.sort_by_key(|(id, _, _)| *id);
@@ -885,6 +959,8 @@ pub enum JobError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use schemars::JsonSchema;
     use serde::Deserialize;
     use tokio::{sync::Semaphore, task::JoinSet};
@@ -910,6 +986,28 @@ mod tests {
         fn authorize(&self, _request: AuthorizationRequest) -> PolicyFuture<'_> {
             Box::pin(std::future::pending())
         }
+    }
+
+    #[test]
+    fn presentation_hides_only_location_target_metadata() {
+        let envelope = JobEnvelope {
+            id: JobId::new(1).unwrap(),
+            parent: None,
+            tool: "adapter".to_owned(),
+            state: JobState::Completed,
+            output: Some(serde_json::json!({"target": "application-value"})),
+            error: None,
+            location: ExecutionLocation::named("build", "/srv/project".into()),
+        };
+        let presented = envelope.presented(&CapabilitySet::default()).unwrap();
+
+        assert!(presented["location"].get("target").is_none());
+        assert_eq!(presented["output"]["target"], "application-value");
+        assert!(
+            !presented_job_schema(&CapabilitySet::default(), false)
+                .to_string()
+                .contains("target")
+        );
     }
 
     #[tokio::test]
@@ -943,6 +1041,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(foreground.output.value, "a");
+        assert_eq!(
+            jobs.snapshot(foreground.job).await.unwrap().location,
+            ExecutionLocation::root(root.path().to_path_buf())
+        );
         let background = executor
             .execute(
                 agent.clone(),
@@ -1040,23 +1142,32 @@ mod tests {
         let agent = AgentId::root(session);
         let manager = JobManager::new(store.clone());
         let lease = manager
-            .create(
-                agent.clone(),
-                None,
-                "long_task".to_owned(),
-                serde_json::json!({}),
-                false,
-                true,
-                None,
-            )
+            .create(JobSpec {
+                background: true,
+                ..JobSpec::test(agent.clone(), "long_task")
+            })
             .await
             .unwrap();
         manager
             .transition(lease.id, JobState::Running)
             .await
             .unwrap();
+        let located = manager
+            .create(JobSpec {
+                background: true,
+                location: ExecutionLocation::named("build", "/srv/project".into()),
+                ..JobSpec::test(agent.clone(), "located")
+            })
+            .await
+            .unwrap();
+        manager
+            .transition(located.id, JobState::Running)
+            .await
+            .unwrap();
         drop(lease);
+        drop(located);
         drop(manager);
+        store.close().await.unwrap();
         drop(store);
 
         let (store, records) = SessionStore::open(root.path(), session).await.unwrap();
@@ -1069,19 +1180,24 @@ mod tests {
                 .state,
             JobState::Interrupted
         );
-        let next = restored
-            .create(
-                agent,
-                None,
-                "next".to_owned(),
-                serde_json::json!({}),
-                false,
-                false,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(next.id.get(), 2);
+        assert_eq!(
+            restored
+                .snapshot(JobId::new(1).unwrap())
+                .await
+                .unwrap()
+                .location,
+            ExecutionLocation::root(".".into())
+        );
+        assert_eq!(
+            restored
+                .snapshot(JobId::new(2).unwrap())
+                .await
+                .unwrap()
+                .location,
+            ExecutionLocation::named("build", "/srv/project".into())
+        );
+        let next = restored.create(JobSpec::test(agent, "next")).await.unwrap();
+        assert_eq!(next.id.get(), 3);
     }
 
     #[tokio::test]
@@ -1091,15 +1207,10 @@ mod tests {
         let agent = AgentId::root(store.id());
         let manager = JobManager::new(store);
         let lease = manager
-            .create(
-                agent.clone(),
-                None,
-                "agent".to_owned(),
-                serde_json::json!({}),
-                true,
-                false,
-                None,
-            )
+            .create(JobSpec {
+                accepts_input: true,
+                ..JobSpec::test(agent.clone(), "agent")
+            })
             .await
             .unwrap();
         manager
@@ -1152,15 +1263,7 @@ mod tests {
         let agent = AgentId::root(store.id());
         let manager = JobManager::new(store);
         let lease = manager
-            .create(
-                agent,
-                None,
-                "progress".to_owned(),
-                serde_json::json!({}),
-                false,
-                false,
-                None,
-            )
+            .create(JobSpec::test(agent, "progress"))
             .await
             .unwrap();
         manager
@@ -1216,15 +1319,7 @@ mod tests {
         let manager = JobManager::new(store);
         for _ in 0..128 {
             let lease = manager
-                .create(
-                    agent.clone(),
-                    None,
-                    "fast".to_owned(),
-                    serde_json::json!({}),
-                    false,
-                    false,
-                    None,
-                )
+                .create(JobSpec::test(agent.clone(), "fast"))
                 .await
                 .unwrap();
             manager

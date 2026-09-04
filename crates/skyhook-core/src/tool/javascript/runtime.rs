@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use crate::{
     media::ImageReference,
     tool::executor::ToolExecutor,
-    tool::{ToolContext, ToolOutput, ToolVisibilityContext},
+    tool::{ToolContext, ToolOutput},
 };
 
 const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
@@ -67,8 +67,7 @@ pub async fn evaluate(
         .build_async(&runtime)
         .await
         .map_err(|error| JsError::Initialization(error.to_string()))?;
-    let visibility = ToolVisibilityContext::new(context.agent.clone());
-    let builders = executor.registry().script_manifests(&visibility);
+    let builders = executor.surface().script_manifests();
     let builders = serde_json::to_string(&builders)
         .map_err(|error| JsError::Initialization(error.to_string()))?;
     let source = source.trim();
@@ -312,33 +311,6 @@ tool.job = job => {{
   return Object.freeze(methods);
 }};
 
-function __skillBuilder(input) {{
-  if (Object.prototype.hasOwnProperty.call(input, "name") &&
-      (typeof input.name !== "string" || input.name.length === 0)) {{
-    throw new TypeError("tool.skill requires a non-empty name");
-  }}
-  const operation = __operation("skill", input);
-  Object.defineProperty(operation, "name", {{
-    enumerable: false,
-    value(name) {{
-      if (typeof name !== "string" || name.length === 0) throw new TypeError("tool.skill requires a non-empty name");
-      return __skillBuilder(Object.assign(Object.create(null), input, {{name}}));
-    }},
-  }});
-  Object.defineProperty(operation, "asset", {{
-    enumerable: false,
-    value(options) {{ return __skillBuilder(Object.assign(Object.create(null), input, __plainObject("skill.asset", options))); }},
-  }});
-  return Object.freeze(operation);
-}}
-
-tool.skill = (...values) => {{
-  if (values.length === 0) return __skillBuilder(Object.create(null));
-  if (values.length !== 1) throw new TypeError("tool.skill accepts zero arguments, a name, or one argument object");
-  if (typeof values[0] === "string") return __skillBuilder({{name: values[0]}});
-  return __skillBuilder(__plainObject("skill", values[0]));
-}};
-
 async function __request(request) {{
   const response = __parse(await __skyhookHostCall(__stringify(request)));
   if (!response.ok) throw new Error(response.error);
@@ -502,15 +474,7 @@ mod tests {
         let agent = AgentId::root(store.id());
         let jobs = JobManager::new(store);
         let lease = jobs
-            .create(
-                agent.clone(),
-                None,
-                "script".to_owned(),
-                serde_json::json!({}),
-                false,
-                false,
-                None,
-            )
+            .create(crate::job::JobSpec::test(agent.clone(), "script"))
             .await
             .unwrap();
         let executor = ToolExecutor::new(
@@ -520,11 +484,16 @@ mod tests {
             root.path().to_path_buf(),
         );
         let context = ToolContext::new(
-            agent,
-            lease.id,
-            root.path().to_path_buf(),
-            lease.cancellation,
-            lease.cancellation_notify,
+            crate::tool::authorization::AuthorizationSubject {
+                agent,
+                job: lease.id,
+                parent: None,
+                scope: None,
+                capabilities: crate::tool::policy::CapabilitySet::default(),
+                cancellation: lease.cancellation.clone(),
+            },
+            crate::execution::ExecutionLocation::root(root.path().to_path_buf()),
+            crate::execution::ExecutionLocation::root(root.path().to_path_buf()),
             lease.input,
             jobs.progress_sink(lease.id),
         );
@@ -554,7 +523,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schemas_generate_immutable_builders_and_skill_is_directly_awaitable() {
+    async fn schemas_generate_immutable_builders() {
         let mut builder = ToolRegistryBuilder::default();
         builder
             .register::<Defaults, Defaults, _, _>(
@@ -588,12 +557,9 @@ return {
   built,
   set: base.set("required", "y"),
   reused: [built, built],
-  skill: tool.skill("alpha"),
   skillObject: tool.skill({name:"beta"}),
   skillFluent: tool.skill().name("gamma"),
-  asset: tool.skill("alpha").asset({path:"template.txt"}),
-  fluentAsset: tool.skill().name("gamma").asset({path:"other.txt"}),
-  hasLoad: typeof tool.skill("alpha").load,
+  asset: tool.skill().name("alpha").path("template.txt"),
 };
 "#
             .to_owned(),
@@ -617,12 +583,9 @@ return {
                 {"required":"x", "limit":7}, {"required":"x", "limit":7}
             ])
         );
-        assert_eq!(output.value["skill"]["path"], Value::Null);
         assert_eq!(output.value["skillObject"]["name"], "beta");
         assert_eq!(output.value["skillFluent"]["name"], "gamma");
         assert_eq!(output.value["asset"]["path"], "template.txt");
-        assert_eq!(output.value["fluentAsset"]["path"], "other.txt");
-        assert_eq!(output.value["hasLoad"], "undefined");
     }
 
     #[tokio::test]

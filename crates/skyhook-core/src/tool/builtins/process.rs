@@ -11,190 +11,77 @@ use tokio::{
 use super::workspace::resolve_directory;
 use crate::tool::{
     PathKind, RegistryError, ToolContext, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder,
-    policy::{PathAccess, ToolEffect},
-};
-use crate::{
-    remote::{RemoteError, RemoteManager},
-    target::ROOT_TARGET,
+    policy::{Capability, PathAccess},
 };
 
 const MAX_PROCESS_OUTPUT: usize = 1024 * 1024;
 const PROCESS_CHUNK: usize = 8 * 1024;
 
-pub(super) fn register(
-    builder: &mut ToolRegistryBuilder,
-    remote: Option<RemoteManager>,
-) -> Result<(), RegistryError> {
+pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
     let exec_schema = serde_json::to_value(schema_for!(ExecArgs))
         .map_err(|error| RegistryError::Schema(error.to_string()))?;
     let process_output_schema = serde_json::to_value(schema_for!(ProcessOutput))
         .map_err(|error| RegistryError::Schema(error.to_string()))?;
-    let exec_remote = remote.clone();
-    builder.register_dynamic_effects(
+    builder.register_dynamic_targeted(
         "exec",
         "Run an exact argument vector without shell parsing.",
         exec_schema,
-        ToolOptions::new(vec![ToolEffect::ExecuteProcess])
+        ToolOptions::new(vec![Capability::Exec])
             .output_schema(process_output_schema.clone())
-            .workspace_bound()
             .background()
             .input()
-            .default_path_argument("cwd", ".", PathAccess::Read, PathKind::Existing, true),
-        remote_effects,
-        move |context, arguments| {
-            let remote = exec_remote.clone();
-            async move {
-                let args: ExecArgs = serde_json::from_value(arguments)
-                    .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
-                if let Some(target) = args
-                    .target
-                    .as_deref()
-                    .filter(|target| *target != ROOT_TARGET)
-                {
-                    let remote = remote.as_ref().ok_or_else(|| {
-                        ToolError::InvalidArguments(
-                            "remote targets are unavailable in this tool runtime".to_owned(),
-                        )
-                    })?;
-                    let result = remote
-                        .execute_tool_cancellable(
-                            target,
-                            None,
-                            "exec".to_owned(),
-                            serde_json::json!({
-                                "argv": args.argv,
-                                "cwd": args.cwd,
-                                "timeout": args.timeout,
-                            }),
-                            &context,
-                        )
-                        .await;
-                    if context.is_cancelled() {
-                        return Err(ToolError::Cancelled);
-                    }
-                    return finish_remote(context, result).await;
-                }
-                let (program, arguments) = args.argv.split_first().ok_or_else(|| {
-                    ToolError::InvalidArguments("argv cannot be empty".to_owned())
-                })?;
-                let cwd = resolve_directory(&context.workspace, &args.cwd).await?;
-                let mut command = Command::new(program);
-                command.args(arguments).current_dir(cwd);
-                run_process(context, command, args.timeout)
-                    .await
-                    .map(|output| {
-                        ToolOutput::new(
-                            serde_json::to_value(output).expect("process output serializes"),
-                        )
-                    })
-            }
+            .default_path_argument("cwd", ".", PathAccess::Read, PathKind::Existing),
+        move |context, arguments| async move {
+            let args: ExecArgs = serde_json::from_value(arguments)
+                .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+            let (program, arguments) = args
+                .argv
+                .split_first()
+                .ok_or_else(|| ToolError::InvalidArguments("argv cannot be empty".to_owned()))?;
+            let cwd = resolve_directory(&context.execution_location.workspace, &args.cwd).await?;
+            let mut command = Command::new(program);
+            command.args(arguments).current_dir(cwd);
+            run_process(context, command, args.timeout)
+                .await
+                .map(|output| {
+                    ToolOutput::new(
+                        serde_json::to_value(output).expect("process output serializes"),
+                    )
+                })
         },
     )?;
     let shell_schema = serde_json::to_value(schema_for!(ShellArgs))
         .map_err(|error| RegistryError::Schema(error.to_string()))?;
-    builder.register_dynamic_effects(
+    builder.register_dynamic_targeted(
         "shell",
         "Run /bin/sh -lc in the workspace.",
         shell_schema,
-        ToolOptions::new(vec![ToolEffect::ExecuteProcess])
+        ToolOptions::new(vec![Capability::Exec])
             .output_schema(process_output_schema)
-            .workspace_bound()
             .background()
             .input()
-            .default_path_argument("cwd", ".", PathAccess::Read, PathKind::Existing, true),
-        remote_effects,
-        move |context, arguments| {
-            let remote = remote.clone();
-            async move {
-                let args: ShellArgs = serde_json::from_value(arguments)
-                    .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
-                if args.command.is_empty() {
-                    return Err(ToolError::InvalidArguments(
-                        "command cannot be empty".to_owned(),
-                    ));
-                }
-                if let Some(target) = args
-                    .target
-                    .as_deref()
-                    .filter(|target| *target != ROOT_TARGET)
-                {
-                    let remote = remote.as_ref().ok_or_else(|| {
-                        ToolError::InvalidArguments(
-                            "remote targets are unavailable in this tool runtime".to_owned(),
-                        )
-                    })?;
-                    let result = remote
-                        .execute_tool_cancellable(
-                            target,
-                            None,
-                            "shell".to_owned(),
-                            serde_json::json!({
-                                "command": args.command,
-                                "cwd": args.cwd,
-                                "timeout": args.timeout,
-                            }),
-                            &context,
-                        )
-                        .await;
-                    if context.is_cancelled() {
-                        return Err(ToolError::Cancelled);
-                    }
-                    return finish_remote(context, result).await;
-                }
-                let cwd = resolve_directory(&context.workspace, &args.cwd).await?;
-                let mut command = Command::new("/bin/sh");
-                command.arg("-lc").arg(args.command).current_dir(cwd);
-                run_process(context, command, args.timeout)
-                    .await
-                    .map(|output| {
-                        ToolOutput::new(
-                            serde_json::to_value(output).expect("process output serializes"),
-                        )
-                    })
+            .default_path_argument("cwd", ".", PathAccess::Read, PathKind::Existing),
+        move |context, arguments| async move {
+            let args: ShellArgs = serde_json::from_value(arguments)
+                .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+            if args.command.is_empty() {
+                return Err(ToolError::InvalidArguments(
+                    "command cannot be empty".to_owned(),
+                ));
             }
+            let cwd = resolve_directory(&context.execution_location.workspace, &args.cwd).await?;
+            let mut command = Command::new("/bin/sh");
+            command.arg("-lc").arg(args.command).current_dir(cwd);
+            run_process(context, command, args.timeout)
+                .await
+                .map(|output| {
+                    ToolOutput::new(
+                        serde_json::to_value(output).expect("process output serializes"),
+                    )
+                })
         },
     )?;
     Ok(())
-}
-
-#[allow(clippy::unnecessary_wraps)]
-fn remote_effects(arguments: &serde_json::Value) -> Result<Vec<ToolEffect>, ToolError> {
-    let target = arguments.get("target").and_then(serde_json::Value::as_str);
-    let mut effects = vec![ToolEffect::ExecuteProcess];
-    if target.is_some_and(|target| target != ROOT_TARGET) {
-        effects.push(ToolEffect::RemoteAccess);
-        effects.push(ToolEffect::Network);
-    }
-    Ok(effects)
-}
-
-async fn finish_remote(
-    context: ToolContext,
-    result: Result<ToolOutput, RemoteError>,
-) -> Result<ToolOutput, ToolError> {
-    let (output, error) = match result {
-        Ok(output) => (output, None),
-        Err(RemoteError::Remote {
-            message,
-            output: Some(output),
-        }) => (output, Some(message)),
-        Err(error) => return Err(error.into_tool_error()),
-    };
-    let process: ProcessOutput = serde_json::from_value(output.value.clone())?;
-    if !process.stdout.is_empty() {
-        context
-            .progress("stdout", serde_json::json!({"text": process.stdout}))
-            .await?;
-    }
-    if !process.stderr.is_empty() {
-        context
-            .progress("stderr", serde_json::json!({"text": process.stderr}))
-            .await?;
-    }
-    if let Some(message) = error {
-        return Err(ToolError::with_output(message, output));
-    }
-    Ok(output)
 }
 
 async fn run_process(
@@ -242,20 +129,18 @@ async fn run_process(
         Ok::<(), ToolError>(())
     });
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
-    let (status, timed_out, cancelled) = loop {
-        if context.is_cancelled() {
+    let deadline = tokio::time::sleep(Duration::from_secs(timeout));
+    tokio::pin!(deadline);
+    let (status, timed_out, cancelled) = tokio::select! {
+        status = child.wait() => (status?, false, false),
+        () = &mut deadline => {
             child.kill().await?;
-            break (child.wait().await?, false, true);
+            (child.wait().await?, true, false)
         }
-        if tokio::time::Instant::now() >= deadline {
+        () = context.cancelled() => {
             child.kill().await?;
-            break (child.wait().await?, true, false);
+            (child.wait().await?, false, true)
         }
-        if let Some(status) = child.try_wait()? {
-            break (status, false, false);
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
     };
     input_task.abort();
     let stdout = stdout_task
@@ -352,9 +237,7 @@ struct Capture {
 struct ExecArgs {
     /// Program and arguments without shell parsing, for example `["cargo","test"]`.
     argv: Vec<String>,
-    /// Named SSH target. Omit or use `root` for the local Skyhook host.
-    target: Option<String>,
-    /// Working directory relative to the target workspace by default.
+    /// Working directory relative to the execution workspace by default.
     #[serde(default = "default_dot")]
     cwd: String,
     /// Timeout in seconds.
@@ -366,11 +249,9 @@ struct ExecArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ShellArgs {
-    /// Command interpreted by the target's shell.
+    /// Command interpreted by the execution environment's shell.
     command: String,
-    /// Named SSH target. Omit or use `root` for the local Skyhook host.
-    target: Option<String>,
-    /// Working directory relative to the target workspace by default.
+    /// Working directory relative to the execution workspace by default.
     #[serde(default = "default_dot")]
     cwd: String,
     /// Timeout in seconds.
@@ -405,7 +286,6 @@ mod tests {
         identity::{AgentId, JobId},
         job::{JobManager, JobState},
         session::SessionStore,
-        target::TargetRegistry,
         tool::{
             ToolRegistryBuilder,
             executor::{ExecutionError, ToolExecutor},
@@ -421,11 +301,7 @@ mod tests {
         let agent = AgentId::root(store.id());
         let jobs = JobManager::new(store);
         let mut builder = ToolRegistryBuilder::default();
-        register(
-            &mut builder,
-            Some(RemoteManager::new(TargetRegistry::default())),
-        )
-        .unwrap();
+        register(&mut builder).unwrap();
         let executor = ToolExecutor::new(
             builder.build(),
             Arc::new(AllowAll),
