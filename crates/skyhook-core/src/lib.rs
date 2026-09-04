@@ -4,6 +4,7 @@
 pub mod agent;
 pub mod config;
 pub mod execution;
+mod fs;
 pub mod identity;
 pub mod job;
 pub mod media;

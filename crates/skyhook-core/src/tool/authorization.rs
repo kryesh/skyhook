@@ -1,10 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::{collections::HashMap, sync::Arc};
 
 use futures_util::future::{BoxFuture, FutureExt as _, Shared};
 use tokio::sync::Mutex;
@@ -47,27 +41,28 @@ struct PendingApproval {
 #[derive(Clone)]
 pub(crate) struct AuthorizationCoordinator {
     policy: Arc<dyn Policy>,
-    grants: Arc<Mutex<Vec<ApprovalGrant>>>,
-    pending: Arc<Mutex<HashMap<ApprovalGrant, PendingApproval>>>,
-    next_pending: Arc<AtomicU64>,
+    state: Arc<Mutex<ApprovalState>>,
+}
+
+#[derive(Default)]
+struct ApprovalState {
+    grants: Vec<ApprovalGrant>,
+    pending: HashMap<ApprovalGrant, PendingApproval>,
+    next_pending: u64,
 }
 
 impl AuthorizationCoordinator {
     pub fn new(policy: Arc<dyn Policy>) -> Self {
         Self {
             policy,
-            grants: Arc::new(Mutex::new(Vec::new())),
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            next_pending: Arc::new(AtomicU64::new(1)),
+            state: Arc::new(Mutex::new(ApprovalState::default())),
         }
     }
 
     pub async fn revoke(&self, predicate: impl Fn(&ApprovalGrant) -> bool) {
-        self.grants.lock().await.retain(|grant| !predicate(grant));
-        self.pending
-            .lock()
-            .await
-            .retain(|grant, _| !predicate(grant));
+        let mut state = self.state.lock().await;
+        state.grants.retain(|grant| !predicate(grant));
+        state.pending.retain(|grant, _| !predicate(grant));
     }
 
     pub async fn authorize(
@@ -91,13 +86,13 @@ impl AuthorizationCoordinator {
         }
         permissions = unique;
         loop {
-            let grants = self.grants.lock().await;
+            let mut state = self.state.lock().await;
             permissions.retain(|use_| {
-                !grants
+                !state
+                    .grants
                     .iter()
                     .any(|grant| grant.covers(use_.capability, &use_.resource))
             });
-            drop(grants);
             if permissions.is_empty() {
                 return Ok(());
             }
@@ -106,25 +101,17 @@ impl AuthorizationCoordinator {
                 .iter()
                 .filter_map(|use_| use_.proposed_grant.clone())
                 .collect::<Vec<_>>();
-            if let Some(pending) = {
-                let pending = self.pending.lock().await;
-                proposals.iter().find_map(|key| pending.get(key).cloned())
-            } {
-                let approved = self.wait(subject, pending.future).await?;
-                self.finish_pending(pending.id, &approved).await;
+            if let Some(pending) = proposals
+                .iter()
+                .find_map(|key| state.pending.get(key).cloned())
+            {
+                drop(state);
+                self.wait(subject, pending.future).await?;
                 continue;
             }
 
-            if proposals.is_empty() {
-                return self
-                    .wait(
-                        subject,
-                        self.decision(subject, tool, permissions, arguments, Vec::new()),
-                    )
-                    .await
-                    .map(|_| ());
-            }
-
+            state.next_pending += 1;
+            let id = state.next_pending;
             let decision = self.decision(
                 subject,
                 tool.clone(),
@@ -132,53 +119,58 @@ impl AuthorizationCoordinator {
                 arguments.clone(),
                 proposals.clone(),
             );
-            let approval = PendingApproval {
-                id: self.next_pending.fetch_add(1, Ordering::Relaxed),
-                future: decision.clone(),
-            };
-            {
-                let mut pending = self.pending.lock().await;
-                if let Some(existing) = proposals.iter().find_map(|key| pending.get(key).cloned()) {
-                    drop(pending);
-                    let approved = self.wait(subject, existing.future).await?;
-                    self.finish_pending(existing.id, &approved).await;
-                    continue;
-                }
-                for proposal in &proposals {
-                    pending.insert(proposal.clone(), approval.clone());
-                }
+            let coordinator = self.clone();
+            // Finalization belongs to the decision, not to any individual waiter.
+            let task = tokio::spawn(async move {
+                let result = tokio::spawn(decision).await.unwrap_or_else(|error| {
+                    Err(AuthorizationError::Denied(format!(
+                        "authorization policy failed: {error}"
+                    )))
+                });
+                coordinator.finish_pending(id, &result).await;
+                result
+            });
+            let future = async move {
+                task.await.unwrap_or_else(|error| {
+                    Err(AuthorizationError::Denied(format!(
+                        "authorization task failed: {error}"
+                    )))
+                })
             }
-            let result = self.wait(subject, decision).await;
-            match result {
-                Ok(approved) => {
-                    self.finish_pending(approval.id, &approved).await;
-                    return Ok(());
-                }
-                Err(AuthorizationError::Cancelled) => {
-                    return Err(AuthorizationError::Cancelled);
-                }
-                Err(error) => {
-                    self.remove_pending(approval.id).await;
-                    return Err(error);
-                }
+            .boxed()
+            .shared();
+            for proposal in proposals {
+                state.pending.insert(
+                    proposal,
+                    PendingApproval {
+                        id,
+                        future: future.clone(),
+                    },
+                );
             }
+            drop(state);
+            return self.wait(subject, future).await.map(|_| ());
         }
     }
 
-    async fn finish_pending(&self, pending_id: u64, approved: &[ApprovalGrant]) {
-        let mut grants = self.grants.lock().await;
-        for grant in approved {
-            if !grants.contains(grant) {
-                grants.push(grant.clone());
+    async fn finish_pending(
+        &self,
+        id: u64,
+        result: &Result<Vec<ApprovalGrant>, AuthorizationError>,
+    ) {
+        let mut state = self.state.lock().await;
+        if let Ok(grants) = result {
+            for grant in grants {
+                let current = state
+                    .pending
+                    .iter()
+                    .any(|(proposal, pending)| pending.id == id && proposal.permits(grant));
+                if current && !state.grants.contains(grant) {
+                    state.grants.push(grant.clone());
+                }
             }
         }
-        drop(grants);
-        self.remove_pending(pending_id).await;
-    }
-
-    async fn remove_pending(&self, pending_id: u64) {
-        let mut pending = self.pending.lock().await;
-        pending.retain(|_, pending| pending.id != pending_id);
+        state.pending.retain(|_, pending| pending.id != id);
     }
 
     fn decision(
@@ -188,7 +180,7 @@ impl AuthorizationCoordinator {
         permissions: Vec<PermissionUse>,
         arguments: serde_json::Value,
         proposals: Vec<ApprovalGrant>,
-    ) -> ApprovalFuture {
+    ) -> BoxFuture<'static, Result<Vec<ApprovalGrant>, AuthorizationError>> {
         let policy = self.policy.clone();
         let request = AuthorizationRequest {
             agent: subject.agent.clone(),
@@ -199,7 +191,7 @@ impl AuthorizationCoordinator {
             permissions,
             arguments,
         };
-        let decision = async move {
+        async move {
             match policy.authorize(request).await {
                 PolicyDecision::Deny { reason } => Err(AuthorizationError::Denied(reason)),
                 PolicyDecision::Allow { grants } => {
@@ -215,16 +207,8 @@ impl AuthorizationCoordinator {
                     Ok(grants)
                 }
             }
-        };
-        async move {
-            tokio::spawn(decision).await.unwrap_or_else(|error| {
-                Err(AuthorizationError::Denied(format!(
-                    "authorization policy failed: {error}"
-                )))
-            })
         }
         .boxed()
-        .shared()
     }
 
     async fn wait(

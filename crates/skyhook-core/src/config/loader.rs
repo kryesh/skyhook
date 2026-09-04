@@ -1,9 +1,6 @@
 //! Config discovery and TOML parsing.
 
-use std::{
-    env,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use tokio::fs;
 
@@ -24,12 +21,7 @@ pub(super) async fn load(explicit: Option<&Path>) -> Result<Config, ConfigError>
 }
 
 fn user_config_path() -> Option<PathBuf> {
-    if let Some(root) = env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(root).join("skyhook/config.toml"));
-    }
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".config/skyhook/config.toml"))
+    super::user_config_directory().map(|root| root.join("config.toml"))
 }
 
 async fn read_optional_toml(path: &Path) -> Result<toml::Value, ConfigError> {

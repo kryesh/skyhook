@@ -1,7 +1,6 @@
 use std::{process::Stdio, time::Duration};
 
 use schemars::JsonSchema;
-use schemars::schema_for;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _},
@@ -18,22 +17,14 @@ const MAX_PROCESS_OUTPUT: usize = 1024 * 1024;
 const PROCESS_CHUNK: usize = 8 * 1024;
 
 pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
-    let exec_schema = serde_json::to_value(schema_for!(ExecArgs))
-        .map_err(|error| RegistryError::Schema(error.to_string()))?;
-    let process_output_schema = serde_json::to_value(schema_for!(ProcessOutput))
-        .map_err(|error| RegistryError::Schema(error.to_string()))?;
-    builder.register_dynamic_targeted(
+    builder.register_targeted::<ExecArgs, ProcessOutput, _, _>(
         "exec",
         "Run an exact argument vector without shell parsing.",
-        exec_schema,
         ToolOptions::new(vec![Capability::Exec])
-            .output_schema(process_output_schema.clone())
             .background()
             .input()
             .default_path_argument("cwd", ".", PathAccess::Read, PathKind::Existing),
-        move |context, arguments| async move {
-            let args: ExecArgs = serde_json::from_value(arguments)
-                .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        move |context, args| async move {
             let (program, arguments) = args
                 .argv
                 .split_first()
@@ -41,29 +32,17 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             let cwd = resolve_directory(&context.execution_location.workspace, &args.cwd).await?;
             let mut command = Command::new(program);
             command.args(arguments).current_dir(cwd);
-            run_process(context, command, args.timeout)
-                .await
-                .map(|output| {
-                    ToolOutput::new(
-                        serde_json::to_value(output).expect("process output serializes"),
-                    )
-                })
+            run_process(context, command, args.timeout).await
         },
     )?;
-    let shell_schema = serde_json::to_value(schema_for!(ShellArgs))
-        .map_err(|error| RegistryError::Schema(error.to_string()))?;
-    builder.register_dynamic_targeted(
+    builder.register_targeted::<ShellArgs, ProcessOutput, _, _>(
         "shell",
         "Run /bin/sh -lc in the workspace.",
-        shell_schema,
         ToolOptions::new(vec![Capability::Exec])
-            .output_schema(process_output_schema)
             .background()
             .input()
             .default_path_argument("cwd", ".", PathAccess::Read, PathKind::Existing),
-        move |context, arguments| async move {
-            let args: ShellArgs = serde_json::from_value(arguments)
-                .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        move |context, args| async move {
             if args.command.is_empty() {
                 return Err(ToolError::InvalidArguments(
                     "command cannot be empty".to_owned(),
@@ -72,13 +51,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             let cwd = resolve_directory(&context.execution_location.workspace, &args.cwd).await?;
             let mut command = Command::new("/bin/sh");
             command.arg("-lc").arg(args.command).current_dir(cwd);
-            run_process(context, command, args.timeout)
-                .await
-                .map(|output| {
-                    ToolOutput::new(
-                        serde_json::to_value(output).expect("process output serializes"),
-                    )
-                })
+            run_process(context, command, args.timeout).await
         },
     )?;
     Ok(())

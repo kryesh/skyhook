@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-use tokio::{fs, io::AsyncWriteExt as _};
+use tokio::fs;
 
 use crate::tool::ToolError;
 use crate::tool::registry::PathKind;
@@ -108,8 +108,8 @@ pub(crate) async fn resolve_removable(
     Ok(resolved)
 }
 
-pub(crate) fn relative_path(workspace: &Path, path: &Path) -> Result<String, ToolError> {
-    Ok(match path.strip_prefix(workspace) {
+pub(crate) fn relative_path(workspace: &Path, path: &Path) -> String {
+    match path.strip_prefix(workspace) {
         Ok(path) => {
             let text = path.to_string_lossy();
             if text.is_empty() {
@@ -119,48 +119,17 @@ pub(crate) fn relative_path(workspace: &Path, path: &Path) -> Result<String, Too
             }
         }
         Err(_) => path.to_string_lossy().into_owned(),
-    })
+    }
 }
 
 pub(super) async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| ToolError::Failed("path has no parent".to_owned()))?;
-    let mut random = [0; 8];
-    getrandom::fill(&mut random).map_err(|error| ToolError::Failed(error.to_string()))?;
-    let temporary = parent.join(format!(".skyhook-{:016x}.tmp", u64::from_ne_bytes(random)));
-    let permissions = match fs::metadata(path).await {
-        Ok(metadata) => Some(metadata.permissions()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    let mut file = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)
-        .await?;
-    if let Err(error) = async {
-        file.write_all(bytes).await?;
-        file.flush().await?;
-        file.sync_all().await?;
-        if let Some(permissions) = permissions {
-            fs::set_permissions(&temporary, permissions).await?;
-        }
-        Ok::<(), std::io::Error>(())
-    }
-    .await
-    {
-        let _ = fs::remove_file(&temporary).await;
-        return Err(error.into());
-    }
-    drop(file);
-    if let Err(error) = fs::rename(&temporary, path).await {
-        let _ = fs::remove_file(&temporary).await;
-        return Err(error.into());
-    }
-    let parent = parent.to_owned();
-    tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all())
-        .await
-        .map_err(|error| ToolError::Failed(error.to_string()))??;
-    Ok(())
+    Ok(crate::fs::atomic_write(
+        path,
+        bytes,
+        crate::fs::AtomicWriteOptions {
+            preserve_permissions: true,
+            sync_parent: true,
+        },
+    )
+    .await?)
 }

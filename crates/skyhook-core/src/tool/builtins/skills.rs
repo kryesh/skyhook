@@ -69,13 +69,7 @@ impl HostSkills {
 }
 
 fn user_skills_root() -> Option<PathBuf> {
-    if let Some(root) = std::env::var_os("XDG_CONFIG_HOME").filter(|root| !root.is_empty()) {
-        return Some(PathBuf::from(root).join("skyhook/.agents/skills"));
-    }
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .map(|home| home.join(".config/skyhook/.agents/skills"))
+    crate::config::user_config_directory().map(|root| root.join(".agents/skills"))
 }
 
 async fn scan_root(root: &Path, entries: &mut BTreeMap<String, SkillEntry>) {

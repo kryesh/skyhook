@@ -726,16 +726,12 @@ impl ToolRegistryBuilder {
         if options.output_schema.is_none() {
             options = options.output_schema(output_schema);
         }
-        if placement == ToolPlacement::TargetedWorkspace {
-            ensure_no_target(&input_schema)?;
-            options =
-                options.conditional_input("target", Capability::Targets, target_property_schema());
-        }
-        options.execution.placement = placement;
-        self.register_dynamic_inner(
-            (name, description),
+        self.register_dynamic_at(
+            name,
+            description,
             input_schema,
             options,
+            placement,
             move |context, arguments| {
                 let parsed = serde_json::from_value(arguments);
                 let future = parsed.map(|input| handler(context, input));

@@ -28,10 +28,7 @@ pub(crate) fn register_coding_tools(
     skills: HostSkills,
     router: crate::target::TargetRouter,
 ) -> Result<(), RegistryError> {
-    filesystem::register(builder, store.clone())?;
-    search::register(builder)?;
-    process::register(builder)?;
-    jobs::register(builder, jobs)?;
+    register_worker_tools(builder, store.clone(), jobs)?;
     skills::register(builder, skills)?;
     targets::register(builder, store, router)?;
     Ok(())

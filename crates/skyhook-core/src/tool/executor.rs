@@ -27,6 +27,14 @@ enum InvocationKind {
     Script,
 }
 
+struct PreparedInvocation {
+    tool: Arc<super::RegisteredTool>,
+    original_arguments: Value,
+    handler_arguments: Value,
+    background: bool,
+    authorization_scope: Option<u64>,
+}
+
 struct InvocationPlan {
     agent: AgentId,
     tool: Arc<super::RegisteredTool>,
@@ -302,20 +310,15 @@ impl ToolExecutor {
         Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
     {
         let runner: ExternalRunner = Box::new(move |_context, arguments| Box::pin(run(arguments)));
-        let tool = self
-            .shared
-            .registry
-            .get(name)
-            .ok_or_else(|| ExecutionError::UnknownTool(name.to_owned()))?;
-        let surface = self.surface();
-        surface.validate_arguments(name, &arguments)?;
-        let spec = surface
-            .get(name)
-            .expect("validated tools are present on the surface");
-        validate_invocation(spec, &agent, InvocationKind::Model)?;
-        let original_arguments = arguments.clone();
-        let (handler_arguments, background) =
-            self.shared.registry.split_execution(spec, arguments)?;
+        let PreparedInvocation {
+            tool,
+            original_arguments,
+            handler_arguments,
+            background,
+            authorization_scope,
+        } = self
+            .prepare_invocation(InvocationKind::Model, name, arguments, parent, None)
+            .await?;
         let mut capabilities = tool.capabilities_for(&handler_arguments)?;
         capabilities.extend(extra_capabilities);
         let permissions = scope_capabilities(
@@ -334,7 +337,7 @@ impl ToolExecutor {
             execution_location: self.shared.root_location.clone(),
             permissions,
             parent,
-            authorization_scope: self.authorization_scope(parent, None).await?,
+            authorization_scope,
             background,
             dispatch: InvocationDispatch::External(runner),
         };
@@ -342,15 +345,14 @@ impl ToolExecutor {
         self.collect_started(started).await
     }
 
-    async fn plan_registered(
+    async fn prepare_invocation(
         &self,
         kind: InvocationKind,
-        agent: AgentId,
         name: &str,
-        mut arguments: Value,
+        arguments: Value,
         parent: Option<JobId>,
         authorization_scope: Option<u64>,
-    ) -> Result<InvocationPlan, ExecutionError> {
+    ) -> Result<PreparedInvocation, ExecutionError> {
         let tool = self
             .shared
             .registry
@@ -361,16 +363,48 @@ impl ToolExecutor {
         let spec = surface
             .get(name)
             .expect("validated tools are present on the surface");
-        validate_invocation(spec, &agent, kind)?;
+        validate_invocation(spec, kind)?;
         let original_arguments = arguments.clone();
-        let selected = self.resolve_workspace_invocation(&tool, &arguments).await?;
+        let (handler_arguments, background) =
+            self.shared.registry.split_execution(spec, arguments)?;
+        Ok(PreparedInvocation {
+            tool,
+            original_arguments,
+            handler_arguments,
+            background,
+            authorization_scope: self
+                .authorization_scope(parent, authorization_scope)
+                .await?,
+        })
+    }
+
+    async fn plan_registered(
+        &self,
+        kind: InvocationKind,
+        agent: AgentId,
+        name: &str,
+        arguments: Value,
+        parent: Option<JobId>,
+        authorization_scope: Option<u64>,
+    ) -> Result<InvocationPlan, ExecutionError> {
+        let PreparedInvocation {
+            tool,
+            original_arguments,
+            handler_arguments: mut arguments,
+            background,
+            authorization_scope,
+        } = self
+            .prepare_invocation(kind, name, arguments, parent, authorization_scope)
+            .await?;
+        let selected = self
+            .resolve_workspace_invocation(&tool, &original_arguments)
+            .await?;
         if tool.placement() == ToolPlacement::TargetedWorkspace {
             arguments
                 .as_object_mut()
                 .ok_or(ToolError::ArgumentsMustBeObject)?
                 .remove("target");
         }
-        let (mut arguments, background) = self.shared.registry.split_execution(spec, arguments)?;
         let path_permissions = if selected.route.is_none() {
             preflight_path_arguments(
                 &tool,
@@ -409,9 +443,7 @@ impl ToolExecutor {
             execution_location: selected.location,
             permissions,
             parent,
-            authorization_scope: self
-                .authorization_scope(parent, authorization_scope)
-                .await?,
+            authorization_scope,
             background,
             dispatch: selected
                 .route
@@ -819,6 +851,16 @@ pub enum ExecutionError {
 }
 
 impl ExecutionError {
+    pub(crate) fn into_failure(self) -> ExecutionFailure {
+        let message = self.concise_message();
+        let output = match self {
+            Self::Failed { output, .. } => output,
+            Self::Tool(ToolError::FailedWithOutput { output, .. }) => Some(output),
+            _ => None,
+        };
+        ExecutionFailure { message, output }
+    }
+
     pub(crate) fn concise_message(&self) -> String {
         match self {
             Self::Tool(error) => error.concise_message(),
@@ -828,11 +870,12 @@ impl ExecutionError {
     }
 }
 
-fn validate_invocation(
-    tool: &super::ToolSpec,
-    _agent: &AgentId,
-    kind: InvocationKind,
-) -> Result<(), ExecutionError> {
+pub(crate) struct ExecutionFailure {
+    pub message: String,
+    pub output: Option<ToolOutput>,
+}
+
+fn validate_invocation(tool: &super::ToolSpec, kind: InvocationKind) -> Result<(), ExecutionError> {
     match kind {
         InvocationKind::Host => Ok(()),
         InvocationKind::Model if tool.exposure == ToolExposure::ScriptOnly => {

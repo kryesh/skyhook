@@ -150,7 +150,7 @@ fn search_blocking(
         if matches.len() > args.limit || truncated {
             break;
         }
-        let relative = relative_path(workspace, &path)?;
+        let relative = relative_path(workspace, &path);
         let mut found = Vec::new();
         let mut sink = SearchSink {
             matcher: &matcher,
@@ -199,7 +199,7 @@ fn glob_blocking(workspace: &Path, root: &Path, args: &GlobArgs) -> Result<GlobO
         if entry.depth() == 0 || !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
-        paths.push(relative_path(workspace, entry.path())?);
+        paths.push(relative_path(workspace, entry.path()));
         if paths.len() > args.limit {
             break;
         }

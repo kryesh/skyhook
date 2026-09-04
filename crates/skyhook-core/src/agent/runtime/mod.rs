@@ -3,11 +3,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    sync::{
-        Arc, OnceLock, RwLock as StdRwLock, Weak,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
+    sync::{Arc, OnceLock, RwLock as StdRwLock, Weak},
 };
 
 use base64::Engine as _;
@@ -21,7 +17,7 @@ use tokio::{
 use crate::{
     agent::AgentProfile,
     identity::{AgentId, JobId, SessionId},
-    job::JobManager,
+    job::{CancellationToken, JobManager},
     media::{MAX_IMAGE_BYTES, MAX_IMAGE_BYTES_PER_SUBMISSION, MAX_IMAGES_PER_SUBMISSION},
     provider::Provider,
     provider::profile::ModelProfile,
@@ -39,9 +35,10 @@ use crate::{
 };
 
 pub use super::error::HarnessError;
-use super::interaction::{Question, QuestionError, QuestionHandler, RuntimeEvent};
+use super::interaction::{QuestionHandler, RuntimeEvent};
 
 mod prompt;
+mod questions;
 mod tools;
 
 const AGENT_CHANNEL_CAPACITY: usize = 64;
@@ -196,21 +193,18 @@ impl HarnessBuilder {
             .unwrap_or_else(|| workspace.join(".skyhook/sessions"));
         let mut instructions = load_agent_instructions(&workspace).await?;
         let skills = HostSkills::discover(&workspace).await;
-        let mut target_definitions = if self.targets.import_ssh_config {
+        let imported = if self.targets.import_ssh_config {
             import_ssh_targets().await?
         } else {
             Vec::new()
         };
-        for definition in self.targets.definitions()? {
-            if let Some(existing) = target_definitions
-                .iter_mut()
-                .find(|target| target.name == definition.name)
-            {
-                *existing = definition;
-            } else {
-                target_definitions.push(definition);
-            }
-        }
+        let target_definitions = imported
+            .into_iter()
+            .chain(self.targets.definitions()?)
+            .map(|definition| (definition.name.clone(), definition))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect::<Vec<_>>();
         TargetRegistry::from_definitions(target_definitions.clone())?;
         instructions.extend(self.instructions);
         Ok(Harness {
@@ -423,32 +417,17 @@ struct SessionRuntime {
     // Keeps the script tool's weak executor lookup alive without an executor/registry cycle.
     _executor_slot: Arc<OnceLock<ToolExecutor>>,
     router: crate::target::TargetRouter,
-    agents: RwLock<HashMap<AgentId, mpsc::Sender<AgentCommand>>>,
-    interrupts: RwLock<HashMap<AgentId, Arc<AtomicBool>>>,
+    agents: StdRwLock<HashMap<AgentId, LiveAgent>>,
     child_counters: RwLock<HashMap<AgentId, u32>>,
-    available_depths: StdRwLock<HashMap<AgentId, usize>>,
-    pending_questions: Mutex<HashMap<JobId, PendingQuestion>>,
-    ask_batches: Mutex<HashMap<AgentId, QuestionBatch>>,
+    questions: Arc<questions::QuestionCoordinator>,
     usage: Mutex<Usage>,
     events: broadcast::Sender<RuntimeEvent>,
 }
 
-#[derive(Clone)]
-struct PendingQuestion {
-    ask_jobs: Vec<(String, JobId)>,
-}
-
-struct PendingAsk {
-    context: crate::tool::ToolContext,
-    question: Question,
-    event_id: String,
-    result: oneshot::Sender<Result<serde_json::Value, String>>,
-}
-
-#[derive(Default)]
-struct QuestionBatch {
-    expected: Option<usize>,
-    pending: Vec<PendingAsk>,
+struct LiveAgent {
+    sender: mpsc::Sender<AgentCommand>,
+    cancellation: CancellationToken,
+    available_depth: usize,
 }
 
 enum AgentCommand {
@@ -475,7 +454,6 @@ struct AgentLaunch {
 struct AgentLoop {
     id: AgentId,
     owner_job: Option<JobId>,
-    interrupted: Arc<AtomicBool>,
     profile: ModelProfile,
     system: Vec<SystemSegment>,
     history: Vec<Message>,
@@ -490,7 +468,7 @@ struct TurnContext<'a> {
     profile: &'a ModelProfile,
     system: &'a [SystemSegment],
     owner_job: Option<JobId>,
-    interrupted: &'a Arc<AtomicBool>,
+    cancellation: &'a CancellationToken,
     location: &'a crate::execution::ExecutionLocation,
     capabilities: &'a CapabilitySet,
 }
@@ -568,6 +546,10 @@ impl SessionRuntime {
                 *counter = (*counter).max(*segment);
             }
         }
+        let questions = Arc::new(questions::QuestionCoordinator::new(
+            jobs.clone(),
+            harness.questions.clone(),
+        ));
         let runtime = Arc::new(Self {
             harness,
             store: store.clone(),
@@ -575,12 +557,9 @@ impl SessionRuntime {
             executor,
             _executor_slot: executor_slot,
             router,
-            agents: RwLock::new(HashMap::new()),
-            interrupts: RwLock::new(HashMap::new()),
+            agents: StdRwLock::new(HashMap::new()),
             child_counters: RwLock::new(child_counters),
-            available_depths: StdRwLock::new(HashMap::new()),
-            pending_questions: Mutex::new(HashMap::new()),
-            ask_batches: Mutex::new(HashMap::new()),
+            questions,
             usage: Mutex::new(usage),
             events,
         });
@@ -646,7 +625,7 @@ impl SessionRuntime {
                 let Some(runtime) = runtime.upgrade() else {
                     break;
                 };
-                if let Some(sender) = runtime.agents.read().await.get(&completion.agent).cloned() {
+                if let Some(sender) = runtime.agent_sender(&completion.agent) {
                     let _ = sender.send(AgentCommand::JobsReady).await;
                 }
             }
@@ -655,18 +634,18 @@ impl SessionRuntime {
 
     async fn interrupt_tree(&self, root: &AgentId) -> usize {
         let targets = self
-            .interrupts
+            .agents
             .read()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .filter(|(agent, _)| {
                 agent.session() == root.session() && agent.path().starts_with(root.path())
             })
-            .map(|(agent, interrupted)| (agent.clone(), interrupted.clone()))
+            .map(|(id, agent)| (id.clone(), agent.cancellation.clone()))
             .collect::<Vec<_>>();
         let mut cancelled = 0;
-        for (agent, interrupted) in targets {
-            interrupted.store(true, Ordering::Relaxed);
+        for (agent, cancellation) in targets {
+            cancellation.cancel();
             cancelled += self.jobs.cancel_all(&agent).await;
         }
         cancelled
@@ -715,23 +694,23 @@ impl SessionRuntime {
             )
             .await?;
         let (tx, rx) = mpsc::channel(AGENT_CHANNEL_CAPACITY);
-        self.agents.write().await.insert(id.clone(), tx.clone());
-        let interrupted = Arc::new(AtomicBool::new(false));
-        self.interrupts
-            .write()
-            .await
-            .insert(id.clone(), interrupted.clone());
-        self.available_depths
+        self.agents
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id.clone(), available_depth);
+            .insert(
+                id.clone(),
+                LiveAgent {
+                    sender: tx.clone(),
+                    cancellation: CancellationToken::new(),
+                    available_depth,
+                },
+            );
         let runtime = self.clone();
         tokio::spawn(async move {
             runtime
                 .run_agent(AgentLoop {
                     id,
                     owner_job,
-                    interrupted,
                     profile,
                     system,
                     history,
@@ -786,13 +765,23 @@ impl SessionRuntime {
                 images: result.output.images,
                 is_error: false,
             },
-            Err(error) => ToolResult {
-                call_id: call.id,
-                name: call.name,
-                result: json!({"error": error.to_string()}),
-                images: Vec::new(),
-                is_error: true,
-            },
+            Err(error) => {
+                let failure = error.into_failure();
+                let mut result = json!({"error": failure.message});
+                let images = if let Some(output) = failure.output {
+                    result["output"] = output.value;
+                    output.images
+                } else {
+                    Vec::new()
+                };
+                ToolResult {
+                    call_id: call.id,
+                    name: call.name,
+                    result,
+                    images,
+                    is_error: true,
+                }
+            }
         }
     }
 
@@ -840,7 +829,6 @@ impl SessionRuntime {
         let AgentLoop {
             id,
             owner_job,
-            interrupted,
             profile,
             system,
             mut history,
@@ -886,7 +874,7 @@ impl SessionRuntime {
                     (content, None)
                 }
             };
-            interrupted.store(false, Ordering::Relaxed);
+            let cancellation = self.begin_turn(&id);
             let message = Message::User(content);
             if let Err(error) = self.commit(&id, message.clone()).await {
                 if let Some(done) = done {
@@ -902,7 +890,7 @@ impl SessionRuntime {
                         profile: &profile,
                         system: &system,
                         owner_job,
-                        interrupted: &interrupted,
+                        cancellation: &cancellation,
                         location: &location,
                         capabilities: &capabilities,
                     },
@@ -927,9 +915,7 @@ impl SessionRuntime {
                 break;
             }
         }
-        self.agents.write().await.remove(&id);
-        self.interrupts.write().await.remove(&id);
-        self.available_depths
+        self.agents
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&id);
@@ -945,7 +931,7 @@ impl SessionRuntime {
             profile,
             system,
             owner_job,
-            interrupted,
+            cancellation,
             location,
             capabilities,
         } = turn;
@@ -960,7 +946,7 @@ impl SessionRuntime {
             .ok_or_else(|| HarnessError::UnknownProvider(profile.provider.clone()))?;
         let mut final_text = String::new();
         loop {
-            if interrupted.load(Ordering::Relaxed) {
+            if cancellation.is_cancelled() {
                 return Err(HarnessError::Interrupted);
             }
             let mut request_messages = history.clone();
@@ -979,14 +965,17 @@ impl SessionRuntime {
                 max_output_tokens: profile.max_output_tokens,
                 correlation: Some(agent.to_string()),
             };
-            let mut response = provider.invoke(request).await?;
+            let mut response = tokio::select! {
+                response = provider.invoke(request) => response?,
+                () = cancellation.cancelled() => return Err(HarnessError::Interrupted),
+            };
             let mut blocks = Vec::new();
             let mut streamed_text = String::new();
             let mut usage = Usage::default();
             loop {
                 let chunk = tokio::select! {
                     chunk = poll_fn(|context| response.as_mut().poll_chunk(context)) => chunk,
-                    () = wait_for_interrupt(interrupted) => return Err(HarnessError::Interrupted),
+                    () = cancellation.cancelled() => return Err(HarnessError::Interrupted),
                 };
                 let Some(chunk) = chunk else {
                     break;
@@ -1030,7 +1019,9 @@ impl SessionRuntime {
                 });
                 return Ok(final_text);
             }
-            self.prepare_question_batch(agent, &response.calls).await;
+            self.questions
+                .prepare_question_batch(agent, &response.calls)
+                .await;
             let results = join_all(
                 response
                     .calls
@@ -1082,272 +1073,31 @@ impl SessionRuntime {
     }
 
     fn available_depth(&self, agent: &AgentId) -> usize {
-        self.available_depths
+        self.agents
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(agent)
-            .copied()
-            .unwrap_or(0)
+            .map_or(0, |agent| agent.available_depth)
     }
 
-    async fn owning_agent_job(&self, mut job: JobId) -> Result<JobId, HarnessError> {
-        loop {
-            let envelope = self.jobs.snapshot(job).await?;
-            if envelope.tool == "agent" {
-                return Ok(job);
-            }
-            job = envelope.parent.ok_or_else(|| {
-                HarnessError::Agent("child question has no owning agent job".to_owned())
-            })?;
-        }
+    fn agent_sender(&self, id: &AgentId) -> Option<mpsc::Sender<AgentCommand>> {
+        self.agents
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .map(|agent| agent.sender.clone())
     }
 
-    async fn coordinate_question(
-        self: &Arc<Self>,
-        context: crate::tool::ToolContext,
-        question: Question,
-    ) -> Result<serde_json::Value, crate::tool::ToolError> {
-        let (result, received) = oneshot::channel();
-        let agent = context.agent.clone();
-        let launch = {
-            let mut batches = self.ask_batches.lock().await;
-            let batch = batches.entry(agent.clone()).or_default();
-            let first = batch.pending.is_empty();
-            batch.pending.push(PendingAsk {
-                event_id: format!("q-{}", context.job),
-                context,
-                question,
-                result,
-            });
-            batch
-                .expected
-                .map_or(first, |expected| batch.pending.len() >= expected)
-        };
-        if launch {
-            let runtime = self.clone();
-            tokio::spawn(async move {
-                tokio::task::yield_now().await;
-                let batch = runtime
-                    .ask_batches
-                    .lock()
-                    .await
-                    .remove(&agent)
-                    .unwrap_or_default()
-                    .pending;
-                runtime.present_question_batch(agent, batch).await;
-            });
-        }
-        received
-            .await
-            .map_err(|_| crate::tool::ToolError::Failed("question batch stopped".to_owned()))?
-            .map_err(crate::tool::ToolError::Failed)
+    fn begin_turn(&self, id: &AgentId) -> CancellationToken {
+        let cancellation = CancellationToken::new();
+        self.agents
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(id)
+            .expect("running agents are registered")
+            .cancellation = cancellation.clone();
+        cancellation
     }
-
-    async fn prepare_question_batch(&self, agent: &AgentId, calls: &[ToolCall]) {
-        let count = calls
-            .iter()
-            .filter(|call| {
-                call.name == "ask"
-                    && serde_json::from_value::<Question>(call.arguments.clone()).is_ok()
-            })
-            .count();
-        if count > 0 {
-            self.ask_batches
-                .lock()
-                .await
-                .entry(agent.clone())
-                .or_default()
-                .expected = Some(count);
-        }
-    }
-
-    async fn present_question_batch(&self, agent: AgentId, batch: Vec<PendingAsk>) {
-        if batch.is_empty() {
-            return;
-        }
-        let questions = batch
-            .iter()
-            .map(|pending| pending.question.clone())
-            .collect::<Vec<_>>();
-        if let Some(duplicate) = duplicate_question_id(&questions) {
-            send_question_error(batch, format!("duplicate question id `{duplicate}`"));
-            return;
-        }
-        if agent.parent().is_some() {
-            self.present_child_questions(batch, questions).await;
-        } else {
-            self.present_root_questions(agent, batch, questions).await;
-        }
-    }
-
-    async fn present_root_questions(
-        &self,
-        agent: AgentId,
-        batch: Vec<PendingAsk>,
-        questions: Vec<Question>,
-    ) {
-        let Some(handler) = self.harness.questions.clone() else {
-            send_question_error(batch, QuestionError::Unavailable.to_string());
-            return;
-        };
-        let answer = handler.ask(agent, questions);
-        tokio::pin!(answer);
-        let answer = tokio::select! {
-            answer = &mut answer => answer.map_err(|error| error.to_string()),
-            () = batch[0].context.cancelled() => Err("tool was cancelled".to_owned()),
-        };
-        match answer {
-            Ok(answer) => distribute_question_answer(batch, answer),
-            Err(error) => send_question_error(batch, error),
-        }
-    }
-
-    async fn present_child_questions(&self, batch: Vec<PendingAsk>, questions: Vec<Question>) {
-        let event_ids = batch
-            .iter()
-            .map(|pending| pending.event_id.clone())
-            .collect::<Vec<_>>();
-        let ask_jobs = batch
-            .iter()
-            .map(|pending| (pending.question.id.clone(), pending.context.job))
-            .collect::<Vec<_>>();
-        let output = json!({
-            "kind": "questions",
-            "question_id": event_ids[0],
-            "question_ids": event_ids,
-            "questions": questions,
-        });
-        let owner_job = match self.open_child_questions(ask_jobs, output).await {
-            Ok(owner_job) => owner_job,
-            Err(error) => {
-                send_question_error(batch, error.to_string());
-                return;
-            }
-        };
-        let answers = join_all(batch.iter().map(|pending| pending.context.receive())).await;
-        let resolved = self.resolve_child_question(owner_job).await;
-        if let Err(error) = resolved {
-            send_question_error(batch, error.to_string());
-            return;
-        }
-        for (pending, answer) in batch.into_iter().zip(answers) {
-            let _ = pending
-                .result
-                .send(answer.map_err(|error| error.to_string()));
-        }
-    }
-
-    async fn open_child_questions(
-        &self,
-        ask_jobs: Vec<(String, JobId)>,
-        output: serde_json::Value,
-    ) -> Result<JobId, HarnessError> {
-        let ask_job = ask_jobs
-            .first()
-            .map(|(_, job)| *job)
-            .ok_or_else(|| HarnessError::Agent("question batch is empty".to_owned()))?;
-        let owner_job = self.owning_agent_job(ask_job).await?;
-        {
-            let mut pending = self.pending_questions.lock().await;
-            if pending.contains_key(&owner_job) {
-                return Err(HarnessError::Agent(
-                    "an agent job may only have one outstanding question batch".to_owned(),
-                ));
-            }
-            pending.insert(owner_job, PendingQuestion { ask_jobs });
-        }
-        if let Err(error) = self.jobs.request_input(owner_job, output).await {
-            self.pending_questions.lock().await.remove(&owner_job);
-            return Err(error.into());
-        }
-        Ok(owner_job)
-    }
-
-    async fn resolve_child_question(&self, owner_job: JobId) -> Result<(), HarnessError> {
-        self.pending_questions.lock().await.remove(&owner_job);
-        self.jobs.resume_input(owner_job).await?;
-        Ok(())
-    }
-
-    async fn answer_child_question(
-        &self,
-        owner_job: JobId,
-        value: serde_json::Value,
-    ) -> Result<bool, HarnessError> {
-        let pending = self.pending_questions.lock().await.get(&owner_job).cloned();
-        let Some(pending) = pending else {
-            return Ok(false);
-        };
-        let ids = pending
-            .ask_jobs
-            .iter()
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        let answers = split_answers(&ids, value)
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(HarnessError::Agent)?;
-        for ((_, ask_job), answer) in pending.ask_jobs.iter().zip(answers) {
-            self.jobs.send(*ask_job, answer).await?;
-        }
-        Ok(true)
-    }
-
-    async fn cancel_child_question(&self, owner_job: JobId) {
-        let pending = self.pending_questions.lock().await.remove(&owner_job);
-        if let Some(pending) = pending {
-            for (_, ask_job) in pending.ask_jobs {
-                let _ = self.jobs.cancel(ask_job).await;
-            }
-        }
-    }
-}
-
-fn send_question_error(batch: Vec<PendingAsk>, error: String) {
-    for pending in batch {
-        let _ = pending.result.send(Err(error.clone()));
-    }
-}
-
-fn distribute_question_answer(batch: Vec<PendingAsk>, answer: serde_json::Value) {
-    let ids = batch
-        .iter()
-        .map(|pending| pending.question.id.clone())
-        .collect::<Vec<_>>();
-    for (pending, result) in batch.into_iter().zip(split_answers(&ids, answer)) {
-        let _ = pending.result.send(result);
-    }
-}
-
-fn duplicate_question_id(questions: &[Question]) -> Option<&str> {
-    let mut seen = std::collections::HashSet::new();
-    questions
-        .iter()
-        .map(|question| question.id.as_str())
-        .find(|id| !seen.insert(*id))
-}
-
-fn split_answers(
-    ids: &[String],
-    answer: serde_json::Value,
-) -> Vec<Result<serde_json::Value, String>> {
-    if ids.len() == 1 {
-        return vec![Ok(answer)];
-    }
-    let Some(answers) = answer.as_object() else {
-        return ids
-            .iter()
-            .map(|_| Err("answers to multiple questions must be keyed by question id".to_owned()))
-            .collect();
-    };
-    ids.iter()
-        .map(|id| {
-            answers
-                .get(id)
-                .cloned()
-                .ok_or_else(|| format!("answer is missing question id `{id}`"))
-        })
-        .collect()
 }
 
 struct FoldedResponse {
@@ -1494,12 +1244,6 @@ async fn hydrate_image(
     Ok(())
 }
 
-async fn wait_for_interrupt(interrupted: &AtomicBool) {
-    while !interrupted.load(Ordering::Relaxed) {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1511,12 +1255,14 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         },
         task::Poll,
+        time::Duration,
     };
 
     use futures_util::stream;
 
     use super::*;
     use crate::{
+        agent::Question,
         provider::protocol::ToolCall,
         provider::{ProviderFuture, ResponseHandle},
     };
@@ -2374,19 +2120,7 @@ mod tests {
         );
         session.shutdown().await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while session
-                .runtime
-                .agents
-                .read()
-                .await
-                .contains_key(&session.root)
-                || session
-                    .runtime
-                    .interrupts
-                    .read()
-                    .await
-                    .contains_key(&session.root)
-            {
+            while session.runtime.agent_sender(&session.root).is_some() {
                 tokio::task::yield_now().await;
             }
         })
@@ -2581,6 +2315,7 @@ mod tests {
             .unwrap();
         let owner = session
             .runtime
+            .questions
             .open_child_questions(
                 vec![
                     ("first".to_owned(), ask.id),
@@ -2598,13 +2333,19 @@ mod tests {
         assert!(
             session
                 .runtime
+                .questions
                 .answer_child_question(owner, json!({"first": "yes", "second": 2}))
                 .await
                 .unwrap()
         );
         assert_eq!(ask.input.recv().await.unwrap(), json!("yes"));
         assert_eq!(ask_two.input.recv().await.unwrap(), json!(2));
-        session.runtime.resolve_child_question(owner).await.unwrap();
+        session
+            .runtime
+            .questions
+            .resolve_child_question(owner)
+            .await
+            .unwrap();
         assert_eq!(
             session.runtime.jobs.snapshot(owner).await.unwrap().state,
             crate::job::JobState::Running

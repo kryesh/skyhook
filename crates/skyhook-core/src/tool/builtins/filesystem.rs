@@ -75,7 +75,7 @@ fn register_read(
                     entries.sort_by(|left, right| left.name.cmp(&right.name));
                     validate_read_range(args.start, args.limit)?;
                     let directory_path =
-                        relative_path(&context.execution_location.workspace, &path)?;
+                        relative_path(&context.execution_location.workspace, &path);
                     for entry in &mut entries {
                         if directory_path == "." {
                             entry.name.clone_into(&mut entry.path);
@@ -103,7 +103,7 @@ fn register_read(
                 }
 
                 validate_read_range(args.start, args.limit)?;
-                let output_path = relative_path(&context.execution_location.workspace, &path)?;
+                let output_path = relative_path(&context.execution_location.workspace, &path);
                 match read_text_range(&path, output_path.clone(), args.start, args.limit).await {
                     Ok(output) => {
                         return Ok(ToolOutput::new(serde_json::to_value(output)?));
@@ -162,7 +162,7 @@ fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryErro
             let path = resolve_writable(&context.execution_location.workspace, &args.path).await?;
             atomic_write(&path, args.content.as_bytes()).await?;
             Ok(WriteOutput {
-                path: relative_path(&context.execution_location.workspace, &path)?,
+                path: relative_path(&context.execution_location.workspace, &path),
                 bytes: args.content.len(),
             })
         },
@@ -199,7 +199,7 @@ fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryErro
             check_write_size(&output)?;
             atomic_write(&path, output.as_bytes()).await?;
             Ok(EditOutput {
-                path: relative_path(&context.execution_location.workspace, &path)?,
+                path: relative_path(&context.execution_location.workspace, &path),
                 replacements,
                 bytes: output.len(),
             })
@@ -225,7 +225,7 @@ fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryErro
             check_write_size(&output)?;
             atomic_write(&path, output.as_bytes()).await?;
             Ok(EditOutput {
-                path: relative_path(&context.execution_location.workspace, &path)?,
+                path: relative_path(&context.execution_location.workspace, &path),
                 replacements,
                 bytes: output.len(),
             })
@@ -259,7 +259,7 @@ fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryErro
                 return Err(ToolError::Failed("unsupported filesystem entry".to_owned()));
             };
             Ok(RemoveOutput {
-                path: relative_path(&context.execution_location.workspace, &path)?,
+                path: relative_path(&context.execution_location.workspace, &path),
                 kind: kind.to_owned(),
             })
         },

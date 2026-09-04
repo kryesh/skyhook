@@ -1,15 +1,10 @@
-use std::sync::Arc;
-
-use tokio::{
-    fs,
-    sync::{Notify, mpsc},
-};
+use tokio::fs;
 
 use crate::session::{
     EventRecord, SessionError, SessionEvent, SessionStore, is_safe_artifact_path,
 };
 
-use super::{CancellationToken, JOB_INPUT_CAPACITY, JobEntry, JobError, JobManager, JobState};
+use super::{DeliveryState, JobEntry, JobError, JobManager, JobSpec, JobState};
 
 pub(super) async fn restore(
     store: SessionStore,
@@ -29,32 +24,17 @@ pub(super) async fn restore(
                 ..
             } => {
                 maximum = maximum.max(job.get());
-                let (input, _receiver) = mpsc::channel(JOB_INPUT_CAPACITY);
-                jobs.insert(
-                    *job,
-                    JobEntry {
-                        agent: record.agent.clone(),
-                        parent: *parent,
-                        tool: tool.clone(),
-                        state: JobState::Queued,
-                        output: None,
-                        images: Vec::new(),
-                        error: None,
-                        accepts_input: *accepts_input,
-                        input,
-                        cancellation: CancellationToken::new(),
-                        notify: Arc::new(Notify::new()),
-                        operation: Arc::new(tokio::sync::Mutex::new(())),
-                        task_abort: None,
-                        cancellation_watchdog_started: false,
-                        next_progress: 1,
-                        claimed: false,
-                        injected: false,
-                        background: *background,
-                        authorization_scope: None,
-                        location: location.clone(),
-                    },
-                );
+                let (entry, _receiver) = JobEntry::new(JobSpec {
+                    agent: record.agent.clone(),
+                    parent: *parent,
+                    tool: tool.clone(),
+                    arguments: serde_json::Value::Null,
+                    accepts_input: *accepts_input,
+                    background: *background,
+                    authorization_scope: None,
+                    location: location.clone(),
+                });
+                jobs.insert(*job, entry);
             }
             SessionEvent::JobStateChanged { job, state } => {
                 if let Some(entry) = jobs.get_mut(job) {
@@ -86,12 +66,12 @@ pub(super) async fn restore(
             }
             SessionEvent::JobClaimed { job } => {
                 if let Some(entry) = jobs.get_mut(job) {
-                    entry.claimed = true;
+                    entry.delivery = DeliveryState::Claimed;
                 }
             }
             SessionEvent::JobInjected { job } => {
                 if let Some(entry) = jobs.get_mut(job) {
-                    entry.injected = true;
+                    entry.delivery = DeliveryState::Injected;
                 }
             }
             _ => {}

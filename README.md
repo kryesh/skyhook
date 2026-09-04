@@ -170,6 +170,9 @@ supervisor, persistence, and path authorization checks as model-originated calls
 `undefined` returns JSON `null`; nested `undefined` values are rejected with their result path.
 The `script` tool is deliberately omitted from the runtime, preventing recursive script invocation.
 
+Failed tools retain any partial output (including captured process output on timeout). Model tool
+errors include it in an `output` field; JavaScript callers can catch the error and read `error.output`.
+
 ## Library architecture
 
 - `provider::Provider` returns an object-safe, asynchronously pollable response handle; concrete

@@ -339,30 +339,7 @@ where
 }
 
 async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
-    let parent = path.parent().ok_or(SessionError::UnsafeArtifactPath)?;
-    let mut random = [0; 8];
-    getrandom::fill(&mut random)?;
-    let temporary = parent.join(format!(".skyhook-{:016x}.tmp", u64::from_ne_bytes(random)));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)
-        .await?;
-    if let Err(error) = async {
-        file.write_all(bytes).await?;
-        file.sync_all().await
-    }
-    .await
-    {
-        let _ = fs::remove_file(&temporary).await;
-        return Err(error.into());
-    }
-    drop(file);
-    if let Err(error) = fs::rename(&temporary, path).await {
-        let _ = fs::remove_file(&temporary).await;
-        return Err(error.into());
-    }
-    Ok(())
+    Ok(crate::fs::atomic_write(path, bytes, crate::fs::AtomicWriteOptions::default()).await?)
 }
 
 #[derive(Debug, Error)]

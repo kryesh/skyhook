@@ -72,7 +72,7 @@ fn register_ask(
                     )
                     .await
                     .map_err(|error| tool_error(&error))?;
-                let answers = runtime.coordinate_question(context.clone(), input).await?;
+                let answers = runtime.questions.coordinate_question(context.clone(), input).await?;
                 runtime
                     .store
                     .append(
@@ -175,12 +175,12 @@ fn register_child_agent(
                             let value = match value {
                                 Ok(value) => value,
                                 Err(error) => {
-                                    runtime.cancel_child_question(context.job).await;
+                                    runtime.questions.cancel_child_question(context.job).await;
                                     runtime.interrupt_tree(&child).await;
                                     return Err(error);
                                 }
                             };
-                            if !runtime.answer_child_question(context.job, value.clone()).await
+                            if !runtime.questions.answer_child_question(context.job, value.clone()).await
                                 .map_err(|error| tool_error(&error))?
                             {
                                 sender.send(AgentCommand::Input {

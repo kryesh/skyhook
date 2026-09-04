@@ -15,7 +15,10 @@ use serde::Deserialize;
 use thiserror::Error;
 
 mod loader;
+mod paths;
 mod providers;
+
+pub(crate) use paths::user_config_directory;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

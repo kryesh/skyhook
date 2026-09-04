@@ -295,8 +295,9 @@ async fn externalize_result(
         Ok(result) => externalize_images(result.output, store)
             .await
             .map_err(remote_error),
-        Err(ExecutionError::Failed { message, output }) => {
-            let output = match output {
+        Err(error) => {
+            let failure = error.into_failure();
+            let output = match failure.output {
                 Some(output) => Some(
                     externalize_images(output, store)
                         .await
@@ -304,12 +305,11 @@ async fn externalize_result(
                 ),
                 None => None,
             };
-            Err(RemoteToolError { message, output })
+            Err(RemoteToolError {
+                message: failure.message,
+                output,
+            })
         }
-        Err(error) => Err(RemoteToolError {
-            message: error.to_string(),
-            output: None,
-        }),
     }
 }
 

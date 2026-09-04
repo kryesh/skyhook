@@ -68,103 +68,62 @@ pub struct JobProgressRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq)]
-pub struct JobEnvelope {
+pub struct JobEnvelope<L = ExecutionLocation, T = String, V = Value> {
     pub id: JobId,
     pub parent: Option<JobId>,
-    pub tool: String,
+    pub tool: T,
     pub state: JobState,
-    pub output: Option<Value>,
-    pub error: Option<String>,
-    pub location: ExecutionLocation,
+    pub output: Option<V>,
+    pub error: Option<T>,
+    pub location: L,
 }
 
-#[derive(Serialize)]
-struct JobEnvelopeView<'a, L: Serialize> {
-    id: JobId,
-    parent: Option<JobId>,
-    tool: &'a str,
-    state: JobState,
-    output: &'a Option<Value>,
-    error: &'a Option<String>,
-    location: L,
-}
-
-#[derive(Serialize)]
-struct LocationView<'a> {
-    target: &'a str,
+#[derive(Serialize, JsonSchema)]
+struct LocalLocation<'a> {
     workspace: &'a std::path::Path,
-}
-
-#[derive(Serialize)]
-struct LocalLocationView<'a> {
-    workspace: &'a std::path::Path,
-}
-
-#[derive(JsonSchema)]
-#[allow(dead_code)]
-struct LocalExecutionLocationSchema {
-    workspace: std::path::PathBuf,
-}
-
-#[derive(JsonSchema)]
-#[allow(dead_code)]
-struct LocalJobEnvelopeSchema {
-    id: JobId,
-    parent: Option<JobId>,
-    tool: String,
-    state: JobState,
-    output: Option<Value>,
-    error: Option<String>,
-    location: LocalExecutionLocationSchema,
 }
 
 impl JobEnvelope {
+    fn view<L>(&self, location: L) -> JobEnvelope<L, &str, &Value> {
+        JobEnvelope {
+            id: self.id,
+            parent: self.parent,
+            tool: &self.tool,
+            state: self.state,
+            output: self.output.as_ref(),
+            error: self.error.as_deref(),
+            location,
+        }
+    }
+
     pub(crate) fn presented(
         &self,
         capabilities: &CapabilitySet,
     ) -> Result<Value, serde_json::Error> {
         if capabilities.contains(Capability::Targets) {
-            serde_json::to_value(JobEnvelopeView {
-                id: self.id,
-                parent: self.parent,
-                tool: &self.tool,
-                state: self.state,
-                output: &self.output,
-                error: &self.error,
-                location: LocationView {
-                    target: &self.location.target,
-                    workspace: &self.location.workspace,
-                },
-            })
+            serde_json::to_value(self.view(&self.location))
         } else {
-            serde_json::to_value(JobEnvelopeView {
-                id: self.id,
-                parent: self.parent,
-                tool: &self.tool,
-                state: self.state,
-                output: &self.output,
-                error: &self.error,
-                location: LocalLocationView {
-                    workspace: &self.location.workspace,
-                },
-            })
+            serde_json::to_value(self.view(LocalLocation {
+                workspace: &self.location.workspace,
+            }))
         }
     }
 }
 
 pub(crate) fn presented_job_schema(capabilities: &CapabilitySet, many: bool) -> Value {
-    if capabilities.contains(Capability::Targets) {
+    fn schema<T: JsonSchema>(many: bool) -> Value {
         if many {
-            serde_json::to_value(schemars::schema_for!(Vec<JobEnvelope>))
+            serde_json::to_value(schemars::schema_for!(Vec<T>))
         } else {
-            serde_json::to_value(schemars::schema_for!(JobEnvelope))
+            serde_json::to_value(schemars::schema_for!(T))
         }
-    } else if many {
-        serde_json::to_value(schemars::schema_for!(Vec<LocalJobEnvelopeSchema>))
-    } else {
-        serde_json::to_value(schemars::schema_for!(LocalJobEnvelopeSchema))
+        .expect("job presentation schemas serialize")
     }
-    .expect("job presentation schemas serialize")
+    if capabilities.contains(Capability::Targets) {
+        schema::<JobEnvelope>(many)
+    } else {
+        schema::<JobEnvelope<LocalLocation<'_>>>(many)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -189,14 +148,53 @@ struct JobEntry {
     task_abort: Option<AbortHandle>,
     cancellation_watchdog_started: bool,
     next_progress: u64,
-    claimed: bool,
-    injected: bool,
+    delivery: DeliveryState,
     background: bool,
     authorization_scope: Option<u64>,
     location: ExecutionLocation,
 }
 
 impl JobEntry {
+    fn new(spec: JobSpec) -> (Self, mpsc::Receiver<Value>) {
+        let (input, receiver) = mpsc::channel(JOB_INPUT_CAPACITY);
+        (
+            Self {
+                agent: spec.agent,
+                parent: spec.parent,
+                tool: spec.tool,
+                state: JobState::Queued,
+                output: None,
+                images: Vec::new(),
+                error: None,
+                accepts_input: spec.accepts_input,
+                input,
+                cancellation: CancellationToken::new(),
+                notify: Arc::new(Notify::new()),
+                operation: Arc::new(Mutex::new(())),
+                task_abort: None,
+                cancellation_watchdog_started: false,
+                next_progress: 1,
+                delivery: DeliveryState::Pending,
+                background: spec.background,
+                authorization_scope: spec.authorization_scope,
+                location: spec.location,
+            },
+            receiver,
+        )
+    }
+
+    fn deliverable(&self) -> bool {
+        self.state.is_terminal() || self.state == JobState::WaitingInput
+    }
+
+    fn reserve_delivery(&mut self, delivery: DeliveryState) -> Option<AgentId> {
+        if !self.deliverable() || self.delivery != DeliveryState::Pending {
+            return None;
+        }
+        self.delivery = delivery;
+        Some(self.agent.clone())
+    }
+
     fn envelope(&self, id: JobId) -> JobEnvelope {
         JobEnvelope {
             id,
@@ -206,6 +204,29 @@ impl JobEntry {
             output: self.output.clone(),
             error: self.error.clone(),
             location: self.location.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeliveryState {
+    Pending,
+    Claimed,
+    Injected,
+}
+
+#[derive(Clone, Copy)]
+enum WaitMode {
+    Foreground,
+    Explicit { claim: bool },
+}
+
+impl DeliveryState {
+    fn event(self, job: JobId) -> SessionEvent {
+        match self {
+            Self::Claimed => SessionEvent::JobClaimed { job },
+            Self::Injected => SessionEvent::JobInjected { job },
+            Self::Pending => unreachable!("pending delivery has no event"),
         }
     }
 }
@@ -288,65 +309,31 @@ impl JobManager {
         &self.inner.store
     }
 
-    pub async fn create(&self, spec: JobSpec) -> Result<JobLease, JobError> {
-        let JobSpec {
-            agent,
-            parent,
-            tool,
-            arguments,
-            accepts_input,
-            background,
-            authorization_scope,
-            location,
-        } = spec;
+    pub async fn create(&self, mut spec: JobSpec) -> Result<JobLease, JobError> {
         let raw = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let id = JobId::new(raw).map_err(|error| JobError::Internal(error.to_string()))?;
-        let (input, input_rx) = mpsc::channel(JOB_INPUT_CAPACITY);
-        let cancellation = CancellationToken::new();
         self.inner
             .store
             .append(
-                agent.clone(),
+                spec.agent.clone(),
                 SessionEvent::JobCreated {
                     job: id,
-                    parent,
-                    tool: tool.clone(),
-                    arguments,
-                    accepts_input,
-                    background,
-                    location: location.clone(),
+                    parent: spec.parent,
+                    tool: spec.tool.clone(),
+                    arguments: std::mem::take(&mut spec.arguments),
+                    accepts_input: spec.accepts_input,
+                    background: spec.background,
+                    location: spec.location.clone(),
                 },
             )
             .await?;
-        self.inner.jobs.lock().await.insert(
-            id,
-            JobEntry {
-                agent,
-                parent,
-                tool,
-                state: JobState::Queued,
-                output: None,
-                images: Vec::new(),
-                error: None,
-                accepts_input,
-                input,
-                cancellation: cancellation.clone(),
-                notify: Arc::new(Notify::new()),
-                operation: Arc::new(Mutex::new(())),
-                task_abort: None,
-                cancellation_watchdog_started: false,
-                next_progress: 1,
-                claimed: false,
-                injected: false,
-                background,
-                authorization_scope,
-                location,
-            },
-        );
+        let (entry, input) = JobEntry::new(spec);
+        let cancellation = entry.cancellation.clone();
+        self.inner.jobs.lock().await.insert(id, entry);
         Ok(JobLease {
             id,
             cancellation,
-            input: input_rx,
+            input,
         })
     }
 
@@ -577,32 +564,50 @@ impl JobManager {
         timeout: Option<Duration>,
         claim: bool,
     ) -> Result<JobEnvelope, JobError> {
+        self.wait_inner(id, timeout, WaitMode::Explicit { claim })
+            .await
+    }
+
+    pub(crate) async fn wait_foreground(&self, id: JobId) -> Result<JobEnvelope, JobError> {
+        self.wait_inner(id, None, WaitMode::Foreground).await
+    }
+
+    async fn wait_inner(
+        &self,
+        id: JobId,
+        timeout: Option<Duration>,
+        mode: WaitMode,
+    ) -> Result<JobEnvelope, JobError> {
         loop {
-            let (snapshot, notified, deliverable, claimed_agent) = {
+            let (snapshot, notified, ready, claimed_agent) = {
                 let mut jobs = self.inner.jobs.lock().await;
                 let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
                 let notified = entry.notify.clone().notified_owned();
-                let deliverable = entry.state.is_terminal()
-                    || (entry.state == JobState::WaitingInput && !entry.claimed && !entry.injected);
-                let claimed_agent = if deliverable && claim && !entry.claimed && !entry.injected {
-                    entry.claimed = true;
-                    Some(entry.agent.clone())
+                let pending_question = entry.state == JobState::WaitingInput
+                    && entry.delivery == DeliveryState::Pending;
+                let (ready, claim) = match mode {
+                    WaitMode::Foreground => (
+                        entry.deliverable() || entry.background,
+                        entry.state == JobState::WaitingInput,
+                    ),
+                    WaitMode::Explicit { claim } => {
+                        (entry.state.is_terminal() || pending_question, claim)
+                    }
+                };
+                let claimed_agent = if ready && claim {
+                    entry.reserve_delivery(DeliveryState::Claimed)
                 } else {
                     None
                 };
                 let mut snapshot = entry.envelope(id);
-                if entry.state == JobState::WaitingInput && !deliverable {
+                if entry.state == JobState::WaitingInput && !ready {
                     snapshot.output = None;
                 }
-                (snapshot, notified, deliverable, claimed_agent)
+                (snapshot, notified, ready, claimed_agent)
             };
-            if deliverable {
-                if let Some(agent) = claimed_agent {
-                    self.inner
-                        .store
-                        .append(agent, SessionEvent::JobClaimed { job: id })
-                        .await?;
-                }
+            if ready {
+                self.persist_delivery(id, claimed_agent, DeliveryState::Claimed)
+                    .await?;
                 return Ok(snapshot);
             }
             if let Some(timeout) = timeout {
@@ -615,60 +620,29 @@ impl JobManager {
         }
     }
 
-    pub(crate) async fn wait_foreground(&self, id: JobId) -> Result<JobEnvelope, JobError> {
-        loop {
-            let (snapshot, notified, detached, claimed_agent) = {
-                let mut jobs = self.inner.jobs.lock().await;
-                let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
-                let notified = entry.notify.clone().notified_owned();
-                let claimed_agent =
-                    if entry.state == JobState::WaitingInput && !entry.claimed && !entry.injected {
-                        entry.claimed = true;
-                        Some(entry.agent.clone())
-                    } else {
-                        None
-                    };
-                (
-                    entry.envelope(id),
-                    notified,
-                    entry.background,
-                    claimed_agent,
-                )
-            };
-            if snapshot.state.is_terminal() || snapshot.state == JobState::WaitingInput {
-                if let Some(agent) = claimed_agent {
-                    self.inner
-                        .store
-                        .append(agent, SessionEvent::JobClaimed { job: id })
-                        .await?;
-                }
-                return Ok(snapshot);
-            }
-            if detached {
-                return Ok(snapshot);
-            }
-            notified.await;
+    async fn persist_delivery(
+        &self,
+        id: JobId,
+        agent: Option<AgentId>,
+        delivery: DeliveryState,
+    ) -> Result<(), JobError> {
+        if let Some(agent) = agent {
+            self.inner.store.append(agent, delivery.event(id)).await?;
         }
+        Ok(())
     }
 
     pub async fn claim(&self, id: JobId) -> Result<(), JobError> {
         let agent = {
             let mut jobs = self.inner.jobs.lock().await;
             let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
-            if !entry.state.is_terminal() && entry.state != JobState::WaitingInput {
+            if !entry.deliverable() {
                 return Err(JobError::NotTerminal(id));
             }
-            if entry.claimed || entry.injected {
-                return Ok(());
-            }
-            entry.claimed = true;
-            entry.agent.clone()
+            entry.reserve_delivery(DeliveryState::Claimed)
         };
-        self.inner
-            .store
-            .append(agent, SessionEvent::JobClaimed { job: id })
-            .await?;
-        Ok(())
+        self.persist_delivery(id, agent, DeliveryState::Claimed)
+            .await
     }
 
     pub(crate) async fn prune_claimed(&self) -> Result<usize, JobError> {
@@ -677,7 +651,8 @@ impl JobManager {
             let removed = jobs
                 .iter()
                 .filter_map(|(id, entry)| {
-                    (entry.state.is_terminal() && entry.claimed).then_some(*id)
+                    (entry.state.is_terminal() && entry.delivery == DeliveryState::Claimed)
+                        .then_some(*id)
                 })
                 .collect::<Vec<_>>();
             for id in &removed {
@@ -820,8 +795,7 @@ impl JobManager {
             entry.state = JobState::WaitingInput;
             entry.output = Some(output);
             entry.error = None;
-            entry.claimed = false;
-            entry.injected = false;
+            entry.delivery = DeliveryState::Pending;
             entry.background = true;
             entry.notify.clone()
         };
@@ -859,8 +833,7 @@ impl JobManager {
             let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
             entry.state = JobState::Running;
             entry.output = None;
-            entry.claimed = false;
-            entry.injected = false;
+            entry.delivery = DeliveryState::Pending;
             entry.notify.clone()
         };
         notify.notify_waiters();
@@ -874,25 +847,17 @@ impl JobManager {
             let mut jobs = self.inner.jobs.lock().await;
             let mut pending = jobs
                 .iter_mut()
-                .filter(|(_, entry)| {
-                    &entry.agent == owner
-                        && entry.background
-                        && (entry.state.is_terminal() || entry.state == JobState::WaitingInput)
-                        && !entry.claimed
-                        && !entry.injected
-                })
-                .map(|(id, entry)| {
-                    entry.injected = true;
-                    (*id, entry.agent.clone(), entry.envelope(*id))
+                .filter(|(_, entry)| &entry.agent == owner && entry.background)
+                .filter_map(|(id, entry)| {
+                    let agent = entry.reserve_delivery(DeliveryState::Injected)?;
+                    Some((*id, agent, entry.envelope(*id)))
                 })
                 .collect::<Vec<_>>();
             pending.sort_by_key(|(id, _, _)| *id);
             pending
         };
         for (job, agent, _) in &pending {
-            self.inner
-                .store
-                .append(agent.clone(), SessionEvent::JobInjected { job: *job })
+            self.persist_delivery(*job, Some(agent.clone()), DeliveryState::Injected)
                 .await?;
         }
         Ok(pending
