@@ -32,6 +32,7 @@ struct PreparedInvocation {
     original_arguments: Value,
     handler_arguments: Value,
     background: bool,
+    job_name: Option<String>,
     authorization_scope: Option<u64>,
 }
 
@@ -47,6 +48,7 @@ struct InvocationPlan {
     parent: Option<JobId>,
     authorization_scope: Option<u64>,
     background: bool,
+    job_name: Option<String>,
     dispatch: InvocationDispatch,
 }
 
@@ -315,6 +317,7 @@ impl ToolExecutor {
             original_arguments,
             handler_arguments,
             background,
+            job_name,
             authorization_scope,
         } = self
             .prepare_invocation(InvocationKind::Model, name, arguments, parent, None)
@@ -339,6 +342,7 @@ impl ToolExecutor {
             parent,
             authorization_scope,
             background,
+            job_name,
             dispatch: InvocationDispatch::External(runner),
         };
         let started = self.start(plan).await?;
@@ -365,13 +369,15 @@ impl ToolExecutor {
             .expect("validated tools are present on the surface");
         validate_invocation(spec, kind)?;
         let original_arguments = arguments.clone();
-        let (handler_arguments, background) =
+        let (mut handler_arguments, background) =
             self.shared.registry.split_execution(spec, arguments)?;
+        let job_name = tool.take_job_name(&mut handler_arguments)?;
         Ok(PreparedInvocation {
             tool,
             original_arguments,
             handler_arguments,
             background,
+            job_name,
             authorization_scope: self
                 .authorization_scope(parent, authorization_scope)
                 .await?,
@@ -392,6 +398,7 @@ impl ToolExecutor {
             original_arguments,
             handler_arguments: mut arguments,
             background,
+            job_name,
             authorization_scope,
         } = self
             .prepare_invocation(kind, name, arguments, parent, authorization_scope)
@@ -445,6 +452,7 @@ impl ToolExecutor {
             parent,
             authorization_scope,
             background,
+            job_name,
             dispatch: selected
                 .route
                 .map_or(InvocationDispatch::Local, InvocationDispatch::Remote),
@@ -471,6 +479,7 @@ impl ToolExecutor {
                 agent: plan.agent.clone(),
                 parent: plan.parent,
                 tool: plan.tool.name().to_owned(),
+                name: plan.job_name.clone(),
                 arguments: plan.original_arguments.clone(),
                 accepts_input: plan.tool.accepts_input(),
                 background: plan.background,

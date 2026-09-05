@@ -36,6 +36,7 @@ use crate::{
 
 pub use super::error::HarnessError;
 use super::interaction::{QuestionHandler, RuntimeEvent};
+use super::{TodoItem, TodoSnapshot, todo::TodoStore};
 
 mod prompt;
 mod questions;
@@ -279,7 +280,9 @@ impl Harness {
             .iter()
             .filter(|record| record.agent == root)
             .filter_map(|record| match &record.event {
-                SessionEvent::MessageCommitted { message } => Some(message.clone()),
+                SessionEvent::MessageCommitted { message } => {
+                    prompt::without_legacy_state(message.clone())
+                }
                 _ => None,
             })
             .collect();
@@ -314,6 +317,12 @@ impl SessionHandle {
     /// Returns cumulative model usage for the session, including usage restored on resume.
     pub async fn usage(&self) -> Usage {
         *self.runtime.usage.lock().await
+    }
+
+    /// Current todo lists for all session agents, including historical children.
+    /// Subscribe before reading this snapshot to observe subsequent replacements.
+    pub async fn todos(&self) -> Vec<TodoSnapshot> {
+        self.runtime.todos.snapshots().await
     }
 
     #[must_use]
@@ -413,6 +422,7 @@ struct SessionRuntime {
     harness: Arc<HarnessInner>,
     store: SessionStore,
     jobs: JobManager,
+    todos: TodoStore,
     executor: ToolExecutor,
     // Keeps the script tool's weak executor lookup alive without an executor/registry cycle.
     _executor_slot: Arc<OnceLock<ToolExecutor>>,
@@ -446,6 +456,7 @@ struct AgentLaunch {
     model_profile: String,
     agent_profile: Option<String>,
     history: Vec<Message>,
+    todos: Option<Vec<TodoItem>>,
     one_shot: bool,
     available_depth: usize,
     location: crate::execution::ExecutionLocation,
@@ -551,6 +562,7 @@ impl SessionRuntime {
             harness.questions.clone(),
         ));
         let runtime = Arc::new(Self {
+            todos: TodoStore::restore(store.clone(), &prior_records),
             harness,
             store: store.clone(),
             jobs: jobs.clone(),
@@ -584,6 +596,7 @@ impl SessionRuntime {
                 model_profile: self.harness.default_model_profile.clone(),
                 agent_profile: self.harness.default_agent_profile.clone(),
                 history,
+                todos: None,
                 one_shot: false,
                 available_depth: self.harness.max_child_depth,
                 location: crate::execution::ExecutionLocation::root(self.harness.workspace.clone()),
@@ -662,6 +675,7 @@ impl SessionRuntime {
             model_profile,
             agent_profile,
             history,
+            todos,
             one_shot,
             available_depth,
             location,
@@ -687,12 +701,17 @@ impl SessionRuntime {
                 id.clone(),
                 SessionEvent::AgentStarted {
                     parent,
+                    owner_job,
                     model_profile: model_profile.clone(),
                     agent_profile: agent_profile.clone(),
                     location: location.clone(),
                 },
             )
             .await?;
+        if let Some(job) = owner_job {
+            self.jobs.set_agent_location(job, location.clone()).await?;
+        }
+        self.todos.register(id.clone(), owner_job, todos).await?;
         let (tx, rx) = mpsc::channel(AGENT_CHANNEL_CAPACITY);
         self.agents
             .write()
@@ -878,12 +897,7 @@ impl SessionRuntime {
                         .await;
                     break;
                 }
-                AgentCommand::Input { mut content, done } => {
-                    if let Some(state) = prompt::active_jobs_content(&self.jobs, &id).await {
-                        content.push(state);
-                    }
-                    (content, done)
-                }
+                AgentCommand::Input { content, done } => (content, done),
                 AgentCommand::JobsReady => {
                     let pending = match self.jobs.take_pending(&id).await {
                         Ok(pending) if !pending.is_empty() => pending,
@@ -909,15 +923,12 @@ impl SessionRuntime {
                         .map(|job| job.presented(&capabilities))
                         .collect::<Result<Vec<_>, _>>()
                         .unwrap_or_default();
-                    let mut content = vec![UserContent::Runtime {
+                    let content = vec![UserContent::Runtime {
                         text: format!(
                             "<skyhook_job_events>\n{}\n</skyhook_job_events>",
                             serde_json::to_string(&presented).unwrap_or_else(|_| "[]".to_owned())
                         ),
                     }];
-                    if let Some(state) = prompt::active_jobs_content(&self.jobs, &id).await {
-                        content.push(state);
-                    }
                     (content, None)
                 }
             };
@@ -1039,6 +1050,9 @@ impl SessionRuntime {
                 return Err(HarnessError::Interrupted);
             }
             let mut request_messages = history.clone();
+            request_messages.push(Message::User(vec![
+                prompt::runtime_state_content(&self.jobs, &self.todos, agent, capabilities).await,
+            ]));
             self.hydrate_images(&mut request_messages).await?;
             let request = ModelRequest {
                 model: profile.model.clone(),
@@ -1335,6 +1349,9 @@ async fn hydrate_image(
 
 #[cfg(test)]
 mod tests {
+    mod names;
+    mod state;
+    mod todos;
     use std::{
         collections::VecDeque,
         future::Future,
@@ -1472,6 +1489,13 @@ mod tests {
                 )
             })
             .count()
+    }
+
+    fn request_history(request: &ModelRequest) -> &[Message] {
+        assert_eq!(runtime_state_count(&request.messages), 1);
+        let (state, history) = request.messages.split_last().unwrap();
+        assert_eq!(runtime_state_count(std::slice::from_ref(state)), 1);
+        history
     }
 
     fn request_has_tool(request: &ModelRequest, name: &str) -> bool {
@@ -1631,7 +1655,7 @@ mod tests {
         assert!(requests[0].system[0].cache);
         assert!(requests[0].system[0].text.starts_with(prompt::ROOT_PROMPT));
         assert!(requests[0].system[0].text.contains("<skyhook_context>"));
-        assert!(requests[0].system[0].text.contains("\"date\":"));
+        assert!(!requests[0].system[0].text.contains("\"date\":"));
         assert!(requests[0].system[0].text.contains("\"available_depth\":4"));
         assert!(!requests[0].system[0].text.contains(prompt::TARGET_PROMPT));
         let read = requests[0]
@@ -1656,18 +1680,22 @@ mod tests {
             .find(|tool| tool.name == "agent")
             .unwrap();
         assert_eq!(agent.input_schema["properties"]["depth"]["default"], 0);
-        let Message::User(content) = requests[0].messages.last().unwrap() else {
-            panic!("external input and runtime state must share a user message");
+        let Message::User(content) = request_history(&requests[0]).last().unwrap() else {
+            panic!("external input must remain a user message");
         };
         assert!(matches!(&content[0], UserContent::Text { text } if text == "read the note"));
-        assert_eq!(content.len(), 1, "empty runtime state must not be appended");
-        assert!(requests[1].messages.starts_with(&requests[0].messages));
+        assert_eq!(
+            content.len(),
+            1,
+            "runtime state must not be committed with input"
+        );
+        assert!(request_history(&requests[1]).starts_with(request_history(&requests[0])));
         assert_eq!(requests[1].messages.len(), requests[0].messages.len() + 2);
-        let Message::Tool(results) = requests[1].messages.last().unwrap() else {
+        let Message::Tool(results) = request_history(&requests[1]).last().unwrap() else {
             panic!("parallel calls must be committed as one tool-result message");
         };
         assert_eq!(results.len(), 2);
-        assert_eq!(runtime_state_count(&requests[1].messages), 0);
+        assert_eq!(runtime_state_count(&requests[1].messages), 1);
     }
 
     #[tokio::test]
@@ -1741,7 +1769,7 @@ mod tests {
         assert!(!requests[1].system[0].text.contains("orchestration"));
         assert!(!requests[1].system[0].text.contains("available_depth"));
         assert!(!request_has_tool(&requests[1], "agent"));
-        let Message::Tool(results) = requests[2].messages.last().unwrap() else {
+        let Message::Tool(results) = request_history(&requests[2]).last().unwrap() else {
             panic!("root must receive the child result");
         };
         assert_eq!(results[0].result["target"], "build");
@@ -1829,7 +1857,8 @@ mod tests {
             "root done"
         );
         let requests = requests.lock().unwrap();
-        let Message::Tool(results) = requests.last().unwrap().messages.last().unwrap() else {
+        let Message::Tool(results) = request_history(requests.last().unwrap()).last().unwrap()
+        else {
             panic!("child result expected")
         };
         assert_eq!(results[0].result["result"], "child work completed");
@@ -1871,6 +1900,7 @@ mod tests {
                 model_profile: "test".to_owned(),
                 agent_profile: None,
                 history: Vec::new(),
+                todos: None,
                 one_shot: true,
                 available_depth: 0,
                 location: crate::execution::ExecutionLocation::root(workspace.path().to_path_buf()),
@@ -2015,7 +2045,7 @@ mod tests {
                 .text
                 .contains(&child_path.to_string_lossy().into_owned())
         );
-        let Message::Tool(results) = requests[2].messages.last().unwrap() else {
+        let Message::Tool(results) = request_history(&requests[2]).last().unwrap() else {
             panic!("child must receive its read result");
         };
         assert_eq!(results[0].result["content"], "from child workspace");
@@ -2042,7 +2072,7 @@ mod tests {
                         block: AssistantContent::ToolCall(ToolCall {
                             id: "child-agent".to_owned(),
                             name: "agent".to_owned(),
-                            arguments: json!({"prompt":"inspect directly"}),
+                            arguments: json!({"prompt":"inspect directly", "todos":["Inspect directly"]}),
                         }),
                     }],
                     vec![ResponseChunk::TextDelta {
@@ -2073,6 +2103,12 @@ mod tests {
         assert!(requests[2].system[0].text.starts_with(prompt::CHILD_PROMPT));
         assert!(!requests[2].system[0].text.contains("available_depth"));
         assert!(!request_has_tool(&requests[2], "agent"));
+        let Message::User(content) = requests[2].messages.last().unwrap() else {
+            panic!("grandchild runtime state");
+        };
+        assert!(
+            matches!(&content[0], UserContent::Runtime { text } if text.contains(r#""todos":[{"text":"Inspect directly","status":"pending"}]"#))
+        );
     }
 
     #[tokio::test]
@@ -2106,7 +2142,7 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2, "an over-budget child must not start");
-        let Message::Tool(results) = requests[1].messages.last().unwrap() else {
+        let Message::Tool(results) = request_history(&requests[1]).last().unwrap() else {
             panic!("root must receive the failed agent result");
         };
         assert!(results[0].is_error);
@@ -2169,7 +2205,7 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 4, "hidden delegation must not start agents");
-        let Message::Tool(results) = requests[2].messages.last().unwrap() else {
+        let Message::Tool(results) = request_history(&requests[2]).last().unwrap() else {
             panic!("child must receive both failed tool results");
         };
         assert_eq!(results.len(), 2);
@@ -2244,7 +2280,7 @@ mod tests {
             ["first", "second"]
         );
         let requests = requests.lock().unwrap();
-        let Message::Tool(results) = requests[1].messages.last().unwrap() else {
+        let Message::Tool(results) = request_history(&requests[1]).last().unwrap() else {
             panic!("answers must be returned as tool results");
         };
         assert_eq!(results[0].result, "yes");
@@ -2456,9 +2492,9 @@ mod tests {
         );
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
-        assert!(requests[1].messages.starts_with(&requests[0].messages));
-        assert_eq!(runtime_state_count(&requests[0].messages), 0);
-        assert_eq!(runtime_state_count(&requests[1].messages), 0);
+        assert!(request_history(&requests[1]).starts_with(request_history(&requests[0])));
+        assert_eq!(runtime_state_count(&requests[0].messages), 1);
+        assert_eq!(runtime_state_count(&requests[1].messages), 1);
     }
 
     #[tokio::test]
@@ -2496,6 +2532,7 @@ mod tests {
                 .jobs
                 .create(crate::job::JobSpec {
                     background: true,
+                    name: Some(value.to_owned()),
                     ..crate::job::JobSpec::test(session.root.clone(), "test")
                 })
                 .await
@@ -2532,8 +2569,8 @@ mod tests {
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
-        assert!(requests[1].messages.starts_with(&requests[0].messages));
-        let Message::User(content) = requests[1].messages.last().unwrap() else {
+        assert!(request_history(&requests[1]).starts_with(request_history(&requests[0])));
+        let Message::User(content) = request_history(&requests[1]).last().unwrap() else {
             panic!("job wakeup must append one runtime user message");
         };
         assert_eq!(content.len(), 1);
@@ -2541,7 +2578,9 @@ mod tests {
             panic!("job events must be runtime content");
         };
         assert_eq!(events.matches("\"id\"").count(), 2);
-        assert_eq!(runtime_state_count(&requests[1].messages), 0);
+        assert!(events.contains(r#""name":"first""#));
+        assert!(events.contains(r#""name":"second""#));
+        assert_eq!(runtime_state_count(&requests[1].messages), 1);
         let event_messages = requests[2]
             .messages
             .iter()
@@ -2558,7 +2597,7 @@ mod tests {
             })
             .count();
         assert_eq!(event_messages, 1, "redundant wakeups must commit nothing");
-        assert_eq!(runtime_state_count(&requests[2].messages), 0);
+        assert_eq!(runtime_state_count(&requests[2].messages), 1);
     }
 
     #[tokio::test]

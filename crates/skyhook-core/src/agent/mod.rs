@@ -4,6 +4,7 @@ mod error;
 mod interaction;
 mod profile;
 mod runtime;
+mod todo;
 
 pub use error::HarnessError;
 pub use interaction::{
@@ -11,5 +12,6 @@ pub use interaction::{
 };
 pub use profile::AgentProfile;
 pub use runtime::{Harness, HarnessBuilder, SessionHandle};
+pub use todo::{TodoItem, TodoSnapshot, TodoStatus};
 
 pub(crate) use interaction::QuestionOutput;

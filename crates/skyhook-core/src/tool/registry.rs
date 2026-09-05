@@ -194,6 +194,7 @@ pub struct ToolOptions {
 pub struct ToolExecution {
     pub capabilities: Vec<Capability>,
     pub accepts_input: bool,
+    supports_name: bool,
     placement: ToolPlacement,
     permission_resource: Option<ResourceId>,
     path_arguments: Vec<PathArgument>,
@@ -201,6 +202,13 @@ pub struct ToolExecution {
 }
 
 impl ToolExecution {
+    /// Interpret an optional `name` argument as a snake_case job label.
+    #[must_use]
+    pub const fn named(mut self) -> Self {
+        self.supports_name = true;
+        self
+    }
+
     #[must_use]
     pub fn new(capabilities: Vec<Capability>) -> Self {
         Self {
@@ -229,6 +237,13 @@ impl ToolExecution {
 }
 
 impl ToolOptions {
+    /// Expose an optional snake_case job label, handled by the executor.
+    #[must_use]
+    pub const fn named(mut self) -> Self {
+        self.execution.supports_name = true;
+        self
+    }
+
     #[must_use]
     pub fn new(capabilities: Vec<Capability>) -> Self {
         let required = capabilities.iter().copied().collect();
@@ -360,6 +375,23 @@ impl Default for ToolOptions {
 }
 
 impl RegisteredTool {
+    pub(crate) fn take_job_name(&self, arguments: &mut Value) -> Result<Option<String>, ToolError> {
+        if !self.execution.supports_name {
+            return Ok(None);
+        }
+        let value = arguments
+            .as_object_mut()
+            .ok_or(ToolError::ArgumentsMustBeObject)?
+            .remove("name");
+        match value {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(name)) if valid_job_name(&name) => Ok(Some(name)),
+            _ => Err(ToolError::InvalidArguments(
+                "name must be lowercase snake_case: start with a letter, use only a-z, 0-9, and single underscores between nonempty words".to_owned(),
+            )),
+        }
+    }
+
     pub async fn call(
         &self,
         context: ToolContext,
@@ -657,8 +689,25 @@ impl ToolRegistryBuilder {
             conditional_inputs,
             output_schema,
         } = options;
+        let supports_name = execution.supports_name;
+        if supports_name && input_schema["properties"].get("name").is_some() {
+            return Err(RegistryError::Schema(
+                "named tools reserve the name argument for job metadata".to_owned(),
+            ));
+        }
         let schema = move |capabilities: &CapabilitySet| {
             let mut schema = input_schema.clone();
+            if supports_name {
+                add_schema_property(
+                    &mut schema,
+                    "name",
+                    serde_json::json!({
+                        "type": ["string", "null"],
+                        "pattern": "^[a-z][a-z0-9]*(_[a-z0-9]+)*$",
+                        "description": "Optional lowercase snake_case job name describing this work, for example run_tests or inspect_config. Shown in job state and notifications."
+                    }),
+                );
+            }
             for (name, capability, property) in &conditional_inputs {
                 if capabilities.contains(*capability) {
                     add_schema_property(&mut schema, name, property.clone());
@@ -882,6 +931,16 @@ fn validate_output_schema(schema: &Value) -> Result<(), RegistryError> {
             "output schema root must be an object or boolean".to_owned(),
         ))
     }
+}
+
+fn valid_job_name(name: &str) -> bool {
+    name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && name.split('_').all(|word| {
+            !word.is_empty()
+                && word
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
 }
 
 fn add_background(schema: &mut Value) {

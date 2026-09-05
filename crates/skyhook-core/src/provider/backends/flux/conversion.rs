@@ -322,21 +322,21 @@ mod tests {
     }
 
     #[test]
-    fn stable_system_stays_cached_and_runtime_state_stays_in_conversation() {
+    fn stable_system_stays_cached_and_transient_state_remains_a_request_suffix() {
         let converted = convert_request(ModelRequest {
             model: "test".to_owned(),
             system: vec![SystemSegment {
                 text: "stable system".to_owned(),
                 cache: true,
             }],
-            messages: vec![Message::User(vec![
-                UserContent::Text {
+            messages: vec![
+                Message::User(vec![UserContent::Text {
                     text: "hello".to_owned(),
-                },
-                UserContent::Runtime {
+                }]),
+                Message::User(vec![UserContent::Runtime {
                     text: "<skyhook_state>{}</skyhook_state>".to_owned(),
-                },
-            ])],
+                }]),
+            ],
             tools: Vec::new(),
             reasoning: None,
             max_output_tokens: None,
@@ -348,11 +348,13 @@ mod tests {
         assert_eq!(converted.system_segments.len(), 1);
         assert_eq!(converted.system_segments[0].text, "stable system");
         assert!(converted.system_segments[0].cache);
-        assert_eq!(converted.messages.len(), 1);
+        assert!(converted.cache_tail);
+        assert_eq!(converted.messages.len(), 2);
         assert_eq!(converted.messages[0].role, Role::User);
-        assert_eq!(converted.messages[0].content.len(), 2);
+        assert_eq!(converted.messages[0].content.len(), 1);
+        assert_eq!(converted.messages[1].role, Role::User);
         assert!(matches!(
-            &converted.messages[0].content[1],
+            &converted.messages[1].content[0],
             ContentBlock::Text { text } if text.contains("<skyhook_state>")
         ));
     }

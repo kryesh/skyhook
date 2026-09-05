@@ -267,10 +267,93 @@ unfinished jobs become interrupted and job identifiers continue monotonically; t
 service survival across harness restarts. `SessionHandle::interrupt` stops active provider streams
 and cancels jobs across the session's agent tree.
 
+`agent`, `exec`, and `shell` accept an optional `name` describing the work. Names must use
+lowercase snake_case: start with a letter, then use lowercase ASCII letters, digits, and single
+underscores between nonempty words. Examples include `inspect_config`, `run_tests`, and `build_v2`.
+Names are descriptive labels, do not need to be unique, and do not replace job IDs.
+
+```js
+return tool.exec({argv: ["cargo", "test"], name: "run_tests", bg: true});
+```
+
+Names appear in active-job state, job envelopes (including notifications and inspection), and
+durable job records. They survive session resume. Omitted or null names leave jobs unnamed;
+invalid names are rejected before execution. JavaScript builders also support `.name("run_tests")`.
+
+## Todos and runtime context
+
+Every agent has an ordered advisory todo list. `todo()` reads the caller's list;
+`todo({items:[...]})` replaces the whole list, and an empty array clears it. Each item has
+`text` and a `status` of `pending`, `in_progress`, or `completed`. Multiple items may be in
+progress. Unfinished items do not prevent an agent from finishing.
+
+Any agent allowed to delegate can seed a child with `agent.todos`. The task `prompt` remains
+required; seed strings become pending items before the child's first model request:
+
+```js
+const child = await tool.agent({
+  prompt: "Implement the requested change and report the validation results.",
+  name: "implement_change",
+  todos: ["Inspect the implementation", "Make the change", "Run relevant checks"],
+  bg: true
+});
+await tool.job(child.id).wait();
+return tool.todo({job: child.id});
+```
+
+The child owns subsequent edits. Ancestors can inspect a descendant using its agent job ID,
+including after it finishes; `items` and `job` cannot be combined. Inspection is available once
+the child has initialized; a queued launch may not have a list yet. Reads and updates return
+`{agent, items}`. An agent without todos has an empty list. Inside the child, progress can be
+updated with the same tool:
+
+```js
+return tool.todo({items: [
+  {text: "Inspect the implementation", status: "completed"},
+  {text: "Make the change", status: "in_progress"},
+  {text: "Run relevant checks", status: "pending"}
+]});
+```
+
+Lists persist with the session, including completed and interrupted child lists. Resume preserves
+recorded statuses. Host interfaces can read all current lists through `SessionHandle::todos()`
+and observe `SessionEvent::TodosReplaced` through the existing runtime event subscription.
+The public `TodoItem`, `TodoStatus`, and `TodoSnapshot` types live in `skyhook::agent`.
+
+Each model request ends with one fresh `<skyhook_state>` snapshot containing the host's current
+local `date` (`YYYY-MM-DD`), and the caller's `todos` and `active_jobs`, including empty arrays.
+The date is refreshed per request instead of being fixed in the system prompt at agent startup.
+Active jobs include their execution `location` and `age_seconds`: elapsed whole seconds since
+job creation, including time queued or waiting for input. Age is clamped to zero if the clock
+moves before the creation timestamp. Child-agent jobs report the child's selected target and
+workspace once initialized. Location includes `target` when target capabilities are enabled;
+otherwise it contains only `workspace`.
+
+```json
+{
+  "date": "2026-09-05",
+  "active_jobs": [{
+    "job": 7,
+    "tool": "exec",
+    "name": "run_tests",
+    "state": "running",
+    "location": {"workspace": "/home/user/project"},
+    "age_seconds": 12
+  }],
+  "todos": []
+}
+```
+
+These snapshots are assembled at request time
+and never appended to durable conversation history. Actual job notifications, tool exchanges,
+and todo replacement events remain durable. Older persisted active-job snapshots are omitted
+from replayed model context without changing the session log. Provider caching behavior is
+unchanged; transient history does not guarantee exclusion from provider KV caches.
+
 ## Built-in tools
 
 `read`, `search`, `glob`, `exec`, `shell`, `write`, `replace`, `patch`, `remove`, `script`, `targets`,
-`target_add`, `jobs`, `wait`, `ask`, and `agent`. `jobs()` returns the current agent's active
+`target_add`, `jobs`, `wait`, `ask`, `todo`, and `agent`. `jobs()` returns the current agent's active
 jobs and excludes the listing call itself and, when called from a script, its containing script;
 use `jobs({all:true})` to include terminal history. The remaining job controls are kept out of model tool definitions and exposed to scripts as
 `tool.job(id).inspect()`, `.send({value})`, `.cancel()`, and `.events({after, limit})`;

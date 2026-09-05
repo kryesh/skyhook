@@ -21,6 +21,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
         "exec",
         "Run an exact argument vector without shell parsing.",
         ToolOptions::new(vec![Capability::Exec])
+            .named()
             .background()
             .input()
             .default_path_argument("cwd", ".", PathAccess::Read, PathKind::Existing),
@@ -39,6 +40,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
         "shell",
         "Run /bin/sh -lc in the workspace.",
         ToolOptions::new(vec![Capability::Exec])
+            .named()
             .background()
             .input()
             .default_path_argument("cwd", ".", PathAccess::Read, PathKind::Existing),

@@ -82,6 +82,8 @@ pub struct JobEnvelope<L = ExecutionLocation, T = String, V = Value> {
     pub id: JobId,
     pub parent: Option<JobId>,
     pub tool: T,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<T>,
     pub state: JobState,
     pub output: Option<V>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -97,12 +99,32 @@ struct LocalLocation<'a> {
     workspace: &'a std::path::Path,
 }
 
+/// Minimal job information included in the model's current runtime snapshot.
+#[derive(Serialize)]
+pub(crate) struct ActiveJob {
+    job: JobId,
+    tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    state: JobState,
+    location: ActiveJobLocation,
+    age_seconds: u64,
+}
+
+#[derive(Serialize)]
+struct ActiveJobLocation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    workspace: std::path::PathBuf,
+}
+
 impl JobEnvelope {
     fn view<L>(&self, location: L) -> JobEnvelope<L, &str, &Value> {
         JobEnvelope {
             id: self.id,
             parent: self.parent,
             tool: &self.tool,
+            name: self.name.as_deref(),
             state: self.state.presented(),
             output: self.output.as_ref(),
             console_output: self.console_output.clone(),
@@ -172,6 +194,8 @@ struct JobEntry {
     agent: AgentId,
     parent: Option<JobId>,
     tool: String,
+    name: Option<String>,
+    created_at_millis: i64,
     state: JobState,
     output: Option<Value>,
     images: Vec<ImageReference>,
@@ -193,13 +217,15 @@ struct JobEntry {
 }
 
 impl JobEntry {
-    fn new(spec: JobSpec) -> (Self, mpsc::Receiver<Value>) {
+    fn new(spec: JobSpec, created_at_millis: i64) -> (Self, mpsc::Receiver<Value>) {
         let (input, receiver) = mpsc::channel(JOB_INPUT_CAPACITY);
         (
             Self {
                 agent: spec.agent,
                 parent: spec.parent,
                 tool: spec.tool,
+                name: spec.name,
+                created_at_millis,
                 state: JobState::Queued,
                 output: None,
                 images: Vec::new(),
@@ -240,6 +266,7 @@ impl JobEntry {
             id,
             parent: self.parent,
             tool: self.tool.clone(),
+            name: self.name.clone(),
             state: self.state,
             output: self.output.clone(),
             console_output: self.console_output.clone(),
@@ -296,6 +323,7 @@ pub struct JobSpec {
     pub agent: AgentId,
     pub parent: Option<JobId>,
     pub tool: String,
+    pub name: Option<String>,
     pub arguments: Value,
     pub accepts_input: bool,
     pub background: bool,
@@ -310,6 +338,7 @@ impl JobSpec {
             agent,
             parent: None,
             tool: tool.into(),
+            name: None,
             arguments: Value::Object(serde_json::Map::new()),
             accepts_input: false,
             background: false,
@@ -354,7 +383,8 @@ impl JobManager {
     pub async fn create(&self, mut spec: JobSpec) -> Result<JobLease, JobError> {
         let raw = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let id = JobId::new(raw).map_err(|error| JobError::Internal(error.to_string()))?;
-        self.inner
+        let created = self
+            .inner
             .store
             .append(
                 spec.agent.clone(),
@@ -362,6 +392,7 @@ impl JobManager {
                     job: id,
                     parent: spec.parent,
                     tool: spec.tool.clone(),
+                    name: spec.name.clone(),
                     arguments: std::mem::take(&mut spec.arguments),
                     accepts_input: spec.accepts_input,
                     background: spec.background,
@@ -369,7 +400,7 @@ impl JobManager {
                 },
             )
             .await?;
-        let (mut entry, input) = JobEntry::new(spec);
+        let (mut entry, input) = JobEntry::new(spec, created.timestamp_millis);
         let cancellation = {
             let mut jobs = self.inner.jobs.lock().await;
             if let Some(parent) = entry.parent {
@@ -644,6 +675,49 @@ impl JobManager {
             .collect::<Vec<_>>();
         output.sort_by_key(|job| job.id);
         output
+    }
+
+    /// Lightweight current state for request-time context; never clones job output artifacts.
+    pub(crate) async fn active_states(
+        &self,
+        owner: &AgentId,
+        capabilities: &CapabilitySet,
+        now_millis: i64,
+    ) -> Vec<ActiveJob> {
+        let jobs = self.inner.jobs.lock().await;
+        let mut states = jobs
+            .iter()
+            .filter(|(_, entry)| &entry.agent == owner && !entry.state.is_terminal())
+            .map(|(id, entry)| ActiveJob {
+                job: *id,
+                tool: entry.tool.clone(),
+                name: entry.name.clone(),
+                state: entry.state.presented(),
+                location: ActiveJobLocation {
+                    target: capabilities
+                        .contains(Capability::Targets)
+                        .then(|| entry.location.target.clone()),
+                    workspace: entry.location.workspace.clone(),
+                },
+                age_seconds: u64::try_from(now_millis.saturating_sub(entry.created_at_millis))
+                    .unwrap_or(0)
+                    / 1_000,
+            })
+            .collect::<Vec<_>>();
+        states.sort_by_key(|job| job.job);
+        states
+    }
+
+    /// Associate an agent job with the child's actual workspace and target.
+    /// The corresponding AgentStarted record persists this association for replay.
+    pub(crate) async fn set_agent_location(
+        &self,
+        job: JobId,
+        location: ExecutionLocation,
+    ) -> Result<(), JobError> {
+        let mut jobs = self.inner.jobs.lock().await;
+        jobs.get_mut(&job).ok_or(JobError::Unknown(job))?.location = location;
+        Ok(())
     }
 
     pub async fn has_running(&self, owner: &AgentId) -> bool {
@@ -1040,6 +1114,7 @@ pub enum JobError {
 
 #[cfg(test)]
 mod tests {
+    mod state;
     use std::sync::atomic::AtomicBool;
 
     use schemars::JsonSchema;
@@ -1207,6 +1282,7 @@ mod tests {
             id: JobId::new(1).unwrap(),
             parent: None,
             tool: "adapter".to_owned(),
+            name: None,
             state: JobState::Completed,
             output: Some(serde_json::json!({"target": "application-value"})),
             console_output: String::new(),
@@ -1235,7 +1311,7 @@ mod tests {
             .register::<Echo, String, _, _>(
                 "echo",
                 "echo",
-                ToolOptions::new(Vec::new()).background(),
+                ToolOptions::new(Vec::new()).background().named(),
                 |_context, input| async move { Ok(input.value) },
             )
             .unwrap();
@@ -1250,12 +1326,16 @@ mod tests {
             .execute(
                 agent.clone(),
                 "echo",
-                serde_json::json!({"value":"a"}),
+                serde_json::json!({"value":"a", "name":"foreground_echo"}),
                 None,
             )
             .await
             .unwrap();
         assert_eq!(foreground.output.value, "a");
+        assert_eq!(
+            jobs.snapshot(foreground.job).await.unwrap().name.as_deref(),
+            Some("foreground_echo")
+        );
         assert_eq!(
             jobs.snapshot(foreground.job).await.unwrap().location,
             ExecutionLocation::root(root.path().to_path_buf())
@@ -1264,12 +1344,13 @@ mod tests {
             .execute(
                 agent.clone(),
                 "echo",
-                serde_json::json!({"value":"b", "bg":true}),
+                serde_json::json!({"value":"b", "bg":true, "name":"background_echo"}),
                 None,
             )
             .await
             .unwrap();
         assert!(background.background);
+        assert_eq!(background.output.value["name"], "background_echo");
         assert_eq!(
             jobs.wait(background.job, None, true).await.unwrap().output,
             Some(serde_json::json!("b"))
@@ -1279,14 +1360,21 @@ mod tests {
             .execute_external(
                 agent.clone(),
                 "echo",
-                serde_json::json!({"value":"c"}),
+                serde_json::json!({"value":"c", "name":"external_echo"}),
                 None,
                 Vec::new(),
-                |arguments| async move { Ok(ToolOutput::new(arguments["value"].clone())) },
+                |arguments| async move {
+                    assert!(arguments.get("name").is_none());
+                    Ok(ToolOutput::new(arguments["value"].clone()))
+                },
             )
             .await
             .unwrap();
         assert_eq!(external.output.value, "c");
+        assert_eq!(
+            jobs.snapshot(external.job).await.unwrap().name.as_deref(),
+            Some("external_echo")
+        );
 
         let failed = executor
             .execute_external(

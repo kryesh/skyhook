@@ -30,9 +30,14 @@ pub enum SessionEvent {
     },
     AgentStarted {
         parent: Option<AgentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_job: Option<JobId>,
         model_profile: String,
         agent_profile: Option<String>,
         location: ExecutionLocation,
+    },
+    TodosReplaced {
+        items: Vec<crate::agent::TodoItem>,
     },
     MessageCommitted {
         message: Message,
@@ -44,6 +49,8 @@ pub enum SessionEvent {
         job: JobId,
         parent: Option<JobId>,
         tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         arguments: Value,
         accepts_input: bool,
         background: bool,

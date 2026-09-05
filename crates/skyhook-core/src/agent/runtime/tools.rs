@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use crate::{
-    agent::Question,
+    agent::{Question, TodoItem, TodoSnapshot, TodoStatus, todo::TodoStore},
     provider::protocol::UserContent,
     session::SessionEvent,
     tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::Capability},
@@ -24,6 +24,8 @@ use super::{AgentCommand, AgentLaunch, SessionRuntime};
 pub(super) struct AgentArgs {
     /// Complete task for the one-shot child agent.
     pub(super) prompt: String,
+    /// Initial ordered instructions for the child, all initially pending.
+    pub(super) todos: Option<Vec<String>>,
     /// Further agent generations available to the child. Defaults to zero.
     #[serde(default)]
     pub(super) depth: usize,
@@ -51,7 +53,44 @@ pub(super) fn register(
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
 ) -> Result<(), RegistryError> {
     register_ask(builder, runtime_slot.clone())?;
+    register_todo(builder, runtime_slot.clone())?;
     register_child_agent(builder, runtime_slot)
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TodoArgs {
+    /// Replace your entire list. An empty array clears it. Cannot be combined with job.
+    items: Option<Vec<TodoItem>>,
+    /// Inspect a descendant's list using its agent job ID. Omit to read your own list.
+    job: Option<crate::identity::JobId>,
+}
+
+fn register_todo(
+    builder: &mut ToolRegistryBuilder,
+    runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
+) -> Result<(), RegistryError> {
+    builder.register::<TodoArgs, TodoSnapshot, _, _>(
+        "todo",
+        "Read your advisory todo list, replace it with items, or inspect a descendant by agent job ID. Only the owning agent can edit its list. Multiple items may be in progress; unfinished items do not prevent completion.",
+        ToolOptions::default(),
+        move |context, input| {
+            let runtime = runtime_slot.get().and_then(Weak::upgrade);
+            async move {
+                let runtime = runtime.ok_or_else(runtime_unavailable)?;
+                if let Some(items) = input.items {
+                    if input.job.is_some() {
+                        return Err(ToolError::InvalidArguments("items and job cannot be combined".to_owned()));
+                    }
+                    TodoStore::validate(&items)?;
+                    runtime.todos.replace(&context.agent, items).await.map_err(|error| tool_error(&error))
+                } else {
+                    runtime.todos.inspect(&context.agent, input.job).await
+                }
+            }
+        },
+    )?;
+    Ok(())
 }
 
 fn register_ask(
@@ -108,6 +147,7 @@ fn register_child_agent(
         "agent",
         "Run a one-shot child agent with fresh conversation history. The job completes only after owned work finishes or is cancelled; questions suspend it and return a job envelope.",
         ToolOptions::default()
+            .named()
             .generated_output_schema(|capabilities| {
                 let mut schema = serde_json::to_value(schemars::schema_for!(AgentOutput)).expect("agent output schema serializes");
                 if !capabilities.contains(Capability::Targets) {
@@ -131,6 +171,10 @@ fn register_child_agent(
             async move {
                 let runtime = runtime.ok_or_else(runtime_unavailable)?;
                 let available_depth = runtime.available_depth(&context.agent);
+                let todos = input.todos.map(|items| items.into_iter().map(|text| TodoItem { text, status: TodoStatus::Pending }).collect::<Vec<_>>());
+                if let Some(items) = &todos {
+                    TodoStore::validate(items)?;
+                }
                 if input.depth >= available_depth {
                     return Err(ToolError::InvalidArguments(format!(
                         "depth must be less than the caller's available depth of {available_depth}"
@@ -167,6 +211,7 @@ fn register_child_agent(
                     model_profile: model,
                     agent_profile,
                     history: Vec::new(),
+                    todos,
                     one_shot: true,
                     available_depth: input.depth,
                     location,

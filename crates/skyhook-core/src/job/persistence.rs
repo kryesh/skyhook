@@ -18,23 +18,37 @@ pub(super) async fn restore(
                 job,
                 parent,
                 tool,
+                name,
                 accepts_input,
                 background,
                 location,
                 ..
             } => {
                 maximum = maximum.max(job.get());
-                let (entry, _receiver) = JobEntry::new(JobSpec {
-                    agent: record.agent.clone(),
-                    parent: *parent,
-                    tool: tool.clone(),
-                    arguments: serde_json::Value::Null,
-                    accepts_input: *accepts_input,
-                    background: *background,
-                    authorization_scope: None,
-                    location: location.clone(),
-                });
+                let (entry, _receiver) = JobEntry::new(
+                    JobSpec {
+                        agent: record.agent.clone(),
+                        parent: *parent,
+                        tool: tool.clone(),
+                        name: name.clone(),
+                        arguments: serde_json::Value::Null,
+                        accepts_input: *accepts_input,
+                        background: *background,
+                        authorization_scope: None,
+                        location: location.clone(),
+                    },
+                    record.timestamp_millis,
+                );
                 jobs.insert(*job, entry);
+            }
+            SessionEvent::AgentStarted {
+                owner_job: Some(job),
+                location,
+                ..
+            } => {
+                if let Some(entry) = jobs.get_mut(job) {
+                    entry.location.clone_from(location);
+                }
             }
             SessionEvent::JobStateChanged { job, state } => {
                 if let Some(entry) = jobs.get_mut(job) {
