@@ -22,18 +22,18 @@ use super::{AgentCommand, AgentLaunch, SessionRuntime};
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AgentArgs {
-    /// Complete task for the one-shot child agent.
+    /// Complete child task.
     pub(super) prompt: String,
-    /// Initial ordered instructions for the child, all initially pending.
+    /// Initial pending instructions.
     pub(super) todos: Option<Vec<String>>,
-    /// Further agent generations available to the child. Defaults to zero.
+    /// Further child generations.
     #[serde(default)]
     pub(super) depth: usize,
     /// Model profile override.
     pub(super) model: Option<String>,
     /// Agent profile override.
     pub(super) profile: Option<String>,
-    /// Execution target. Omit to inherit the caller; root selects the local host and root workspace.
+    /// Target; omitted inherits. root selects local host/root workspace.
     #[schemars(skip)]
     pub(super) target: Option<String>,
     /// Child workspace override: absolute, or relative to the workspace selected by target.
@@ -72,7 +72,7 @@ fn register_todo(
 ) -> Result<(), RegistryError> {
     builder.register::<TodoArgs, TodoSnapshot, _, _>(
         "todo",
-        "Read your advisory todo list, replace it with items, or inspect a descendant by agent job ID. Only the owning agent can edit its list. Multiple items may be in progress; unfinished items do not prevent completion.",
+        "Read your list, replace it with items, or inspect a descendant by agent job ID. Only the owner can edit.",
         ToolOptions::default(),
         move |context, input| {
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
@@ -145,7 +145,7 @@ fn register_child_agent(
 ) -> Result<(), RegistryError> {
     builder.register::<AgentArgs, AgentOutput, _, _>(
         "agent",
-        "Run a one-shot child agent with fresh conversation history. The job completes only after owned work finishes or is cancelled; questions suspend it and return a job envelope.",
+        "Run a one-shot child agent with fresh history; questions suspend it.",
         ToolOptions::default()
             .named()
             .generated_output_schema(|capabilities| {
@@ -161,7 +161,7 @@ fn register_child_agent(
                 Capability::Targets,
                 json!({
                     "type": ["string", "null"],
-                    "description": "Execution target. Omit to inherit the caller; root selects the local host and root workspace."
+                    "description": "Target; omitted inherits. root selects local host/root workspace."
                 }),
             )
             .background()

@@ -56,7 +56,7 @@ pub(super) fn register(
     let inspect = jobs.clone();
     builder.register::<JobArgs, Value, _, _>(
         "job_inspect",
-        "Read the current job envelope without acknowledging delivery, including previously delivered questions and terminal results.",
+        "Read the current envelope, including delivered questions/results; never acknowledges delivery.",
         ToolOptions::default()
             .generated_output_schema(|capabilities| presented_job_schema(capabilities, false))
             .script_only()
@@ -77,7 +77,7 @@ pub(super) fn register(
     let wait = jobs.clone();
     builder.register::<JobWaitArgs, Value, _, _>(
         "wait",
-        "Wait for the next undelivered question or terminal result and acknowledge delivery, suppressing duplicate automatic notification. Terminal results remain rereadable. On timeout return a nonterminal envelope without stopping work. Answer waiting_input with tool.job(id).send({value: answer}).",
+        "Wait for and acknowledge the next undelivered question or terminal result. Timeout returns a nonterminal envelope without stopping work. Answer via script: tool.job(id).send({value:answer}).",
         ToolOptions::default()
             .generated_output_schema(|capabilities| presented_job_schema(capabilities, false))
             .job_method("wait", "job"),
@@ -102,7 +102,7 @@ pub(super) fn register(
     let send = jobs.clone();
     builder.register::<JobSendArgs, Value, _, _>(
         "job_send",
-        "Send JSON input to a running job. For an agent in waiting_input, send answers to its stable agent job ID.",
+        "Send JSON input; agent answers use its stable agent job ID.",
         ToolOptions::default()
             .script_only()
             .job_method("send", "job"),
@@ -119,7 +119,7 @@ pub(super) fn register(
     let cancel = jobs.clone();
     builder.register::<JobArgs, Value, _, _>(
         "job_cancel",
-        "Request cancellation of a job and its descendants. The returned snapshot may still be nonterminal; wait or inspect to confirm completion.",
+        "Request cancellation of job/descendants; confirm terminal state with wait/inspect.",
         ToolOptions::default()
             .generated_output_schema(|capabilities| presented_job_schema(capabilities, false))
             .script_only()
@@ -194,7 +194,7 @@ struct JobArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct JobWaitArgs {
-    /// Stable job identifier returned by a background or suspended tool call.
+    /// Background/suspended job ID.
     job: JobId,
     /// Maximum seconds to wait (1-3600). Omit to wait indefinitely.
     #[schemars(range(min = 1, max = 3600))]
@@ -214,10 +214,10 @@ struct JobSendArgs {
 #[serde(deny_unknown_fields)]
 struct JobEventsArgs {
     job: JobId,
-    /// Return events strictly after this durable sequence cursor.
+    /// Exclusive durable sequence cursor.
     #[serde(default)]
     after: u64,
-    /// Maximum number of events to return (1-1000).
+    /// Maximum events (1-1000).
     #[serde(default = "default_job_events")]
     #[schemars(range(min = 1, max = 1000))]
     limit: usize,

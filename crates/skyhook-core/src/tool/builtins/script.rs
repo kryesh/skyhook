@@ -101,28 +101,17 @@ fn script_error(error: crate::tool::javascript::JsError) -> ToolError {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ScriptArgs {
-    /// An async JavaScript function body. Top-level `await` and `return` are supported.
+    /// Async JavaScript body.
     source: String,
 }
 
-const SCRIPT_DESCRIPTION: &str = r#"Run an async JavaScript function body for sequencing, transformation, or bounded concurrency. Prefer direct tool calls for simple operations.
+const SCRIPT_DESCRIPTION: &str = r#"Run an async JavaScript body with top-level await/return. Foreground returns JSON (null without return). console.log captures text/JSON. No Node, fetch, URL, TextEncoder/TextDecoder, setTimeout/setInterval or recursive script. Built-ins include Date, RegExp, Map/Set, Proxy/Reflect, BigInt, ArrayBuffer, DataView and typed arrays; Uint8Array supports fromBase64/fromHex/toBase64/toHex. Return JSON-compatible values: convert BigInts, dates and typed arrays; undefined, non-finite numbers, functions and cycles fail serialization.
 
-Environment and results: Top-level await and return are supported. No Node.js APIs or recursive script calls. Return data to inspect it. console.log(...values) captures space-separated text (objects as JSON). Foreground execution returns the script's value; no return produces null. Return JSON-compatible data: nested undefined, non-finite numbers, functions, BigInts, and circular references fail serialization.
+Use direct tools' arguments/results: `tool.read({path:"Cargo.toml"})` or `tool.read().path("Cargo.toml")`; omitted arguments keep schema defaults. Builders execute once when awaited/returned. Returning nested builders runs independent calls concurrently: `return {a:tool.read({path:"a"}),b:tool.read({path:"b"})};`. Promise.all works; await ordinary promises before nesting results.
 
-Built-ins include Date, RegExp, Map/Set, Proxy/Reflect, BigInt, ArrayBuffer, DataView, and typed arrays. Uint8Array supports fromBase64/fromHex and toBase64/toHex. Use performance.now() for elapsed milliseconds. Convert BigInts to strings, dates to ISO strings, and typed arrays to ordinary arrays or encoded strings before returning them. No fetch, URL, TextEncoder/TextDecoder, or setTimeout/setInterval.
+`await sleep(ms)`: finite nonnegative milliseconds within the host timer range; cancellation interrupts it. performance.now() measures elapsed milliseconds. Unawaited promises/sleeps do not keep scripts alive; use background jobs for lasting work.
 
-`await sleep(ms)` asynchronously waits for finite nonnegative milliseconds (including fractional values) and resolves to undefined. Invalid types, negative/non-finite values, or delays outside the host timer range fail. Sleep stops on script cancellation; an unawaited sleep does not keep the script alive. For example: `const start = performance.now(); await sleep(100); return {elapsed_ms: performance.now() - start};`.
-
-Tool calls use their separately documented arguments and results. `tool.read({path:"src/lib.rs"})` and `tool.read().path("src/lib.rs")` are equivalent; omitted arguments keep schema defaults. Builders are lazy: await or return them to execute. Reusing one builder executes it once; separate builders execute separately. Returning builders inside objects or arrays runs independent calls concurrently:
-```js
-return {
-  lib: tool.read({path: "src/lib.rs"}),
-  manifest: tool.read({path: "Cargo.toml"})
-};
-```
-Promise.all is also supported. Await ordinary promises before placing their results inside returned objects or arrays. Tool failures throw; command results with nonzero exit_code do not.
-
-Bounded concurrency: `new WorkPool(n).map(items, worker)` and `.run(tasks)` return async iterables; tasks are zero-argument worker functions. Each iteration yields {index, value}: index identifies the input, value is the worker's result. Successful results arrive in completion order, with at most n workers running. Failed items are logged and skipped; remaining items continue. Breaking iteration stops scheduling and waits for running workers.
+`new WorkPool(n).map(items,worker)` or `.run(zeroArgFunctions)` returns an async iterable of {index,value} in completion order, at most n workers. index identifies the original input; value is its result. Failures are logged/skipped; breaking stops scheduling and awaits running workers.
 ```js
 const {paths} = await tool.glob({pattern: "src/**/*.rs"});
 const results = [];
@@ -134,12 +123,5 @@ for await (const {index, value} of new WorkPool(4).map(
 return results;
 ```
 
-Background execution: bg:true returns a JobEnvelope. Await the launch before accessing its ID. tool.job(id) requires the positive integer ID, not the envelope:
-```js
-const job = await tool.shell({command: "make test", bg: true});
-const result = await tool.job(job.id).wait({timeout: 300});
-return {state: result.state, output: result.output};
-```
-Use background jobs for work that must outlive the script; do not rely on unawaited JavaScript promises. Agent ownership and cancellation follow the shared lifecycle rules.
-
-Messaging: Inside a background script, await receive() returns the next JSON input sent to that job with tool.job(id).send({value}). Read command output events with tool.job(commandJobId).events()."#;
+For bg:true, await launch before using the positive integer job ID: `const j=await tool.shell({command:"make test",bg:true}); return await tool.job(j.id).wait();`.
+Inside background scripts, `await receive()` reads the next JSON input sent with tool.job(id).send({value}). Read command output events with tool.job(id).events()."#;

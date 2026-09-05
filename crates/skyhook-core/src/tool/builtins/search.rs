@@ -283,7 +283,7 @@ struct SearchArgs {
     /// Treat `pattern` as literal text instead of a regular expression (`rg -F`).
     #[serde(default)]
     fixed: bool,
-    /// Case mode: `smart`, `sensitive`, or `insensitive`.
+    /// Case matching mode.
     #[serde(default)]
     case: Case,
     /// Require whole-word matches (`rg -w`).

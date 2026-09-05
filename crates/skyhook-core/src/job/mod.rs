@@ -1114,7 +1114,6 @@ pub enum JobError {
 
 #[cfg(test)]
 mod tests {
-    mod state;
     use std::sync::atomic::AtomicBool;
 
     use schemars::JsonSchema;

@@ -488,6 +488,10 @@ impl ToolSurface {
 
     #[must_use]
     pub fn definitions(&self) -> Vec<ProviderToolDefinition> {
+        let job_envelope = self
+            .tools
+            .get("wait")
+            .and_then(|tool| tool.output_schema.as_ref());
         self.tools
             .values()
             .filter(|tool| tool.exposure == ToolExposure::ModelVisible)
@@ -495,20 +499,12 @@ impl ToolSurface {
                 let description = if tool.name == "script" {
                     let mut description = self.script_description(&tool.description);
                     if let Some(schema) = &tool.output_schema {
-                        let mut result_type = schema_type(schema, schema);
-                        if let Some(envelope) = self
-                            .tools
-                            .get("wait")
-                            .and_then(|tool| tool.output_schema.as_ref())
-                        {
-                            result_type = result_type
-                                .replace(&schema_type(envelope, envelope), "JobEnvelope");
-                        }
+                        let result_type = output_type(schema, job_envelope);
                         description.push_str(&format!("\n\nScript return: `{result_type}`."));
                     }
                     description
                 } else {
-                    describe_output(tool.description.clone(), tool.output_schema.as_ref())
+                    describe_output(&tool.description, tool.output_schema.as_ref(), job_envelope)
                 };
                 ProviderToolDefinition {
                     name: tool.name.clone(),
@@ -704,7 +700,7 @@ impl ToolRegistryBuilder {
                     serde_json::json!({
                         "type": ["string", "null"],
                         "pattern": "^[a-z][a-z0-9]*(_[a-z0-9]+)*$",
-                        "description": "Optional lowercase snake_case job name describing this work, for example run_tests or inspect_config. Shown in job state and notifications."
+                        "description": "Lowercase snake_case name shown in job state and notifications."
                     }),
                 );
             }
@@ -860,7 +856,7 @@ fn ensure_no_target(schema: &Value) -> Result<(), RegistryError> {
 fn target_property_schema() -> Value {
     serde_json::json!({
         "type": ["string", "null"],
-        "description": "Execution target. Omit to inherit the calling agent's target."
+        "description": "Target; omitted inherits the caller."
     })
 }
 
@@ -950,7 +946,7 @@ fn add_background(schema: &mut Value) {
         serde_json::json!({
             "type": "boolean",
             "default": false,
-            "description": "Run as a background job and return a job envelope immediately."
+            "description": "Return a JobEnvelope immediately; run in background."
         }),
     );
 }
@@ -970,10 +966,28 @@ fn sanitize_schema(value: &mut Value) {
     }
 }
 
-fn describe_output(description: String, schema: Option<&Value>) -> String {
-    schema.map_or(description.clone(), |schema| {
-        format!("{description} Returns `{}`.", schema_type(schema, schema))
-    })
+fn describe_output(
+    description: &str,
+    schema: Option<&Value>,
+    job_envelope: Option<&Value>,
+) -> String {
+    schema.map_or_else(
+        || description.to_owned(),
+        |schema| {
+            format!(
+                "{description} Returns `{}`.",
+                output_type(schema, job_envelope)
+            )
+        },
+    )
+}
+
+fn output_type(schema: &Value, job_envelope: Option<&Value>) -> String {
+    let rendered = schema_type(schema, schema);
+    job_envelope.map_or_else(
+        || rendered.clone(),
+        |envelope| rendered.replace(&schema_type(envelope, envelope), "JobEnvelope"),
+    )
 }
 
 pub(crate) fn job_envelope_type(capabilities: &CapabilitySet) -> String {
@@ -1085,6 +1099,11 @@ fn script_documentation(tool: &ToolSpec, job_envelope: Option<&Value>) -> String
         ScriptBinding::JobMethod { method, .. } => format!("tool.job(id).{method}{arguments}"),
         ScriptBinding::Unavailable => unreachable!(),
     };
+    if tool.exposure == ToolExposure::ModelVisible
+        && matches!(tool.script_binding, ScriptBinding::JobMethod { .. })
+    {
+        return format!("- `{call}` — Same as `{}`.", tool.name);
+    }
     let field_docs = schema["properties"]
         .as_object()
         .into_iter()
@@ -1099,12 +1118,7 @@ fn script_documentation(tool: &ToolSpec, job_envelope: Option<&Value>) -> String
             )
         })
         .collect::<String>();
-    let description = if tool.output_schema.is_some() && tool.output_schema.as_ref() == job_envelope
-    {
-        format!("{} Returns `JobEnvelope`.", tool.description)
-    } else {
-        describe_output(tool.description.clone(), tool.output_schema.as_ref())
-    };
+    let description = describe_output(&tool.description, tool.output_schema.as_ref(), job_envelope);
     format!("- `{call}` — {description}{field_docs}")
 }
 
@@ -1357,9 +1371,27 @@ mod tests {
             );
             assert_eq!(
                 script.description.matches("Returns `JobEnvelope`.").count(),
-                3
+                2
             );
+            assert!(script.description.contains("Same as `wait`."));
             assert!(!script.description.contains("location:"));
+            for name in ["exec", "shell", "jobs", "wait"] {
+                let description = &definitions
+                    .iter()
+                    .find(|tool| tool.name == name)
+                    .unwrap()
+                    .description;
+                assert!(description.contains("JobEnvelope"), "{name}: {description}");
+                assert!(!description.contains("location:"), "{name}: {description}");
+            }
+            assert!(
+                definitions
+                    .iter()
+                    .find(|tool| tool.name == "jobs")
+                    .unwrap()
+                    .description
+                    .ends_with("Returns `JobEnvelope[]`.")
+            );
             let shared_type = job_envelope_type(&target_context(targets));
             assert!(shared_type.contains("workspace:string"));
             assert_eq!(shared_type.contains("target:string"), targets);

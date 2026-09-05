@@ -266,10 +266,10 @@ struct Capture {
 struct ExecArgs {
     /// Program and arguments without shell parsing, for example `["cargo","test"]`.
     argv: Vec<String>,
-    /// Working directory relative to the execution workspace by default.
+    /// Working directory; relative to selected workspace.
     #[serde(default = "default_dot")]
     cwd: String,
-    /// Execution timeout in seconds (1-3600). Omit or use null for no deadline.
+    /// Timeout seconds; omitted/null means no deadline.
     #[schemars(range(min = 1, max = 3600))]
     timeout: Option<u64>,
 }
@@ -279,10 +279,10 @@ struct ExecArgs {
 struct ShellArgs {
     /// Command interpreted by the execution environment's shell.
     command: String,
-    /// Working directory relative to the execution workspace by default.
+    /// Working directory; relative to selected workspace.
     #[serde(default = "default_dot")]
     cwd: String,
-    /// Execution timeout in seconds (1-3600). Omit or use null for no deadline.
+    /// Timeout seconds; omitted/null means no deadline.
     #[schemars(range(min = 1, max = 3600))]
     timeout: Option<u64>,
 }
