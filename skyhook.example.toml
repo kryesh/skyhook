@@ -56,7 +56,8 @@ supports_images = true
 [models.local]
 provider = "local"
 model = "qwen3-coder"
-max_output_tokens = 8192
+# Optional; omitted by default so the server decides its output limit.
+# max_output_tokens = 32768
 supports_images = false
 
 # Importing concrete aliases from ~/.ssh/config is opt-in.

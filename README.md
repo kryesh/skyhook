@@ -85,12 +85,15 @@ requested by the host with terminal echo disabled and never enter tool arguments
 `via` references another named target and may form an acyclic jump chain.
 
 `root` is the built-in local target, always the main Skyhook process rather than an SSH alias. The
-target-aware `read`, `search`, `glob`, `exec`, and `shell` tools use these rules:
+target-aware tools, including `agent`, use these rules:
 
 - Omitting `target` uses the calling agent's target and current workspace.
 - Setting `target: "root"` uses the local host and root workspace.
 - Setting another named target uses its configured workspace, except that explicitly selecting the
   calling agent's current named target retains that agent's workspace override.
+
+Tools without a target selector use the calling agent's target and workspace. An explicit
+`agent.workspace` takes precedence over the selected base; relative overrides resolve against that base.
 
 Prefer these named targets to manually running `ssh`. The first tool in a session that needs an SSH
 route asks for approval before any probe, authentication, or shim deployment. Approval is shared
@@ -126,9 +129,13 @@ api = "chat_completions"
 [models.local]
 provider = "local"
 model = "qwen3-coder"
-max_output_tokens = 8192
+# Optional: max_output_tokens = 32768
 supports_images = false
 ```
+
+Skyhook does not set an output token limit unless `max_output_tokens` is configured. The server's
+own limits still apply. Anthropic/Claude profiles require an explicit value because their protocol
+requires an output limit.
 
 The `codex` and `claude` provider kinds import and refresh credentials through Flux, including
 credentials from the official Codex and Claude CLIs. Instructions in `AGENTS.md` files are loaded
@@ -136,7 +143,7 @@ from outermost ancestor to workspace, followed by instructions configured throug
 
 ## Embedded JavaScript
 
-Every `script` call gets a fresh, memory-limited QuickJS runtime. Tool calls are lazy. Each builder
+Every `script` call gets a fresh QuickJS runtime. Tool calls are lazy. Each builder
 instance memoizes its own execution, so reusing one builder executes it once while constructing an
 equivalent new builder creates a new call:
 
@@ -157,11 +164,30 @@ return { packageFile, matches, firstLines, instructions, template };
 
 The runtime also exposes:
 
-- `new WorkPool(concurrency, { failFast: true })` for bounded, ordered, fail-fast work; set
-  `failFast: false` for per-item `{ok, value|error}` results;
-- `new Queue()` as an async iterable queue;
-- `receive()` for input sent to the owning job (background scripts only);
-- `await notify(value)` for durable job progress; notifications must be awaited before returning.
+- `Date`, `RegExp`, `Map`/`Set`, `Proxy`/`Reflect`, and `BigInt`;
+- `ArrayBuffer`, `DataView`, and typed arrays, including `Uint8Array.fromBase64`,
+  `.fromHex`, `.toBase64()`, and `.toHex()`;
+- `performance.now()` for measuring elapsed milliseconds;
+- `await sleep(ms)` for asynchronous waits, resolving to `undefined`. The delay must be a finite,
+  nonnegative number of milliseconds within the host timer range; fractional values are accepted.
+  Sleeps stop when the script is cancelled, and unawaited sleeps do not keep it alive;
+- `new WorkPool(concurrency).map(items, worker)` and `.run(tasks)` as async iterables yielding
+  successful `{index, value}` results in completion order. Failed items are logged and skipped;
+  remaining items continue. Early iterator closure stops scheduling and drains running work;
+- `await receive()` for the next JSON input sent to the owning job with
+  `tool.job(id).send({value})` (background scripts only).
+
+Read command stdout/stderr events with `tool.job(commandJobId).events()`.
+
+Before returning results, convert `BigInt` values to strings, dates with `.toISOString()`, and
+typed arrays with `Array.from(bytes)`, `.toBase64()`, or `.toHex()`. The runtime does not provide
+Node.js APIs, `fetch`, `URL`, `TextEncoder`/`TextDecoder`, or `setTimeout`/`setInterval`.
+
+`console.log(...values)` captures space-separated text, formatting objects as JSON. The agent
+receives it in a separate text block alongside the unchanged JSON return value, on success or
+failure. Logs are delivered at completion, not streamed, and are capped at 16 MiB per script with
+an explicit truncation marker. Background job envelopes retain them in `console_output` when
+nonempty. Scripts without logs keep their existing output format.
 
 Builder setters and object arguments come from the same strict JSON schema; omitted values receive
 the handler's normal defaults. Awaiting a builder executes it immediately. Returning builders recursively executes independent
@@ -195,18 +221,51 @@ errors include it in an `output` field; JavaScript callers can catch the error a
 `agent` accepts an optional `depth` delegation budget. It defaults to zero, making the launched
 child a leaf. A caller may grant less than its own available depth; once no depth remains, `agent`
 is omitted from both model tools and script bindings. Its optional `workspace` accepts relative or
-absolute directories for both local and remote children.
+absolute directories for both local and remote children. Relative overrides resolve against the
+workspace selected by the target rules. Children receive a fresh conversation, shared harness
+instructions and host-owned skills, and harness model/profile defaults unless overridden. Agents on
+the same target share files; a workspace override creates no filesystem isolation. Children must
+finish or cancel all owned jobs and descendants before their agent job completes. Only root agents
+may leave background services running after answering.
 
-Filesystem tools likewise accept relative or absolute paths. Canonical paths outside the configured
+Filesystem tools and command `cwd` accept absolute paths or relative paths including `..`.
+The workspace is a base directory, not a security boundary. Canonical paths outside the configured
 workspace require approval, cached in memory by session, target, access mode, and path; directory
 approval covers descendants. Read and write grants are separate. Process execution remains subject
 to confirmation on each invocation.
 
-Background-capable tools accept a common optional `bg` argument. Unclaimed completions and child
-questions are retained, injected exactly once into their owning agent, and wake it for another turn.
-On resume, unfinished jobs are marked
-interrupted and job identifiers continue monotonically. Hosts can call `SessionHandle::interrupt` to
-stop active provider streams and cancel jobs across the session's agent tree.
+Background-capable tools accept an optional `bg` argument. Foreground calls normally return the
+handler's result; background calls and suspended foreground child calls return a job envelope with
+`id`, `parent`, `tool`, `state`, `output`, `error`, and `location`. Schemas describe both variants.
+A child question has `state: "waiting_input"` and output
+`{kind:"questions", question_id, question_ids, questions}`.
+
+Jobs normally follow `queued → running → completed`, optionally cycling through
+`waiting_input → running`; `failed`, `cancelled`, and `interrupted` are terminal alternatives.
+`wait` acknowledges a pending question or terminal result and suppresses duplicate automatic
+notification. Terminal results can be read repeatedly; a question is delivered once by wait or
+notification but remains inspectable. `inspect` does not acknowledge. A wait deadline bounds the
+whole wait and returns a nonterminal envelope without stopping the job. Unanswered questions do
+not expire. Send answers to the stable child-agent job ID.
+
+Cancellation cascades through descendant jobs and agents and terminates managed command process
+groups locally and remotely. It is a request: wait or inspect to confirm termination. Deliberately
+detached processes and unreachable remote hosts limit cleanup. Command timeouts are optional;
+omission or null means no deadline. Explicit timeouts of 1–3600 seconds terminate execution,
+retaining captured output. A nonzero command exit is a normal result with `exit_code`.
+
+Approval controls and pending/granted approval details remain user-facing. Agents see an ordinary
+queued job while authorization is pending. Denials preserve the reason and add
+`code: "permission_denied", executed: false` to the rejected operation's error or job envelope;
+script exceptions carry the same fields. A containing script may already have executed other work,
+so uncaught script failures retain the rejected operation as nested failure details. Agents must not
+circumvent a denial through another tool or route.
+
+Unacknowledged background questions/completions wake their owner for another turn. Child completion
+waits for owned work; root background services remain managed by the live session. On resume,
+unfinished jobs become interrupted and job identifiers continue monotonically; this does not add
+service survival across harness restarts. `SessionHandle::interrupt` stops active provider streams
+and cancels jobs across the session's agent tree.
 
 ## Built-in tools
 

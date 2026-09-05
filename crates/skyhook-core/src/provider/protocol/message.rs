@@ -39,6 +39,8 @@ pub struct ToolResult {
     pub call_id: String,
     pub name: String,
     pub result: Value,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub console_output: String,
     #[serde(default)]
     pub images: Vec<ImageReference>,
     #[serde(default)]

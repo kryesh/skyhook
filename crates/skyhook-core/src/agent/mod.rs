@@ -11,3 +11,5 @@ pub use interaction::{
 };
 pub use profile::AgentProfile;
 pub use runtime::{Harness, HarnessBuilder, SessionHandle};
+
+pub(crate) use interaction::QuestionOutput;

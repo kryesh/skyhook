@@ -28,6 +28,17 @@ pub struct Question {
     pub options: Vec<QuestionOption>,
 }
 
+/// A suspended child's question batch, returned in its agent job's output.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum QuestionOutput {
+    Questions {
+        question_id: String,
+        question_ids: Vec<String>,
+        questions: Vec<Question>,
+    },
+}
+
 pub type QuestionFuture =
     Pin<Box<dyn Future<Output = Result<Value, QuestionError>> + Send + 'static>>;
 

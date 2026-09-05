@@ -168,11 +168,10 @@ impl QuestionCoordinator {
             .iter()
             .map(|pending| (pending.question.id.clone(), pending.context.job))
             .collect::<Vec<_>>();
-        let output = json!({
-            "kind": "questions",
-            "question_id": event_ids[0],
-            "question_ids": event_ids,
-            "questions": questions,
+        let output = json!(crate::agent::QuestionOutput::Questions {
+            question_id: event_ids[0].clone(),
+            question_ids: event_ids,
+            questions,
         });
         let owner_job = match self.open_child_questions(ask_jobs, output).await {
             Ok(owner_job) => owner_job,

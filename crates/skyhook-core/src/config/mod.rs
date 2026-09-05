@@ -87,6 +87,26 @@ impl Config {
         &self,
         workspace: impl Into<PathBuf>,
     ) -> Result<HarnessBuilder, ConfigError> {
+        for (name, profile) in &self.models {
+            if matches!(profile.max_output_tokens, Some(0)) {
+                return Err(ConfigError::Model(
+                    name.clone(),
+                    "max_output_tokens must be positive; omit it to leave the limit unset"
+                        .to_owned(),
+                ));
+            }
+            if profile.max_output_tokens.is_none()
+                && matches!(
+                    self.providers.get(&profile.provider),
+                    Some(ProviderConfig::Anthropic { .. } | ProviderConfig::Claude)
+                )
+            {
+                return Err(ConfigError::Model(
+                    name.clone(),
+                    "this provider requires an explicit max_output_tokens value".to_owned(),
+                ));
+            }
+        }
         let mut capabilities = crate::tool::policy::CapabilitySet::default();
         if self.targets_enabled {
             capabilities.insert(crate::tool::policy::Capability::Targets);
@@ -140,6 +160,8 @@ pub enum ConfigError {
     MissingEnvironment(String),
     #[error("provider `{0}` could not be initialized: {1}")]
     Provider(String, String),
+    #[error("invalid model profile `{0}`: {1}")]
+    Model(String, String),
     #[error(transparent)]
     Harness(#[from] crate::agent::HarnessError),
 }
@@ -162,6 +184,20 @@ mod tests {
         assert_eq!(config.default_model_profile, "local");
         assert!(!config.approve_all);
         assert!(!config.targets_enabled);
+    }
+
+    #[test]
+    fn providers_requiring_output_limits_need_explicit_configuration() {
+        for kind in ["anthropic", "claude"] {
+            let config: Config = toml::from_str(&format!(
+                "default_model_profile = 'test'\n[providers.test]\nkind = '{kind}'\n[models.test]\nprovider = 'test'\nmodel = 'sonnet'\n"
+            )).unwrap();
+            let Err(ConfigError::Model(name, message)) = config.harness_builder(".") else {
+                panic!("expected missing output limit validation before credential loading");
+            };
+            assert_eq!(name, "test");
+            assert!(message.contains("explicit max_output_tokens"));
+        }
     }
 
     #[test]

@@ -60,9 +60,9 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
 async fn run_process(
     context: ToolContext,
     mut command: Command,
-    timeout: u64,
+    timeout: Option<u64>,
 ) -> Result<ProcessOutput, ToolError> {
-    if !(1..=3_600).contains(&timeout) {
+    if timeout.is_some_and(|seconds| !(1..=3_600).contains(&seconds)) {
         return Err(ToolError::InvalidArguments(
             "timeout must be 1 through 3600".to_owned(),
         ));
@@ -72,7 +72,17 @@ async fn run_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    if context.is_cancelled() {
+        return Err(ToolError::Cancelled);
+    }
     let mut child = command.spawn()?;
+    #[cfg(unix)]
+    let group = ProcessGroup(
+        i32::try_from(child.id().expect("spawned process has an ID"))
+            .map_err(|_| ToolError::Failed("process ID is out of range".to_owned()))?,
+    );
     let stdin = child
         .stdin
         .take()
@@ -86,8 +96,6 @@ async fn run_process(
         .take()
         .ok_or_else(|| ToolError::Failed("process stderr unavailable".to_owned()))?;
 
-    let stdout_task = tokio::spawn(read_stream(context.clone(), "stdout", stdout));
-    let stderr_task = tokio::spawn(read_stream(context.clone(), "stderr", stderr));
     let input_context = context.clone();
     let input_task = tokio::spawn(async move {
         let mut stdin = stdin;
@@ -102,26 +110,44 @@ async fn run_process(
         Ok::<(), ToolError>(())
     });
 
-    let deadline = tokio::time::sleep(Duration::from_secs(timeout));
-    tokio::pin!(deadline);
-    let (status, timed_out, cancelled) = tokio::select! {
-        status = child.wait() => (status?, false, false),
-        () = &mut deadline => {
-            child.kill().await?;
-            (child.wait().await?, true, false)
-        }
-        () = context.cancelled() => {
-            child.kill().await?;
-            (child.wait().await?, false, true)
+    let _input_guard = AbortTask(input_task.abort_handle());
+    let deadline = async {
+        match timeout {
+            Some(seconds) => tokio::time::sleep(Duration::from_secs(seconds)).await,
+            None => std::future::pending::<()>().await,
         }
     };
-    input_task.abort();
-    let stdout = stdout_task
-        .await
-        .map_err(|error| ToolError::Failed(error.to_string()))??;
-    let stderr = stderr_task
-        .await
-        .map_err(|error| ToolError::Failed(error.to_string()))??;
+    // Keep cancellation and the deadline active while descendants hold output pipes open.
+    let mut stdout_capture = Capture::default();
+    let mut stderr_capture = Capture::default();
+    let (status, timed_out, cancelled) = {
+        let execution = async {
+            let (status, out, err) = tokio::join!(
+                child.wait(),
+                capture_stream(context.clone(), "stdout", stdout, &mut stdout_capture),
+                capture_stream(context.clone(), "stderr", stderr, &mut stderr_capture),
+            );
+            out?;
+            err?;
+            status.map_err(ToolError::from)
+        };
+        tokio::pin!(execution);
+        tokio::select! {
+            status = &mut execution => (Some(status?), false, false),
+            () = deadline => (None, true, false),
+            () = context.cancelled() => (None, false, true),
+        }
+    };
+    let status = if let Some(status) = status {
+        status
+    } else {
+        #[cfg(unix)]
+        group.kill();
+        child.kill().await?;
+        child.wait().await?
+    };
+    let stdout = stdout_capture;
+    let stderr = stderr_capture;
     let (stdout_text, stdout_truncated) = lossy_output(&stdout);
     let (stderr_text, stderr_truncated) = lossy_output(&stderr);
     let output = ProcessOutput {
@@ -138,22 +164,50 @@ async fn run_process(
     if timed_out {
         let value = serde_json::to_value(&output)?;
         return Err(ToolError::with_output(
-            format!("process timed out after {timeout} seconds"),
+            format!(
+                "process timed out after {} seconds",
+                timeout.expect("finite deadline expired")
+            ),
             ToolOutput::new(value),
         ));
     }
     Ok(output)
 }
 
-async fn read_stream<R>(
+struct AbortTask(tokio::task::AbortHandle);
+impl Drop for AbortTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(unix)]
+struct ProcessGroup(i32);
+#[cfg(unix)]
+impl ProcessGroup {
+    fn kill(&self) {
+        // SAFETY: kill takes an integer process group ID and does not access memory.
+        unsafe {
+            libc::kill(-self.0, libc::SIGKILL);
+        }
+    }
+}
+#[cfg(unix)]
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+async fn capture_stream<R>(
     context: ToolContext,
     kind: &'static str,
     mut stream: R,
-) -> Result<Capture, ToolError>
+    capture: &mut Capture,
+) -> Result<(), ToolError>
 where
     R: AsyncRead + Unpin,
 {
-    let mut capture = Capture::default();
     let mut buffer = vec![0_u8; PROCESS_CHUNK];
     loop {
         let read = stream.read(&mut buffer).await?;
@@ -182,7 +236,7 @@ where
             .progress(kind, serde_json::json!({"truncated": true}))
             .await?;
     }
-    Ok(capture)
+    Ok(())
 }
 
 fn lossy_output(capture: &Capture) -> (String, bool) {
@@ -213,10 +267,9 @@ struct ExecArgs {
     /// Working directory relative to the execution workspace by default.
     #[serde(default = "default_dot")]
     cwd: String,
-    /// Timeout in seconds.
-    #[serde(default = "default_timeout")]
+    /// Execution timeout in seconds (1-3600). Omit or use null for no deadline.
     #[schemars(range(min = 1, max = 3600))]
-    timeout: u64,
+    timeout: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -227,10 +280,9 @@ struct ShellArgs {
     /// Working directory relative to the execution workspace by default.
     #[serde(default = "default_dot")]
     cwd: String,
-    /// Timeout in seconds.
-    #[serde(default = "default_timeout")]
+    /// Execution timeout in seconds (1-3600). Omit or use null for no deadline.
     #[schemars(range(min = 1, max = 3600))]
-    timeout: u64,
+    timeout: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -245,9 +297,6 @@ pub struct ProcessOutput {
 
 fn default_dot() -> String {
     ".".to_owned()
-}
-const fn default_timeout() -> u64 {
-    60
 }
 
 #[cfg(test)]
@@ -265,6 +314,65 @@ mod tests {
             policy::AllowAll,
         },
     };
+
+    #[test]
+    fn command_timeouts_are_optional_and_null_means_no_deadline() {
+        assert_eq!(
+            serde_json::from_value::<ShellArgs>(serde_json::json!({"command":"server"}))
+                .unwrap()
+                .timeout,
+            None
+        );
+        assert_eq!(
+            serde_json::from_value::<ExecArgs>(
+                serde_json::json!({"argv":["server"],"timeout":null})
+            )
+            .unwrap()
+            .timeout,
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_kills_descendants_even_after_the_shell_exits() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(sessions.path()).await.unwrap();
+        let agent = AgentId::root(store.id());
+        let jobs = JobManager::new(store);
+        let mut builder = ToolRegistryBuilder::default();
+        register(&mut builder).unwrap();
+        let executor = ToolExecutor::new(
+            builder.build(),
+            Arc::new(AllowAll),
+            jobs.clone(),
+            workspace.path().to_path_buf(),
+        );
+        let running = executor.execute(agent, "shell", serde_json::json!({
+            "command":"(sleep 0.3; printf escaped > escaped) & printf ready; exit 0", "bg":true
+        }), None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !jobs.events(running.job, 0, 10).await.unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        jobs.cancel(running.job).await.unwrap();
+        assert_eq!(
+            jobs.wait(running.job, Some(Duration::from_secs(2)), true)
+                .await
+                .unwrap()
+                .state,
+            crate::job::JobState::Cancelled
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!workspace.path().join("escaped").exists());
+    }
 
     #[tokio::test]
     async fn nonzero_is_success_and_timeout_persists_partial_output() {

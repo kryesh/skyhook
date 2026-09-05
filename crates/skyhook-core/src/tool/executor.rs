@@ -478,6 +478,9 @@ impl ToolExecutor {
                 location: plan.execution_location.clone(),
             })
             .await?;
+        if lease.cancellation.is_cancelled() {
+            return Err(self.cancelled(lease.id).await);
+        }
         self.shared
             .jobs
             .transition(lease.id, JobState::AwaitingApproval)
@@ -504,8 +507,8 @@ impl ToolExecutor {
             let error = match error {
                 AuthorizationError::Cancelled => return Err(self.cancelled(lease.id).await),
                 AuthorizationError::Denied(reason) => ExecutionError::Denied(reason),
-                AuthorizationError::InvalidGrant(reason) => ExecutionError::Failed {
-                    message: reason,
+                AuthorizationError::InvalidGrant(_) => ExecutionError::Failed {
+                    message: "operation could not be started".to_owned(),
                     output: None,
                 },
                 AuthorizationError::Unavailable => {
@@ -531,6 +534,12 @@ impl ToolExecutor {
                 Err(error) => {
                     let error = match error {
                         RemoteError::ApprovalDenied(reason) => ExecutionError::Denied(reason),
+                        RemoteError::ApprovalInvalidGrant(_) | RemoteError::ApprovalUnavailable => {
+                            ExecutionError::Failed {
+                                message: "target is unavailable in this context".to_owned(),
+                                output: None,
+                            }
+                        }
                         error => ExecutionError::Failed {
                             message: error.to_string(),
                             output: None,
@@ -542,6 +551,9 @@ impl ToolExecutor {
         } else {
             None
         };
+        if lease.cancellation.is_cancelled() {
+            return Err(self.cancelled(lease.id).await);
+        }
         self.shared
             .jobs
             .transition(lease.id, JobState::Running)
@@ -558,7 +570,11 @@ impl ToolExecutor {
         let job = lease.id;
         let background = plan.background;
         let worker = tokio::spawn(async move {
-            match plan.dispatch {
+            if context.is_cancelled() {
+                return Err(ToolError::Cancelled);
+            }
+            let cancellation = context.authorization.cancellation.clone();
+            let result = match plan.dispatch {
                 InvocationDispatch::Local => plan.tool.call(context, plan.handler_arguments).await,
                 InvocationDispatch::Remote(_) => {
                     let result = prepared
@@ -576,6 +592,11 @@ impl ToolExecutor {
                     }
                 }
                 InvocationDispatch::External(run) => run(context, plan.handler_arguments).await,
+            };
+            if cancellation.is_cancelled() {
+                Err(ToolError::Cancelled)
+            } else {
+                result
             }
         });
         self.shared
@@ -586,6 +607,7 @@ impl ToolExecutor {
             let completion = match worker.await {
                 Ok(Ok(output)) => JobResult::Completed(output),
                 Ok(Err(ToolError::Cancelled)) => JobResult::Cancelled,
+                Ok(Err(ToolError::Denied(reason))) => JobResult::Denied(reason),
                 Ok(Err(ToolError::FailedWithOutput { message, output })) => {
                     JobResult::FailedWithOutput { message, output }
                 }
@@ -629,14 +651,25 @@ impl ToolExecutor {
                 output: ToolOutput {
                     value: envelope.output.unwrap_or(Value::Null),
                     images,
+                    console_output: envelope.console_output,
                 },
             })
+        } else if envelope.denial.is_some() {
+            Err(ExecutionError::Denied(
+                envelope
+                    .error
+                    .unwrap_or_else(|| "operation denied".to_owned()),
+            ))
         } else {
             Err(ExecutionError::Failed {
                 message: envelope
                     .error
                     .unwrap_or_else(|| format!("job ended as {:?}", envelope.state)),
-                output: envelope.output.map(|value| ToolOutput { value, images }),
+                output: envelope.output.map(|value| ToolOutput {
+                    value,
+                    images,
+                    console_output: envelope.console_output,
+                }),
             })
         }
     }
@@ -664,7 +697,11 @@ impl ToolExecutor {
             }
             error => error.to_string(),
         };
-        self.shared.jobs.finish(job, Err(message), None).await?;
+        if matches!(error, ExecutionError::Denied(_)) {
+            self.shared.jobs.finish_denied(job, message).await?;
+        } else {
+            self.shared.jobs.finish(job, Err(message), None).await?;
+        }
         Ok(error)
     }
 }
@@ -787,6 +824,7 @@ pub(crate) struct StartedExecution {
 enum JobResult {
     Completed(ToolOutput),
     Failed(String),
+    Denied(String),
     FailedWithOutput { message: String, output: ToolOutput },
     Cancelled,
 }
@@ -795,6 +833,7 @@ async fn persist_completion(jobs: &JobManager, job: JobId, completion: JobResult
     let result = match completion {
         JobResult::Completed(output) => jobs.finish(job, Ok(output), None).await,
         JobResult::Failed(message) => jobs.finish(job, Err(message), None).await,
+        JobResult::Denied(reason) => jobs.finish_denied(job, reason).await,
         JobResult::FailedWithOutput { message, output } => {
             jobs.finish_failed(job, message, Some(output), None).await
         }
@@ -853,12 +892,18 @@ pub enum ExecutionError {
 impl ExecutionError {
     pub(crate) fn into_failure(self) -> ExecutionFailure {
         let message = self.concise_message();
+        let denial = matches!(&self, Self::Denied(_) | Self::Tool(ToolError::Denied(_)))
+            .then(super::Denial::permission_denied);
         let output = match self {
             Self::Failed { output, .. } => output,
             Self::Tool(ToolError::FailedWithOutput { output, .. }) => Some(output),
             _ => None,
         };
-        ExecutionFailure { message, output }
+        ExecutionFailure {
+            message,
+            output,
+            denial,
+        }
     }
 
     pub(crate) fn concise_message(&self) -> String {
@@ -873,6 +918,7 @@ impl ExecutionError {
 pub(crate) struct ExecutionFailure {
     pub message: String,
     pub output: Option<ToolOutput>,
+    pub denial: Option<super::Denial>,
 }
 
 fn validate_invocation(tool: &super::ToolSpec, kind: InvocationKind) -> Result<(), ExecutionError> {
@@ -1089,6 +1135,14 @@ mod tests {
         assert!(error.to_string().contains("targets capability"));
 
         let inherit = registry.get("write_like").unwrap();
+        assert_eq!(
+            executor
+                .resolve_workspace_invocation(&inherit, &serde_json::json!({"path":"file"}))
+                .await
+                .unwrap()
+                .location,
+            ExecutionLocation::named("current", "/override-current".into())
+        );
         let error = executor
             .resolve_workspace_invocation(
                 &inherit,

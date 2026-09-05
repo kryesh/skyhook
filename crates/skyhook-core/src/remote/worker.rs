@@ -307,6 +307,7 @@ async fn externalize_result(
             };
             Err(RemoteToolError {
                 message: failure.message,
+                denial: failure.denial,
                 output,
             })
         }
@@ -316,6 +317,7 @@ async fn externalize_result(
 fn remote_error(error: impl ToString) -> RemoteToolError {
     RemoteToolError {
         message: error.to_string(),
+        denial: None,
         output: None,
     }
 }
@@ -338,6 +340,7 @@ async fn externalize_images(
     }
     Ok(crate::remote::protocol::RemoteToolOutput {
         value: output.value,
+        console_output: output.console_output,
         images,
     })
 }

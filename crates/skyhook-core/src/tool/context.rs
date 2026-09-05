@@ -76,6 +76,8 @@ impl ToolContext {
 pub struct ToolOutput {
     pub value: Value,
     pub images: Vec<ImageReference>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub console_output: String,
 }
 
 impl ToolOutput {
@@ -84,6 +86,7 @@ impl ToolOutput {
         Self {
             value,
             images: Vec::new(),
+            console_output: String::new(),
         }
     }
 
@@ -94,8 +97,34 @@ impl ToolOutput {
     }
 }
 
+/// Metadata for a rejected operation. The enclosing script may already have run other work.
+#[derive(
+    Clone, Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq,
+)]
+pub struct Denial {
+    pub code: DenialCode,
+    pub executed: bool,
+}
+#[derive(
+    Clone, Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DenialCode {
+    PermissionDenied,
+}
+impl Denial {
+    pub(crate) const fn permission_denied() -> Self {
+        Self {
+            code: DenialCode::PermissionDenied,
+            executed: false,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ToolError {
+    #[error("operation denied: {0}")]
+    Denied(String),
     #[error("tool arguments must be a JSON object")]
     ArgumentsMustBeObject,
     #[error("`bg` must be a boolean")]

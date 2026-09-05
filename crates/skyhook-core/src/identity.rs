@@ -72,8 +72,11 @@ impl<'de> Deserialize<'de> for SessionId {
     }
 }
 
-#[derive(Clone, Debug, Hash, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Debug, Hash, Deserialize, JsonSchema, Serialize, PartialEq, Eq, PartialOrd, Ord,
+)]
 pub struct AgentId {
+    #[schemars(with = "String")]
     session: SessionId,
     path: Vec<u32>,
 }

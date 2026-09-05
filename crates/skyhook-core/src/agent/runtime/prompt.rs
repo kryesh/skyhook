@@ -10,8 +10,19 @@ use crate::{
 };
 
 pub(super) const ROOT_PROMPT: &str = "You are an agent running in Skyhook, a general-purpose tool and orchestration harness. Complete the user's task using the available tools. Prefer direct tool calls for straightforward operations and issue independent calls together. Use `script` when JavaScript control flow, transformation, or dynamic or bounded concurrency is useful. Before finishing, account for relevant active jobs and child questions in the Skyhook runtime state, deciding whether each should be awaited, cancelled, or left running based on the task.";
-pub(super) const CHILD_PROMPT: &str = "You are an agent running in Skyhook. Complete the task assigned by your parent using the available tools and return the result to the parent. Prefer direct tool calls for straightforward operations and issue independent calls together. Use `script` when JavaScript control flow, transformation, or dynamic or bounded concurrency is useful. Before finishing, account for relevant active jobs in the Skyhook runtime state, deciding whether each should be awaited, cancelled, or left running based on the task.";
-pub(super) const TARGET_PROMPT: &str = "Target-aware tools follow three selection rules. Omitting `target` runs on the target to which this agent belongs, in this agent's current workspace. Setting `target: \"root\"` runs on the local Skyhook process and host using the root workspace, never SSH. Setting `target` to another named target uses that target's configured workspace and pooled remote shim, establishing the complete configured `via` route after approval if that route has not yet been approved in this session. Explicitly selecting this agent's current named target retains this agent's workspace override. Reconnecting an unchanged route already approved in this session does not request approval again. Prefer named targets and target-aware tools' native `target` parameter over invoking `ssh` manually.";
+pub(super) const CHILD_PROMPT: &str = "You are an agent running in Skyhook. Complete the task assigned by your parent using the available tools and return the result to the parent. Prefer direct tool calls for straightforward operations and issue independent calls together. Use `script` when JavaScript control flow, transformation, or dynamic or bounded concurrency is useful. Before finishing, await or cancel all owned jobs and descendants. Your agent job cannot complete while owned work remains active; only the root agent may leave background services running after answering.";
+pub(super) const TARGET_PROMPT: &str = r#"Workspace operations use these target selection rules:
+| Selection | Machine | Base workspace |
+|---|---|---|
+| Omitted | Calling agent's target | Calling agent's workspace |
+| `"root"` | Local Skyhook host, never SSH | Root workspace |
+| Another named target | That SSH target | Its configured workspace |
+| Explicit current named target | Current SSH target | Agent's workspace override |
+A tool without a target selector behaves as though target were omitted. An explicit child workspace overrides the selected base. Prefer named targets and native target arguments over manual SSH."#;
+
+const WORKSPACE_PROMPT: &str = "A workspace is a base directory, not an isolation boundary. File paths and command cwd accept absolute paths and relative paths including .., resolved on the selected machine. Relative child workspace overrides resolve against the base selected by target. A workspace override does not create a filesystem copy.";
+const LIFECYCLE_PROMPT: &str = "Jobs normally progress queued → running → completed, optionally through waiting_input → running; failed, cancelled, and interrupted are terminal alternatives. Background calls return a JobEnvelope; a foreground child question also returns a suspended envelope. Its output contains kind=questions, question_id, question_ids, and questions [{id,prompt,options}]. wait returns the next undelivered question or terminal envelope and acknowledges delivery, suppressing duplicate automatic notification. Terminal results remain rereadable; a question is delivered once by wait or automatic notification and remains visible through inspect. A timed-out wait returns a nonterminal envelope and leaves the job running. inspect never acknowledges. Send answers to the stable agent job ID; questions have no automatic expiry. cancel requests cancellation of the job, descendant jobs/agents, and managed command process groups; inspect or wait for terminal confirmation. Deliberately detached processes and unreachable remote hosts limit cleanup. All timeouts are optional; commands without a timeout have no deadline, while an explicit command timeout terminates execution. Direct tool failures return errors; script tool calls throw, retaining partial output on error.output. A nonzero command exit is a normal result with exit_code. If an operation is declined, do not circumvent that decision using another tool or route; continue with permitted alternatives or explain what could not be completed.";
+const AGENT_PROMPT: &str = "Children start with fresh conversation history: include the complete task in prompt. They receive shared harness instructions, the selected profile, harness tools and configured targets, and the host-owned skill catalog. Model/profile defaults come from the harness unless overridden. Agents on the same target share its filesystem. depth is the child's budget for further generations, defaults to zero, and must be less than the caller's available_depth.";
 
 #[derive(Serialize)]
 struct SkyhookContext<'a> {
@@ -56,6 +67,11 @@ pub(super) fn system_segment(
     } else {
         CHILD_PROMPT.to_owned()
     });
+    parts.push(WORKSPACE_PROMPT.to_owned());
+    parts.push(format!(
+        "{LIFECYCLE_PROMPT}\n\nShared result type: JobEnvelope = `{}`.",
+        crate::tool::job_envelope_type(capabilities)
+    ));
     for capability in capabilities.iter() {
         if let Some(chunk) = capability_prompt(capability, location, available_depth) {
             parts.push(chunk);
@@ -92,7 +108,7 @@ fn capability_prompt(
             ))
         }
         Capability::Agents => Some(format!(
-            "<agent_context>\n{{\"available_depth\":{available_depth}}}\n</agent_context>"
+            "{AGENT_PROMPT}\n\n<agent_context>\n{{\"available_depth\":{available_depth}}}\n</agent_context>"
         )),
         Capability::Read | Capability::Write | Capability::Exec => None,
     }
@@ -107,7 +123,7 @@ pub(super) async fn active_jobs_content(jobs: &JobManager, agent: &AgentId) -> O
         .map(|job| ActiveJob {
             job: job.id.get(),
             tool: job.tool,
-            state: job.state,
+            state: job.state.presented(),
         })
         .collect::<Vec<_>>();
     if active_jobs.is_empty() {

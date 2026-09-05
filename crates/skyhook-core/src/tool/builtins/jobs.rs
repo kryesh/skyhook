@@ -56,7 +56,7 @@ pub(super) fn register(
     let inspect = jobs.clone();
     builder.register::<JobArgs, Value, _, _>(
         "job_inspect",
-        "Inspect one job without claiming its result.",
+        "Read the current job envelope without acknowledging delivery, including previously delivered questions and terminal results.",
         ToolOptions::default()
             .generated_output_schema(|capabilities| presented_job_schema(capabilities, false))
             .script_only()
@@ -77,7 +77,7 @@ pub(super) fn register(
     let wait = jobs.clone();
     builder.register::<JobWaitArgs, Value, _, _>(
         "wait",
-        "Wait for and claim the next question or terminal result from a job. A waiting_input result can be answered with job_send.",
+        "Wait for the next undelivered question or terminal result and acknowledge delivery, suppressing duplicate automatic notification. Terminal results remain rereadable. On timeout return a nonterminal envelope without stopping work. Answer waiting_input with tool.job(id).send({value: answer}).",
         ToolOptions::default()
             .generated_output_schema(|capabilities| presented_job_schema(capabilities, false))
             .job_method("wait", "job"),
@@ -119,7 +119,7 @@ pub(super) fn register(
     let cancel = jobs.clone();
     builder.register::<JobArgs, Value, _, _>(
         "job_cancel",
-        "Request cancellation of a job.",
+        "Request cancellation of a job and its descendants. The returned snapshot may still be nonterminal; wait or inspect to confirm completion.",
         ToolOptions::default()
             .generated_output_schema(|capabilities| presented_job_schema(capabilities, false))
             .script_only()
@@ -160,7 +160,8 @@ pub(super) fn register(
                     .snapshot(args.job)
                     .await
                     .map_err(|error| job_error(&error))?
-                    .state;
+                    .state
+                    .presented();
                 Ok(JobEventsOutput {
                     events,
                     next,
@@ -196,6 +197,7 @@ struct JobWaitArgs {
     /// Stable job identifier returned by a background or suspended tool call.
     job: JobId,
     /// Maximum seconds to wait (1-3600). Omit to wait indefinitely.
+    #[schemars(range(min = 1, max = 3600))]
     timeout: Option<u64>,
 }
 
@@ -244,6 +246,52 @@ mod tests {
         session::SessionStore,
         tool::{ToolOutput, ToolRegistryBuilder, executor::ToolExecutor, policy::AllowAll},
     };
+
+    #[tokio::test]
+    async fn every_job_api_projects_pending_authorization_as_queued() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(root.path()).await.unwrap();
+        let agent = AgentId::root(store.id());
+        let jobs = JobManager::new(store);
+        let pending = jobs
+            .create(JobSpec::test(agent.clone(), "pending"))
+            .await
+            .unwrap()
+            .id;
+        jobs.transition(pending, JobState::AwaitingApproval)
+            .await
+            .unwrap();
+        let mut builder = ToolRegistryBuilder::default();
+        register(&mut builder, jobs.clone()).unwrap();
+        let executor = ToolExecutor::new(
+            builder.build(),
+            Arc::new(AllowAll),
+            jobs,
+            root.path().to_path_buf(),
+        );
+        for (tool, args) in [
+            ("jobs", serde_json::json!({})),
+            ("job_inspect", serde_json::json!({"job":pending})),
+            ("job_events", serde_json::json!({"job":pending})),
+            ("wait", serde_json::json!({"job":pending,"timeout":1})),
+        ] {
+            let result = executor
+                .execute(agent.clone(), tool, args, None)
+                .await
+                .unwrap()
+                .output
+                .value;
+            assert!(!result.to_string().contains("awaiting_approval"));
+            assert_eq!(
+                if tool == "jobs" {
+                    &result[0]["state"]
+                } else {
+                    &result["state"]
+                },
+                "queued"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn jobs_defaults_to_other_active_jobs_and_all_includes_history() {

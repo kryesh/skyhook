@@ -59,6 +59,10 @@ pub enum SessionEvent {
         output_path: Option<PathBuf>,
         error: Option<String>,
         images: Vec<ImageReference>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        console_output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        denial: Option<crate::tool::Denial>,
     },
     JobClaimed {
         job: JobId,

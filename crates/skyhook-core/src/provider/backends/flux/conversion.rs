@@ -35,7 +35,8 @@ pub(super) fn convert_request(request: ModelRequest) -> Result<Request, Provider
             input_schema: tool.input_schema,
         })
         .collect();
-    let max_tokens = u32::try_from(request.max_output_tokens.unwrap_or(8_192)).map_err(|_| {
+    // Flux's OpenAI codecs use zero to omit the token-limit field entirely.
+    let max_tokens = u32::try_from(request.max_output_tokens.unwrap_or(0)).map_err(|_| {
         ProviderError::protocol("max_output_tokens exceeds the Flux u32 request limit")
     })?;
     let trace = request.correlation.map(|session_id| RequestTrace {
@@ -93,6 +94,11 @@ fn convert_message(message: Message) -> Result<FluxMessage, ProviderError> {
                     text: serde_json::to_string(&result.result)
                         .map_err(|error| ProviderError::protocol(error.to_string()))?,
                 }];
+                if !result.console_output.is_empty() {
+                    content.push(ToolResultContent::Text {
+                        text: format!("Console output:\n{}", result.console_output),
+                    });
+                }
                 for image in result.images {
                     let data = image.data_base64.ok_or_else(|| {
                         ProviderError::protocol(format!(
@@ -233,6 +239,87 @@ pub(super) fn map_error(error: &FluxError) -> ProviderError {
 mod tests {
     use super::*;
     use crate::provider::protocol::SystemSegment;
+
+    #[test]
+    fn output_limit_is_only_sent_when_configured() {
+        use flux_provider::WireCodec;
+        use flux_providers::openai::{OpenAiChat, OpenAiResponses};
+
+        for limit in [None, Some(32_768)] {
+            for (model, codec, field) in [
+                ("qwen36-35", &OpenAiChat as &dyn WireCodec, "max_tokens"),
+                (
+                    "gpt-5",
+                    &OpenAiChat as &dyn WireCodec,
+                    "max_completion_tokens",
+                ),
+                (
+                    "gpt-5",
+                    &OpenAiResponses { codex: false } as &dyn WireCodec,
+                    "max_output_tokens",
+                ),
+            ] {
+                let request = convert_request(ModelRequest {
+                    model: model.to_owned(),
+                    system: Vec::new(),
+                    messages: vec![Message::User(vec![UserContent::Text {
+                        text: "hello".to_owned(),
+                    }])],
+                    tools: Vec::new(),
+                    reasoning: None,
+                    max_output_tokens: limit,
+                    correlation: None,
+                })
+                .unwrap();
+                let body = codec.build_body(&request).unwrap();
+                if let Some(limit) = limit {
+                    assert_eq!(body[field], limit);
+                } else {
+                    for field in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+                        assert!(body.get(field).is_none(), "unexpected limit: {body}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn console_output_is_a_separate_tool_text_block() {
+        for is_error in [false, true] {
+            for console_output in ["", "Processed 12 files\n"] {
+                let converted =
+                    convert_message(Message::Tool(vec![crate::provider::protocol::ToolResult {
+                        call_id: "script-1".to_owned(),
+                        name: "script".to_owned(),
+                        result: serde_json::json!({"changed":3}),
+                        console_output: console_output.to_owned(),
+                        images: Vec::new(),
+                        is_error,
+                    }]))
+                    .unwrap();
+                let ContentBlock::ToolResult {
+                    content,
+                    is_error: actual_error,
+                    ..
+                } = &converted.content[0]
+                else {
+                    panic!("expected tool result");
+                };
+                assert_eq!(*actual_error, is_error);
+                assert!(
+                    matches!(&content[0], ToolResultContent::Text { text } if text == r#"{"changed":3}"#)
+                );
+                if console_output.is_empty() {
+                    assert_eq!(content.len(), 1);
+                } else {
+                    assert_eq!(content.len(), 2);
+                    assert!(
+                        matches!(&content[1], ToolResultContent::Text { text } if text == "Console output:\nProcessed 12 files\n")
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn stable_system_stays_cached_and_runtime_state_stays_in_conversation() {

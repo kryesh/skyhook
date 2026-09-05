@@ -1,4 +1,4 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use tokio::fs;
 
@@ -75,14 +75,6 @@ fn lexical_path(workspace: &Path, relative: &str) -> Result<PathBuf, ToolError> 
     if path.is_absolute() {
         return Ok(path.to_path_buf());
     }
-    if path
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
-    {
-        return Err(ToolError::Failed(
-            "relative path cannot contain `..`".to_owned(),
-        ));
-    }
     Ok(workspace.join(path))
 }
 
@@ -91,6 +83,12 @@ pub(crate) async fn resolve_removable(
     relative: &str,
 ) -> Result<PathBuf, ToolError> {
     let joined = lexical_path(workspace, relative)?;
+    // A final .. has no filename; resolve it before removing the directory entry.
+    let joined = if joined.file_name().is_none() {
+        fs::canonicalize(joined).await?
+    } else {
+        joined
+    };
     let parent = joined
         .parent()
         .ok_or_else(|| ToolError::Failed("path has no parent".to_owned()))?;
@@ -99,7 +97,7 @@ pub(crate) async fn resolve_removable(
         .file_name()
         .ok_or_else(|| ToolError::Failed("path has no filename".to_owned()))?;
     let resolved = parent.join(name);
-    if resolved == workspace {
+    if resolved == fs::canonicalize(workspace).await? {
         return Err(ToolError::Failed(
             "cannot remove the workspace root".to_owned(),
         ));
@@ -132,4 +130,48 @@ pub(super) async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ToolEr
         },
     )
     .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn traversal_is_consistent_and_workspace_root_stays_protected() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).await.unwrap();
+        fs::create_dir(workspace.join("nested")).await.unwrap();
+        fs::write(root.path().join("outside"), "data")
+            .await
+            .unwrap();
+        let outside = fs::canonicalize(root.path().join("outside")).await.unwrap();
+        assert_eq!(
+            resolve_existing(&workspace, "../outside").await.unwrap(),
+            outside
+        );
+        assert_eq!(
+            resolve_existing(&workspace, outside.to_str().unwrap())
+                .await
+                .unwrap(),
+            outside
+        );
+        assert_eq!(
+            resolve_writable(&workspace, "../new").await.unwrap(),
+            root.path().join("new")
+        );
+        assert_eq!(
+            resolve_directory(&workspace, "nested/..").await.unwrap(),
+            fs::canonicalize(&workspace).await.unwrap()
+        );
+        for path in [".", "nested/..", "../workspace"] {
+            assert!(
+                resolve_removable(&workspace, path)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("workspace root")
+            );
+        }
+    }
 }

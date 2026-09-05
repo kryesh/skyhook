@@ -47,11 +47,15 @@ pub(super) async fn restore(
                 output_path,
                 error,
                 images,
+                console_output,
+                denial,
             } => {
                 if let Some(entry) = jobs.get_mut(job) {
                     entry.state = *state;
                     entry.error.clone_from(error);
+                    entry.denial.clone_from(denial);
                     entry.images.clone_from(images);
+                    entry.console_output.clone_from(console_output);
                     if let Some(relative) = output_path {
                         if !is_safe_artifact_path(relative) {
                             return Err(SessionError::UnsafeArtifactPath.into());

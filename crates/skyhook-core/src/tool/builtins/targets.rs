@@ -27,7 +27,7 @@ pub(super) fn register(
     let listed = router.clone();
     builder.register::<TargetsArgs, Vec<TargetRecord>, _, _>(
         "targets",
-        "List the built-in local `root` target and named SSH targets available in this session. Prefer named targets and target-aware tools’ target parameter over invoking ssh manually so Skyhook can apply configured authentication, jump routing, workspaces, cancellation, approvals, and audit metadata.",
+        "List the built-in local `root` target and named SSH targets available in this session. Prefer named targets and target-aware tools’ target parameter over invoking ssh manually so Skyhook can apply configured authentication, jump routing, workspaces, and cancellation.",
         ToolOptions::default().requires(Capability::Targets),
         move |_context, _args| {
             let router = listed.clone();

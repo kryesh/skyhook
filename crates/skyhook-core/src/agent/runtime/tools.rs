@@ -6,7 +6,7 @@ use std::{
 };
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
@@ -31,11 +31,19 @@ pub(super) struct AgentArgs {
     pub(super) model: Option<String>,
     /// Agent profile override.
     pub(super) profile: Option<String>,
-    /// Named SSH target. Omit or use `root` to run locally.
+    /// Execution target. Omit to inherit the caller; root selects the local host and root workspace.
     #[schemars(skip)]
     pub(super) target: Option<String>,
-    /// Initial workspace override for the child.
+    /// Child workspace override: absolute, or relative to the workspace selected by target.
     pub(super) workspace: Option<PathBuf>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct AgentOutput {
+    agent: crate::identity::AgentId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    result: String,
 }
 
 pub(super) fn register(
@@ -96,17 +104,24 @@ fn register_child_agent(
     builder: &mut ToolRegistryBuilder,
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
 ) -> Result<(), RegistryError> {
-    builder.register::<AgentArgs, Value, _, _>(
+    builder.register::<AgentArgs, AgentOutput, _, _>(
         "agent",
-        "Run a one-shot child agent.",
+        "Run a one-shot child agent with fresh conversation history. The job completes only after owned work finishes or is cancelled; questions suspend it and return a job envelope.",
         ToolOptions::default()
+            .generated_output_schema(|capabilities| {
+                let mut schema = serde_json::to_value(schemars::schema_for!(AgentOutput)).expect("agent output schema serializes");
+                if !capabilities.contains(Capability::Targets) {
+                    schema["properties"].as_object_mut().unwrap().remove("target");
+                }
+                schema
+            })
             .requires(Capability::Agents)
             .conditional_input(
                 "target",
                 Capability::Targets,
                 json!({
                     "type": ["string", "null"],
-                    "description": "Named SSH target. Omit or use `root` to run locally."
+                    "description": "Execution target. Omit to inherit the caller; root selects the local host and root workspace."
                 }),
             )
             .background()
@@ -128,17 +143,18 @@ fn register_child_agent(
                 let agent_profile = input
                     .profile
                     .or_else(|| runtime.harness.default_agent_profile.clone());
-                let target = input
-                    .target
-                    .unwrap_or_else(|| context.caller_location.target.clone());
-                let workspace = input.workspace.or_else(|| {
-                    (target == context.caller_location.target)
-                        .then(|| context.caller_location.workspace.clone())
-                });
-                let location = runtime
-                    .resolve_location(&target, workspace)
-                    .await
+                let explicit_root = input.target.as_deref() == Some(crate::target::ROOT_TARGET);
+                let target = input.target.unwrap_or_else(|| context.caller_location.target.clone());
+                let inherited = (target == context.caller_location.target && !explicit_root)
+                    .then(|| context.caller_location.workspace.clone());
+                let mut location = runtime.resolve_location(&target, inherited).await
                     .map_err(|error| tool_error(&error))?;
+                if let Some(workspace) = input.workspace {
+                    if workspace.as_os_str().is_empty() {
+                        return Err(ToolError::InvalidArguments("workspace cannot be empty".to_owned()));
+                    }
+                    location.workspace = location.workspace.join(workspace);
+                }
                 let result_target = context
                     .capabilities
                     .contains(Capability::Targets)
@@ -166,10 +182,7 @@ fn register_child_agent(
                             let text = result
                                 .map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?
                                 .map_err(ToolError::Failed)?;
-                            return Ok(match result_target {
-                                Some(target) => json!({"agent": child, "target": target, "result": text}),
-                                None => json!({"agent": child, "result": text}),
-                            });
+                            return Ok(AgentOutput { agent: child, target: result_target, result: text });
                         }
                         value = context.receive() => {
                             let value = match value {

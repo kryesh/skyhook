@@ -50,11 +50,15 @@ pub(crate) enum Response {
 pub(crate) struct RemoteToolOutput {
     pub value: Value,
     pub images: Vec<RemoteImage>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub console_output: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct RemoteToolError {
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denial: Option<crate::tool::Denial>,
     pub output: Option<RemoteToolOutput>,
 }
 
@@ -77,6 +81,7 @@ impl From<RemoteToolOutput> for ToolOutput {
             .collect();
         Self {
             value: value.value,
+            console_output: value.console_output,
             images,
         }
     }
@@ -147,8 +152,10 @@ mod tests {
             request_id: 7,
             result: Err(RemoteToolError {
                 message: "timed out".to_owned(),
+                denial: None,
                 output: Some(RemoteToolOutput {
                     value: serde_json::json!({"stdout":"partial"}),
+                    console_output: String::new(),
                     images: Vec::new(),
                 }),
             }),

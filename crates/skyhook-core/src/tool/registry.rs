@@ -79,6 +79,12 @@ impl ToolDefinition for GeneratedToolDefinition {
                 sanitize_schema(&mut input_schema);
                 let output_schema = self.output_schema.as_ref().map(|schema| {
                     let mut schema = schema(capabilities);
+                    if self.supports_background {
+                        schema = output_union(
+                            schema,
+                            crate::job::presented_job_schema(capabilities, false),
+                        );
+                    }
                     sanitize_schema(&mut schema);
                     schema
                 });
@@ -455,13 +461,26 @@ impl ToolSurface {
             .filter(|tool| tool.exposure == ToolExposure::ModelVisible)
             .map(|tool| {
                 let description = if tool.name == "script" {
-                    self.script_description(&tool.description)
+                    let mut description = self.script_description(&tool.description);
+                    if let Some(schema) = &tool.output_schema {
+                        let mut result_type = schema_type(schema, schema);
+                        if let Some(envelope) = self
+                            .tools
+                            .get("wait")
+                            .and_then(|tool| tool.output_schema.as_ref())
+                        {
+                            result_type = result_type
+                                .replace(&schema_type(envelope, envelope), "JobEnvelope");
+                        }
+                        description.push_str(&format!("\n\nScript return: `{result_type}`."));
+                    }
+                    description
                 } else {
-                    tool.description.clone()
+                    describe_output(tool.description.clone(), tool.output_schema.as_ref())
                 };
                 ProviderToolDefinition {
                     name: tool.name.clone(),
-                    description: describe_output(description, tool.output_schema.as_ref()),
+                    description,
                     input_schema: tool.input_schema.clone(),
                 }
             })
@@ -476,6 +495,10 @@ impl ToolSurface {
     }
 
     fn script_description(&self, base: &str) -> String {
+        let job_envelope = self
+            .tools
+            .get("wait")
+            .and_then(|tool| tool.output_schema.as_ref());
         let documented = self
             .tools
             .values()
@@ -486,13 +509,13 @@ impl ToolSurface {
                 }
                 ScriptBinding::Unavailable => false,
             })
-            .map(script_documentation)
+            .map(|tool| script_documentation(tool, job_envelope))
             .collect::<Vec<_>>();
         if documented.is_empty() {
             base.to_owned()
         } else {
             format!(
-                "{base}\n\nAdditional script APIs:\n{}",
+                "{base}\n\nJob controls and additional script APIs:\n{}",
                 documented.join("\n")
             )
         }
@@ -894,6 +917,11 @@ fn describe_output(description: String, schema: Option<&Value>) -> String {
     })
 }
 
+pub(crate) fn job_envelope_type(capabilities: &CapabilitySet) -> String {
+    let schema = crate::job::presented_job_schema(capabilities, false);
+    schema_type(&schema, &schema)
+}
+
 #[derive(Clone, Serialize)]
 pub(crate) struct ScriptManifest {
     name: String,
@@ -959,7 +987,7 @@ impl ScriptManifest {
     }
 }
 
-fn script_documentation(tool: &ToolSpec) -> String {
+fn script_documentation(tool: &ToolSpec, job_envelope: Option<&Value>) -> String {
     let schema = &tool.input_schema;
     let excluded = match &tool.script_binding {
         ScriptBinding::JobMethod { job_argument, .. } => Some(job_argument.as_str()),
@@ -995,7 +1023,7 @@ fn script_documentation(tool: &ToolSpec) -> String {
     };
     let call = match &tool.script_binding {
         ScriptBinding::TopLevel => format!("tool.{}{arguments}", tool.name),
-        ScriptBinding::JobMethod { method, .. } => format!("tool.job(job).{method}{arguments}"),
+        ScriptBinding::JobMethod { method, .. } => format!("tool.job(id).{method}{arguments}"),
         ScriptBinding::Unavailable => unreachable!(),
     };
     let field_docs = schema["properties"]
@@ -1012,8 +1040,54 @@ fn script_documentation(tool: &ToolSpec) -> String {
             )
         })
         .collect::<String>();
-    let description = describe_output(tool.description.clone(), tool.output_schema.as_ref());
+    let description = if tool.output_schema.is_some() && tool.output_schema.as_ref() == job_envelope
+    {
+        format!("{} Returns `JobEnvelope`.", tool.description)
+    } else {
+        describe_output(tool.description.clone(), tool.output_schema.as_ref())
+    };
     format!("- `{call}` — {description}{field_docs}")
+}
+
+/// Hoist definitions so both union members retain valid, unambiguous references.
+fn output_union(foreground: Value, background: Value) -> Value {
+    fn rename(value: &mut Value, prefix: &str) {
+        match value {
+            Value::Object(object) => {
+                if let Some(Value::String(reference)) = object.get_mut("$ref")
+                    && let Some(name) = reference.strip_prefix("#/$defs/")
+                {
+                    *reference = format!("#/$defs/{prefix}{name}");
+                }
+                for value in object.values_mut() {
+                    rename(value, prefix);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    rename(value, prefix);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut definitions = serde_json::Map::new();
+    let variants = [("Foreground_", foreground), ("Job_", background)]
+        .into_iter()
+        .map(|(prefix, mut schema)| {
+            rename(&mut schema, prefix);
+            if let Some(Value::Object(defs)) = schema
+                .as_object_mut()
+                .and_then(|object| object.remove("$defs"))
+            {
+                for (name, value) in defs {
+                    definitions.insert(format!("{prefix}{name}"), value);
+                }
+            }
+            schema
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({"anyOf": variants, "$defs": definitions})
 }
 
 fn schema_type(field: &Value, root: &Value) -> String {
@@ -1040,6 +1114,17 @@ fn schema_type(field: &Value, root: &Value) -> String {
             .map(|variant| schema_type(variant, root))
             .collect::<Vec<_>>();
         return types.join(" | ");
+    }
+    if let Some(types) = field.get("type").and_then(Value::as_array) {
+        return types
+            .iter()
+            .map(|kind| {
+                let mut variant = field.clone();
+                variant["type"] = kind.clone();
+                schema_type(&variant, root)
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
     }
     match field.get("type").and_then(Value::as_str) {
         Some("string" | "integer" | "number" | "boolean" | "null") => {
@@ -1141,6 +1226,89 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn builtin_schemas_render_nullable_types_and_preserve_union_references() {
+        fn check_refs(value: &Value, root: &Value) {
+            match value {
+                Value::Object(object) => {
+                    if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+                        assert!(
+                            root.pointer(reference.strip_prefix('#').unwrap()).is_some(),
+                            "unresolved {reference}"
+                        );
+                    }
+                    for value in object.values() {
+                        check_refs(value, root);
+                    }
+                }
+                Value::Array(values) => {
+                    for value in values {
+                        check_refs(value, root);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::session::SessionStore::create(root.path())
+            .await
+            .unwrap();
+        let jobs = crate::job::JobManager::new(store.clone());
+        let mut builder = ToolRegistryBuilder::default();
+        crate::tool::builtins::register_worker_tools(&mut builder, store, jobs).unwrap();
+        crate::tool::builtins::install_script_tool(
+            &mut builder,
+            Arc::new(std::sync::OnceLock::new()),
+        )
+        .unwrap();
+        let registry = builder.build();
+        for targets in [false, true] {
+            let surface = registry.surface(&target_context(targets));
+            for tool in surface.tools.values() {
+                if let Some(schema) = &tool.output_schema {
+                    check_refs(schema, schema);
+                    assert!(!schema.to_string().contains("awaiting_approval"));
+                }
+            }
+            for name in ["exec", "shell", "wait"] {
+                let tool = surface.get(name).unwrap();
+                assert!(
+                    !tool.input_schema["required"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|value| value == "timeout")
+                );
+                assert_eq!(tool.input_schema["properties"]["timeout"]["minimum"], 1);
+                assert_eq!(tool.input_schema["properties"]["timeout"]["maximum"], 3600);
+                assert!(script_documentation(tool, None).contains("timeout?: integer | null"));
+            }
+            let schema = surface.get("exec").unwrap().output_schema.as_ref().unwrap();
+            assert_eq!(schema["anyOf"].as_array().unwrap().len(), 2);
+            assert!(schema_type(schema, schema).contains("integer | null"));
+            let definitions = surface.definitions();
+            let script = definitions
+                .iter()
+                .find(|tool| tool.name == "script")
+                .unwrap();
+            assert!(
+                script
+                    .description
+                    .ends_with("\n\nScript return: `JSON | JobEnvelope`.")
+            );
+            assert_eq!(
+                script.description.matches("Returns `JobEnvelope`.").count(),
+                3
+            );
+            assert!(!script.description.contains("location:"));
+            let shared_type = job_envelope_type(&target_context(targets));
+            assert!(shared_type.contains("workspace:string"));
+            assert_eq!(shared_type.contains("target:string"), targets);
+            assert!(shared_type.contains("permission_denied"));
+            assert!(!shared_type.contains("awaiting_approval"));
+        }
+    }
+
     #[test]
     fn background_is_generated_not_owned_by_handler_schema() {
         let mut builder = ToolRegistry::builder();
@@ -1162,13 +1330,13 @@ mod tests {
         assert!(background);
         assert!(arguments.get("bg").is_none());
         assert_eq!(
-            surface.get("echo").unwrap().output_schema.as_ref().unwrap()["type"],
+            surface.get("echo").unwrap().output_schema.as_ref().unwrap()["anyOf"][0]["type"],
             "string"
         );
         assert!(
             registry.surface(&context(true)).definitions()[0]
                 .description
-                .contains("Returns `string`.")
+                .contains("Returns `string |")
         );
     }
 

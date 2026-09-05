@@ -19,6 +19,9 @@ use tokio::io::AsyncBufReadExt as _;
 
 use interaction::{CliInteraction, CliPolicy, CliQuestions, CliSensitivePrompts};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "skyhook", version, about = "Programmable coding-agent harness")]
 struct Args {
@@ -129,6 +132,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let source = tokio::fs::read_to_string(script).await?;
         let output = session.run_script(source).await?;
         println!("{}", serde_json::to_string_pretty(&output.value)?);
+        if !output.console_output.is_empty() {
+            eprintln!("Console output:\n{}", output.console_output);
+        }
     } else if let Some(prompt) = args.prompt {
         if args.images.is_empty() {
             let _ = session.prompt(prompt).await?;

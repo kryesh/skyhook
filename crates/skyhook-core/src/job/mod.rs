@@ -40,6 +40,7 @@ const CANCELLATION_GRACE: Duration = Duration::from_millis(250);
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
     Queued,
+    #[schemars(skip)]
     AwaitingApproval,
     Running,
     WaitingInput,
@@ -50,6 +51,15 @@ pub enum JobState {
 }
 
 impl JobState {
+    /// Agent-facing projection; authorization remains a host concern.
+    #[must_use]
+    pub const fn presented(self) -> Self {
+        match self {
+            Self::AwaitingApproval => Self::Queued,
+            state => state,
+        }
+    }
+
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(
@@ -74,8 +84,12 @@ pub struct JobEnvelope<L = ExecutionLocation, T = String, V = Value> {
     pub tool: T,
     pub state: JobState,
     pub output: Option<V>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub console_output: String,
     pub error: Option<T>,
     pub location: L,
+    #[serde(flatten)]
+    pub denial: Option<crate::tool::Denial>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -89,10 +103,12 @@ impl JobEnvelope {
             id: self.id,
             parent: self.parent,
             tool: &self.tool,
-            state: self.state,
+            state: self.state.presented(),
             output: self.output.as_ref(),
+            console_output: self.console_output.clone(),
             error: self.error.as_deref(),
             location,
+            denial: self.denial.clone(),
         }
     }
 
@@ -119,10 +135,30 @@ pub(crate) fn presented_job_schema(capabilities: &CapabilitySet, many: bool) -> 
         }
         .expect("job presentation schemas serialize")
     }
-    if capabilities.contains(Capability::Targets) {
-        schema::<JobEnvelope>(many)
+    let mut envelope = if capabilities.contains(Capability::Targets) {
+        schema::<JobEnvelope>(false)
     } else {
-        schema::<JobEnvelope<LocalLocation<'_>>>(many)
+        schema::<JobEnvelope<LocalLocation<'_>>>(false)
+    };
+    let mut question = schema::<crate::agent::QuestionOutput>(false);
+    if let Some(Value::Object(definitions)) = question
+        .as_object_mut()
+        .and_then(|schema| schema.remove("$defs"))
+    {
+        envelope["$defs"]
+            .as_object_mut()
+            .expect("job schema has definitions")
+            .extend(definitions);
+    }
+    envelope["allOf"] = serde_json::json!([{
+        "if": {"properties": {"state": {"const": "waiting_input"}, "tool": {"const": "agent"}}, "required": ["state", "tool"]},
+        "then": {"properties": {"output": {"anyOf": [question, {"type": "null"}]}}}
+    }]);
+    if many {
+        let definitions = envelope.as_object_mut().unwrap().remove("$defs").unwrap();
+        serde_json::json!({"type": "array", "items": envelope, "$defs": definitions})
+    } else {
+        envelope
     }
 }
 
@@ -139,7 +175,9 @@ struct JobEntry {
     state: JobState,
     output: Option<Value>,
     images: Vec<ImageReference>,
+    console_output: String,
     error: Option<String>,
+    denial: Option<crate::tool::Denial>,
     accepts_input: bool,
     input: mpsc::Sender<Value>,
     cancellation: CancellationToken,
@@ -165,7 +203,9 @@ impl JobEntry {
                 state: JobState::Queued,
                 output: None,
                 images: Vec::new(),
+                console_output: String::new(),
                 error: None,
+                denial: None,
                 accepts_input: spec.accepts_input,
                 input,
                 cancellation: CancellationToken::new(),
@@ -202,8 +242,10 @@ impl JobEntry {
             tool: self.tool.clone(),
             state: self.state,
             output: self.output.clone(),
+            console_output: self.console_output.clone(),
             error: self.error.clone(),
             location: self.location.clone(),
+            denial: self.denial.clone(),
         }
     }
 }
@@ -327,9 +369,23 @@ impl JobManager {
                 },
             )
             .await?;
-        let (entry, input) = JobEntry::new(spec);
-        let cancellation = entry.cancellation.clone();
-        self.inner.jobs.lock().await.insert(id, entry);
+        let (mut entry, input) = JobEntry::new(spec);
+        let cancellation = {
+            let mut jobs = self.inner.jobs.lock().await;
+            if let Some(parent) = entry.parent {
+                entry.cancellation = jobs
+                    .get(&parent)
+                    .ok_or(JobError::Unknown(parent))?
+                    .cancellation
+                    .child_token();
+            }
+            let cancellation = entry.cancellation.clone();
+            jobs.insert(id, entry);
+            cancellation
+        };
+        if cancellation.is_cancelled() {
+            self.cancel(id).await?;
+        }
         Ok(JobLease {
             id,
             cancellation,
@@ -362,13 +418,13 @@ impl JobManager {
             .store
             .append(agent, SessionEvent::JobStateChanged { job: id, state })
             .await?;
-        self.inner
-            .jobs
-            .lock()
-            .await
-            .get_mut(&id)
-            .ok_or(JobError::Unknown(id))?
-            .state = state;
+        let notify = {
+            let mut jobs = self.inner.jobs.lock().await;
+            let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
+            entry.state = state;
+            entry.notify.clone()
+        };
+        notify.notify_waiters();
         Ok(())
     }
 
@@ -378,7 +434,8 @@ impl JobManager {
         result: Result<ToolOutput, String>,
         terminal_override: Option<JobState>,
     ) -> Result<(), JobError> {
-        self.finish_inner(id, result, None, terminal_override).await
+        self.finish_inner(id, result, None, terminal_override, None)
+            .await
     }
 
     pub async fn finish_failed(
@@ -388,8 +445,19 @@ impl JobManager {
         output: Option<ToolOutput>,
         terminal_override: Option<JobState>,
     ) -> Result<(), JobError> {
-        self.finish_inner(id, Err(error), output, terminal_override)
+        self.finish_inner(id, Err(error), output, terminal_override, None)
             .await
+    }
+
+    pub(crate) async fn finish_denied(&self, id: JobId, reason: String) -> Result<(), JobError> {
+        self.finish_inner(
+            id,
+            Err(reason),
+            None,
+            None,
+            Some(crate::tool::Denial::permission_denied()),
+        )
+        .await
     }
 
     async fn finish_inner(
@@ -398,30 +466,34 @@ impl JobManager {
         result: Result<ToolOutput, String>,
         failure_output: Option<ToolOutput>,
         terminal_override: Option<JobState>,
+        denial: Option<crate::tool::Denial>,
     ) -> Result<(), JobError> {
         let operation = self.operation(id).await?;
         let _operation = operation.lock().await;
-        let (agent, state, output, images, error) = {
+        let (agent, state, output, images, console_output, error) = {
             let jobs = self.inner.jobs.lock().await;
             let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
             if entry.state.is_terminal() {
                 return Err(JobError::AlreadyTerminal(id));
             }
-            let (state, output, images, error) = match result {
+            let (state, output, images, console_output, error) = match result {
                 Ok(output) => (
                     terminal_override.unwrap_or(JobState::Completed),
                     Some(output.value),
                     output.images,
+                    output.console_output,
                     None,
                 ),
                 Err(error) => {
-                    let (output, images) = failure_output.map_or((None, Vec::new()), |output| {
-                        (Some(output.value), output.images)
-                    });
+                    let (output, images, console_output) = failure_output
+                        .map_or((None, Vec::new(), String::new()), |output| {
+                            (Some(output.value), output.images, output.console_output)
+                        });
                     (
                         terminal_override.unwrap_or(JobState::Failed),
                         output,
                         images,
+                        console_output,
                         Some(error),
                     )
                 }
@@ -429,7 +501,14 @@ impl JobManager {
             if !state.is_terminal() {
                 return Err(JobError::InvalidTransition);
             }
-            (entry.agent.clone(), state, output, images, error)
+            (
+                entry.agent.clone(),
+                state,
+                output,
+                images,
+                console_output,
+                error,
+            )
         };
         let output_path = match &output {
             Some(value) => Some(self.inner.store.write_job_output(id, value).await?),
@@ -445,6 +524,8 @@ impl JobManager {
                     output_path,
                     error: error.clone(),
                     images: images.clone(),
+                    console_output: console_output.clone(),
+                    denial: denial.clone(),
                 },
             )
             .await?;
@@ -457,7 +538,9 @@ impl JobManager {
             entry.state = state;
             entry.output = output;
             entry.images = images;
+            entry.console_output = console_output;
             entry.error = error;
+            entry.denial = denial;
             (entry.notify.clone(), entry.background)
         };
         notify.notify_waiters();
@@ -508,6 +591,7 @@ impl JobManager {
             entry.state = JobState::Failed;
             entry.output = None;
             entry.images.clear();
+            entry.console_output.clear();
             entry.error = Some(error);
             Some((entry.agent.clone(), entry.notify.clone(), entry.background))
         };
@@ -526,6 +610,19 @@ impl JobManager {
         let jobs = self.inner.jobs.lock().await;
         let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
         Ok(entry.envelope(id))
+    }
+
+    pub(crate) async fn cancellation_token(
+        &self,
+        id: JobId,
+    ) -> Result<CancellationToken, JobError> {
+        self.inner
+            .jobs
+            .lock()
+            .await
+            .get(&id)
+            .map(|entry| entry.cancellation.clone())
+            .ok_or(JobError::Unknown(id))
     }
 
     pub(crate) async fn authorization_scope(&self, id: JobId) -> Result<Option<u64>, JobError> {
@@ -578,6 +675,7 @@ impl JobManager {
         timeout: Option<Duration>,
         mode: WaitMode,
     ) -> Result<JobEnvelope, JobError> {
+        let deadline = timeout.map(|duration| tokio::time::Instant::now() + duration);
         loop {
             let (snapshot, notified, ready, claimed_agent) = {
                 let mut jobs = self.inner.jobs.lock().await;
@@ -610,8 +708,8 @@ impl JobManager {
                     .await?;
                 return Ok(snapshot);
             }
-            if let Some(timeout) = timeout {
-                if tokio::time::timeout(timeout, notified).await.is_err() {
+            if let Some(deadline) = deadline {
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
                     return Ok(snapshot);
                 }
             } else {
@@ -685,24 +783,42 @@ impl JobManager {
     }
 
     pub async fn cancel(&self, id: JobId) -> Result<JobEnvelope, JobError> {
-        let (terminal, cancellation, launch_watchdog) = {
+        let watchdogs = {
             let mut jobs = self.inner.jobs.lock().await;
-            let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
-            let terminal = entry.state.is_terminal();
-            let launch_watchdog = !terminal && !entry.cancellation_watchdog_started;
-            if launch_watchdog {
-                entry.cancellation_watchdog_started = true;
+            if !jobs.contains_key(&id) {
+                return Err(JobError::Unknown(id));
             }
-            (terminal, entry.cancellation.clone(), launch_watchdog)
+            let mut descendants = std::collections::HashSet::from([id]);
+            loop {
+                let before = descendants.len();
+                for (child, entry) in jobs.iter() {
+                    if entry
+                        .parent
+                        .is_some_and(|parent| descendants.contains(&parent))
+                    {
+                        descendants.insert(*child);
+                    }
+                }
+                if descendants.len() == before {
+                    break;
+                }
+            }
+            let mut watchdogs = Vec::new();
+            for job in descendants {
+                let entry = jobs.get_mut(&job).expect("known descendant");
+                entry.cancellation.cancel();
+                if !entry.state.is_terminal() && !entry.cancellation_watchdog_started {
+                    entry.cancellation_watchdog_started = true;
+                    watchdogs.push(job);
+                }
+            }
+            watchdogs
         };
-        if !terminal {
-            cancellation.cancel();
-        }
-        if launch_watchdog {
+        for job in watchdogs {
             let jobs = self.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(CANCELLATION_GRACE).await;
-                jobs.force_cancel(id).await;
+                jobs.force_cancel(job).await;
             });
         }
         self.snapshot(id).await
@@ -953,6 +1069,138 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn wait_deadline_does_not_restart_on_notifications() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(root.path()).await.unwrap();
+        let agent = AgentId::root(store.id());
+        let jobs = JobManager::new(store);
+        let lease = jobs.create(JobSpec::test(agent, "pending")).await.unwrap();
+        let notify = jobs
+            .inner
+            .jobs
+            .lock()
+            .await
+            .get(&lease.id)
+            .unwrap()
+            .notify
+            .clone();
+        let waiter = {
+            let jobs = jobs.clone();
+            tokio::spawn(async move {
+                jobs.wait(lease.id, Some(Duration::from_secs(10)), true)
+                    .await
+                    .unwrap()
+            })
+        };
+        tokio::task::yield_now().await;
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_secs(2)).await;
+            notify.notify_waiters();
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(waiter.is_finished());
+        assert_eq!(waiter.await.unwrap().state, JobState::Queued);
+        assert!(!lease.cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cancelling_completed_parent_cancels_descendants_and_late_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(root.path()).await.unwrap();
+        let agent = AgentId::root(store.id());
+        let jobs = JobManager::new(store);
+        let parent = jobs
+            .create(JobSpec::test(agent.clone(), "script"))
+            .await
+            .unwrap();
+        let child = jobs
+            .create(JobSpec {
+                parent: Some(parent.id),
+                ..JobSpec::test(agent.child(1), "agent")
+            })
+            .await
+            .unwrap();
+        let grandchild = jobs
+            .create(JobSpec {
+                parent: Some(child.id),
+                ..JobSpec::test(agent.child(1), "shell")
+            })
+            .await
+            .unwrap();
+        jobs.finish(parent.id, Ok(ToolOutput::default()), None)
+            .await
+            .unwrap();
+        jobs.cancel(parent.id).await.unwrap();
+        assert!(child.cancellation.is_cancelled());
+        assert!(grandchild.cancellation.is_cancelled());
+        let late = jobs
+            .create(JobSpec {
+                parent: Some(grandchild.id),
+                ..JobSpec::test(agent, "late")
+            })
+            .await
+            .unwrap();
+        assert!(late.cancellation.is_cancelled());
+        let terminal = jobs
+            .wait(late.id, Some(Duration::from_secs(2)), true)
+            .await
+            .unwrap();
+        assert_eq!(terminal.state, JobState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn denial_survives_replay_and_agent_views_hide_pending_authorization() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(root.path()).await.unwrap();
+        let agent = AgentId::root(store.id());
+        let jobs = JobManager::new(store.clone());
+        let job = jobs.create(JobSpec::test(agent, "shell")).await.unwrap().id;
+        jobs.transition(job, JobState::AwaitingApproval)
+            .await
+            .unwrap();
+        let pending = jobs.snapshot(job).await.unwrap();
+        assert_eq!(
+            pending.presented(&CapabilitySet::default()).unwrap()["state"],
+            "queued"
+        );
+        assert!(
+            !presented_job_schema(&CapabilitySet::default(), false)
+                .to_string()
+                .contains("awaiting_approval")
+        );
+        jobs.finish_denied(job, "user reason".to_owned())
+            .await
+            .unwrap();
+        let denied = jobs
+            .wait(job, None, true)
+            .await
+            .unwrap()
+            .presented(&CapabilitySet::default())
+            .unwrap();
+        assert_eq!(denied["code"], "permission_denied");
+        assert_eq!(denied["executed"], false);
+        assert_eq!(denied["error"], "user reason");
+        // The persisted terminal event is the source of truth for replay.
+        let session_id = store.id();
+        drop(jobs);
+        store.close().await.unwrap();
+        drop(store);
+        let (store, records) = SessionStore::open(root.path(), session_id).await.unwrap();
+        let restored = JobManager::restore(store, &records).await.unwrap();
+        assert_eq!(
+            restored
+                .snapshot(job)
+                .await
+                .unwrap()
+                .presented(&CapabilitySet::default())
+                .unwrap(),
+            denied
+        );
+    }
+
     #[test]
     fn presentation_hides_only_location_target_metadata() {
         let envelope = JobEnvelope {
@@ -961,8 +1209,10 @@ mod tests {
             tool: "adapter".to_owned(),
             state: JobState::Completed,
             output: Some(serde_json::json!({"target": "application-value"})),
+            console_output: String::new(),
             error: None,
             location: ExecutionLocation::named("build", "/srv/project".into()),
+            denial: None,
         };
         let presented = envelope.presented(&CapabilitySet::default()).unwrap();
 
@@ -1355,6 +1605,7 @@ mod tests {
         let store = SessionStore::create(root.path()).await.unwrap();
         let agent = AgentId::root(store.id());
         let observed = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Notify::new());
         let mut builder = ToolRegistryBuilder::default();
         builder
             .register::<NoArgs, String, _, _>(
@@ -1363,9 +1614,12 @@ mod tests {
                 ToolOptions::new(Vec::new()).background(),
                 {
                     let observed = observed.clone();
+                    let started = started.clone();
                     move |context, _input| {
                         let observed = observed.clone();
+                        let started = started.clone();
                         async move {
+                            started.notify_one();
                             context.cancelled().await;
                             observed.store(true, Ordering::Relaxed);
                             Err(ToolError::Cancelled)
@@ -1391,6 +1645,7 @@ mod tests {
             )
             .await
             .unwrap();
+        started.notified().await;
         jobs.cancel(running.job).await.unwrap();
         let cancelled =
             tokio::time::timeout(Duration::from_secs(1), jobs.wait(running.job, None, true))

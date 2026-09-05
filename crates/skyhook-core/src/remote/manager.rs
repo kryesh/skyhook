@@ -412,6 +412,7 @@ async fn call_tool(
     };
     match result {
         Ok(output) => Ok(output.into()),
+        Err(error) if error.denial.is_some() => Err(RemoteError::OperationDenied(error.message)),
         Err(error) => Err(RemoteError::Remote {
             message: error.message,
             output: error.output.map(Into::into),
@@ -953,6 +954,8 @@ pub enum RemoteError {
     Deployment(String),
     #[error("remote protocol failed: {0}")]
     Protocol(String),
+    #[error("remote operation denied: {0}")]
+    OperationDenied(String),
     #[error("remote tool failed: {message}")]
     Remote {
         message: String,
@@ -1002,6 +1005,7 @@ impl RemoteError {
     #[must_use]
     pub fn into_tool_error(self) -> ToolError {
         match self {
+            Self::OperationDenied(reason) => ToolError::Denied(reason),
             Self::Remote {
                 message,
                 output: Some(output),
@@ -1035,6 +1039,7 @@ mod tests {
     fn output(value: &str) -> RemoteToolResult {
         Ok(RemoteToolOutput {
             value: serde_json::json!(value),
+            console_output: String::new(),
             images: Vec::new(),
         })
     }
