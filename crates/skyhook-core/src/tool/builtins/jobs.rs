@@ -10,7 +10,7 @@ use crate::{
     tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder},
 };
 
-pub(super) fn register(
+pub(crate) fn register(
     builder: &mut ToolRegistryBuilder,
     jobs: JobManager,
 ) -> Result<(), RegistryError> {
@@ -236,6 +236,7 @@ const fn default_job_events() -> usize {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::TestRuntime;
     use std::sync::Arc;
 
     use super::*;
@@ -249,10 +250,9 @@ mod tests {
 
     #[tokio::test]
     async fn every_job_api_projects_pending_authorization_as_queued() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
-        let jobs = JobManager::new(store);
+        let runtime = TestRuntime::new().await;
+        let agent = runtime.agent.clone();
+        let jobs = runtime.jobs.clone();
         let pending = jobs
             .create(JobSpec::test(agent.clone(), "pending"))
             .await
@@ -263,12 +263,7 @@ mod tests {
             .unwrap();
         let mut builder = ToolRegistryBuilder::default();
         register(&mut builder, jobs.clone()).unwrap();
-        let executor = ToolExecutor::new(
-            builder.build(),
-            Arc::new(AllowAll),
-            jobs,
-            root.path().to_path_buf(),
-        );
+        let executor = runtime.executor(builder);
         for (tool, args) in [
             ("jobs", serde_json::json!({})),
             ("job_inspect", serde_json::json!({"job":pending})),
@@ -315,9 +310,12 @@ mod tests {
             .await
             .unwrap()
             .id;
-        jobs.finish(completed, Ok(ToolOutput::new(Value::Null)), None)
-            .await
-            .unwrap();
+        jobs.finish(
+            completed,
+            crate::job::JobOutcome::Completed(ToolOutput::new(Value::Null)),
+        )
+        .await
+        .unwrap();
         let mut builder = ToolRegistryBuilder::default();
         register(&mut builder, jobs.clone()).unwrap();
         let executor = ToolExecutor::new(

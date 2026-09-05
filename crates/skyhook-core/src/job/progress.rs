@@ -1,12 +1,7 @@
-use std::sync::Arc;
-
 use chrono::Utc;
 use serde_json::Value;
 
-use crate::{
-    identity::JobId,
-    tool::{ProgressFuture, ProgressSink, ToolError},
-};
+use crate::identity::JobId;
 
 use super::{JobError, JobManager, JobProgressRecord};
 
@@ -52,25 +47,4 @@ pub(super) async fn events(
         .store
         .read_job_events(id, after, limit)
         .await?)
-}
-
-pub(super) fn sink(manager: JobManager, id: JobId) -> Arc<dyn ProgressSink> {
-    Arc::new(JobProgressSink { manager, id })
-}
-
-struct JobProgressSink {
-    manager: JobManager,
-    id: JobId,
-}
-
-impl ProgressSink for JobProgressSink {
-    fn publish(&self, kind: String, data: Value) -> ProgressFuture {
-        let manager = self.manager.clone();
-        let id = self.id;
-        Box::pin(async move {
-            publish(&manager, id, kind, data)
-                .await
-                .map_err(|error| ToolError::Failed(error.to_string()))
-        })
-    }
 }

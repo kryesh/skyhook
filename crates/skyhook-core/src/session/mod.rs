@@ -282,42 +282,34 @@ impl SessionStore {
         media_type: String,
     ) -> Result<ImageReference, SessionError> {
         let hash = crate::sha256_hex(bytes);
-        if !self.inner.durable {
-            return Ok(ImageReference {
-                sha256: hash,
-                media_type,
-                name,
-                bytes: u64::try_from(bytes.len()).map_err(|_| SessionError::FileTooLarge)?,
-                data_base64: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
-            });
-        }
-        let destination = self.inner.directory.join("blobs").join(&hash);
-        if !fs::try_exists(&destination).await? {
-            atomic_write(&destination, bytes).await?;
-        }
+        let data_base64 = if self.inner.durable {
+            let destination = self.inner.directory.join("blobs").join(&hash);
+            if !fs::try_exists(&destination).await? {
+                atomic_write(&destination, bytes).await?;
+            }
+            None
+        } else {
+            Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+        };
         Ok(ImageReference {
             sha256: hash,
             media_type,
             name,
             bytes: u64::try_from(bytes.len()).map_err(|_| SessionError::FileTooLarge)?,
-            data_base64: None,
+            data_base64,
         })
     }
 
     pub async fn read_blob(&self, reference: &ImageReference) -> Result<Vec<u8>, SessionError> {
-        if let Some(data) = &reference.data_base64 {
-            let bytes = base64::engine::general_purpose::STANDARD
+        let bytes = if let Some(data) = &reference.data_base64 {
+            base64::engine::general_purpose::STANDARD
                 .decode(data)
                 .map_err(|error| {
                     SessionError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-                })?;
-            let actual = crate::sha256_hex(&bytes);
-            if actual != reference.sha256 {
-                return Err(SessionError::BlobHashMismatch(reference.sha256.clone()));
-            }
-            return Ok(bytes);
-        }
-        let bytes = fs::read(self.inner.directory.join("blobs").join(&reference.sha256)).await?;
+                })?
+        } else {
+            fs::read(self.inner.directory.join("blobs").join(&reference.sha256)).await?
+        };
         let actual = crate::sha256_hex(&bytes);
         if actual != reference.sha256 {
             return Err(SessionError::BlobHashMismatch(reference.sha256.clone()));

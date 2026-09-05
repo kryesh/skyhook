@@ -60,15 +60,7 @@ function __operation(name, input) {
 
 const __reserved = new Set(["then", "catch", "finally", "set"]);
 function __validIdentifier(value) {
-  if (typeof value !== "string" || value.length === 0) return false;
-  const first = value.charCodeAt(0);
-  const firstOk = first === 36 || first === 95 || (first >= 65 && first <= 90) || (first >= 97 && first <= 122);
-  if (!firstOk) return false;
-  for (let index = 1; index < value.length; index++) {
-    const code = value.charCodeAt(index);
-    if (!(code === 36 || code === 95 || (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122))) return false;
-  }
-  return true;
+  return typeof value === "string" && /^[A-Za-z_$][A-Za-z0-9_$]*(?![\s\S])/.test(value);
 }
 
 function __chainBuilder(manifest, input = Object.create(null)) {

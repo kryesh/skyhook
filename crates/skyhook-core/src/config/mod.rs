@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    agent::{AgentProfile, Harness, HarnessBuilder},
+    agent::{AgentProfile, HarnessBuilder},
     provider::backends::flux::OpenAiApi,
     provider::profile::ModelProfile,
     target::TargetsConfig,
@@ -135,16 +135,6 @@ impl Config {
             builder = builder.agent_profile(name.clone(), profile.clone());
         }
         Ok(builder)
-    }
-
-    pub async fn build_harness(
-        &self,
-        workspace: impl Into<PathBuf>,
-    ) -> Result<Harness, ConfigError> {
-        self.harness_builder(workspace)?
-            .build()
-            .await
-            .map_err(ConfigError::Harness)
     }
 }
 

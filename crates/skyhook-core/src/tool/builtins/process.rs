@@ -17,10 +17,11 @@ const MAX_PROCESS_OUTPUT: usize = 1024 * 1024;
 const PROCESS_CHUNK: usize = 8 * 1024;
 
 pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
-    builder.register_targeted::<ExecArgs, ProcessOutput, _, _>(
+    builder.register::<ExecArgs, ProcessOutput, _, _>(
         "exec",
         "Run an exact argument vector without shell parsing.",
         ToolOptions::new(vec![Capability::Exec])
+            .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .named()
             .background()
             .input()
@@ -36,10 +37,11 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             run_process(context, command, args.timeout).await
         },
     )?;
-    builder.register_targeted::<ShellArgs, ProcessOutput, _, _>(
+    builder.register::<ShellArgs, ProcessOutput, _, _>(
         "shell",
         "Run /bin/sh -lc in the workspace.",
         ToolOptions::new(vec![Capability::Exec])
+            .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .named()
             .background()
             .input()
@@ -303,18 +305,13 @@ fn default_dot() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use crate::test_support::TestRuntime;
 
     use super::*;
     use crate::{
-        identity::{AgentId, JobId},
-        job::{JobManager, JobState},
-        session::SessionStore,
-        tool::{
-            ToolRegistryBuilder,
-            executor::{ExecutionError, ToolExecutor},
-            policy::AllowAll,
-        },
+        identity::JobId,
+        job::JobState,
+        tool::{ToolRegistryBuilder, executor::ExecutionError},
     };
 
     #[test]
@@ -338,19 +335,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_kills_descendants_even_after_the_shell_exits() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(sessions.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
-        let jobs = JobManager::new(store);
+        let runtime = TestRuntime::new().await;
+        let agent = runtime.agent.clone();
+        let jobs = runtime.jobs.clone();
         let mut builder = ToolRegistryBuilder::default();
         register(&mut builder).unwrap();
-        let executor = ToolExecutor::new(
-            builder.build(),
-            Arc::new(AllowAll),
-            jobs.clone(),
-            workspace.path().to_path_buf(),
-        );
+        let executor = runtime.executor(builder);
         let running = executor.execute(agent, "shell", serde_json::json!({
             "command":"(sleep 0.3; printf escaped > escaped) & printf ready; exit 0", "bg":true
         }), None).await.unwrap();
@@ -373,24 +363,17 @@ mod tests {
             crate::job::JobState::Cancelled
         );
         tokio::time::sleep(Duration::from_millis(400)).await;
-        assert!(!workspace.path().join("escaped").exists());
+        assert!(!runtime.root.path().join("escaped").exists());
     }
 
     #[tokio::test]
     async fn nonzero_is_success_and_timeout_persists_partial_output() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(sessions.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
-        let jobs = JobManager::new(store);
+        let runtime = TestRuntime::new().await;
+        let agent = runtime.agent.clone();
+        let jobs = runtime.jobs.clone();
         let mut builder = ToolRegistryBuilder::default();
         register(&mut builder).unwrap();
-        let executor = ToolExecutor::new(
-            builder.build(),
-            Arc::new(AllowAll),
-            jobs.clone(),
-            workspace.path().to_path_buf(),
-        );
+        let executor = runtime.executor(builder);
         let output = executor
             .execute(
                 agent.clone(),

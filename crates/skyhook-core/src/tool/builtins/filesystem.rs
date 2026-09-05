@@ -37,11 +37,12 @@ fn register_read(
     let schema = serde_json::to_value(schema_for!(ReadArgs)).expect("read schema serializes");
     let output_schema = serde_json::to_value(schema_for!(ReadOutput))
         .map_err(|error| RegistryError::Schema(error.to_string()))?;
-    builder.register_dynamic_targeted(
+    builder.register_dynamic(
         "read",
         "Read UTF-8 lines, list a directory, or attach a supported image from the workspace.",
         schema,
         ToolOptions::new(vec![Capability::Read])
+            .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .output_schema(output_schema)
             .path_argument("path", PathAccess::Read, PathKind::Existing),
         move |context, arguments| {
@@ -149,14 +150,12 @@ fn register_read(
 }
 
 fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
-    builder.register_workspace::<WriteArgs, WriteOutput, _, _>(
+    builder.register::<WriteArgs, WriteOutput, _, _>(
         "write",
         "Atomically create or replace a UTF-8 workspace file.",
-        ToolOptions::new(vec![Capability::Write]).path_argument(
-            "path",
-            PathAccess::Write,
-            PathKind::Writable,
-        ),
+        ToolOptions::new(vec![Capability::Write])
+            .placement(crate::tool::ToolPlacement::InheritWorkspace)
+            .path_argument("path", PathAccess::Write, PathKind::Writable),
         |context, args| async move {
             check_write_size(&args.content)?;
             let path = resolve_writable(&context.execution_location.workspace, &args.path).await?;
@@ -167,14 +166,12 @@ fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryErro
             })
         },
     )?;
-    builder.register_workspace::<ReplaceArgs, EditOutput, _, _>(
+    builder.register::<ReplaceArgs, EditOutput, _, _>(
         "replace",
         "Replace exact text in a UTF-8 workspace file with an expected match count.",
-        ToolOptions::new(vec![Capability::Write]).path_argument(
-            "path",
-            PathAccess::Write,
-            PathKind::Existing,
-        ),
+        ToolOptions::new(vec![Capability::Write])
+            .placement(crate::tool::ToolPlacement::InheritWorkspace)
+            .path_argument("path", PathAccess::Write, PathKind::Existing),
         |context, args| async move {
             if args.old.len().saturating_add(args.new.len()) > MAX_WRITE_BYTES {
                 return Err(ToolError::InvalidArguments(format!(
@@ -205,14 +202,12 @@ fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryErro
             })
         },
     )?;
-    builder.register_workspace::<PatchArgs, EditOutput, _, _>(
+    builder.register::<PatchArgs, EditOutput, _, _>(
         "patch",
         "Apply a unified patch to one UTF-8 workspace file.",
-        ToolOptions::new(vec![Capability::Write]).path_argument(
-            "path",
-            PathAccess::Write,
-            PathKind::Existing,
-        ),
+        ToolOptions::new(vec![Capability::Write])
+            .placement(crate::tool::ToolPlacement::InheritWorkspace)
+            .path_argument("path", PathAccess::Write, PathKind::Existing),
         |context, args| async move {
             check_write_size(&args.patch)?;
             let path = resolve_existing(&context.execution_location.workspace, &args.path).await?;
@@ -231,14 +226,12 @@ fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryErro
             })
         },
     )?;
-    builder.register_workspace::<RemoveArgs, RemoveOutput, _, _>(
+    builder.register::<RemoveArgs, RemoveOutput, _, _>(
         "remove",
         "Remove a workspace file, symlink, or directory.",
-        ToolOptions::new(vec![Capability::Write]).path_argument(
-            "path",
-            PathAccess::Write,
-            PathKind::Removable,
-        ),
+        ToolOptions::new(vec![Capability::Write])
+            .placement(crate::tool::ToolPlacement::InheritWorkspace)
+            .path_argument("path", PathAccess::Write, PathKind::Removable),
         |context, args| async move {
             let path = resolve_removable(&context.execution_location.workspace, &args.path).await?;
             let metadata = fs::symlink_metadata(&path).await?;

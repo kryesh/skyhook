@@ -187,12 +187,18 @@ fn register_child_agent(
                 let agent_profile = input
                     .profile
                     .or_else(|| runtime.harness.default_agent_profile.clone());
-                let explicit_root = input.target.as_deref() == Some(crate::target::ROOT_TARGET);
-                let target = input.target.unwrap_or_else(|| context.caller_location.target.clone());
-                let inherited = (target == context.caller_location.target && !explicit_root)
-                    .then(|| context.caller_location.workspace.clone());
-                let mut location = runtime.resolve_location(&target, inherited).await
-                    .map_err(|error| tool_error(&error))?;
+                let target = input.target.as_deref().unwrap_or(&context.caller_location.target);
+                let definition = if target == crate::target::ROOT_TARGET {
+                    None
+                } else {
+                    Some(runtime.router.targets().get(target).await.map_err(|error| tool_error(&error))?)
+                };
+                let mut location = crate::execution::ExecutionLocation::select(
+                    &context.caller_location,
+                    &runtime.harness.workspace,
+                    input.target.as_deref(),
+                    definition.as_ref().map(|definition| definition.workspace.as_path()),
+                );
                 if let Some(workspace) = input.workspace {
                     if workspace.as_os_str().is_empty() {
                         return Err(ToolError::InvalidArguments("workspace cannot be empty".to_owned()));

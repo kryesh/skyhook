@@ -201,9 +201,9 @@ errors include it in an `output` field; JavaScript callers can catch the error a
 
 ## Library architecture
 
-- `provider::Provider` returns an object-safe, asynchronously pollable response handle; concrete
+- `provider::Provider` returns a boxed asynchronous response stream; concrete
   adapters live under `provider::backends` and wire types under `provider::protocol`.
-- `tool::ToolRegistryBuilder` supports typed and erased tools, while `tool::executor::ToolExecutor`
+- `tool::ToolRegistryBuilder` supports typed and JSON-based tools, while `tool::executor::ToolExecutor`
   turns every invocation into a supervised job. Typed registrations generate both input and output
   schemas; compact result shapes are included in model and script documentation.
 - `session::SessionStore` persists a versioned append-only JSONL log, content-addressed image blobs, job
@@ -346,8 +346,7 @@ otherwise it contains only `workspace`.
 
 These snapshots are assembled at request time
 and never appended to durable conversation history. Actual job notifications, tool exchanges,
-and todo replacement events remain durable. Older persisted active-job snapshots are omitted
-from replayed model context without changing the session log. Provider caching behavior is
+and todo replacement events remain durable. Provider caching behavior is
 unchanged; transient history does not guarantee exclusion from provider KV caches.
 
 ## Built-in tools

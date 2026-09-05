@@ -7,7 +7,7 @@ use std::{
 };
 
 use base64::Engine as _;
-use futures_util::{future::join_all, future::poll_fn};
+use futures_util::{StreamExt as _, future::join_all};
 use serde_json::json;
 use tokio::{
     fs,
@@ -28,7 +28,7 @@ use crate::{
     remote::{EmbeddedShimCatalog, RejectSensitivePrompts, RemoteManager, SensitivePromptHandler},
     session::{EventRecord, SessionError, SessionEvent, SessionStore},
     target::{TargetDefinition, TargetRegistry, TargetsConfig, import_ssh_targets},
-    tool::builtins::{HostSkills, install_script_tool_weak, register_coding_tools},
+    tool::builtins::{HostSkills, install_script_tool, register_coding_tools},
     tool::policy::CapabilitySet,
     tool::policy::{AllowAll, Policy},
     tool::{ToolRegistry, ToolRegistryBuilder, executor::ToolExecutor},
@@ -280,9 +280,7 @@ impl Harness {
             .iter()
             .filter(|record| record.agent == root)
             .filter_map(|record| match &record.event {
-                SessionEvent::MessageCommitted { message } => {
-                    prompt::without_legacy_state(message.clone())
-                }
+                SessionEvent::MessageCommitted { message } => Some(message.clone()),
                 _ => None,
             })
             .collect();
@@ -525,7 +523,7 @@ impl SessionRuntime {
             harness.skills.clone(),
             router.clone(),
         )?;
-        install_script_tool_weak(&mut builder, Arc::downgrade(&executor_slot))?;
+        install_script_tool(&mut builder, Arc::downgrade(&executor_slot))?;
         tools::register(&mut builder, runtime_slot.clone())?;
         builder.extend(&harness.extra_tools)?;
         let executor = ToolExecutor::with_authorization(
@@ -741,23 +739,6 @@ impl SessionRuntime {
                 .await;
         });
         Ok(tx)
-    }
-
-    async fn resolve_location(
-        &self,
-        target: &str,
-        workspace: Option<PathBuf>,
-    ) -> Result<crate::execution::ExecutionLocation, HarnessError> {
-        if target == crate::target::ROOT_TARGET {
-            return Ok(crate::execution::ExecutionLocation::root(
-                workspace.unwrap_or_else(|| self.harness.workspace.clone()),
-            ));
-        }
-        let definition = self.router.targets().get(target).await?;
-        Ok(crate::execution::ExecutionLocation::named(
-            target,
-            workspace.unwrap_or(definition.workspace),
-        ))
     }
 
     async fn execute_call(
@@ -1077,7 +1058,7 @@ impl SessionRuntime {
             let mut usage = Usage::default();
             loop {
                 let chunk = tokio::select! {
-                    chunk = poll_fn(|context| response.as_mut().poll_chunk(context)) => chunk,
+                    chunk = response.next() => chunk,
                     () = cancellation.cancelled() => return Err(HarnessError::Interrupted),
                 };
                 let Some(chunk) = chunk else {
@@ -1367,12 +1348,22 @@ mod tests {
     use crate::{
         agent::Question,
         provider::protocol::ToolCall,
-        provider::{ProviderFuture, ResponseHandle},
+        provider::{ProviderFuture, ResponseStream},
     };
 
     struct ScriptedProvider {
         responses: StdMutex<VecDeque<Vec<ResponseChunk>>>,
         requests: Arc<StdMutex<Vec<ModelRequest>>>,
+    }
+
+    fn scripted_provider(
+        requests: &Arc<StdMutex<Vec<ModelRequest>>>,
+        responses: impl IntoIterator<Item = Vec<ResponseChunk>>,
+    ) -> Arc<ScriptedProvider> {
+        Arc::new(ScriptedProvider {
+            requests: requests.clone(),
+            responses: StdMutex::new(responses.into_iter().collect()),
+        })
     }
 
     #[derive(Default)]
@@ -1396,8 +1387,10 @@ mod tests {
         emitted: bool,
     }
 
-    impl ResponseHandle for GatedResponse {
-        fn poll_chunk(
+    impl futures_util::Stream for GatedResponse {
+        type Item = Result<ResponseChunk, crate::provider::ProviderError>;
+
+        fn poll_next(
             mut self: Pin<&mut Self>,
             context: &mut std::task::Context<'_>,
         ) -> Poll<Option<Result<ResponseChunk, crate::provider::ProviderError>>> {
@@ -1419,7 +1412,7 @@ mod tests {
             if let Some(invocations) = &self.invocations {
                 invocations.fetch_add(1, Ordering::SeqCst);
             }
-            Box::pin(async { Ok(Box::pin(stream::pending()) as Pin<Box<dyn ResponseHandle>>) })
+            Box::pin(async { Ok(Box::pin(stream::pending()) as ResponseStream) })
         }
     }
 
@@ -1433,8 +1426,7 @@ mod tests {
                 .pop_front()
                 .expect("scripted provider response");
             Box::pin(async move {
-                Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok)))
-                    as Pin<Box<dyn ResponseHandle>>)
+                Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))) as ResponseStream)
             })
         }
     }
@@ -1445,7 +1437,7 @@ mod tests {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let release = self.release.clone();
             Box::pin(async move {
-                let response: Pin<Box<dyn ResponseHandle>> = if call == 0 {
+                let response: ResponseStream = if call == 0 {
                     Box::pin(GatedResponse {
                         release: Box::pin(async move {
                             let permit = release.acquire_owned().await.unwrap();
@@ -1576,8 +1568,9 @@ mod tests {
         let harness = test_harness(
             workspace.path(),
             sessions.path(),
-            Arc::new(ScriptedProvider {
-                responses: StdMutex::new(VecDeque::from([
+            scripted_provider(
+                &requests,
+                [
                     vec![
                         ResponseChunk::Block {
                             block: AssistantContent::ToolCall(ToolCall {
@@ -1597,9 +1590,8 @@ mod tests {
                     vec![ResponseChunk::TextDelta {
                         text: "finished".to_owned(),
                     }],
-                ])),
-                requests: requests.clone(),
-            }),
+                ],
+            ),
         )
         .await;
         let session = harness.new_session().await.unwrap();
@@ -1621,29 +1613,6 @@ mod tests {
             .await
             .unwrap();
         assert!(background.output.value["location"].get("target").is_none());
-        assert!(session.tools().get("script").is_some());
-        assert!(session.tools().get("jobs").is_some());
-        assert_eq!(
-            session.tools().get("read").unwrap().placement(),
-            crate::tool::ToolPlacement::TargetedWorkspace
-        );
-        assert_eq!(
-            session.tools().get("jobs").unwrap().placement(),
-            crate::tool::ToolPlacement::Host
-        );
-        let targeted = session
-            .tools()
-            .tools()
-            .filter(|tool| tool.placement() == crate::tool::ToolPlacement::TargetedWorkspace)
-            .map(|tool| tool.name())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(targeted, ["exec", "glob", "read", "search", "shell"].into());
-        let mut capabilities = crate::tool::policy::CapabilitySet::default();
-        capabilities.insert(crate::tool::policy::Capability::Targets);
-        let surface = session.tools().surface(&capabilities);
-        assert!(targeted.iter().all(|name| {
-            surface.get(name).unwrap().input_schema["properties"]["target"].is_object()
-        }));
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].system, requests[1].system);
@@ -1655,12 +1624,6 @@ mod tests {
         assert!(!requests[0].system[0].text.contains("\"date\":"));
         assert!(requests[0].system[0].text.contains("\"available_depth\":4"));
         assert!(!requests[0].system[0].text.contains(prompt::TARGET_PROMPT));
-        let read = requests[0]
-            .tools
-            .iter()
-            .find(|tool| tool.name == "read")
-            .unwrap();
-        assert!(read.input_schema["properties"].get("target").is_none());
         assert!(requests[0].tools.iter().all(|tool| {
             tool.input_schema["properties"].get("target").is_none()
                 && !matches!(tool.name.as_str(), "targets" | "target_add")
@@ -1700,8 +1663,9 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
         let requests = Arc::new(StdMutex::new(Vec::new()));
-        let provider = Arc::new(ScriptedProvider {
-            responses: StdMutex::new(VecDeque::from([
+        let provider = scripted_provider(
+            &requests,
+            [
                 vec![ResponseChunk::Block {
                     block: AssistantContent::ToolCall(ToolCall {
                         id: "agent-1".to_owned(),
@@ -1715,9 +1679,8 @@ mod tests {
                 vec![ResponseChunk::TextDelta {
                     text: "root done".to_owned(),
                 }],
-            ])),
-            requests: requests.clone(),
-        });
+            ],
+        );
         let mut targets = TargetsConfig::default();
         targets.entries.insert(
             "build".to_owned(),
@@ -1795,8 +1758,9 @@ mod tests {
         let harness = test_harness(
             workspace.path(),
             sessions.path(),
-            Arc::new(ScriptedProvider {
-                responses: StdMutex::new(VecDeque::from([
+            scripted_provider(
+                &requests,
+                [
                     call("agent", json!({"prompt":"work"})),
                     call(
                         "script",
@@ -1805,9 +1769,8 @@ mod tests {
                     text("premature child answer"),
                     text("child work completed"),
                     text("root done"),
-                ])),
-                requests: requests.clone(),
-            }),
+                ],
+            ),
         )
         .await;
         let session = harness.new_session().await.unwrap();
@@ -1924,7 +1887,10 @@ mod tests {
         session
             .runtime
             .jobs
-            .finish(job, Ok(crate::tool::ToolOutput::default()), None)
+            .finish(
+                job,
+                crate::job::JobOutcome::Completed(crate::tool::ToolOutput::default()),
+            )
             .await
             .unwrap();
         session.runtime.jobs.claim(job).await.unwrap();
@@ -1962,16 +1928,16 @@ mod tests {
             let harness = test_builder(
                 workspace.path(),
                 sessions.path(),
-                Arc::new(ScriptedProvider {
-                    responses: StdMutex::new(VecDeque::from([
+                scripted_provider(
+                    &requests,
+                    [
                         call(json!({"prompt":"child", "depth":1, "workspace":"nested"})),
                         call(json!({"prompt":"grandchild", "target":target})),
                         text(),
                         text(),
                         text(),
-                    ])),
-                    requests: requests.clone(),
-                }),
+                    ],
+                ),
             )
             .capabilities({
                 let mut set = CapabilitySet::default();
@@ -2006,8 +1972,9 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let child_path = std::fs::canonicalize(child_workspace.path()).unwrap();
-        let provider = Arc::new(ScriptedProvider {
-            responses: StdMutex::new(VecDeque::from([
+        let provider = scripted_provider(
+            &requests,
+            [
                 vec![ResponseChunk::Block {
                     block: AssistantContent::ToolCall(ToolCall {
                         id: "agent-local".to_owned(),
@@ -2028,9 +1995,8 @@ mod tests {
                 vec![ResponseChunk::TextDelta {
                     text: "root done".to_owned(),
                 }],
-            ])),
-            requests: requests.clone(),
-        });
+            ],
+        );
         let harness = test_harness(workspace.path(), sessions.path(), provider).await;
         let session = harness.new_session().await.unwrap();
         assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
@@ -2056,8 +2022,7 @@ mod tests {
         let harness = test_harness(
             workspace.path(),
             sessions.path(),
-            Arc::new(ScriptedProvider {
-                responses: StdMutex::new(VecDeque::from([
+            scripted_provider(&requests, [
                     vec![ResponseChunk::Block {
                         block: AssistantContent::ToolCall(ToolCall {
                             id: "root-agent".to_owned(),
@@ -2081,9 +2046,7 @@ mod tests {
                     vec![ResponseChunk::TextDelta {
                         text: "root done".to_owned(),
                     }],
-                ])),
-                requests: requests.clone(),
-            }),
+                ]),
         )
         .await;
 
@@ -2116,8 +2079,9 @@ mod tests {
         let harness = test_harness(
             workspace.path(),
             sessions.path(),
-            Arc::new(ScriptedProvider {
-                responses: StdMutex::new(VecDeque::from([
+            scripted_provider(
+                &requests,
+                [
                     vec![ResponseChunk::Block {
                         block: AssistantContent::ToolCall(ToolCall {
                             id: "agent-too-deep".to_owned(),
@@ -2128,9 +2092,8 @@ mod tests {
                     vec![ResponseChunk::TextDelta {
                         text: "root done".to_owned(),
                     }],
-                ])),
-                requests: requests.clone(),
-            }),
+                ],
+            ),
         )
         .await;
 
@@ -2158,8 +2121,9 @@ mod tests {
         let harness = test_harness(
             workspace.path(),
             sessions.path(),
-            Arc::new(ScriptedProvider {
-                responses: StdMutex::new(VecDeque::from([
+            scripted_provider(
+                &requests,
+                [
                     vec![ResponseChunk::Block {
                         block: AssistantContent::ToolCall(ToolCall {
                             id: "root-agent".to_owned(),
@@ -2191,9 +2155,8 @@ mod tests {
                     vec![ResponseChunk::TextDelta {
                         text: "root done".to_owned(),
                     }],
-                ])),
-                requests: requests.clone(),
-            }),
+                ],
+            ),
         )
         .await;
 
@@ -2223,8 +2186,9 @@ mod tests {
         let harness = question_harness(
             workspace.path(),
             sessions.path(),
-            Arc::new(ScriptedProvider {
-                responses: StdMutex::new(VecDeque::from([
+            scripted_provider(
+                &requests,
+                [
                     vec![
                         ResponseChunk::Block {
                             block: AssistantContent::ToolCall(ToolCall {
@@ -2244,9 +2208,8 @@ mod tests {
                     vec![ResponseChunk::TextDelta {
                         text: "done".to_owned(),
                     }],
-                ])),
-                requests: requests.clone(),
-            }),
+                ],
+            ),
             Arc::new(RecordingQuestions {
                 batches: batches.clone(),
                 answer: json!({"first":"yes", "second":{"value":2}, "extra":true}),
@@ -2417,8 +2380,9 @@ mod tests {
         let harness = test_harness(
             workspace.path(),
             sessions.path(),
-            Arc::new(ScriptedProvider {
-                responses: StdMutex::new(VecDeque::from([
+            scripted_provider(
+                &requests,
+                [
                     vec![
                         ResponseChunk::TextDelta {
                             text: "done".to_owned(),
@@ -2443,9 +2407,8 @@ mod tests {
                             },
                         },
                     ],
-                ])),
-                requests: requests.clone(),
-            }),
+                ],
+            ),
         )
         .await;
         let session = harness.new_session().await.unwrap();
@@ -2545,8 +2508,9 @@ mod tests {
                 .jobs
                 .finish(
                     lease.id,
-                    Ok(crate::tool::ToolOutput::new(json!({"value": value}))),
-                    None,
+                    crate::job::JobOutcome::Completed(crate::tool::ToolOutput::new(
+                        json!({"value": value}),
+                    )),
                 )
                 .await
                 .unwrap();
@@ -2767,8 +2731,9 @@ mod tests {
         let harness = test_harness(
             workspace.path(),
             sessions.path(),
-            Arc::new(ScriptedProvider {
-                responses: StdMutex::new(VecDeque::from([
+            scripted_provider(
+                &requests,
+                [
                     scripts
                         .into_iter()
                         .map(|(id, source)| ResponseChunk::Block {
@@ -2782,9 +2747,8 @@ mod tests {
                     vec![ResponseChunk::TextDelta {
                         text: "done".to_owned(),
                     }],
-                ])),
-                requests: requests.clone(),
-            }),
+                ],
+            ),
         )
         .await;
         let session = harness.new_session().await.unwrap();

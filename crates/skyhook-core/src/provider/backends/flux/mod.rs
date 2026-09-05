@@ -45,7 +45,7 @@ impl Provider for FluxProvider {
                     Err(error) => Some(Err(map_error(&error))),
                 })
             });
-            Ok(Box::pin(mapped) as std::pin::Pin<Box<dyn crate::provider::ResponseHandle>>)
+            Ok(Box::pin(mapped) as crate::provider::ResponseStream)
         })
     }
 }

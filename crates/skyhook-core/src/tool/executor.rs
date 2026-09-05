@@ -1,13 +1,12 @@
 use base64::Engine as _;
-use futures_util::future::BoxFuture;
 use serde_json::Value;
-use std::{future::Future, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 use thiserror::Error;
 
 use crate::{
     execution::ExecutionLocation,
     identity::{AgentId, JobId},
-    job::{JobError, JobManager, JobSpec, JobState},
+    job::{JobError, JobManager, JobOutcome, JobSpec, JobState},
     remote::RemoteError,
     target::{ROOT_TARGET, ResolvedRoute, TargetRouter},
     tool::{
@@ -55,11 +54,7 @@ struct InvocationPlan {
 enum InvocationDispatch {
     Local,
     Remote(ResolvedRoute),
-    External(ExternalRunner),
 }
-
-type ExternalRunner =
-    Box<dyn FnOnce(ToolContext, Value) -> BoxFuture<'static, Result<ToolOutput, ToolError>> + Send>;
 
 #[derive(Clone)]
 pub struct ToolExecutor {
@@ -192,13 +187,13 @@ impl ToolExecutor {
         };
         let selected = explicit.unwrap_or(&self.caller_location.target);
         if selected == ROOT_TARGET {
-            let workspace = if explicit.is_some() {
-                self.shared.root_location.workspace.clone()
-            } else {
-                self.caller_location.workspace.clone()
-            };
             return Ok(SelectedLocation {
-                location: ExecutionLocation::root(workspace),
+                location: ExecutionLocation::select(
+                    &self.caller_location,
+                    &self.shared.root_location.workspace,
+                    explicit,
+                    None,
+                ),
                 route: None,
             });
         }
@@ -216,13 +211,11 @@ impl ToolExecutor {
             .last()
             .expect("validated target routes are nonempty");
         Ok(SelectedLocation {
-            location: ExecutionLocation::named(
-                selected,
-                if selected == self.caller_location.target {
-                    self.caller_location.workspace.clone()
-                } else {
-                    definition.workspace.clone()
-                },
+            location: ExecutionLocation::select(
+                &self.caller_location,
+                &self.shared.root_location.workspace,
+                explicit,
+                Some(&definition.workspace),
             ),
             route: Some(route),
         })
@@ -295,58 +288,6 @@ impl ToolExecutor {
             )
             .await?;
         self.start(plan).await
-    }
-
-    /// Supervise a tool invocation whose implementation executes in another runtime.
-    pub async fn execute_external<F, Fut>(
-        &self,
-        agent: AgentId,
-        name: &str,
-        arguments: Value,
-        parent: Option<JobId>,
-        extra_capabilities: Vec<Capability>,
-        run: F,
-    ) -> Result<ExecutionResult, ExecutionError>
-    where
-        F: FnOnce(Value) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
-    {
-        let runner: ExternalRunner = Box::new(move |_context, arguments| Box::pin(run(arguments)));
-        let PreparedInvocation {
-            tool,
-            original_arguments,
-            handler_arguments,
-            background,
-            job_name,
-            authorization_scope,
-        } = self
-            .prepare_invocation(InvocationKind::Model, name, arguments, parent, None)
-            .await?;
-        let mut capabilities = tool.capabilities_for(&handler_arguments)?;
-        capabilities.extend(extra_capabilities);
-        let permissions = scope_capabilities(
-            capabilities,
-            &self.shared.root_location,
-            tool.permission_resource(),
-        );
-        let authorization_arguments = original_arguments.clone();
-        let plan = InvocationPlan {
-            agent,
-            tool,
-            original_arguments,
-            authorization_arguments,
-            handler_arguments,
-            caller_location: self.caller_location.clone(),
-            execution_location: self.shared.root_location.clone(),
-            permissions,
-            parent,
-            authorization_scope,
-            background,
-            job_name,
-            dispatch: InvocationDispatch::External(runner),
-        };
-        let started = self.start(plan).await?;
-        self.collect_started(started).await
     }
 
     async fn prepare_invocation(
@@ -572,7 +513,7 @@ impl ToolExecutor {
             plan.execution_location,
             plan.caller_location,
             lease.input,
-            self.shared.jobs.progress_sink(lease.id),
+            self.shared.jobs.clone(),
         );
         let jobs = self.shared.jobs.clone();
         let store = jobs.store().clone();
@@ -600,7 +541,6 @@ impl ToolExecutor {
                         import_remote_result(&store, result).await
                     }
                 }
-                InvocationDispatch::External(run) => run(context, plan.handler_arguments).await,
             };
             if cancellation.is_cancelled() {
                 Err(ToolError::Cancelled)
@@ -614,15 +554,10 @@ impl ToolExecutor {
             .await?;
         tokio::spawn(async move {
             let completion = match worker.await {
-                Ok(Ok(output)) => JobResult::Completed(output),
-                Ok(Err(ToolError::Cancelled)) => JobResult::Cancelled,
-                Ok(Err(ToolError::Denied(reason))) => JobResult::Denied(reason),
-                Ok(Err(ToolError::FailedWithOutput { message, output })) => {
-                    JobResult::FailedWithOutput { message, output }
-                }
-                Ok(Err(error)) => JobResult::Failed(error.concise_message()),
-                Err(error) if error.is_cancelled() => JobResult::Cancelled,
-                Err(_) => JobResult::Failed("tool handler panicked".to_owned()),
+                Ok(Ok(output)) => JobOutcome::Completed(output),
+                Ok(Err(error)) => error.into(),
+                Err(error) if error.is_cancelled() => JobOutcome::Cancelled,
+                Err(_) => ToolError::Failed("tool handler panicked".to_owned()).into(),
             };
             persist_completion(&jobs, job, completion).await;
         });
@@ -684,7 +619,7 @@ impl ToolExecutor {
     }
 
     async fn cancelled(&self, job: JobId) -> ExecutionError {
-        persist_completion(&self.shared.jobs, job, JobResult::Cancelled).await;
+        persist_completion(&self.shared.jobs, job, JobOutcome::Cancelled).await;
         ExecutionError::Failed {
             message: "tool was cancelled".to_owned(),
             output: None,
@@ -707,9 +642,15 @@ impl ToolExecutor {
             error => error.to_string(),
         };
         if matches!(error, ExecutionError::Denied(_)) {
-            self.shared.jobs.finish_denied(job, message).await?;
+            self.shared
+                .jobs
+                .finish(job, ToolError::Denied(message).into())
+                .await?;
         } else {
-            self.shared.jobs.finish(job, Err(message), None).await?;
+            self.shared
+                .jobs
+                .finish(job, ToolError::Failed(message).into())
+                .await?;
         }
         Ok(error)
     }
@@ -830,31 +771,8 @@ pub(crate) struct StartedExecution {
     background: bool,
 }
 
-enum JobResult {
-    Completed(ToolOutput),
-    Failed(String),
-    Denied(String),
-    FailedWithOutput { message: String, output: ToolOutput },
-    Cancelled,
-}
-
-async fn persist_completion(jobs: &JobManager, job: JobId, completion: JobResult) {
-    let result = match completion {
-        JobResult::Completed(output) => jobs.finish(job, Ok(output), None).await,
-        JobResult::Failed(message) => jobs.finish(job, Err(message), None).await,
-        JobResult::Denied(reason) => jobs.finish_denied(job, reason).await,
-        JobResult::FailedWithOutput { message, output } => {
-            jobs.finish_failed(job, message, Some(output), None).await
-        }
-        JobResult::Cancelled => {
-            jobs.finish(
-                job,
-                Err("tool was cancelled".to_owned()),
-                Some(JobState::Cancelled),
-            )
-            .await
-        }
-    };
+async fn persist_completion(jobs: &JobManager, job: JobId, completion: JobOutcome) {
+    let result = jobs.finish(job, completion).await;
     if let Err(error) = result
         && !matches!(error, JobError::AlreadyTerminal(_))
     {
@@ -1032,28 +950,31 @@ mod tests {
         let mut builder = ToolRegistryBuilder::default();
         let seen = Arc::new(std::sync::Mutex::new(None));
         builder
-            .register_targeted::<PathArgs, String, _, _>(
+            .register::<PathArgs, String, _, _>(
                 "arbitrary_name",
                 "test read",
-                ToolOptions::new(Vec::new()),
+                ToolOptions::new(Vec::new())
+                    .placement(crate::tool::ToolPlacement::TargetedWorkspace),
                 |_context, input| async move { Ok(input.path) },
             )
             .unwrap();
         builder
-            .register_workspace::<PathArgs, String, _, _>(
+            .register::<PathArgs, String, _, _>(
                 "write_like",
                 "inherit only",
-                ToolOptions::new(Vec::new()),
+                ToolOptions::new(Vec::new())
+                    .placement(crate::tool::ToolPlacement::InheritWorkspace),
                 |_context, input| async move { Ok(input.path) },
             )
             .unwrap();
         let dynamic_seen = seen.clone();
         builder
-            .register_dynamic_targeted(
+            .register_dynamic(
                 "totally_custom",
                 "dynamic targeted",
                 serde_json::json!({"type":"object","properties":{"value":{"type":"string"}}}),
-                ToolOptions::new(Vec::new()),
+                ToolOptions::new(Vec::new())
+                    .placement(crate::tool::ToolPlacement::TargetedWorkspace),
                 move |_context, arguments| {
                     *dynamic_seen.lock().unwrap() = Some(arguments.clone());
                     async move { Ok(ToolOutput::new(arguments)) }
@@ -1210,11 +1131,12 @@ mod tests {
         let jobs = JobManager::new(store);
         let mut builder = ToolRegistryBuilder::default();
         builder
-            .register_dynamic_targeted(
+            .register_dynamic(
                 "custom_remote",
                 "test",
                 serde_json::json!({"type":"object","properties":{}}),
-                ToolOptions::new(Vec::new()),
+                ToolOptions::new(Vec::new())
+                    .placement(crate::tool::ToolPlacement::TargetedWorkspace),
                 |_context, _arguments| async { Ok(ToolOutput::new(Value::Null)) },
             )
             .unwrap();

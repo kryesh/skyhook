@@ -9,11 +9,9 @@ pub mod builtins;
 pub mod javascript;
 pub mod policy;
 
-pub use context::{
-    Denial, DenialCode, ProgressFuture, ProgressSink, ToolContext, ToolError, ToolOutput,
-};
+pub use context::{Denial, DenialCode, ToolContext, ToolError, ToolOutput};
 pub(crate) use registry::{PathKind, job_envelope_type};
 pub use registry::{
-    RegisteredTool, RegistryError, ScriptBinding, ToolDefinition, ToolExecution, ToolExposure,
-    ToolOptions, ToolPlacement, ToolRegistry, ToolRegistryBuilder, ToolSpec, ToolSurface,
+    RegisteredTool, RegistryError, ScriptBinding, ToolExposure, ToolOptions, ToolPlacement,
+    ToolRegistry, ToolRegistryBuilder, ToolSpec, ToolSurface,
 };

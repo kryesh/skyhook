@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::sync::Arc;
 
 use serde_json::Value;
 use thiserror::Error;
@@ -11,12 +11,6 @@ use crate::{
     tool::policy::CapabilitySet,
 };
 
-pub type ProgressFuture = Pin<Box<dyn Future<Output = Result<(), ToolError>> + Send>>;
-
-pub trait ProgressSink: Send + Sync {
-    fn publish(&self, kind: String, data: Value) -> ProgressFuture;
-}
-
 #[derive(Clone)]
 pub struct ToolContext {
     pub agent: AgentId,
@@ -26,7 +20,7 @@ pub struct ToolContext {
     pub capabilities: CapabilitySet,
     pub(crate) authorization: super::authorization::AuthorizationSubject,
     input: Arc<Mutex<mpsc::Receiver<Value>>>,
-    progress: Arc<dyn ProgressSink>,
+    jobs: crate::job::JobManager,
 }
 
 impl ToolContext {
@@ -35,7 +29,7 @@ impl ToolContext {
         execution_location: ExecutionLocation,
         caller_location: ExecutionLocation,
         input: mpsc::Receiver<Value>,
-        progress: Arc<dyn ProgressSink>,
+        jobs: crate::job::JobManager,
     ) -> Self {
         Self {
             agent: authorization.agent.clone(),
@@ -45,7 +39,7 @@ impl ToolContext {
             capabilities: authorization.capabilities.clone(),
             authorization,
             input: Arc::new(Mutex::new(input)),
-            progress,
+            jobs,
         }
     }
 
@@ -68,7 +62,10 @@ impl ToolContext {
     }
 
     pub async fn progress(&self, kind: impl Into<String>, data: Value) -> Result<(), ToolError> {
-        self.progress.publish(kind.into(), data).await
+        self.jobs
+            .publish_progress(self.job, kind.into(), data)
+            .await
+            .map_err(|error| ToolError::Failed(error.to_string()))
     }
 }
 

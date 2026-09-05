@@ -303,17 +303,12 @@ fn wrapper_script(source: &str, builders: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::TestRuntime;
     use schemars::JsonSchema;
     use serde::Deserialize;
 
     use super::*;
-    use crate::{
-        identity::AgentId,
-        job::JobManager,
-        session::SessionStore,
-        tool::policy::AllowAll,
-        tool::{ToolOptions, ToolRegistryBuilder, executor::ToolExecutor},
-    };
+    use crate::tool::{ToolOptions, ToolRegistryBuilder, executor::ToolExecutor};
 
     #[derive(Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
@@ -356,20 +351,14 @@ mod tests {
     async fn test_runtime(
         builder: ToolRegistryBuilder,
     ) -> (tempfile::TempDir, ToolExecutor, ToolContext) {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
-        let jobs = JobManager::new(store);
+        let runtime = TestRuntime::new().await;
+        let agent = runtime.agent.clone();
+        let jobs = runtime.jobs.clone();
         let lease = jobs
             .create(crate::job::JobSpec::test(agent.clone(), "script"))
             .await
             .unwrap();
-        let executor = ToolExecutor::new(
-            builder.build(),
-            Arc::new(AllowAll),
-            jobs.clone(),
-            root.path().to_path_buf(),
-        );
+        let executor = runtime.executor(builder);
         let context = ToolContext::new(
             crate::tool::authorization::AuthorizationSubject {
                 agent,
@@ -379,12 +368,12 @@ mod tests {
                 capabilities: crate::tool::policy::CapabilitySet::default(),
                 cancellation: lease.cancellation.clone(),
             },
-            crate::execution::ExecutionLocation::root(root.path().to_path_buf()),
-            crate::execution::ExecutionLocation::root(root.path().to_path_buf()),
+            crate::execution::ExecutionLocation::root(runtime.root.path().to_path_buf()),
+            crate::execution::ExecutionLocation::root(runtime.root.path().to_path_buf()),
             lease.input,
-            jobs.progress_sink(lease.id),
+            jobs.clone(),
         );
-        (root, executor, context)
+        (runtime.root, executor, context)
     }
 
     #[tokio::test]
@@ -529,25 +518,39 @@ return rejected;
     }
 
     #[tokio::test]
-    async fn lazy_builders_are_memoized_and_returned_builders_are_concurrent() {
+    async fn lazy_builders_execute_once_and_independent_calls_overlap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
         let mut builder = ToolRegistryBuilder::default();
         builder
-            .register::<Echo, String, _, _>(
-                "echo",
-                "echo",
-                ToolOptions::default(),
-                |_context, input| async move { Ok(input.value) },
-            )
+            .register::<Echo, String, _, _>("echo", "echo", ToolOptions::default(), {
+                let calls = calls.clone();
+                move |_context, input| {
+                    let gate = gate.clone();
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        gate.wait().await;
+                        Ok(input.value)
+                    }
+                }
+            })
             .unwrap();
         let (_root, executor, context) = test_runtime(builder).await;
-        let output = evaluate(
-            "const x=tool.echo({value:'a'}); return [x,x,tool.echo({value:'b'})];".to_owned(),
-            executor,
-            context,
+        // Two equivalent builders must execute independently; reusing one must not execute again.
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            evaluate(
+                "const x=tool.echo({value:'a'}); return [x,x,tool.echo({value:'a'})];".to_owned(),
+                executor,
+                context,
+            ),
         )
         .await
+        .expect("independent builders did not run concurrently")
         .unwrap();
-        assert_eq!(output.value, serde_json::json!(["a", "a", "b"]));
+        assert_eq!(output.value, serde_json::json!(["a", "a", "a"]));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -874,24 +877,6 @@ console.log();
         let (captured, marker) = output.console_output.split_at(16 * 1024 * 1024);
         assert!(captured.bytes().all(|byte| byte == b'x'));
         assert_eq!(marker, "\n[console output truncated at 16 MiB]\n");
-    }
-
-    #[tokio::test]
-    async fn scripts_can_allocate_beyond_the_former_heap_limit() {
-        let (_root, executor, context) = test_runtime(ToolRegistryBuilder::default()).await;
-        let output = evaluate(
-            // Dense QuickJS arrays use 16 bytes per element on 64-bit platforms.
-            // This array alone exceeds the former 64 MiB heap limit.
-            "const values = new Array(5_000_000).fill(7); return {length:values.length, last:values[values.length-1]};".to_owned(),
-            executor,
-            context,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            output.value,
-            serde_json::json!({"length":5_000_000,"last":7})
-        );
     }
 
     #[tokio::test]

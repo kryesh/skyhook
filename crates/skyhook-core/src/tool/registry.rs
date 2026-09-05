@@ -19,7 +19,7 @@ use super::{ToolContext, ToolError, ToolOutput};
 
 #[derive(Clone)]
 pub struct RegisteredTool {
-    definition: Arc<dyn ToolDefinition>,
+    definition: GeneratedToolDefinition,
     execution: ToolExecution,
     handler: ToolHandler,
 }
@@ -39,15 +39,6 @@ pub struct ToolSpec {
     pub script_binding: ScriptBinding,
 }
 
-/// Generates the final model-facing definition for a particular capability set.
-///
-/// Dynamic adapters can implement this trait directly. The returned schemas must
-/// already be final: the registry never removes fields from them afterward.
-pub trait ToolDefinition: Send + Sync {
-    fn name(&self) -> &str;
-    fn generate(&self, capabilities: &CapabilitySet) -> Option<ToolSpec>;
-}
-
 type SchemaGenerator = Arc<dyn Fn(&CapabilitySet) -> Value + Send + Sync>;
 
 #[derive(Clone)]
@@ -62,11 +53,7 @@ struct GeneratedToolDefinition {
     required: BTreeSet<Capability>,
 }
 
-impl ToolDefinition for GeneratedToolDefinition {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
+impl GeneratedToolDefinition {
     fn generate(&self, capabilities: &CapabilitySet) -> Option<ToolSpec> {
         self.required
             .iter()
@@ -98,45 +85,6 @@ impl ToolDefinition for GeneratedToolDefinition {
                 }
             })
     }
-}
-
-macro_rules! dynamic_registrations {
-    ($($method:ident => $placement:expr),+ $(,)?) => {$(
-        pub fn $method<F, Fut>(
-            &mut self,
-            name: impl Into<String>,
-            description: impl Into<String>,
-            input_schema: Value,
-            options: ToolOptions,
-            handler: F,
-        ) -> Result<&mut Self, RegistryError>
-        where
-            F: Fn(ToolContext, Value) -> Fut + Send + Sync + 'static,
-            Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
-        {
-            self.register_dynamic_at(name, description, input_schema, options, $placement, handler)
-        }
-    )+};
-}
-
-macro_rules! typed_registrations {
-    ($($method:ident => $placement:expr),+ $(,)?) => {$(
-        pub fn $method<I, O, F, Fut>(
-            &mut self,
-            name: impl Into<String>,
-            description: impl Into<String>,
-            options: ToolOptions,
-            handler: F,
-        ) -> Result<&mut Self, RegistryError>
-        where
-            I: DeserializeOwned + JsonSchema + Send + 'static,
-            O: Serialize + JsonSchema + Send + 'static,
-            F: Fn(ToolContext, I) -> Fut + Send + Sync + 'static,
-            Fut: Future<Output = Result<O, ToolError>> + Send + 'static,
-        {
-            self.register_typed_at(name, description, options, $placement, handler)
-        }
-    )+};
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,9 +137,9 @@ pub struct ToolOptions {
     output_schema: Option<SchemaGenerator>,
 }
 
-/// Execution metadata paired with an erased [`ToolDefinition`].
+/// Internal execution metadata.
 #[derive(Clone, Default)]
-pub struct ToolExecution {
+struct ToolExecution {
     pub capabilities: Vec<Capability>,
     pub accepts_input: bool,
     supports_name: bool,
@@ -201,42 +149,13 @@ pub struct ToolExecution {
     capability_resolver: Option<CapabilityResolver>,
 }
 
-impl ToolExecution {
-    /// Interpret an optional `name` argument as a snake_case job label.
-    #[must_use]
-    pub const fn named(mut self) -> Self {
-        self.supports_name = true;
-        self
-    }
-
-    #[must_use]
-    pub fn new(capabilities: Vec<Capability>) -> Self {
-        Self {
-            capabilities,
-            ..Self::default()
-        }
-    }
-
-    #[must_use]
-    pub const fn input(mut self) -> Self {
-        self.accepts_input = true;
-        self
-    }
-
+impl ToolOptions {
     #[must_use]
     pub const fn placement(mut self, placement: ToolPlacement) -> Self {
-        self.placement = placement;
+        self.execution.placement = placement;
         self
     }
 
-    #[must_use]
-    pub fn permission_resource(mut self, resource: ResourceId) -> Self {
-        self.permission_resource = Some(resource);
-        self
-    }
-}
-
-impl ToolOptions {
     /// Expose an optional snake_case job label, handled by the executor.
     #[must_use]
     pub const fn named(mut self) -> Self {
@@ -249,7 +168,10 @@ impl ToolOptions {
         let required = capabilities.iter().copied().collect();
         Self {
             supports_background: false,
-            execution: ToolExecution::new(capabilities),
+            execution: ToolExecution {
+                capabilities,
+                ..ToolExecution::default()
+            },
             exposure: ToolExposure::ModelVisible,
             script_binding: ScriptBinding::TopLevel,
             required,
@@ -409,7 +331,7 @@ impl RegisteredTool {
 
     #[must_use]
     pub fn name(&self) -> &str {
-        self.definition.name()
+        &self.definition.name
     }
 
     #[must_use]
@@ -427,30 +349,6 @@ impl RegisteredTool {
 
     pub(crate) fn permission_resource(&self) -> Option<&ResourceId> {
         self.execution.permission_resource.as_ref()
-    }
-}
-
-impl ToolSpec {
-    #[must_use]
-    pub fn new(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        input_schema: Value,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            description: description.into(),
-            input_schema,
-            output_schema: None,
-            exposure: ToolExposure::ModelVisible,
-            script_binding: ScriptBinding::TopLevel,
-        }
-    }
-
-    #[must_use]
-    pub fn output_schema(mut self, schema: Value) -> Self {
-        self.output_schema = Some(schema);
-        self
     }
 }
 
@@ -620,59 +518,23 @@ impl ToolRegistryBuilder {
         Ok(self)
     }
 
-    dynamic_registrations! {
-        register_dynamic => ToolPlacement::Host,
-        register_dynamic_workspace => ToolPlacement::InheritWorkspace,
-        register_dynamic_targeted => ToolPlacement::TargetedWorkspace,
-    }
-
-    pub fn register_erased<F, Fut>(
-        &mut self,
-        definition: Arc<dyn ToolDefinition>,
-        execution: ToolExecution,
-        handler: F,
-    ) -> Result<&mut Self, RegistryError>
-    where
-        F: Fn(ToolContext, Value) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
-    {
-        self.register_definition(definition, execution, handler)
-    }
-
-    fn register_dynamic_at<F, Fut>(
+    pub fn register_dynamic<F, Fut>(
         &mut self,
         name: impl Into<String>,
         description: impl Into<String>,
         input_schema: Value,
         mut options: ToolOptions,
-        placement: ToolPlacement,
         handler: F,
     ) -> Result<&mut Self, RegistryError>
     where
         F: Fn(ToolContext, Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
     {
-        options.execution.placement = placement;
-        if placement == ToolPlacement::TargetedWorkspace {
+        if options.execution.placement == ToolPlacement::TargetedWorkspace {
             ensure_no_target(&input_schema)?;
             options =
                 options.conditional_input("target", Capability::Targets, target_property_schema());
         }
-        self.register_dynamic_inner((name, description), input_schema, options, handler)
-    }
-
-    fn register_dynamic_inner<F, Fut>(
-        &mut self,
-        identity: (impl Into<String>, impl Into<String>),
-        input_schema: Value,
-        options: ToolOptions,
-        handler: F,
-    ) -> Result<&mut Self, RegistryError>
-    where
-        F: Fn(ToolContext, Value) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
-    {
-        let (name, description) = identity;
         let name = name.into();
         validate_name(&name)?;
         validate_schema(&input_schema)?;
@@ -711,7 +573,7 @@ impl ToolRegistryBuilder {
             }
             schema
         };
-        let definition = Arc::new(GeneratedToolDefinition {
+        let definition = GeneratedToolDefinition {
             name,
             description: description.into(),
             input_schema: Arc::new(schema),
@@ -720,13 +582,13 @@ impl ToolRegistryBuilder {
             script_binding,
             supports_background,
             required,
-        });
+        };
         self.register_definition(definition, execution, handler)
     }
 
     fn register_definition<F, Fut>(
         &mut self,
-        definition: Arc<dyn ToolDefinition>,
+        definition: GeneratedToolDefinition,
         execution: ToolExecution,
         handler: F,
     ) -> Result<&mut Self, RegistryError>
@@ -734,19 +596,13 @@ impl ToolRegistryBuilder {
         F: Fn(ToolContext, Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
     {
-        let name = definition.name().to_owned();
+        let name = definition.name.clone();
         validate_name(&name)?;
         if self.tools.contains_key(&name) {
             return Err(RegistryError::Duplicate(name));
         }
         for capabilities in capability_subsets() {
             if let Some(spec) = definition.generate(&capabilities) {
-                if spec.name != name {
-                    return Err(RegistryError::DefinitionName {
-                        registered: name,
-                        generated: spec.name,
-                    });
-                }
                 validate_object_schema(&spec.input_schema)?;
                 if let Some(schema) = &spec.output_schema {
                     validate_output_schema(schema)?;
@@ -767,18 +623,11 @@ impl ToolRegistryBuilder {
         Ok(self)
     }
 
-    typed_registrations! {
-        register => ToolPlacement::Host,
-        register_workspace => ToolPlacement::InheritWorkspace,
-        register_targeted => ToolPlacement::TargetedWorkspace,
-    }
-
-    fn register_typed_at<I, O, F, Fut>(
+    pub fn register<I, O, F, Fut>(
         &mut self,
         name: impl Into<String>,
         description: impl Into<String>,
         mut options: ToolOptions,
-        placement: ToolPlacement,
         handler: F,
     ) -> Result<&mut Self, RegistryError>
     where
@@ -794,12 +643,11 @@ impl ToolRegistryBuilder {
         if options.output_schema.is_none() {
             options = options.output_schema(output_schema);
         }
-        self.register_dynamic_at(
+        self.register_dynamic(
             name,
             description,
             input_schema,
             options,
-            placement,
             move |context, arguments| {
                 let parsed = serde_json::from_value(arguments);
                 let future = parsed.map(|input| handler(context, input));
@@ -834,7 +682,7 @@ impl ToolRegistryBuilder {
                 .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
             Ok(capability_resolver(&input))
         }));
-        self.register_typed_at(name, description, options, ToolPlacement::Host, handler)
+        self.register(name, description, options, handler)
     }
 
     #[must_use]
@@ -1244,11 +1092,6 @@ pub enum RegistryError {
     InvalidName(String),
     #[error("duplicate tool `{0}`")]
     Duplicate(String),
-    #[error("tool definition registered as `{registered}` generated the name `{generated}`")]
-    DefinitionName {
-        registered: String,
-        generated: String,
-    },
     #[error("tool schema is invalid: {0}")]
     Schema(String),
     #[error("`bg` is reserved by the harness")]
@@ -1322,22 +1165,29 @@ mod tests {
                 _ => {}
             }
         }
-        let root = tempfile::tempdir().unwrap();
-        let store = crate::session::SessionStore::create(root.path())
-            .await
-            .unwrap();
-        let jobs = crate::job::JobManager::new(store.clone());
+        let runtime = crate::test_support::TestRuntime::new().await;
         let mut builder = ToolRegistryBuilder::default();
-        crate::tool::builtins::register_worker_tools(&mut builder, store, jobs).unwrap();
-        crate::tool::builtins::install_script_tool(
-            &mut builder,
-            Arc::new(std::sync::OnceLock::new()),
-        )
-        .unwrap();
+        crate::tool::builtins::register_worker_tools(&mut builder, runtime.store.clone()).unwrap();
+        crate::tool::builtins::jobs::register(&mut builder, runtime.jobs.clone()).unwrap();
+        crate::tool::builtins::install_script_tool(&mut builder, std::sync::Weak::new()).unwrap();
         let registry = builder.build();
+        let targeted = registry
+            .tools()
+            .filter(|tool| tool.placement() == ToolPlacement::TargetedWorkspace)
+            .map(|tool| tool.name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(targeted, ["exec", "glob", "read", "search", "shell"].into());
+        assert_eq!(
+            registry.get("jobs").unwrap().placement(),
+            ToolPlacement::Host
+        );
         for targets in [false, true] {
             let surface = registry.surface(&target_context(targets));
             for tool in surface.tools.values() {
+                assert_eq!(
+                    tool.input_schema["properties"].get("target").is_some(),
+                    targets && targeted.contains(tool.name.as_str())
+                );
                 if let Some(schema) = &tool.output_schema {
                     check_refs(schema, schema);
                     assert!(!schema.to_string().contains("awaiting_approval"));
@@ -1513,7 +1363,7 @@ mod tests {
     fn targeted_metadata_is_filtered_from_provider_and_javascript_surfaces() {
         let mut builder = ToolRegistry::builder();
         builder
-            .register_dynamic_targeted(
+            .register_dynamic(
                 "renamed_remote_tool",
                 "A structurally targeted dynamic tool.",
                 serde_json::json!({
@@ -1521,7 +1371,7 @@ mod tests {
                     "additionalProperties": false,
                     "properties": {"value": {"type": "string"}}
                 }),
-                ToolOptions::default(),
+                ToolOptions::default().placement(crate::tool::ToolPlacement::TargetedWorkspace),
                 |_context, arguments| async move { Ok(ToolOutput::new(arguments)) },
             )
             .unwrap();
@@ -1553,54 +1403,5 @@ mod tests {
                 .iter()
                 .any(|name| name == "target")
         );
-    }
-
-    #[test]
-    fn erased_definitions_generate_final_capability_aware_schemas() {
-        struct AdapterDefinition;
-
-        impl ToolDefinition for AdapterDefinition {
-            fn name(&self) -> &str {
-                "adapter_tool"
-            }
-
-            fn generate(&self, capabilities: &CapabilitySet) -> Option<ToolSpec> {
-                let mut schema = serde_json::json!({
-                    "type": "object",
-                    "properties": {"query": {"type": "string"}}
-                });
-                if capabilities.contains(Capability::Targets) {
-                    add_schema_property(
-                        &mut schema,
-                        "endpoint",
-                        serde_json::json!({"type": "string"}),
-                    );
-                }
-                Some(ToolSpec::new(
-                    self.name(),
-                    "A dynamically supplied tool.",
-                    schema,
-                ))
-            }
-        }
-
-        let mut builder = ToolRegistry::builder();
-        builder
-            .register_erased(
-                Arc::new(AdapterDefinition),
-                ToolExecution::default().placement(ToolPlacement::TargetedWorkspace),
-                |_context, arguments| async move { Ok(ToolOutput::new(arguments)) },
-            )
-            .unwrap();
-        let registry = builder.build();
-
-        assert!(
-            registry.surface(&target_context(false)).definitions()[0].input_schema["properties"]
-                .get("endpoint")
-                .is_none()
-        );
-        assert!(registry.surface(&target_context(true)).definitions()[0].input_schema
-            ["properties"]["endpoint"]
-            .is_object());
     }
 }

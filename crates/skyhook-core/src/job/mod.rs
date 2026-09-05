@@ -25,7 +25,7 @@ use crate::{
     media::ImageReference,
     session::{EventRecord, SessionError, SessionEvent, SessionStore},
     tool::{
-        ProgressSink, ToolOutput,
+        ToolOutput,
         policy::{Capability, CapabilitySet},
     },
 };
@@ -181,6 +181,38 @@ pub(crate) fn presented_job_schema(capabilities: &CapabilitySet, many: bool) -> 
         serde_json::json!({"type": "array", "items": envelope, "$defs": definitions})
     } else {
         envelope
+    }
+}
+
+pub(crate) enum JobOutcome {
+    Completed(ToolOutput),
+    Failed {
+        message: String,
+        output: Option<ToolOutput>,
+        denial: Option<crate::tool::Denial>,
+    },
+    Cancelled,
+    Interrupted,
+}
+
+impl From<crate::tool::ToolError> for JobOutcome {
+    fn from(error: crate::tool::ToolError) -> Self {
+        use crate::tool::{Denial, ToolError};
+        let message = match &error {
+            crate::tool::ToolError::Denied(reason) => reason.clone(),
+            error => error.concise_message(),
+        };
+        let (output, denial) = match error {
+            ToolError::Cancelled => return Self::Cancelled,
+            ToolError::Denied(_) => (None, Some(Denial::permission_denied())),
+            ToolError::FailedWithOutput { output, .. } => (Some(output), None),
+            _ => (None, None),
+        };
+        Self::Failed {
+            message,
+            output,
+            denial,
+        }
     }
 }
 
@@ -459,88 +491,41 @@ impl JobManager {
         Ok(())
     }
 
-    pub async fn finish(
-        &self,
-        id: JobId,
-        result: Result<ToolOutput, String>,
-        terminal_override: Option<JobState>,
-    ) -> Result<(), JobError> {
-        self.finish_inner(id, result, None, terminal_override, None)
-            .await
-    }
-
-    pub async fn finish_failed(
-        &self,
-        id: JobId,
-        error: String,
-        output: Option<ToolOutput>,
-        terminal_override: Option<JobState>,
-    ) -> Result<(), JobError> {
-        self.finish_inner(id, Err(error), output, terminal_override, None)
-            .await
-    }
-
-    pub(crate) async fn finish_denied(&self, id: JobId, reason: String) -> Result<(), JobError> {
-        self.finish_inner(
-            id,
-            Err(reason),
-            None,
-            None,
-            Some(crate::tool::Denial::permission_denied()),
-        )
-        .await
-    }
-
-    async fn finish_inner(
-        &self,
-        id: JobId,
-        result: Result<ToolOutput, String>,
-        failure_output: Option<ToolOutput>,
-        terminal_override: Option<JobState>,
-        denial: Option<crate::tool::Denial>,
-    ) -> Result<(), JobError> {
+    pub(crate) async fn finish(&self, id: JobId, outcome: JobOutcome) -> Result<(), JobError> {
         let operation = self.operation(id).await?;
         let _operation = operation.lock().await;
-        let (agent, state, output, images, console_output, error) = {
+        let agent = {
             let jobs = self.inner.jobs.lock().await;
             let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
             if entry.state.is_terminal() {
                 return Err(JobError::AlreadyTerminal(id));
             }
-            let (state, output, images, console_output, error) = match result {
-                Ok(output) => (
-                    terminal_override.unwrap_or(JobState::Completed),
-                    Some(output.value),
-                    output.images,
-                    output.console_output,
-                    None,
-                ),
-                Err(error) => {
-                    let (output, images, console_output) = failure_output
-                        .map_or((None, Vec::new(), String::new()), |output| {
-                            (Some(output.value), output.images, output.console_output)
-                        });
-                    (
-                        terminal_override.unwrap_or(JobState::Failed),
-                        output,
-                        images,
-                        console_output,
-                        Some(error),
-                    )
-                }
-            };
-            if !state.is_terminal() {
-                return Err(JobError::InvalidTransition);
-            }
-            (
-                entry.agent.clone(),
-                state,
-                output,
-                images,
-                console_output,
-                error,
-            )
+            entry.agent.clone()
         };
+        let (state, output, error, denial) = match outcome {
+            JobOutcome::Completed(output) => (JobState::Completed, Some(output), None, None),
+            JobOutcome::Failed {
+                message,
+                output,
+                denial,
+            } => (JobState::Failed, output, Some(message), denial),
+            JobOutcome::Cancelled => (
+                JobState::Cancelled,
+                None,
+                Some("tool was cancelled".to_owned()),
+                None,
+            ),
+            JobOutcome::Interrupted => (
+                JobState::Interrupted,
+                None,
+                Some("interrupted while the session was not running".to_owned()),
+                None,
+            ),
+        };
+        let (output, images, console_output) = output
+            .map_or((None, Vec::new(), String::new()), |output| {
+                (Some(output.value), output.images, output.console_output)
+            });
         let output_path = match &output {
             Some(value) => Some(self.inner.store.write_job_output(id, value).await?),
             None => None,
@@ -929,13 +914,7 @@ impl JobManager {
         if let Some(task_abort) = task_abort {
             task_abort.abort();
         }
-        if let Err(error) = self
-            .finish(
-                id,
-                Err("tool was cancelled".to_owned()),
-                Some(JobState::Cancelled),
-            )
-            .await
+        if let Err(error) = self.finish(id, JobOutcome::Cancelled).await
             && !matches!(error, JobError::AlreadyTerminal(_))
         {
             self.fail_volatile(
@@ -1083,11 +1062,6 @@ impl JobManager {
     ) -> Result<Vec<JobProgressRecord>, JobError> {
         progress::events(self, id, after, limit).await
     }
-
-    #[must_use]
-    pub fn progress_sink(&self, id: JobId) -> Arc<dyn ProgressSink> {
-        progress::sink(self.clone(), id)
-    }
 }
 
 #[derive(Debug, Error)]
@@ -1114,6 +1088,7 @@ pub enum JobError {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::TestRuntime;
     use std::sync::atomic::AtomicBool;
 
     use schemars::JsonSchema;
@@ -1204,7 +1179,7 @@ mod tests {
             })
             .await
             .unwrap();
-        jobs.finish(parent.id, Ok(ToolOutput::default()), None)
+        jobs.finish(parent.id, JobOutcome::Completed(ToolOutput::default()))
             .await
             .unwrap();
         jobs.cancel(parent.id).await.unwrap();
@@ -1245,7 +1220,7 @@ mod tests {
                 .to_string()
                 .contains("awaiting_approval")
         );
-        jobs.finish_denied(job, "user reason".to_owned())
+        jobs.finish(job, ToolError::Denied("user reason".to_owned()).into())
             .await
             .unwrap();
         let denied = jobs
@@ -1301,10 +1276,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registered_and_external_calls_share_one_job_path() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
+    async fn registered_calls_preserve_names_and_partial_failures() {
+        let runtime = TestRuntime::new().await;
+        let agent = runtime.agent.clone();
         let mut builder = ToolRegistryBuilder::default();
         builder
             .register::<Echo, String, _, _>(
@@ -1314,13 +1288,8 @@ mod tests {
                 |_context, input| async move { Ok(input.value) },
             )
             .unwrap();
-        let jobs = JobManager::new(store);
-        let executor = ToolExecutor::new(
-            builder.build(),
-            Arc::new(AllowAll),
-            jobs.clone(),
-            root.path().to_path_buf(),
-        );
+        let jobs = runtime.jobs.clone();
+        let executor = runtime.executor(builder);
         let foreground = executor
             .execute(
                 agent.clone(),
@@ -1337,7 +1306,7 @@ mod tests {
         );
         assert_eq!(
             jobs.snapshot(foreground.job).await.unwrap().location,
-            ExecutionLocation::root(root.path().to_path_buf())
+            ExecutionLocation::root(runtime.root.path().to_path_buf())
         );
         let background = executor
             .execute(
@@ -1355,40 +1324,23 @@ mod tests {
             Some(serde_json::json!("b"))
         );
 
-        let external = executor
-            .execute_external(
-                agent.clone(),
-                "echo",
-                serde_json::json!({"value":"c", "name":"external_echo"}),
-                None,
-                Vec::new(),
-                |arguments| async move {
-                    assert!(arguments.get("name").is_none());
-                    Ok(ToolOutput::new(arguments["value"].clone()))
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(external.output.value, "c");
-        assert_eq!(
-            jobs.snapshot(external.job).await.unwrap().name.as_deref(),
-            Some("external_echo")
-        );
-
-        let failed = executor
-            .execute_external(
-                agent,
-                "echo",
-                serde_json::json!({"value":"partial"}),
-                None,
-                Vec::new(),
-                |arguments| async move {
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register::<Echo, String, _, _>(
+                "fail",
+                "partial failure",
+                ToolOptions::default(),
+                |_context, input| async move {
                     Err(ToolError::with_output(
                         "stopped",
-                        ToolOutput::new(arguments["value"].clone()),
+                        ToolOutput::new(serde_json::json!(input.value)),
                     ))
                 },
             )
+            .unwrap();
+        let failed = runtime
+            .executor(builder)
+            .execute(agent, "fail", serde_json::json!({"value":"partial"}), None)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1636,8 +1588,7 @@ mod tests {
             manager
                 .finish(
                     lease.id,
-                    Ok(ToolOutput::new(serde_json::json!("done"))),
-                    None,
+                    JobOutcome::Completed(ToolOutput::new(serde_json::json!("done"))),
                 )
                 .await
                 .unwrap();
@@ -1651,9 +1602,8 @@ mod tests {
 
     #[tokio::test]
     async fn uncooperative_handlers_are_aborted_after_cancellation_grace() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
+        let runtime = TestRuntime::new().await;
+        let agent = runtime.agent.clone();
         let mut builder = ToolRegistryBuilder::default();
         builder
             .register::<NoArgs, String, _, _>(
@@ -1665,13 +1615,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let jobs = JobManager::new(store);
-        let executor = ToolExecutor::new(
-            builder.build(),
-            Arc::new(AllowAll),
-            jobs.clone(),
-            root.path().to_path_buf(),
-        );
+        let jobs = runtime.jobs.clone();
+        let executor = runtime.executor(builder);
         let running = executor
             .execute(agent, "stubborn", serde_json::json!({"bg": true}), None)
             .await
@@ -1782,9 +1727,8 @@ mod tests {
 
     #[tokio::test]
     async fn handler_panics_are_supervised_as_failed_jobs() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
+        let runtime = TestRuntime::new().await;
+        let agent = runtime.agent.clone();
         let mut builder = ToolRegistryBuilder::default();
         builder
             .register::<NoArgs, String, _, _>(
@@ -1796,13 +1740,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let jobs = JobManager::new(store);
-        let executor = ToolExecutor::new(
-            builder.build(),
-            Arc::new(AllowAll),
-            jobs.clone(),
-            root.path().to_path_buf(),
-        );
+        let jobs = runtime.jobs.clone();
+        let executor = runtime.executor(builder);
         let running = executor
             .execute(agent, "panic", serde_json::json!({"bg": true}), None)
             .await

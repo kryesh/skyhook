@@ -4,7 +4,7 @@ use crate::session::{
     EventRecord, SessionError, SessionEvent, SessionStore, is_safe_artifact_path,
 };
 
-use super::{DeliveryState, JobEntry, JobError, JobManager, JobSpec, JobState};
+use super::{DeliveryState, JobEntry, JobError, JobManager, JobOutcome, JobSpec};
 
 pub(super) async fn restore(
     store: SessionStore,
@@ -101,13 +101,7 @@ pub(super) async fn restore(
         .collect::<Vec<_>>();
     let manager = JobManager::with_jobs(store, jobs, maximum.saturating_add(1).max(1));
     for job in active {
-        manager
-            .finish(
-                job,
-                Err("interrupted while the session was not running".to_owned()),
-                Some(JobState::Interrupted),
-            )
-            .await?;
+        manager.finish(job, JobOutcome::Interrupted).await?;
     }
     Ok(manager)
 }

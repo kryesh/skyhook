@@ -17,7 +17,7 @@ use skyhook::{
 };
 use tokio::io::AsyncBufReadExt as _;
 
-use interaction::{CliInteraction, CliPolicy, CliQuestions, CliSensitivePrompts};
+use interaction::CliInteraction;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -84,7 +84,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.default_agent_profile = args.agent_profile;
     }
     let interaction = Arc::new(CliInteraction::default());
-    // `Config::build_harness` is convenient for embedders; the CLI adds its interactive hooks.
     let approve_all = args.approve_all || config.approve_all;
     let builder = config
         .harness_builder(args.workspace)?
@@ -92,11 +91,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let builder = if approve_all {
         builder.policy(Arc::new(AllowAll))
     } else {
-        builder.policy(Arc::new(CliPolicy::new(interaction.clone())))
+        builder.policy(interaction.clone())
     };
     let harness = builder
-        .question_handler(Arc::new(CliQuestions::new(interaction.clone())))
-        .sensitive_prompt_handler(Arc::new(CliSensitivePrompts::new(interaction)))
+        .question_handler(interaction.clone())
+        .sensitive_prompt_handler(interaction)
         .build()
         .await?;
     let session = match args.resume {
@@ -197,7 +196,7 @@ impl AgentOutput {
                 {
                     self.tool(
                         &record.agent,
-                        &format_tool_call(*job, tool, arguments, *background, Some(location)),
+                        &format_tool_call(*job, tool, arguments, *background, location),
                     );
                 }
             }
@@ -265,7 +264,7 @@ fn format_tool_call(
     tool: &str,
     arguments: &Value,
     bg: bool,
-    location: Option<&skyhook::execution::ExecutionLocation>,
+    location: &skyhook::execution::ExecutionLocation,
 ) -> String {
     let detail = match tool {
         "read" | "remove" => one_arg(arguments, "path"),
@@ -337,15 +336,10 @@ fn format_tool_call(
         _ => safe_scalar_args(arguments),
     };
     let background = if bg { " [background]" } else { "" };
-    let location = location.map_or_else(
-        || "[target=unknown workspace=unknown]".to_owned(),
-        |location| {
-            format!(
-                "[target={} workspace={}]",
-                location.target,
-                location.workspace.display()
-            )
-        },
+    let location = format!(
+        "[target={} workspace={}]",
+        location.target,
+        location.workspace.display()
     );
     if detail.is_empty() {
         format!("tool #{job}: {location} {tool}{background}")
@@ -466,16 +460,17 @@ mod tests {
 
     #[test]
     fn tool_summaries_are_brief_and_hide_payloads() {
+        let location = ExecutionLocation::root("/workspace".into());
         let script = format_tool_call(
             JobId::new(7).unwrap(),
             "script",
             &json!({"source":"const secret = 'do not print'; return 42", "bg":true}),
             true,
-            None,
+            &location,
         );
         assert_eq!(
             script,
-            "tool #7: [target=unknown workspace=unknown] script JavaScript workflow (40 chars) [background]"
+            "tool #7: [target=root workspace=/workspace] script JavaScript workflow (40 chars) [background]"
         );
         assert!(!script.contains("secret"));
 
@@ -484,11 +479,11 @@ mod tests {
             "agent",
             &json!({"prompt":"report the kernel version", "target":"lab-monitoring"}),
             false,
-            None,
+            &location,
         );
         assert_eq!(
             agent,
-            "tool #8: [target=unknown workspace=unknown] agent task \"report the kernel version\" on lab-monitoring"
+            "tool #8: [target=root workspace=/workspace] agent task \"report the kernel version\" on lab-monitoring"
         );
         assert_eq!(brief("one\n two   three", 7), "one two…");
 
@@ -497,10 +492,7 @@ mod tests {
             "read",
             &json!({"path":"README.md"}),
             false,
-            Some(&ExecutionLocation {
-                target: "root".to_owned(),
-                workspace: "/workspace".into(),
-            }),
+            &location,
         );
         assert_eq!(
             located,

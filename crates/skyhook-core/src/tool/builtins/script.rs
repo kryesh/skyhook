@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{OnceLock, Weak};
 
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
@@ -8,30 +8,10 @@ use crate::tool::{
     RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, executor::ToolExecutor,
 };
 
-pub fn install_script_tool(
-    builder: &mut ToolRegistryBuilder,
-    executor: Arc<OnceLock<ToolExecutor>>,
-) -> Result<(), RegistryError> {
-    install_script_tool_with(builder, move || executor.get().cloned())
-}
-
-pub(crate) fn install_script_tool_weak(
+pub(crate) fn install_script_tool(
     builder: &mut ToolRegistryBuilder,
     executor: Weak<OnceLock<ToolExecutor>>,
 ) -> Result<(), RegistryError> {
-    install_script_tool_with(builder, move || {
-        executor.upgrade().and_then(|slot| slot.get().cloned())
-    })
-}
-
-fn install_script_tool_with<F>(
-    builder: &mut ToolRegistryBuilder,
-    executor: F,
-) -> Result<(), RegistryError>
-where
-    F: Fn() -> Option<ToolExecutor> + Send + Sync + 'static,
-{
-    let executor = Arc::new(executor);
     let schema = serde_json::to_value(schema_for!(ScriptArgs))
         .map_err(|error| RegistryError::Schema(error.to_string()))?;
     let output_schema = serde_json::to_value(schema_for!(Value))
@@ -50,7 +30,9 @@ where
             async move {
                 let args: ScriptArgs = serde_json::from_value(arguments)
                     .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
-                let executor = executor()
+                let executor = executor
+                    .upgrade()
+                    .and_then(|slot| slot.get().cloned())
                     .ok_or_else(|| {
                         ToolError::Failed("script executor is not initialized".to_owned())
                     })?

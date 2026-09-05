@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::Path,
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -20,7 +20,7 @@ use crate::{
     session::SessionStore,
     tool::{
         ToolRegistryBuilder,
-        builtins::{install_script_tool_weak, register_worker_tools},
+        builtins::register_worker_tools,
         executor::{ExecutionError, ExecutionResult, ToolExecutor},
         policy::{AuthorizationRequest, Policy, PolicyDecision, PolicyFuture},
     },
@@ -69,10 +69,8 @@ where
     let store = SessionStore::create_ephemeral(temporary.path()).await?;
     let worker_agent = AgentId::root(store.id());
     let jobs = JobManager::new(store.clone());
-    let slot = Arc::new(OnceLock::new());
     let mut builder = ToolRegistryBuilder::default();
-    register_worker_tools(&mut builder, store.clone(), jobs.clone())?;
-    install_script_tool_weak(&mut builder, Arc::downgrade(&slot))?;
+    register_worker_tools(&mut builder, store.clone())?;
     let executor = ToolExecutor::new(
         builder.build(),
         Arc::new(ForwardPolicy {
@@ -84,8 +82,6 @@ where
         std::fs::canonicalize(".")?,
     )
     .with_authorization_root(authorization_root);
-    slot.set(executor.clone())
-        .map_err(|_| "worker executor already initialized")?;
     let (requests, mut incoming) = mpsc::channel(32);
     let (started_jobs, mut started) = mpsc::channel(32);
     let reader = tokio::spawn(read_requests(input, requests));

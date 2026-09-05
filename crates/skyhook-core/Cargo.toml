@@ -18,7 +18,6 @@ chrono = { version = "0.4.42", default-features = false, features = [
     "serde",
 ] }
 diffy = "0.5.1"
-digest = "0.11"
 flux-core = { package = "codewandler-flux-core", version = "=0.59.3" }
 flux-credentials = { package = "codewandler-flux-credentials", version = "=0.59.3" }
 flux-provider = { package = "codewandler-flux-provider", version = "=0.59.3" }

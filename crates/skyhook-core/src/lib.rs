@@ -12,10 +12,12 @@ pub mod provider;
 pub mod remote;
 pub mod session;
 pub mod target;
+#[cfg(test)]
+mod test_support;
 pub mod tool;
 
 pub(crate) fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
-    use digest::Digest as _;
+    use sha2::Digest as _;
     use std::fmt::Write as _;
 
     sha2::Sha256::digest(bytes)

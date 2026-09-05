@@ -6,7 +6,7 @@ use crate::{
     execution::ExecutionLocation,
     identity::AgentId,
     job::{ActiveJob, JobManager},
-    provider::protocol::{Message, SystemSegment, UserContent},
+    provider::protocol::{SystemSegment, UserContent},
     tool::policy::{Capability, CapabilitySet},
 };
 
@@ -138,33 +138,4 @@ pub(super) async fn runtime_state_content_at(
             serde_json::to_string(&state).expect("Skyhook state is serializable")
         ),
     }
-}
-
-/// Remove only the old, harness-generated active-job snapshot from replayed model history.
-/// Durable records and other runtime content (especially notifications) are untouched.
-pub(super) fn without_legacy_state(mut message: Message) -> Option<Message> {
-    if let Message::User(content) = &mut message {
-        content.retain(|item| {
-            let UserContent::Runtime { text } = item else {
-                return true;
-            };
-            let Some(body) = text
-                .strip_prefix("<skyhook_state>\n")
-                .and_then(|text| text.strip_suffix("\n</skyhook_state>"))
-            else {
-                return true;
-            };
-            let Ok(serde_json::Value::Object(state)) = serde_json::from_str(body) else {
-                return true;
-            };
-            !(state.len() == 1
-                && state
-                    .get("active_jobs")
-                    .is_some_and(serde_json::Value::is_array))
-        });
-        if content.is_empty() {
-            return None;
-        }
-    }
-    Some(message)
 }

@@ -1,6 +1,6 @@
 //! Shared execution-location identity.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,23 @@ pub struct ExecutionLocation {
 }
 
 impl ExecutionLocation {
+    pub(crate) fn select(
+        caller: &Self,
+        root_workspace: &Path,
+        explicit: Option<&str>,
+        configured_workspace: Option<&Path>,
+    ) -> Self {
+        let target = explicit.unwrap_or(&caller.target);
+        let workspace = if explicit == Some(ROOT_TARGET) {
+            root_workspace
+        } else if target == caller.target {
+            &caller.workspace
+        } else {
+            configured_workspace.expect("named target was resolved")
+        };
+        Self::named(target, workspace.to_owned())
+    }
+
     #[must_use]
     pub fn root(workspace: PathBuf) -> Self {
         Self {

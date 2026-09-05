@@ -18,14 +18,12 @@ const MAX_LINE_BYTES: usize = 32 * 1024;
 const MAX_OUTPUT_BYTES: usize = 512 * 1024;
 
 pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
-    builder.register_targeted::<SearchArgs, SearchOutput, _, _>(
+    builder.register::<SearchArgs, SearchOutput, _, _>(
         "search",
         "Search files with ripgrep regex, glob, and ignore semantics.",
-        ToolOptions::new(vec![Capability::Read]).path_argument(
-            "path",
-            PathAccess::Read,
-            PathKind::Existing,
-        ),
+        ToolOptions::new(vec![Capability::Read])
+            .placement(crate::tool::ToolPlacement::TargetedWorkspace)
+            .path_argument("path", PathAccess::Read, PathKind::Existing),
         |context, args| async move {
             validate_limit(args.limit)?;
             let root = resolve_existing(&context.execution_location.workspace, &args.path).await?;
@@ -35,14 +33,12 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
                 .map_err(|error| ToolError::Failed(error.to_string()))?
         },
     )?;
-    builder.register_targeted::<GlobArgs, GlobOutput, _, _>(
+    builder.register::<GlobArgs, GlobOutput, _, _>(
         "glob",
         "Find files with ripgrep glob and ignore semantics.",
-        ToolOptions::new(vec![Capability::Read]).path_argument(
-            "path",
-            PathAccess::Read,
-            PathKind::Existing,
-        ),
+        ToolOptions::new(vec![Capability::Read])
+            .placement(crate::tool::ToolPlacement::TargetedWorkspace)
+            .path_argument("path", PathAccess::Read, PathKind::Existing),
         |context, args| async move {
             validate_limit(args.limit)?;
             let root = resolve_existing(&context.execution_location.workspace, &args.path).await?;
