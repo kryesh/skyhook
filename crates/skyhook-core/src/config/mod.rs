@@ -213,14 +213,16 @@ supports_images = false
 import_ssh_config = true
 
 [targets.bastion]
+type = "ssh"
 host = "bastion.example.com"
 
 [targets.build]
+type = "ssh"
 host = "build.internal"
 via = "bastion"
 workspace = "/srv/project"
 
-[targets.build.auth]
+[targets.build.ssh.auth]
 kind = "key"
 path = "~/.ssh/build"
 "#,
@@ -231,7 +233,7 @@ path = "~/.ssh/build"
             config.targets.entries["build"].via.as_deref(),
             Some("bastion")
         );
-        assert_eq!(config.targets.entries["build"].auth.kind(), "key");
+        assert_eq!(config.targets.entries["build"].ssh.auth.kind(), "key");
     }
 
     #[test]

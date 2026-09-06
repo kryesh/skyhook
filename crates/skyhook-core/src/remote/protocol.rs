@@ -9,9 +9,35 @@ use serde_json::Value;
 
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum Request {
+    ResolveSsh {
+        request_id: u64,
+        target: Box<crate::target::TargetDefinition>,
+    },
+    OpenSsh {
+        channel: u64,
+        route: Vec<crate::target::TargetDefinition>,
+        command: String,
+    },
+    StreamData {
+        channel: u64,
+        data: Vec<u8>,
+    },
+    StreamEnd {
+        channel: u64,
+    },
+    StreamAck {
+        channel: u64,
+    },
+    StreamClose {
+        channel: u64,
+    },
+    SensitiveAnswer {
+        prompt_id: u64,
+        answer: super::askpass::PromptAnswer,
+    },
     Hello,
     Tool {
         request_id: u64,
@@ -29,9 +55,31 @@ pub(crate) enum Request {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum Response {
+    SensitiveCancelled {
+        prompt_id: u64,
+    },
+    ResolvedSsh {
+        request_id: u64,
+        result: Result<super::ssh::ResolvedSsh, String>,
+    },
+    StreamData {
+        channel: u64,
+        data: Vec<u8>,
+    },
+    StreamClosed {
+        channel: u64,
+        error: Option<String>,
+    },
+    StreamAck {
+        channel: u64,
+    },
+    SensitivePrompt {
+        prompt_id: u64,
+        prompt: super::SensitivePrompt,
+    },
     Ready,
     Tool {
         request_id: u64,
@@ -92,7 +140,7 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    let bytes = zeroize::Zeroizing::new(serde_json::to_vec(value).map_err(std::io::Error::other)?);
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -127,7 +175,7 @@ where
             "RPC frame is too large",
         ));
     }
-    let mut bytes = vec![0; length];
+    let mut bytes = zeroize::Zeroizing::new(vec![0; length]);
     reader.read_exact(&mut bytes).await?;
     serde_json::from_slice(&bytes)
         .map(Some)

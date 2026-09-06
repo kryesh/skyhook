@@ -51,8 +51,4 @@ impl ExecutionLocation {
     pub fn is_root(&self) -> bool {
         self.target == ROOT_TARGET
     }
-
-    pub fn kind(&self) -> &'static str {
-        if self.is_root() { "local" } else { "ssh" }
-    }
 }

@@ -1,10 +1,15 @@
-//! Remote platform artifacts and SSH execution support.
+//! Remote transport sessions, shim protocol, and platform artifacts.
 
 mod artifact;
 mod askpass;
+pub(crate) mod authentication;
+mod backend;
 mod manager;
 mod prompt;
 mod protocol;
+mod service;
+pub mod ssh;
+mod transport;
 pub mod worker;
 
 pub use artifact::{ArtifactError, EmbeddedShim, EmbeddedShimCatalog};

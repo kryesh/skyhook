@@ -53,7 +53,29 @@ agent ID (`root`, `1`, `1:1`, and so on), so root and child-agent activity remai
 during concurrent workflows. When the CLI closes the session, it prints cumulative output, total
 input, and uncached input token counts.
 
-## SSH targets
+## Reconstructing model calls
+
+Session format 3 records the inputs needed to reconstruct each call at the shared `Provider`
+boundary. It stores no backend-specific request bodies or authentication headers:
+
+- `model_context` records the configured provider name and a shared `ModelRequest` template:
+  actual model ID, assembled system prompt (including harness/profile instructions and location),
+  tool descriptions and schemas, reasoning setting, output limit, and correlation. Its `messages`
+  array is empty; conversation history remains in `message_committed` events.
+- `model_requested` is persisted before each provider invocation. It references the context event's
+  sequence, records the agent's history length, and saves the exact transient runtime state appended
+  to that call. Calls within a turn share one context record, including through tool-result rounds.
+- Each call uses preceding `message_committed` events belonging to that agent, followed by its
+  recorded runtime state. Reconstruction uses those saved values rather than current configuration,
+  prompt code, or live job state. Failed/interrupted calls retain their input records.
+
+`session::reconstruct_model_request(&records, sequence)` returns the provider name and reconstructed
+`ModelRequest` for a `model_requested` sequence. Image metadata references the existing session blobs;
+`store.hydrate_model_request(&mut request).await` restores their payloads when needed. This reconstructs
+Skyhook's provider-neutral input, not an API-specific wire encoding. There is no migration from older
+session formats.
+
+## Execution targets
 
 Set top-level `targets_enabled = true` to grant the session's target capability. When it is false
 (the default), target-management tools, target arguments, JavaScript target setters, and target
@@ -67,28 +89,72 @@ SSH configuration is disabled by default. Session tools can upsert targets witho
 import_ssh_config = false
 
 [targets.bastion]
+type = "ssh"
 host = "bastion.example.com"
+
+[targets.bastion.ssh]
 user = "gateway"
 
 [targets.build]
+type = "ssh"
 host = "build.internal"
 workspace = "/srv/project"
 via = "bastion"
 
-[targets.build.auth]
+[targets.build.ssh.auth]
 kind = "key"
 path = "~/.ssh/build_ed25519"
 ```
 
-Authentication kinds are `openssh`, `agent`, `key`, and `interactive`. Interactive secrets are
-requested by the host with terminal echo disabled and never enter tool arguments or session logs.
-`via` references another named target and may form an acyclic jump chain.
+Targets have an explicit `type`. The built-in `root` is `local`, meaning the session host—the machine
+running the main Skyhook process. It always identifies that machine, including when an agent's
+current target is remote. Named target configuration and `target_add` accept only `type = "ssh"`.
+SSH-specific settings live under `ssh`, including authentication kinds `openssh` (default),
+`agent` (the session's managed agent), and `key` (an explicit path). Older target configurations and
+session formats are rejected; update configurations and start a new session.
 
-`root` is the built-in local target, always the main Skyhook process rather than an SSH alias. The
-target-aware tools, including `agent`, use these rules:
+The target list shows each target's effective destination hostname/IP, original SSH alias, type,
+origin, and `via`. SSH imports resolve aliases with OpenSSH and translate `ProxyJump` into named
+`via` chains, creating stable names for unnamed or route-specific hops. Opaque `ProxyCommand`
+settings remain SSH-specific. Listing targets does not connect to their destinations.
+
+Agents receive their current target's name, type, resolved hostname, origin, and `via` alongside
+their effective workspace in `skyhook_context`. Registering a target does not change the agent's
+location.
+
+`via` describes reachability; `origin` identifies the machine where connection configuration and
+outbound SSH processes belong. Local config/imports originate on `root`. `target_add` defaults its
+origin to the caller's target and accepts an explicit `origin` override:
+
+```javascript
+await tool.target_add({name: "database", type: "ssh", host: "db.internal",
+  origin: "build", ssh: {auth: {kind: "key", path: "~/.ssh/database"}}});
+```
+
+The resulting target automatically uses `via: "build"`, extended by any jump chain in build's SSH
+configuration. Registration resolves configuration on the origin, which may require connecting to
+it, but never connects to the new destination or decrypts its keys. Registrations are session-wide.
+A root-origin connection via build uses native SSH forwarding; a build-origin connection runs SSH
+under build's shim. Native forwarding alone does not require a shim on jump hosts. Native hops in
+a connection segment must share its configuration origin; use an explicit remote origin to start
+a shim-owned continuation. This prevents remote credential paths being interpreted on root.
+
+One private, session-owned SSH agent runs on root. SSH loads keys lazily from their configuration
+origin into this central agent. Remote Skyhook commands receive a private relay socket in
+`SSH_AUTH_SOCK`, allowing commands such as `git`, `ssh`, and `ssh-add` to use the same identities.
+Skyhook does not inherit an existing user agent. Agent state is discarded at session shutdown and
+is not restored when resuming a session.
+
+Skyhook's askpass handler routes passwords, key passphrases, keyboard-interactive challenges, host
+confirmations, and agent confirmations to the host UI. Interactivity is controlled by the handler,
+not target configuration. `-p`, `-s`, and invocations without an interactive terminal fail operations
+that require input; `--approve-all` does not approve authentication prompts. Secrets are never
+included in tool results or session logs.
+
+Target-aware tools, including `agent`, use these rules:
 
 - Omitting `target` uses the calling agent's target and current workspace.
-- Setting `target: "root"` uses the local host and root workspace.
+- Setting `target: "root"` uses the session host and its configured session workspace.
 - Setting another named target uses its configured workspace, except that explicitly selecting the
   calling agent's current named target retains that agent's workspace override.
 

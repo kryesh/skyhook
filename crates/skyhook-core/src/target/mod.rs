@@ -1,11 +1,14 @@
-//! Named local and SSH execution targets.
+//! Typed execution targets, configuration, and routing.
 
 mod config;
 mod import;
+pub(crate) mod normalize;
 mod registry;
 mod router;
 
-pub use config::{TargetAuth, TargetConfig, TargetsConfig};
+pub use config::{
+    SshOptions, TargetAuth, TargetConfig, TargetConfigType, TargetType, TargetsConfig,
+};
 pub use registry::{
     ROOT_TARGET, TargetDefinition, TargetError, TargetRecord, TargetRegistry, TargetSource,
 };

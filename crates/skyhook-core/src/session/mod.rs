@@ -21,14 +21,17 @@ use crate::{
     identity::{AgentId, JobId, SessionId},
     job::JobProgressRecord,
     media::ImageReference,
+    provider::protocol::{Message, ModelRequest, UserContent},
 };
 
 mod event;
+mod request;
 
 pub(crate) use event::is_safe_artifact_path;
 pub use event::{EventRecord, SessionEvent};
+pub use request::reconstruct_model_request;
 
-pub const SESSION_FORMAT_VERSION: u16 = 1;
+pub const SESSION_FORMAT_VERSION: u16 = 3;
 
 struct SessionWriter {
     file: Option<BufWriter<File>>,
@@ -84,6 +87,15 @@ impl SessionStore {
             .rposition(|byte| *byte == b'\n')
             .map_or(0, |position| position + 1);
         let complete = &bytes[..complete_len];
+        #[derive(serde::Deserialize)]
+        struct Version {
+            version: u16,
+        }
+        for record in parse_lines::<Version>(complete)? {
+            if record.version != SESSION_FORMAT_VERSION {
+                return Err(SessionError::UnsupportedVersion(record.version));
+            }
+        }
         let records = parse_lines(complete)?;
         event::validate_records(&records, id)?;
         if complete_len != bytes.len() {
@@ -316,6 +328,42 @@ impl SessionStore {
         }
         Ok(bytes)
     }
+
+    /// Restore image payloads in a reconstructed or newly assembled provider-neutral request.
+    pub async fn hydrate_model_request(
+        &self,
+        request: &mut ModelRequest,
+    ) -> Result<(), SessionError> {
+        for message in &mut request.messages {
+            match message {
+                Message::User(content) => {
+                    for item in content {
+                        if let UserContent::Image { image } = item {
+                            self.hydrate_image(image).await?;
+                        }
+                    }
+                }
+                Message::Tool(results) => {
+                    for result in results {
+                        for image in &mut result.images {
+                            self.hydrate_image(image).await?;
+                        }
+                    }
+                }
+                Message::Assistant(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn hydrate_image(&self, image: &mut ImageReference) -> Result<(), SessionError> {
+        if image.data_base64.is_none() {
+            image.data_base64 = Some(
+                base64::engine::general_purpose::STANDARD.encode(self.read_blob(image).await?),
+            );
+        }
+        Ok(())
+    }
 }
 
 fn parse_lines<T>(bytes: &[u8]) -> Result<Vec<T>, SessionError>
@@ -336,6 +384,8 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
 
 #[derive(Debug, Error)]
 pub enum SessionError {
+    #[error("cannot reconstruct model request at sequence {sequence}: {reason}")]
+    ModelRequestReplay { sequence: u64, reason: &'static str },
     #[error("session I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("session JSON failed: {0}")]
@@ -389,6 +439,20 @@ mod tests {
         let (_store, records) = SessionStore::open(root.path(), id).await.unwrap();
         assert_eq!(records.len(), 1);
         assert!(fs::read_to_string(path).await.unwrap().ends_with('\n'));
+    }
+
+    #[tokio::test]
+    async fn old_versions_are_rejected_before_deserializing_old_target_shapes() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(root.path()).await.unwrap();
+        let id = store.id();
+        let path = store.directory().join("events.jsonl");
+        store.close().await.unwrap();
+        fs::write(path, b"{\"version\":1,\"event\":{\"type\":\"target_upserted\",\"target\":{\"host\":\"legacy\"}}}\n").await.unwrap();
+        assert!(matches!(
+            SessionStore::open(root.path(), id).await,
+            Err(SessionError::UnsupportedVersion(1))
+        ));
     }
 
     #[tokio::test]

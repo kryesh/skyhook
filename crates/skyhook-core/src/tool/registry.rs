@@ -704,7 +704,7 @@ fn ensure_no_target(schema: &Value) -> Result<(), RegistryError> {
 fn target_property_schema() -> Value {
     serde_json::json!({
         "type": ["string", "null"],
-        "description": "Target; omitted inherits the caller."
+        "description": "Execution target; omitted uses your current target. root selects the Skyhook session host."
     })
 }
 

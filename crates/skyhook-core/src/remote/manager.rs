@@ -1,8 +1,6 @@
 use std::{
     collections::HashMap,
-    io::Write as _,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::Arc,
 };
 
@@ -10,15 +8,14 @@ use futures_util::future::{BoxFuture, FutureExt as _, Shared};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _},
-    process::{Child, ChildStdin, Command},
     sync::{Mutex, oneshot},
     task::JoinHandle,
 };
 
 use crate::{
     job::CancellationToken,
-    remote::{ArtifactError, EmbeddedShim, EmbeddedShimCatalog, SensitivePromptHandler},
-    target::{ResolvedRoute, RouteIdentity, TargetAuth, TargetDefinition, TargetError},
+    remote::{ArtifactError, EmbeddedShimCatalog, SensitivePromptHandler},
+    target::{ResolvedRoute, RouteIdentity, TargetDefinition, TargetError},
     tool::{
         ToolContext, ToolError, ToolOutput,
         authorization::{AuthorizationCoordinator, AuthorizationError},
@@ -26,6 +23,7 @@ use crate::{
     },
 };
 
+use super::backend::{Session, TargetSession};
 use super::protocol::{
     RemoteToolError, RemoteToolOutput, Request, Response, read_frame, write_frame,
 };
@@ -37,6 +35,8 @@ pub(crate) struct RemoteManager {
 
 struct RemoteInner {
     catalog: EmbeddedShimCatalog,
+    authentication: super::authentication::Authentication,
+    shutdown: CancellationToken,
     pool: Mutex<HashMap<ConnectionKey, Arc<PooledSlot>>>,
     prompts: Arc<dyn SensitivePromptHandler>,
     authorization: AuthorizationCoordinator,
@@ -63,13 +63,12 @@ pub(crate) trait ConnectionFactory: Send + Sync {
 pub(crate) struct PooledConnection {
     writer: Arc<Mutex<RequestWriter>>,
     state: Arc<Mutex<ConnectionState>>,
-    child: Mutex<Child>,
+    _owner: std::sync::Mutex<Box<dyn Send>>,
     reader: JoinHandle<()>,
-    _config: tempfile::TempDir,
 }
 
 struct PooledSlot {
-    connection: Shared<BoxFuture<'static, Result<Arc<PooledConnection>, RemoteError>>>,
+    connection: Shared<BoxFuture<'static, Result<Session, RemoteError>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -83,7 +82,7 @@ pub(crate) struct PreparedConnection {
     manager: RemoteManager,
     key: ConnectionKey,
     slot: Arc<PooledSlot>,
-    connection: Arc<PooledConnection>,
+    connection: Session,
 }
 
 impl PreparedConnection {
@@ -93,7 +92,7 @@ impl PreparedConnection {
         arguments: serde_json::Value,
         context: &ToolContext,
     ) -> Result<ToolOutput, RemoteError> {
-        let result = call_tool(&self.connection, name, arguments, context).await;
+        let result = self.connection.execute(name, arguments, context).await;
         if matches!(
             result,
             Err(RemoteError::Io { .. } | RemoteError::Protocol(_))
@@ -105,7 +104,7 @@ impl PreparedConnection {
 }
 
 struct RequestWriter {
-    input: ChildStdin,
+    input: super::transport::Writer,
     next_request_id: u64,
 }
 
@@ -117,9 +116,21 @@ struct PendingCall {
     context: Option<ToolContext>,
 }
 
+struct ClientStream {
+    output: tokio::sync::mpsc::Sender<Result<Vec<u8>, RemoteError>>,
+    credit: Arc<tokio::sync::Semaphore>,
+}
+impl Drop for ClientStream {
+    fn drop(&mut self) {
+        self.credit.close();
+    }
+}
+
 struct ConnectionState {
     pending: HashMap<u64, PendingCall>,
     failure: Option<RemoteError>,
+    resolutions: HashMap<u64, oneshot::Sender<Result<super::ssh::ResolvedSsh, RemoteError>>>,
+    streams: HashMap<u64, ClientStream>,
 }
 
 impl RemoteManager {
@@ -131,6 +142,8 @@ impl RemoteManager {
         Self {
             inner: Arc::new(RemoteInner {
                 catalog,
+                authentication: super::authentication::Authentication::new(prompts.clone()),
+                shutdown: CancellationToken::new(),
                 pool: Mutex::new(HashMap::new()),
                 prompts,
                 authorization,
@@ -138,6 +151,20 @@ impl RemoteManager {
                 factory: None,
             }),
         }
+    }
+
+    pub(crate) async fn environment(
+        &self,
+    ) -> Result<super::authentication::ProcessEnvironment, RemoteError> {
+        if self.inner.shutdown.is_cancelled() {
+            return Err(RemoteError::Cancelled);
+        }
+        self.inner.authentication.environment().await
+    }
+    pub(crate) async fn shutdown(&self) {
+        self.inner.shutdown.cancel();
+        self.inner.pool.lock().await.clear();
+        self.inner.authentication.shutdown().await;
     }
 
     #[cfg(test)]
@@ -148,70 +175,72 @@ impl RemoteManager {
         self
     }
 
-    pub(crate) async fn connection(
-        &self,
+    pub(crate) fn connection<'a>(
+        &'a self,
         route: ResolvedRoute,
-        workspace: &Path,
-        cancellation: &CancellationToken,
-    ) -> Result<PreparedConnection, RemoteError> {
-        let key = ConnectionKey {
-            route: route.identity.clone(),
-            workspace: workspace.to_path_buf(),
-        };
-        let slot = {
-            let mut pool = self.inner.pool.lock().await;
-            if let Some(existing) = pool.get(&key) {
-                existing.clone()
-            } else {
-                let manager = self.clone();
-                let target = route.identity.destination.clone();
-                let definitions = route.definitions;
-                let workspace = workspace.to_path_buf();
-                let startup = tokio::spawn(async move {
-                    #[cfg(test)]
-                    if let Some(factory) = manager.inner.factory.clone() {
-                        return factory
-                            .connect(ConnectionRequest {
-                                target: target.clone(),
-                                route: definitions.clone(),
-                                workspace: workspace.clone(),
-                            })
+        workspace: &'a Path,
+        cancellation: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<PreparedConnection, RemoteError>> {
+        Box::pin(async move {
+            let key = ConnectionKey {
+                route: route.identity.clone(),
+                workspace: workspace.to_path_buf(),
+            };
+            let slot = {
+                let mut pool = self.inner.pool.lock().await;
+                if let Some(existing) = pool.get(&key) {
+                    existing.clone()
+                } else {
+                    let manager = self.clone();
+                    let target = route.identity.destination.clone();
+                    let definitions = route.definitions;
+                    let workspace = workspace.to_path_buf();
+                    let startup = tokio::spawn(async move {
+                        let connect = async {
+                            #[cfg(test)]
+                            if let Some(factory) = manager.inner.factory.clone() {
+                                return factory
+                                    .connect(ConnectionRequest {
+                                        target: target.clone(),
+                                        route: definitions.clone(),
+                                        workspace: workspace.clone(),
+                                    })
+                                    .await
+                                    .map(|connection| Arc::new(connection) as Session);
+                            }
+                            manager.connect(&target, &definitions, &workspace).await
+                        };
+                        tokio::select! { result = connect => result, () = manager.inner.shutdown.cancelled() => Err(RemoteError::Cancelled) }
+                    });
+                    let connection = async move {
+                        startup
                             .await
-                            .map(Arc::new);
+                            .map_err(|error| RemoteError::ConnectionTask(error.to_string()))?
                     }
-                    manager
-                        .connect(&target, &definitions, &workspace)
-                        .await
-                        .map(Arc::new)
-                });
-                let connection = async move {
-                    startup
-                        .await
-                        .map_err(|error| RemoteError::ConnectionTask(error.to_string()))?
+                    .boxed()
+                    .shared();
+                    let slot = Arc::new(PooledSlot { connection });
+                    pool.insert(key.clone(), slot.clone());
+                    slot
                 }
-                .boxed()
-                .shared();
-                let slot = Arc::new(PooledSlot { connection });
-                pool.insert(key.clone(), slot.clone());
-                slot
+            };
+            let result = tokio::select! {
+                result = slot.connection.clone() => result,
+                () = cancellation.cancelled() => return Err(RemoteError::Cancelled),
+            };
+            match result {
+                Ok(connection) => Ok(PreparedConnection {
+                    manager: self.clone(),
+                    key,
+                    slot,
+                    connection,
+                }),
+                Err(error) => {
+                    self.remove_slot(&key, &slot).await;
+                    Err(error)
+                }
             }
-        };
-        let result = tokio::select! {
-            result = slot.connection.clone() => result,
-            () = cancellation.cancelled() => return Err(RemoteError::Cancelled),
-        };
-        match result {
-            Ok(connection) => Ok(PreparedConnection {
-                manager: self.clone(),
-                key,
-                slot,
-                connection,
-            }),
-            Err(error) => {
-                self.remove_slot(&key, &slot).await;
-                Err(error)
-            }
-        }
+        })
     }
 
     pub(crate) async fn is_current(&self, prepared: &PreparedConnection) -> bool {
@@ -250,77 +279,91 @@ impl RemoteManager {
         target: &str,
         route: &[TargetDefinition],
         workspace: &Path,
-    ) -> Result<PooledConnection, RemoteError> {
-        let config = SshConfig::create(route, self.inner.prompts.clone()).await?;
-        let destination = config.destination.clone();
-        let probe = run_ssh_output(&config, &destination, "uname -s; uname -m").await?;
-        let mut lines = probe.lines();
-        let os = lines.next().ok_or(RemoteError::InvalidProbe)?.trim();
-        let arch = lines.next().ok_or(RemoteError::InvalidProbe)?.trim();
-        let shim = self.inner.catalog.find(arch, os).ok_or_else(|| {
-            if self.inner.catalog.is_empty() {
-                RemoteError::MissingShims
-            } else {
-                RemoteError::UnsupportedPlatform {
-                    arch: arch.to_owned(),
-                    os: os.to_owned(),
-                }
+    ) -> Result<Session, RemoteError> {
+        let destination = route.last().ok_or(RemoteError::EmptyRoute)?;
+        let (origin, hops) = if destination.origin == crate::target::ROOT_TARGET {
+            (None, route)
+        } else {
+            let index = route
+                .iter()
+                .position(|hop| hop.name == destination.origin)
+                .ok_or_else(|| RemoteError::Protocol("origin missing from route".into()))?;
+            let definitions = route[..=index].to_vec();
+            let identity = RouteIdentity {
+                destination: destination.origin.clone(),
+                hops: definitions
+                    .iter()
+                    .map(|h| (h.name.clone(), h.revision))
+                    .collect(),
+            };
+            let cancellation = CancellationToken::new();
+            let prepared = self
+                .connection(
+                    ResolvedRoute {
+                        identity,
+                        definitions,
+                    },
+                    &route[index].workspace,
+                    &cancellation,
+                )
+                .await?;
+            (Some(prepared.connection), &route[index + 1..])
+        };
+        let environment = if origin.is_none() {
+            self.environment().await?
+        } else {
+            Default::default()
+        };
+        match destination.r#type {
+            crate::target::TargetType::Ssh => {
+                let backend = super::ssh::SshLauncher {
+                    origin,
+                    route: hops.to_vec(),
+                    environment,
+                    prompts: self.inner.prompts.clone(),
+                };
+                let transport = backend
+                    .connect(destination, workspace, &self.inner.catalog)
+                    .await?;
+                Ok(Arc::new(
+                    PooledConnection::from_transport(
+                        transport,
+                        target,
+                        self.inner.authorization.clone(),
+                        self.inner.prompts.clone(),
+                    )
+                    .await?,
+                ))
             }
-        })?;
-        let remote_path = ensure_shim(&config, &destination, &shim).await?;
-        let target_workspace = &route.last().ok_or(RemoteError::EmptyRoute)?.workspace;
-        let workspace = workspace.to_string_lossy();
-        let remote_command = format!(
-            "r=$(cd -- {} && pwd -P) && cd -- {} && exec \"$HOME/{}\" --serve \"$r\"",
-            shell_quote(&target_workspace.to_string_lossy()),
-            shell_quote(&workspace),
-            remote_path,
-        );
-        let mut command = ssh_command(&config, &destination);
-        command
-            .arg(remote_command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command.spawn().map_err(RemoteError::start)?;
-        let mut input = child
-            .stdin
-            .take()
-            .ok_or(RemoteError::MissingPipe("stdin"))?;
-        let mut output = child
-            .stdout
-            .take()
-            .ok_or(RemoteError::MissingPipe("stdout"))?;
-        if let Some(mut stderr) = child.stderr.take() {
-            tokio::spawn(async move {
-                let mut diagnostics = Vec::new();
-                let _ = stderr.read_to_end(&mut diagnostics).await;
-                if !diagnostics.is_empty() {
-                    eprintln!(
-                        "remote shim: {}",
-                        String::from_utf8_lossy(&diagnostics).trim()
-                    );
-                }
-            });
+            crate::target::TargetType::Local => Err(RemoteError::Target(TargetError::BuiltinOnly)),
         }
+    }
+}
+
+impl PooledConnection {
+    async fn from_transport(
+        transport: super::transport::Transport,
+        target: &str,
+        authorization: AuthorizationCoordinator,
+        prompts: Arc<dyn SensitivePromptHandler>,
+    ) -> Result<Self, RemoteError> {
+        let super::transport::Transport {
+            mut input,
+            mut output,
+            owner,
+        } = transport;
         write_frame(&mut input, &Request::Hello).await?;
-        match read_frame::<_, Response>(&mut output).await? {
-            Some(Response::Ready) => {}
-            Some(response) => {
-                return Err(RemoteError::Protocol(format!(
-                    "unexpected handshake: {response:?}"
-                )));
-            }
-            None => {
-                return Err(RemoteError::Protocol(
-                    "shim closed during handshake".to_owned(),
-                ));
-            }
+        if !matches!(
+            read_frame::<_, Response>(&mut output).await?,
+            Some(Response::Ready)
+        ) {
+            return Err(RemoteError::Protocol("invalid shim handshake".into()));
         }
         let state = Arc::new(Mutex::new(ConnectionState {
             pending: HashMap::new(),
             failure: None,
+            resolutions: HashMap::new(),
+            streams: HashMap::new(),
         }));
         let writer = Arc::new(Mutex::new(RequestWriter {
             input,
@@ -328,23 +371,22 @@ impl RemoteManager {
         }));
         let reader_state = state.clone();
         let reader_writer = writer.clone();
-        let reader_authorization = self.inner.authorization.clone();
         let reader_target = target.to_owned();
         let reader = tokio::spawn(async move {
             route_responses(
                 output,
                 &reader_state,
-                Some((&reader_writer, &reader_authorization)),
+                Some((&reader_writer, &authorization)),
                 reader_target,
+                Some(prompts),
             )
             .await;
         });
         Ok(PooledConnection {
             writer,
             state,
-            child: Mutex::new(child),
+            _owner: std::sync::Mutex::new(owner),
             reader,
-            _config: config.directory,
         })
     }
 }
@@ -436,12 +478,20 @@ async fn send_cancel(connection: &PooledConnection, request_id: u64) -> Result<(
 async fn route_responses<R>(
     mut output: R,
     state: &Mutex<ConnectionState>,
-    host: Option<(&Mutex<RequestWriter>, &AuthorizationCoordinator)>,
+    host: Option<(&Arc<Mutex<RequestWriter>>, &AuthorizationCoordinator)>,
     target: String,
+    prompts: Option<Arc<dyn SensitivePromptHandler>>,
 ) where
     R: AsyncRead + Unpin,
 {
+    let mut callbacks = tokio::task::JoinSet::new();
+    let mut prompt_tasks = HashMap::<u64, tokio::task::AbortHandle>::new();
     loop {
+        while let Some(result) = callbacks.try_join_next() {
+            if let Ok(id) = result {
+                prompt_tasks.remove(&id);
+            }
+        }
         let response = match read_frame::<_, Response>(&mut output).await {
             Ok(Some(response)) => response,
             Ok(None) => {
@@ -458,6 +508,88 @@ async fn route_responses<R>(
             }
         };
         match response {
+            Response::SensitiveCancelled { prompt_id } => {
+                if let Some(task) = prompt_tasks.remove(&prompt_id) {
+                    task.abort();
+                }
+            }
+            Response::ResolvedSsh { request_id, result } => {
+                if let Some(sender) = state.lock().await.resolutions.remove(&request_id) {
+                    let _ = sender.send(result.map_err(RemoteError::Resolution));
+                }
+            }
+            Response::StreamData { channel, data } => {
+                let invalid = data.len() > 32 * 1024;
+                let overflow = {
+                    let state = state.lock().await;
+                    state
+                        .streams
+                        .get(&channel)
+                        .is_some_and(|sender| sender.output.try_send(Ok(data)).is_err())
+                };
+                if invalid || overflow {
+                    fail_connection(
+                        state,
+                        RemoteError::Protocol(
+                            "invalid stream output or flow-control overflow".into(),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+            Response::StreamClosed { channel, error } => {
+                if let Some(sender) = state.lock().await.streams.remove(&channel)
+                    && let Some(error) = error
+                {
+                    let _ = sender.output.try_send(Err(RemoteError::Ssh(error)));
+                }
+            }
+            Response::StreamAck { channel } => {
+                let invalid = {
+                    let state = state.lock().await;
+                    state.streams.get(&channel).is_some_and(|stream| {
+                        if stream.credit.available_permits() >= 16 {
+                            true
+                        } else {
+                            stream.credit.add_permits(1);
+                            false
+                        }
+                    })
+                };
+                if invalid {
+                    fail_connection(state, RemoteError::Protocol("invalid stream credit".into()))
+                        .await;
+                    return;
+                }
+            }
+            Response::SensitivePrompt {
+                prompt_id,
+                mut prompt,
+            } => {
+                prompt.message = format!("[origin={target}] {}", prompt.message);
+                if let Some((writer, _)) = host {
+                    let writer = writer.clone();
+                    let prompts = prompts.clone();
+                    let task = callbacks.spawn(async move {
+                        let answer = if let Some(prompts) = prompts {
+                            match prompts.prompt(prompt).await {
+                                Ok(value) => super::askpass::PromptAnswer::Accepted(value),
+                                Err(_) => super::askpass::PromptAnswer::Rejected,
+                            }
+                        } else {
+                            super::askpass::PromptAnswer::Rejected
+                        };
+                        let _ = write_frame(
+                            &mut writer.lock().await.input,
+                            &Request::SensitiveAnswer { prompt_id, answer },
+                        )
+                        .await;
+                        prompt_id
+                    });
+                    prompt_tasks.insert(prompt_id, task);
+                }
+            }
             Response::Tool { request_id, result } => {
                 let pending = state.lock().await.pending.remove(&request_id);
                 let Some(pending) = pending else {
@@ -594,6 +726,10 @@ async fn fail_connection(state: &Mutex<ConnectionState>, failure: RemoteError) {
             return;
         }
         state.failure = Some(failure.clone());
+        for (_, sender) in state.resolutions.drain() {
+            let _ = sender.send(Err(failure.clone()));
+        }
+        state.streams.clear();
         std::mem::take(&mut state.pending)
     };
     for pending in pending.into_values() {
@@ -604,13 +740,14 @@ async fn fail_connection(state: &Mutex<ConnectionState>, failure: RemoteError) {
 impl Drop for PooledConnection {
     fn drop(&mut self) {
         self.reader.abort();
-        let _ = self.child.get_mut().start_kill();
     }
 }
 
 #[cfg(test)]
 pub(crate) async fn test_connection() -> PooledConnection {
     let directory = tempfile::tempdir().unwrap();
+    use std::process::Stdio;
+    use tokio::process::Command;
     let mut child = Command::new("sh")
         .args(["-c", "sleep 60"])
         .stdin(Stdio::piped())
@@ -621,302 +758,18 @@ pub(crate) async fn test_connection() -> PooledConnection {
     let input = child.stdin.take().unwrap();
     PooledConnection {
         writer: Arc::new(Mutex::new(RequestWriter {
-            input,
+            input: Box::new(input),
             next_request_id: 1,
         })),
         state: Arc::new(Mutex::new(ConnectionState {
             pending: HashMap::new(),
             failure: None,
+            resolutions: HashMap::new(),
+            streams: HashMap::new(),
         })),
-        child: Mutex::new(child),
+        _owner: std::sync::Mutex::new(Box::new((child, directory))),
         reader: tokio::spawn(std::future::pending()),
-        _config: directory,
     }
-}
-
-struct SshConfig {
-    directory: tempfile::TempDir,
-    path: std::path::PathBuf,
-    destination: String,
-    askpass: super::askpass::AskpassServer,
-}
-
-impl SshConfig {
-    async fn create(
-        route: &[TargetDefinition],
-        prompts: Arc<dyn SensitivePromptHandler>,
-    ) -> Result<Self, RemoteError> {
-        if route.is_empty() {
-            return Err(RemoteError::EmptyRoute);
-        }
-        let directory = tempfile::Builder::new().prefix("skyhook-ssh-").tempdir()?;
-        let path = directory.path().join("config");
-        let source_path = directory.path().join("user-config");
-        {
-            let mut source = std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&source_path)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                source.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            }
-            writeln!(source, "Include ~/.ssh/config")?;
-            source.flush()?;
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        let mut previous = None::<String>;
-        for (index, target) in route.iter().enumerate() {
-            let alias = format!("skyhook-target-{index}");
-            let resolved = resolve_openssh(target, &source_path).await?;
-            writeln!(file, "Host {alias}")?;
-            writeln!(file, "  HostName {}", ssh_token(&resolved.host)?)?;
-            writeln!(file, "  User {}", ssh_token(&resolved.user)?)?;
-            writeln!(file, "  Port {}", resolved.port)?;
-            writeln!(file, "  HostKeyAlias {}", ssh_token(&resolved.host)?)?;
-            if let Some(previous) = &previous {
-                writeln!(file, "  ProxyJump {previous}")?;
-            } else if route.len() == 1 {
-                if let Some(proxy_jump) = &resolved.proxy_jump {
-                    writeln!(file, "  ProxyJump {}", ssh_token(proxy_jump)?)?;
-                } else if let Some(proxy_command) = &resolved.proxy_command {
-                    writeln!(file, "  ProxyCommand {proxy_command}")?;
-                }
-            }
-            write_auth(&mut file, target, &resolved)?;
-            writeln!(file, "  LogLevel ERROR")?;
-            previous = Some(alias);
-        }
-        writeln!(file, "Host *\n  Include ~/.ssh/config")?;
-        file.flush()?;
-        let allow_secrets = route
-            .iter()
-            .any(|target| target.auth.permits_secret_prompt());
-        let askpass = super::askpass::AskpassServer::start(prompts, allow_secrets)?;
-        Ok(Self {
-            directory,
-            path,
-            destination: previous.expect("nonempty route"),
-            askpass,
-        })
-    }
-}
-
-struct ResolvedSsh {
-    host: String,
-    user: String,
-    port: u16,
-    identity_files: Vec<String>,
-    identity_agent: Option<String>,
-    proxy_jump: Option<String>,
-    proxy_command: Option<String>,
-}
-
-async fn resolve_openssh(
-    target: &TargetDefinition,
-    source_config: &Path,
-) -> Result<ResolvedSsh, RemoteError> {
-    let mut command = Command::new("ssh");
-    command.arg("-G").arg("-F").arg(source_config);
-    if let Some(user) = &target.user {
-        command.args(["-l", user]);
-    }
-    if let Some(port) = target.port {
-        command.args(["-p", &port.to_string()]);
-    }
-    command
-        .arg("--")
-        .arg(&target.host)
-        .stdin(Stdio::null())
-        .stderr(Stdio::piped())
-        .stdout(Stdio::piped())
-        .kill_on_drop(true);
-    let output = command.output().await.map_err(RemoteError::start)?;
-    if !output.status.success() {
-        return Err(RemoteError::Resolution(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ));
-    }
-    let mut host = None;
-    let mut user = None;
-    let mut port = None;
-    let mut identity_files = Vec::new();
-    let mut identity_agent = None;
-    let mut proxy_jump = None;
-    let mut proxy_command = None;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Some((key, value)) = line.split_once(' ') else {
-            continue;
-        };
-        match key {
-            "hostname" => host = Some(value.to_owned()),
-            "user" => user = Some(value.to_owned()),
-            "port" => port = value.parse().ok(),
-            "identityfile" => identity_files.push(value.to_owned()),
-            "identityagent" if value != "none" => identity_agent = Some(value.to_owned()),
-            "proxyjump" if value != "none" => proxy_jump = Some(value.to_owned()),
-            "proxycommand" if value != "none" => proxy_command = Some(value.to_owned()),
-            _ => {}
-        }
-    }
-    Ok(ResolvedSsh {
-        host: host.ok_or_else(|| RemoteError::Resolution("ssh -G omitted hostname".to_owned()))?,
-        user: user.ok_or_else(|| RemoteError::Resolution("ssh -G omitted user".to_owned()))?,
-        port: port.ok_or_else(|| RemoteError::Resolution("ssh -G omitted port".to_owned()))?,
-        identity_files,
-        identity_agent,
-        proxy_jump,
-        proxy_command,
-    })
-}
-
-fn write_auth(
-    file: &mut std::fs::File,
-    target: &TargetDefinition,
-    resolved: &ResolvedSsh,
-) -> Result<(), RemoteError> {
-    match &target.auth {
-        TargetAuth::Openssh => {
-            writeln!(file, "  BatchMode yes")?;
-            for path in &resolved.identity_files {
-                writeln!(file, "  IdentityFile {}", ssh_token(path)?)?;
-            }
-            if let Some(agent) = &resolved.identity_agent {
-                writeln!(file, "  IdentityAgent {}", ssh_token(agent)?)?;
-            }
-        }
-        TargetAuth::Agent => {
-            writeln!(
-                file,
-                "  BatchMode yes\n  IdentityFile none\n  IdentityAgent SSH_AUTH_SOCK\n  PreferredAuthentications publickey\n  PasswordAuthentication no\n  KbdInteractiveAuthentication no"
-            )?;
-        }
-        TargetAuth::Key { path } => {
-            writeln!(
-                file,
-                "  BatchMode yes\n  IdentityFile {}\n  IdentitiesOnly yes\n  PreferredAuthentications publickey",
-                ssh_token(&path.to_string_lossy())?
-            )?;
-        }
-        TargetAuth::Interactive { path } => {
-            writeln!(file, "  BatchMode no")?;
-            if let Some(path) = path {
-                writeln!(
-                    file,
-                    "  IdentityFile {}\n  IdentitiesOnly yes",
-                    ssh_token(&path.to_string_lossy())?
-                )?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn ssh_command(config: &SshConfig, destination: &str) -> Command {
-    let mut command = Command::new("ssh");
-    command
-        .args(["-F"])
-        .arg(&config.path)
-        .args(["-T", "--", destination]);
-    if let Ok(executable) = std::env::current_exe() {
-        command
-            .env("SSH_ASKPASS", executable)
-            .env("SSH_ASKPASS_REQUIRE", "force")
-            .env("SKYHOOK_ASKPASS_SOCKET", &config.askpass.socket)
-            .env("DISPLAY", "skyhook");
-    }
-    command
-}
-
-async fn run_ssh_output(
-    config: &SshConfig,
-    destination: &str,
-    remote: &str,
-) -> Result<String, RemoteError> {
-    let mut command = ssh_command(config, destination);
-    command
-        .arg(remote)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let output = command.output().await.map_err(RemoteError::start)?;
-    if !output.status.success() {
-        return Err(RemoteError::Ssh(format!(
-            "SSH exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-async fn ensure_shim(
-    config: &SshConfig,
-    destination: &str,
-    shim: &EmbeddedShim,
-) -> Result<String, RemoteError> {
-    let hash = shim.sha256();
-    let name = shim.installed_name();
-    let directory = format!(".cache/skyhook/shims/{hash}");
-    let path = format!("{directory}/{name}");
-    let check = format!("test -x \"$HOME/{path}\" && \"$HOME/{path}\" --self-check {hash}");
-    if run_ssh_output(config, destination, &check).await.is_ok() {
-        return Ok(path);
-    }
-    let mut random = [0_u8; 8];
-    getrandom::fill(&mut random).map_err(|error| RemoteError::Deployment(error.to_string()))?;
-    let temporary = format!("{directory}/.upload-{:016x}", u64::from_ne_bytes(random));
-    let remote = format!(
-        "umask 077; d=\"$HOME/{directory}\"; t=\"$HOME/{temporary}\"; mkdir -p \"$d\" && trap 'rm -f \"$t\"' EXIT HUP INT TERM && cat > \"$t\" && chmod 700 \"$t\" && \"$t\" --self-check {hash} && mv -f \"$t\" \"$HOME/{path}\""
-    );
-    let mut command = ssh_command(config, destination);
-    command
-        .arg(remote)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command.spawn().map_err(RemoteError::start)?;
-    let mut input = child
-        .stdin
-        .take()
-        .ok_or(RemoteError::MissingPipe("deployment stdin"))?;
-    input.write_all(&shim.bytes).await?;
-    input.shutdown().await?;
-    drop(input);
-    let output = child.wait_with_output().await?;
-    if !output.status.success() {
-        return Err(RemoteError::Deployment(format!(
-            "upload exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(path)
-}
-
-fn ssh_token(value: &str) -> Result<String, RemoteError> {
-    if value.is_empty() || value.chars().any(char::is_control) {
-        return Err(RemoteError::InvalidSshValue);
-    }
-    Ok(format!(
-        "\"{}\"",
-        value.replace('\\', "\\\\").replace('"', "\\\"")
-    ))
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[derive(Clone, Debug, Error)]
@@ -931,18 +784,18 @@ pub enum RemoteError {
     MissingShims,
     #[error("unsupported remote platform {arch}-{os}: no matching shim is embedded")]
     UnsupportedPlatform { arch: String, os: String },
-    #[error("could not start SSH: {message}")]
+    #[error("could not start transport process: {message}")]
     Start {
         kind: std::io::ErrorKind,
         message: String,
     },
     #[error("SSH configuration resolution failed: {0}")]
     Resolution(String),
-    #[error("SSH target connection was denied: {0}")]
+    #[error("target connection was denied: {0}")]
     ApprovalDenied(String),
-    #[error("SSH target connection returned an invalid approval grant: {0}")]
+    #[error("target connection returned an invalid approval grant: {0}")]
     ApprovalInvalidGrant(String),
-    #[error("SSH target connection requires an unavailable capability")]
+    #[error("target connection requires an unavailable capability")]
     ApprovalUnavailable,
     #[error("target connection was cancelled")]
     Cancelled,
@@ -988,7 +841,7 @@ impl RemoteError {
         }
     }
 
-    fn start(error: std::io::Error) -> Self {
+    pub(crate) fn start(error: std::io::Error) -> Self {
         Self::Start {
             kind: error.kind(),
             message: error.to_string(),
@@ -1084,6 +937,8 @@ mod tests {
         let state = Arc::new(Mutex::new(ConnectionState {
             pending: HashMap::new(),
             failure: None,
+            resolutions: HashMap::new(),
+            streams: HashMap::new(),
         }));
         let (first_sender, first) = oneshot::channel();
         let (second_sender, second) = oneshot::channel();
@@ -1106,7 +961,7 @@ mod tests {
         }
         let reader_state = state.clone();
         let reader = tokio::spawn(async move {
-            route_responses(stream, &reader_state, None, "test".to_owned()).await;
+            route_responses(stream, &reader_state, None, "test".to_owned(), None).await;
         });
 
         write_frame(
@@ -1140,6 +995,8 @@ mod tests {
         let state = Arc::new(Mutex::new(ConnectionState {
             pending: HashMap::new(),
             failure: None,
+            resolutions: HashMap::new(),
+            streams: HashMap::new(),
         }));
         let (sender, receiver) = oneshot::channel();
         state.lock().await.pending.insert(
@@ -1151,7 +1008,7 @@ mod tests {
         );
         let reader_state = state.clone();
         let reader = tokio::spawn(async move {
-            route_responses(stream, &reader_state, None, "test".to_owned()).await;
+            route_responses(stream, &reader_state, None, "test".to_owned(), None).await;
         });
 
         write_frame(
@@ -1178,6 +1035,8 @@ mod tests {
         let state = Arc::new(Mutex::new(ConnectionState {
             pending: HashMap::new(),
             failure: None,
+            resolutions: HashMap::new(),
+            streams: HashMap::new(),
         }));
         let (sender, receiver) = oneshot::channel();
         state.lock().await.pending.insert(
@@ -1189,7 +1048,7 @@ mod tests {
         );
         let reader_state = state.clone();
         let reader = tokio::spawn(async move {
-            route_responses(stream, &reader_state, None, "test".to_owned()).await;
+            route_responses(stream, &reader_state, None, "test".to_owned(), None).await;
         });
 
         drop(peer);
@@ -1202,3 +1061,186 @@ mod tests {
         reader.await.unwrap();
     }
 }
+
+#[async_trait::async_trait]
+impl TargetSession for PooledConnection {
+    async fn execute(
+        &self,
+        name: String,
+        arguments: serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<ToolOutput, RemoteError> {
+        call_tool(self, name, arguments, context).await
+    }
+    async fn resolve_ssh(
+        &self,
+        target: TargetDefinition,
+    ) -> Result<super::ssh::ResolvedSsh, RemoteError> {
+        let (sender, receiver) = oneshot::channel();
+        let mut writer = self.writer.lock().await;
+        let request_id = writer.next_request_id;
+        writer.next_request_id = request_id
+            .checked_add(1)
+            .ok_or_else(|| RemoteError::Protocol("request IDs exhausted".into()))?;
+        self.state
+            .lock()
+            .await
+            .resolutions
+            .insert(request_id, sender);
+        write_frame(
+            &mut writer.input,
+            &Request::ResolveSsh {
+                request_id,
+                target: Box::new(target),
+            },
+        )
+        .await?;
+        drop(writer);
+        receiver
+            .await
+            .map_err(|_| RemoteError::Protocol("configuration channel closed".into()))?
+    }
+    async fn open_ssh(
+        self: Arc<Self>,
+        route: Vec<TargetDefinition>,
+        command: String,
+    ) -> Result<super::transport::Transport, RemoteError> {
+        self.open_stream(route, command).await
+    }
+}
+impl PreparedConnection {
+    pub(crate) async fn resolve_ssh(
+        &self,
+        target: TargetDefinition,
+    ) -> Result<super::ssh::ResolvedSsh, RemoteError> {
+        self.connection.resolve_ssh(target).await
+    }
+}
+
+struct StreamOwner {
+    parent: Arc<PooledConnection>,
+    channel: u64,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+impl Drop for StreamOwner {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        let parent = self.parent.clone();
+        let channel = self.channel;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                parent.state.lock().await.streams.remove(&channel);
+                let _ = write_frame(
+                    &mut parent.writer.lock().await.input,
+                    &Request::StreamClose { channel },
+                )
+                .await;
+            });
+        }
+    }
+}
+impl PooledConnection {
+    async fn open_stream(
+        self: &Arc<Self>,
+        route: Vec<TargetDefinition>,
+        command: String,
+    ) -> Result<super::transport::Transport, RemoteError> {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
+        let mut writer = self.writer.lock().await;
+        let channel = writer.next_request_id;
+        writer.next_request_id = channel
+            .checked_add(1)
+            .ok_or_else(|| RemoteError::Protocol("request IDs exhausted".into()))?;
+        let credit = Arc::new(tokio::sync::Semaphore::new(16));
+        self.state.lock().await.streams.insert(
+            channel,
+            ClientStream {
+                output: sender,
+                credit: credit.clone(),
+            },
+        );
+        write_frame(
+            &mut writer.input,
+            &Request::OpenSsh {
+                channel,
+                route,
+                command,
+            },
+        )
+        .await?;
+        drop(writer);
+        let (client, peer) = tokio::io::duplex(64 * 1024);
+        let (mut input, mut output) = tokio::io::split(peer);
+        let parent = self.clone();
+        let write_task = tokio::spawn(async move {
+            let mut bytes = vec![0; 32 * 1024];
+            while let Ok(count) = input.read(&mut bytes).await {
+                let Ok(permit) = credit.acquire().await else {
+                    break;
+                };
+                permit.forget();
+                let request = if count == 0 {
+                    Request::StreamEnd { channel }
+                } else {
+                    Request::StreamData {
+                        channel,
+                        data: bytes[..count].to_vec(),
+                    }
+                };
+                if write_frame(&mut parent.writer.lock().await.input, &request)
+                    .await
+                    .is_err()
+                    || count == 0
+                {
+                    break;
+                }
+            }
+        });
+        let parent = self.clone();
+        let failure = Arc::new(std::sync::Mutex::new(None));
+        let read_failure = failure.clone();
+        let read_task = tokio::spawn(async move {
+            while let Some(result) = receiver.recv().await {
+                let bytes = match result {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        *read_failure
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(error.to_string());
+                        break;
+                    }
+                };
+                if output.write_all(&bytes).await.is_err() {
+                    break;
+                }
+                if write_frame(
+                    &mut parent.writer.lock().await.input,
+                    &Request::StreamAck { channel },
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+            let _ = output.shutdown().await;
+        });
+        let (output, input) = tokio::io::split(client);
+        Ok(super::transport::Transport {
+            input: Box::new(input),
+            output: Box::new(super::transport::RelayedReader { output, failure }),
+            owner: Box::new(StreamOwner {
+                parent: self.clone(),
+                channel,
+                tasks: vec![write_task.abort_handle(), read_task.abort_handle()],
+            }),
+        })
+    }
+}
+
+#[cfg(test)]
+#[path = "integration.rs"]
+mod integration;

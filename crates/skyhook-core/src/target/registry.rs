@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-use super::{TargetAuth, TargetConfig};
+use super::{SshOptions, TargetConfig, TargetType};
 
 pub const ROOT_TARGET: &str = "root";
 
@@ -25,14 +25,17 @@ pub enum TargetSource {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct TargetDefinition {
     pub name: String,
+    pub r#type: TargetType,
     pub host: String,
-    pub user: Option<String>,
-    pub port: Option<u16>,
+    pub origin: String,
+    pub ssh: SshOptions,
+    pub ssh_alias: String,
+    pub resolved: Option<crate::remote::ssh::ResolvedSsh>,
     pub workspace: PathBuf,
     pub via: Option<String>,
-    pub auth: TargetAuth,
     pub source: TargetSource,
     pub revision: u64,
+    pub generated_key: Option<String>,
 }
 
 impl TargetDefinition {
@@ -42,20 +45,26 @@ impl TargetDefinition {
         source: TargetSource,
     ) -> Result<Self, TargetError> {
         validate_name(&name)?;
-        validate_endpoint(&config.host, config.user.as_deref())?;
+        validate_endpoint(&config.host, config.ssh.user.as_deref())?;
+        if config.ssh.port == Some(0) {
+            return Err(TargetError::InvalidPort);
+        }
         if config.via.as_deref() == Some(ROOT_TARGET) {
             return Err(TargetError::RootCannotBeJump);
         }
         Ok(Self {
             name,
+            r#type: config.r#type.into(),
+            ssh_alias: config.host.clone(),
             host: config.host,
-            user: config.user,
-            port: config.port,
+            origin: ROOT_TARGET.to_owned(),
+            ssh: config.ssh,
+            resolved: None,
             workspace: config.workspace,
             via: config.via,
-            auth: config.auth,
             source,
             revision: 1,
+            generated_key: None,
         })
     }
 
@@ -64,12 +73,11 @@ impl TargetDefinition {
         Self::from_config(
             name.to_owned(),
             TargetConfig {
+                r#type: super::TargetConfigType::Ssh,
                 host: format!("{name}.example.com"),
-                user: None,
-                port: None,
+                ssh: SshOptions::default(),
                 workspace: workspace.into(),
                 via: via.map(str::to_owned),
-                auth: TargetAuth::Openssh,
             },
             TargetSource::Config,
         )
@@ -80,6 +88,10 @@ impl TargetDefinition {
 #[derive(Clone, Debug, JsonSchema, Serialize, PartialEq, Eq)]
 pub struct TargetRecord {
     pub name: String,
+    /// local identifies the Skyhook session host; ssh identifies a remote target.
+    pub r#type: TargetType,
+    pub origin: String,
+    pub ssh_alias: Option<String>,
     pub source: TargetSource,
     pub host: String,
     pub user: Option<String>,
@@ -93,13 +105,20 @@ impl From<&TargetDefinition> for TargetRecord {
     fn from(value: &TargetDefinition) -> Self {
         Self {
             name: value.name.clone(),
+            r#type: value.r#type,
+            origin: value.origin.clone(),
+            ssh_alias: Some(value.ssh_alias.clone()),
             source: value.source,
             host: value.host.clone(),
-            user: value.user.clone(),
-            port: value.port,
+            user: value
+                .resolved
+                .as_ref()
+                .map(|r| r.user.clone())
+                .or_else(|| value.ssh.user.clone()),
+            port: value.resolved.as_ref().map(|r| r.port).or(value.ssh.port),
             workspace: value.workspace.clone(),
             via: value.via.clone(),
-            auth: value.auth.kind(),
+            auth: value.ssh.auth.kind(),
         }
     }
 }
@@ -126,6 +145,9 @@ impl TargetRegistry {
     pub async fn list(&self) -> Vec<TargetRecord> {
         let mut records = vec![TargetRecord {
             name: ROOT_TARGET.to_owned(),
+            r#type: TargetType::Local,
+            origin: ROOT_TARGET.to_owned(),
+            ssh_alias: None,
             source: TargetSource::Builtin,
             host: "localhost".to_owned(),
             user: None,
@@ -160,26 +182,49 @@ impl TargetRegistry {
         Ok(route)
     }
 
+    pub async fn definitions(&self) -> Vec<TargetDefinition> {
+        self.entries.read().await.values().cloned().collect()
+    }
+
     pub async fn upsert(
         &self,
-        mut definition: TargetDefinition,
+        definition: TargetDefinition,
     ) -> Result<(TargetDefinition, Vec<String>), TargetError> {
-        definition.source = TargetSource::Session;
+        let name = definition.name.clone();
+        let (definitions, invalidated) = self.upsert_many(vec![definition]).await?;
+        Ok((
+            definitions
+                .into_iter()
+                .find(|d| d.name == name)
+                .expect("upserted target"),
+            invalidated,
+        ))
+    }
+
+    pub async fn upsert_many(
+        &self,
+        definitions: Vec<TargetDefinition>,
+    ) -> Result<(Vec<TargetDefinition>, Vec<String>), TargetError> {
         let mut entries = self.entries.write().await;
-        definition.revision = entries
-            .get(&definition.name)
-            .map_or(1, |previous| previous.revision.saturating_add(1));
-        let old = entries.insert(definition.name.clone(), definition.clone());
-        if let Err(error) = validate_graph(&entries) {
-            if let Some(old) = old {
-                entries.insert(definition.name.clone(), old);
-            } else {
-                entries.remove(&definition.name);
-            }
-            return Err(error);
+        let mut next = entries.clone();
+        let mut saved = Vec::new();
+        for mut definition in definitions {
+            definition.source = TargetSource::Session;
+            definition.revision = entries
+                .get(&definition.name)
+                .map_or(1, |old| old.revision.saturating_add(1));
+            next.insert(definition.name.clone(), definition.clone());
+            saved.push(definition);
         }
-        let invalidated = dependants(&entries, &definition.name);
-        Ok((definition, invalidated))
+        validate_graph(&next)?;
+        let invalidated = saved
+            .iter()
+            .flat_map(|d| dependants(&next, &d.name))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        *entries = next;
+        Ok((saved, invalidated))
     }
 }
 
@@ -196,7 +241,36 @@ fn dependants(entries: &BTreeMap<String, TargetDefinition>, changed: &str) -> Ve
 
 fn validate_graph(entries: &BTreeMap<String, TargetDefinition>) -> Result<(), TargetError> {
     for name in entries.keys() {
-        walk_route(entries, name, TargetError::UnknownJump)?;
+        let route = walk_route(entries, name, TargetError::UnknownJump)?;
+        let target = &entries[name];
+        validate_name(&target.name)?;
+        if target.r#type != TargetType::Ssh {
+            return Err(TargetError::BuiltinOnly);
+        }
+        validate_endpoint(&target.host, target.ssh.user.as_deref())?;
+        if target.ssh.port == Some(0) {
+            return Err(TargetError::InvalidPort);
+        }
+        for hop in route
+            .iter()
+            .skip(1)
+            .take_while(|hop| hop.name != target.origin)
+        {
+            if hop.origin != target.origin {
+                return Err(TargetError::Origin(format!(
+                    "jump {} uses configuration on {}; select origin {} for a shim-owned continuation, or define a jump using configuration on {}",
+                    hop.name, hop.origin, hop.name, target.origin
+                )));
+            }
+        }
+        if target.origin != ROOT_TARGET
+            && !route.iter().skip(1).any(|hop| hop.name == target.origin)
+        {
+            return Err(TargetError::Origin(format!(
+                "{} must occur before {} in its via route",
+                target.origin, target.name
+            )));
+        }
     }
     Ok(())
 }
@@ -259,10 +333,16 @@ fn validate_endpoint(host: &str, user: Option<&str>) -> Result<(), TargetError> 
 
 #[derive(Clone, Debug, Error)]
 pub enum TargetError {
+    #[error("only the session host root may use type = local; named targets require type = ssh")]
+    BuiltinOnly,
+    #[error("invalid target origin: {0}")]
+    Origin(String),
     #[error("invalid target name `{0}`")]
     InvalidName(String),
     #[error("invalid target hostname `{0}`")]
     InvalidHost(String),
+    #[error("SSH port must be between 1 and 65535")]
+    InvalidPort,
     #[error("invalid SSH username")]
     InvalidUser,
     #[error("unknown target `{0}`")]
@@ -271,7 +351,7 @@ pub enum TargetError {
     UnknownJump(String),
     #[error("target route contains a cycle at `{0}`")]
     Cycle(String),
-    #[error("`root` is local and is not an SSH target")]
+    #[error("`root` identifies the Skyhook session host")]
     RootIsLocal,
     #[error("`root` cannot be used as a jump target")]
     RootCannotBeJump,
@@ -316,12 +396,37 @@ mod tests {
     #[tokio::test]
     async fn records_redact_key_paths() {
         let mut value = target("build", None);
-        value.auth = TargetAuth::Key {
+        value.ssh.auth = super::super::TargetAuth::Key {
             path: PathBuf::from("secret-key"),
         };
         let registry = TargetRegistry::from_definitions([value]).unwrap();
         let json = serde_json::to_string(&registry.list().await).unwrap();
         assert!(!json.contains("secret-key"));
         assert!(json.contains("\"auth\":\"key\""));
+    }
+    #[tokio::test]
+    async fn batch_registration_is_atomic_and_validates_origins() {
+        let registry = TargetRegistry::from_definitions([target("first", None)]).unwrap();
+        let before = registry.definitions().await;
+        let mut invalid = target("invalid", None);
+        invalid.origin = "first".into();
+        assert!(
+            registry
+                .upsert_many(vec![target("added", None), invalid])
+                .await
+                .is_err()
+        );
+        assert_eq!(registry.definitions().await, before);
+    }
+    #[test]
+    fn native_segments_cannot_silently_reinterpret_remote_credential_paths() {
+        let first = target("first", None);
+        let mut remote = target("remote", Some("first"));
+        remote.origin = "first".into();
+        let invalid = target("destination", Some("remote"));
+        assert!(matches!(
+            TargetRegistry::from_definitions([first, remote, invalid]),
+            Err(TargetError::Origin(_))
+        ));
     }
 }

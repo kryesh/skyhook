@@ -56,8 +56,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    if let Some(socket) = std::env::var_os("SKYHOOK_ASKPASS_SOCKET") {
-        let prompt = std::env::args().nth(1).unwrap_or_default();
+    if std::env::args().nth(1).as_deref() == Some("--askpass") {
+        let Some(socket) = std::env::var_os("SKYHOOK_ASKPASS_SOCKET") else {
+            std::process::exit(1)
+        };
+        let prompt = std::env::args().nth(2).unwrap_or_default();
         if let Err(error) =
             skyhook::remote::run_askpass_helper(std::path::Path::new(&socket), prompt)
         {
@@ -83,7 +86,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if args.agent_profile.is_some() {
         config.default_agent_profile = args.agent_profile;
     }
-    let interaction = Arc::new(CliInteraction::default());
+    let interaction = Arc::new(CliInteraction::new(
+        args.prompt.is_none() && args.script.is_none(),
+    ));
     let approve_all = args.approve_all || config.approve_all;
     let builder = config
         .harness_builder(args.workspace)?
@@ -319,8 +324,9 @@ fn format_tool_call(
                 .map_or(0, Vec::len)
         ),
         "target_add" => format!(
-            "{} ({})",
+            "{} [{}] ({})",
             arg(arguments, "name").unwrap_or("<target>"),
+            arg(arguments, "type").unwrap_or("<type>"),
             arg(arguments, "host").unwrap_or("<host>")
         ),
         "skill" => match arg(arguments, "path") {

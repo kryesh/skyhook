@@ -1,17 +1,19 @@
 use std::{future::Future, pin::Pin};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SensitivePromptKind {
     Password,
     KeyboardInteractive,
     KeyPassphrase,
     HostConfirmation,
+    AgentConfirmation,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SensitivePrompt {
     pub kind: SensitivePromptKind,
     pub message: String,
@@ -60,4 +62,15 @@ pub enum SensitivePromptError {
     Cancelled,
     #[error("interactive authentication failed: {0}")]
     Failed(String),
+}
+
+impl Serialize for SecretValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.expose())
+    }
+}
+impl<'de> Deserialize<'de> for SecretValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self::new)
+    }
 }

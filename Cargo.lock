@@ -1943,6 +1943,7 @@ name = "skyhook-agent"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "mimalloc",
  "serde_json",
  "skyhook-agent-core",

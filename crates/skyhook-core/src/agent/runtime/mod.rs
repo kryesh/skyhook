@@ -6,7 +6,6 @@ use std::{
     sync::{Arc, OnceLock, RwLock as StdRwLock, Weak},
 };
 
-use base64::Engine as _;
 use futures_util::{StreamExt as _, future::join_all};
 use serde_json::json;
 use tokio::{
@@ -206,6 +205,12 @@ impl HarnessBuilder {
             .collect::<BTreeMap<_, _>>()
             .into_values()
             .collect::<Vec<_>>();
+        let target_definitions = crate::target::normalize::normalize(
+            target_definitions,
+            Vec::new(),
+            Arc::new(crate::target::normalize::LocalResolver),
+        )
+        .await?;
         TargetRegistry::from_definitions(target_definitions.clone())?;
         instructions.extend(self.instructions);
         Ok(Harness {
@@ -341,6 +346,13 @@ impl SessionHandle {
         let result = self
             .runtime
             .executor
+            .clone()
+            .with_capabilities(
+                self.runtime
+                    .harness
+                    .capabilities
+                    .for_agent(self.runtime.harness.max_child_depth),
+            )
             .execute(
                 self.root.clone(),
                 "script",
@@ -405,6 +417,8 @@ impl SessionHandle {
     }
 
     pub async fn shutdown(&self) -> Result<(), HarnessError> {
+        self.runtime.interrupt_tree(&self.root).await;
+        self.runtime.router.shutdown().await;
         self.root_tx
             .send(AgentCommand::Shutdown)
             .await
@@ -500,8 +514,8 @@ impl SessionRuntime {
             })?;
         let targets = TargetRegistry::from_definitions(definitions)?;
         for record in &prior_records {
-            if let SessionEvent::TargetUpserted { target } = &record.event {
-                targets.upsert(target.clone()).await?;
+            if let SessionEvent::TargetsUpserted { targets: restored } = &record.event {
+                targets.upsert_many(restored.clone()).await?;
             }
         }
         let authorization =
@@ -686,14 +700,16 @@ impl SessionRuntime {
             return Err(HarnessError::ChildDepth);
         }
         let capabilities = self.harness.capabilities.for_agent(available_depth);
-        let (profile, system) = self.resolve_agent(
-            &model_profile,
-            agent_profile.as_deref(),
-            &id,
-            &location,
-            available_depth,
-            &capabilities,
-        )?;
+        let (profile, system) = self
+            .resolve_agent(
+                &model_profile,
+                agent_profile.as_deref(),
+                &id,
+                &location,
+                available_depth,
+                &capabilities,
+            )
+            .await?;
         self.store
             .append(
                 id.clone(),
@@ -793,7 +809,7 @@ impl SessionRuntime {
         }
     }
 
-    fn resolve_agent(
+    async fn resolve_agent(
         &self,
         model_profile: &str,
         agent_profile: Option<&str>,
@@ -822,11 +838,17 @@ impl SessionRuntime {
             .get(&selected_model)
             .cloned()
             .ok_or(HarnessError::UnknownModelProfile(selected_model))?;
+        let target = if location.is_root() {
+            None
+        } else {
+            Some(self.router.targets().get(&location.target).await?)
+        };
         let system = vec![prompt::system_segment(
             &self.harness.instructions,
             profile_instructions,
             agent,
             location,
+            target.as_ref(),
             available_depth,
             capabilities,
         )];
@@ -1025,30 +1047,59 @@ impl SessionRuntime {
             .get(&profile.provider)
             .cloned()
             .ok_or_else(|| HarnessError::UnknownProvider(profile.provider.clone()))?;
+        let template = ModelRequest {
+            model: profile.model.clone(),
+            system: system.to_vec(),
+            messages: Vec::new(),
+            tools: self
+                .executor
+                .clone()
+                .with_capabilities(capabilities.clone())
+                .surface()
+                .definitions(),
+            reasoning: profile.reasoning.clone(),
+            max_output_tokens: profile.max_output_tokens,
+            correlation: Some(agent.to_string()),
+        };
+        let mut context_sequence = None;
         let mut final_text = String::new();
         loop {
             if cancellation.is_cancelled() {
                 return Err(HarnessError::Interrupted);
             }
-            let mut request_messages = history.clone();
-            request_messages.push(Message::User(vec![
-                prompt::runtime_state_content(&self.jobs, &self.todos, agent, capabilities).await,
-            ]));
-            self.hydrate_images(&mut request_messages).await?;
-            let request = ModelRequest {
-                model: profile.model.clone(),
-                system: system.to_vec(),
-                messages: request_messages,
-                tools: self
-                    .executor
-                    .clone()
-                    .with_capabilities(capabilities.clone())
-                    .surface()
-                    .definitions(),
-                reasoning: profile.reasoning.clone(),
-                max_output_tokens: profile.max_output_tokens,
-                correlation: Some(agent.to_string()),
+            let runtime =
+                prompt::runtime_state_content(&self.jobs, &self.todos, agent, capabilities).await;
+            let mut request = template.clone();
+            request.messages.clone_from(history);
+            request.messages.push(Message::User(vec![runtime.clone()]));
+            self.store.hydrate_model_request(&mut request).await?;
+            let context = match context_sequence {
+                Some(sequence) => sequence,
+                None => {
+                    let record = self
+                        .store
+                        .append(
+                            agent.clone(),
+                            SessionEvent::ModelContext {
+                                provider: profile.provider.clone(),
+                                template: template.clone(),
+                            },
+                        )
+                        .await?;
+                    context_sequence = Some(record.sequence);
+                    record.sequence
+                }
             };
+            self.store
+                .append(
+                    agent.clone(),
+                    SessionEvent::ModelRequested {
+                        context,
+                        history_len: history.len(),
+                        runtime,
+                    },
+                )
+                .await?;
             let mut response = tokio::select! {
                 response = provider.invoke(request) => response?,
                 () = cancellation.cancelled() => return Err(HarnessError::Interrupted),
@@ -1123,29 +1174,6 @@ impl SessionRuntime {
         self.store
             .append(agent.clone(), SessionEvent::MessageCommitted { message })
             .await?;
-        Ok(())
-    }
-
-    async fn hydrate_images(&self, messages: &mut [Message]) -> Result<(), HarnessError> {
-        for message in messages {
-            match message {
-                Message::User(content) => {
-                    for item in content {
-                        if let UserContent::Image { image } = item {
-                            hydrate_image(&self.store, image).await?;
-                        }
-                    }
-                }
-                Message::Tool(results) => {
-                    for result in results {
-                        for image in &mut result.images {
-                            hydrate_image(&self.store, image).await?;
-                        }
-                    }
-                }
-                Message::Assistant(_) => {}
-            }
-        }
         Ok(())
     }
 
@@ -1317,17 +1345,6 @@ fn contains_images(messages: &[Message]) -> bool {
     })
 }
 
-async fn hydrate_image(
-    store: &SessionStore,
-    image: &mut crate::media::ImageReference,
-) -> Result<(), HarnessError> {
-    if image.data_base64.is_none() {
-        let bytes = store.read_blob(image).await?;
-        image.data_base64 = Some(base64::engine::general_purpose::STANDARD.encode(bytes));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1491,6 +1508,53 @@ mod tests {
         request.tools.iter().any(|tool| tool.name == name)
     }
 
+    async fn assert_request_journal(
+        store: &SessionStore,
+        captured: &Arc<StdMutex<Vec<ModelRequest>>>,
+    ) {
+        let journal = fs::read_to_string(store.directory().join("events.jsonl"))
+            .await
+            .unwrap();
+        let records = journal
+            .lines()
+            .map(|line| serde_json::from_str::<EventRecord>(line).unwrap())
+            .collect::<Vec<_>>();
+        let mut reconstructed = BTreeMap::<_, Vec<_>>::new();
+        for record in &records {
+            if matches!(record.event, SessionEvent::ModelRequested { .. }) {
+                let (provider, mut request) =
+                    crate::session::reconstruct_model_request(&records, record.sequence).unwrap();
+                assert_eq!(provider, "test");
+                assert_eq!(
+                    request.correlation.as_deref(),
+                    Some(record.agent.to_string().as_str())
+                );
+                store.hydrate_model_request(&mut request).await.unwrap();
+                reconstructed
+                    .entry(request.correlation.clone())
+                    .or_default()
+                    .push(request);
+            }
+        }
+        let mut expected = BTreeMap::<_, Vec<_>>::new();
+        for request in captured.lock().unwrap().iter() {
+            expected
+                .entry(request.correlation.clone())
+                .or_default()
+                .push(request.clone());
+        }
+        assert!(!expected.is_empty());
+        assert_eq!(reconstructed, expected);
+    }
+
+    fn request_location(request: &ModelRequest) -> serde_json::Value {
+        let text = &request.system[0].text;
+        assert!(!text.contains("<target_context>"));
+        let (_, context) = text.split_once("<skyhook_context>\n").unwrap();
+        let (context, _) = context.split_once("\n</skyhook_context>").unwrap();
+        serde_json::from_str(context).unwrap()
+    }
+
     fn test_builder(
         workspace: &Path,
         sessions: &Path,
@@ -1560,6 +1624,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_provider_call_is_journaled_before_invocation() {
+        struct FailingProvider {
+            session_root: PathBuf,
+        }
+        impl Provider for FailingProvider {
+            fn invoke(&self, request: ModelRequest) -> ProviderFuture {
+                let session = request
+                    .correlation
+                    .as_ref()
+                    .unwrap()
+                    .split(':')
+                    .next()
+                    .unwrap();
+                let path = self.session_root.join(session).join("events.jsonl");
+                Box::pin(async move {
+                    let journal = fs::read_to_string(path).await.unwrap();
+                    let records = journal
+                        .lines()
+                        .map(|line| serde_json::from_str::<EventRecord>(line).unwrap())
+                        .collect::<Vec<_>>();
+                    let call = records.last().unwrap();
+                    let (provider, restored) =
+                        crate::session::reconstruct_model_request(&records, call.sequence).unwrap();
+                    assert_eq!(provider, "test");
+                    assert_eq!(restored, request);
+                    Err(crate::provider::ProviderError::protocol(
+                        "intentional provider failure",
+                    ))
+                })
+            }
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(FailingProvider {
+                session_root: sessions.path().to_owned(),
+            }),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        let error = session.prompt("test failure").await.unwrap_err();
+        assert!(error.to_string().contains("intentional provider failure"));
+    }
+
+    #[tokio::test]
     async fn provider_tool_loop_runs_through_the_shared_registry() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("note.txt"), "hello").unwrap();
@@ -1613,6 +1724,7 @@ mod tests {
             .await
             .unwrap();
         assert!(background.output.value["location"].get("target").is_none());
+        assert_request_journal(&session.runtime.store, &requests).await;
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].system, requests[1].system);
@@ -1624,6 +1736,10 @@ mod tests {
         assert!(!requests[0].system[0].text.contains("\"date\":"));
         assert!(requests[0].system[0].text.contains("\"available_depth\":4"));
         assert!(!requests[0].system[0].text.contains(prompt::TARGET_PROMPT));
+        assert_eq!(
+            request_location(&requests[0]),
+            json!({"workspace": workspace.path()})
+        );
         assert!(requests[0].tools.iter().all(|tool| {
             tool.input_schema["properties"].get("target").is_none()
                 && !matches!(tool.name.as_str(), "targets" | "target_add")
@@ -1670,7 +1786,7 @@ mod tests {
                     block: AssistantContent::ToolCall(ToolCall {
                         id: "agent-1".to_owned(),
                         name: "agent".to_owned(),
-                        arguments: json!({"prompt":"inspect", "target":"build"}),
+                        arguments: json!({"prompt":"inspect", "target":"build", "workspace":"child"}),
                     }),
                 }],
                 vec![ResponseChunk::TextDelta {
@@ -1686,11 +1802,11 @@ mod tests {
             "build".to_owned(),
             crate::target::TargetConfig {
                 host: "build.example.com".to_owned(),
-                user: None,
-                port: None,
+
                 workspace: PathBuf::from("/srv/project"),
                 via: None,
-                auth: crate::target::TargetAuth::Openssh,
+                r#type: crate::target::TargetConfigType::Ssh,
+                ssh: crate::target::SshOptions::default(),
             },
         );
         let harness = test_builder(workspace.path(), sessions.path(), provider)
@@ -1705,8 +1821,38 @@ mod tests {
             .unwrap();
 
         let session = harness.new_session().await.unwrap();
+        let targets = session
+            .run_script(
+                r#"
+            const added = await tool.target_add({name:"db", type:"ssh", host:"db.internal"});
+            return {added, listed: await tool.targets()};
+        "#,
+            )
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(targets["added"]["type"], "ssh");
+        assert_eq!(targets["added"]["origin"], "root");
+        assert_eq!(targets["added"]["host"], "db.internal");
+        assert_eq!(targets["added"]["ssh_alias"], "db.internal");
+        assert_eq!(targets["added"]["source"], "session");
+        assert!(
+            targets["listed"]
+                .as_array()
+                .unwrap()
+                .contains(&targets["added"])
+        );
+        assert_eq!(
+            targets["listed"][0],
+            json!({
+                "name":"root", "type":"local", "origin":"root", "ssh_alias":null,
+                "source":"builtin", "host":"localhost", "user":null, "port":null,
+                "workspace":".", "via":null, "auth":"local"
+            })
+        );
         assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
 
+        assert_request_journal(&session.runtime.store, &requests).await;
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
         let tools_with_target = requests[0]
@@ -1721,9 +1867,61 @@ mod tests {
         );
         assert!(request_has_tool(&requests[0], "targets"));
         assert!(request_has_tool(&requests[0], "target_add"));
+        assert_eq!(
+            request_location(&requests[0]),
+            json!({
+                "workspace": workspace.path(),
+                "target": {"name":"root", "type":"local", "host":"localhost", "origin":"root", "via":null}
+            })
+        );
+        assert_eq!(
+            request_location(&requests[1]),
+            json!({
+                "workspace": "/srv/project/child",
+                "target": {"name":"build", "type":"ssh", "host":"build.example.com", "origin":"root", "via":null}
+            })
+        );
+        let add = requests[0]
+            .tools
+            .iter()
+            .find(|tool| tool.name == "target_add")
+            .unwrap();
+        let schema = &add.input_schema;
+        let reference = schema["properties"]["type"]["$ref"].as_str().unwrap();
+        assert_eq!(
+            schema
+                .pointer(reference.strip_prefix('#').unwrap())
+                .unwrap()["enum"],
+            json!(["ssh"])
+        );
+        let required = schema["required"].as_array().unwrap();
+        for name in ["name", "type", "host"] {
+            assert!(required.contains(&json!(name)));
+        }
+        assert!(
+            schema["properties"]["origin"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("defaults to your current target")
+        );
+        assert!(
+            schema["properties"]["via"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("SSH ProxyJump")
+        );
+        assert!(
+            add.description
+                .contains(r#"tool.target_add({name:"db", type:"ssh", host:"db.internal"})"#)
+        );
+        assert!(
+            add.description
+                .contains("does not connect to the destination or change your current target")
+        );
+        assert!(add.description.contains("Returns `"));
         assert!(requests[0].system[0].text.contains(prompt::TARGET_PROMPT));
         assert!(requests[1].system[0].text.contains("\"name\":\"build\""));
-        assert!(requests[1].system[0].text.contains("\"kind\":\"ssh\""));
+        assert!(requests[1].system[0].text.contains("\"type\":\"ssh\""));
         assert!(requests[1].system[0].text.contains("/srv/project"));
         assert!(requests[1].system[0].text.starts_with(prompt::CHILD_PROMPT));
         assert!(!requests[1].system[0].text.contains("orchestration"));
@@ -2450,6 +2648,7 @@ mod tests {
                 output_tokens: 8,
             }
         );
+        assert_request_journal(&resumed.runtime.store, &requests).await;
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert!(request_history(&requests[1]).starts_with(request_history(&requests[0])));
@@ -2528,6 +2727,7 @@ mod tests {
         session.root_tx.send(AgentCommand::JobsReady).await.unwrap();
         assert_eq!(session.prompt("barrier").await.unwrap(), "jobs handled");
 
+        assert_request_journal(&session.runtime.store, &requests).await;
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
         assert!(request_history(&requests[1]).starts_with(request_history(&requests[0])));

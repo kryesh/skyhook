@@ -72,6 +72,7 @@ async fn run_process(
         ));
     }
     command
+        .envs(&context.process_environment)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -70,6 +70,7 @@ struct ExecutorServices {
     jobs: JobManager,
     root_location: ExecutionLocation,
     router: Option<TargetRouter>,
+    process_environment: crate::remote::authentication::ProcessEnvironment,
 }
 
 impl ToolExecutor {
@@ -103,6 +104,7 @@ impl ToolExecutor {
                 jobs,
                 root_location: ExecutionLocation::root(workspace),
                 router: None,
+                process_environment: Default::default(),
             }),
             caller_location,
             capabilities: CapabilitySet::default(),
@@ -219,6 +221,14 @@ impl ToolExecutor {
             ),
             route: Some(route),
         })
+    }
+
+    pub(crate) fn with_process_environment(
+        mut self,
+        environment: crate::remote::authentication::ProcessEnvironment,
+    ) -> Self {
+        Arc::make_mut(&mut self.shared).process_environment = environment;
+        self
     }
 
     pub async fn execute(
@@ -508,18 +518,35 @@ impl ToolExecutor {
             .jobs
             .transition(lease.id, JobState::Running)
             .await?;
-        let context = ToolContext::new(
+        let mut context = ToolContext::new(
             subject,
             plan.execution_location,
             plan.caller_location,
             lease.input,
             self.shared.jobs.clone(),
         );
+        context.process_environment = self.shared.process_environment.clone();
+        let authentication = if context.capabilities.contains(Capability::Targets)
+            && context.execution_location.is_root()
+            && matches!(plan.tool.name(), "exec" | "shell")
+        {
+            self.shared.router.clone()
+        } else {
+            None
+        };
         let jobs = self.shared.jobs.clone();
         let store = jobs.store().clone();
         let job = lease.id;
         let background = plan.background;
         let worker = tokio::spawn(async move {
+            if let Some(router) = authentication {
+                context.process_environment.extend(
+                    router
+                        .environment()
+                        .await
+                        .map_err(|e| e.into_tool_error())?,
+                );
+            }
             if context.is_cancelled() {
                 return Err(ToolError::Cancelled);
             }

@@ -65,16 +65,21 @@ supports_images = false
 import_ssh_config = false
 
 # [targets.bastion]
+# type = "ssh"
 # host = "bastion.example.com"
+# [targets.bastion.ssh]
 # user = "gateway"
 #
 # [targets.build]
+# type = "ssh"
 # host = "build.internal"
-# user = "builder"
 # workspace = "/srv/project"
 # via = "bastion"
 #
-# [targets.build.auth]
+# [targets.build.ssh]
+# user = "builder"
+#
+# [targets.build.ssh.auth]
 # kind = "key"
 # path = "~/.ssh/build_ed25519"
 

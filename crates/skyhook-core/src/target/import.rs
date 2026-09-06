@@ -3,7 +3,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{ROOT_TARGET, TargetAuth, TargetConfig, TargetDefinition, TargetError, TargetSource};
+use super::{
+    ROOT_TARGET, SshOptions, TargetConfig, TargetConfigType, TargetDefinition, TargetError,
+    TargetSource,
+};
 
 pub(crate) async fn import_ssh_targets() -> Result<Vec<TargetDefinition>, TargetError> {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
@@ -31,12 +34,11 @@ fn import_from(home: &Path) -> Result<Vec<TargetDefinition>, TargetError> {
             TargetDefinition::from_config(
                 name.clone(),
                 TargetConfig {
+                    r#type: TargetConfigType::Ssh,
                     host: name,
-                    user: None,
-                    port: None,
+                    ssh: SshOptions::default(),
                     workspace: PathBuf::from("."),
                     via: None,
-                    auth: TargetAuth::Openssh,
                 },
                 TargetSource::SshConfig,
             )

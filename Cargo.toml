@@ -39,6 +39,9 @@ tokio = { version = "1.53.1", features = [
     "sync",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [[bin]]
 name = "skyhook"
 path = "src/bin/skyhook/main.rs"

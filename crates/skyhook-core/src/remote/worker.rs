@@ -63,6 +63,7 @@ where
 
     let output = Arc::new(Mutex::new(output));
     let authorizations = Arc::new(Mutex::new(HashMap::new()));
+    let mut services = super::service::WorkerServices::new(output.clone())?;
     let temporary = tempfile::Builder::new()
         .prefix("skyhook-worker-")
         .tempdir()?;
@@ -81,7 +82,8 @@ where
         jobs.clone(),
         std::fs::canonicalize(".")?,
     )
-    .with_authorization_root(authorization_root);
+    .with_authorization_root(authorization_root)
+    .with_process_environment(services.environment.clone());
     let (requests, mut incoming) = mpsc::channel(32);
     let (started_jobs, mut started) = mpsc::channel(32);
     let reader = tokio::spawn(read_requests(input, requests));
@@ -161,12 +163,14 @@ where
                             let _ = sender.send(decision);
                         }
                     }
+                    control @ (Request::ResolveSsh { .. } | Request::OpenSsh { .. } | Request::StreamData { .. } | Request::StreamEnd { .. } | Request::StreamClose { .. } | Request::StreamAck { .. } | Request::SensitiveAnswer { .. }) => services.handle(control).await?,
                     Request::Hello => {
                         reader.abort();
                         return Err("received a second hello".into());
                     }
                 }
             }
+            _ = services.tasks.join_next(), if !services.tasks.is_empty() => {}
             completed = tasks.join_next(), if !tasks.is_empty() => {
                 let (request_id, result) = match completed {
                     Some(Ok(completed)) => completed,

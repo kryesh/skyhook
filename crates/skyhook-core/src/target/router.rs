@@ -41,6 +41,9 @@ impl ResolvedRoute {
     pub fn authorization_arguments(&self) -> serde_json::Value {
         serde_json::json!({
             "destination": self.identity.destination,
+            "type": self.definitions.last().map(|target| target.r#type),
+            "origin": self.definitions.last().map(|target| &target.origin),
+            "host": self.definitions.last().map(|target| &target.host),
             "route": self.definitions.iter().map(|hop| &hop.name).collect::<Vec<_>>(),
         })
     }
@@ -65,6 +68,90 @@ impl TargetRouter {
             remote,
             authorization,
             mutation: Arc::new(RwLock::new(())),
+        }
+    }
+
+    pub(crate) async fn environment(
+        &self,
+    ) -> Result<crate::remote::authentication::ProcessEnvironment, RemoteError> {
+        self.remote.environment().await
+    }
+    pub(crate) async fn shutdown(&self) {
+        self.remote.shutdown().await;
+    }
+
+    pub(crate) async fn add(
+        &self,
+        mut definition: TargetDefinition,
+        origin: String,
+        subject: &AuthorizationSubject,
+        store: &crate::session::SessionStore,
+    ) -> Result<Vec<TargetDefinition>, RemoteError> {
+        definition.origin = origin.clone();
+        loop {
+            let snapshot = self.targets.definitions().await;
+            let resolver: Arc<dyn super::normalize::ConfigResolver> =
+                if origin == super::ROOT_TARGET {
+                    Arc::new(super::normalize::LocalResolver)
+                } else {
+                    let route = self.resolve(&origin).await?;
+                    self.authorization
+                        .authorize(
+                            subject,
+                            "connect_target".into(),
+                            vec![route.permission()],
+                            route.authorization_arguments(),
+                        )
+                        .await
+                        .map_err(RemoteError::authorization)?;
+                    let workspace = route
+                        .definitions
+                        .last()
+                        .ok_or(RemoteError::EmptyRoute)?
+                        .workspace
+                        .clone();
+                    Arc::new(RemoteResolver(
+                        self.prepare(route, &workspace, subject).await?,
+                    ))
+                };
+            let normalized = tokio::select! {
+                normalized = super::normalize::normalize(vec![definition.clone()], snapshot.clone(), resolver) => normalized?,
+                () = subject.cancellation.cancelled() => return Err(RemoteError::Cancelled),
+            };
+            let _mutation = self.mutation.write().await;
+            if self.targets.definitions().await != snapshot {
+                continue;
+            }
+            let staged = TargetRegistry::from_definitions(snapshot)?;
+            let (definitions, invalidated) = staged.upsert_many(normalized).await?;
+            if subject.cancellation.is_cancelled() {
+                return Err(RemoteError::Cancelled);
+            }
+            store
+                .append(
+                    subject.agent.clone(),
+                    crate::session::SessionEvent::TargetsUpserted {
+                        targets: definitions.clone(),
+                    },
+                )
+                .await
+                .map_err(|e| RemoteError::Io {
+                    kind: std::io::ErrorKind::Other,
+                    message: e.to_string(),
+                })?;
+            self.targets.upsert_many(definitions.clone()).await?;
+            self.authorization
+                .revoke(|grant| {
+                    grant.resource.namespace == "route"
+                        && grant
+                            .resource
+                            .segments
+                            .first()
+                            .is_some_and(|target| invalidated.contains(target))
+                })
+                .await;
+            self.remote.invalidate(&invalidated).await;
+            return Ok(definitions);
         }
     }
 
@@ -118,6 +205,7 @@ impl TargetRouter {
         }
     }
 
+    #[cfg(test)]
     pub async fn upsert(
         &self,
         definition: TargetDefinition,
@@ -136,6 +224,20 @@ impl TargetRouter {
             .await;
         self.remote.invalidate(&invalidated).await;
         Ok(definition)
+    }
+}
+
+struct RemoteResolver(PreparedConnection);
+#[async_trait::async_trait]
+impl super::normalize::ConfigResolver for RemoteResolver {
+    async fn resolve(
+        &self,
+        target: &TargetDefinition,
+    ) -> Result<crate::remote::ssh::ResolvedSsh, TargetError> {
+        self.0
+            .resolve_ssh(target.clone())
+            .await
+            .map_err(|e| TargetError::Import(e.to_string()))
     }
 }
 
@@ -491,5 +593,28 @@ mod tests {
             ));
         }
         assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn failed_persistence_does_not_publish_target_registration() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::session::SessionStore::create_ephemeral(root.path())
+            .await
+            .unwrap();
+        let targets = TargetRegistry::from_definitions([target("first", None)]).unwrap();
+        let before = targets.definitions().await;
+        let router = router(targets.clone(), RecordingPolicy::new([]), None);
+        // The mismatched session rejects append after normalization and graph validation.
+        assert!(
+            router
+                .add(
+                    target("second", None),
+                    crate::target::ROOT_TARGET.into(),
+                    &subject(),
+                    &store
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(targets.definitions().await, before);
     }
 }

@@ -13,7 +13,7 @@ use crate::{
     identity::{AgentId, JobId, SessionId},
     job::JobState,
     media::ImageReference,
-    provider::protocol::{Message, Usage},
+    provider::protocol::{Message, ModelRequest, Usage, UserContent},
     target::TargetDefinition,
 };
 
@@ -25,8 +25,8 @@ pub enum SessionEvent {
     SessionStarted {
         targets: Vec<TargetDefinition>,
     },
-    TargetUpserted {
-        target: TargetDefinition,
+    TargetsUpserted {
+        targets: Vec<TargetDefinition>,
     },
     AgentStarted {
         parent: Option<AgentId>,
@@ -41,6 +41,17 @@ pub enum SessionEvent {
     },
     MessageCommitted {
         message: Message,
+    },
+    /// Shared request fields; template.messages is empty because history is already journaled.
+    ModelContext {
+        provider: String,
+        template: ModelRequest,
+    },
+    /// A provider call using the preceding committed history and this exact transient state.
+    ModelRequested {
+        context: u64,
+        history_len: usize,
+        runtime: UserContent,
     },
     Usage {
         usage: Usage,
