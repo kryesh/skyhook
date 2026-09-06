@@ -45,6 +45,14 @@ pub(super) fn convert_request(request: ModelRequest) -> Result<Request, Provider
         stage: "agent".to_owned(),
         round: 0,
     });
+    let mut metadata = serde_json::Map::new();
+    if let Some(schema) = request.response_schema {
+        metadata.insert(
+            super::schema::METADATA_KEY.to_owned(),
+            serde_json::to_value(schema)
+                .map_err(|error| ProviderError::protocol(error.to_string()))?,
+        );
+    }
     Ok(Request {
         model: request.model,
         system: None,
@@ -58,7 +66,7 @@ pub(super) fn convert_request(request: ModelRequest) -> Result<Request, Provider
         thinking: effort.is_some(),
         effort,
         trace,
-        metadata: serde_json::Map::new(),
+        metadata,
         cache_tail: true,
     })
 }
@@ -126,9 +134,10 @@ fn convert_message(message: Message) -> Result<FluxMessage, ProviderError> {
 
 fn convert_user_content(content: UserContent) -> Result<ContentBlock, ProviderError> {
     match content {
-        UserContent::Text { text } | UserContent::Runtime { text } => {
-            Ok(ContentBlock::Text { text })
-        }
+        UserContent::Text { text }
+        | UserContent::Runtime { text }
+        | UserContent::ParentInput { text }
+        | UserContent::Compaction { text } => Ok(ContentBlock::Text { text }),
         UserContent::Image { image } => Ok(ContentBlock::Image {
             source: ImageSource::Base64 {
                 media_type: image.media_type,
@@ -183,14 +192,18 @@ pub(super) fn convert_chunk(chunk: Chunk) -> Option<ResponseChunk> {
         }),
         Chunk::Usage(usage) => Some(ResponseChunk::Usage {
             usage: Usage {
-                input_tokens: usage.input_tokens,
+                input_tokens: usage
+                    .input_tokens
+                    .saturating_add(usage.cache_creation_input_tokens),
                 cached_input_tokens: usage.cache_read_input_tokens,
                 output_tokens: usage.output_tokens,
             },
         }),
+        Chunk::Done { stop_reason } => Some(ResponseChunk::Finished {
+            truncated: stop_reason == Some(flux_core::StopReason::MaxTokens),
+        }),
         Chunk::MessageStart { .. }
         | Chunk::ToolInputDelta { .. }
-        | Chunk::Done { .. }
         | Chunk::StreamDiagnostic { .. } => None,
     }
 }
@@ -224,6 +237,10 @@ pub(super) fn map_error(error: &FluxError) -> ProviderError {
     let kind = match error {
         FluxError::Auth(_) => ProviderErrorKind::Authentication,
         FluxError::Api { status: 429, .. } => ProviderErrorKind::RateLimited,
+        FluxError::Api {
+            status: 400 | 413 | 422,
+            message,
+        } if is_context_overflow(message) => ProviderErrorKind::ContextWindowExceeded,
         FluxError::Http(_) | FluxError::Io(_) => ProviderErrorKind::Transport,
         FluxError::Serde(_) | FluxError::StreamDecode(_) => ProviderErrorKind::Protocol,
         FluxError::Config(_) => ProviderErrorKind::InvalidRequest,
@@ -235,10 +252,136 @@ pub(super) fn map_error(error: &FluxError) -> ProviderError {
     }
 }
 
+// Flux retains provider error bodies as text. Recognize only explicit context-limit
+// errors; unrelated bad requests and HTTP payload-size errors must not compact.
+fn is_context_overflow(message: &str) -> bool {
+    if let Ok(body) = serde_json::from_str::<serde_json::Value>(message) {
+        let error = body.get("error").unwrap_or(&body);
+        if error.get("code").and_then(serde_json::Value::as_str) == Some("context_length_exceeded")
+        {
+            return true;
+        }
+        return error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_context_overflow_description);
+    }
+    is_context_overflow_description(message)
+}
+
+fn is_context_overflow_description(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.starts_with("prompt is too long:")
+        || message.contains("maximum context length is")
+        || message.contains("exceeds the model's maximum context length")
+        || message.contains("exceeds the context window")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::provider::protocol::SystemSegment;
+
+    #[test]
+    fn normalized_usage_includes_cache_creation_without_double_counting_subsets() {
+        let provider_usage = flux_core::Usage {
+            input_tokens: 100,
+            cache_creation_input_tokens: 200,
+            cache_creation_1h_input_tokens: 150,
+            cache_read_input_tokens: 300,
+            output_tokens: 50,
+            reasoning_tokens: 25,
+            ..Default::default()
+        };
+        let Some(ResponseChunk::Usage { usage }) =
+            convert_chunk(Chunk::Usage(provider_usage.clone()))
+        else {
+            panic!("expected normalized usage");
+        };
+        assert_eq!(usage.input_tokens, 300);
+        assert_eq!(usage.cached_input_tokens, 300);
+        assert_eq!(
+            usage.input_tokens + usage.cached_input_tokens,
+            provider_usage.context_tokens()
+        );
+        assert_eq!(usage.output_tokens, 50);
+    }
+
+    #[test]
+    fn generated_messages_keep_provenance_but_use_the_user_role_on_the_wire() {
+        for content in [
+            UserContent::ParentInput {
+                text: "parent steering".to_owned(),
+            },
+            UserContent::Compaction {
+                text: "preserved context".to_owned(),
+            },
+        ] {
+            let saved = serde_json::to_value(&content).unwrap();
+            assert!(matches!(
+                saved["type"].as_str(),
+                Some("parent_input" | "compaction")
+            ));
+            let converted = convert_message(Message::User(vec![content])).unwrap();
+            assert_eq!(converted.role, Role::User);
+            assert!(
+                matches!(&converted.content[0], ContentBlock::Text { text } if text == saved["text"].as_str().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn finish_reason_preserves_truncation() {
+        for reason in [
+            None,
+            Some(flux_core::StopReason::EndTurn),
+            Some(flux_core::StopReason::MaxTokens),
+            Some(flux_core::StopReason::ToolUse),
+        ] {
+            assert_eq!(
+                convert_chunk(Chunk::Done {
+                    stop_reason: reason
+                }),
+                Some(ResponseChunk::Finished {
+                    truncated: reason == Some(flux_core::StopReason::MaxTokens),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn only_explicit_context_errors_are_classified_for_compaction() {
+        for message in [
+            r#"{"error":{"code":"context_length_exceeded","message":"Too many tokens"}}"#,
+            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 140000 tokens > 128000 maximum"}}"#,
+            "This model's maximum context length is 128000 tokens.",
+        ] {
+            assert_eq!(
+                map_error(&FluxError::Api {
+                    status: 400,
+                    message: message.to_owned()
+                })
+                .kind,
+                ProviderErrorKind::ContextWindowExceeded,
+            );
+        }
+        for (status, message) in [
+            (400, "invalid tools schema"),
+            (400, "max_tokens must be positive"),
+            (413, "request body too large"),
+            (500, "maximum context length is unavailable"),
+            (429, "maximum context length is 128000 tokens"),
+        ] {
+            assert_ne!(
+                map_error(&FluxError::Api {
+                    status,
+                    message: message.to_owned()
+                })
+                .kind,
+                ProviderErrorKind::ContextWindowExceeded,
+            );
+        }
+    }
 
     #[test]
     fn output_limit_is_only_sent_when_configured() {
@@ -266,6 +409,7 @@ mod tests {
                         text: "hello".to_owned(),
                     }])],
                     tools: Vec::new(),
+                    response_schema: None,
                     reasoning: None,
                     max_output_tokens: limit,
                     correlation: None,
@@ -338,6 +482,7 @@ mod tests {
                 }]),
             ],
             tools: Vec::new(),
+            response_schema: None,
             reasoning: None,
             max_output_tokens: None,
             correlation: Some("session/agent".to_owned()),

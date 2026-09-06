@@ -457,7 +457,7 @@ async fn call_tool(
         Err(error) if error.denial.is_some() => Err(RemoteError::OperationDenied(error.message)),
         Err(error) => Err(RemoteError::Remote {
             message: error.message,
-            output: error.output.map(Into::into),
+            output: error.output.map(|output| Box::new((*output).into())),
         }),
     }
 }
@@ -964,7 +964,7 @@ pub enum RemoteError {
     #[error("remote tool failed: {message}")]
     Remote {
         message: String,
-        output: Option<ToolOutput>,
+        output: Option<Box<ToolOutput>>,
     },
     #[error("remote connection is missing {0}")]
     MissingPipe(&'static str),
@@ -1014,7 +1014,7 @@ impl RemoteError {
             Self::Remote {
                 message,
                 output: Some(output),
-            } => ToolError::with_output(message, output),
+            } => ToolError::with_output(message, *output),
             Self::Remote {
                 message,
                 output: None,

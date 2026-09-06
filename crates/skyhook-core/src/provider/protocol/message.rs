@@ -17,6 +17,8 @@ pub enum UserContent {
     Text { text: String },
     Image { image: ImageReference },
     Runtime { text: String },
+    ParentInput { text: String },
+    Compaction { text: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

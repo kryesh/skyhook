@@ -58,7 +58,7 @@ pub enum QuestionError {
 
 #[derive(Clone, Debug)]
 pub enum RuntimeEvent {
-    Record(EventRecord),
+    Record(Box<EventRecord>),
     TextDelta { agent: AgentId, text: String },
     ReasoningDelta { agent: AgentId, text: String },
     TurnCompleted { agent: AgentId, text: String },

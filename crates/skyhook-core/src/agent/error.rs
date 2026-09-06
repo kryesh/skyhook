@@ -36,6 +36,8 @@ pub enum HarnessError {
     UnknownAgentProfile(String),
     #[error("invalid profile: {0}")]
     InvalidProfile(String),
+    #[error("compaction failed: {0}")]
+    Compaction(String),
     #[error("agent stopped before completing the request")]
     AgentStopped,
     #[error("agent failed: {0}")]

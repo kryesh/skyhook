@@ -52,6 +52,7 @@ pub(super) fn register(
     builder: &mut ToolRegistryBuilder,
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
 ) -> Result<(), RegistryError> {
+    super::history::register(builder, runtime_slot.clone())?;
     register_ask(builder, runtime_slot.clone())?;
     register_todo(builder, runtime_slot.clone())?;
     register_child_agent(builder, runtime_slot)
@@ -248,7 +249,7 @@ fn register_child_agent(
                                 .map_err(|error| tool_error(&error))?
                             {
                                 sender.send(AgentCommand::Input {
-                                    content: vec![UserContent::Runtime { text: format!("Owner input: {value}") }],
+                                    content: vec![UserContent::ParentInput { text: format!("Owner input: {value}") }],
                                     done: None,
                                 }).await.map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?;
                             }

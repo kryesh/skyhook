@@ -14,6 +14,9 @@ pub type ProviderFuture =
     Pin<Box<dyn Future<Output = Result<ResponseStream, ProviderError>> + Send>>;
 
 pub trait Provider: Send + Sync {
+    /// Streams reasoning independently of the final answer. When `response_schema`
+    /// is supplied, transmit it as a structured-output constraint or return
+    /// `InvalidRequest`; do not silently ignore it or replace it with a prompt.
     fn invoke(&self, request: ModelRequest) -> ProviderFuture;
 }
 
@@ -25,6 +28,7 @@ pub enum ProviderErrorKind {
     Transport,
     Protocol,
     InvalidRequest,
+    ContextWindowExceeded,
     Response,
 }
 

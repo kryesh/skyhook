@@ -13,11 +13,49 @@ use crate::{
     identity::{AgentId, JobId, SessionId},
     job::JobState,
     media::ImageReference,
-    provider::protocol::{Message, ModelRequest, Usage, UserContent},
+    provider::protocol::{Message, ModelRequest, Usage},
     target::TargetDefinition,
 };
 
 use super::{SESSION_FORMAT_VERSION, SessionError};
+
+/// An exact request message, either journal-backed or request-specific.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContextMessage {
+    Source { sequence: u64 },
+    Inline { message: Message },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPurpose {
+    Agent,
+    Compaction,
+}
+
+/// Durable replacement of one agent's model-visible history.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct CompactionCheckpoint {
+    /// Version of the structured continuation schema used for this checkpoint.
+    pub schema_version: u16,
+    pub previous: Option<u64>,
+    pub frontier: u64,
+    pub message: Message,
+    /// Reconciled owner todos, activated atomically with this history replacement.
+    pub todos: Vec<crate::agent::TodoItem>,
+    pub retained: Vec<u64>,
+    pub request: u64,
+    pub max_context: u64,
+    pub before_tokens: u64,
+    pub after_tokens: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ModelCallOrigin {
+    pub message: u64,
+    pub call_id: String,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -47,18 +85,36 @@ pub enum SessionEvent {
         provider: String,
         template: ModelRequest,
     },
-    /// A provider call using the preceding committed history and this exact transient state.
+    /// A provider call with exact ordered messages, independent of future state/configuration.
     ModelRequested {
         context: u64,
-        history_len: usize,
-        runtime: UserContent,
+        messages: Vec<ContextMessage>,
+        purpose: ModelPurpose,
+    },
+    Compaction {
+        checkpoint: CompactionCheckpoint,
+    },
+    ModelFailed {
+        request: u64,
+        attempt: u8,
+        error: String,
+    },
+    CompactionSkipped {
+        request: u64,
+        reason: String,
+    },
+    CompactionFailed {
+        request: Option<u64>,
+        error: String,
     },
     Usage {
+        request: Option<u64>,
         usage: Usage,
     },
     JobCreated {
         job: JobId,
         parent: Option<JobId>,
+        origin: Option<ModelCallOrigin>,
         tool: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
@@ -116,7 +172,7 @@ pub(super) fn validate_records(records: &[EventRecord], id: SessionId) -> Result
     let mut expected = 1;
     let mut jobs = HashSet::new();
     let mut terminal = HashSet::new();
-    for record in records {
+    for (index, record) in records.iter().enumerate() {
         if record.version != SESSION_FORMAT_VERSION {
             return Err(SessionError::UnsupportedVersion(record.version));
         }
@@ -130,6 +186,12 @@ pub(super) fn validate_records(records: &[EventRecord], id: SessionId) -> Result
             return Err(SessionError::WrongSession);
         }
         match &record.event {
+            SessionEvent::Compaction { .. } => {
+                super::request::validate_compaction(&records[..index], record)?;
+            }
+            SessionEvent::ModelRequested { .. } => {
+                super::reconstruct_model_request(records, record.sequence)?;
+            }
             SessionEvent::JobCreated { job, .. } if !jobs.insert(*job) => {
                 return Err(SessionError::DuplicateJob(*job));
             }

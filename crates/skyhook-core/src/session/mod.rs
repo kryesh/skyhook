@@ -26,14 +26,17 @@ mod event;
 mod request;
 
 pub(crate) use event::is_safe_artifact_path;
-pub use event::{EventRecord, SessionEvent};
-pub use request::reconstruct_model_request;
+pub use event::{
+    CompactionCheckpoint, ContextMessage, EventRecord, ModelCallOrigin, ModelPurpose, SessionEvent,
+};
+pub use request::{project_history, reconstruct_model_request};
 
-pub const SESSION_FORMAT_VERSION: u16 = 4;
+pub const SESSION_FORMAT_VERSION: u16 = 1;
 
 struct SessionWriter {
     file: Option<BufWriter<File>>,
     next_sequence: u64,
+    records: Vec<EventRecord>,
 }
 
 struct StoreInner {
@@ -65,7 +68,7 @@ impl SessionStore {
             let id = SessionId::generate()?;
             let directory = root.join(id.to_string());
             match fs::create_dir(&directory).await {
-                Ok(()) => return Self::initialize(id, directory, 1, durable).await,
+                Ok(()) => return Self::initialize(id, directory, Vec::new(), durable).await,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error.into()),
             }
@@ -85,15 +88,6 @@ impl SessionStore {
             .rposition(|byte| *byte == b'\n')
             .map_or(0, |position| position + 1);
         let complete = &bytes[..complete_len];
-        #[derive(serde::Deserialize)]
-        struct Version {
-            version: u16,
-        }
-        for record in parse_lines::<Version>(complete)? {
-            if record.version != SESSION_FORMAT_VERSION {
-                return Err(SessionError::UnsupportedVersion(record.version));
-            }
-        }
         let records = parse_lines(complete)?;
         event::validate_records(&records, id)?;
         if complete_len != bytes.len() {
@@ -102,9 +96,8 @@ impl SessionStore {
                 .await?;
             file.sync_all().await?;
         }
-        let next_sequence = records.last().map_or(1, |record| record.sequence + 1);
         Ok((
-            Self::initialize(id, directory, next_sequence, true).await?,
+            Self::initialize(id, directory, records.clone(), true).await?,
             records,
         ))
     }
@@ -112,7 +105,7 @@ impl SessionStore {
     async fn initialize(
         id: SessionId,
         directory: PathBuf,
-        next_sequence: u64,
+        records: Vec<EventRecord>,
         durable: bool,
     ) -> Result<Self, SessionError> {
         fs::create_dir_all(directory.join("blobs")).await?;
@@ -144,7 +137,8 @@ impl SessionStore {
                 durable,
                 writer: Mutex::new(SessionWriter {
                     file,
-                    next_sequence,
+                    next_sequence: records.last().map_or(1, |record| record.sequence + 1),
+                    records,
                 }),
                 events,
                 _lock: Mutex::new(lock),
@@ -167,6 +161,11 @@ impl SessionStore {
         self.inner.events.subscribe()
     }
 
+    /// A consistent snapshot of all successfully committed events, including ephemeral sessions.
+    pub async fn records(&self) -> Vec<EventRecord> {
+        self.inner.writer.lock().await.records.clone()
+    }
+
     pub async fn append(
         &self,
         agent: AgentId,
@@ -183,6 +182,10 @@ impl SessionStore {
             agent,
             event,
         };
+        request::validate_compaction(&writer.records, &record)?;
+        if matches!(record.event, SessionEvent::ModelRequested { .. }) {
+            request::reconstruct_from_prefix(&writer.records, &record)?;
+        }
         let mut bytes = serde_json::to_vec(&record)?;
         bytes.push(b'\n');
         if let Some(file) = &mut writer.file {
@@ -191,6 +194,7 @@ impl SessionStore {
             file.get_ref().sync_data().await?;
         }
         writer.next_sequence = writer.next_sequence.saturating_add(1);
+        writer.records.push(record.clone());
         let _ = self.inner.events.send(record.clone());
         Ok(record)
     }
@@ -368,22 +372,34 @@ mod tests {
         let mut file = OpenOptions::new().append(true).open(&path).await.unwrap();
         file.write_all(b"{incomplete").await.unwrap();
         drop(file);
-        let (_store, records) = SessionStore::open(root.path(), id).await.unwrap();
+        let (store, records) = SessionStore::open(root.path(), id).await.unwrap();
         assert_eq!(records.len(), 1);
+        assert_eq!(store.records().await, records);
+        let appended = store
+            .append(AgentId::root(id), SessionEvent::AgentCompleted)
+            .await
+            .unwrap();
+        assert_eq!(store.records().await, vec![records[0].clone(), appended]);
         assert!(fs::read_to_string(path).await.unwrap().ends_with('\n'));
     }
 
     #[tokio::test]
-    async fn old_versions_are_rejected_before_deserializing_old_target_shapes() {
+    async fn unsupported_event_versions_are_rejected() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::create(root.path()).await.unwrap();
         let id = store.id();
         let path = store.directory().join("events.jsonl");
+        let record = store
+            .append(AgentId::root(id), SessionEvent::AgentInterrupted)
+            .await
+            .unwrap();
         store.close().await.unwrap();
-        fs::write(path, b"{\"version\":1,\"event\":{\"type\":\"target_upserted\",\"target\":{\"host\":\"legacy\"}}}\n").await.unwrap();
+        let mut record = serde_json::to_value(record).unwrap();
+        record["version"] = 2.into();
+        fs::write(path, format!("{record}\n")).await.unwrap();
         assert!(matches!(
             SessionStore::open(root.path(), id).await,
-            Err(SessionError::UnsupportedVersion(1))
+            Err(SessionError::UnsupportedVersion(2))
         ));
     }
 
@@ -396,6 +412,7 @@ mod tests {
             .append(AgentId::root(store.id()), SessionEvent::AgentInterrupted)
             .await
             .unwrap();
+        assert_eq!(store.records().await.len(), 1);
         let image = store
             .import_blob(
                 b"image",

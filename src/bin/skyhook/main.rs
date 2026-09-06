@@ -12,7 +12,7 @@ use skyhook::{
     agent::RuntimeEvent,
     config::Config,
     identity::{AgentId, SessionId},
-    session::SessionEvent,
+    session::{ModelPurpose, SessionEvent},
     tool::policy::AllowAll,
 };
 use tokio::io::AsyncBufReadExt as _;
@@ -189,22 +189,52 @@ impl AgentOutput {
         match event {
             RuntimeEvent::TextDelta { agent, text } => self.text(&agent, &text),
             RuntimeEvent::TurnCompleted { agent, text } => self.finish(&agent, &text),
-            RuntimeEvent::Record(record) => {
-                if let SessionEvent::JobCreated {
+            RuntimeEvent::Record(record) => match &record.event {
+                SessionEvent::JobCreated {
                     job,
                     tool,
                     arguments,
                     background,
                     location,
                     ..
-                } = &record.event
-                {
-                    self.tool(
-                        &record.agent,
-                        &format_tool_call(*job, tool, arguments, *background, location),
-                    );
+                } => self.tool(
+                    &record.agent,
+                    &format_tool_call(*job, tool, arguments, *background, location),
+                ),
+                SessionEvent::ModelRequested {
+                    purpose: ModelPurpose::Compaction,
+                    ..
+                } => {
+                    self.tool(&record.agent, "compacting conversation…");
                 }
-            }
+                SessionEvent::Compaction { checkpoint } => self.tool(
+                    &record.agent,
+                    &format!(
+                        "compacted conversation: ~{} → ~{} input tokens",
+                        checkpoint.before_tokens, checkpoint.after_tokens
+                    ),
+                ),
+                SessionEvent::ModelFailed { attempt, error, .. } => self.tool(
+                    &record.agent,
+                    &format!(
+                        "model request failed (attempt {attempt}/3){}: {}",
+                        if *attempt < 3 { "; retrying" } else { "" },
+                        brief(error, 240)
+                    ),
+                ),
+                SessionEvent::CompactionSkipped { reason, .. } => self.tool(
+                    &record.agent,
+                    &format!("compaction skipped: {}", brief(reason, 240)),
+                ),
+                SessionEvent::CompactionFailed { error, .. } => self.tool(
+                    &record.agent,
+                    &format!(
+                        "compaction failed; previous context retained: {}",
+                        brief(error, 240)
+                    ),
+                ),
+                _ => {}
+            },
             RuntimeEvent::ReasoningDelta { .. } => {}
         }
     }

@@ -37,6 +37,11 @@ pub use super::error::HarnessError;
 use super::interaction::{QuestionHandler, RuntimeEvent};
 use super::{TodoItem, TodoSnapshot, todo::TodoStore};
 
+mod compact;
+#[cfg(test)]
+mod compact_tests;
+mod compaction;
+mod history;
 mod prompt;
 mod questions;
 mod tools;
@@ -281,13 +286,9 @@ impl Harness {
     pub async fn resume_session(&self, id: SessionId) -> Result<SessionHandle, HarnessError> {
         let (store, records) = SessionStore::open(&self.inner.session_root, id).await?;
         let root = AgentId::root(id);
-        let history = records
-            .iter()
-            .filter(|record| record.agent == root)
-            .filter_map(|record| match &record.event {
-                SessionEvent::MessageCommitted { message } => Some(message.clone()),
-                _ => None,
-            })
+        let history = crate::session::project_history(&records, &root)?
+            .into_iter()
+            .map(|(_, message)| message)
             .collect();
         let runtime = SessionRuntime::build(self.inner.clone(), store, records).await?;
         runtime.start_root(history).await
@@ -553,7 +554,7 @@ impl SessionRuntime {
         let (events, _) = broadcast::channel(1024);
         let mut usage = Usage::default();
         for record in &prior_records {
-            if let SessionEvent::Usage { usage: value } = &record.event {
+            if let SessionEvent::Usage { usage: value, .. } = &record.event {
                 usage.accumulate(*value);
             }
         }
@@ -628,7 +629,7 @@ impl SessionRuntime {
             loop {
                 match source.recv().await {
                     Ok(record) => {
-                        let _ = events.send(RuntimeEvent::Record(record));
+                        let _ = events.send(RuntimeEvent::Record(Box::new(record)));
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -762,6 +763,7 @@ impl SessionRuntime {
         agent: &AgentId,
         parent: Option<JobId>,
         call: &ToolCall,
+        origin: u64,
         location: &crate::execution::ExecutionLocation,
         capabilities: &CapabilitySet,
     ) -> ToolResult {
@@ -771,6 +773,10 @@ impl SessionRuntime {
             .clone()
             .with_location(location.clone())
             .with_capabilities(capabilities.clone())
+            .with_model_origin(crate::session::ModelCallOrigin {
+                message: origin,
+                call_id: call.id.clone(),
+            })
             .execute_model(agent.clone(), &call.name, call.arguments.clone(), parent)
             .await;
         match result {
@@ -1080,21 +1086,20 @@ impl SessionRuntime {
                 .surface()
                 .definitions(),
             reasoning: profile.reasoning.clone(),
-            max_output_tokens: profile.max_output_tokens,
+            response_schema: None,
+            max_output_tokens: Some(profile.max_output),
             correlation: Some(agent.to_string()),
         };
         let mut context_sequence = None;
         let mut final_text = String::new();
-        loop {
+        let mut meter = compact::TokenMeter::restore(&self.store.records().await, agent, &template);
+        let mut force_compaction = false;
+        let mut provider_attempt = 0u8;
+        let mut compaction_checked = false;
+        'requests: loop {
             if cancellation.is_cancelled() {
                 return Err(HarnessError::Interrupted);
             }
-            let runtime =
-                prompt::runtime_state_content(&self.jobs, &self.todos, agent, capabilities).await;
-            let mut request = template.clone();
-            request.messages.clone_from(history);
-            request.messages.push(Message::User(vec![runtime.clone()]));
-            self.store.hydrate_model_request(&mut request).await?;
             let context = match context_sequence {
                 Some(sequence) => sequence,
                 None => {
@@ -1112,19 +1117,99 @@ impl SessionRuntime {
                     record.sequence
                 }
             };
-            self.store
+            let mut projected =
+                crate::session::project_history(&self.store.records().await, agent)?;
+            let runtime =
+                prompt::runtime_state_content(&self.jobs, &self.todos, agent, capabilities).await;
+            let mut request = template.clone();
+            request.messages = projected
+                .iter()
+                .map(|(_, message)| message.clone())
+                .collect();
+            request.messages.push(Message::User(vec![runtime]));
+            if force_compaction
+                || (!compaction_checked
+                    && meter.estimate(&request)
+                        >= profile.max_context.saturating_sub(profile.max_output))
+            {
+                self.compact_history(
+                    &TurnContext {
+                        agent,
+                        profile,
+                        system,
+                        owner_job,
+                        cancellation,
+                        location,
+                        capabilities,
+                    },
+                    provider.as_ref(),
+                    context,
+                    &request,
+                )
+                .await?;
+                force_compaction = false;
+                compaction_checked = true;
+                projected = crate::session::project_history(&self.store.records().await, agent)?;
+                request.messages = projected
+                    .iter()
+                    .map(|(_, message)| message.clone())
+                    .collect();
+                let runtime =
+                    prompt::runtime_state_content(&self.jobs, &self.todos, agent, capabilities)
+                        .await;
+                request.messages.push(Message::User(vec![runtime]));
+            }
+            *history = projected
+                .iter()
+                .map(|(_, message)| message.clone())
+                .collect();
+            let mut messages = compact::context_sources(&projected);
+            messages.push(crate::session::ContextMessage::Inline {
+                message: request
+                    .messages
+                    .last()
+                    .expect("runtime state is present")
+                    .clone(),
+            });
+            let requested = self
+                .store
                 .append(
                     agent.clone(),
                     SessionEvent::ModelRequested {
                         context,
-                        history_len: history.len(),
-                        runtime,
+                        messages,
+                        purpose: crate::session::ModelPurpose::Agent,
                     },
                 )
                 .await?;
-            let mut response = tokio::select! {
-                response = provider.invoke(request) => response?,
+            let input_estimate = compaction::estimate_request(&request);
+            self.store.hydrate_model_request(&mut request).await?;
+            provider_attempt += 1;
+            let invoked = tokio::select! {
+                response = provider.invoke(request) => response,
                 () = cancellation.cancelled() => return Err(HarnessError::Interrupted),
+            };
+            let mut response = match invoked {
+                Ok(response) => response,
+                Err(error) => {
+                    self.store
+                        .append(
+                            agent.clone(),
+                            SessionEvent::ModelFailed {
+                                request: requested.sequence,
+                                attempt: provider_attempt,
+                                error: error.to_string(),
+                            },
+                        )
+                        .await?;
+                    if provider_attempt < compact::MAX_PROVIDER_ATTEMPTS {
+                        force_compaction =
+                            error.kind == crate::provider::ProviderErrorKind::ContextWindowExceeded;
+                        compact::retry_delay(cancellation, provider_attempt).await?;
+                        continue;
+                    }
+                    return Err(error.into());
+                }
             };
             let mut blocks = Vec::new();
             let mut streamed_text = String::new();
@@ -1137,7 +1222,33 @@ impl SessionRuntime {
                 let Some(chunk) = chunk else {
                     break;
                 };
-                match chunk? {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        if usage != Usage::default() {
+                            self.record_model_usage(agent, requested.sequence, usage)
+                                .await?;
+                        }
+                        self.store
+                            .append(
+                                agent.clone(),
+                                SessionEvent::ModelFailed {
+                                    request: requested.sequence,
+                                    attempt: provider_attempt,
+                                    error: error.to_string(),
+                                },
+                            )
+                            .await?;
+                        if provider_attempt < compact::MAX_PROVIDER_ATTEMPTS {
+                            force_compaction = error.kind
+                                == crate::provider::ProviderErrorKind::ContextWindowExceeded;
+                            compact::retry_delay(cancellation, provider_attempt).await?;
+                            continue 'requests;
+                        }
+                        return Err(error.into());
+                    }
+                };
+                match chunk {
                     ResponseChunk::TextDelta { text } => {
                         let _ = self.events.send(RuntimeEvent::TextDelta {
                             agent: agent.clone(),
@@ -1153,22 +1264,42 @@ impl SessionRuntime {
                     }
                     ResponseChunk::Block { block } => blocks.push(block),
                     ResponseChunk::Usage { usage: value } => usage = value,
+                    ResponseChunk::Finished { .. } => {}
                 }
             }
-            let response = finish_response(blocks, streamed_text, usage)?;
+            let response = match finish_response(blocks, streamed_text, usage) {
+                Ok(response) => response,
+                Err(error) => {
+                    if usage != Usage::default() {
+                        self.record_model_usage(agent, requested.sequence, usage)
+                            .await?;
+                    }
+                    self.store
+                        .append(
+                            agent.clone(),
+                            SessionEvent::ModelFailed {
+                                request: requested.sequence,
+                                attempt: provider_attempt,
+                                error: error.to_string(),
+                            },
+                        )
+                        .await?;
+                    if provider_attempt < compact::MAX_PROVIDER_ATTEMPTS {
+                        compact::retry_delay(cancellation, provider_attempt).await?;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
             final_text.push_str(&response.text);
             let assistant = Message::Assistant(response.blocks);
-            self.commit(agent, assistant.clone()).await?;
+            let origin = self.commit(agent, assistant.clone()).await?;
             history.push(assistant);
-            self.store
-                .append(
-                    agent.clone(),
-                    SessionEvent::Usage {
-                        usage: response.usage,
-                    },
-                )
+            self.record_model_usage(agent, requested.sequence, response.usage)
                 .await?;
-            self.usage.lock().await.accumulate(response.usage);
+            meter.observe(input_estimate, response.usage);
+            provider_attempt = 0;
+            compaction_checked = false;
             if response.calls.is_empty() {
                 let _ = self.events.send(RuntimeEvent::TurnCompleted {
                     agent: agent.clone(),
@@ -1179,12 +1310,9 @@ impl SessionRuntime {
             self.questions
                 .prepare_question_batch(agent, &response.calls)
                 .await;
-            let results = join_all(
-                response
-                    .calls
-                    .iter()
-                    .map(|call| self.execute_call(agent, owner_job, call, location, capabilities)),
-            )
+            let results = join_all(response.calls.iter().map(|call| {
+                self.execute_call(agent, owner_job, call, origin, location, capabilities)
+            }))
             .await;
             let tools = Message::Tool(results);
             self.commit(agent, tools.clone()).await?;
@@ -1192,11 +1320,31 @@ impl SessionRuntime {
         }
     }
 
-    async fn commit(&self, agent: &AgentId, message: Message) -> Result<(), SessionError> {
+    async fn record_model_usage(
+        &self,
+        agent: &AgentId,
+        request: u64,
+        usage: Usage,
+    ) -> Result<(), HarnessError> {
         self.store
+            .append(
+                agent.clone(),
+                SessionEvent::Usage {
+                    request: Some(request),
+                    usage,
+                },
+            )
+            .await?;
+        self.usage.lock().await.accumulate(usage);
+        Ok(())
+    }
+
+    async fn commit(&self, agent: &AgentId, message: Message) -> Result<u64, SessionError> {
+        let record = self
+            .store
             .append(agent.clone(), SessionEvent::MessageCommitted { message })
             .await?;
-        Ok(())
+        Ok(record.sequence)
     }
 
     async fn next_child(&self, parent: &AgentId) -> AgentId {
@@ -1299,6 +1447,9 @@ fn validate_profiles(
         return Err(HarnessError::UnknownAgentProfile(name.to_owned()));
     }
     for (name, profile) in models {
+        profile.validate_limits().map_err(|error| {
+            HarnessError::InvalidProfile(format!("model profile `{name}`: {error}"))
+        })?;
         if !providers.contains_key(&profile.provider) {
             return Err(HarnessError::InvalidProfile(format!(
                 "model profile `{name}` uses unknown provider `{}`",
@@ -1591,7 +1742,8 @@ mod tests {
                     provider: "test".to_owned(),
                     model: "test".to_owned(),
                     reasoning: None,
-                    max_output_tokens: None,
+                    max_context: 128_000,
+                    max_output: 16_384,
                     supports_images: false,
                 },
             )
@@ -3315,5 +3467,293 @@ return {live,completed,first,replay,second};
         assert_eq!(value["completed"]["result"]["stdout"], "before\nafter\n");
         assert_eq!(value["first"]["preview"]["lines"][0]["text"], "before");
         assert_eq!(value["second"]["preview"]["lines"][0]["text"], "after");
+    }
+
+    async fn add_research_for_compaction(
+        session: &SessionHandle,
+        template: &ModelRequest,
+        target: u64,
+    ) {
+        let mut prospective = template.clone();
+        prospective.messages =
+            crate::session::project_history(&session.runtime.store.records().await, &session.root)
+                .unwrap()
+                .into_iter()
+                .map(|(_, message)| message)
+                .collect();
+        prospective
+            .messages
+            .push(template.messages.last().unwrap().clone());
+        let padding = target.saturating_sub(compaction::estimate_request(&prospective)) * 4;
+        session
+            .runtime
+            .commit(
+                &session.root,
+                Message::Assistant(vec![AssistantContent::Text {
+                    text: "r".repeat(padding as usize),
+                }]),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn structured_compaction_preserves_supplied_text_todos_launches_and_exact_requests() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let plan = "## Implementation plan\n1. Preserve the full original plan.\n2. Run the migration only after approval.\n";
+        let provider = scripted_provider(
+            &requests,
+            [vec![ResponseChunk::TextDelta { text: plan.into() }]],
+        );
+        let harness = test_harness(workspace.path(), sessions.path(), provider.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        session
+            .prompt("Design the migration, preserving state; do not deploy.")
+            .await
+            .unwrap();
+        let template = requests.lock().unwrap()[0].clone();
+        let todos = vec![TodoItem {
+            text: "Review the exact migration plan".into(),
+            status: super::super::TodoStatus::Pending,
+        }];
+        session
+            .runtime
+            .todos
+            .replace(&session.root, todos.clone())
+            .await
+            .unwrap();
+        let creator = Message::Assistant(vec![AssistantContent::ToolCall(ToolCall {
+            id: "launch-once".into(),
+            name: "shell".into(),
+            arguments: json!({"command":"long-running research", "bg":true}),
+        })]);
+        let origin = session
+            .runtime
+            .commit(&session.root, creator.clone())
+            .await
+            .unwrap();
+        let lease = session
+            .runtime
+            .jobs
+            .create(crate::job::JobSpec {
+                origin: Some(crate::session::ModelCallOrigin {
+                    message: origin,
+                    call_id: "launch-once".into(),
+                }),
+                background: true,
+                ..crate::job::JobSpec::test(session.root.clone(), "shell")
+            })
+            .await
+            .unwrap();
+        session
+            .runtime
+            .jobs
+            .transition(lease.id, crate::job::JobState::Running)
+            .await
+            .unwrap();
+        let result = Message::Tool(vec![ToolResult {
+            call_id: "launch-once".into(),
+            name: "shell".into(),
+            result: json!({"id":lease.id,"state":"running"}),
+            console_output: String::new(),
+            images: vec![],
+            is_error: false,
+        }]);
+        session
+            .runtime
+            .commit(&session.root, result.clone())
+            .await
+            .unwrap();
+        for progress in ["Research completed.", "Further research completed."] {
+            let summary = json!({
+                "objective": "Continue the existing migration design task.",
+                "user_instructions": ["Continue."],
+                "session_rules": ["Do not deploy: deployment is not authorized because the user requested design only."],
+                "plan": [plan],
+                "resumption_point": progress,
+                "completed_work": [],
+                "findings": [],
+                "decisions": [],
+                "open_issues": [],
+                "next_actions": ["Continue the existing plan."],
+                "running_work": [],
+                "recovery_details": [],
+                "additional_context": [],
+                "todo_reconciliation": [],
+                "todos": todos
+            }).to_string();
+            add_research_for_compaction(&session, &template, 114_000).await;
+            provider.responses.lock().unwrap().extend([
+                vec![
+                    ResponseChunk::TextDelta { text: summary },
+                    ResponseChunk::Usage {
+                        usage: Usage {
+                            input_tokens: 10,
+                            output_tokens: 3,
+                            cached_input_tokens: 0,
+                        },
+                    },
+                    ResponseChunk::Finished { truncated: false },
+                ],
+                vec![ResponseChunk::TextDelta {
+                    text: "Continuing the original plan.".into(),
+                }],
+            ]);
+            session.prompt("Continue.").await.unwrap();
+            let captured = requests.lock().unwrap();
+            let summary_call = &captured[captured.len() - 2];
+            let resumed = captured.last().unwrap();
+            assert_eq!(summary_call.system, template.system);
+            assert!(summary_call.tools.is_empty());
+            assert_eq!(
+                summary_call.response_schema.as_ref().unwrap().schema,
+                compaction::response_schema()
+            );
+            assert!(resumed.response_schema.is_none());
+            assert_eq!(resumed.system, template.system);
+            assert_eq!(resumed.tools, template.tools);
+            assert!(
+                matches!(summary_call.messages.last(),Some(Message::User(blocks)) if matches!(&blocks[0],UserContent::Compaction{text} if !text.contains("30k") && !text.contains("30,000")))
+            );
+            assert_eq!(
+                resumed.messages.iter().filter(|m| **m == creator).count(),
+                1
+            );
+            assert_eq!(resumed.messages.iter().filter(|m| **m == result).count(), 1);
+            let joined = serde_json::to_string(&resumed.messages).unwrap();
+            assert!(joined.contains("Do not deploy"));
+            assert!(joined.contains("deployment is not authorized"));
+            assert!(resumed.messages.iter().any(|message| matches!(message,Message::User(blocks) if blocks.iter().any(|b| matches!(b,UserContent::Compaction{text} if text.contains(plan))))));
+            assert_eq!(runtime_state_count(&resumed.messages), 1);
+            assert!(joined.contains("Review the exact migration plan"));
+        }
+        let records = session.runtime.store.records().await;
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| matches!(r.event, SessionEvent::Compaction { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| matches!(r.event, SessionEvent::TodosReplaced { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| matches!(r.event, SessionEvent::JobCreated { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|r| matches!(r.event, SessionEvent::JobClaimed { .. }))
+        );
+        assert_eq!(
+            session
+                .runtime
+                .todos
+                .inspect(&session.root, None)
+                .await
+                .unwrap()
+                .items,
+            todos
+        );
+        assert_eq!(session.usage().await.output_tokens, 6);
+        let reconstructed: Vec<_> = records
+            .iter()
+            .filter(|r| matches!(r.event, SessionEvent::ModelRequested { .. }))
+            .map(|r| {
+                crate::session::reconstruct_model_request(&records, r.sequence)
+                    .unwrap()
+                    .1
+            })
+            .collect();
+        assert_eq!(reconstructed, *requests.lock().unwrap());
+        session.shutdown().await.unwrap();
+        session.runtime.store.close().await.unwrap();
+        let resumed = harness.resume_session(session.id()).await.unwrap();
+        provider
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(vec![ResponseChunk::TextDelta {
+                text: "Resumed safely.".into(),
+            }]);
+        resumed.prompt("Resume.").await.unwrap();
+        let last = requests.lock().unwrap().last().unwrap().clone();
+        assert!(
+            serde_json::to_string(&last.messages)
+                .unwrap()
+                .contains("Do not deploy")
+        );
+        assert_eq!(
+            resumed
+                .runtime
+                .todos
+                .inspect(&resumed.root, None)
+                .await
+                .unwrap()
+                .items,
+            todos
+        );
+        resumed.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_compaction_preserves_the_original_projection_and_never_executes_tools() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let provider = scripted_provider(
+            &requests,
+            [vec![ResponseChunk::TextDelta {
+                text: "## Plan\nKeep this original plan.".into(),
+            }]],
+        );
+        let harness = test_harness(workspace.path(), sessions.path(), provider.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        session.prompt("Plan a change.").await.unwrap();
+        let template = requests.lock().unwrap()[0].clone();
+        add_research_for_compaction(&session, &template, 114_000).await;
+        let before =
+            crate::session::project_history(&session.runtime.store.records().await, &session.root)
+                .unwrap();
+        provider
+            .responses
+            .lock()
+            .unwrap()
+            .extend(std::iter::repeat_n(
+                vec![ResponseChunk::Block {
+                    block: AssistantContent::ToolCall(ToolCall {
+                        id: "must-not-run".into(),
+                        name: "shell".into(),
+                        arguments: json!({"command":"touch should-not-exist"}),
+                    }),
+                }],
+                super::compact::MAX_PROVIDER_ATTEMPTS as usize,
+            ));
+        assert!(session.prompt("Continue.").await.is_err());
+        let records = session.runtime.store.records().await;
+        assert!(!records.iter().any(|r| matches!(
+            r.event,
+            SessionEvent::Compaction { .. } | SessionEvent::JobCreated { .. }
+        )));
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(r.event, SessionEvent::CompactionFailed { .. }))
+        );
+        let after = crate::session::project_history(&records, &session.root).unwrap();
+        assert!(after.starts_with(&before));
+        assert!(!workspace.path().join("should-not-exist").exists());
+        session.shutdown().await.unwrap();
     }
 }

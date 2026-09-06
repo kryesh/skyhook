@@ -6,7 +6,7 @@ use crate::{
     provider::profile::ModelProfile,
     provider::{
         Provider,
-        backends::flux::{FluxProvider, openai_compatible},
+        backends::flux::{anthropic_api, claude_oauth, codex_oauth, openai_compatible},
     },
 };
 
@@ -18,18 +18,16 @@ pub(super) fn build(name: &str, config: &ProviderConfig) -> Result<Arc<dyn Provi
             let key = required_env(api_key_env)?;
             openai_compatible(name, "https://api.openai.com", *api, Some(key))
         }
-        ProviderConfig::Anthropic { api_key_env } => FluxProvider::new(
-            flux_providers::anthropic::anthropic_api(required_env(api_key_env)?),
-        ),
+        ProviderConfig::Anthropic { api_key_env } => anthropic_api(required_env(api_key_env)?),
         ProviderConfig::Codex => {
             let tokens = flux_credentials::codex_token_source()
                 .map_err(|error| ConfigError::Provider(name.to_owned(), error.to_string()))?;
-            FluxProvider::new(flux_providers::codex::oauth(tokens))
+            codex_oauth(tokens)
         }
         ProviderConfig::Claude => {
             let tokens = flux_credentials::claude_token_source()
                 .map_err(|error| ConfigError::Provider(name.to_owned(), error.to_string()))?;
-            FluxProvider::new(flux_providers::anthropic::claude_oauth(tokens))
+            claude_oauth(tokens)
         }
         ProviderConfig::OpenaiCompatible {
             base_url,

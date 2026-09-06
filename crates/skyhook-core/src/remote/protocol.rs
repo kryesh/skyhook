@@ -120,7 +120,7 @@ pub(crate) struct RemoteToolError {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denial: Option<crate::tool::Denial>,
-    pub output: Option<RemoteToolOutput>,
+    pub output: Option<Box<RemoteToolOutput>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -287,11 +287,11 @@ mod tests {
             result: Err(RemoteToolError {
                 message: "timed out".to_owned(),
                 denial: None,
-                output: Some(RemoteToolOutput {
+                output: Some(Box::new(RemoteToolOutput {
                     value: serde_json::json!({"stdout":"partial"}),
                     console_output: String::new(),
                     images: Vec::new(),
-                }),
+                })),
             }),
         };
         let write = tokio::spawn(async move { write_frame(&mut left, &sent).await.unwrap() });
@@ -302,10 +302,10 @@ mod tests {
             Response::Tool {
                 request_id: 7,
                 result: Err(RemoteToolError {
-                    output: Some(RemoteToolOutput { value, .. }),
+                    output: Some(output),
                     ..
                 })
-            } if value["stdout"] == "partial"
+            } if output.value["stdout"] == "partial"
         ));
 
         let (mut left, mut right) = tokio::io::duplex(4096);

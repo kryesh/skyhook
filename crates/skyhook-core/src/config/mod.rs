@@ -88,24 +88,9 @@ impl Config {
         workspace: impl Into<PathBuf>,
     ) -> Result<HarnessBuilder, ConfigError> {
         for (name, profile) in &self.models {
-            if matches!(profile.max_output_tokens, Some(0)) {
-                return Err(ConfigError::Model(
-                    name.clone(),
-                    "max_output_tokens must be positive; omit it to leave the limit unset"
-                        .to_owned(),
-                ));
-            }
-            if profile.max_output_tokens.is_none()
-                && matches!(
-                    self.providers.get(&profile.provider),
-                    Some(ProviderConfig::Anthropic { .. } | ProviderConfig::Claude)
-                )
-            {
-                return Err(ConfigError::Model(
-                    name.clone(),
-                    "this provider requires an explicit max_output_tokens value".to_owned(),
-                ));
-            }
+            profile
+                .validate_limits()
+                .map_err(|message| ConfigError::Model(name.clone(), message.to_owned()))?;
         }
         let mut capabilities = crate::tool::policy::CapabilitySet::default();
         if self.targets_enabled {
@@ -166,7 +151,7 @@ mod tests {
         let path = root.path().join("explicit.toml");
         tokio::fs::write(
             &path,
-            "default_model_profile = 'local'\n\n[models.local]\nprovider = 'local'\nmodel = 'test'\nsupports_images = false\n",
+            "default_model_profile = 'local'\n\n[models.local]\nprovider = 'local'\nmodel = 'test'\nmax_context = 128000\nmax_output = 16384\nsupports_images = false\n",
         )
         .await
         .unwrap();
@@ -177,17 +162,50 @@ mod tests {
     }
 
     #[test]
-    fn providers_requiring_output_limits_need_explicit_configuration() {
-        for kind in ["anthropic", "claude"] {
+    fn every_provider_requires_both_model_limits() {
+        for kind in ["openai", "anthropic", "claude", "codex"] {
+            for limits in ["", "max_context = 128000\n", "max_output = 16384\n"] {
+                let text = format!(
+                    "default_model_profile = 'test'\n[providers.test]\nkind = '{kind}'\n[models.test]\nprovider = 'test'\nmodel = 'test'\n{limits}"
+                );
+                assert!(toml::from_str::<Config>(&text).is_err(), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_limits_are_rejected_before_credentials_are_loaded() {
+        for (max_context, max_output, expected) in [
+            (0, 1, "max_context must be positive"),
+            (128000, 0, "max_output must be positive"),
+            (128000, 128000, "max_output must be smaller"),
+            (128000, 128001, "max_output must be smaller"),
+            (
+                u64::from(u32::MAX) + 2,
+                u64::from(u32::MAX) + 1,
+                "provider u32",
+            ),
+        ] {
             let config: Config = toml::from_str(&format!(
-                "default_model_profile = 'test'\n[providers.test]\nkind = '{kind}'\n[models.test]\nprovider = 'test'\nmodel = 'sonnet'\n"
+                "default_model_profile = 'test'\n[providers.test]\nkind = 'anthropic'\n[models.test]\nprovider = 'test'\nmodel = 'test'\nmax_context = {max_context}\nmax_output = {max_output}\n"
             )).unwrap();
             let Err(ConfigError::Model(name, message)) = config.harness_builder(".") else {
-                panic!("expected missing output limit validation before credential loading");
+                panic!("expected limit validation before credential loading");
             };
             assert_eq!(name, "test");
-            assert!(message.contains("explicit max_output_tokens"));
+            assert!(message.contains(expected), "{message}");
         }
+    }
+
+    #[test]
+    fn removed_model_limit_name_is_rejected() {
+        let text = "default_model_profile = 'test'\n[models.test]\nprovider = 'test'\nmodel = 'test'\nmax_context = 128000\nmax_output = 16384\nmax_output_tokens = 16384\n";
+        assert!(
+            toml::from_str::<Config>(text)
+                .unwrap_err()
+                .to_string()
+                .contains("max_output_tokens")
+        );
     }
 
     #[test]
@@ -207,6 +225,8 @@ default_model_profile = "test"
 [models.test]
 provider = "test"
 model = "test"
+max_context = 128000
+max_output = 16384
 supports_images = false
 
 [targets]
@@ -239,14 +259,14 @@ path = "~/.ssh/build"
     #[test]
     fn approve_all_is_opt_in() {
         let disabled: Config = toml::from_str(
-            "default_model_profile='test'\n[models.test]\nprovider='test'\nmodel='test'\nsupports_images=false\n",
+            "default_model_profile='test'\n[models.test]\nprovider='test'\nmodel='test'\nmax_context=128000\nmax_output=16384\nsupports_images=false\n",
         )
         .unwrap();
         assert!(!disabled.approve_all);
         assert!(!disabled.targets_enabled);
 
         let enabled: Config = toml::from_str(
-            "default_model_profile='test'\napprove_all=true\n[models.test]\nprovider='test'\nmodel='test'\nsupports_images=false\n",
+            "default_model_profile='test'\napprove_all=true\n[models.test]\nprovider='test'\nmodel='test'\nmax_context=128000\nmax_output=16384\nsupports_images=false\n",
         )
         .unwrap();
         assert!(enabled.approve_all);

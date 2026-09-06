@@ -146,7 +146,10 @@ pub enum ToolError {
     #[error("tool failed: {0}")]
     Failed(String),
     #[error("tool failed: {message}")]
-    FailedWithOutput { message: String, output: ToolOutput },
+    FailedWithOutput {
+        message: String,
+        output: Box<ToolOutput>,
+    },
     #[error("tool I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("tool JSON failed: {0}")]
@@ -165,7 +168,7 @@ impl ToolError {
     pub fn with_output(message: impl Into<String>, output: ToolOutput) -> Self {
         Self::FailedWithOutput {
             message: message.into(),
-            output,
+            output: Box::new(output),
         }
     }
 }

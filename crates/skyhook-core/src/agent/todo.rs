@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     identity::{AgentId, JobId},
-    session::{EventRecord, SessionError, SessionEvent, SessionStore},
+    session::{CompactionCheckpoint, EventRecord, SessionError, SessionEvent, SessionStore},
     tool::ToolError,
 };
 
@@ -38,6 +38,7 @@ pub struct TodoSnapshot {
 struct AgentTodos {
     owner_job: Option<JobId>,
     items: Vec<TodoItem>,
+    revision: u64,
 }
 
 pub(super) struct TodoStore {
@@ -54,11 +55,14 @@ impl TodoStore {
                     agents.entry(record.agent.clone()).or_default().owner_job = *owner_job;
                 }
                 SessionEvent::TodosReplaced { items } => {
-                    agents
-                        .entry(record.agent.clone())
-                        .or_default()
-                        .items
-                        .clone_from(items);
+                    let state = agents.entry(record.agent.clone()).or_default();
+                    state.items.clone_from(items);
+                    state.revision = record.sequence;
+                }
+                SessionEvent::Compaction { checkpoint } => {
+                    let state = agents.entry(record.agent.clone()).or_default();
+                    state.items.clone_from(&checkpoint.todos);
+                    state.revision = record.sequence;
                 }
                 _ => {}
             }
@@ -78,20 +82,26 @@ impl TodoStore {
         // Publish the job association and seed together so inspection cannot see an
         // empty list between registering the child and persisting its initial instructions.
         let mut agents = self.agents.lock().await;
-        if let Some(items) = &seed {
-            self.store
-                .append(
-                    agent.clone(),
-                    SessionEvent::TodosReplaced {
-                        items: items.clone(),
-                    },
-                )
-                .await?;
-        }
+        let revision = if let Some(items) = &seed {
+            Some(
+                self.store
+                    .append(
+                        agent.clone(),
+                        SessionEvent::TodosReplaced {
+                            items: items.clone(),
+                        },
+                    )
+                    .await?
+                    .sequence,
+            )
+        } else {
+            None
+        };
         let state = agents.entry(agent).or_default();
         state.owner_job = owner_job;
         if let Some(items) = seed {
             state.items = items;
+            state.revision = revision.expect("seed was journaled");
         }
         Ok(())
     }
@@ -112,7 +122,8 @@ impl TodoStore {
     ) -> Result<TodoSnapshot, SessionError> {
         // Hold the lock across persistence so published snapshots and replay agree on order.
         let mut agents = self.agents.lock().await;
-        self.store
+        let record = self
+            .store
             .append(
                 agent.clone(),
                 SessionEvent::TodosReplaced {
@@ -120,15 +131,35 @@ impl TodoStore {
                 },
             )
             .await?;
-        agents
-            .entry(agent.clone())
-            .or_default()
-            .items
-            .clone_from(&items);
+        let state = agents.entry(agent.clone()).or_default();
+        state.items.clone_from(&items);
+        state.revision = record.sequence;
         Ok(TodoSnapshot {
             agent: agent.clone(),
             items,
         })
+    }
+
+    /// Journal and publish history and todos together. A newer todo mutation
+    /// invalidates the summary's snapshot and must be reconciled by a fresh attempt.
+    pub(crate) async fn commit_compaction(
+        &self,
+        agent: &AgentId,
+        checkpoint: CompactionCheckpoint,
+    ) -> Result<bool, SessionError> {
+        let mut agents = self.agents.lock().await;
+        let state = agents.entry(agent.clone()).or_default();
+        if state.revision > checkpoint.frontier {
+            return Ok(false);
+        }
+        let items = checkpoint.todos.clone();
+        let record = self
+            .store
+            .append(agent.clone(), SessionEvent::Compaction { checkpoint })
+            .await?;
+        state.items = items;
+        state.revision = record.sequence;
+        Ok(true)
     }
 
     pub async fn inspect(

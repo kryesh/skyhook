@@ -55,25 +55,113 @@ input, and uncached input token counts.
 
 ## Reconstructing model calls
 
-Session format 4 records the inputs needed to reconstruct each call at the shared `Provider`
+Session format 1 records the inputs needed to reconstruct each call at the shared `Provider`
 boundary. It stores no backend-specific request bodies or authentication headers:
 
 - `model_context` records the configured provider name and a shared `ModelRequest` template:
   actual model ID, assembled system prompt (including harness/profile instructions and location),
-  tool descriptions and schemas, reasoning setting, output limit, and correlation. Its `messages`
-  array is empty; conversation history remains in `message_committed` events.
+  tool descriptions and schemas, optional response schema, reasoning setting, output limit, and correlation. Its `messages`
+  array is empty; conversation history remains in `message_committed` and `compaction` events.
 - `model_requested` is persisted before each provider invocation. It references the context event's
-  sequence, records the agent's history length, and saves the exact transient runtime state appended
-  to that call. Calls within a turn share one context record, including through tool-result rounds.
-- Each call uses preceding `message_committed` events belonging to that agent, followed by its
-  recorded runtime state. Reconstruction uses those saved values rather than current configuration,
-  prompt code, or live job state. Failed/interrupted calls retain their input records.
+  sequence and records an ordered list of source-event references and exact inline messages,
+  including transient runtime state and compaction directives. Its purpose distinguishes ordinary
+  agent calls from summarization. Ordinary calls within a turn share one context record;
+  summarization records a separate template containing its response schema.
+- `compaction` is an ordinary log event containing the exact replacement message, retained original
+  message references, covered frontier, previous compaction reference, and the
+  summarization request reference and token estimates. It also contains schema version 1 and the
+  reconciled owner todo list. History and todos become active together after persistence.
+- Reconstruction resolves recorded references and inline values rather than using current
+  configuration, prompt code, or live job state. It neither reruns summarization nor rerenders old
+  compaction messages. Failed/interrupted calls retain their input records; usage records identify
+  their originating request, including summarization calls.
 
 `session::reconstruct_model_request(&records, sequence)` returns the provider name and reconstructed
 `ModelRequest` for a `model_requested` sequence. Image metadata references the existing session blobs;
 `store.hydrate_model_request(&mut request).await` restores their payloads when needed. This reconstructs
-Skyhook's provider-neutral input, not an API-specific wire encoding. There is no migration from older
-session formats.
+Skyhook's provider-neutral input, not an API-specific wire encoding. Format versions remain at 1;
+there is no compatibility or migration layer for earlier layouts.
+
+## Conversation compaction
+
+Skyhook automatically compacts an agent's conversation when its estimated complete input reaches
+the model profile's `max_context - max_output`. This is a soft trigger: estimates never reject
+a request locally, and the provider decides whether it fits. Both limits are mandatory; Skyhook
+does not silently reduce the output allowance. Token estimates include prompts, tools, messages,
+images, response schemas, and current state, and are calibrated against reported provider usage.
+
+Compaction uses the current model to summarize the conversation. The regular system prompt remains
+present, but the summarization request has no tool definitions and explicitly disables tool calls.
+Historical tool calls and results remain available as evidence. Subsequent agent requests retain
+their normal tool definitions. The directive and resulting
+compaction message occupy the user role with separate harness provenance. The model returns a
+structured JSON final answer with an objective and resumption point as strings, all other narrative
+sections as arrays of strings, and a complete current todo list. Empty arrays represent inapplicable
+sections. Reasoning is streamed separately and is not parsed as JSON. Skyhook renders entries in
+order, separated by blank lines, without rewriting their contents. Entries can include Markdown;
+each verbatim plan remains one complete entry, with its status recorded separately.
+The response schema is also included in the directive so its descriptions are visible to models
+whose provider only uses the schema to constrain decoding. Tool calls returned by the summarizer
+are rejected without execution.
+
+Schema property order is preserved through serialization and session replay. The generation order
+records the objective, instructions, and plan first, then findings, open issues, running and completed
+work, decisions, and recovery context. Todo reconciliation and todos follow that evidence; the
+resumption point and next actions come last. Providers such as llama.cpp can enforce this order in
+their constrained decoder; JSON Schema itself does not require object property order. The rendered
+continuation retains its reading order, with the objective and resumption point near the beginning.
+
+The directive guides the model to carry forward the current task, latest user instructions,
+applicable plans verbatim, progress, chosen and rejected approaches with their reasons, and useful
+evidence. It includes any preceding continuation in the conversation and asks the model to preserve
+still-relevant details, session rules, and the precise resumption point. Completion claims must
+reflect observed results and their scope, preserving unfinished investigation, verification, and
+uncertainty. The continuation must not invent directions to stop gathering evidence or replace
+outstanding work with presentation alone. Schema validation checks
+the required fields, their types, todo statuses, and nonblank todo text; it cannot guarantee factual
+accuracy or completeness. The prompt prescribes no token budget.
+
+The recent conversation and complete creator exchanges for active jobs remain in context,
+including original calls for nested work. Historical calls are not executed again. The summarizer
+reconciles this agent's todos against the conversation, accounting for work performed without a todo
+update. It preserves unaffected items, retains completed items, and explains changes and their
+evidence. The checkpoint installs that list in the todo store without changing child-agent lists.
+If todos change during summarization, a fresh attempt uses current history and state. Each working
+request still ends with a fresh state block containing current todos and active jobs.
+
+`ModelRequest.response_schema` optionally supplies a named JSON Schema for final answer text,
+independently of reasoning settings. Built-in Flux adapters transmit it through OpenAI Chat
+Completions, Responses, and Anthropic Messages formats. Codex OAuth schema calls use HTTP while
+ordinary calls retain Flux's WebSocket transport. Models/endpoints must support structured output;
+an opaque provider wrapped with `FluxProvider::new` rejects schemas explicitly instead of ignoring
+them. Ordinary agent requests have no response schema.
+
+Original messages and saved job artifacts remain available. The `history` tool reads only the
+calling agent's conversation, including prior compaction messages and job notifications, without
+consuming notifications or exposing reasoning blocks. It supports an exact `source`, a literal
+case-insensitive `query`, and up to 100 text chunks per page, with the complete response limited to
+8 KiB. Use returned `next_cursor` and `through` together, keeping the same source/query, to browse
+a stable snapshot. Returned entry offsets are byte positions in original source text.
+
+```javascript
+const page = await tool.history({query: "rejected approach", limit: 10});
+return page.next_cursor === null ? page : await tool.history({
+  query: "rejected approach", limit: 10, cursor: page.next_cursor, through: page.through
+});
+```
+
+Sources use `m42/b0` for original text, `m43/b0/result` or `/console` for tool output, and `c50/b0`
+for compaction text. Tool-call arguments are available at `m42/b0/arguments`. Existing job retrieval
+continues to provide complete saved outputs.
+
+Invalid structured responses, truncation, failed persistence, and cancellation leave the preceding
+context and todos active. If the continuation and retained messages do not reduce context, Skyhook skips installing it and continues with
+the original history. Oversized estimates never cause preserved state to be dropped. Ordinary model
+calls and summarization each allow up to three attempts total, including failures during streaming;
+invalid summaries, truncated summaries, or summary tool-call responses are also retried. Recognized provider context-overflow errors force compaction
+before the next ordinary attempt. Each attempt is journaled with its exact input, and failed streamed
+tool calls are never executed. The CLI reports compaction start, estimated input reduction, skipped
+compactions, failures, and ordinary request retries without printing the summary.
 
 ## Execution targets
 
@@ -195,13 +283,15 @@ api = "chat_completions"
 [models.local]
 provider = "local"
 model = "qwen3-coder"
-# Optional: max_output_tokens = 32768
+max_context = 128000
+max_output = 16384
 supports_images = false
 ```
 
-Skyhook does not set an output token limit unless `max_output_tokens` is configured. The server's
-own limits still apply. Anthropic/Claude profiles require an explicit value because their protocol
-requires an output limit.
+Every model profile requires `max_context` and `max_output`. Set them to the context capacity and
+output limit you want Skyhook to use for that model; the example values are conservative starting
+points. Both must be positive, `max_output` must be smaller than `max_context`, and the output limit
+must fit the provider's 32-bit token field. Skyhook sends the configured output limit on every call.
 
 The `codex` and `claude` provider kinds import and refresh credentials through Flux, including
 credentials from the official Codex and Claude CLIs. Instructions in `AGENTS.md` files are loaded
@@ -478,7 +568,7 @@ without reconnecting to the remote machine.
 
 The journal stores the exact model-visible previews, pages, and notifications. Full artifacts
 are separate; provider-neutral request reconstruction reuses committed content rather than
-regenerating it from current files or settings. Session format 4 has no migration path.
+regenerating it from current files or settings. Session format 1 has no migration layer.
 
 Host-owned skills are exposed through `skills` and `skill`; they are discovered from the user
 configuration directory and `.agents/skills` directories along the workspace ancestry.

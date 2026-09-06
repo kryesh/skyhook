@@ -321,7 +321,7 @@ async fn externalize_result(
             Err(RemoteToolError {
                 message: failure.message,
                 denial: failure.denial,
-                output,
+                output: output.map(Box::new),
             })
         }
     }

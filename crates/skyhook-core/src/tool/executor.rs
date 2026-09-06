@@ -36,6 +36,7 @@ struct PreparedInvocation {
 }
 
 struct InvocationPlan {
+    origin: Option<crate::session::ModelCallOrigin>,
     agent: AgentId,
     tool: Arc<super::RegisteredTool>,
     original_arguments: Value,
@@ -58,6 +59,7 @@ enum InvocationDispatch {
 
 #[derive(Clone)]
 pub struct ToolExecutor {
+    model_origin: Option<crate::session::ModelCallOrigin>,
     shared: Arc<ExecutorServices>,
     caller_location: ExecutionLocation,
     capabilities: CapabilitySet,
@@ -98,6 +100,7 @@ impl ToolExecutor {
     ) -> Self {
         let caller_location = ExecutionLocation::root(workspace.clone());
         Self {
+            model_origin: None,
             shared: Arc::new(ExecutorServices {
                 registry,
                 authorization,
@@ -109,6 +112,12 @@ impl ToolExecutor {
             caller_location,
             capabilities: CapabilitySet::default(),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_model_origin(mut self, origin: crate::session::ModelCallOrigin) -> Self {
+        self.model_origin = Some(origin);
+        self
     }
 
     #[must_use]
@@ -409,6 +418,11 @@ impl ToolExecutor {
             original_arguments.clone()
         };
         Ok(InvocationPlan {
+            origin: if matches!(kind, InvocationKind::Model) {
+                self.model_origin.clone()
+            } else {
+                None
+            },
             agent,
             tool,
             original_arguments,
@@ -444,6 +458,7 @@ impl ToolExecutor {
             .shared
             .jobs
             .create(JobSpec {
+                origin: plan.origin,
                 agent: plan.agent.clone(),
                 parent: plan.parent,
                 tool: plan.tool.name().to_owned(),
@@ -676,11 +691,14 @@ impl ToolExecutor {
                 message: envelope
                     .error
                     .unwrap_or_else(|| format!("job ended as {:?}", envelope.state)),
-                output: envelope.output.map(|value| ToolOutput {
-                    value,
-                    images,
-                    console_output: envelope.console_output,
-                }),
+                output: envelope
+                    .output
+                    .map(|value| ToolOutput {
+                        value,
+                        images,
+                        console_output: envelope.console_output,
+                    })
+                    .map(Box::new),
             })
         }
     }
@@ -740,7 +758,7 @@ async fn import_remote_result(
             output: Some(output),
         }) => Err(ToolError::with_output(
             message,
-            import_remote_output(store, output).await?,
+            import_remote_output(store, *output).await?,
         )),
         Err(error) => Err(error.into_tool_error()),
     }
@@ -877,7 +895,7 @@ pub enum ExecutionError {
     #[error("tool execution failed: {message}")]
     Failed {
         message: String,
-        output: Option<ToolOutput>,
+        output: Option<Box<ToolOutput>>,
     },
     #[error("could not serialize tool result: {0}")]
     Json(#[from] serde_json::Error),
@@ -889,8 +907,8 @@ impl ExecutionError {
         let denial = matches!(&self, Self::Denied(_) | Self::Tool(ToolError::Denied(_)))
             .then(super::Denial::permission_denied);
         let output = match self {
-            Self::Failed { output, .. } => output,
-            Self::Tool(ToolError::FailedWithOutput { output, .. }) => Some(output),
+            Self::Failed { output, .. } => output.map(|output| *output),
+            Self::Tool(ToolError::FailedWithOutput { output, .. }) => Some(*output),
             _ => None,
         };
         ExecutionFailure {

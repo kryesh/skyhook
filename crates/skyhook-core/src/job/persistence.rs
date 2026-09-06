@@ -13,6 +13,7 @@ pub(super) async fn restore(
     for record in records {
         match &record.event {
             SessionEvent::JobCreated {
+                origin,
                 job,
                 parent,
                 tool,
@@ -26,6 +27,7 @@ pub(super) async fn restore(
                 maximum = maximum.max(job.get());
                 let (entry, _receiver) = JobEntry::new(
                     JobSpec {
+                        origin: origin.clone(),
                         agent: record.agent.clone(),
                         parent: *parent,
                         tool: tool.clone(),

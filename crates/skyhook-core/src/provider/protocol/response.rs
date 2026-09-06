@@ -8,6 +8,7 @@ pub enum ResponseChunk {
     ReasoningDelta { text: String },
     Block { block: AssistantContent },
     Usage { usage: Usage },
+    Finished { truncated: bool },
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]

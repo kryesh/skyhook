@@ -197,7 +197,7 @@ impl From<crate::tool::ToolError> for JobOutcome {
         let (output, denial) = match error {
             ToolError::Cancelled => return Self::Cancelled,
             ToolError::Denied(_) => (None, Some(Denial::permission_denied())),
-            ToolError::FailedWithOutput { output, .. } => (Some(output), None),
+            ToolError::FailedWithOutput { output, .. } => (Some(*output), None),
             _ => (None, None),
         };
         Self::Failed {
@@ -215,6 +215,7 @@ pub struct JobCompletion {
 }
 
 struct JobEntry {
+    origin: Option<crate::session::ModelCallOrigin>,
     output_schema: Option<Value>,
     agent: AgentId,
     parent: Option<JobId>,
@@ -245,6 +246,7 @@ impl JobEntry {
         let (input, receiver) = mpsc::channel(JOB_INPUT_CAPACITY);
         (
             Self {
+                origin: spec.origin,
                 output_schema: spec.output_schema,
                 agent: spec.agent,
                 parent: spec.parent,
@@ -359,6 +361,7 @@ pub struct JobLease {
 
 #[derive(Clone, Debug)]
 pub struct JobSpec {
+    pub origin: Option<crate::session::ModelCallOrigin>,
     pub output_schema: Option<Value>,
     pub agent: AgentId,
     pub parent: Option<JobId>,
@@ -375,6 +378,7 @@ pub struct JobSpec {
 impl JobSpec {
     pub(crate) fn test(agent: AgentId, tool: impl Into<String>) -> Self {
         Self {
+            origin: None,
             output_schema: None,
             agent,
             parent: None,
@@ -430,6 +434,7 @@ impl JobManager {
             .append(
                 spec.agent.clone(),
                 SessionEvent::JobCreated {
+                    origin: spec.origin.clone(),
                     job: id,
                     parent: spec.parent,
                     tool: spec.tool.clone(),
@@ -464,6 +469,52 @@ impl JobManager {
             cancellation,
             input,
         })
+    }
+
+    /// Inspect launch provenance without claiming output or changing delivery state.
+    pub(crate) async fn active_launches(
+        &self,
+        agent: &AgentId,
+    ) -> Vec<(JobId, Option<crate::session::ModelCallOrigin>)> {
+        let jobs = self.inner.jobs.lock().await;
+        let mut launches = Vec::new();
+        for (id, entry) in jobs
+            .iter()
+            .filter(|(_, entry)| &entry.agent == agent && !entry.state.is_terminal())
+        {
+            let mut current = entry;
+            let origin = loop {
+                if &current.agent != agent {
+                    break None;
+                }
+                if let Some(origin) = &current.origin {
+                    break Some(origin.clone());
+                }
+                let Some(parent) = current.parent.and_then(|id| jobs.get(&id)) else {
+                    break None;
+                };
+                current = parent;
+            };
+            launches.push((*id, origin));
+        }
+        launches.sort_by_key(|(id, _)| *id);
+        launches
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn active_origins(
+        &self,
+        agent: &AgentId,
+    ) -> Vec<crate::session::ModelCallOrigin> {
+        let mut origins = Vec::new();
+        for (_, origin) in self.active_launches(agent).await {
+            if let Some(origin) = origin
+                && !origins.contains(&origin)
+            {
+                origins.push(origin);
+            }
+        }
+        origins
     }
 
     pub async fn transition(&self, id: JobId, state: JobState) -> Result<(), JobError> {
@@ -1171,6 +1222,167 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn active_origins_keep_completed_launchers_and_do_not_consume_outputs() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(root.path()).await.unwrap();
+        let agent = AgentId::root(store.id());
+        let jobs = JobManager::new(store.clone());
+        let origin = crate::session::ModelCallOrigin {
+            message: 1,
+            call_id: "script-call".into(),
+        };
+        let parent = jobs
+            .create(JobSpec {
+                origin: Some(origin.clone()),
+                background: true,
+                ..JobSpec::test(agent.clone(), "script")
+            })
+            .await
+            .unwrap();
+        let child = jobs
+            .create(JobSpec {
+                parent: Some(parent.id),
+                ..JobSpec::test(agent.clone(), "shell")
+            })
+            .await
+            .unwrap();
+        let grandchild = jobs
+            .create(JobSpec {
+                parent: Some(child.id),
+                ..JobSpec::test(agent.clone(), "nested")
+            })
+            .await
+            .unwrap();
+        jobs.finish(parent.id, JobOutcome::Completed(ToolOutput::default()))
+            .await
+            .unwrap();
+        let before = store.records().await;
+        assert_eq!(jobs.active_origins(&agent).await, vec![origin.clone()]);
+        assert_eq!(jobs.active_origins(&agent).await, vec![origin.clone()]);
+        assert_eq!(store.records().await, before);
+        assert!(
+            jobs.inner
+                .jobs
+                .lock()
+                .await
+                .get(&parent.id)
+                .unwrap()
+                .delivery
+                == DeliveryState::Pending
+        );
+        assert_eq!(
+            jobs.take_pending(&agent)
+                .await
+                .unwrap()
+                .iter()
+                .map(|job| job.id)
+                .collect::<Vec<_>>(),
+            vec![parent.id]
+        );
+        assert!(jobs.take_pending(&agent).await.unwrap().is_empty());
+        jobs.finish(child.id, JobOutcome::Completed(ToolOutput::default()))
+            .await
+            .unwrap();
+        assert_eq!(jobs.active_origins(&agent).await, vec![origin]);
+        jobs.finish(grandchild.id, JobOutcome::Completed(ToolOutput::default()))
+            .await
+            .unwrap();
+        assert!(jobs.active_origins(&agent).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_origins_stop_at_agent_boundaries_and_prefer_the_nearest_call() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(root.path()).await.unwrap();
+        let agent = AgentId::root(store.id());
+        let child_agent = agent.child(1);
+        let jobs = JobManager::new(store);
+        let root_origin = crate::session::ModelCallOrigin {
+            message: 1,
+            call_id: "delegate".into(),
+        };
+        let child_origin = crate::session::ModelCallOrigin {
+            message: 2,
+            call_id: "child-script".into(),
+        };
+        let owner = jobs
+            .create(JobSpec {
+                origin: Some(root_origin.clone()),
+                ..JobSpec::test(agent.clone(), "agent")
+            })
+            .await
+            .unwrap();
+        jobs.create(JobSpec {
+            parent: Some(owner.id),
+            ..JobSpec::test(child_agent.clone(), "host-started")
+        })
+        .await
+        .unwrap();
+        assert!(jobs.active_origins(&child_agent).await.is_empty());
+        let child = jobs
+            .create(JobSpec {
+                parent: Some(owner.id),
+                origin: Some(child_origin.clone()),
+                ..JobSpec::test(child_agent.clone(), "script")
+            })
+            .await
+            .unwrap();
+        jobs.create(JobSpec {
+            parent: Some(child.id),
+            ..JobSpec::test(child_agent.clone(), "shell")
+        })
+        .await
+        .unwrap();
+        assert_eq!(jobs.active_origins(&agent).await, vec![root_origin]);
+        assert_eq!(jobs.active_origins(&child_agent).await, vec![child_origin]);
+    }
+
+    #[tokio::test]
+    async fn restored_launch_provenance_survives_interruption_and_new_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(root.path()).await.unwrap();
+        let agent = AgentId::root(store.id());
+        let jobs = JobManager::new(store.clone());
+        let origin = crate::session::ModelCallOrigin {
+            message: 1,
+            call_id: "restored-script".into(),
+        };
+        let parent = jobs
+            .create(JobSpec {
+                origin: Some(origin.clone()),
+                ..JobSpec::test(agent.clone(), "script")
+            })
+            .await
+            .unwrap();
+        let child = jobs
+            .create(JobSpec {
+                parent: Some(parent.id),
+                ..JobSpec::test(agent.clone(), "shell")
+            })
+            .await
+            .unwrap();
+        jobs.finish(parent.id, JobOutcome::Completed(ToolOutput::default()))
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+        let (store, records) = SessionStore::open(root.path(), store.id()).await.unwrap();
+        let restored = JobManager::restore(store.clone(), &records).await.unwrap();
+        assert_eq!(
+            restored.snapshot(child.id).await.unwrap().state,
+            JobState::Interrupted
+        );
+        assert!(restored.active_origins(&agent).await.is_empty());
+        restored
+            .create(JobSpec {
+                parent: Some(child.id),
+                ..JobSpec::test(agent.clone(), "new-descendant")
+            })
+            .await
+            .unwrap();
+        assert_eq!(restored.active_origins(&agent).await, vec![origin]);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn wait_deadline_does_not_restart_on_notifications() {
         let root = tempfile::tempdir().unwrap();
@@ -1399,9 +1611,9 @@ mod tests {
         assert!(matches!(
             failed,
             ExecutionError::Failed {
-                output: Some(ToolOutput { value, .. }),
+                output: Some(output),
                 ..
-            } if value == "partial"
+            } if output.value == "partial"
         ));
     }
 

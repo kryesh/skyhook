@@ -19,7 +19,7 @@ pub(super) const TARGET_PROMPT: &str = r#"Your current target and workspace are 
 Remote commands receive Skyhook's SSH_AUTH_SOCK. SSH authentication prompts are handled by Skyhook."#;
 
 const WORKSPACE_PROMPT: &str = "A workspace is a base directory, not isolation or a filesystem copy. Paths/cwd accept absolute paths or relative paths including `..`, resolved on the selected machine. Relative child workspace overrides resolve against the selected base.";
-const LIFECYCLE_PROMPT: &str = "Model calls return JobView; Result in tool descriptions refers to its result field. JavaScript calls return native results; background launches return job metadata. Some result fields may be truncated. Use job_output to retrieve or filter a field's saved content.\n\nCommand timeouts terminate execution; omitted timeouts have no deadline. Nonzero exit_code is a normal result. Script failures throw with partial error.output. Never circumvent a declined operation; use permitted alternatives or explain the limitation.";
+const LIFECYCLE_PROMPT: &str = "Model calls return JobView; Result in tool descriptions refers to its result field. JavaScript calls return native results; background launches return job metadata. Some result fields may be truncated. Use job_output to retrieve or filter a field's saved content. Use history to read or search your original conversation by source reference after compaction.\n\nCommand timeouts terminate execution; omitted timeouts have no deadline. Nonzero exit_code is a normal result. Script failures throw with partial error.output. Never circumvent a declined operation; use permitted alternatives or explain the limitation.";
 const AGENT_PROMPT: &str = "Children start with fresh history; include the full task, relevant context, and scope. Give children distinct responsibilities and use their results. Consider supplying todos with steps or checkpoints. Agents on one target share its filesystem. Child depth limits further delegation and must be below available_depth.";
 
 const TODO_PROMPT: &str = "Use todo for multi-step work and account for unfinished items.";
@@ -126,17 +126,38 @@ pub(super) async fn runtime_state_content_at(
     capabilities: &CapabilitySet,
     now: DateTime<Local>,
 ) -> UserContent {
+    let items = todos
+        .inspect(agent, None)
+        .await
+        .expect("own todo list is always readable")
+        .items;
+    runtime_state_with_todos_at(jobs, agent, capabilities, items, now).await
+}
+
+/// Preview a candidate compaction's state without publishing its todos.
+pub(super) async fn runtime_state_with_todos(
+    jobs: &JobManager,
+    agent: &AgentId,
+    capabilities: &CapabilitySet,
+    todos: Vec<TodoItem>,
+) -> UserContent {
+    runtime_state_with_todos_at(jobs, agent, capabilities, todos, Local::now()).await
+}
+
+async fn runtime_state_with_todos_at(
+    jobs: &JobManager,
+    agent: &AgentId,
+    capabilities: &CapabilitySet,
+    todos: Vec<TodoItem>,
+    now: DateTime<Local>,
+) -> UserContent {
     let active_jobs = jobs
         .active_states(agent, capabilities, now.timestamp_millis())
         .await;
     let state = SkyhookState {
         date: now.format("%Y-%m-%d").to_string(),
         active_jobs,
-        todos: todos
-            .inspect(agent, None)
-            .await
-            .expect("own todo list is always readable")
-            .items,
+        todos,
     };
     UserContent::Runtime {
         text: format!(

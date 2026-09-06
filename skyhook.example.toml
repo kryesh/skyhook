@@ -30,34 +30,39 @@ api = "chat_completions"
 provider = "openai"
 model = "gpt-5.6"
 reasoning = "high"
-max_output_tokens = 16384
+max_context = 128000
+max_output = 16384
 supports_images = true
 
 [models.sonnet]
 provider = "anthropic"
 model = "sonnet"
 reasoning = "high"
-max_output_tokens = 16384
+max_context = 128000
+max_output = 16384
 supports_images = true
 
 [models.codex]
 provider = "codex"
 model = "gpt-5.6-sol"
 reasoning = "high"
+max_context = 128000
+max_output = 16384
 supports_images = true
 
 [models.claude]
 provider = "claude"
 model = "sonnet"
 reasoning = "high"
-max_output_tokens = 16384
+max_context = 128000
+max_output = 16384
 supports_images = true
 
 [models.local]
 provider = "local"
 model = "qwen3-coder"
-# Optional; omitted by default so the server decides its output limit.
-# max_output_tokens = 32768
+max_context = 128000
+max_output = 16384
 supports_images = false
 
 # Importing concrete aliases from ~/.ssh/config is opt-in.

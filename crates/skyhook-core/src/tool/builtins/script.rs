@@ -67,7 +67,7 @@ fn script_error(error: crate::tool::javascript::JsError) -> ToolError {
                     mut output,
                 } => {
                     output.console_output = console_output;
-                    ToolError::with_output(message, output)
+                    ToolError::with_output(message, *output)
                 }
                 error => {
                     let mut output = ToolOutput::new(serde_json::Value::Null);
