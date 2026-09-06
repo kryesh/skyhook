@@ -4,3 +4,5 @@ mod console;
 mod runtime;
 
 pub use runtime::{JsError, evaluate};
+
+pub(crate) use runtime::evaluate_captured;

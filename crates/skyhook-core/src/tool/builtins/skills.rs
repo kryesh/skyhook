@@ -294,7 +294,9 @@ struct NoArgs {}
 #[serde(deny_unknown_fields)]
 struct SkillArgs {
     name: String,
+    /// Asset path within the named skill; omitted loads its instructions.
     path: Option<String>,
+    /// Destination path for copying the selected asset instead of returning its content.
     to: Option<String>,
 }
 
@@ -315,6 +317,7 @@ enum SkillOutput {
     Asset {
         name: String,
         path: String,
+        #[schemars(extend("x-skyhook-truncatable" = true))]
         content: String,
         bytes: usize,
     },
@@ -349,6 +352,69 @@ mod tests {
             extract_description("# Name\n\nFirst paragraph").unwrap(),
             "First paragraph"
         );
+    }
+
+    #[tokio::test]
+    async fn asset_content_truncates_but_skill_instructions_remain_complete() {
+        let runtime = crate::test_support::TestRuntime::new().await;
+        let skill = runtime.root.path().join(".agents/skills/demo");
+        fs::create_dir_all(&skill).await.unwrap();
+        let instructions = "# Demo\n\n".to_owned() + &"Important instruction.\n".repeat(300);
+        let asset = "x".repeat(5000);
+        fs::write(skill.join("SKILL.md"), &instructions)
+            .await
+            .unwrap();
+        fs::write(skill.join("asset.txt"), &asset).await.unwrap();
+        let skills = HostSkills::discover_from(runtime.root.path(), None).await;
+        let mut builder = ToolRegistryBuilder::default();
+        register(&mut builder, skills).unwrap();
+        let executor = runtime.executor(builder);
+
+        let loaded = executor
+            .execute_model(
+                runtime.agent.clone(),
+                "skill",
+                serde_json::json!({"name":"demo"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(loaded.output.value["result"]["content"], instructions);
+        assert!(loaded.output.value.get("truncated").is_none());
+
+        let loaded = executor
+            .execute_model(
+                runtime.agent.clone(),
+                "skill",
+                serde_json::json!({"name":"demo","path":"asset.txt"}),
+                None,
+            )
+            .await
+            .unwrap();
+        let view = &loaded.output.value;
+        assert_eq!(view["result"]["content"], "x".repeat(2048));
+        assert_eq!(view["result"]["name"], "demo");
+        assert_eq!(view["result"]["path"], "asset.txt");
+        assert_eq!(view["result"]["bytes"], 5000);
+        assert_eq!(view["truncated"][0]["field"], "/result/content");
+        assert_eq!(
+            runtime
+                .jobs
+                .snapshot(loaded.job)
+                .await
+                .unwrap()
+                .output
+                .unwrap()["content"],
+            asset
+        );
+        let mut args = crate::job::output::OutputArgs::new(loaded.job);
+        args.cursor = Some(view["truncated"][0]["next"].as_str().unwrap().into());
+        let page = runtime
+            .jobs
+            .present_output(args, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(page["preview"]["lines"][0]["offset"], 2048);
     }
 
     #[tokio::test]

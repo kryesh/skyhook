@@ -4,7 +4,7 @@ mod filesystem;
 pub(crate) mod jobs;
 mod process;
 mod script;
-mod search;
+pub(crate) mod search;
 mod skills;
 mod targets;
 pub(crate) mod workspace;

@@ -1,5 +1,3 @@
-use tokio::fs;
-
 use crate::session::{
     EventRecord, SessionError, SessionEvent, SessionStore, is_safe_artifact_path,
 };
@@ -22,6 +20,7 @@ pub(super) async fn restore(
                 accepts_input,
                 background,
                 location,
+                output_schema,
                 ..
             } => {
                 maximum = maximum.max(job.get());
@@ -32,6 +31,7 @@ pub(super) async fn restore(
                         tool: tool.clone(),
                         name: name.clone(),
                         arguments: serde_json::Value::Null,
+                        output_schema: output_schema.clone(),
                         accepts_input: *accepts_input,
                         background: *background,
                         authorization_scope: None,
@@ -74,11 +74,13 @@ pub(super) async fn restore(
                         if !is_safe_artifact_path(relative) {
                             return Err(SessionError::UnsafeArtifactPath.into());
                         }
-                        let bytes = fs::read(store.directory().join(relative))
-                            .await
-                            .map_err(SessionError::from)?;
-                        entry.output =
-                            Some(serde_json::from_slice(&bytes).map_err(SessionError::from)?);
+                        if !store.directory().join(relative).is_file() {
+                            return Err(SessionError::from(std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "missing job output artifact",
+                            ))
+                            .into());
+                        }
                     }
                 }
             }

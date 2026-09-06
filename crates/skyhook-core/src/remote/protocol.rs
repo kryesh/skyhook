@@ -58,6 +58,19 @@ pub(crate) enum Request {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum Response {
+    ToolArtifact {
+        request_id: u64,
+        field: String,
+        offset: u64,
+        data: Vec<u8>,
+        finished: bool,
+    },
+    ToolChunk {
+        request_id: u64,
+        offset: u64,
+        data: Vec<u8>,
+        finished: bool,
+    },
     SensitiveCancelled {
         prompt_id: u64,
     },
@@ -180,6 +193,79 @@ where
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(std::io::Error::other)
+}
+
+/// Send completed results as bounded frames, never one unbounded RPC message.
+pub(crate) async fn write_tool_result<W: AsyncWrite + Unpin>(
+    writer: &tokio::sync::Mutex<W>,
+    request_id: u64,
+    result: &Result<RemoteToolOutput, RemoteToolError>,
+) -> std::io::Result<()> {
+    use std::io::{Seek as _, Write as _};
+    let mut file = tempfile::tempfile()?;
+    {
+        let mut buffered = std::io::BufWriter::new(&mut file);
+        serde_json::to_writer(&mut buffered, result)?;
+        buffered.flush()?;
+    }
+    file.rewind()?;
+    if file.metadata()?.len() <= 64 * 1024 {
+        let result = serde_json::from_reader(std::io::BufReader::new(file))?;
+        return write_frame(
+            &mut *writer.lock().await,
+            &Response::Tool { request_id, result },
+        )
+        .await;
+    }
+    let mut file = tokio::fs::File::from_std(file);
+    let mut offset = 0;
+    let mut buffer = vec![0; 64 * 1024];
+    loop {
+        let length = file.read(&mut buffer).await?;
+        write_frame(
+            &mut *writer.lock().await,
+            &Response::ToolChunk {
+                request_id,
+                offset,
+                data: buffer[..length].to_vec(),
+                finished: length == 0,
+            },
+        )
+        .await?;
+        if length == 0 {
+            return Ok(());
+        }
+        offset += length as u64;
+    }
+}
+
+pub(crate) async fn write_artifact<W: AsyncWrite + Unpin>(
+    writer: &tokio::sync::Mutex<W>,
+    request_id: u64,
+    field: String,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    let mut input = tokio::fs::File::open(path).await?;
+    let mut buffer = vec![0; 64 * 1024];
+    let mut offset = 0;
+    loop {
+        let length = input.read(&mut buffer).await?;
+        write_frame(
+            &mut *writer.lock().await,
+            &Response::ToolArtifact {
+                request_id,
+                field: field.clone(),
+                offset,
+                data: buffer[..length].to_vec(),
+                finished: length == 0,
+            },
+        )
+        .await?;
+        if length == 0 {
+            return Ok(());
+        }
+        offset += length as u64;
+    }
 }
 
 #[cfg(test)]

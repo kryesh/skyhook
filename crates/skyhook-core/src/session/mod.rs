@@ -4,7 +4,6 @@ use base64::Engine as _;
 use chrono::Utc;
 use fs2::FileExt;
 use serde::Deserialize;
-use serde_json::Value;
 use std::{
     fs::OpenOptions as StdOpenOptions,
     path::{Path, PathBuf},
@@ -19,7 +18,6 @@ use tokio::{
 
 use crate::{
     identity::{AgentId, JobId, SessionId},
-    job::JobProgressRecord,
     media::ImageReference,
     provider::protocol::{Message, ModelRequest, UserContent},
 };
@@ -31,7 +29,7 @@ pub(crate) use event::is_safe_artifact_path;
 pub use event::{EventRecord, SessionEvent};
 pub use request::reconstruct_model_request;
 
-pub const SESSION_FORMAT_VERSION: u16 = 3;
+pub const SESSION_FORMAT_VERSION: u16 = 4;
 
 struct SessionWriter {
     file: Option<BufWriter<File>>,
@@ -210,72 +208,6 @@ impl SessionStore {
             FileExt::unlock(&lock)?;
         }
         Ok(())
-    }
-
-    pub async fn write_job_output(
-        &self,
-        job: JobId,
-        value: &Value,
-    ) -> Result<PathBuf, SessionError> {
-        let relative = PathBuf::from("jobs")
-            .join(job.to_string())
-            .join("output.json");
-        if !self.inner.durable {
-            return Ok(relative);
-        }
-        let directory = self.job_directory(job).await?;
-        atomic_write(&directory.join("output.json"), &serde_json::to_vec(value)?).await?;
-        Ok(relative)
-    }
-
-    pub async fn append_job_event(
-        &self,
-        job: JobId,
-        event: &JobProgressRecord,
-    ) -> Result<(), SessionError> {
-        let directory = self.job_directory(job).await?;
-        let path = directory.join("events.jsonl");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
-        let mut bytes = serde_json::to_vec(event)?;
-        bytes.push(b'\n');
-        file.write_all(&bytes).await?;
-        file.flush().await?;
-        Ok(())
-    }
-
-    pub async fn read_job_events(
-        &self,
-        job: JobId,
-        after: u64,
-        limit: usize,
-    ) -> Result<Vec<JobProgressRecord>, SessionError> {
-        let path = self
-            .inner
-            .directory
-            .join("jobs")
-            .join(job.to_string())
-            .join("events.jsonl");
-        let bytes = match fs::read(path).await {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error.into()),
-        };
-        let records = parse_lines::<JobProgressRecord>(&bytes)?;
-        Ok(records
-            .into_iter()
-            .filter(|record| record.sequence > after)
-            .take(limit)
-            .collect())
-    }
-
-    async fn job_directory(&self, job: JobId) -> Result<PathBuf, SessionError> {
-        let directory = self.inner.directory.join("jobs").join(job.to_string());
-        fs::create_dir_all(&directory).await?;
-        Ok(directory)
     }
 
     pub(crate) async fn remove_job_artifacts(&self, job: JobId) -> Result<(), SessionError> {

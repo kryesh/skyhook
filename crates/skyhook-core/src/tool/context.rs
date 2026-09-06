@@ -63,11 +63,18 @@ impl ToolContext {
         }
     }
 
-    pub async fn progress(&self, kind: impl Into<String>, data: Value) -> Result<(), ToolError> {
-        self.jobs
-            .publish_progress(self.job, kind.into(), data)
-            .await
-            .map_err(|error| ToolError::Failed(error.to_string()))
+    pub(crate) fn cancellation_token(&self) -> crate::job::CancellationToken {
+        self.authorization.cancellation.clone()
+    }
+
+    pub(crate) async fn capture_path(&self, field: &str) -> Result<std::path::PathBuf, ToolError> {
+        let directory = self.jobs.output_directory(self.job);
+        tokio::fs::create_dir_all(&directory).await?;
+        Ok(crate::job::output::field_file(&directory, field))
+    }
+
+    pub(crate) async fn output_changed(&self) {
+        self.jobs.output_changed(self.job).await;
     }
 }
 

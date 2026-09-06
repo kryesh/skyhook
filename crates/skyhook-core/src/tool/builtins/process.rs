@@ -13,7 +13,6 @@ use crate::tool::{
     policy::{Capability, PathAccess},
 };
 
-const MAX_PROCESS_OUTPUT: usize = 1024 * 1024;
 const PROCESS_CHUNK: usize = 8 * 1024;
 
 pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
@@ -123,18 +122,16 @@ async fn run_process(
         }
     };
     // Keep cancellation and the deadline active while descendants hold output pipes open.
-    let mut stdout_capture = Capture::default();
-    let mut stderr_capture = Capture::default();
+    let mut stdout_capture = Capture::new(context.capture_path("/result/stdout").await?).await?;
+    let mut stderr_capture = Capture::new(context.capture_path("/result/stderr").await?).await?;
     let (status, timed_out, cancelled) = {
         let execution = async {
-            let (status, out, err) = tokio::join!(
-                child.wait(),
+            let (status, (), ()) = tokio::try_join!(
+                async { child.wait().await.map_err(ToolError::from) },
                 capture_stream(context.clone(), "stdout", stdout, &mut stdout_capture),
                 capture_stream(context.clone(), "stderr", stderr, &mut stderr_capture),
-            );
-            out?;
-            err?;
-            status.map_err(ToolError::from)
+            )?;
+            Ok::<_, ToolError>(status)
         };
         tokio::pin!(execution);
         tokio::select! {
@@ -151,16 +148,12 @@ async fn run_process(
         child.kill().await?;
         child.wait().await?
     };
-    let stdout = stdout_capture;
-    let stderr = stderr_capture;
-    let (stdout_text, stdout_truncated) = lossy_output(&stdout);
-    let (stderr_text, stderr_truncated) = lossy_output(&stderr);
+    let stdout_text = String::new();
+    let stderr_text = String::new();
     let output = ProcessOutput {
         exit_code: status.code(),
         stdout: stdout_text,
         stderr: stderr_text,
-        stdout_truncated,
-        stderr_truncated,
         timed_out,
     };
     if cancelled {
@@ -206,7 +199,7 @@ impl Drop for ProcessGroup {
 
 async fn capture_stream<R>(
     context: ToolContext,
-    kind: &'static str,
+    _kind: &'static str,
     mut stream: R,
     capture: &mut Capture,
 ) -> Result<(), ToolError>
@@ -214,54 +207,52 @@ where
     R: AsyncRead + Unpin,
 {
     let mut buffer = vec![0_u8; PROCESS_CHUNK];
+    let mut pending = Vec::new();
     loop {
         let read = stream.read(&mut buffer).await?;
         if read == 0 {
+            capture
+                .file
+                .write_all(String::from_utf8_lossy(&pending).as_bytes())
+                .await?;
             break;
         }
-        let remaining = MAX_PROCESS_OUTPUT.saturating_sub(capture.bytes.len());
-        let retained = read.min(remaining);
-        if retained > 0 {
-            capture.bytes.extend_from_slice(&buffer[..retained]);
-            context
-                .progress(
-                    kind,
-                    serde_json::json!({
-                        "text": String::from_utf8_lossy(&buffer[..retained]),
-                    }),
-                )
-                .await?;
+        pending.extend_from_slice(&buffer[..read]);
+        loop {
+            match std::str::from_utf8(&pending) {
+                Ok(text) => {
+                    capture.file.write_all(text.as_bytes()).await?;
+                    pending.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    capture.file.write_all(&pending[..valid]).await?;
+                    pending.drain(..valid);
+                    if let Some(length) = error.error_len() {
+                        capture.file.write_all("�".as_bytes()).await?;
+                        pending.drain(..length);
+                    } else {
+                        break;
+                    }
+                }
+            }
         }
-        if retained < read {
-            capture.truncated = true;
-        }
-    }
-    if capture.truncated {
-        context
-            .progress(kind, serde_json::json!({"truncated": true}))
-            .await?;
+        capture.file.flush().await?;
+        context.output_changed().await;
     }
     Ok(())
 }
 
-fn lossy_output(capture: &Capture) -> (String, bool) {
-    let mut output = String::from_utf8_lossy(&capture.bytes).into_owned();
-    let mut truncated = capture.truncated;
-    if output.len() > MAX_PROCESS_OUTPUT {
-        let mut boundary = MAX_PROCESS_OUTPUT;
-        while !output.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        output.truncate(boundary);
-        truncated = true;
-    }
-    (output, truncated)
-}
-
-#[derive(Default)]
 struct Capture {
-    bytes: Vec<u8>,
-    truncated: bool,
+    file: tokio::fs::File,
+}
+impl Capture {
+    async fn new(path: std::path::PathBuf) -> Result<Self, ToolError> {
+        Ok(Self {
+            file: tokio::fs::File::create(&path).await?,
+        })
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -269,7 +260,7 @@ struct Capture {
 struct ExecArgs {
     /// Program and arguments without shell parsing, for example `["cargo","test"]`.
     argv: Vec<String>,
-    /// Working directory; relative to selected workspace.
+    /// Working directory.
     #[serde(default = "default_dot")]
     cwd: String,
     /// Timeout seconds; omitted/null means no deadline.
@@ -282,7 +273,7 @@ struct ExecArgs {
 struct ShellArgs {
     /// Command interpreted by the execution environment's shell.
     command: String,
-    /// Working directory; relative to selected workspace.
+    /// Working directory.
     #[serde(default = "default_dot")]
     cwd: String,
     /// Timeout seconds; omitted/null means no deadline.
@@ -293,10 +284,10 @@ struct ShellArgs {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct ProcessOutput {
     pub exit_code: Option<i32>,
+    #[schemars(extend("x-skyhook-truncatable" = true))]
     pub stdout: String,
+    #[schemars(extend("x-skyhook-truncatable" = true))]
     pub stderr: String,
-    pub stdout_truncated: bool,
-    pub stderr_truncated: bool,
     pub timed_out: bool,
 }
 
@@ -347,7 +338,15 @@ mod tests {
         }), None).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if !jobs.events(running.job, 0, 10).await.unwrap().is_empty() {
+                let mut args = crate::job::output::OutputArgs::new(running.job);
+                args.field = Some("/result/stdout".into());
+                if jobs
+                    .present_output(args, &Default::default())
+                    .await
+                    .unwrap()["preview"]["lines"]
+                    .as_array()
+                    .is_some_and(|lines| !lines.is_empty())
+                {
                     break;
                 }
                 tokio::task::yield_now().await;

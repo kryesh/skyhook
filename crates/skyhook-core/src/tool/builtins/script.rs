@@ -38,7 +38,7 @@ pub(crate) fn install_script_tool(
                     })?
                     .with_location(context.caller_location.clone())
                     .with_capabilities(context.capabilities.clone());
-                crate::tool::javascript::evaluate(args.source, executor, context)
+                crate::tool::javascript::evaluate_captured(args.source, executor, context)
                     .await
                     .map_err(script_error)
             }
@@ -87,7 +87,7 @@ struct ScriptArgs {
     source: String,
 }
 
-const SCRIPT_DESCRIPTION: &str = r#"Run an async JavaScript body with top-level await/return. Foreground returns JSON (null without return). console.log captures text/JSON. No Node, fetch, URL, TextEncoder/TextDecoder, setTimeout/setInterval or recursive script. Built-ins include Date, RegExp, Map/Set, Proxy/Reflect, BigInt, ArrayBuffer, DataView and typed arrays; Uint8Array supports fromBase64/fromHex/toBase64/toHex. Return JSON-compatible values: convert BigInts, dates and typed arrays; undefined, non-finite numbers, functions and cycles fail serialization.
+const SCRIPT_DESCRIPTION: &str = r#"Run an async JavaScript body with top-level await/return. Native return is JSON (null without return); the model receives a JobView. console.log captures text/JSON. No Node, fetch, URL, TextEncoder/TextDecoder, setTimeout/setInterval or recursive script. Built-ins include Date, RegExp, Map/Set, Proxy/Reflect, BigInt, ArrayBuffer, DataView and typed arrays; Uint8Array supports fromBase64/fromHex/toBase64/toHex. Return JSON-compatible values: convert BigInts, dates and typed arrays; undefined, non-finite numbers, functions and cycles fail serialization.
 
 Use direct tools' arguments/results: `tool.read({path:"Cargo.toml"})` or `tool.read().path("Cargo.toml")`; omitted arguments keep schema defaults. Builders execute once when awaited/returned. Returning nested builders runs independent calls concurrently: `return {a:tool.read({path:"a"}),b:tool.read({path:"b"})};`. Promise.all works; await ordinary promises before nesting results.
 
@@ -100,10 +100,10 @@ const results = [];
 for await (const {index, value} of new WorkPool(4).map(
   paths, path => tool.read({path})
 )) {
-  results.push({index, path: value.path, content: value.content, truncated: value.truncated});
+  results.push({index, path: value.path, content: value.content});
 }
 return results;
 ```
 
-For bg:true, await launch before using the positive integer job ID: `const j=await tool.shell({command:"make test",bg:true}); return await tool.job(j.id).wait();`.
-Inside background scripts, `await receive()` reads the next JSON input sent with tool.job(id).send({value}). Read command output events with tool.job(id).events()."#;
+For bg:true, await launch before using the positive integer job ID: `const j=await tool.shell({command:"make test",bg:true}); return await tool.job(j.id).output({wait:60});`.
+Inside background scripts, `await receive()` reads the next JSON input sent with tool.job(id).send({value}). Read or search saved output with tool.job(id).output({field:"/result/stdout"})."#;

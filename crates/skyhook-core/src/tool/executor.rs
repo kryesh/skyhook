@@ -276,6 +276,23 @@ impl ToolExecutor {
             .plan_registered(kind, agent, name, arguments, parent, None)
             .await?;
         let started = self.start(plan).await?;
+        if matches!(kind, InvocationKind::Model) && name != "job_output" {
+            let job = started.job;
+            let background = started.background;
+            if !background {
+                self.shared.jobs.wait_foreground(job).await?;
+            }
+            let output = self
+                .shared
+                .jobs
+                .present_output(crate::job::output::OutputArgs::new(job), &self.capabilities)
+                .await?;
+            return Ok(ExecutionResult {
+                job,
+                background,
+                output: ToolOutput::new(output).with_images(self.shared.jobs.images(job).await?),
+            });
+        }
         self.collect_started(started).await
     }
 
@@ -432,6 +449,7 @@ impl ToolExecutor {
                 tool: plan.tool.name().to_owned(),
                 name: plan.job_name.clone(),
                 arguments: plan.original_arguments.clone(),
+                output_schema: plan.tool.output_schema(&self.capabilities),
                 accepts_input: plan.tool.accepts_input(),
                 background: plan.background,
                 authorization_scope: plan.authorization_scope,
@@ -595,9 +613,25 @@ impl ToolExecutor {
         &self,
         started: StartedExecution,
     ) -> Result<ExecutionResult, ExecutionError> {
+        self.collect_up_to(started, u64::MAX).await
+    }
+
+    pub(crate) async fn collect_for_transfer(
+        &self,
+        started: StartedExecution,
+    ) -> Result<ExecutionResult, ExecutionError> {
+        self.collect_up_to(started, crate::job::output::PAGE_BYTES as u64)
+            .await
+    }
+
+    async fn collect_up_to(
+        &self,
+        started: StartedExecution,
+        maximum: u64,
+    ) -> Result<ExecutionResult, ExecutionError> {
         let StartedExecution { job, background } = started;
         if background {
-            let envelope = self.shared.jobs.snapshot(job).await?;
+            let envelope = self.shared.jobs.metadata(job).await?;
             let value = envelope.presented(&self.capabilities)?;
             return Ok(ExecutionResult {
                 job,
@@ -605,7 +639,11 @@ impl ToolExecutor {
                 output: ToolOutput::new(value),
             });
         }
-        let envelope = self.shared.jobs.wait_foreground(job).await?;
+        let mut envelope = self.shared.jobs.wait_foreground(job).await?;
+        self.shared
+            .jobs
+            .hydrate_envelope_up_to(&mut envelope, maximum)
+            .await?;
         if !envelope.state.is_terminal() {
             return Ok(ExecutionResult {
                 job,
@@ -613,7 +651,9 @@ impl ToolExecutor {
                 output: ToolOutput::new(envelope.presented(&self.capabilities)?),
             });
         }
-        self.shared.jobs.claim(job).await?;
+        if maximum == u64::MAX {
+            self.shared.jobs.claim(job).await?;
+        }
         let images = self.shared.jobs.images(job).await?;
         if envelope.state == JobState::Completed {
             Ok(ExecutionResult {

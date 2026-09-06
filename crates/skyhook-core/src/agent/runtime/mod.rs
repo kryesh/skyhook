@@ -774,14 +774,25 @@ impl SessionRuntime {
             .execute_model(agent.clone(), &call.name, call.arguments.clone(), parent)
             .await;
         match result {
-            Ok(result) => ToolResult {
-                call_id: call.id,
-                name: call.name,
-                result: result.output.value,
-                console_output: result.output.console_output,
-                images: result.output.images,
-                is_error: false,
-            },
+            Ok(result) => {
+                let is_error = call.name != "job_output"
+                    && result
+                        .output
+                        .value
+                        .get("state")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|state| {
+                            matches!(state, "failed" | "cancelled" | "interrupted")
+                        });
+                ToolResult {
+                    call_id: call.id,
+                    name: call.name,
+                    result: result.output.value,
+                    console_output: result.output.console_output,
+                    images: result.output.images,
+                    is_error,
+                }
+            }
             Err(error) => {
                 let failure = error.into_failure();
                 let mut result = json!({"error": failure.message});
@@ -921,11 +932,22 @@ impl SessionRuntime {
                         }
                         _ => continue,
                     };
-                    let presented = pending
-                        .iter()
-                        .map(|job| job.presented(&capabilities))
-                        .collect::<Result<Vec<_>, _>>()
-                        .unwrap_or_default();
+                    let mut presented = Vec::new();
+                    for job in &pending {
+                        match self
+                            .jobs
+                            .present_output(
+                                crate::job::output::OutputArgs::new(job.id),
+                                &capabilities,
+                            )
+                            .await
+                        {
+                            Ok(view) => presented.push(view),
+                            Err(error) => presented.push(
+                                json!({"id":job.id,"state":job.state,"error":error.to_string()}),
+                            ),
+                        }
+                    }
                     let content = vec![UserContent::Runtime {
                         text: format!(
                             "<skyhook_job_events>\n{}\n</skyhook_job_events>",
@@ -1624,6 +1646,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn annotated_output_remains_bounded_and_requests_reconstruct_exactly() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let call = |id: &str, name: &str, arguments| {
+            vec![ResponseChunk::Block {
+                block: AssistantContent::ToolCall(ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments,
+                }),
+            }]
+        };
+        tokio::fs::write(workspace.path().join("large.txt"), "x".repeat(92_000))
+            .await
+            .unwrap();
+        let mut responses = vec![call("large", "read", json!({"path":"large.txt"}))];
+        responses.push(call(
+            "page",
+            "job_output",
+            json!({"job":1,"field":"/result/content","limit":2}),
+        ));
+        for n in 0..10 {
+            responses.push(call(
+                &format!("small{n}"),
+                "script",
+                json!({"source":"return 1;"}),
+            ));
+        }
+        responses.push(vec![ResponseChunk::TextDelta {
+            text: "done".into(),
+        }]);
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            scripted_provider(&requests, responses),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(
+            session.prompt("inspect saved output").await.unwrap(),
+            "done"
+        );
+        assert_request_journal(&session.runtime.store, &requests).await;
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 13);
+        let mut repeated_large_bytes = 0;
+        for request in &requests[1..] {
+            for message in &request.messages {
+                if let Message::Tool(results) = message {
+                    for result in results {
+                        if result.call_id == "large" {
+                            let bytes = serde_json::to_vec(&result.result).unwrap().len();
+                            assert!(bytes <= crate::job::output::PAGE_BYTES);
+                            assert_eq!(
+                                result.result["result"]["content"].as_str().unwrap().len(),
+                                2048
+                            );
+                            assert_eq!(result.result["result"]["path"], "large.txt");
+                            assert!(result.result["truncated"][0]["next"].is_string());
+                            repeated_large_bytes += bytes;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(repeated_large_bytes < 12 * crate::job::output::PAGE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn unannotated_script_results_are_sent_to_the_model_in_full() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let responses = vec![
+            vec![ResponseChunk::Block {
+                block: AssistantContent::ToolCall(ToolCall {
+                    id: "full".into(),
+                    name: "script".into(),
+                    arguments: json!({"source":"return {text:'x'.repeat(92000),ok:true};"}),
+                }),
+            }],
+            vec![ResponseChunk::TextDelta {
+                text: "done".into(),
+            }],
+        ];
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            scripted_provider(&requests, responses),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        session.prompt("return the result").await.unwrap();
+        assert_request_journal(&session.runtime.store, &requests).await;
+        let requests = requests.lock().unwrap();
+        let result = requests[1]
+            .messages
+            .iter()
+            .find_map(|message| {
+                if let Message::Tool(results) = message {
+                    results.iter().find(|result| result.call_id == "full")
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(result.result["result"]["text"], "x".repeat(92_000));
+        assert_eq!(result.result["result"]["ok"], true);
+        assert!(result.result.get("truncated").is_none());
+        assert!(result.result.get("preview").is_none());
+    }
+
+    #[tokio::test]
     async fn failed_provider_call_is_journaled_before_invocation() {
         struct FailingProvider {
             session_root: PathBuf,
@@ -1918,7 +2054,7 @@ mod tests {
             add.description
                 .contains("does not connect to the destination or change your current target")
         );
-        assert!(add.description.contains("Returns `"));
+        assert!(add.description.contains("Result:"));
         assert!(requests[0].system[0].text.contains(prompt::TARGET_PROMPT));
         assert!(requests[1].system[0].text.contains("\"name\":\"build\""));
         assert!(requests[1].system[0].text.contains("\"type\":\"ssh\""));
@@ -1930,8 +2066,8 @@ mod tests {
         let Message::Tool(results) = request_history(&requests[2]).last().unwrap() else {
             panic!("root must receive the child result");
         };
-        assert_eq!(results[0].result["target"], "build");
-        assert_eq!(results[0].result["result"], "child done");
+        assert_eq!(results[0].result["result"]["target"], "build");
+        assert_eq!(results[0].result["result"]["result"], "child done");
     }
 
     #[tokio::test]
@@ -2019,7 +2155,10 @@ mod tests {
         else {
             panic!("child result expected")
         };
-        assert_eq!(results[0].result["result"], "child work completed");
+        assert_eq!(
+            results[0].result["result"]["result"],
+            "child work completed"
+        );
     }
 
     #[tokio::test]
@@ -2209,7 +2348,10 @@ mod tests {
         let Message::Tool(results) = request_history(&requests[2]).last().unwrap() else {
             panic!("child must receive its read result");
         };
-        assert_eq!(results[0].result["content"], "from child workspace");
+        assert_eq!(
+            results[0].result["result"]["content"],
+            "from child workspace"
+        );
     }
 
     #[tokio::test]
@@ -2441,8 +2583,8 @@ mod tests {
         let Message::Tool(results) = request_history(&requests[1]).last().unwrap() else {
             panic!("answers must be returned as tool results");
         };
-        assert_eq!(results[0].result, "yes");
-        assert_eq!(results[1].result, json!({"value":2}));
+        assert_eq!(results[0].result["result"], "yes");
+        assert_eq!(results[1].result["result"], json!({"value":2}));
 
         let events =
             std::fs::read_to_string(session.runtime.store.directory().join("events.jsonl"))
@@ -2517,7 +2659,7 @@ mod tests {
             .map(|definition| definition.name.as_str())
             .collect::<Vec<_>>();
         assert!(names.contains(&"jobs"));
-        assert!(names.contains(&"wait"));
+        assert!(names.contains(&"job_output"));
         for hidden in ["job_inspect", "job_send", "job_cancel", "job_events"] {
             assert!(!names.contains(&hidden));
         }
@@ -2527,11 +2669,9 @@ mod tests {
             .unwrap()
             .description;
         for signature in [
-            "tool.job(id).inspect()",
-            "tool.job(id).wait({timeout?",
+            "tool.job(id).output({",
             "tool.job(id).send({value: JSON})",
             "tool.job(id).cancel()",
-            "tool.job(id).events({after?",
         ] {
             assert!(
                 description.contains(signature),
@@ -2547,7 +2687,7 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert!(direct.to_string().contains("not exposed"));
+        assert!(direct.to_string().contains("unknown tool"));
 
         let running = session
             .runtime
@@ -2562,7 +2702,7 @@ mod tests {
             .unwrap();
         let inspected = session
             .run_script(format!(
-                "await tool.job({}).wait({{timeout:2}}); return tool.job({}).inspect();",
+                "await tool.job({}).output({{wait:2}}); return tool.job({}).output();",
                 running.job, running.job
             ))
             .await
@@ -2967,19 +3107,19 @@ mod tests {
             .flatten()
             .collect::<Vec<_>>();
         let result = |id: &str| *results.iter().find(|result| result.call_id == id).unwrap();
-        assert_eq!(result("success").result, json!({"changed":3}));
+        assert_eq!(result("success").result["result"], json!({"changed":3}));
         assert_eq!(
-            result("success").console_output,
+            result("success").result["console"],
             "Processed 12 {\"files\":true}\n"
         );
         assert!(!result("success").is_error);
         assert!(result("failure").is_error);
-        assert_eq!(result("failure").console_output, "before failure\n");
+        assert_eq!(result("failure").result["console"], "before failure\n");
         assert_eq!(
-            result("failure").result["output"]["failure"]["message"],
+            result("failure").result["result"]["failure"]["message"],
             "boom"
         );
-        assert_eq!(result("silent").result, json!(42));
+        assert_eq!(result("silent").result["result"], json!(42));
         assert!(
             serde_json::to_value(result("silent"))
                 .unwrap()
@@ -2988,24 +3128,26 @@ mod tests {
         );
         assert!(result("serialization").is_error);
         assert_eq!(
-            result("serialization").console_output,
+            result("serialization").result["console"],
             "before serialization\n"
         );
         assert!(!result("pool").is_error);
         assert_eq!(
-            result("pool").result,
+            result("pool").result["result"],
             json!([
                 {"index":1,"content":"hello"}, {"index":3,"content":"hello"}
             ])
         );
         assert!(
-            result("pool")
-                .console_output
+            result("pool").result["console"]
+                .as_str()
+                .unwrap()
                 .contains("WorkPool item 0 failed:")
         );
         assert!(
-            result("pool")
-                .console_output
+            result("pool").result["console"]
+                .as_str()
+                .unwrap()
                 .contains("WorkPool item 2 failed:")
         );
     }
@@ -3038,14 +3180,14 @@ mod tests {
                 .unwrap();
             let completed = session
                 .run_script(format!(
-                    "return tool.job({}).wait({{timeout:5}});",
+                    "return tool.job({}).output({{wait:5}});",
                     running.job.get()
                 ))
                 .await
                 .unwrap();
-            assert_eq!(completed.value["console_output"], "background\n");
+            assert_eq!(completed.value["console"], "background\n");
             if source.contains("return") {
-                assert_eq!(completed.value["output"], 7);
+                assert_eq!(completed.value["result"], 7);
             } else {
                 assert_eq!(completed.value["state"], "failed");
             }
@@ -3056,12 +3198,13 @@ mod tests {
             .await
             .unwrap();
         let restored = JobManager::restore(store, &records).await.unwrap();
-        let scripts = restored
-            .list(&session.root)
-            .await
-            .into_iter()
-            .filter(|job| job.console_output == "background\n")
-            .collect::<Vec<_>>();
+        let mut scripts = Vec::new();
+        for job in restored.list(&session.root).await {
+            let job = restored.snapshot(job.id).await.unwrap();
+            if job.console_output == "background\n" {
+                scripts.push(job);
+            }
+        }
         assert_eq!(scripts.len(), 2);
     }
 
@@ -3089,7 +3232,7 @@ const accepted = [];
 for (const value of [{{text:"hello 🌏", nested:[1,true]}}, null, false]) {{
   accepted.push(await tool.job({id}).send({{value}}));
 }}
-const pending = await tool.job({id}).wait({{timeout:1}});
+const pending = await tool.job({id}).output({{wait:1}});
 return {{accepted, state:pending.state}};
 "#
             ))
@@ -3104,14 +3247,14 @@ return {{accepted, state:pending.state}};
             .run_script(format!(
                 r#"
 await tool.job({id}).send({{value:"last"}});
-return tool.job({id}).wait({{timeout:5}});
+return tool.job({id}).output({{wait:5}});
 "#
             ))
             .await
             .unwrap();
         assert_eq!(completed.value["state"], "completed");
         assert_eq!(
-            completed.value["output"],
+            completed.value["result"],
             json!({
                 "messages":[{"text":"hello 🌏", "nested":[1,true]}, null, false, "last"],
                 "notifyType":"undefined",
@@ -3133,9 +3276,9 @@ return tool.job({id}).wait({{timeout:5}});
         let cancelled = session
             .run_script(format!(
                 r#"
-await tool.job({id}).wait({{timeout:1}});
+await tool.job({id}).output({{wait:1}});
 await tool.job({id}).cancel();
-return tool.job({id}).wait({{timeout:5}});
+return tool.job({id}).output({{wait:5}});
 "#
             ))
             .await
@@ -3145,7 +3288,7 @@ return tool.job({id}).wait({{timeout:5}});
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn script_command_events_are_live_replayable_and_paginated() {
+    async fn script_output_is_live_replayable_and_paginated() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
         let harness = test_harness(
@@ -3156,54 +3299,21 @@ return tool.job({id}).wait({{timeout:5}});
         .await;
         let session = harness.new_session().await.unwrap();
         let output = tokio::time::timeout(Duration::from_secs(15), session.run_script(r#"
-const job = await tool.shell({
-  command: "printf 'out-before\\n'; printf 'err-before\\n' >&2; while [ ! -f release ]; do sleep 0.01; done; printf 'out-after\\n'; printf 'err-after\\n' >&2",
-  timeout:10, bg:true
-});
-let live;
-do { live = await tool.job(job.id).events({limit:1}); } while (!live.events.length);
-const pending = await tool.job(job.id).inspect();
-await tool.write({path:"release", content:"go"});
-const completed = await tool.job(job.id).wait({timeout:10});
-const first = await tool.job(job.id).events({after:0, limit:1});
-const replay = await tool.job(job.id).events({after:0, limit:1});
-const events = [];
-let cursor = 0, page;
-do {
-  page = await tool.job(job.id).events({after:cursor, limit:1});
-  if (page.events.length) {
-    if (page.events.length !== 1 || page.next <= cursor) throw new Error("invalid event cursor");
-    events.push(...page.events);
-  }
-  cursor = page.next;
-} while (page.events.length);
-return {live, pending:pending.state, completed, first, replay, events, tail:page};
+const job = await tool.shell({command:"printf 'before\\n'; while [ ! -f release ]; do sleep 0.01; done; printf 'after\\n'",timeout:10,bg:true});
+const live = await tool.job(job.id).output({field:"/result/stdout",wait:5});
+await tool.write({path:"release",content:"go"});
+const completed = await tool.job(job.id).output({wait:10});
+const first = await tool.job(job.id).output({field:"/result/stdout",limit:1});
+const replay = await tool.job(job.id).output({field:"/result/stdout",limit:1});
+const second = await tool.job(job.id).output({cursor:first.preview.next});
+return {live,completed,first,replay,second};
 "#)).await.unwrap().unwrap();
         let value = output.value;
-        assert_eq!(value["pending"], "running");
         assert_eq!(value["live"]["state"], "running");
-        assert_eq!(value["completed"]["state"], "completed");
-        assert_eq!(value["completed"]["output"]["exit_code"], 0);
         assert_eq!(value["first"], value["replay"]);
-        let events = value["events"].as_array().unwrap();
-        assert!(events.len() >= 2);
-        for (index, event) in events.iter().enumerate() {
-            assert_eq!(event["sequence"], (index + 1) as u64);
-        }
-        for (kind, expected) in [
-            ("stdout", "out-before\nout-after\n"),
-            ("stderr", "err-before\nerr-after\n"),
-        ] {
-            let text = events
-                .iter()
-                .filter(|event| event["kind"] == kind)
-                .map(|event| event["data"]["text"].as_str().unwrap())
-                .collect::<String>();
-            assert_eq!(text, expected);
-            assert_eq!(value["completed"]["output"][kind], expected);
-        }
-        assert_eq!(value["tail"]["events"], json!([]));
-        assert_eq!(value["tail"]["next"], events.last().unwrap()["sequence"]);
-        assert_eq!(value["tail"]["state"], "completed");
+        assert_eq!(value["completed"]["state"], "completed");
+        assert_eq!(value["completed"]["result"]["stdout"], "before\nafter\n");
+        assert_eq!(value["first"]["preview"]["lines"][0]["text"], "before");
+        assert_eq!(value["second"]["preview"]["lines"][0]["text"], "after");
     }
 }

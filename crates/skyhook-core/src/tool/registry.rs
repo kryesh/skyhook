@@ -34,6 +34,8 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// Handler result, without the background job alternative.
+    pub result_schema: Option<Value>,
     pub output_schema: Option<Value>,
     pub exposure: ToolExposure,
     pub script_binding: ScriptBinding,
@@ -64,8 +66,13 @@ impl GeneratedToolDefinition {
                     add_background(&mut input_schema);
                 }
                 sanitize_schema(&mut input_schema);
-                let output_schema = self.output_schema.as_ref().map(|schema| {
+                let result_schema = self.output_schema.as_ref().map(|schema| {
                     let mut schema = schema(capabilities);
+                    sanitize_schema(&mut schema);
+                    schema
+                });
+                let output_schema = result_schema.as_ref().map(|schema| {
+                    let mut schema = schema.clone();
                     if self.supports_background {
                         schema = output_union(
                             schema,
@@ -79,6 +86,7 @@ impl GeneratedToolDefinition {
                     name: self.name.clone(),
                     description: self.description.clone(),
                     input_schema,
+                    result_schema,
                     output_schema,
                     exposure: self.exposure,
                     script_binding: self.script_binding.clone(),
@@ -297,6 +305,13 @@ impl Default for ToolOptions {
 }
 
 impl RegisteredTool {
+    pub(crate) fn output_schema(&self, capabilities: &CapabilitySet) -> Option<Value> {
+        self.definition
+            .output_schema
+            .as_ref()
+            .map(|generate| generate(capabilities))
+    }
+
     pub(crate) fn take_job_name(&self, arguments: &mut Value) -> Result<Option<String>, ToolError> {
         if !self.execution.supports_name {
             return Ok(None);
@@ -388,7 +403,7 @@ impl ToolSurface {
     pub fn definitions(&self) -> Vec<ProviderToolDefinition> {
         let job_envelope = self
             .tools
-            .get("wait")
+            .get("job_cancel")
             .and_then(|tool| tool.output_schema.as_ref());
         self.tools
             .values()
@@ -396,13 +411,25 @@ impl ToolSurface {
             .map(|tool| {
                 let description = if tool.name == "script" {
                     let mut description = self.script_description(&tool.description);
-                    if let Some(schema) = &tool.output_schema {
+                    if let Some(schema) = &tool.result_schema {
                         let result_type = output_type(schema, job_envelope);
                         description.push_str(&format!("\n\nScript return: `{result_type}`."));
                     }
                     description
                 } else {
-                    describe_output(&tool.description, tool.output_schema.as_ref(), job_envelope)
+                    let native = tool
+                        .result_schema
+                        .as_ref()
+                        .map(|schema| output_type(schema, job_envelope));
+                    if tool.name == "job_output" {
+                        tool.description.clone()
+                    } else {
+                        format!(
+                            "{} Result: `{}`.",
+                            tool.description,
+                            native.unwrap_or_else(|| "JSON".into())
+                        )
+                    }
                 };
                 ProviderToolDefinition {
                     name: tool.name.clone(),
@@ -423,7 +450,7 @@ impl ToolSurface {
     fn script_description(&self, base: &str) -> String {
         let job_envelope = self
             .tools
-            .get("wait")
+            .get("job_cancel")
             .and_then(|tool| tool.output_schema.as_ref());
         let documented = self
             .tools
@@ -431,7 +458,7 @@ impl ToolSurface {
             .filter(|tool| match &tool.script_binding {
                 ScriptBinding::TopLevel => tool.exposure == ToolExposure::ScriptOnly,
                 ScriptBinding::JobMethod { .. } => {
-                    tool.exposure == ToolExposure::ScriptOnly || tool.name == "wait"
+                    tool.exposure == ToolExposure::ScriptOnly || tool.name == "job_output"
                 }
                 ScriptBinding::Unavailable => false,
             })
@@ -704,7 +731,7 @@ fn ensure_no_target(schema: &Value) -> Result<(), RegistryError> {
 fn target_property_schema() -> Value {
     serde_json::json!({
         "type": ["string", "null"],
-        "description": "Execution target; omitted uses your current target. root selects the Skyhook session host."
+        "description": "Execution target."
     })
 }
 
@@ -794,7 +821,7 @@ fn add_background(schema: &mut Value) {
         serde_json::json!({
             "type": "boolean",
             "default": false,
-            "description": "Return a JobEnvelope immediately; run in background."
+            "description": "Run in background."
         }),
     );
 }
@@ -834,11 +861,24 @@ fn output_type(schema: &Value, job_envelope: Option<&Value>) -> String {
     let rendered = schema_type(schema, schema);
     job_envelope.map_or_else(
         || rendered.clone(),
-        |envelope| rendered.replace(&schema_type(envelope, envelope), "JobEnvelope"),
+        |envelope| {
+            let metadata = schema_type(envelope, envelope);
+            if rendered == format!("{metadata}[]") {
+                "job metadata array".to_owned()
+            } else {
+                rendered.replace(&metadata, "job metadata")
+            }
+        },
     )
 }
 
-pub(crate) fn job_envelope_type(capabilities: &CapabilitySet) -> String {
+pub(crate) fn job_view_type(capabilities: &CapabilitySet) -> String {
+    let schema = crate::job::output::view_schema(capabilities);
+    schema_type(&schema, &schema)
+}
+
+#[cfg(test)]
+fn job_envelope_type(capabilities: &CapabilitySet) -> String {
     let schema = crate::job::presented_job_schema(capabilities, false);
     schema_type(&schema, &schema)
 }
@@ -1193,7 +1233,7 @@ mod tests {
                     assert!(!schema.to_string().contains("awaiting_approval"));
                 }
             }
-            for name in ["exec", "shell", "wait"] {
+            for name in ["exec", "shell"] {
                 let tool = surface.get(name).unwrap();
                 assert!(
                     !tool.input_schema["required"]
@@ -1210,29 +1250,31 @@ mod tests {
             assert_eq!(schema["anyOf"].as_array().unwrap().len(), 2);
             assert!(schema_type(schema, schema).contains("integer | null"));
             let definitions = surface.definitions();
+            let output_args = &surface.get("job_output").unwrap().input_schema["properties"];
+            assert_eq!(output_args["limit"]["default"], 100);
+            assert_eq!(output_args["limit"]["maximum"], 1000);
+            assert_eq!(output_args["wait"]["default"], 0);
+            assert_eq!(output_args["wait"]["maximum"], 3600);
+            assert_eq!(output_args["context"]["maximum"], 20);
             let script = definitions
                 .iter()
                 .find(|tool| tool.name == "script")
                 .unwrap();
-            assert!(
-                script
-                    .description
-                    .ends_with("\n\nScript return: `JSON | JobEnvelope`.")
-            );
-            assert_eq!(
-                script.description.matches("Returns `JobEnvelope`.").count(),
-                2
-            );
-            assert!(script.description.contains("Same as `wait`."));
-            assert!(!script.description.contains("location:"));
-            for name in ["exec", "shell", "jobs", "wait"] {
+            assert!(script.description.ends_with("\n\nScript return: `JSON`."));
+            assert!(script.description.contains("tool.job(id).output("));
+            assert!(!script.description.contains("tool.job(id).wait("));
+            for name in ["exec", "shell", "jobs"] {
                 let description = &definitions
                     .iter()
                     .find(|tool| tool.name == name)
                     .unwrap()
                     .description;
-                assert!(description.contains("JobEnvelope"), "{name}: {description}");
-                assert!(!description.contains("location:"), "{name}: {description}");
+                assert!(description.contains("Result:"), "{name}: {description}");
+                assert!(!description.contains("JobView"), "{name}: {description}");
+                assert!(
+                    !description.contains("JobEnvelope"),
+                    "{name}: {description}"
+                );
             }
             assert!(
                 definitions
@@ -1240,7 +1282,7 @@ mod tests {
                     .find(|tool| tool.name == "jobs")
                     .unwrap()
                     .description
-                    .ends_with("Returns `JobEnvelope[]`.")
+                    .ends_with("Result: `job metadata array`.")
             );
             let shared_type = job_envelope_type(&target_context(targets));
             assert!(shared_type.contains("workspace:string"));
@@ -1277,7 +1319,7 @@ mod tests {
         assert!(
             registry.surface(&context(true)).definitions()[0]
                 .description
-                .contains("Returns `string |")
+                .ends_with("Result: `string`.")
         );
     }
 

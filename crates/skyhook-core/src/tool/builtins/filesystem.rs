@@ -1,10 +1,7 @@
 use diffy::{Patch, apply};
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
-use tokio::{
-    fs,
-    io::{AsyncBufReadExt as _, BufReader},
-};
+use tokio::fs;
 
 use super::workspace::{
     atomic_write, relative_path, resolve_existing, resolve_removable, resolve_writable,
@@ -18,8 +15,6 @@ use crate::{
     },
 };
 
-const MAX_READ_LINES: usize = 2_000;
-const MAX_READ_BYTES: usize = 1024 * 1024;
 const MAX_WRITE_BYTES: usize = 4 * 1024 * 1024;
 
 pub(super) fn register(
@@ -39,7 +34,7 @@ fn register_read(
         .map_err(|error| RegistryError::Schema(error.to_string()))?;
     builder.register_dynamic(
         "read",
-        "Read UTF-8 lines, list a directory, or attach a supported image from the workspace.",
+        "Capture a complete UTF-8 file or directory listing, or attach a supported image. Use job_output to page or search the saved snapshot.",
         schema,
         ToolOptions::new(vec![Capability::Read])
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
@@ -74,7 +69,6 @@ fn register_read(
                         });
                     }
                     entries.sort_by(|left, right| left.name.cmp(&right.name));
-                    validate_read_range(args.start, args.limit)?;
                     let directory_path =
                         relative_path(&context.execution_location.workspace, &path);
                     for entry in &mut entries {
@@ -84,28 +78,16 @@ fn register_read(
                             entry.path = format!("{directory_path}/{}", entry.name);
                         }
                     }
-                    let first = args.start - 1;
-                    let end_index = first.saturating_add(args.limit).min(entries.len());
-                    let selected = if first < entries.len() {
-                        entries[first..end_index].to_vec()
-                    } else {
-                        Vec::new()
-                    };
-                    let visible = selected.len();
                     return Ok(ToolOutput::new(serde_json::to_value(
                         ReadOutput::Directory {
                             path: directory_path,
-                            entries: selected,
-                            start: args.start,
-                            end: range_end(args.start, visible),
-                            truncated: end_index < entries.len(),
+                            entries,
                         },
                     )?));
                 }
 
-                validate_read_range(args.start, args.limit)?;
                 let output_path = relative_path(&context.execution_location.workspace, &path);
-                match read_text_range(&path, output_path.clone(), args.start, args.limit).await {
+                match read_text(&path, output_path.clone(), &context).await {
                     Ok(output) => {
                         return Ok(ToolOutput::new(serde_json::to_value(output)?));
                     }
@@ -260,82 +242,57 @@ fn register_writes(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryErro
     Ok(())
 }
 
-async fn read_text_range(
+async fn read_text(
     path: &std::path::Path,
     output_path: String,
-    start: usize,
-    limit: usize,
+    context: &crate::tool::ToolContext,
 ) -> Result<ReadOutput, ToolError> {
-    let mut reader = BufReader::new(fs::File::open(path).await?);
-    let mut line = String::new();
-    for _ in 1..start {
-        if reader.read_line(&mut line).await? == 0 {
-            return Ok(ReadOutput::File {
-                path: output_path,
-                content: String::new(),
-                start,
-                end: 0,
-                truncated: false,
-            });
-        }
-        line.clear();
-    }
-    let mut content = String::new();
-    let mut visible = 0;
-    let mut byte_truncated = false;
-    while visible < limit {
-        line.clear();
-        if reader.read_line(&mut line).await? == 0 {
-            break;
-        }
-        while line.ends_with('\n') || line.ends_with('\r') {
-            line.pop();
-        }
-        let separator = usize::from(visible > 0);
-        let available = MAX_READ_BYTES.saturating_sub(content.len());
-        if separator.saturating_add(line.len()) > available {
-            let mut remaining = available;
-            if separator == 1 && remaining > 0 {
-                content.push('\n');
-                remaining -= 1;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let capture = context.capture_path("/result/content").await?;
+    let mut input = fs::File::open(path).await?;
+    let mut output = fs::File::create(&capture).await?;
+    let result = async {
+        let mut buffer = vec![0; 64 * 1024];
+        let mut pending = Vec::new();
+        loop {
+            if context.is_cancelled() {
+                return Err(ToolError::Cancelled);
             }
-            let mut boundary = remaining.min(line.len());
-            while !line.is_char_boundary(boundary) {
-                boundary -= 1;
+            let size = input.read(&mut buffer).await?;
+            pending.extend_from_slice(&buffer[..size]);
+            match std::str::from_utf8(&pending) {
+                Ok(_) => {
+                    output.write_all(&pending).await?;
+                    pending.clear();
+                }
+                Err(error) if error.error_len().is_none() && size != 0 => {
+                    let valid = error.valid_up_to();
+                    output.write_all(&pending[..valid]).await?;
+                    pending.drain(..valid);
+                }
+                Err(_) => {
+                    return Err(ToolError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "file is not UTF-8",
+                    )));
+                }
             }
-            content.push_str(&line[..boundary]);
-            visible += 1;
-            byte_truncated = true;
-            break;
+            if size == 0 {
+                break;
+            }
         }
-        if separator == 1 {
-            content.push('\n');
-        }
-        content.push_str(&line);
-        visible += 1;
+        output.flush().await?;
+        Ok(ReadOutput::File {
+            path: output_path,
+            content: String::new(),
+        })
     }
-    line.clear();
-    let more = byte_truncated || (visible == limit && reader.read_line(&mut line).await? != 0);
-    Ok(ReadOutput::File {
-        path: output_path,
-        content,
-        start,
-        end: range_end(start, visible),
-        truncated: more,
-    })
-}
-
-fn validate_read_range(start: usize, limit: usize) -> Result<(), ToolError> {
-    if start == 0 || !(1..=MAX_READ_LINES).contains(&limit) {
-        return Err(ToolError::InvalidArguments(format!(
-            "start must be at least 1 and limit must be 1 through {MAX_READ_LINES}"
-        )));
+    .await;
+    if result.is_err() {
+        drop(output);
+        let _ = fs::remove_file(capture).await;
     }
-    Ok(())
-}
-
-const fn range_end(start: usize, visible: usize) -> usize {
-    if visible == 0 { 0 } else { start + visible - 1 }
+    result
 }
 
 fn check_write_size(text: &str) -> Result<(), ToolError> {
@@ -365,16 +322,8 @@ fn detect_image(bytes: &[u8]) -> Option<&'static str> {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ReadArgs {
-    /// File or directory path, relative to the selected workspace by default.
+    /// File or directory path.
     path: String,
-    /// One-based first line or directory entry to return.
-    #[serde(default = "default_one")]
-    #[schemars(range(min = 1))]
-    start: usize,
-    /// Maximum number of lines or directory entries to return.
-    #[serde(default = "default_read_lines")]
-    #[schemars(range(min = 1, max = 2000))]
-    limit: usize,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -382,17 +331,13 @@ struct ReadArgs {
 enum ReadOutput {
     File {
         path: String,
+        #[schemars(extend("x-skyhook-truncatable" = true))]
         content: String,
-        start: usize,
-        end: usize,
-        truncated: bool,
     },
     Directory {
         path: String,
+        #[schemars(extend("x-skyhook-truncatable" = true))]
         entries: Vec<DirectoryEntry>,
-        start: usize,
-        end: usize,
-        truncated: bool,
     },
     Image {
         path: String,
@@ -412,7 +357,7 @@ struct DirectoryEntry {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct WriteArgs {
-    /// File path, relative to the selected workspace by default.
+    /// File path.
     path: String,
     /// Complete replacement file contents.
     content: String,
@@ -473,9 +418,6 @@ struct RemoveOutput {
 const fn default_one() -> usize {
     1
 }
-const fn default_read_lines() -> usize {
-    200
-}
 
 #[cfg(test)]
 mod tests {
@@ -511,30 +453,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_ranges_are_one_based_and_report_lookahead() {
+    async fn read_captures_complete_snapshot() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("lines.txt");
-        fs::write(&path, "one\ntwo\nthree\n").await.unwrap();
-        let output = read_text_range(&path, "lines.txt".to_owned(), 2, 1)
+        fs::write(root.path().join("lines.txt"), "one\ntwo\nthree\n")
             .await
             .unwrap();
-        match output {
-            ReadOutput::File {
-                path,
-                content,
-                start,
-                end,
-                truncated,
-            } => {
-                assert_eq!(path, "lines.txt");
-                assert_eq!(content, "two");
-                assert_eq!((start, end), (2, 2));
-                assert!(truncated);
-            }
-            ReadOutput::Directory { .. } | ReadOutput::Image { .. } => {
-                panic!("expected file output")
-            }
-        }
+        let store = SessionStore::create(root.path()).await.unwrap();
+        let jobs = JobManager::new(store.clone());
+        let mut builder = ToolRegistryBuilder::default();
+        register(&mut builder, store.clone()).unwrap();
+        let executor = ToolExecutor::new(
+            builder.build(),
+            Arc::new(AllowAll),
+            jobs.clone(),
+            root.path().to_owned(),
+        );
+        let result = executor
+            .execute(
+                AgentId::root(store.id()),
+                "read",
+                serde_json::json!({"path":"lines.txt"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output.value["content"], "one\ntwo\nthree\n");
+        fs::write(root.path().join("lines.txt"), "changed")
+            .await
+            .unwrap();
+        let mut args = crate::job::output::OutputArgs::new(result.job);
+        args.field = Some("/result/content".into());
+        args.start = Some(2);
+        args.limit = Some(1);
+        let page = jobs
+            .present_output(args, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(page["preview"]["lines"][0]["text"], "two");
     }
 
     #[cfg(unix)]

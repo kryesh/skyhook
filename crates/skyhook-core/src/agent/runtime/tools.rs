@@ -33,7 +33,7 @@ pub(super) struct AgentArgs {
     pub(super) model: Option<String>,
     /// Agent profile override.
     pub(super) profile: Option<String>,
-    /// Target; omitted inherits. root selects local host/root workspace.
+    /// Child target; omitted inherits.
     #[schemars(skip)]
     pub(super) target: Option<String>,
     /// Child workspace override: absolute, or relative to the workspace selected by target.
@@ -161,7 +161,7 @@ fn register_child_agent(
                 Capability::Targets,
                 json!({
                     "type": ["string", "null"],
-                    "description": "Target; omitted inherits. root selects local host/root workspace."
+                    "description": "Child target; omitted inherits."
                 }),
             )
             .background()

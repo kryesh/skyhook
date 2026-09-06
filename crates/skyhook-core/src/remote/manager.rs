@@ -486,6 +486,8 @@ async fn route_responses<R>(
 {
     let mut callbacks = tokio::task::JoinSet::new();
     let mut prompt_tasks = HashMap::<u64, tokio::task::AbortHandle>::new();
+    let mut transfers = HashMap::<u64, (std::fs::File, u64)>::new();
+    let mut artifacts = HashMap::<(u64, String), (tokio::fs::File, u64, bool)>::new();
     loop {
         while let Some(result) = callbacks.try_join_next() {
             if let Ok(id) = result {
@@ -508,6 +510,144 @@ async fn route_responses<R>(
             }
         };
         match response {
+            Response::ToolArtifact {
+                request_id,
+                field,
+                offset,
+                data,
+                finished,
+            } => {
+                let context = state
+                    .lock()
+                    .await
+                    .pending
+                    .get(&request_id)
+                    .and_then(|pending| pending.context.clone());
+                let Some(context) = context else {
+                    fail_connection(
+                        state,
+                        RemoteError::Protocol("artifact for unknown request".into()),
+                    )
+                    .await;
+                    return;
+                };
+                if !(field == "/console"
+                    || field == "/error"
+                    || field == "/result"
+                    || field.starts_with("/result/"))
+                    || data.len() > 64 * 1024
+                    || (finished && !data.is_empty())
+                {
+                    fail_connection(
+                        state,
+                        RemoteError::Protocol("invalid artifact frame".into()),
+                    )
+                    .await;
+                    return;
+                }
+                let key = (request_id, field.clone());
+                let received = async {
+                    use tokio::io::AsyncWriteExt as _;
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        artifacts.entry(key.clone())
+                    {
+                        if offset != 0 {
+                            return Err(std::io::Error::other("invalid initial artifact offset"));
+                        }
+                        let path = context
+                            .capture_path(&field)
+                            .await
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                        entry.insert((tokio::fs::File::create(path).await?, 0, false));
+                    }
+                    let (file, expected, done) =
+                        artifacts.get_mut(&key).expect("inserted artifact");
+                    if *done || offset != *expected {
+                        return Err(std::io::Error::other("invalid artifact offset"));
+                    }
+                    file.write_all(&data).await?;
+                    file.flush().await?;
+                    *expected += data.len() as u64;
+                    if finished {
+                        file.sync_data().await?;
+                        *done = true;
+                    }
+                    Ok::<_, std::io::Error>(())
+                }
+                .await;
+                if let Err(error) = received {
+                    fail_connection(state, RemoteError::io(error)).await;
+                    return;
+                }
+            }
+            Response::ToolChunk {
+                request_id,
+                offset,
+                data,
+                finished,
+            } => {
+                let result = (|| -> std::io::Result<Option<RemoteToolResult>> {
+                    use std::io::{Seek as _, Write as _};
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        transfers.entry(request_id)
+                    {
+                        if offset != 0 {
+                            return Err(std::io::Error::other("invalid initial result offset"));
+                        }
+                        entry.insert((tempfile::tempfile()?, 0));
+                    }
+                    let (file, expected) =
+                        transfers.get_mut(&request_id).expect("inserted transfer");
+                    if offset != *expected
+                        || data.len() > 64 * 1024
+                        || (finished && !data.is_empty())
+                    {
+                        return Err(std::io::Error::other("invalid result chunk"));
+                    }
+                    file.write_all(&data)?;
+                    *expected += data.len() as u64;
+                    if !finished {
+                        return Ok(None);
+                    }
+                    let (mut file, _) = transfers.remove(&request_id).expect("completed transfer");
+                    file.rewind()?;
+                    Ok(Some(serde_json::from_reader(std::io::BufReader::new(
+                        file,
+                    ))?))
+                })();
+                match result {
+                    Ok(Some(result)) => {
+                        if artifacts
+                            .iter()
+                            .any(|((id, _), (_, _, done))| *id == request_id && !done)
+                        {
+                            fail_connection(
+                                state,
+                                RemoteError::Protocol("result before artifact completion".into()),
+                            )
+                            .await;
+                            return;
+                        }
+                        artifacts.retain(|(id, _), _| *id != request_id);
+                        let pending = state.lock().await.pending.remove(&request_id);
+                        if let Some(pending) = pending {
+                            let _ = pending.sender.send(Ok(result));
+                        } else {
+                            fail_connection(
+                                state,
+                                RemoteError::Protocol("result for unknown request".into()),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        fail_connection(state, RemoteError::io(error)).await;
+                        return;
+                    }
+                }
+            }
             Response::SensitiveCancelled { prompt_id } => {
                 if let Some(task) = prompt_tasks.remove(&prompt_id) {
                     task.abort();
@@ -591,6 +731,18 @@ async fn route_responses<R>(
                 }
             }
             Response::Tool { request_id, result } => {
+                if artifacts
+                    .iter()
+                    .any(|((id, _), (_, _, done))| *id == request_id && !done)
+                {
+                    fail_connection(
+                        state,
+                        RemoteError::Protocol("result before artifact completion".into()),
+                    )
+                    .await;
+                    return;
+                }
+                artifacts.retain(|(id, _), _| *id != request_id);
                 let pending = state.lock().await.pending.remove(&request_id);
                 let Some(pending) = pending else {
                     fail_connection(
@@ -895,6 +1047,77 @@ mod tests {
             console_output: String::new(),
             images: Vec::new(),
         })
+    }
+
+    #[tokio::test]
+    async fn artifact_transfer_hydrates_native_results_and_preserves_interrupted_prefixes() {
+        for complete in [true, false] {
+            let runtime = crate::test_support::TestRuntime::new().await;
+            let payload = "line\n".repeat(250_000);
+            let source = runtime.root.path().join("payload.txt");
+            tokio::fs::write(&source, &payload).await.unwrap();
+            let mut builder = crate::tool::ToolRegistryBuilder::default();
+            builder.register_dynamic("remote_fixture", "remote fixture", serde_json::json!({"type":"object","properties":{},"additionalProperties":false}), crate::tool::ToolOptions::default().output_schema(serde_json::to_value(schemars::schema_for!(crate::tool::builtins::ProcessOutput)).unwrap()), move |context, _| {
+                let source = source.clone();
+                async move {
+                    let (peer, stream) = tokio::io::duplex(64 * 1024);
+                    let (sender, receiver) = oneshot::channel();
+                    let state = Arc::new(Mutex::new(ConnectionState { pending:HashMap::from([(1, PendingCall {sender,context:Some(context)})]), failure:None,resolutions:HashMap::new(),streams:HashMap::new() }));
+                    let reader_state = state.clone();
+                    let reader = tokio::spawn(async move { route_responses(stream,&reader_state,None,"fixture".into(),None).await; });
+                    let writer = tokio::spawn(async move {
+                        let peer = Mutex::new(peer);
+                        if complete {
+                            super::super::protocol::write_artifact(&peer,1,"/result/stdout".into(),&source).await.unwrap();
+                            write_frame(&mut *peer.lock().await,&Response::Tool {request_id:1,result:Ok(RemoteToolOutput {value:serde_json::json!({"stdout":"","exit_code":0}),images:Vec::new(),console_output:String::new()})}).await.unwrap();
+                        } else {
+                            write_frame(&mut *peer.lock().await,&Response::ToolArtifact {request_id:1,field:"/result/stdout".into(),offset:0,data:b"retained prefix\n".to_vec(),finished:false}).await.unwrap();
+                        }
+                    });
+                    let result = receiver.await.map_err(|e| ToolError::Failed(e.to_string()))?;
+                    writer.await.map_err(|e| ToolError::Failed(e.to_string()))?;
+                    reader.await.map_err(|e| ToolError::Failed(e.to_string()))?;
+                    result.map_err(RemoteError::into_tool_error)?.map(Into::into).map_err(|e| ToolError::Failed(e.message))
+                }
+            }).unwrap();
+            let result = runtime
+                .executor(builder)
+                .execute(
+                    runtime.agent.clone(),
+                    "remote_fixture",
+                    serde_json::json!({}),
+                    None,
+                )
+                .await;
+            if complete {
+                let result = result.unwrap();
+                assert_eq!(result.output.value["stdout"], payload);
+                let view = runtime
+                    .jobs
+                    .present_output(
+                        crate::job::output::OutputArgs::new(result.job),
+                        &Default::default(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(view["result"]["stdout"], "line\n".repeat(100));
+                assert_eq!(view["result"]["exit_code"], 0);
+                assert_eq!(view["truncated"][0]["field"], "/result/stdout");
+            } else {
+                assert!(result.is_err());
+                let job = runtime.jobs.list(&runtime.agent).await[0].id;
+                let mut args = crate::job::output::OutputArgs::new(job);
+                args.field = Some("/result/stdout".into());
+                let view = runtime
+                    .jobs
+                    .present_output(args, &Default::default())
+                    .await
+                    .unwrap();
+                assert_eq!(view["state"], "failed");
+                assert_eq!(view["preview"]["lines"][0]["text"], "retained prefix");
+                assert_eq!(view["preview"]["capture_complete"], false);
+            }
+        }
     }
 
     #[test]

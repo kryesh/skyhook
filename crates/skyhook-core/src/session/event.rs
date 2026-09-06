@@ -63,6 +63,7 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         arguments: Value,
+        output_schema: Option<Value>,
         accepts_input: bool,
         background: bool,
         location: ExecutionLocation,

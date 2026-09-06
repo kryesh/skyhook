@@ -19,10 +19,10 @@ pub(super) const TARGET_PROMPT: &str = r#"Your current target and workspace are 
 Remote commands receive Skyhook's SSH_AUTH_SOCK. SSH authentication prompts are handled by Skyhook."#;
 
 const WORKSPACE_PROMPT: &str = "A workspace is a base directory, not isolation or a filesystem copy. Paths/cwd accept absolute paths or relative paths including `..`, resolved on the selected machine. Relative child workspace overrides resolve against the selected base.";
-const LIFECYCLE_PROMPT: &str = "Jobs progress queued → running → completed, optionally via waiting_input → running; completed, failed, cancelled and interrupted are terminal. Background calls and foreground child questions return JobEnvelope. Child question output: {kind:questions,question_id,question_ids,questions:[{id,prompt,options}]}. Questions have no expiry. wait or automatic notifications acknowledge delivery; questions are delivered once, terminal results remain rereadable. inspect can reread delivered questions without acknowledging. A wait timeout returns a nonterminal envelope and leaves work running. cancel includes descendants and managed process groups; confirm terminal state with wait/inspect. Detached processes/unreachable hosts limit cleanup. Command timeouts terminate execution; omitted timeouts have no deadline. Direct failures return errors; script failures throw with partial error.output; nonzero command exit_code is a normal result. Never circumvent a declined operation; use permitted alternatives or explain the limitation.";
-const AGENT_PROMPT: &str = "Children have fresh history: include the complete task in prompt. Preserve the requested outcome and scope when delegating. Give children distinct responsibilities and use their results to avoid repeating completed work. Consider supplying todos with concrete steps or checkpoints to help steer the child toward the intended outcome. They receive shared harness instructions, the selected profile, tools, targets and host skill catalog; model/profile defaults come from harness configuration. Agents on one target share its filesystem. Child depth is its budget for further generations, defaults to zero and must be less than the caller's available_depth. Children must await/cancel all owned work before completing.";
+const LIFECYCLE_PROMPT: &str = "Model calls return JobView; Result in tool descriptions refers to its result field. JavaScript calls return native results; background launches return job metadata. Some result fields may be truncated. Use job_output to retrieve or filter a field's saved content.\n\nCommand timeouts terminate execution; omitted timeouts have no deadline. Nonzero exit_code is a normal result. Script failures throw with partial error.output. Never circumvent a declined operation; use permitted alternatives or explain the limitation.";
+const AGENT_PROMPT: &str = "Children start with fresh history; include the full task, relevant context, and scope. Give children distinct responsibilities and use their results. Consider supplying todos with steps or checkpoints. Agents on one target share its filesystem. Child depth limits further delegation and must be below available_depth.";
 
-const TODO_PROMPT: &str = "Use todo for multi-step work; replace the whole ordered list to update it. Multiple items may be in_progress. Account for unfinished items; they do not gate completion. The final skyhook_state supersedes older snapshots. agent.todos seeds pending instructions; children own edits. todo({job:agent_job_id}) reads a descendant's list.";
+const TODO_PROMPT: &str = "Use todo for multi-step work and account for unfinished items.";
 
 #[derive(Serialize)]
 struct SkyhookContext<'a> {
@@ -78,8 +78,8 @@ pub(super) fn system_segment(
     parts.push(WORKSPACE_PROMPT.to_owned());
     parts.push(TODO_PROMPT.to_owned());
     parts.push(format!(
-        "{LIFECYCLE_PROMPT}\n\nShared result type: JobEnvelope = `{}`.",
-        crate::tool::job_envelope_type(capabilities)
+        "{LIFECYCLE_PROMPT}\n\nModel result type: JobView = `{}`.",
+        crate::tool::job_view_type(capabilities)
     ));
     for capability in capabilities.iter() {
         if let Some(chunk) = capability_prompt(capability, available_depth) {

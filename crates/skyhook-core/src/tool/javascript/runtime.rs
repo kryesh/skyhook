@@ -54,9 +54,14 @@ pub async fn evaluate(
     executor: ToolExecutor,
     context: ToolContext,
 ) -> Result<ToolOutput, JsError> {
-    let console = Arc::new(std::sync::Mutex::new(ConsoleOutput::default()));
-    let result = evaluate_inner(source, executor, context, console.clone()).await;
-    let console_output = console.lock().expect("console lock poisoned").take();
+    let path = context
+        .capture_path("/console")
+        .await
+        .map_err(|e| JsError::Execution(e.to_string()))?;
+    let result = evaluate_captured(source, executor, context).await;
+    let console_output = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| JsError::Execution(e.to_string()))?;
     match result {
         Ok(mut output) => {
             output.console_output = console_output;
@@ -68,6 +73,28 @@ pub async fn evaluate(
             console_output,
         }),
     }
+}
+
+/// Execute into the owning job's capture; native callers hydrate only when collecting the job.
+pub(crate) async fn evaluate_captured(
+    source: String,
+    executor: ToolExecutor,
+    context: ToolContext,
+) -> Result<ToolOutput, JsError> {
+    let path = context
+        .capture_path("/console")
+        .await
+        .map_err(|e| JsError::Execution(e.to_string()))?;
+    let console = Arc::new(std::sync::Mutex::new(
+        ConsoleOutput::new(&path).map_err(|e| JsError::Execution(e.to_string()))?,
+    ));
+    let result = evaluate_inner(source, executor, context, console.clone()).await;
+    console
+        .lock()
+        .expect("console lock poisoned")
+        .finish()
+        .map_err(|e| JsError::Execution(e.to_string()))?;
+    result
 }
 
 async fn evaluate_inner(
@@ -139,7 +166,7 @@ async fn evaluate_inner(
         .map_err(|error| error.to_string())?;
         js.globals().set("sleep", sleep).map_err(|error| error.to_string())?;
         let log = Function::new(js.clone(), move |text: String| {
-            console.lock().expect("console lock poisoned").log(&text);
+            console.lock().expect("console lock poisoned").log(&text).map_err(|e| bridge_error(&e))
         })
         .map_err(|error| error.to_string())?;
         js.globals()
@@ -846,7 +873,7 @@ return {first, second, started};
     }
 
     #[tokio::test]
-    async fn console_formats_values_and_caps_large_capture_without_changing_the_result() {
+    async fn console_formats_values_and_retains_large_capture_without_changing_the_result() {
         let (_root, executor, context) = test_runtime(ToolRegistryBuilder::default()).await;
         let output = evaluate(
             r#"
@@ -874,9 +901,11 @@ console.log();
         .await
         .unwrap();
         assert_eq!(output.value, serde_json::json!(42));
-        let (captured, marker) = output.console_output.split_at(16 * 1024 * 1024);
-        assert!(captured.bytes().all(|byte| byte == b'x'));
-        assert_eq!(marker, "\n[console output truncated at 16 MiB]\n");
+        assert_eq!(
+            output.console_output.len(),
+            17 * 1024 * 1024 + "\ndiscarded\n".len()
+        );
+        assert!(output.console_output.ends_with("\ndiscarded\n"));
     }
 
     #[tokio::test]

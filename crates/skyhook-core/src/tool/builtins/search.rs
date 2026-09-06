@@ -13,10 +13,6 @@ use crate::tool::{
     policy::{Capability, PathAccess},
 };
 
-const MAX_RESULTS: usize = 1_000;
-const MAX_LINE_BYTES: usize = 32 * 1024;
-const MAX_OUTPUT_BYTES: usize = 512 * 1024;
-
 pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
     builder.register::<SearchArgs, SearchOutput, _, _>(
         "search",
@@ -25,12 +21,14 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .path_argument("path", PathAccess::Read, PathKind::Existing),
         |context, args| async move {
-            validate_limit(args.limit)?;
             let root = resolve_existing(&context.execution_location.workspace, &args.path).await?;
-            let workspace = context.execution_location.workspace;
-            tokio::task::spawn_blocking(move || search_blocking(&workspace, &root, &args))
-                .await
-                .map_err(|error| ToolError::Failed(error.to_string()))?
+            let capture = context.capture_path("/result/matches").await?;
+            let workspace = context.execution_location.workspace.clone();
+            tokio::task::spawn_blocking(move || {
+                search_blocking(&workspace, &root, &args, Some(&capture), Some(&context))
+            })
+            .await
+            .map_err(|error| ToolError::Failed(error.to_string()))?
         },
     )?;
     builder.register::<GlobArgs, GlobOutput, _, _>(
@@ -40,25 +38,17 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .path_argument("path", PathAccess::Read, PathKind::Existing),
         |context, args| async move {
-            validate_limit(args.limit)?;
             let root = resolve_existing(&context.execution_location.workspace, &args.path).await?;
-            let workspace = context.execution_location.workspace;
-            tokio::task::spawn_blocking(move || glob_blocking(&workspace, &root, &args))
-                .await
-                .map_err(|error| ToolError::Failed(error.to_string()))?
+            let capture = context.capture_path("/result/paths").await?;
+            let workspace = context.execution_location.workspace.clone();
+            tokio::task::spawn_blocking(move || {
+                glob_blocking(&workspace, &root, &args, Some(&capture), Some(&context))
+            })
+            .await
+            .map_err(|error| ToolError::Failed(error.to_string()))?
         },
     )?;
     Ok(())
-}
-
-fn validate_limit(limit: usize) -> Result<(), ToolError> {
-    if (1..=MAX_RESULTS).contains(&limit) {
-        Ok(())
-    } else {
-        Err(ToolError::InvalidArguments(format!(
-            "limit must be 1 through {MAX_RESULTS}"
-        )))
-    }
 }
 
 fn walk_builder(root: &Path, hidden: bool, no_ignore: bool) -> WalkBuilder {
@@ -90,15 +80,11 @@ fn search_blocking(
     workspace: &Path,
     root: &Path,
     args: &SearchArgs,
+    capture: Option<&Path>,
+    context: Option<&crate::tool::ToolContext>,
 ) -> Result<SearchOutput, ToolError> {
-    let mut matcher_builder = RegexMatcherBuilder::new();
-    matcher_builder
-        .fixed_strings(args.fixed)
-        .word(args.word)
-        .line_terminator(Some(b'\n'))
-        .ban_byte(Some(b'\0'))
-        .size_limit(10 * 1024 * 1024)
-        .dfa_size_limit(10 * 1024 * 1024);
+    let mut matcher_builder = common_matcher();
+    matcher_builder.fixed_strings(args.fixed).word(args.word);
     match args.case {
         Case::Smart => {
             matcher_builder.case_smart(true);
@@ -114,142 +100,185 @@ fn search_blocking(
         .build(&args.pattern)
         .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
 
-    let mut files = Vec::<PathBuf>::new();
-    if root.is_file() {
-        files.push(root.to_owned());
+    let files: Box<dyn Iterator<Item = Result<PathBuf, ToolError>>> = if root.is_file() {
+        Box::new(std::iter::once(Ok(root.to_owned())))
     } else if root.is_dir() {
         let mut walk = walk_builder(root, args.hidden, args.no_ignore);
         if !args.glob.is_empty() {
             walk.overrides(overrides(root, &args.glob)?);
         }
-        for entry in walk.build() {
-            let entry = entry.map_err(|error| ToolError::Failed(error.to_string()))?;
-            if entry.file_type().is_some_and(|kind| kind.is_file()) {
-                files.push(entry.into_path());
+        Box::new(walk.build().filter_map(|entry| match entry {
+            Ok(entry) if entry.file_type().is_some_and(|kind| kind.is_file()) => {
+                Some(Ok(entry.into_path()))
             }
-        }
+            Ok(_) => None,
+            Err(error) => Some(Err(ToolError::Failed(error.to_string()))),
+        }))
     } else {
         return Err(ToolError::Failed(
-            "search root is not a file or directory".to_owned(),
+            "search root is not a file or directory".into(),
         ));
-    }
-
+    };
     let mut searcher = SearcherBuilder::new()
         .line_number(true)
         .binary_detection(BinaryDetection::quit(b'\0'))
-        .heap_limit(Some(MAX_LINE_BYTES * 4))
+        .heap_limit(Some(4 * 1024 * 1024))
         .build();
-    let mut matches = Vec::new();
-    let mut retained = 0_usize;
-    let mut truncated = false;
+    let mut matches = CapturedArray::new(capture)?;
     for path in files {
-        if matches.len() > args.limit || truncated {
-            break;
+        if context.is_some_and(crate::tool::ToolContext::is_cancelled) {
+            return Err(ToolError::Cancelled);
         }
-        let relative = relative_path(workspace, &path);
-        let mut found = Vec::new();
+        let path = path?;
+        let checkpoint = matches.checkpoint()?;
         let mut sink = SearchSink {
             matcher: &matcher,
-            path: &relative,
-            matches: &mut found,
+            path: relative_path(workspace, &path),
+            matches: &mut matches,
             binary: false,
-            limit: args.limit.saturating_add(1).saturating_sub(matches.len()),
+            context,
         };
         searcher
             .search_path(&matcher, &path, &mut sink)
             .map_err(|error| ToolError::Failed(error.to_string()))?;
         if sink.binary {
-            continue;
-        }
-        for item in found {
-            let bytes = item
-                .text
-                .len()
-                .saturating_add(item.path.len())
-                .saturating_add(64);
-            if retained.saturating_add(bytes) > MAX_OUTPUT_BYTES {
-                truncated = true;
-                break;
-            }
-            retained += bytes;
-            matches.push(item);
-            if matches.len() > args.limit {
-                break;
-            }
+            matches.rollback(checkpoint)?;
         }
     }
-    truncated |= matches.len() > args.limit;
-    matches.truncate(args.limit);
-    Ok(SearchOutput { matches, truncated })
+    Ok(SearchOutput {
+        matches: matches.finish()?,
+    })
 }
 
-fn glob_blocking(workspace: &Path, root: &Path, args: &GlobArgs) -> Result<GlobOutput, ToolError> {
+fn glob_blocking(
+    workspace: &Path,
+    root: &Path,
+    args: &GlobArgs,
+    capture: Option<&Path>,
+    context: Option<&crate::tool::ToolContext>,
+) -> Result<GlobOutput, ToolError> {
     if !root.is_dir() {
-        return Err(ToolError::Failed("glob root is not a directory".to_owned()));
+        return Err(ToolError::Failed("glob root is not a directory".into()));
     }
     let mut walk = walk_builder(root, args.hidden, args.no_ignore);
     walk.overrides(overrides(root, std::slice::from_ref(&args.pattern))?);
-    let mut paths = Vec::new();
+    let mut paths = CapturedArray::new(capture)?;
     for entry in walk.build() {
-        let entry = entry.map_err(|error| ToolError::Failed(error.to_string()))?;
-        if entry.depth() == 0 || !entry.file_type().is_some_and(|kind| kind.is_file()) {
-            continue;
+        if context.is_some_and(crate::tool::ToolContext::is_cancelled) {
+            return Err(ToolError::Cancelled);
         }
-        paths.push(relative_path(workspace, entry.path()));
-        if paths.len() > args.limit {
-            break;
+        let entry = entry.map_err(|error| ToolError::Failed(error.to_string()))?;
+        if entry.depth() != 0 && entry.file_type().is_some_and(|kind| kind.is_file()) {
+            paths.push(relative_path(workspace, entry.path()))?;
         }
     }
-    let truncated = paths.len() > args.limit;
-    paths.truncate(args.limit);
-    Ok(GlobOutput { paths, truncated })
+    Ok(GlobOutput {
+        paths: paths.finish()?,
+    })
 }
 
+struct CapturedArray<T> {
+    file: Option<std::io::BufWriter<std::fs::File>>,
+    values: Vec<T>,
+    count: usize,
+}
+impl<T: Serialize> CapturedArray<T> {
+    fn new(path: Option<&Path>) -> std::io::Result<Self> {
+        use std::io::Write as _;
+        let mut file = path
+            .map(std::fs::File::create)
+            .transpose()?
+            .map(std::io::BufWriter::new);
+        if let Some(file) = &mut file {
+            file.write_all(b"[\n")?;
+        }
+        Ok(Self {
+            file,
+            values: Vec::new(),
+            count: 0,
+        })
+    }
+    fn push(&mut self, value: T) -> std::io::Result<()> {
+        use std::io::Write as _;
+        if let Some(file) = &mut self.file {
+            if self.count > 0 {
+                file.write_all(b",\n")?;
+            }
+            serde_json::to_writer(file, &value)?;
+        } else {
+            self.values.push(value);
+        }
+        self.count += 1;
+        Ok(())
+    }
+    fn checkpoint(&mut self) -> std::io::Result<(usize, u64)> {
+        use std::io::Seek as _;
+        Ok((
+            self.count,
+            self.file
+                .as_mut()
+                .map(std::io::BufWriter::stream_position)
+                .transpose()?
+                .unwrap_or(0),
+        ))
+    }
+    fn rollback(&mut self, checkpoint: (usize, u64)) -> std::io::Result<()> {
+        use std::io::{Seek as _, Write as _};
+        self.count = checkpoint.0;
+        self.values.truncate(checkpoint.0);
+        if let Some(file) = &mut self.file {
+            file.flush()?;
+            file.get_ref().set_len(checkpoint.1)?;
+            file.seek(std::io::SeekFrom::Start(checkpoint.1))?;
+        }
+        Ok(())
+    }
+    fn finish(mut self) -> std::io::Result<Vec<T>> {
+        use std::io::Write as _;
+        if let Some(file) = &mut self.file {
+            file.write_all(b"\n]")?;
+            file.flush()?;
+        }
+        Ok(self.values)
+    }
+}
 struct SearchSink<'a> {
     matcher: &'a grep_regex::RegexMatcher,
-    path: &'a str,
-    matches: &'a mut Vec<SearchMatch>,
+    path: String,
+    matches: &'a mut CapturedArray<SearchMatch>,
     binary: bool,
-    limit: usize,
+    context: Option<&'a crate::tool::ToolContext>,
 }
-
 impl Sink for SearchSink<'_> {
     type Error = std::io::Error;
-
     fn matched(
         &mut self,
         _searcher: &Searcher,
         matched: &SinkMatch<'_>,
     ) -> Result<bool, Self::Error> {
+        if self
+            .context
+            .is_some_and(crate::tool::ToolContext::is_cancelled)
+        {
+            return Err(std::io::Error::other("search cancelled"));
+        }
         let bytes = matched.bytes();
         let first = self
             .matcher
             .find(bytes)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let Some(first) = first else {
-            return Ok(true);
-        };
-        let mut line = bytes;
-        if line.ends_with(b"\n") {
-            line = &line[..line.len() - 1];
-            if line.ends_with(b"\r") {
-                line = &line[..line.len() - 1];
-            }
+        if let Some(first) = first {
+            self.matches.push(SearchMatch {
+                path: self.path.clone(),
+                line: matched.line_number().unwrap_or(1),
+                column: first.start() + 1,
+                text: String::from_utf8_lossy(bytes)
+                    .trim_end_matches(['\r', '\n'])
+                    .to_owned(),
+            })?;
         }
-        let line_truncated = line.len() > MAX_LINE_BYTES;
-        if line_truncated {
-            line = &line[..MAX_LINE_BYTES];
-        }
-        self.matches.push(SearchMatch {
-            path: self.path.to_owned(),
-            line: matched.line_number().unwrap_or(1),
-            column: first.start().saturating_add(1),
-            text: String::from_utf8_lossy(line).into_owned(),
-            truncated: line_truncated,
-        });
-        Ok(self.matches.len() < self.limit)
+        Ok(true)
     }
-
     fn binary_data(&mut self, _searcher: &Searcher, _offset: u64) -> Result<bool, Self::Error> {
         self.binary = true;
         Ok(false)
@@ -270,7 +299,7 @@ enum Case {
 struct SearchArgs {
     /// Rust-regex pattern, using ripgrep syntax. Set `fixed` to match it literally.
     pattern: String,
-    /// File or directory to search, relative to the selected workspace by default.
+    /// File or directory to search.
     #[serde(default = "default_dot")]
     path: String,
     /// Ripgrep-style include/exclude globs. Prefix exclusions with `!`; later globs override earlier ones.
@@ -291,16 +320,12 @@ struct SearchArgs {
     /// Ignore .gitignore and related ignore files (`rg --no-ignore`).
     #[serde(default)]
     no_ignore: bool,
-    /// Maximum number of matches to return.
-    #[serde(default = "default_search_limit")]
-    #[schemars(range(min = 1, max = 1000))]
-    limit: usize,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct SearchOutput {
+    #[schemars(extend("x-skyhook-truncatable" = true))]
     matches: Vec<SearchMatch>,
-    truncated: bool,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -309,7 +334,6 @@ struct SearchMatch {
     line: u64,
     column: usize,
     text: String,
-    truncated: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -317,7 +341,7 @@ struct SearchMatch {
 struct GlobArgs {
     /// Ripgrep-style file glob, such as `src/**/*.rs`.
     pattern: String,
-    /// Directory to enumerate, relative to the selected workspace by default.
+    /// Directory to enumerate.
     #[serde(default = "default_dot")]
     path: String,
     /// Include hidden files and directories.
@@ -326,26 +350,31 @@ struct GlobArgs {
     /// Ignore .gitignore and related ignore files.
     #[serde(default)]
     no_ignore: bool,
-    /// Maximum number of paths to return.
-    #[serde(default = "default_glob_limit")]
-    #[schemars(range(min = 1, max = 1000))]
-    limit: usize,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct GlobOutput {
+    #[schemars(extend("x-skyhook-truncatable" = true))]
     paths: Vec<String>,
-    truncated: bool,
 }
 
 fn default_dot() -> String {
     ".".to_owned()
 }
-const fn default_search_limit() -> usize {
-    100
+fn common_matcher() -> RegexMatcherBuilder {
+    let mut builder = RegexMatcherBuilder::new();
+    builder
+        .line_terminator(Some(b'\n'))
+        .ban_byte(Some(b'\0'))
+        .size_limit(10 * 1024 * 1024)
+        .dfa_size_limit(10 * 1024 * 1024);
+    builder
 }
-const fn default_glob_limit() -> usize {
-    200
+
+pub(crate) fn output_matcher(pattern: &str) -> Result<grep_regex::RegexMatcher, ToolError> {
+    common_matcher()
+        .build(pattern)
+        .map_err(|error| ToolError::InvalidArguments(error.to_string()))
 }
 
 #[cfg(test)]
@@ -371,15 +400,15 @@ mod tests {
                 word: false,
                 hidden: false,
                 no_ignore: false,
-                limit: 100,
             },
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(output.matches.len(), 1);
         assert_eq!(output.matches[0].path, "upper.rs");
         assert_eq!(output.matches[0].line, 1);
         assert_eq!(output.matches[0].column, 1);
-        assert!(!output.truncated);
     }
 
     #[test]
@@ -395,11 +424,11 @@ mod tests {
                 path: ".".to_owned(),
                 hidden: false,
                 no_ignore: false,
-                limit: 1,
             },
+            None,
+            None,
         )
         .unwrap();
-        assert_eq!(output.paths, vec!["a.rs"]);
-        assert!(output.truncated);
+        assert_eq!(output.paths, vec!["a.rs", "b.rs"]);
     }
 }

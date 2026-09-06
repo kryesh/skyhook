@@ -115,19 +115,32 @@ where
                         let worker_agent = worker_agent.clone();
                         let started_jobs = started_jobs.clone();
                         tasks.spawn(async move {
+                            let mut captured_job = None;
                             let result = match executor
                                 .start_scoped(worker_agent, &name, arguments, None, request_id)
                                 .await
                             {
                                 Ok(started) => {
                                     let _ = started_jobs.send((request_id, started.job)).await;
-                                    executor.collect_started(started).await
+                                    captured_job = Some(started.job);
+                                    executor.collect_for_transfer(started).await
                                 }
                                 Err(error) => Err(error),
                             };
-                            let result = externalize_result(result, &store).await;
-                            let response = Response::Tool { request_id, result };
-                            let result = write_frame(&mut *output.lock().await, &response).await;
+                            let mut result = externalize_result(result, &store).await;
+                            if let Some(job) = captured_job {
+                                let directory = store.directory().join("jobs").join(job.to_string());
+                                match crate::job::output::transfer_fields(&directory) {
+                                    Ok(fields) => for (field, path) in fields {
+                                        if let Err(error) = super::protocol::write_artifact(&output, request_id, field, &path).await {
+                                            return (request_id, Err(error));
+                                        }
+                                    },
+                                    Err(error) => result = Err(remote_error(error)),
+                                }
+                            }
+                            let result = super::protocol::write_tool_result(&output, request_id, &result).await;
+                            if result.is_ok() && let Some(job) = captured_job { let _ = executor.jobs().claim(job).await; }
                             (request_id, result)
                         });
                     }
@@ -360,6 +373,93 @@ mod tests {
 
     use super::*;
     use crate::remote::protocol::RemoteToolOutput;
+
+    #[tokio::test]
+    async fn large_file_results_transfer_after_capture_in_bounded_artifact_frames() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large.txt");
+        let size = 17 * 1024 * 1024;
+        tokio::fs::write(&path, vec![b'x'; size]).await.unwrap();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut input, mut output) = tokio::io::split(client);
+        let (server_input, server_output) = tokio::io::split(server);
+        let worker = tokio::spawn(async move {
+            serve_io(server_input, server_output)
+                .await
+                .map_err(|e| e.to_string())
+        });
+        write_frame(&mut output, &Request::Hello).await.unwrap();
+        assert!(matches!(
+            read_frame::<_, Response>(&mut input).await.unwrap(),
+            Some(Response::Ready)
+        ));
+        write_frame(
+            &mut output,
+            &Request::Tool {
+                request_id: 1,
+                name: "read".into(),
+                arguments: serde_json::json!({"path":path}),
+            },
+        )
+        .await
+        .unwrap();
+        let mut received = 0;
+        let mut closed = false;
+        loop {
+            match read_frame::<_, Response>(&mut input)
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                Response::Authorization {
+                    authorization_id, ..
+                } => {
+                    write_frame(
+                        &mut output,
+                        &Request::AuthorizationDecision {
+                            request_id: 1,
+                            authorization_id,
+                            allowed: true,
+                            reason: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                Response::ToolArtifact {
+                    request_id,
+                    field,
+                    offset,
+                    data,
+                    finished,
+                } => {
+                    assert_eq!(request_id, 1);
+                    assert_eq!(field, "/result/content");
+                    assert_eq!(offset, received as u64);
+                    assert!(data.len() <= 64 * 1024);
+                    assert!(data.iter().all(|b| *b == b'x'));
+                    received += data.len();
+                    closed = finished;
+                }
+                Response::Tool {
+                    result: Ok(result), ..
+                } => {
+                    assert!(closed);
+                    assert_eq!(received, size);
+                    assert_eq!(result.value["content"], "");
+                    break;
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+        drop(output);
+        drop(input);
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn tool_requests_execute_concurrently_and_reply_on_completion() {

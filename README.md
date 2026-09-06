@@ -55,7 +55,7 @@ input, and uncached input token counts.
 
 ## Reconstructing model calls
 
-Session format 3 records the inputs needed to reconstruct each call at the shared `Provider`
+Session format 4 records the inputs needed to reconstruct each call at the shared `Provider`
 boundary. It stores no backend-specific request bodies or authentication headers:
 
 - `model_context` records the configured provider name and a shared `ModelRequest` template:
@@ -243,7 +243,7 @@ The runtime also exposes:
 - `await receive()` for the next JSON input sent to the owning job with
   `tool.job(id).send({value})` (background scripts only).
 
-Read command stdout/stderr events with `tool.job(commandJobId).events()`.
+Read or search saved command output with `tool.job(commandJobId).output({field:"/result/stdout"})`.
 
 Before returning results, convert `BigInt` values to strings, dates with `.toISOString()`, and
 typed arrays with `Array.from(bytes)`, `.toBase64()`, or `.toHex()`. The runtime does not provide
@@ -300,22 +300,21 @@ workspace require approval, cached in memory by session, target, access mode, an
 approval covers descendants. Read and write grants are separate. Process execution remains subject
 to confirmation on each invocation.
 
-Background-capable tools accept an optional `bg` argument. Foreground calls normally return the
-handler's result; background calls and suspended foreground child calls return a job envelope with
-`id`, `parent`, `tool`, `state`, `output`, `error`, and `location`. Schemas describe both variants.
-A child question has `state: "waiting_input"` and output
-`{kind:"questions", question_id, question_ids, questions}`.
+Background-capable tools accept an optional `bg` argument. Model-facing calls return a job view
+with `id`, `tool`, `state`, and `location`, plus a structured `result`. Only annotated fields are shortened; `truncated` lists their continuation cursors.
+JavaScript foreground calls return the handler's full native result; background launches return
+a job reference. A child question has `state: "waiting_input"`; `job_output` returns its stable
+question IDs and text in `question`, regardless of its size.
 
 Jobs normally follow `queued → running → completed`, optionally cycling through
 `waiting_input → running`; `failed`, `cancelled`, and `interrupted` are terminal alternatives.
-`wait` acknowledges a pending question or terminal result and suppresses duplicate automatic
-notification. Terminal results can be read repeatedly; a question is delivered once by wait or
-notification but remains inspectable. `inspect` does not acknowledge. A wait deadline bounds the
-whole wait and returns a nonterminal envelope without stopping the job. Unanswered questions do
-not expire. Send answers to the stable child-agent job ID.
+`job_output` acknowledges a pending question or terminal result and suppresses duplicate automatic
+notification. Explicit reads remain repeatable. The optional wait duration returns when content,
+a question, or completion is available, or when its deadline expires; it does not stop the job.
+Unanswered questions do not expire. Send answers to the stable child-agent job ID.
 
 Cancellation cascades through descendant jobs and agents and terminates managed command process
-groups locally and remotely. It is a request: wait or inspect to confirm termination. Deliberately
+groups locally and remotely. It is a request: use job_output to confirm termination. Deliberately
 detached processes and unreachable remote hosts limit cleanup. Command timeouts are optional;
 omission or null means no deadline. Explicit timeouts of 1–3600 seconds terminate execution,
 retaining captured output. A nonzero command exit is a normal result with `exit_code`.
@@ -363,7 +362,7 @@ const child = await tool.agent({
   todos: ["Inspect the implementation", "Make the change", "Run relevant checks"],
   bg: true
 });
-await tool.job(child.id).wait();
+await tool.job(child.id).output({wait:60});
 return tool.todo({job: child.id});
 ```
 
@@ -418,11 +417,69 @@ unchanged; transient history does not guarantee exclusion from provider KV cache
 ## Built-in tools
 
 `read`, `search`, `glob`, `exec`, `shell`, `write`, `replace`, `patch`, `remove`, `script`, `targets`,
-`target_add`, `jobs`, `wait`, `ask`, `todo`, and `agent`. `jobs()` returns the current agent's active
-jobs and excludes the listing call itself and, when called from a script, its containing script;
-use `jobs({all:true})` to include terminal history. The remaining job controls are kept out of model tool definitions and exposed to scripts as
-`tool.job(id).inspect()`, `.send({value})`, `.cancel()`, and `.events({after, limit})`;
-`.wait({timeout})` uses the same `wait` tool.
+`target_add`, `jobs`, `job_output`, `ask`, `todo`, and `agent`. `jobs()` lists the current agent's
+active jobs, excluding the listing call and its containing script. `jobs({all:true})` includes
+completed history; listings contain status and references, never saved results.
+
+`job_output` reads saved output and status, optionally waiting for output, a question, or completion.
+Scripts use `tool.job(id).output(...)`, `.send({value})`, and `.cancel()`.
+
+### Saved job output
+
+Tools execute once and capture their complete results to disk. File reads capture snapshots;
+subsequent retrieval does not reread changed files. Search and glob capture their complete result
+sets. There is no configured capture-size cap or automatic eviction; storage failures are reported
+as failures, with retained partial output marked incomplete.
+
+Model-facing responses include the job ID, tool, state, location, and a structured `result`.
+Only output fields annotated with `x-skyhook-truncatable: true` may be shortened. Each annotated
+field independently retains at most 100 lines or 2 KiB (2048 bytes), whichever is reached first.
+Strings count UTF-8 content bytes before JSON escaping; arrays count their saved JSON text and
+retain only complete items. All other fields remain intact regardless of size, so there is no
+aggregate response-size limit or whole-result fallback.
+
+Annotations cover file `content`, directory `entries`, process `stdout` and `stderr`, search
+`matches`, glob `paths`, skill asset `content`, and shared `console` text. Skill instructions
+remain complete. Shortened fields keep their original types;
+`truncated: [{field, next}]` identifies each one and supplies a cursor starting at the remaining
+content. `capture_complete` separately reports whether capture finished successfully. Errors
+and questions are returned in full. Schemas are persisted with jobs so these rules also apply
+after session resume and to completed remote jobs.
+
+Full JavaScript tool results remain available for programmatic transformations. Arbitrary script
+return values have no truncation annotations and are returned in full; script console text uses
+the shared per-field limit. Explicit `job_output` selections return a `preview`, defaulting to
+100 lines with bounded page content. Unannotated job metadata is always returned in full.
+
+```js
+// Read a selected part of a saved result.
+job_output({job:42, field:"/result/stdout", start:300, limit:80})
+// Search stored text, with source line numbers and surrounding context.
+job_output({job:42, field:"/result/stderr", pattern:"(?i)error|warning", context:2})
+// Resume an opaque saved cursor, optionally waiting for new output.
+job_output({job:42, cursor:"...", wait:30})
+```
+
+`field` is a JSON Pointer: `/result/content` selects a file snapshot, `/result/stdout` and
+`/result/stderr` select process streams, and `/console` selects script console text. Objects and
+arrays have deterministic JSON text views. Long lines are split into UTF-8-safe fragments;
+`line` and `offset` identify each fragment. Regex matching is case-sensitive unless inline flags override it. Matching supports lines up to 4 MiB and reports
+an explicit resource error for larger lines; ordinary paging can still read those lines.
+
+`limit` is 1–1000 lines, `start` is one-based, `context` is 0–20 surrounding lines, and `wait`
+is 0–3600 seconds (default 0). A cursor retains its field and query: do not combine it with
+`field`, `start`, `pattern`, or `context`; `limit` and `wait` can change. Cursors are repeatable
+and survive session resume. `next` continues retained content; `capture_complete` separately
+reports whether capture finished successfully. A wait timeout never stops the original job.
+
+Local process output can be read while running. Remote shims capture first and transfer their
+results in bounded frames after execution completes. Once transferred, output can be queried
+without reconnecting to the remote machine.
+
+The journal stores the exact model-visible previews, pages, and notifications. Full artifacts
+are separate; provider-neutral request reconstruction reuses committed content rather than
+regenerating it from current files or settings. Session format 4 has no migration path.
+
 Host-owned skills are exposed through `skills` and `skill`; they are discovered from the user
 configuration directory and `.agents/skills` directories along the workspace ancestry.
 

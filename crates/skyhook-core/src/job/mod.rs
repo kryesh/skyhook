@@ -30,8 +30,8 @@ use crate::{
     },
 };
 
+pub(crate) mod output;
 mod persistence;
-mod progress;
 
 const JOB_INPUT_CAPACITY: usize = 32;
 const CANCELLATION_GRACE: Duration = Duration::from_millis(250);
@@ -67,14 +67,6 @@ impl JobState {
             Self::Completed | Self::Failed | Self::Cancelled | Self::Interrupted
         )
     }
-}
-
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq)]
-pub struct JobProgressRecord {
-    pub sequence: u64,
-    pub timestamp_millis: i64,
-    pub kind: String,
-    pub data: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq)]
@@ -223,6 +215,7 @@ pub struct JobCompletion {
 }
 
 struct JobEntry {
+    output_schema: Option<Value>,
     agent: AgentId,
     parent: Option<JobId>,
     tool: String,
@@ -241,7 +234,6 @@ struct JobEntry {
     operation: Arc<Mutex<()>>,
     task_abort: Option<AbortHandle>,
     cancellation_watchdog_started: bool,
-    next_progress: u64,
     delivery: DeliveryState,
     background: bool,
     authorization_scope: Option<u64>,
@@ -253,6 +245,7 @@ impl JobEntry {
         let (input, receiver) = mpsc::channel(JOB_INPUT_CAPACITY);
         (
             Self {
+                output_schema: spec.output_schema,
                 agent: spec.agent,
                 parent: spec.parent,
                 tool: spec.tool,
@@ -271,7 +264,6 @@ impl JobEntry {
                 operation: Arc::new(Mutex::new(())),
                 task_abort: None,
                 cancellation_watchdog_started: false,
-                next_progress: 1,
                 delivery: DeliveryState::Pending,
                 background: spec.background,
                 authorization_scope: spec.authorization_scope,
@@ -291,6 +283,21 @@ impl JobEntry {
         }
         self.delivery = delivery;
         Some(self.agent.clone())
+    }
+
+    fn metadata(&self, id: JobId) -> JobEnvelope {
+        JobEnvelope {
+            id,
+            parent: self.parent,
+            tool: self.tool.clone(),
+            name: self.name.clone(),
+            state: self.state,
+            output: None,
+            console_output: String::new(),
+            error: self.error.clone(),
+            location: self.location.clone(),
+            denial: self.denial.clone(),
+        }
     }
 
     fn envelope(&self, id: JobId) -> JobEnvelope {
@@ -352,6 +359,7 @@ pub struct JobLease {
 
 #[derive(Clone, Debug)]
 pub struct JobSpec {
+    pub output_schema: Option<Value>,
     pub agent: AgentId,
     pub parent: Option<JobId>,
     pub tool: String,
@@ -367,6 +375,7 @@ pub struct JobSpec {
 impl JobSpec {
     pub(crate) fn test(agent: AgentId, tool: impl Into<String>) -> Self {
         Self {
+            output_schema: None,
             agent,
             parent: None,
             tool: tool.into(),
@@ -426,6 +435,7 @@ impl JobManager {
                     tool: spec.tool.clone(),
                     name: spec.name.clone(),
                     arguments: std::mem::take(&mut spec.arguments),
+                    output_schema: spec.output_schema.clone(),
                     accepts_input: spec.accepts_input,
                     background: spec.background,
                     location: spec.location.clone(),
@@ -522,14 +532,35 @@ impl JobManager {
                 None,
             ),
         };
-        let (output, images, console_output) = output
+        let (mut output, images, console_output) = output
             .map_or((None, Vec::new(), String::new()), |output| {
                 (Some(output.value), output.images, output.console_output)
             });
-        let output_path = match &output {
-            Some(value) => Some(self.inner.store.write_job_output(id, value).await?),
-            None => None,
-        };
+        let directory = self.output_directory(id);
+        let capture_complete = output
+            .as_ref()
+            .is_some_and(|value| value.get("timed_out") != Some(&Value::Bool(true)));
+        if output.is_none() {
+            let mut partial = serde_json::Map::new();
+            for field in ["stdout", "stderr"] {
+                if output::field_file(&directory, &format!("/result/{field}")).exists() {
+                    partial.insert(field.to_owned(), Value::String(String::new()));
+                }
+            }
+            if !partial.is_empty() {
+                output = Some(Value::Object(partial));
+            }
+        }
+        let document = serde_json::json!({"capture_complete":capture_complete, "result":output, "console":console_output, "error":error});
+        tokio::task::spawn_blocking(move || output::save(&directory, &document))
+            .await
+            .map_err(|e| JobError::Internal(e.to_string()))?
+            .map_err(SessionError::from)?;
+        let output_path = Some(
+            std::path::PathBuf::from("jobs")
+                .join(id.to_string())
+                .join("document.json"),
+        );
         self.inner
             .store
             .append(
@@ -540,7 +571,7 @@ impl JobManager {
                     output_path,
                     error: error.clone(),
                     images: images.clone(),
-                    console_output: console_output.clone(),
+                    console_output: String::new(),
                     denial: denial.clone(),
                 },
             )
@@ -552,9 +583,9 @@ impl JobManager {
                 return Err(JobError::AlreadyTerminal(id));
             }
             entry.state = state;
-            entry.output = output;
+            entry.output = None;
             entry.images = images;
-            entry.console_output = console_output;
+            entry.console_output.clear();
             entry.error = error;
             entry.denial = denial;
             (entry.notify.clone(), entry.background)
@@ -622,10 +653,18 @@ impl JobManager {
         }
     }
 
-    pub async fn snapshot(&self, id: JobId) -> Result<JobEnvelope, JobError> {
+    pub(crate) async fn metadata(&self, id: JobId) -> Result<JobEnvelope, JobError> {
         let jobs = self.inner.jobs.lock().await;
-        let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
-        Ok(entry.envelope(id))
+        Ok(jobs.get(&id).ok_or(JobError::Unknown(id))?.metadata(id))
+    }
+
+    pub async fn snapshot(&self, id: JobId) -> Result<JobEnvelope, JobError> {
+        let mut envelope = {
+            let jobs = self.inner.jobs.lock().await;
+            jobs.get(&id).ok_or(JobError::Unknown(id))?.envelope(id)
+        };
+        self.hydrate_envelope(&mut envelope).await?;
+        Ok(envelope)
     }
 
     pub(crate) async fn cancellation_token(
@@ -656,7 +695,7 @@ impl JobManager {
         let mut output = jobs
             .iter()
             .filter(|(_, entry)| &entry.agent == owner)
-            .map(|(id, entry)| entry.envelope(*id))
+            .map(|(id, entry)| entry.metadata(*id))
             .collect::<Vec<_>>();
         output.sort_by_key(|job| job.id);
         output
@@ -720,8 +759,11 @@ impl JobManager {
         timeout: Option<Duration>,
         claim: bool,
     ) -> Result<JobEnvelope, JobError> {
-        self.wait_inner(id, timeout, WaitMode::Explicit { claim })
-            .await
+        let mut envelope = self
+            .wait_inner(id, timeout, WaitMode::Explicit { claim })
+            .await?;
+        self.hydrate_envelope(&mut envelope).await?;
+        Ok(envelope)
     }
 
     pub(crate) async fn wait_foreground(&self, id: JobId) -> Result<JobEnvelope, JobError> {
@@ -880,7 +922,8 @@ impl JobManager {
                 jobs.force_cancel(job).await;
             });
         }
-        self.snapshot(id).await
+        let jobs = self.inner.jobs.lock().await;
+        Ok(jobs.get(&id).ok_or(JobError::Unknown(id))?.metadata(id))
     }
 
     pub async fn cancel_all(&self, owner: &AgentId) -> usize {
@@ -1014,15 +1057,43 @@ impl JobManager {
     pub async fn take_pending(&self, owner: &AgentId) -> Result<Vec<JobEnvelope>, JobError> {
         let pending = {
             let mut jobs = self.inner.jobs.lock().await;
-            let mut pending = jobs
-                .iter_mut()
-                .filter(|(_, entry)| &entry.agent == owner && entry.background)
-                .filter_map(|(id, entry)| {
-                    let agent = entry.reserve_delivery(DeliveryState::Injected)?;
-                    Some((*id, agent, entry.envelope(*id)))
+            let mut ids = jobs
+                .iter()
+                .filter(|(_, entry)| {
+                    &entry.agent == owner
+                        && entry.background
+                        && entry.deliverable()
+                        && entry.delivery == DeliveryState::Pending
                 })
+                .map(|(id, _)| *id)
                 .collect::<Vec<_>>();
-            pending.sort_by_key(|(id, _, _)| *id);
+            ids.sort();
+            let mut pending = Vec::new();
+            let mut budget = 0;
+            for id in ids {
+                let directory = self.output_directory(id);
+                let entry = jobs.get(&id).expect("selected job");
+                let metadata =
+                    serde_json::to_vec(&entry.metadata(id)).map_or(8192, |bytes| bytes.len());
+                let estimate = output::presentation_size(&directory);
+                let cost =
+                    if entry.state == JobState::Completed && estimate <= output::CONTENT_BYTES {
+                        estimate
+                            .saturating_add(metadata)
+                            .saturating_add(128)
+                            .min(8192)
+                    } else {
+                        8192
+                    };
+                if !pending.is_empty() && budget + cost > 8192 {
+                    break;
+                }
+                let entry = jobs.get_mut(&id).expect("selected job");
+                if let Some(agent) = entry.reserve_delivery(DeliveryState::Injected) {
+                    pending.push((id, agent, entry.envelope(id)));
+                    budget += cost;
+                }
+            }
             pending
         };
         for (job, agent, _) in &pending {
@@ -1035,15 +1106,6 @@ impl JobManager {
             .collect())
     }
 
-    pub async fn publish_progress(
-        &self,
-        id: JobId,
-        kind: String,
-        data: Value,
-    ) -> Result<(), JobError> {
-        progress::publish(self, id, kind, data).await
-    }
-
     pub async fn images(&self, id: JobId) -> Result<Vec<ImageReference>, JobError> {
         self.inner
             .jobs
@@ -1052,15 +1114,6 @@ impl JobManager {
             .get(&id)
             .map(|entry| entry.images.clone())
             .ok_or(JobError::Unknown(id))
-    }
-
-    pub async fn events(
-        &self,
-        id: JobId,
-        after: u64,
-        limit: usize,
-    ) -> Result<Vec<JobProgressRecord>, JobError> {
-        progress::events(self, id, after, limit).await
     }
 }
 
@@ -1093,7 +1146,7 @@ mod tests {
 
     use schemars::JsonSchema;
     use serde::Deserialize;
-    use tokio::{sync::Semaphore, task::JoinSet};
+    use tokio::sync::Semaphore;
 
     use super::*;
     use crate::tool::{
@@ -1508,61 +1561,6 @@ mod tests {
             manager.take_pending(&agent).await.unwrap(),
             Vec::<JobEnvelope>::new()
         );
-    }
-
-    #[tokio::test]
-    async fn concurrent_progress_is_persisted_in_cursor_order() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
-        let manager = JobManager::new(store);
-        let lease = manager
-            .create(JobSpec::test(agent, "progress"))
-            .await
-            .unwrap();
-        manager
-            .transition(lease.id, JobState::Running)
-            .await
-            .unwrap();
-
-        let mut publishers = JoinSet::new();
-        for value in 0..64 {
-            let manager = manager.clone();
-            publishers.spawn(async move {
-                manager
-                    .publish_progress(
-                        lease.id,
-                        "value".to_owned(),
-                        serde_json::json!({"value": value}),
-                    )
-                    .await
-                    .unwrap();
-            });
-        }
-        while let Some(result) = publishers.join_next().await {
-            result.unwrap();
-        }
-
-        let events = manager.events(lease.id, 0, 100).await.unwrap();
-        assert_eq!(events.len(), 64);
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| event.sequence)
-                .collect::<Vec<_>>(),
-            (1..=64).collect::<Vec<_>>()
-        );
-        let mut cursor = 0;
-        let mut paged = Vec::new();
-        loop {
-            let page = manager.events(lease.id, cursor, 3).await.unwrap();
-            if page.is_empty() {
-                break;
-            }
-            cursor = page.last().unwrap().sequence;
-            paged.extend(page.into_iter().map(|event| event.sequence));
-        }
-        assert_eq!(paged, (1..=64).collect::<Vec<_>>());
     }
 
     #[tokio::test]

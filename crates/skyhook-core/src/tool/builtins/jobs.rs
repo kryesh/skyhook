@@ -1,12 +1,10 @@
-use std::time::Duration;
-
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
     identity::JobId,
-    job::{JobManager, JobProgressRecord, JobState, presented_job_schema},
+    job::{JobManager, presented_job_schema},
     tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder},
 };
 
@@ -17,7 +15,7 @@ pub(crate) fn register(
     let list = jobs.clone();
     builder.register::<JobsArgs, Value, _, _>(
         "jobs",
-        "List active jobs owned by this agent, excluding this call and its containing script. Set `all` to include completed history.",
+        "List this agent's active jobs, excluding this call and its containing script. Set `all` to include completed history.",
         ToolOptions::default().generated_output_schema(|capabilities| {
             presented_job_schema(capabilities, true)
         }),
@@ -53,50 +51,15 @@ pub(crate) fn register(
             }
         },
     )?;
-    let inspect = jobs.clone();
-    builder.register::<JobArgs, Value, _, _>(
-        "job_inspect",
-        "Read the current envelope, including delivered questions/results; never acknowledges delivery.",
-        ToolOptions::default()
-            .generated_output_schema(|capabilities| presented_job_schema(capabilities, false))
-            .script_only()
-            .job_method("inspect", "job"),
-        move |context, args| {
-            let jobs = inspect.clone();
-            async move {
-                jobs.snapshot(args.job)
-                    .await
-                    .map_err(|error| job_error(&error))
-                    .and_then(|job| {
-                        job.presented(&context.capabilities)
-                            .map_err(ToolError::from)
-                    })
-            }
-        },
-    )?;
-    let wait = jobs.clone();
-    builder.register::<JobWaitArgs, Value, _, _>(
-        "wait",
-        "Wait for and acknowledge the next undelivered question or terminal result. Timeout returns a nonterminal envelope without stopping work. Answer via script: tool.job(id).send({value:answer}).",
-        ToolOptions::default()
-            .generated_output_schema(|capabilities| presented_job_schema(capabilities, false))
-            .job_method("wait", "job"),
-        move |context, args| {
-            let jobs = wait.clone();
-            async move {
-                if args
-                    .timeout
-                    .is_some_and(|timeout| !(1..=3_600).contains(&timeout))
-                {
-                    return Err(ToolError::InvalidArguments(
-                        "timeout must be 1 through 3600".to_owned(),
-                    ));
-                }
-                jobs.wait(args.job, args.timeout.map(Duration::from_secs), true)
-                    .await
-                    .map_err(|error| job_error(&error))
-                    .and_then(|job| job.presented(&context.capabilities).map_err(ToolError::from))
-            }
+    let output = jobs.clone();
+    builder.register::<crate::job::output::OutputArgs, Value, _, _>(
+        "job_output",
+        "Read or search saved job output and status. Reads are repeatable. Use wait to await output, a question, or completion; timeout does not stop work. Cursors continue the same selection. Answer questions with tool.job(id).send({value:answer}).",
+        ToolOptions::default().generated_output_schema(crate::job::output::view_schema).job_method("output", "job"),
+        move |context, mut args| {
+            let jobs = output.clone();
+            args.cancellation = Some(context.cancellation_token());
+            async move { jobs.present_output(args, &context.capabilities).await }
         },
     )?;
     let send = jobs.clone();
@@ -119,7 +82,7 @@ pub(crate) fn register(
     let cancel = jobs.clone();
     builder.register::<JobArgs, Value, _, _>(
         "job_cancel",
-        "Request cancellation of job/descendants; confirm terminal state with wait/inspect.",
+        "Request cancellation of job/descendants; confirm terminal state with job_output.",
         ToolOptions::default()
             .generated_output_schema(|capabilities| presented_job_schema(capabilities, false))
             .script_only()
@@ -134,39 +97,6 @@ pub(crate) fn register(
                         job.presented(&context.capabilities)
                             .map_err(ToolError::from)
                     })
-            }
-        },
-    )?;
-    builder.register::<JobEventsArgs, JobEventsOutput, _, _>(
-        "job_events",
-        "Read typed progress events after a durable cursor.",
-        ToolOptions::default()
-            .script_only()
-            .job_method("events", "job"),
-        move |_context, args| {
-            let jobs = jobs.clone();
-            async move {
-                if !(1..=1_000).contains(&args.limit) {
-                    return Err(ToolError::InvalidArguments(
-                        "limit must be 1 through 1000".to_owned(),
-                    ));
-                }
-                let events = jobs
-                    .events(args.job, args.after, args.limit)
-                    .await
-                    .map_err(|error| job_error(&error))?;
-                let next = events.last().map_or(args.after, |event| event.sequence);
-                let state = jobs
-                    .snapshot(args.job)
-                    .await
-                    .map_err(|error| job_error(&error))?
-                    .state
-                    .presented();
-                Ok(JobEventsOutput {
-                    events,
-                    next,
-                    state,
-                })
             }
         },
     )?;
@@ -193,16 +123,6 @@ struct JobArgs {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct JobWaitArgs {
-    /// Background/suspended job ID.
-    job: JobId,
-    /// Maximum seconds to wait (1-3600). Omit to wait indefinitely.
-    #[schemars(range(min = 1, max = 3600))]
-    timeout: Option<u64>,
-}
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 struct JobSendArgs {
     /// Stable job identifier. Use the agent job, not its internal ask job.
     job: JobId,
@@ -210,32 +130,9 @@ struct JobSendArgs {
     value: Value,
 }
 
-#[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct JobEventsArgs {
-    job: JobId,
-    /// Exclusive durable sequence cursor.
-    #[serde(default)]
-    after: u64,
-    /// Maximum events (1-1000).
-    #[serde(default = "default_job_events")]
-    #[schemars(range(min = 1, max = 1000))]
-    limit: usize,
-}
-
-#[derive(Serialize, JsonSchema)]
-struct JobEventsOutput {
-    events: Vec<JobProgressRecord>,
-    next: u64,
-    state: JobState,
-}
-
-const fn default_job_events() -> usize {
-    100
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::job::JobState;
     use crate::test_support::TestRuntime;
     use std::sync::Arc;
 
@@ -266,9 +163,8 @@ mod tests {
         let executor = runtime.executor(builder);
         for (tool, args) in [
             ("jobs", serde_json::json!({})),
-            ("job_inspect", serde_json::json!({"job":pending})),
-            ("job_events", serde_json::json!({"job":pending})),
-            ("wait", serde_json::json!({"job":pending,"timeout":1})),
+            ("job_output", serde_json::json!({"job":pending})),
+            ("job_output", serde_json::json!({"job":pending,"wait":1})),
         ] {
             let result = executor
                 .execute(agent.clone(), tool, args, None)
