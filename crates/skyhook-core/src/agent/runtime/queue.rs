@@ -235,18 +235,16 @@ impl SessionRuntime {
     /// for the outer loop (notably JobsReady and ordinary prompt completion).
     pub(super) async fn consume_queued_inputs(
         &self,
-        agent: &AgentId,
+        turn: &TurnContext<'_>,
         context: &mut AgentContext,
         model_profile: &mut String,
-        capabilities: &CapabilitySet,
-        cancellation: &CancellationToken,
         rx: &mut mpsc::Receiver<AgentCommand>,
         deferred: &mut VecDeque<AgentCommand>,
     ) -> bool {
         let mut consumed = false;
         let count = rx.len();
         for _ in 0..count {
-            if cancellation.is_cancelled() {
+            if turn.cancellation.is_cancelled() {
                 break;
             }
             let Ok(command) = rx.try_recv() else { break };
@@ -254,11 +252,11 @@ impl SessionRuntime {
                 AgentCommand::QueuedInputs(inputs) => {
                     consumed |= self
                         .consume_queued_batch(
-                            agent,
+                            turn.agent,
                             context,
                             model_profile,
-                            capabilities,
-                            cancellation,
+                            turn.capabilities,
+                            turn.cancellation,
                             inputs,
                         )
                         .await;

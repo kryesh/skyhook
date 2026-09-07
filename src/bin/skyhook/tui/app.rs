@@ -357,7 +357,7 @@ impl App {
         let selected = session
             .as_ref()
             .map(|s| s.root_agent().clone())
-            .unwrap_or_else(|| draft_root());
+            .unwrap_or_else(draft_root);
         let mut app = Self {
             model: launch.model.clone(),
             remembered_model,
@@ -638,7 +638,7 @@ impl App {
             .session
             .as_ref()
             .map(|s| s.root_agent().clone())
-            .unwrap_or_else(|| draft_root());
+            .unwrap_or_else(draft_root);
         self.views.clear();
         self.content_cache = model::ContentCache::default();
         self.render.reset_session();

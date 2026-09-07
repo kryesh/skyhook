@@ -553,7 +553,7 @@ impl SessionHandle {
         if paths.len() > MAX_IMAGES_PER_SUBMISSION {
             return Err(HarnessError::ImageLimit);
         }
-        let mut content = vec![UserContent::Text { text: text.into() }];
+        let mut content = vec![UserContent::Text { text }];
         let mut total = 0_u64;
         for path in paths {
             let absolute = contained_path(&self.runtime.harness.workspace, path).await?;
@@ -1255,16 +1255,15 @@ impl SessionRuntime {
                     (content, None, None)
                 }
             };
-            if let Some(model) = selected_model.filter(|model| model != &model_profile) {
-                if let Err(error) = self
+            if let Some(model) = selected_model.filter(|model| model != &model_profile)
+                && let Err(error) = self
                     .select_model(&id, &mut context, &mut model_profile, &capabilities, model)
                     .await
-                {
-                    if let Some(done) = done {
-                        let _ = done.send(Err(error.to_string()));
-                    }
-                    continue;
+            {
+                if let Some(done) = done {
+                    let _ = done.send(Err(error.to_string()));
                 }
+                continue;
             }
             let done = if one_shot {
                 if done.is_some() {
@@ -1402,15 +1401,7 @@ impl SessionRuntime {
                 return Err(HarnessError::Interrupted);
             }
             if self
-                .consume_queued_inputs(
-                    agent,
-                    agent_context,
-                    model_profile,
-                    capabilities,
-                    cancellation,
-                    rx,
-                    deferred,
-                )
+                .consume_queued_inputs(&turn, agent_context, model_profile, rx, deferred)
                 .await
             {
                 // A model change can replace both the template and its token meter.

@@ -41,7 +41,7 @@ fn main() {
     let rust_analyzer = running_under_rust_analyzer();
     if env::var_os("CARGO_FEATURE_EMBED_SHIMS").is_none() || rust_analyzer {
         if rust_analyzer {
-            println!("cargo:warning=skipping remote shim builds during rust-analyzer analysis");
+            println!("skipping remote shim builds during rust-analyzer analysis");
         }
         write_catalog(&generated, &[]);
         return;
@@ -55,7 +55,7 @@ fn main() {
     let mut artifacts = Vec::with_capacity(SHIM_TARGETS.len());
 
     for target in SHIM_TARGETS {
-        println!("cargo:warning=building {} with cross", target.triple);
+        println!("building {} with cross", target.triple);
         let mut command = Command::new(&cross);
         command
             .current_dir(&manifest_dir)
