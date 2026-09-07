@@ -23,12 +23,8 @@ use crossterm::{
 };
 use futures_util::StreamExt;
 use skyhook::{
-    agent::{Observation, SessionHandle},
-    config::Config,
-    identity::SessionId,
-    remote::EmbeddedShimCatalog,
-    session::SessionStore,
-    tool::policy::AllowAll,
+    agent::SessionHandle, config::Config, identity::SessionId, remote::EmbeddedShimCatalog,
+    session::SessionStore, tool::policy::AllowAll,
 };
 use std::{
     io::{self, IsTerminal, Write},
@@ -158,11 +154,16 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         catalog: EmbeddedShimCatalog::from_assets(super::embedded_shims::EMBEDDED_SHIMS)?,
         interaction: Arc::new(interaction),
     };
-    let session = launch.create(args.resume).await?;
-    let Observation {
-        snapshot,
-        mut updates,
-    } = session.observe().await;
+    let session = match args.resume {
+        Some(id) => Some(launch.create(Some(id)).await?),
+        None => None,
+    };
+    let (snapshot, mut updates) = if let Some(session) = &session {
+        let observation = session.observe().await;
+        (observation.snapshot, Some(observation.updates))
+    } else {
+        (Default::default(), None)
+    };
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut app = App::new(
         session,
@@ -213,17 +214,22 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     Some(Err(error)) => return Err(error),
                     None => break,
                 },
-                event = updates.recv() => match event {
+                event = async {
+                    match &mut updates {
+                        Some(updates) => updates.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => match event {
                     Ok(event) => {
                         let mut records = app.observe(event);
                         // Reduce a burst once instead of rebuilding the projection per token.
                         for _ in 0..255 {
-                            match updates.try_recv() {
+                            match updates.as_mut().expect("active observation").try_recv() {
                                 Ok(event) => records |= app.observe(event),
                                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
-                                    let observation = app.session.observe().await;
+                                    let observation = app.session.as_ref().expect("observed session").observe().await;
                                     app.snapshot = observation.snapshot;
-                                    updates = observation.updates;
+                                    updates = Some(observation.updates);
                                     app.reset_projection();
                                     break;
                                 }
@@ -233,21 +239,33 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                         if records { app.projection.rebuild(&app.snapshot); }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let observation = app.session.observe().await;
+                        let observation = app.session.as_ref().expect("observed session").observe().await;
                         app.snapshot = observation.snapshot;
-                        updates = observation.updates;
+                        updates = Some(observation.updates);
                         app.reset_projection();
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => updates = None,
                 },
                 Some(prompt) = prompts.recv() => app.prompt(prompt),
                 Some(work) = rx.recv() => {
-                    if let Work::SessionReady(Ok(session)) = work {
-                        let observation = session.observe().await;
-                        updates = observation.updates;
-                        app.set_session(session, observation.snapshot);
-                    } else {
-                        app.work(work);
+                    match work {
+                        Work::SessionReady(Ok(session)) => {
+                            let snapshot = if let Some(session) = &session {
+                                let observation = session.observe().await;
+                                updates = Some(observation.updates);
+                                observation.snapshot
+                            } else {
+                                updates = None;
+                                Default::default()
+                            };
+                            app.set_session(session, snapshot);
+                        }
+                        Work::Started(Ok(session)) => {
+                            let observation = session.observe().await;
+                            updates = Some(observation.updates);
+                            app.session_started(session, observation.snapshot);
+                        }
+                        work => app.work(work),
                     }
                 }
                 _ = ticks.tick() => app.tick(),
@@ -285,8 +303,21 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
     .await;
+    // Terminal EOF/errors can leave a creation or switch result queued. Closing
+    // first also makes later results shut their handles down in the worker.
+    rx.close();
+    while let Ok(work) = rx.try_recv() {
+        match work {
+            Work::Started(Ok(session)) | Work::SessionReady(Ok(Some(session))) => {
+                let _ = session.shutdown().await;
+            }
+            _ => {}
+        }
+    }
     app.status.flush().await;
-    app.session.shutdown().await?;
+    if let Some(session) = &app.session {
+        session.shutdown().await?;
+    }
     result?;
     Ok(())
 }

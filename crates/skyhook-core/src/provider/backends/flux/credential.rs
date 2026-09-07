@@ -85,14 +85,14 @@ fn anthropic(name: &str, credential: impl Credential + 'static) -> FluxProvider 
     })
 }
 
-/// Ordinary requests retain Flux's session-scoped WebSocket transport. Schema
-/// requests use HTTP because Flux's Codex constructor does not expose its codec.
+/// Ordinary requests retain Flux's session-scoped WebSocket transport, with a
+/// bounded HTTP/SSE fallback when stream startup stalls. Schema requests use HTTP
+/// because Flux's Codex constructor does not expose its codec.
 #[must_use]
 pub fn codex_oauth(tokens: Arc<dyn TokenSource>) -> FluxProvider {
     FluxProvider {
-        factory: Arc::new(move || FluxBackends {
-            inner: Arc::new(flux_providers::codex::oauth(tokens.clone())),
-            schema_inner: Some(Arc::new(NativeProvider::new(
+        factory: Arc::new(move || {
+            let http: Arc<dyn flux_provider::Provider> = Arc::new(NativeProvider::new(
                 "codex",
                 Arc::new(SchemaCodec {
                     inner: OpenAiResponses { codex: true },
@@ -102,7 +102,12 @@ pub fn codex_oauth(tokens: Arc<dyn TokenSource>) -> FluxProvider {
                     tokens: tokens.clone(),
                     turn_state: std::sync::Mutex::new(None),
                 }),
-            ))),
+            ));
+            FluxBackends {
+                inner: Arc::new(flux_providers::codex::oauth(tokens.clone())),
+                schema_inner: Some(http.clone()),
+                startup_fallback: Some(http),
+            }
         }),
     }
 }

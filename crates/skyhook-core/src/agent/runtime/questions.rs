@@ -298,3 +298,43 @@ fn split_answers(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::split_answers;
+    use serde_json::json;
+
+    #[test]
+    fn split_answers_preserves_single_suggestion_with_comment() {
+        let answer =
+            json!({"answer": "Use the default", "comment": "  Keep the existing settings.\n"});
+
+        assert_eq!(
+            split_answers(&["answer".to_owned()], answer.clone()),
+            vec![Ok(answer)]
+        );
+    }
+
+    #[test]
+    fn split_answers_preserves_mixed_batch_answers() {
+        let suggestion =
+            json!({"answer": "Use the default", "comment": "  Keep the existing settings.\n"});
+        let ids = ["choice", "commented_choice", "free_form"].map(str::to_owned);
+
+        assert_eq!(
+            split_answers(
+                &ids,
+                json!({
+                    "free_form": "My own answer",
+                    "commented_choice": suggestion.clone(),
+                    "choice": "Continue"
+                })
+            ),
+            vec![
+                Ok(json!("Continue")),
+                Ok(suggestion),
+                Ok(json!("My own answer"))
+            ]
+        );
+    }
+}

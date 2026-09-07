@@ -327,6 +327,7 @@ mod tests {
             factory: Arc::new(move || super::super::FluxBackends {
                 inner: Arc::new(Recorder(ordinary.clone())),
                 schema_inner: Some(Arc::new(Recorder(schema.clone()))),
+                startup_fallback: None,
             }),
         };
         let mut provider = factory.open_context("test-session".into()).unwrap();

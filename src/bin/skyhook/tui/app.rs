@@ -12,7 +12,10 @@ use crossterm::event::{
 use ratatui::layout::Rect;
 use serde_json::{Value, json};
 use skyhook::{
-    agent::{AgentActivity, ObservationSnapshot, ObservedEvent, RuntimeEvent, SessionHandle},
+    agent::{
+        AgentActivity, ObservationSnapshot, ObservedEvent, QueuedPromptToken, RuntimeEvent,
+        SessionHandle,
+    },
     identity::{AgentId, JobId, SessionId},
     job::JobOutputQuery,
     session::{SessionEvent, SessionStore},
@@ -29,6 +32,18 @@ pub enum Focus {
     Composer,
     Tree,
     Content,
+}
+// Only non-authentication drafts are suspended; secrets never enter this state.
+struct SuspendedPrompt {
+    id: u64,
+    editor: Editor,
+    choice: usize,
+    body_scroll: usize,
+    option_scroll: usize,
+    question_index: usize,
+    answers: serde_json::Map<String, Value>,
+    active: bool,
+    focus: Focus,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Attachment {
@@ -107,6 +122,13 @@ impl Menu {
     }
 }
 pub enum Work {
+    QueueCommitted {
+        session: SessionId,
+        id: u64,
+        generation: u64,
+        revision: u64,
+        result: Result<(), String>,
+    },
     Done {
         session: SessionId,
         result: Result<(), String>,
@@ -121,9 +143,10 @@ pub enum Work {
     Sessions(Result<Vec<Item>, String>),
     Files(Vec<Item>),
     File(Result<(PathBuf, String), String>),
-    SessionReady(Result<SessionHandle, String>),
+    SessionReady(Result<Option<SessionHandle>, String>),
+    Started(Result<SessionHandle, String>),
     StatusFailed {
-        session: SessionId,
+        session: Option<SessionId>,
         agent: AgentId,
         message: String,
     },
@@ -152,13 +175,92 @@ enum InputTarget {
 
 pub struct QueuedInput {
     id: u64,
+    generation: u64,
+    delivery: Option<QueuedPromptToken>,
     text: String,
     images: Vec<PathBuf>,
     model: String,
 }
 
+struct QueueDelivery {
+    id: u64,
+    generation: u64,
+    text: String,
+    images: Vec<PathBuf>,
+    model: String,
+    token: QueuedPromptToken,
+}
+
+/// Register each UI queue snapshot atomically, including attachment preparation.
+async fn queue_dispatcher(
+    session: SessionHandle,
+    mut rx: mpsc::UnboundedReceiver<Vec<QueueDelivery>>,
+    tx: mpsc::UnboundedSender<Work>,
+) {
+    use futures_util::{StreamExt, stream::FuturesOrdered};
+    let mut pending = FuturesOrdered::new();
+    let mut open = true;
+    while open || !pending.is_empty() {
+        tokio::select! {
+            biased;
+            delivery = rx.recv(), if open => match delivery {
+                Some(mut deliveries) => {
+                    // Coalesce snapshots already waiting on the UI channel too.
+                    while let Ok(more) = rx.try_recv() {
+                        deliveries.extend(more);
+                    }
+                    let session = session.clone();
+                    pending.push_back(async move {
+                        let ids: Vec<_> = deliveries.iter()
+                            .map(|input| (input.id, input.generation)).collect();
+                        let inputs = deliveries.into_iter().map(|input| {
+                            skyhook::agent::QueuedPrompt {
+                                text: input.text,
+                                paths: input.images,
+                                options: skyhook::agent::PromptOptions { model: Some(input.model) },
+                                token: input.token,
+                            }
+                        }).collect();
+                        let results = session.enqueue_prompts_with_options(inputs).await;
+                        let revision = session.observe().await.snapshot.revision;
+                        ids.into_iter().zip(results).map(|((id, generation), result)| {
+                            Work::QueueCommitted {
+                                session: session.id(), id, generation, revision,
+                                result: result.map_err(|error| error.to_string()),
+                            }
+                        }).collect::<Vec<_>>()
+                    });
+                }
+                None => open = false,
+            },
+            Some(work) = pending.next(), if !pending.is_empty() => {
+                for item in work {
+                    let _ = tx.send(item);
+                }
+            }
+        }
+    }
+}
+
+// A draft identity only scopes UI state/notices; it never names a session directory.
+fn draft_root() -> AgentId {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = SessionId::generate().unwrap_or_else(|_| {
+        SessionId::from_bytes(
+            u128::from(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)).to_be_bytes(),
+        )
+    });
+    AgentId::root(id)
+}
+
+enum PendingStart {
+    Input(QueuedInput),
+    QueuedInput(QueuedInput),
+    Script(PathBuf),
+}
+
 pub struct App {
-    pub session: SessionHandle,
+    pub session: Option<SessionHandle>,
     pub launch: Launch,
     /// UI-only choice, captured by each submitted user message.
     pub model: String,
@@ -178,11 +280,20 @@ pub struct App {
     history_draft: String,
     pub queue: VecDeque<QueuedInput>,
     next_queued_id: u64,
+    queue_sender: Option<mpsc::UnboundedSender<Vec<QueueDelivery>>>,
+    queue_activity_revision: u64,
+    awaiting_initial_input: bool,
+    initial_input_after: u64,
     switch_restore: Option<bool>,
+    creating: bool,
+    pending_start: Option<PendingStart>,
+    attached_draft: Option<AgentId>,
+    deferred_switch: Option<Option<SessionId>>,
     pub paused: bool,
     pub operation: bool,
     pub prompts: VecDeque<Prompt>,
     pub prompt_active: bool,
+    suspended_prompt: Option<SuspendedPrompt>,
     pub prompt_editor: Editor,
     pub prompt_choice: usize,
     pub prompt_body_scroll: usize,
@@ -235,7 +346,7 @@ pub struct App {
 }
 impl App {
     pub fn new(
-        session: SessionHandle,
+        session: Option<SessionHandle>,
         launch: Launch,
         snapshot: ObservationSnapshot,
         remembered_model: Option<String>,
@@ -243,7 +354,10 @@ impl App {
         keys: KeyMap,
         light: bool,
     ) -> Self {
-        let selected = session.root_agent().clone();
+        let selected = session
+            .as_ref()
+            .map(|s| s.root_agent().clone())
+            .unwrap_or_else(|| draft_root());
         let mut app = Self {
             model: launch.model.clone(),
             remembered_model,
@@ -264,11 +378,20 @@ impl App {
             history_draft: String::new(),
             queue: VecDeque::new(),
             next_queued_id: 0,
+            queue_sender: None,
+            queue_activity_revision: 0,
+            awaiting_initial_input: false,
+            initial_input_after: 0,
             switch_restore: None,
+            creating: false,
+            pending_start: None,
+            attached_draft: None,
+            deferred_switch: None,
             paused: false,
             operation: false,
             prompts: VecDeque::new(),
             prompt_active: false,
+            suspended_prompt: None,
             prompt_editor: Editor::default(),
             prompt_choice: 0,
             prompt_body_scroll: 0,
@@ -326,19 +449,29 @@ impl App {
         app.show_warnings();
         app
     }
+    pub fn session_id(&self) -> Option<SessionId> {
+        self.session.as_ref().map(SessionHandle::id)
+    }
+    pub fn root_agent(&self) -> &AgentId {
+        self.session
+            .as_ref()
+            .map_or(&self.selected, SessionHandle::root_agent)
+    }
     fn show_warnings(&mut self) {
-        if !self.session.warnings().is_empty() {
+        if let Some(session) = &self.session
+            && !session.warnings().is_empty()
+        {
             self.notice(format!(
                 "{} startup warning(s) · /diagnostics",
-                self.session.warnings().len()
+                session.warnings().len()
             ));
         }
     }
     fn notifier(&self) -> super::status::StatusSender {
-        self.status.sender(&self.session, &self.selected)
+        self.status.sender(self.session.as_ref(), &self.selected)
     }
     fn root_notifier(&self) -> super::status::StatusSender {
-        self.status.sender(&self.session, self.session.root_agent())
+        self.status.sender(self.session.as_ref(), self.root_agent())
     }
     pub fn notice(&self, message: impl Into<String>) {
         self.notifier().send(message);
@@ -349,6 +482,18 @@ impl App {
     /// Reduce every event, but only invalidate the visible conversation when it changes.
     /// The caller batches projection updates for journal records.
     pub fn observe(&mut self, event: ObservedEvent) -> bool {
+        if let RuntimeEvent::Record(record) = &event.event
+            && &record.agent == self.root_agent()
+            && record.sequence > self.initial_input_after
+            && matches!(
+                &record.event,
+                SessionEvent::MessageCommitted {
+                    message: skyhook::provider::protocol::Message::User(_)
+                }
+            )
+        {
+            self.awaiting_initial_input = false;
+        }
         let (records, repaint, content) = match &event.event {
             RuntimeEvent::Record(_) => (true, true, true),
             RuntimeEvent::TextDelta { agent, .. }
@@ -371,6 +516,7 @@ impl App {
             _ => false,
         };
         self.snapshot.apply(event);
+        self.deliver_queue();
         self.dirty |= repaint;
         if content {
             if append_only && self.unsaved_status.is_empty() {
@@ -438,6 +584,7 @@ impl App {
                     footer: None,
                     indent: 0,
                     job: None,
+                    compact_after: false,
                     document: None,
                 });
             }
@@ -456,9 +603,13 @@ impl App {
     }
     pub fn busy(&self) -> bool {
         self.switch_restore.is_some()
+            || self.creating
+            || self.stopping
             || self.operation
+            || self.snapshot.revision < self.queue_activity_revision
+            || self.queue.iter().any(|input| input.delivery.is_some())
             || matches!(
-                self.snapshot.activity.get(self.session.root_agent()),
+                self.snapshot.activity.get(self.root_agent()),
                 Some(
                     AgentActivity::Working
                         | AgentActivity::Tools
@@ -475,10 +626,19 @@ impl App {
                 .values()
                 .any(|j| !j.state.is_terminal())
     }
-    pub fn set_session(&mut self, session: SessionHandle, snapshot: ObservationSnapshot) {
+    pub fn set_session(&mut self, session: Option<SessionHandle>, snapshot: ObservationSnapshot) {
+        self.cancel_queue_delivery();
+        self.queue_sender = None;
+        self.queue_activity_revision = 0;
+        self.awaiting_initial_input = false;
+        self.attached_draft = None;
         self.session = session;
         self.snapshot = snapshot;
-        self.selected = self.session.root_agent().clone();
+        self.selected = self
+            .session
+            .as_ref()
+            .map(|s| s.root_agent().clone())
+            .unwrap_or_else(|| draft_root());
         self.views.clear();
         self.content_cache = model::ContentCache::default();
         self.render.reset_session();
@@ -489,6 +649,7 @@ impl App {
         self.output_versions.clear();
         self.output_queries.clear();
         self.prompts.clear();
+        self.suspended_prompt = None;
         self.reset_prompt();
         self.prompt_active = false;
         self.editor = Editor::default();
@@ -496,6 +657,9 @@ impl App {
         self.pastes.clear();
         self.queue.clear();
         self.switch_restore = None;
+        self.creating = false;
+        self.pending_start = None;
+        self.deferred_switch = None;
         self.paused = false;
         self.operation = false;
         self.menu = None;
@@ -514,21 +678,124 @@ impl App {
             self.model.clone_from(&root.model);
         }
         self.show_warnings();
+        if self.stopping {
+            self.finish_shutdown();
+        }
+    }
+    fn begin_session(&mut self, action: PendingStart) {
+        if matches!(self.pending_start, Some(PendingStart::Script(_))) {
+            self.notice("Cancelled the pending script in favor of the new action");
+        }
+        self.pending_start = Some(action);
+        self.creating = true;
+        let launch = self.launch.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = launch.create(None).await;
+            if let Err(error) = tx.send(Work::Started(result))
+                && let Work::Started(Ok(session)) = error.0
+            {
+                let _ = session.shutdown().await;
+            }
+        });
+        self.dirty = true;
+    }
+    /// Attach the observation before dispatching the first action. Unlike a switch,
+    /// this preserves composer edits, queued model choices, and draft UI state.
+    pub fn session_started(&mut self, session: SessionHandle, snapshot: ObservationSnapshot) {
+        self.creating = false;
+        let draft = self.selected.clone();
+        self.attached_draft = Some(draft.clone());
+        self.selected = session.root_agent().clone();
+        self.session = Some(session);
+        self.snapshot = snapshot;
+        if let Some(view) = self.views.remove(&draft) {
+            self.views.insert(self.selected.clone(), view);
+        }
+        for (agent, _) in &mut self.unsaved_status {
+            if *agent == draft {
+                *agent = self.selected.clone();
+            }
+        }
+        self.content_cache = model::ContentCache::default();
+        self.render.reset_session();
+        self.reset_projection();
+        self.show_warnings();
+        if self.stopping {
+            self.pending_start = None;
+            self.finish_shutdown();
+            return;
+        }
+        if let Some(id) = self.deferred_switch.take() {
+            self.park_pending_input();
+            self.switch(id);
+            return;
+        }
+        if self.paused {
+            self.park_pending_input();
+            return;
+        }
+        match self.pending_start.take() {
+            Some(PendingStart::Input(input)) => self.send_input(input),
+            Some(PendingStart::QueuedInput(input)) => {
+                self.queue.push_front(input);
+                self.deliver_queue();
+            }
+            Some(PendingStart::Script(path)) => self.start_script(path),
+            None => {}
+        }
+    }
+    fn park_pending_input(&mut self) {
+        match self.pending_start.take() {
+            Some(PendingStart::Input(input) | PendingStart::QueuedInput(input)) => {
+                self.queue.push_front(input);
+                self.refresh_queue_menu();
+            }
+            other => self.pending_start = other,
+        }
+    }
+    fn start_failed(&mut self, error: String) {
+        self.creating = false;
+        if let Some(action) = self.pending_start.take() {
+            match action {
+                PendingStart::Input(input) | PendingStart::QueuedInput(input) => {
+                    self.queue.push_front(input)
+                }
+                PendingStart::Script(path) => {
+                    // Keep an explicit script retry separate from composer input.
+                    self.pending_start = Some(PendingStart::Script(path));
+                }
+            }
+        }
+        self.paused = true;
+        self.refresh_queue_menu();
+        self.notice(error);
+        if self.stopping {
+            self.finish_shutdown();
+        } else if let Some(id) = self.deferred_switch.take() {
+            self.switch(id);
+        }
     }
     pub fn submit(&mut self, text: String, images: Vec<PathBuf>) {
         if text.trim().is_empty() && images.is_empty() {
             return;
         }
         let queued = self.queued_input(text, images);
-        if self.busy() {
+        if self.busy() || self.paused || !self.queue.is_empty() {
             self.queue.push_back(queued);
             self.refresh_queue_menu();
+            self.deliver_queue();
             self.dirty = true;
             return;
         }
         self.send_input(queued);
     }
     fn send_input(&mut self, queued: QueuedInput) {
+        let Some(session) = self.session.clone() else {
+            self.launch.model.clone_from(&queued.model);
+            self.begin_session(PendingStart::Input(queued));
+            return;
+        };
         let QueuedInput {
             text,
             images,
@@ -537,9 +804,16 @@ impl App {
         } = queued;
         self.launch.model.clone_from(&model);
         self.operation = true;
+        self.awaiting_initial_input = true;
+        self.initial_input_after = self
+            .snapshot
+            .records
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(0);
         self.history.push(text.clone());
         self.history_index = None;
-        let session = self.session.clone();
         let tx = self.tx.clone();
         self.set_title(&text);
         let status = self.status.clone();
@@ -569,8 +843,128 @@ impl App {
         });
         self.dirty = true;
     }
+    /// Cancel only messages that have not crossed the runtime claim boundary.
+    /// A claimed row stays until its commit acknowledgement arrives.
+    fn cancel_queue_delivery(&mut self) {
+        for input in &mut self.queue {
+            if input.delivery.as_ref().is_some_and(|token| token.cancel()) {
+                input.delivery = None;
+            }
+        }
+    }
+    fn deliver_queue(&mut self) {
+        // Lag recovery replaces the snapshot without replaying each event.
+        if self.awaiting_initial_input
+            && self.snapshot.records.values().any(|record| {
+                record.sequence > self.initial_input_after
+                    && &record.agent == self.root_agent()
+                    && matches!(
+                        &record.event,
+                        SessionEvent::MessageCommitted {
+                            message: skyhook::provider::protocol::Message::User(_)
+                        }
+                    )
+            })
+        {
+            self.awaiting_initial_input = false;
+        }
+        if self.paused
+            || self.creating
+            || self.stopping
+            || self.switch_restore.is_some()
+            || self.awaiting_initial_input
+            || self.queue.is_empty()
+        {
+            return;
+        }
+        let Some(session) = self.session.clone() else {
+            // Retain the head across creation, then register the entire queue.
+            let input = self.queue.pop_front().unwrap();
+            self.refresh_queue_menu();
+            self.launch.model.clone_from(&input.model);
+            self.begin_session(PendingStart::QueuedInput(input));
+            return;
+        };
+        let sender = self.queue_sender.get_or_insert_with(|| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            tokio::spawn(queue_dispatcher(session, rx, self.tx.clone()));
+            tx
+        });
+        let mut deliveries = Vec::new();
+        for input in &mut self.queue {
+            if input.delivery.is_some() {
+                continue;
+            }
+            input.generation = input.generation.wrapping_add(1);
+            let token = QueuedPromptToken::new();
+            input.delivery = Some(token.clone());
+            let delivery = QueueDelivery {
+                id: input.id,
+                generation: input.generation,
+                text: input.text.clone(),
+                images: input.images.clone(),
+                model: input.model.clone(),
+                token,
+            };
+            deliveries.push(delivery);
+        }
+        if !deliveries.is_empty() && sender.send(deliveries).is_err() {
+            self.queue_sender = None;
+            self.paused = true;
+            self.cancel_queue_delivery();
+            self.notice("Could not deliver queued messages; resume to retry");
+        }
+    }
+    fn queue_committed(
+        &mut self,
+        id: u64,
+        generation: u64,
+        revision: u64,
+        result: Result<(), String>,
+    ) {
+        let Some(index) = self.queue.iter().position(|input| {
+            input.id == id && input.generation == generation && input.delivery.is_some()
+        }) else {
+            // Editing, cancellation and retry invalidate old acknowledgements.
+            return;
+        };
+        match result {
+            Ok(()) => {
+                let input = self.queue.remove(index).unwrap();
+                self.queue_activity_revision = self.queue_activity_revision.max(revision);
+                self.launch.model.clone_from(&input.model);
+                self.history.push(input.text.clone());
+                self.history_index = None;
+                self.set_title(&input.text);
+                if self.remembered_model.as_deref() != Some(input.model.as_str()) {
+                    self.remembered_model = Some(input.model.clone());
+                    let notices = self.root_notifier();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(error) = state::remember(&input.model) {
+                            notices.send(format!("Could not save model selection: {error}"));
+                        }
+                    });
+                }
+            }
+            Err(error) => {
+                self.queue[index].delivery = None;
+                self.paused = true;
+                self.cancel_queue_delivery();
+                if let Some(paused) = &mut self.switch_restore {
+                    *paused = true;
+                }
+                self.notice(format!(
+                    "Queued message was not submitted: {error}. Resume to retry."
+                ));
+            }
+        }
+        self.refresh_queue_menu();
+    }
     fn set_title(&self, title: &str) {
-        let path = self.session.directory().join("ui.json");
+        let Some(session) = &self.session else {
+            return;
+        };
+        let path = session.directory().join("ui.json");
         let title = super::format::brief(title, 100);
         if !path.exists() {
             let notices = self.root_notifier();
@@ -585,9 +979,17 @@ impl App {
         }
     }
     pub fn start_script(&mut self, path: PathBuf) {
+        if self.busy() {
+            self.notice("Wait for the current operation before starting a script");
+            return;
+        }
+        let Some(session) = self.session.clone() else {
+            self.launch.model.clone_from(&self.model);
+            self.begin_session(PendingStart::Script(path));
+            return;
+        };
         self.operation = true;
         self.set_title(&path.display().to_string());
-        let session = self.session.clone();
         let tx = self.tx.clone();
         let status = self.status.clone();
         tokio::spawn(async move {
@@ -614,29 +1016,49 @@ impl App {
             return;
         }
         self.paused = true;
+        self.cancel_queue_delivery();
         self.stopping = true;
+        // Creation/switch tasks own handles which must arrive before teardown.
+        if !self.creating && self.switch_restore.is_none() {
+            self.finish_shutdown();
+        }
+        self.dirty = true;
+    }
+    fn finish_shutdown(&self) {
         let session = self.session.clone();
         let tx = self.tx.clone();
         let notices = self.root_notifier();
         let status = self.status.clone();
         tokio::spawn(async move {
             status.flush().await;
-            let result = session.shutdown().await;
-            if let Err(e) = result {
+            if let Some(session) = session
+                && let Err(e) = session.shutdown().await
+            {
                 notices.send(e.to_string());
             }
             status.flush().await;
             let _ = tx.send(Work::Stopped);
         });
-        self.dirty = true;
     }
     pub fn work(&mut self, work: Work) {
         match work {
-            Work::Done { session, result } if session == self.session.id() => {
+            Work::Started(Err(error)) => self.start_failed(error),
+            Work::QueueCommitted {
+                session,
+                id,
+                generation,
+                revision,
+                result,
+            } if Some(session) == self.session_id() => {
+                self.queue_committed(id, generation, revision, result);
+            }
+            Work::Done { session, result } if Some(session) == self.session_id() => {
                 self.operation = false;
+                self.awaiting_initial_input = false;
                 if let Err(error) = result {
                     self.root_notifier().send(error);
                     self.paused = true;
+                    self.cancel_queue_delivery();
                     if let Some(paused) = &mut self.switch_restore {
                         *paused = true;
                     }
@@ -648,7 +1070,7 @@ impl App {
                 version,
                 finished,
                 result,
-            } if session == self.session.id() => {
+            } if Some(session) == self.session_id() => {
                 self.pending_outputs.remove(&job);
                 if version != *self.output_versions.get(&job).unwrap_or(&0) {
                     return;
@@ -688,12 +1110,23 @@ impl App {
                     self.paused = paused;
                 }
                 self.notice(error);
+                if self.stopping {
+                    self.finish_shutdown();
+                }
             }
             Work::StatusFailed {
                 session,
                 agent,
                 message,
-            } if session == self.session.id() => {
+            } if (session == self.session_id()
+                && (session.is_some() || agent == self.selected))
+                || (session.is_none() && self.attached_draft.as_ref() == Some(&agent)) =>
+            {
+                let agent = if self.attached_draft.as_ref() == Some(&agent) {
+                    self.root_agent().clone()
+                } else {
+                    agent
+                };
                 self.unsaved_status.push((agent, message));
                 self.invalidate_content();
             }
@@ -720,11 +1153,7 @@ impl App {
         if self.prompts.is_empty() {
             self.prompt_active = false;
         }
-        if !self.busy() && !self.paused && !self.queue.is_empty() {
-            let queued = self.queue.pop_front().unwrap();
-            self.refresh_queue_menu();
-            self.send_input(queued);
-        }
+        self.deliver_queue();
         if self.last_output.elapsed() >= Duration::from_millis(500) {
             self.last_output = Instant::now();
             let view = self.views.entry(self.selected.clone()).or_default();
@@ -758,7 +1187,7 @@ impl App {
         self.fetch_output(job);
     }
     fn fetch_output(&mut self, job: JobId) {
-        if !self.pending_outputs.insert(job) {
+        if self.session.is_none() || !self.pending_outputs.insert(job) {
             return;
         }
         let query = self
@@ -781,7 +1210,9 @@ impl App {
             .jobs
             .get(&job)
             .is_some_and(|job| job.state.is_terminal());
-        let session = self.session.clone();
+        let Some(session) = self.session.clone() else {
+            return;
+        };
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = session
@@ -798,12 +1229,56 @@ impl App {
         });
     }
     pub fn prompt(&mut self, prompt: Prompt) {
-        let show = self.prompts.is_empty() && self.focus == Focus::Composer && self.menu.is_none();
-        self.prompts.push_back(prompt);
-        if show {
-            self.prompt_active = true;
+        if matches!(prompt.kind, PromptKind::Authentication(_)) {
+            // SSH may be blocking other work. Keep authentication FIFO, but put
+            // it ahead of ordinary questions/permissions, even dismissed ones.
+            let index = self
+                .prompts
+                .iter()
+                .take_while(|p| matches!(p.kind, PromptKind::Authentication(_)))
+                .count();
+            if index == 0 {
+                if let Some(previous) = self.prompts.front() {
+                    self.suspended_prompt = Some(SuspendedPrompt {
+                        id: previous.id,
+                        editor: std::mem::take(&mut self.prompt_editor),
+                        choice: self.prompt_choice,
+                        body_scroll: self.prompt_body_scroll,
+                        option_scroll: self.prompt_option_scroll,
+                        question_index: self.question_index,
+                        answers: std::mem::take(&mut self.answers),
+                        active: self.prompt_active,
+                        focus: self.focus,
+                    });
+                }
+                self.prompts.push_front(prompt);
+                self.reset_prompt();
+            } else {
+                self.prompts.insert(index, prompt);
+            }
+            self.activate_prompt();
+        } else {
+            // Ordinary requests do not depend on pane focus, but don't steal
+            // input from an open menu/search or reopen dismissed requests.
+            let show = self.prompts.is_empty();
+            self.prompts.push_back(prompt);
+            if show {
+                self.prompt_active = true;
+                self.leader = None;
+            }
         }
         self.dirty = true;
+    }
+    fn activate_prompt(&mut self) {
+        if self.prompts.is_empty() {
+            return;
+        }
+        self.prompt_active = true;
+        self.focus = Focus::Composer;
+        self.leader = None;
+        self.menu = None;
+        self.search_editor = None;
+        self.preview_theme();
     }
     fn reset_prompt(&mut self) {
         self.prompt_editor.clear_sensitive();
@@ -812,6 +1287,27 @@ impl App {
         self.reset_prompt_view();
         self.question_index = 0;
         self.answers.clear();
+        if self
+            .suspended_prompt
+            .as_ref()
+            .is_some_and(|saved| self.prompts.front().is_some_and(|p| p.id == saved.id))
+        {
+            let saved = self.suspended_prompt.take().unwrap();
+            self.prompt_editor = saved.editor;
+            self.prompt_choice = saved.choice;
+            self.prompt_body_scroll = saved.body_scroll;
+            self.prompt_option_scroll = saved.option_scroll;
+            self.question_index = saved.question_index;
+            self.answers = saved.answers;
+            self.prompt_active = saved.active;
+            self.focus = saved.focus;
+        } else if self
+            .suspended_prompt
+            .as_ref()
+            .is_some_and(|saved| !self.prompts.iter().any(|p| p.id == saved.id))
+        {
+            self.suspended_prompt = None;
+        }
     }
     fn reset_prompt_view(&mut self) {
         self.prompt_body_scroll = 0;
@@ -897,6 +1393,43 @@ impl App {
             PromptKind::Authentication(p) => format!("Authentication\n{}", p.message),
         }
     }
+    fn restore_question_answer(&mut self) {
+        let Some(PromptKind::Questions { questions, .. }) = self.prompts.front().map(|p| &p.kind)
+        else {
+            return;
+        };
+        let Some(question) = questions.get(self.question_index) else {
+            return;
+        };
+        let Some(answer) = self.answers.get(&question.id) else {
+            return;
+        };
+        let (label, comment) = if let Some(text) = answer.as_str() {
+            (text, "")
+        } else {
+            (
+                answer
+                    .get("answer")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                answer
+                    .get("comment")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+        };
+        self.prompt_choice = question
+            .options
+            .iter()
+            .position(|o| o.label == label)
+            .unwrap_or(question.options.len());
+        self.prompt_editor
+            .set(if self.prompt_choice < question.options.len() {
+                comment.to_owned()
+            } else {
+                label.to_owned()
+            });
+    }
     fn answer(&mut self) {
         let Some(prompt) = self.prompts.front() else {
             return;
@@ -923,16 +1456,20 @@ impl App {
             )),
             PromptKind::Questions { questions, .. } => {
                 if let Some(question) = questions.get(self.question_index) {
+                    let text = &self.prompt_editor.text;
                     let answer = if let Some(option) = question.options.get(self.prompt_choice) {
-                        option.label.clone()
+                        if text.trim().is_empty() {
+                            Value::String(option.label.clone())
+                        } else {
+                            serde_json::json!({"answer": option.label, "comment": text})
+                        }
                     } else {
-                        self.prompt_editor.text.clone()
+                        if text.trim().is_empty() {
+                            return;
+                        }
+                        Value::String(text.clone())
                     };
-                    if answer.trim().is_empty() {
-                        return;
-                    }
-                    self.answers
-                        .insert(question.id.clone(), Value::String(answer));
+                    self.answers.insert(question.id.clone(), answer);
                     self.question_index += 1;
                     self.prompt_body_scroll = 0;
                     self.prompt_option_scroll = 0;
@@ -968,6 +1505,8 @@ impl App {
             if self.prompts.is_empty() {
                 self.prompt_active = false;
             }
+        } else {
+            self.restore_question_answer();
         }
     }
     pub fn event(&mut self, event: Event) {
@@ -1023,7 +1562,6 @@ impl App {
                     }
                     InputTarget::Prompt => {
                         self.prompt_editor.insert(&text);
-                        self.select_written_answer();
                     }
                     InputTarget::Composer if text.lines().count() > 12 => self.pastes.push(text),
                     InputTarget::Composer => self.editor.insert(&text),
@@ -1106,11 +1644,9 @@ impl App {
                                 }
                                 Hit::Composer => self.focus = Focus::Composer,
                                 Hit::Attachments => self.command("attachments"),
-                                Hit::Attention => {
-                                    self.prompt_active = true;
-                                    self.focus = Focus::Composer;
-                                }
+                                Hit::Attention => self.activate_prompt(),
                                 Hit::PromptChoice(index) => {
+                                    self.activate_prompt();
                                     self.prompt_choice = index;
                                     self.prompt_reveal = true;
                                 }
@@ -1119,7 +1655,7 @@ impl App {
                                 }
                             }
                         }
-                        if self.content_rect.contains(point.into()) {
+                        if let Some(position) = self.text_position(point) {
                             let scroll = self
                                 .views
                                 .get(&self.selected)
@@ -1131,9 +1667,7 @@ impl App {
                             // Hold the viewport still while selecting a streaming reply.
                             self.view().scroll = Some(scroll);
                             self.focus = Focus::Content;
-                            self.selection = self
-                                .text_position(point)
-                                .map(|position| (position, position));
+                            self.selection = Some((position, position));
                         }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
@@ -1193,6 +1727,9 @@ impl App {
             );
         let row = (scroll + point.1.saturating_sub(self.content_rect.y) as usize)
             .min(self.render.rows.len().checked_sub(1)?);
+        if !self.render.rows[row].selectable {
+            return None;
+        }
         Some(super::render::TextPosition {
             row,
             byte: self.render.rows[row].byte_at_column(point.0),
@@ -1207,15 +1744,6 @@ impl App {
             InputTarget::Prompt
         } else {
             InputTarget::Composer
-        }
-    }
-    fn select_written_answer(&mut self) {
-        if matches!(
-            self.prompts.front().map(|p| &p.kind),
-            Some(PromptKind::Questions { .. })
-        ) {
-            self.prompt_choice = self.prompt_options().len().saturating_sub(1);
-            self.prompt_reveal = true;
         }
     }
     fn key(&mut self, key: KeyEvent) {
@@ -1252,8 +1780,12 @@ impl App {
                             let _ = prompt.reply.send(Err("authentication cancelled".into()));
                         }
                         self.reset_prompt();
+                        if self.prompts.is_empty() {
+                            self.prompt_active = false;
+                        }
+                    } else {
+                        self.prompt_active = false;
                     }
-                    self.prompt_active = false;
                 }
                 KeyCode::PageUp | KeyCode::PageDown => {
                     let options = key.modifiers.contains(M::CONTROL);
@@ -1280,11 +1812,6 @@ impl App {
                 KeyCode::Enter => self.answer(),
                 _ => {
                     self.prompt_editor.handle(key);
-                    if matches!(key.code, KeyCode::Char(_))
-                        && !key.modifiers.intersects(M::CONTROL | M::ALT)
-                    {
-                        self.select_written_answer();
-                    }
                 }
             }
             return;
@@ -1431,14 +1958,20 @@ impl App {
             Focus::Content => match key.code {
                 KeyCode::Home => self.view().scroll = Some(0),
                 KeyCode::End => self.view().scroll = None,
-                KeyCode::Up => {
-                    self.view().row = self.view().row.saturating_sub(1);
-                    self.reveal_row();
-                }
-                KeyCode::Down => {
-                    self.view().row =
-                        (self.view().row + 1).min(self.entries.len().saturating_sub(1));
-                    self.reveal_row();
+                KeyCode::Up | KeyCode::Down => {
+                    let current = self.view().row;
+                    let next = if key.code == KeyCode::Up {
+                        (0..current.min(self.entries.len()))
+                            .rev()
+                            .find(|&index| super::render::entry_selectable(&self.entries[index]))
+                    } else {
+                        (current.saturating_add(1)..self.entries.len())
+                            .find(|&index| super::render::entry_selectable(&self.entries[index]))
+                    };
+                    if let Some(next) = next {
+                        self.view().row = next;
+                        self.reveal_row();
+                    }
                 }
                 KeyCode::Enter => self.toggle(),
                 KeyCode::Char('[' | ']') => {
@@ -1526,7 +2059,9 @@ impl App {
             } else {
                 (start + step) % count
             };
-            if self.entries[index].text.to_lowercase().contains(&query) {
+            if super::render::entry_selectable(&self.entries[index])
+                && self.entries[index].text.to_lowercase().contains(&query)
+            {
                 self.view().row = index;
                 self.reveal_row();
                 return;
@@ -1551,6 +2086,7 @@ impl App {
             self.clipboard = self
                 .entries
                 .get(row)
+                .filter(|entry| super::render::entry_selectable(entry))
                 .or_else(|| {
                     self.entries
                         .iter()
@@ -1563,7 +2099,10 @@ impl App {
     }
     fn interrupt(&mut self) {
         self.paused = true;
-        let session = self.session.clone();
+        self.cancel_queue_delivery();
+        let Some(session) = self.session.clone() else {
+            return;
+        };
         // Record the action immediately, before any subsequent prompt can be submitted.
         self.root_notifier().send("Interrupted");
         tokio::spawn(async move {
@@ -1601,6 +2140,8 @@ impl App {
         self.next_queued_id += 1;
         QueuedInput {
             id: self.next_queued_id,
+            generation: 0,
+            delivery: None,
             text,
             images,
             model: self.model.clone(),
@@ -1624,7 +2165,66 @@ impl App {
     }
     fn remove_queued(&mut self, id: u64) -> Option<QueuedInput> {
         let index = self.queue.iter().position(|queued| queued.id == id)?;
+        if let Some(token) = &self.queue[index].delivery
+            && !token.cancel()
+        {
+            self.notice("This message has already been submitted to the model");
+            return None;
+        }
         self.queue.remove(index)
+    }
+    pub fn agent_status(&self, agent: &model::AgentInfo) -> (bool, String) {
+        let pending = self.prompts.iter().find(|prompt| match &prompt.kind {
+            PromptKind::Approval(request) => request.agent == agent.id,
+            PromptKind::Questions { agent: owner, .. } => owner == &agent.id,
+            _ => false,
+        });
+        match pending.map(|prompt| &prompt.kind) {
+            Some(PromptKind::Approval(_)) => (false, "Waiting for permission".into()),
+            Some(_) => (false, "Waiting for user input".into()),
+            None => self.projection.status(agent, &self.snapshot),
+        }
+    }
+    fn agent_items(&self) -> Vec<Item> {
+        self.projection
+            .agents
+            .iter()
+            .map(|agent| {
+                Item::new(
+                    agent.id.to_string(),
+                    format!(
+                        "{}{}{}",
+                        "    ".repeat(agent.id.depth()),
+                        agent.name,
+                        model::target_suffix(&agent.target)
+                    ),
+                    format!(
+                        "{}   {}",
+                        self.agent_status(agent).1,
+                        model::agent_footer(&self.snapshot, &self.projection, &agent.id)
+                    ),
+                )
+            })
+            .collect()
+    }
+    pub fn refresh_agent_menu(&mut self) {
+        if !self
+            .menu
+            .as_ref()
+            .is_some_and(|menu| matches!(menu.kind, MenuKind::Agents))
+        {
+            return;
+        }
+        let items = self.agent_items();
+        let menu = self.menu.as_mut().unwrap();
+        let selected = menu
+            .filtered()
+            .get(menu.selected)
+            .map(|item| item.value.clone());
+        menu.items = items;
+        menu.selected = selected
+            .and_then(|id| menu.filtered().iter().position(|item| item.value == id))
+            .unwrap_or(0);
     }
     fn refresh_queue_menu(&mut self) {
         if !self
@@ -1695,16 +2295,26 @@ impl App {
         );
     }
     fn switch(&mut self, id: Option<SessionId>) {
-        if self.switch_restore.is_some() {
+        if self.stopping || self.switch_restore.is_some() {
             return;
         }
-        if id == Some(self.session.id()) {
-            self.select(self.session.root_agent().clone());
+        if self.creating {
+            self.deferred_switch = Some(id);
+            self.paused = true;
+            return;
+        }
+        if id.is_some() && id == self.session_id() {
+            self.select(self.root_agent().clone());
             return;
         }
         self.switch_restore = Some(self.paused);
         self.paused = true;
-        self.notice("Opening session…");
+        self.cancel_queue_delivery();
+        self.notice(if id.is_some() {
+            "Opening session…"
+        } else {
+            "New session"
+        });
         let old = self.session.clone();
         let launch = self.launch.clone();
         let tx = self.tx.clone();
@@ -1712,15 +2322,26 @@ impl App {
         tokio::spawn(async move {
             status.flush().await;
             let result = async {
-                let destination = launch.create(id).await?;
-                if let Err(error) = old.shutdown().await {
-                    let _ = destination.shutdown().await;
+                let destination = match id {
+                    Some(id) => Some(launch.create(Some(id)).await?),
+                    None => None,
+                };
+                if let Some(old) = old
+                    && let Err(error) = old.shutdown().await
+                {
+                    if let Some(destination) = destination {
+                        let _ = destination.shutdown().await;
+                    }
                     return Err(error.to_string());
                 }
                 Ok(destination)
             }
             .await;
-            let _ = tx.send(Work::SessionReady(result));
+            if let Err(error) = tx.send(Work::SessionReady(result))
+                && let Work::SessionReady(Ok(Some(session))) = error.0
+            {
+                let _ = session.shutdown().await;
+            }
         });
     }
     pub fn command(&mut self, command: &str) {
@@ -1745,14 +2366,7 @@ impl App {
                 items.extend(self.launch.config.agents.keys().map(|name| Item::new(name, name, "")));
                 self.open("Instruction profile · new sessions", MenuKind::Profiles, items);
             }
-            "agents" => self.open(
-                "Agents", MenuKind::Agents,
-                self.projection.agents.iter().map(|agent| Item::new(
-                    agent.id.to_string(),
-                    format!("{}{}", "    ".repeat(agent.id.depth()), agent.name),
-                    self.projection.status(agent, &self.snapshot).1,
-                )).collect(),
-            ),
+            "agents" => self.open("Agents", MenuKind::Agents, self.agent_items()),
             "themes" => self.open("Theme", MenuKind::Themes, vec![
                 Item::new("dark", "Dark", ""), Item::new("light", "Light", ""),
             ]),
@@ -1776,21 +2390,23 @@ impl App {
             }
             "editor" => self.external_editor = true,
             "copy" => self.copy(),
-            "attention" => {
-                self.prompt_active = !self.prompts.is_empty();
-                self.focus = Focus::Composer;
-            }
+            "attention" => self.activate_prompt(),
             "resume" => {
                 self.paused = false;
+                if !self.busy()
+                    && let Some(PendingStart::Script(path)) = self.pending_start.take()
+                {
+                    self.start_script(path);
+                }
                 self.notice("Queued input resumed");
             }
             "retry" => {
                 if !self.busy() && matches!(
-                    self.snapshot.activity.get(self.session.root_agent()),
+                    self.snapshot.activity.get(self.root_agent()),
                     Some(AgentActivity::Failed(_) | AgentActivity::Interrupted),
                 ) {
                     self.operation = true;
-                    let session = self.session.clone();
+                    let Some(session) = self.session.clone() else { return; };
                     let tx = self.tx.clone();
                     tokio::spawn(async move {
                         let result = session.continue_turn().await.map(|_| ()).map_err(|e| e.to_string());
@@ -1860,7 +2476,11 @@ impl App {
                     &View::default(), &self.outputs, self.thinking, true,
                 );
                 let text = entries.iter().map(|entry| entry.text.as_str()).collect::<Vec<_>>().join("\n\n");
-                let path = self.session.directory().join(format!(
+                let Some(session) = &self.session else {
+                    self.notice("No session to export yet");
+                    return;
+                };
+                let path = session.directory().join(format!(
                     "conversation-{}.md", super::format::agent_label(&self.selected).replace(':', "-"),
                 ));
                 let notices = self.notifier();
@@ -1872,7 +2492,8 @@ impl App {
                     notices.send(notice);
                 });
             }
-            "diagnostics" => self.info("Startup diagnostics", self.session.warnings().join("\n")),
+            "diagnostics" => self.info("Startup diagnostics", self.session.as_ref()
+                .map_or_else(|| "No session started yet".into(), |s| s.warnings().join("\n"))),
             "help" => self.info("Skyhook help", format!(concat!(
                 "{}\n\n",
                 "Tab / Shift+Tab: composer, tree, content\n",
@@ -2107,7 +2728,9 @@ impl App {
                         ConfirmAction::NewSession => self.switch(None),
                         ConfirmAction::SwitchSession(id) => self.switch(Some(id)),
                         ConfirmAction::CancelJob(id) => {
-                            let session = self.session.clone();
+                            let Some(session) = self.session.clone() else {
+                                return;
+                            };
                             let notices = self.notifier();
                             tokio::spawn(async move {
                                 let result = session.cancel_job(id).await;
@@ -2293,7 +2916,7 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::oneshot;
 
-    async fn fixture() -> (tempfile::TempDir, App) {
+    async fn draft_fixture() -> (tempfile::TempDir, App) {
         let root = tempfile::tempdir().unwrap();
         let config = toml::from_str("[providers.test]\nkind='openai_compatible'\napi='chat_completions'\nbase_url='http://127.0.0.1:1'\n[models.first]\nprovider='test'\nmodel='fixture'\nmax_context=128000\nmax_output=4096\n").unwrap();
         let (interaction, _) = UiInteraction::new();
@@ -2307,13 +2930,11 @@ mod tests {
             interaction: Arc::new(interaction),
             approve_all: false,
         };
-        let session = launch.create(None).await.unwrap();
-        let snapshot = session.observe().await.snapshot;
         let (tx, _) = mpsc::unbounded_channel();
         let mut app = App::new(
-            session,
+            None,
             launch,
-            snapshot,
+            ObservationSnapshot::default(),
             None,
             tx,
             KeyMap::new(&Default::default()).unwrap(),
@@ -2322,6 +2943,268 @@ mod tests {
         // Unit fixtures must not change the user's global model preference.
         app.remembered_model = Some("first".into());
         (root, app)
+    }
+    async fn fixture() -> (tempfile::TempDir, App) {
+        let (root, mut app) = draft_fixture().await;
+        let session = app.launch.create(None).await.unwrap();
+        let snapshot = session.observe().await.snapshot;
+        app.set_session(Some(session), snapshot);
+        (root, app)
+    }
+    async fn next_lifecycle(rx: &mut mpsc::UnboundedReceiver<Work>) -> Work {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let work = rx.recv().await.expect("work channel open");
+                if matches!(
+                    work,
+                    Work::Started(_) | Work::SessionReady(_) | Work::Stopped
+                ) {
+                    return work;
+                }
+            }
+        })
+        .await
+        .expect("lifecycle task completed")
+    }
+    #[tokio::test]
+    async fn draft_and_new_do_not_create_session_directories() {
+        let (_root, mut app) = draft_fixture().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.tx = tx;
+        let old_draft = app.selected.clone();
+        assert!(app.session_id().is_none());
+        assert!(!app.launch.sessions.exists());
+        app.editor.set("unsent draft".into());
+        app.command("diagnostics");
+        app.command("export");
+        app.command("retry");
+        app.command("new");
+        let Work::SessionReady(Ok(None)) = next_lifecycle(&mut rx).await else {
+            panic!("new must only reset to a draft");
+        };
+        app.set_session(None, ObservationSnapshot::default());
+        assert_ne!(app.selected, old_draft);
+        assert!(app.editor.text.is_empty());
+        assert!(!app.launch.sessions.exists());
+        app.work(Work::StatusFailed {
+            session: None,
+            agent: old_draft,
+            message: "stale notice".into(),
+        });
+        assert!(app.unsaved_status.is_empty());
+        app.shutdown();
+        app.work(next_lifecycle(&mut rx).await);
+        assert!(app.exit);
+        assert!(!app.launch.sessions.exists());
+    }
+    #[tokio::test]
+    async fn late_draft_notices_follow_creation_but_not_new() {
+        let (_root, mut app) = draft_fixture().await;
+        let draft = app.selected.clone();
+        let session = app.launch.create(None).await.unwrap();
+        let snapshot = session.observe().await.snapshot;
+        app.session_started(session.clone(), snapshot);
+        app.work(Work::StatusFailed {
+            session: None,
+            agent: draft.clone(),
+            message: "late draft notice".into(),
+        });
+        assert_eq!(
+            app.unsaved_status,
+            vec![(session.root_agent().clone(), "late draft notice".into())]
+        );
+        session.shutdown().await.unwrap();
+        app.set_session(None, ObservationSnapshot::default());
+        app.work(Work::StatusFailed {
+            session: None,
+            agent: draft,
+            message: "abandoned draft notice".into(),
+        });
+        assert!(app.unsaved_status.is_empty());
+    }
+    #[tokio::test]
+    async fn new_shuts_down_existing_session_without_creating_another() {
+        let (_root, mut app) = fixture().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.tx = tx;
+        let before = std::fs::read_dir(&app.launch.sessions).unwrap().count();
+        app.command("new");
+        let Work::SessionReady(Ok(None)) = next_lifecycle(&mut rx).await else {
+            panic!("new should not create a session");
+        };
+        app.set_session(None, ObservationSnapshot::default());
+        assert!(app.session.is_none());
+        assert_eq!(
+            std::fs::read_dir(&app.launch.sessions).unwrap().count(),
+            before
+        );
+    }
+    #[tokio::test]
+    async fn first_submit_creates_once_and_preserves_queue_models_and_draft() {
+        let (_root, mut app) = draft_fixture().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.tx = tx;
+        app.submit("first input".into(), vec![]);
+        assert!(app.creating);
+        assert!(app.session.is_none());
+        app.model = "second".into();
+        app.submit("second input".into(), vec![PathBuf::from("queued.png")]);
+        app.editor.set("still composing".into());
+        app.pastes.push("unsent attachment".into());
+        let Work::Started(Ok(session)) = next_lifecycle(&mut rx).await else {
+            panic!("first submit should create a session");
+        };
+        assert_eq!(std::fs::read_dir(&app.launch.sessions).unwrap().count(), 1);
+        let snapshot = session.observe().await.snapshot;
+        app.session_started(session, snapshot);
+        assert!(!app.creating);
+        assert!(app.operation);
+        assert_eq!(app.history, ["first input"]);
+        assert_eq!(app.model, "second");
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.queue[0].text, "second input");
+        assert_eq!(app.queue[0].model, "second");
+        assert_eq!(app.queue[0].images, [PathBuf::from("queued.png")]);
+        assert_eq!(app.editor.text, "still composing");
+        assert_eq!(app.pastes, ["unsent attachment"]);
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn failed_creation_retains_inputs_and_can_resume_without_duplicate_creation() {
+        let (_root, mut app) = draft_fixture().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.tx = tx;
+        let config = app.launch.config.clone();
+        Arc::make_mut(&mut app.launch.config)
+            .models
+            .shift_remove("first");
+        app.submit("first".into(), vec![PathBuf::from("first.png")]);
+        app.model = "second".into();
+        app.submit("second".into(), vec![]);
+        app.editor.set("new draft".into());
+        let work = next_lifecycle(&mut rx).await;
+        assert!(matches!(work, Work::Started(Err(_))));
+        app.work(work);
+        assert!(!app.busy());
+        assert!(app.paused);
+        assert!(app.session.is_none());
+        assert_eq!(app.queue.len(), 2);
+        assert_eq!(app.queue[0].text, "first");
+        assert_eq!(app.queue[0].model, "first");
+        assert_eq!(app.queue[0].images, [PathBuf::from("first.png")]);
+        assert_eq!(app.queue[1].model, "second");
+        assert_eq!(app.editor.text, "new draft");
+        app.launch.config = config;
+        app.command("resume");
+        app.tick();
+        assert!(app.creating);
+        app.tick();
+        assert_eq!(app.queue.len(), 1);
+        let Work::Started(Ok(session)) = next_lifecycle(&mut rx).await else {
+            panic!("resume should retry creation");
+        };
+        app.shutdown();
+        let snapshot = session.observe().await.snapshot;
+        app.session_started(session, snapshot);
+        app.work(next_lifecycle(&mut rx).await);
+        assert!(app.exit);
+        assert!(
+            app.history.is_empty(),
+            "shutdown must suppress the pending prompt"
+        );
+    }
+    #[tokio::test]
+    async fn script_creation_and_new_wait_for_inflight_creation() {
+        let (_root, mut app) = draft_fixture().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.tx = tx;
+        app.start_script(PathBuf::from("explicit.js"));
+        assert!(app.creating);
+        app.switch(None);
+        let Work::Started(Ok(session)) = next_lifecycle(&mut rx).await else {
+            panic!("script should create on demand");
+        };
+        let snapshot = session.observe().await.snapshot;
+        app.session_started(session, snapshot);
+        let Work::SessionReady(Ok(None)) = next_lifecycle(&mut rx).await else {
+            panic!("new waits for and shuts down created handle");
+        };
+        app.set_session(None, ObservationSnapshot::default());
+        assert!(app.session.is_none());
+        assert!(app.pending_start.is_none());
+        assert!(!app.operation);
+        assert_eq!(std::fs::read_dir(&app.launch.sessions).unwrap().count(), 1);
+    }
+    #[tokio::test]
+    async fn script_runs_on_demand_and_failed_creation_can_retry_the_path() {
+        let (_root, mut app) = draft_fixture().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.tx = tx;
+        let path = app.launch.workspace.join("explicit.js");
+        std::fs::write(&path, "return 42;").unwrap();
+        let config = app.launch.config.clone();
+        Arc::make_mut(&mut app.launch.config)
+            .models
+            .shift_remove("first");
+        app.start_script(path.clone());
+        let work = next_lifecycle(&mut rx).await;
+        assert!(matches!(work, Work::Started(Err(_))));
+        app.work(work);
+        assert!(matches!(&app.pending_start, Some(PendingStart::Script(saved)) if saved == &path));
+        assert!(app.session.is_none());
+        app.launch.config = config;
+        app.command("resume");
+        let Work::Started(Ok(session)) = next_lifecycle(&mut rx).await else {
+            panic!("resuming a script retries session creation");
+        };
+        let snapshot = session.observe().await.snapshot;
+        app.session_started(session, snapshot);
+        let work = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let work = rx.recv().await.unwrap();
+                if matches!(work, Work::Done { .. }) {
+                    break work;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(&work, Work::Done { result: Ok(()), .. }));
+        app.work(work);
+        assert!(!app.operation);
+        assert!(app.history.is_empty());
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn shutdown_waits_for_failed_creation_and_for_new_session_reset() {
+        let (_root, mut app) = draft_fixture().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.tx = tx;
+        Arc::make_mut(&mut app.launch.config)
+            .models
+            .shift_remove("first");
+        app.submit("unsent".into(), vec![]);
+        app.shutdown();
+        assert!(!app.exit);
+        let work = next_lifecycle(&mut rx).await;
+        assert!(matches!(work, Work::Started(Err(_))));
+        app.work(work);
+        app.work(next_lifecycle(&mut rx).await);
+        assert!(app.exit);
+        assert!(!app.launch.sessions.exists());
+
+        let (_root, mut app) = fixture().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.tx = tx;
+        app.switch(None);
+        app.shutdown();
+        assert!(!app.exit);
+        let Work::SessionReady(Ok(None)) = next_lifecycle(&mut rx).await else {
+            panic!("shutdown waits for the reset task");
+        };
+        app.set_session(None, ObservationSnapshot::default());
+        app.work(next_lifecycle(&mut rx).await);
+        assert!(app.exit);
     }
     fn key(app: &mut App, code: KeyCode, modifiers: M) {
         app.event(Event::Key(KeyEvent::new(code, modifiers)));
@@ -2335,7 +3218,7 @@ mod tests {
         app.prompt(Prompt {
             id: 1,
             kind: PromptKind::Questions {
-                agent: app.session.root_agent().clone(),
+                agent: app.session.as_ref().unwrap().root_agent().clone(),
                 questions: vec![Question {
                     id: "answer".into(),
                     prompt,
@@ -2344,7 +3227,6 @@ mod tests {
             },
             reply,
         });
-        app.prompt_active = true;
         receiver
     }
     fn draw_buffer(app: &mut App) -> ratatui::buffer::Buffer {
@@ -2395,6 +3277,21 @@ mod tests {
             },
         });
         assert!(draw(&mut app).contains("⠋ Working"));
+        assert!(
+            !app.hits
+                .iter()
+                .any(|(_, hit)| matches!(hit, Hit::Entry(_, _)))
+        );
+        let working_row = app.render.rows.entry_start(0).unwrap();
+        assert!(!app.render.rows[working_row].selectable);
+        let working = Rect::new(2, app.content_rect.y + working_row as u16, 1, 1);
+        let focus = app.focus;
+        click(&mut app, working);
+        mouse(&mut app, working, MouseEventKind::Drag(MouseButton::Left));
+        assert!(app.selection.is_none());
+        assert!(app.focus == focus);
+        app.copy();
+        assert!(app.clipboard.is_none());
         let cached = app.render.rows.line_identities();
         app.tick();
         assert!(draw(&mut app).contains("⠙ Working"));
@@ -2414,8 +3311,25 @@ mod tests {
         assert!(!inline.contains("Reasoning"));
         assert!(!inline.contains("Working"));
         assert!(!app.entries[0].expandable);
-        let hit = tool_hits(&app)[0];
+        assert!(tool_hits(&app).is_empty());
+        assert!(
+            !app.hits
+                .iter()
+                .any(|(_, hit)| matches!(hit, Hit::Entry(_, _)))
+        );
+        let inline_row = app.render.rows.entry_start(0).unwrap();
+        let hit = Rect::new(2, app.content_rect.y + inline_row as u16, 1, 1);
+        let focus = app.focus;
         click(&mut app, hit);
+        mouse(
+            &mut app,
+            Rect::new(hit.x + 8, hit.y, 1, 1),
+            MouseEventKind::Drag(MouseButton::Left),
+        );
+        assert!(app.selection.is_none());
+        assert!(app.focus == focus);
+        assert!(app.view().scroll.is_none());
+        app.focus = Focus::Content;
         key(&mut app, KeyCode::Enter, M::NONE);
         assert!(draw(&mut app).contains("⠙ Check file.rs"));
         assert!(!app.entries[0].expandable);
@@ -2430,6 +3344,15 @@ mod tests {
         let multi = draw(&mut app);
         assert!(app.entries[0].expandable);
         assert!(multi.contains("Then continue."));
+        let body = *tool_hits(&app).last().unwrap();
+        mouse(&mut app, body, MouseEventKind::Down(MouseButton::Left));
+        let end = Rect::new(body.x + 4, body.y, 1, 1);
+        mouse(&mut app, end, MouseEventKind::Drag(MouseButton::Left));
+        mouse(&mut app, end, MouseEventKind::Up(MouseButton::Left));
+        let selection = app
+            .selection
+            .expect("expandable reasoning is text selectable");
+        assert!(!super::super::render::selected_text(&app.render.rows, selection).is_empty());
         app.observe(ObservedEvent {
             revision: app.snapshot.revision + 1,
             event: RuntimeEvent::TextDelta {
@@ -2450,7 +3373,57 @@ mod tests {
         });
         assert!(!draw(&mut app).contains("Working"));
         assert!(!app.animating);
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn content_navigation_and_search_skip_inline_reasoning() {
+        let (_root, mut app) = fixture().await;
+        app.rebuild_content();
+        let entry = |text: &str, surface, expandable| Entry {
+            key: text.into(),
+            text: text.into(),
+            surface,
+            expandable,
+            default_open: false,
+            running: false,
+            footer: None,
+            indent: 0,
+            job: None,
+            compact_after: false,
+            document: None,
+        };
+        app.entries = vec![
+            entry("leading inline", model::Surface::Reasoning, false),
+            entry("before", model::Surface::Tool, false),
+            entry("matching inline", model::Surface::Reasoning, false),
+            entry("matching expandable", model::Surface::Reasoning, true),
+            entry("trailing inline", model::Surface::Reasoning, false),
+        ];
+        app.render.changes.reset = true;
+        draw(&mut app);
+        app.focus = Focus::Content;
+        app.view().row = 1;
+        key(&mut app, KeyCode::Down, M::NONE);
+        assert_eq!(app.view().row, 3);
+        key(&mut app, KeyCode::Down, M::NONE);
+        assert_eq!(app.view().row, 3);
+        key(&mut app, KeyCode::Up, M::NONE);
+        assert_eq!(app.view().row, 1);
+        key(&mut app, KeyCode::Up, M::NONE);
+        assert_eq!(app.view().row, 1);
+        app.view().query = "matching".into();
+        key(&mut app, KeyCode::Char('n'), M::NONE);
+        assert_eq!(app.view().row, 3);
+        key(&mut app, KeyCode::Char('N'), M::NONE);
+        assert_eq!(app.view().row, 3);
+        key(&mut app, KeyCode::Char('y'), M::NONE);
+        assert_eq!(app.clipboard.as_deref(), Some("matching expandable"));
+        // An old cursor may point to a newly inlined entry after a model update.
+        app.view().row = 2;
+        key(&mut app, KeyCode::Char('y'), M::NONE);
+        assert!(app.clipboard.is_none());
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -2543,7 +3516,7 @@ mod tests {
         let body = *tool_hits(&app).last().unwrap();
         click(&mut app, body);
         assert!(!draw(&mut app).contains("Second step"));
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -2559,7 +3532,7 @@ mod tests {
         app.notice("Child status");
         delayed.send("Root follow-up status");
         app.status.flush().await;
-        app.snapshot = app.session.observe().await.snapshot;
+        app.snapshot = app.session.as_ref().unwrap().observe().await.snapshot;
         app.refresh();
         let child_screen = draw(&mut app);
         assert!(child_screen.contains("Status · Child status"));
@@ -2577,9 +3550,10 @@ mod tests {
                     && !entry.expandable
                     && entry.job.is_none())
         );
-        let records = SessionStore::read_records(&app.launch.sessions, app.session.id())
-            .await
-            .unwrap();
+        let records =
+            SessionStore::read_records(&app.launch.sessions, app.session.as_ref().unwrap().id())
+                .await
+                .unwrap();
         let messages: Vec<_> = records
             .iter()
             .filter_map(|record| match &record.event {
@@ -2597,12 +3571,12 @@ mod tests {
                 .is_empty()
         );
         app.work(Work::StatusFailed {
-            session: app.session.id(),
+            session: app.session_id(),
             agent: root,
             message: "Unsaved status\nCould not save this status: disk full".into(),
         });
         assert!(draw(&mut app).contains("Could not save this status: disk full"));
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -2614,9 +3588,15 @@ mod tests {
             .models
             .insert("second".into(), second);
         app.editor.set("Draft stays".into());
-        let journal = app.session.directory().join("events.jsonl");
+        let journal = app
+            .session
+            .as_ref()
+            .unwrap()
+            .directory()
+            .join("events.jsonl");
         let before = std::fs::read(&journal).unwrap();
         app.operation = true;
+        app.paused = true; // Keep this model-selection test independent of delivery.
         app.submit("Queued A".into(), vec![]);
         app.command("model");
         assert_eq!(app.menu.as_ref().unwrap().title, "Model");
@@ -2649,7 +3629,7 @@ mod tests {
         );
         app.status.flush().await;
         assert_eq!(std::fs::read(&journal).unwrap(), before);
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -2660,7 +3640,7 @@ mod tests {
         let screen = draw(&mut app);
         let header = screen.lines().next().unwrap();
         assert!(header.contains("/workspace/project"));
-        assert!(header.contains(&app.session.id().to_string()));
+        assert!(header.contains(&app.session.as_ref().unwrap().id().to_string()));
         assert!(!app.hits.iter().any(|(rect, _)| rect.y == 0));
         click(&mut app, Rect::new(2, 0, 1, 1));
         assert!(app.focus == Focus::Composer);
@@ -2669,7 +3649,7 @@ mod tests {
         assert!(screen.lines().nth(22).unwrap().contains("fixture"));
         assert!(!screen.contains("hidden-instruction-profile"));
         assert!(!screen.lines().nth(22).unwrap().contains("first"));
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -2695,7 +3675,7 @@ mod tests {
         assert!(!app.light);
         key(&mut app, KeyCode::Esc, M::NONE);
         assert!(app.light);
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -2731,7 +3711,7 @@ mod tests {
         });
         assert!(app.dirty);
         assert!(app.content_dirty);
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     /// Full frame timings include Ratatui buffer diffing but no terminal I/O.
@@ -2837,7 +3817,7 @@ mod tests {
                     );
                 }
             }
-            app.session.shutdown().await.unwrap();
+            app.session.as_ref().unwrap().shutdown().await.unwrap();
         }
     }
 
@@ -2849,10 +3829,12 @@ mod tests {
             .collect::<String>();
         std::fs::write(app.launch.workspace.join("example.rs"), &source).unwrap();
         app.session
+            .as_ref()
+            .unwrap()
             .run_script("return await tool.read({path:'example.rs'});")
             .await
             .unwrap();
-        app.snapshot = app.session.observe().await.snapshot;
+        app.snapshot = app.session.as_ref().unwrap().observe().await.snapshot;
         app.refresh();
         let job = app
             .projection
@@ -2864,7 +3846,13 @@ mod tests {
         app.fetch_output(job);
         let query = app.output_queries[&job].clone();
         assert!(query.field.is_none());
-        let output = app.session.inspect_output(query).await.unwrap();
+        let output = app
+            .session
+            .as_ref()
+            .unwrap()
+            .inspect_output(query)
+            .await
+            .unwrap();
         let prefix = output["result"]["content"].as_str().unwrap();
         assert!(source.starts_with(prefix));
         let position = output["truncated"][0].clone();
@@ -2896,7 +3884,13 @@ mod tests {
                 .as_u64()
                 .map(|offset| offset as usize)
         );
-        let page = app.session.inspect_output(query).await.unwrap();
+        let page = app
+            .session
+            .as_ref()
+            .unwrap()
+            .inspect_output(query)
+            .await
+            .unwrap();
         assert_eq!(page["preview"]["field"], "/result/content");
         assert!(
             page["preview"]["lines"]
@@ -2909,15 +3903,20 @@ mod tests {
             std::fs::read_to_string(app.launch.workspace.join("example.rs")).unwrap(),
             source
         );
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn highlighting_real_job_survives_resize_and_preserves_session_bytes() {
         let (_root, mut app) = fixture().await;
         let source = "const value = {answer: 42};  \n\treturn value;\n";
-        app.session.run_script(source.to_owned()).await.unwrap();
-        app.snapshot = app.session.observe().await.snapshot;
+        app.session
+            .as_ref()
+            .unwrap()
+            .run_script(source.to_owned())
+            .await
+            .unwrap();
+        app.snapshot = app.session.as_ref().unwrap().observe().await.snapshot;
         app.refresh();
         let job = app
             .projection
@@ -2928,6 +3927,8 @@ mod tests {
             .id;
         let output = app
             .session
+            .as_ref()
+            .unwrap()
             .inspect_output(JobOutputQuery::new(job))
             .await
             .unwrap();
@@ -2935,7 +3936,7 @@ mod tests {
         let journal = app
             .launch
             .sessions
-            .join(app.session.id().to_string())
+            .join(app.session.as_ref().unwrap().id().to_string())
             .join("events.jsonl");
         let before = std::fs::read(&journal).unwrap();
         let records = serde_json::to_vec(&app.snapshot.records).unwrap();
@@ -3009,7 +4010,7 @@ mod tests {
         assert_eq!(app.outputs[&job], output);
         assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
         assert_eq!(std::fs::read(journal).unwrap(), before);
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3026,6 +4027,7 @@ mod tests {
                 footer: None,
                 indent: 0,
                 job: None,
+                compact_after: false,
                 document: None,
             })
             .collect();
@@ -3070,7 +4072,7 @@ mod tests {
                 .count(),
             1
         );
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3088,6 +4090,7 @@ mod tests {
                     footer: None,
                     indent: 0,
                     job: None,
+                    compact_after: false,
                     document: None,
                 }];
                 app.content_dirty = false;
@@ -3134,7 +4137,7 @@ mod tests {
                 key(&mut app, KeyCode::Char('x'), M::CONTROL);
                 key(&mut app, KeyCode::Char('y'), M::NONE);
                 assert_eq!(app.clipboard.as_deref(), Some(word));
-                app.session.shutdown().await.unwrap();
+                app.session.as_ref().unwrap().shutdown().await.unwrap();
             }
         }
     }
@@ -3195,7 +4198,7 @@ mod tests {
         click(&mut app, body);
         draw(&mut app);
         assert_eq!(tool_hits(&app).len(), 1);
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3231,7 +4234,134 @@ mod tests {
                 }
             }
         }
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn menus_fill_terminal_width_with_seven_column_side_margins() {
+        let (_root, mut app) = fixture().await;
+        for command in ["commands", "agents"] {
+            app.command(command);
+            for width in [30, 60, 120, 200] {
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
+                terminal
+                    .draw(|frame| super::super::render::draw(frame, &mut app))
+                    .unwrap();
+                let row = app
+                    .hits
+                    .iter()
+                    .find_map(|(rect, hit)| matches!(hit, Hit::Menu(0)).then_some(*rect))
+                    .unwrap();
+                let margin = 7.min(width.saturating_sub(20) / 2);
+                // Menu rows have one additional column of internal padding.
+                assert_eq!(row.x, margin + 1);
+                assert_eq!(row.right(), width - margin - 1);
+            }
+        }
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_picker_shows_live_tree_status_icons_tokens_and_preserves_selection() {
+        use skyhook::{agent::ContextUsage, provider::protocol::Usage};
+        let (_root, mut app) = fixture().await;
+        let root = app.selected.clone();
+        let mut child = app.projection.agents[0].clone();
+        child.id = root.child(1);
+        child.name = "worker with a long name".into();
+        child.target = "remote".into();
+        child.terminal = false;
+        app.projection.agents.push(child.clone());
+        app.snapshot
+            .activity
+            .insert(child.id.clone(), AgentActivity::Working);
+        app.projection.agent_usage.insert(
+            child.id.clone(),
+            Usage {
+                output_tokens: 4000,
+                input_tokens: 5000,
+                cached_input_tokens: 6000,
+            },
+        );
+        app.snapshot.context.insert(
+            child.id.clone(),
+            ContextUsage {
+                tokens: 40000,
+                capacity: 200000,
+            },
+        );
+        key(&mut app, KeyCode::Char('x'), M::CONTROL);
+        key(&mut app, KeyCode::Char('a'), M::NONE);
+        key(&mut app, KeyCode::Down, M::NONE);
+        for width in [60, 120] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
+            terminal
+                .draw(|frame| super::super::render::draw(frame, &mut app))
+                .unwrap();
+            let rect = app
+                .hits
+                .iter()
+                .find_map(|(rect, hit)| matches!(hit, Hit::Menu(1)).then_some(*rect))
+                .unwrap();
+            let picker_row = |buffer: &ratatui::buffer::Buffer| {
+                (rect.y..rect.bottom())
+                    .map(|y| {
+                        (rect.x..rect.right())
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let before = picker_row(terminal.backend().buffer());
+            assert!(before.contains("Working"), "{before}");
+            assert!(before.contains("@remote"), "{before}");
+            assert!(before.contains("4k · 11k(5k) · 20% (40k/200k)"), "{before}");
+            assert!(app.animating);
+            app.tick_count += 1;
+            terminal
+                .draw(|frame| super::super::render::draw(frame, &mut app))
+                .unwrap();
+            assert_ne!(before, picker_row(terminal.backend().buffer()));
+        }
+        app.menu.as_mut().unwrap().input.set("worker".into());
+        app.menu.as_mut().unwrap().selected = 0;
+        let answer = question(&mut app, "Please choose".into(), vec![]);
+        if let PromptKind::Questions { agent, .. } = &mut app.prompts.front_mut().unwrap().kind {
+            *agent = child.id.clone();
+        }
+        // Ordinary questions do not steal the open picker's input.
+        let screen = draw(&mut app);
+        assert!(screen.contains("? worker"));
+        assert!(screen.contains("Waiting for user input"));
+        assert_eq!(
+            app.menu.as_ref().unwrap().filtered()[0].value,
+            child.id.to_string()
+        );
+        drop(answer);
+        app.tick();
+        app.projection.agents[1].terminal = true;
+        app.projection
+            .agent_usage
+            .get_mut(&child.id)
+            .unwrap()
+            .output_tokens = 9000;
+        let screen = draw(&mut app);
+        assert!(screen.contains("✓ worker"));
+        assert!(screen.contains("Completed"));
+        assert!(screen.contains("9k · 11k(5k)"));
+        let mut added = child.clone();
+        added.id = root.child(2);
+        added.name = "another worker".into();
+        app.projection.agents.insert(1, added);
+        draw(&mut app);
+        let menu = app.menu.as_ref().unwrap();
+        assert_eq!(menu.filtered()[menu.selected].value, child.id.to_string());
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert_eq!(app.selected, child.id);
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3344,7 +4474,7 @@ mod tests {
             model::agent_footer(&app.snapshot, &app.projection, &root.child(2)),
             "0 · 0(0) · —"
         );
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3419,7 +4549,7 @@ mod tests {
         assert_eq!(app.content_rect.height, full_content_height);
         assert!(app.focus == Focus::Composer);
         assert!(!app.hits.iter().any(|(_, hit)| matches!(hit, Hit::Agent(_))));
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3442,7 +4572,140 @@ mod tests {
         app.event(Event::Paste("custom answer".into()));
         assert_eq!(app.prompt_editor.text, "custom answer");
         assert_eq!(app.editor.text, "preserved draft");
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resumed_queue_is_registered_as_one_batch() {
+        let (_root, mut app) = fixture().await;
+        app.paused = true;
+        app.submit(
+            "first queued message".into(),
+            vec![PathBuf::from("image.png")],
+        );
+        app.submit("second queued message".into(), vec![]);
+        app.submit("third queued message".into(), vec![]);
+        let (sender, mut deliveries) = mpsc::unbounded_channel();
+        app.queue_sender = Some(sender);
+        app.paused = false;
+        app.deliver_queue();
+        let batch = deliveries.try_recv().unwrap();
+        assert_eq!(
+            batch
+                .iter()
+                .map(|input| input.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "first queued message",
+                "second queued message",
+                "third queued message"
+            ]
+        );
+        assert_eq!(batch[0].images, [PathBuf::from("image.png")]);
+        assert!(
+            deliveries.try_recv().is_err(),
+            "one registration for the whole queue"
+        );
+        assert!(app.queue.iter().all(|input| input.delivery.is_some()));
+        app.cancel_queue_delivery();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_delivery_is_immediate_while_busy_and_cancellation_rejects_stale_acks() {
+        let (_root, mut app) = fixture().await;
+        app.operation = true;
+        app.submit("pending".into(), vec![PathBuf::from("pending.png")]);
+        assert_eq!(app.queue.len(), 1);
+        assert!(app.history.is_empty());
+        let id = app.queue[0].id;
+        let generation = app.queue[0].generation;
+        let token = app.queue[0].delivery.clone().expect("sent while busy");
+        app.paused = true;
+        app.cancel_queue_delivery();
+        assert!(token.cancel());
+        assert!(app.queue[0].delivery.is_none());
+        app.queue_committed(id, generation, 0, Err("cancelled".into()));
+        assert_eq!(app.queue.len(), 1);
+        app.paused = false;
+        app.deliver_queue();
+        assert!(app.queue[0].generation > generation);
+        app.queue_committed(id, generation, 0, Ok(()));
+        assert_eq!(app.queue.len(), 1);
+        assert!(app.history.is_empty());
+        let edited = app.remove_queued(id).unwrap();
+        assert_eq!(edited.images, [PathBuf::from("pending.png")]);
+        assert!(app.queue.is_empty());
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_waits_for_initial_input_and_commit_does_not_finish_original_operation() {
+        let (_root, mut app) = fixture().await;
+        app.operation = true;
+        app.awaiting_initial_input = true;
+        app.submit("followup".into(), vec![]);
+        app.tick();
+        assert!(app.queue[0].delivery.is_none());
+        // The initial input commit releases follow-ups before its first request,
+        // including when that request first needs compaction.
+        let mut committed = app.snapshot.records.values().next_back().unwrap().clone();
+        committed.sequence += 1;
+        committed.event = SessionEvent::MessageCommitted {
+            message: skyhook::provider::protocol::Message::User(vec![
+                skyhook::provider::protocol::UserContent::Text {
+                    text: "initial".into(),
+                },
+            ]),
+        };
+        app.observe(ObservedEvent {
+            revision: app.snapshot.revision + 1,
+            event: RuntimeEvent::Record(Box::new(committed)),
+        });
+        assert!(!app.awaiting_initial_input);
+        let input = &app.queue[0];
+        let id = input.id;
+        let generation = input.generation;
+        // This unit test synthesizes the ack rather than invoking a provider.
+        assert!(input.delivery.as_ref().unwrap().cancel());
+        app.work(Work::QueueCommitted {
+            session: app.session_id().unwrap(),
+            id,
+            generation,
+            revision: app.snapshot.revision + 1,
+            result: Ok(()),
+        });
+        assert!(app.queue.is_empty());
+        assert_eq!(app.history, ["followup"]);
+        assert!(
+            app.operation,
+            "commit is not a turn-completion acknowledgement"
+        );
+        app.operation = false;
+        assert!(
+            app.busy(),
+            "wait for observation activity after an idle enqueue"
+        );
+        app.snapshot.revision = app.queue_activity_revision;
+        assert!(!app.busy());
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_failure_retains_row_and_pauses_remaining_deliveries() {
+        let (_root, mut app) = fixture().await;
+        app.operation = true;
+        app.submit("first".into(), vec![]);
+        app.submit("second".into(), vec![]);
+        let id = app.queue[0].id;
+        let generation = app.queue[0].generation;
+        assert!(app.queue[0].delivery.as_ref().unwrap().cancel());
+        app.queue_committed(id, generation, 0, Err("attachment missing".into()));
+        assert!(app.paused);
+        assert_eq!(app.queue.len(), 2);
+        assert!(app.queue.iter().all(|input| input.delivery.is_none()));
+        assert!(app.history.is_empty());
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3455,7 +4718,11 @@ mod tests {
         let stale_items = app.menu.as_ref().unwrap().items.clone();
         app.menu.as_mut().unwrap().selected = 1;
         app.operation = false;
-        app.tick(); // Dispatch A while the queue menu remains open.
+        app.tick(); // Delivery keeps the rows until the commit acknowledgement.
+        assert_eq!(app.queue.len(), 2);
+        let id = app.queue[0].id;
+        let generation = app.queue[0].generation;
+        app.queue_committed(id, generation, app.snapshot.revision, Ok(()));
         assert_eq!(app.queue.len(), 1);
         let menu = app.menu.as_ref().unwrap();
         assert_eq!(menu.items.len(), 1);
@@ -3469,7 +4736,257 @@ mod tests {
         key(&mut app, KeyCode::Enter, M::NONE);
         assert_eq!(app.editor.text, "message B");
         assert!(app.queue.is_empty());
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn questions_open_and_accept_answers_while_inspecting_agents() {
+        let (_root, mut app) = fixture().await;
+        let mut child = app.projection.agents[0].clone();
+        child.id = child.id.child(1);
+        child.name = "worker".into();
+        child.terminal = false;
+        app.projection.agents.push(child.clone());
+        app.select(child.id.clone());
+        app.editor.set("preserved draft".into());
+
+        for focus in [Focus::Tree, Focus::Content] {
+            app.focus = focus;
+            let answer = question(
+                &mut app,
+                "Choose a direction".into(),
+                vec![QuestionOption {
+                    label: "Continue".into(),
+                    description: "Keep working".into(),
+                }],
+            );
+            assert!(app.prompt_active);
+            let screen = draw(&mut app);
+            assert!(app.tree_rect.height > 0);
+            assert!(screen.contains("Choose a direction"));
+            assert!(screen.contains("Continue"));
+            key(&mut app, KeyCode::Enter, M::NONE);
+            assert!(matches!(
+                answer.await.unwrap().unwrap(),
+                PromptResponse::Questions(Value::String(value)) if value == "Continue"
+            ));
+            assert_eq!(app.selected, child.id);
+            assert!(app.focus == focus);
+            assert_eq!(app.editor.text, "preserved draft");
+        }
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn questions_arriving_under_overlays_activate_when_overlays_close() {
+        let (_root, mut app) = fixture().await;
+        app.editor.set("preserved draft".into());
+        app.focus = Focus::Content;
+        for search in [false, true] {
+            if search {
+                key(&mut app, KeyCode::Char('/'), M::NONE);
+                assert!(app.search_editor.is_some());
+            } else {
+                app.info("Agent details", "Inspecting an agent".into());
+            }
+            let answer = question(&mut app, "What next?".into(), vec![]);
+            assert!(app.prompt_active);
+            app.event(Event::Paste("overlay input".into()));
+            assert!(app.prompt_editor.text.is_empty());
+            key(&mut app, KeyCode::Esc, M::NONE);
+            assert!(matches!(app.input_target(), InputTarget::Prompt));
+            app.event(Event::Paste("Proceed".into()));
+            key(&mut app, KeyCode::Enter, M::NONE);
+            assert!(matches!(
+                answer.await.unwrap().unwrap(),
+                PromptResponse::Questions(Value::String(value)) if value == "Proceed"
+            ));
+            assert_eq!(app.editor.text, "preserved draft");
+        }
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clicking_requests_transfers_input_from_overlays_and_clears_shortcuts() {
+        let (_root, mut app) = fixture().await;
+        app.editor.set("preserved draft".into());
+        for search in [false, true] {
+            for choice in [false, true] {
+                let answer = question(&mut app, "What next?".into(), vec![]);
+                key(&mut app, KeyCode::Esc, M::NONE);
+                key(&mut app, KeyCode::Char('x'), M::CONTROL);
+                assert!(app.leader.is_some());
+                if search {
+                    app.search_editor = Some(Editor::default());
+                } else {
+                    app.info("Agent details", "Details".into());
+                }
+                if choice {
+                    app.prompt_active = true;
+                }
+                draw(&mut app);
+                let hit = app
+                    .hits
+                    .iter()
+                    .find_map(|(rect, hit)| match (choice, hit) {
+                        (true, Hit::PromptChoice(_)) | (false, Hit::Attention) => Some(*rect),
+                        _ => None,
+                    })
+                    .unwrap();
+                click(&mut app, hit);
+                assert!(app.menu.is_none());
+                assert!(app.search_editor.is_none());
+                assert!(app.leader.is_none());
+                assert!(matches!(app.input_target(), InputTarget::Prompt));
+                app.event(Event::Paste("Proceed".into()));
+                key(&mut app, KeyCode::Enter, M::NONE);
+                assert!(matches!(
+                    answer.await.unwrap().unwrap(),
+                    PromptResponse::Questions(Value::String(value)) if value == "Proceed"
+                ));
+                assert_eq!(app.editor.text, "preserved draft");
+            }
+        }
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dismissed_questions_stay_hidden_until_attention_is_requested() {
+        let (_root, mut app) = fixture().await;
+        key(&mut app, KeyCode::Char('x'), M::CONTROL);
+        assert!(app.leader.is_some());
+        let first = question(&mut app, "First question".into(), vec![]);
+        assert!(app.leader.is_none());
+        key(&mut app, KeyCode::Esc, M::NONE);
+        let second = question(&mut app, "Second question".into(), vec![]);
+        assert!(!app.prompt_active);
+        app.command("attention");
+        for answer in [first, second] {
+            assert!(app.prompt_active);
+            app.event(Event::Paste("Proceed".into()));
+            key(&mut app, KeyCode::Enter, M::NONE);
+            assert!(matches!(
+                answer.await.unwrap().unwrap(),
+                PromptResponse::Questions(Value::String(value)) if value == "Proceed"
+            ));
+        }
+        assert!(!app.prompt_active);
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    fn suggestions() -> Vec<QuestionOption> {
+        ["First", "Second"]
+            .into_iter()
+            .map(|label| QuestionOption {
+                label: label.into(),
+                description: format!("Use {label}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn question_comments_keep_the_selected_suggestion_and_reach_the_agent() {
+        let (_root, mut app) = fixture().await;
+        app.editor.set("preserved draft".into());
+        for paste in [false, true] {
+            let response = question(&mut app, "Choose".into(), suggestions());
+            key(&mut app, KeyCode::Down, M::NONE);
+            if paste {
+                app.event(Event::Paste("with a caveat".into()));
+            } else {
+                for c in "with a caveat".chars() {
+                    key(&mut app, KeyCode::Char(c), M::NONE);
+                }
+            }
+            assert_eq!(app.prompt_choice, 1);
+            let screen = draw(&mut app);
+            assert!(screen.contains("Comment (optional): with a caveat"));
+            key(&mut app, KeyCode::Enter, M::NONE);
+            let PromptResponse::Questions(value) = response.await.unwrap().unwrap() else {
+                panic!("wrong response")
+            };
+            assert_eq!(
+                value,
+                serde_json::json!({"answer": "Second", "comment": "with a caveat"})
+            );
+            assert_eq!(app.editor.text, "preserved draft");
+        }
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn question_freeform_and_comment_modes_follow_keyboard_and_mouse_selection() {
+        let (_root, mut app) = fixture().await;
+        let response = question(&mut app, "Choose".into(), suggestions());
+        app.event(Event::Paste("Different approach".into()));
+        key(&mut app, KeyCode::Down, M::NONE);
+        key(&mut app, KeyCode::Down, M::NONE);
+        assert!(draw(&mut app).contains("Answer: Different approach"));
+        let option = app
+            .hits
+            .iter()
+            .find_map(|(rect, hit)| matches!(hit, Hit::PromptChoice(1)).then_some(*rect))
+            .unwrap();
+        click(&mut app, option);
+        assert_eq!(app.prompt_choice, 1);
+        assert!(draw(&mut app).contains("Comment (optional): Different approach"));
+        key(&mut app, KeyCode::Down, M::NONE);
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert!(
+            matches!(response.await.unwrap().unwrap(), PromptResponse::Questions(Value::String(value)) if value == "Different approach")
+        );
+
+        let response = question(&mut app, "Choose".into(), suggestions());
+        app.event(Event::Paste(" \t ".into()));
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert!(
+            matches!(response.await.unwrap().unwrap(), PromptResponse::Questions(Value::String(value)) if value == "First")
+        );
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn question_comments_survive_ssh_preemption_and_batch_review() {
+        let (_root, mut app) = fixture().await;
+        let response = question(&mut app, "Choose".into(), suggestions());
+        if let PromptKind::Questions { questions, .. } = &mut app.prompts.front_mut().unwrap().kind
+        {
+            questions.push(Question {
+                id: "next".into(),
+                prompt: "Anything else?".into(),
+                options: vec![],
+            });
+        }
+        key(&mut app, KeyCode::Down, M::NONE);
+        app.event(Event::Paste("my comment".into()));
+        let ssh = authentication(&mut app, 100);
+        key(&mut app, KeyCode::Esc, M::NONE);
+        assert!(ssh.await.unwrap().is_err());
+        assert_eq!(app.prompt_choice, 1);
+        assert_eq!(app.prompt_editor.text, "my comment");
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert!(app.prompt_editor.text.is_empty());
+        app.event(Event::Paste("freeform".into()));
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert!(app.prompt_text().contains("my comment"));
+        key(&mut app, KeyCode::Down, M::NONE); // Review again.
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert_eq!(app.question_index, 0);
+        assert_eq!(app.prompt_choice, 1);
+        assert_eq!(app.prompt_editor.text, "my comment");
+        app.event(Event::Paste(" amended".into()));
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert_eq!(app.prompt_editor.text, "freeform");
+        key(&mut app, KeyCode::Enter, M::NONE);
+        key(&mut app, KeyCode::Enter, M::NONE);
+        let PromptResponse::Questions(value) = response.await.unwrap().unwrap() else {
+            panic!("wrong response")
+        };
+        assert_eq!(
+            value,
+            serde_json::json!({"answer": {"answer": "Second", "comment": "my comment amended"}, "next": "freeform"})
+        );
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3508,7 +5025,7 @@ mod tests {
         assert!(matches!(answer.await.unwrap().unwrap(),
             PromptResponse::Questions(value) if value == Value::String("Choice 9".into())));
         assert_eq!(app.editor.text, "preserved draft");
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
     #[tokio::test]
     async fn resize_preserves_semantic_entries_and_reflows_rows() {
@@ -3547,7 +5064,7 @@ mod tests {
             .unwrap();
         assert_eq!(app.entries.as_ptr(), entries);
         assert!(app.content_rows > original_rows);
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3580,7 +5097,141 @@ mod tests {
                 .detail
                 .is_empty()
         );
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    fn authentication(app: &mut App, id: u64) -> oneshot::Receiver<Result<PromptResponse, String>> {
+        let (reply, response) = oneshot::channel();
+        app.prompt(Prompt {
+            id,
+            kind: PromptKind::Authentication(skyhook::remote::SensitivePrompt {
+                kind: skyhook::remote::SensitivePromptKind::Password,
+                message: format!("SSH password {id}"),
+            }),
+            reply,
+        });
+        response
+    }
+
+    #[tokio::test]
+    async fn authentication_preempts_overlays_and_restores_partial_question_batches() {
+        let (_root, mut app) = fixture().await;
+        for finish in 0..3 {
+            app.editor.set("composer draft".into());
+            app.focus = Focus::Tree;
+            let answer = question(&mut app, "First question".into(), vec![]);
+            if let PromptKind::Questions { questions, .. } =
+                &mut app.prompts.front_mut().unwrap().kind
+            {
+                questions.push(Question {
+                    id: "second".into(),
+                    prompt: "Second question".into(),
+                    options: vec![],
+                });
+            }
+            app.event(Event::Paste("first answer".into()));
+            key(&mut app, KeyCode::Enter, M::NONE);
+            app.event(Event::Paste("unfinished answer".into()));
+            app.prompt_body_scroll = 3;
+            app.prompt_option_scroll = 2;
+            app.info("Details", "An open menu".into());
+            app.search_editor = Some(Editor::default());
+            let response = authentication(&mut app, 100);
+            assert!(matches!(app.input_target(), InputTarget::Prompt));
+            assert!(app.menu.is_none());
+            assert!(app.search_editor.is_none());
+            assert_eq!(app.prompts.front().unwrap().id, 100);
+            assert!(app.prompt_editor.text.is_empty());
+            assert!(app.answers.is_empty());
+            app.event(Event::Paste("ssh secret".into()));
+            let screen = draw(&mut app);
+            assert!(screen.contains("SSH password 100"));
+            assert!(!screen.contains("ssh secret"));
+            match finish {
+                0 => {
+                    key(&mut app, KeyCode::Enter, M::NONE);
+                    let PromptResponse::Authentication(secret) = response.await.unwrap().unwrap()
+                    else {
+                        panic!("wrong response kind")
+                    };
+                    assert_eq!(secret.expose(), "ssh secret");
+                }
+                1 => {
+                    key(&mut app, KeyCode::Esc, M::NONE);
+                    assert!(response.await.unwrap().is_err());
+                }
+                _ => {
+                    drop(response);
+                    app.tick();
+                }
+            }
+            assert!(app.prompt_active);
+            assert!(app.focus == Focus::Tree);
+            assert_eq!(app.question_index, 1);
+            assert_eq!(app.prompt_editor.text, "unfinished answer");
+            assert_eq!(app.prompt_body_scroll, 3);
+            assert_eq!(app.prompt_option_scroll, 2);
+            assert_eq!(app.answers["answer"], "first answer");
+            assert_eq!(app.editor.text, "composer draft");
+            assert!(app.suspended_prompt.is_none());
+            key(&mut app, KeyCode::Enter, M::NONE);
+            key(&mut app, KeyCode::Enter, M::NONE);
+            let PromptResponse::Questions(value) = answer.await.unwrap().unwrap() else {
+                panic!("wrong response kind")
+            };
+            assert_eq!(value["answer"], "first answer");
+            assert_eq!(value["second"], "unfinished answer");
+        }
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authentication_is_fifo_and_takes_priority_over_dismissed_requests() {
+        let (_root, mut app) = fixture().await;
+        let answer = question(&mut app, "Question".into(), vec![]);
+        app.event(Event::Paste("saved answer".into()));
+        key(&mut app, KeyCode::Esc, M::NONE);
+        let first = authentication(&mut app, 100);
+        app.event(Event::Paste("first secret".into()));
+        let second = authentication(&mut app, 101);
+        assert!(app.prompt_active);
+        assert_eq!(
+            app.prompts.iter().map(|p| p.id).collect::<Vec<_>>(),
+            vec![100, 101, 1]
+        );
+        assert_eq!(app.prompt_editor.text, "first secret");
+        key(&mut app, KeyCode::Esc, M::NONE);
+        assert!(first.await.unwrap().is_err());
+        assert!(app.prompt_active);
+        assert!(app.prompt_editor.text.is_empty());
+        assert_eq!(app.prompts.front().unwrap().id, 101);
+        key(&mut app, KeyCode::Esc, M::NONE);
+        assert!(second.await.unwrap().is_err());
+        assert!(!app.prompt_active);
+        assert_eq!(app.prompt_editor.text, "saved answer");
+        app.command("attention");
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert!(
+            matches!(answer.await.unwrap().unwrap(), PromptResponse::Questions(Value::String(value)) if value == "saved answer")
+        );
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_suspended_questions_do_not_leak_into_later_prompts() {
+        let (_root, mut app) = fixture().await;
+        let answer = question(&mut app, "Question".into(), vec![]);
+        app.event(Event::Paste("abandoned answer".into()));
+        let response = authentication(&mut app, 100);
+        drop(answer);
+        app.tick();
+        key(&mut app, KeyCode::Esc, M::NONE);
+        assert!(response.await.unwrap().is_err());
+        assert!(app.suspended_prompt.is_none());
+        assert!(app.prompt_editor.text.is_empty());
+        let _next = question(&mut app, "Next question".into(), vec![]);
+        assert!(app.prompt_editor.text.is_empty());
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3603,6 +5254,6 @@ mod tests {
         assert_eq!(secret.expose(), "secret");
         assert!(app.prompt_editor.text.is_empty());
         assert!(app.prompts.is_empty());
-        app.session.shutdown().await.unwrap();
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 }

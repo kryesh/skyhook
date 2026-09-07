@@ -67,6 +67,8 @@ pub struct Entry {
     pub indent: u16,
     pub job: Option<JobId>,
     pub document: Option<Document>,
+    /// Omit the separator only before another tool from this response.
+    pub compact_after: bool,
 }
 impl Entry {
     fn new(key: String, text: String, surface: Surface) -> Self {
@@ -81,6 +83,7 @@ impl Entry {
             indent: 0,
             job: None,
             document: None,
+            compact_after: false,
         }
     }
 }
@@ -634,7 +637,9 @@ impl ContentCache {
                 if let Some(&index) = self.job_indices.get(&job)
                     && let Some(info) = projection.jobs.get(&job)
                 {
+                    let compact_after = entries[index].compact_after;
                     entries[index] = job_entry(info, projection, view, outputs, all_details);
+                    entries[index].compact_after = compact_after;
                     changes.dirty.push(index);
                 }
             }
@@ -983,6 +988,7 @@ fn entries_inner(
             .collect(),
         Tab::Conversation => {
             let mut entries = Vec::new();
+            let mut tool_responses = HashMap::new();
             let agent_name = projection
                 .agents
                 .iter()
@@ -1117,6 +1123,7 @@ fn entries_inner(
                                                 e.document = Some(document);
                                             }
                                             e.expandable = true;
+                                            tool_responses.insert(e.key.clone(), record.sequence);
                                             entries.push(e);
                                         }
                                     }
@@ -1147,9 +1154,13 @@ fn entries_inner(
                             }
                         }
                     },
-                    SessionEvent::JobCreated { job, .. } => {
+                    SessionEvent::JobCreated { job, origin, .. } => {
                         if let Some(job) = projection.jobs.get(job) {
-                            entries.push(job_entry(job, projection, view, outputs, all_details));
+                            let entry = job_entry(job, projection, view, outputs, all_details);
+                            if let Some(origin) = origin {
+                                tool_responses.insert(entry.key.clone(), origin.message);
+                            }
+                            entries.push(entry);
                         }
                     }
                     SessionEvent::Compaction { checkpoint } => {
@@ -1204,6 +1215,16 @@ fn entries_inner(
                     )),
                     _ => {}
                 }
+            }
+            // Store adjacency on the preceding entry so equality-based cache
+            // invalidation also relayouts it when a sibling arrives or disappears.
+            for index in 0..entries.len().saturating_sub(1) {
+                entries[index].compact_after =
+                    tool_responses
+                        .get(&entries[index].key)
+                        .is_some_and(|response| {
+                            tool_responses.get(&entries[index + 1].key) == Some(response)
+                        });
             }
             if !include_live {
                 return entries;
@@ -1442,6 +1463,130 @@ mod tests {
         provider::protocol::ModelRequest,
         session::{ContextMessage, EventRecord, ModelPurpose},
     };
+    #[test]
+    fn conversation_compacts_only_adjacent_calls_from_the_same_response() {
+        let agent = AgentId::root(SessionId::from_bytes([44; 16]));
+        let mut snapshot = ObservationSnapshot::default();
+        let call = |id: &str| {
+            AssistantContent::ToolCall(skyhook::provider::protocol::ToolCall {
+                id: id.into(),
+                name: "exec".into(),
+                arguments: serde_json::json!({"argv": ["true"]}),
+            })
+        };
+        for blocks in [
+            vec![
+                call("a"),
+                call("b"),
+                AssistantContent::Text {
+                    text: "Next".into(),
+                },
+                call("c"),
+                AssistantContent::Reasoning {
+                    text: "Keep this reasoning padded".into(),
+                    opaque: None,
+                },
+                call("f"),
+            ],
+            vec![call("d"), call("e")],
+        ] {
+            record(
+                &mut snapshot,
+                &agent,
+                SessionEvent::MessageCommitted {
+                    message: Message::Assistant(blocks),
+                },
+            );
+        }
+        let mut projection = Projection::default();
+        projection.rebuild(&snapshot);
+        for open in [false, true] {
+            let rows = entries(
+                &snapshot,
+                &projection,
+                &agent,
+                &View::default(),
+                &HashMap::new(),
+                true,
+                open,
+            );
+            assert_eq!(
+                rows.iter().map(|e| e.compact_after).collect::<Vec<_>>(),
+                [true, false, false, false, false, false, true, false]
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_job_spacing_invalidates_previous_rows_and_survives_output_refresh() {
+        let agent = AgentId::root(SessionId::from_bytes([45; 16]));
+        let mut snapshot = ObservationSnapshot::default();
+        let mut projection = Projection::default();
+        let mut cache = ContentCache::default();
+        let mut rows = Vec::new();
+        let view = View::default();
+        let presentation = EntryView {
+            agent: &agent,
+            view: &view,
+            thinking: true,
+            all_details: true,
+        };
+        let outputs = HashMap::new();
+        // Origins, not adjacency or the tool name, define response membership.
+        for (id, response) in [
+            (1, Some(100)),
+            (2, Some(100)),
+            (3, Some(200)),
+            (4, None),
+            (5, None),
+        ] {
+            record(
+                &mut snapshot,
+                &agent,
+                SessionEvent::JobCreated {
+                    job: JobId::new(id).unwrap(),
+                    parent: None,
+                    origin: response.map(|message| skyhook::session::ModelCallOrigin {
+                        message,
+                        call_id: format!("call{id}"),
+                    }),
+                    tool: "exec".into(),
+                    name: None,
+                    arguments: serde_json::json!({"argv": ["true"]}),
+                    output_schema: None,
+                    accepts_input: false,
+                    background: false,
+                    location: skyhook::execution::ExecutionLocation::root("/tmp".into()),
+                },
+            );
+            projection.rebuild(&snapshot);
+            let changes =
+                cache.update(&mut rows, &snapshot, &projection, presentation, &outputs, 0);
+            if id == 2 {
+                assert!(!changes.reset);
+                assert_eq!(changes.dirty, [0, 1]);
+                assert!(rows[0].compact_after);
+            }
+        }
+        assert_eq!(
+            rows.iter().map(|e| e.compact_after).collect::<Vec<_>>(),
+            [true, false, false, false, false]
+        );
+        cache.invalidate_job(JobId::new(1).unwrap());
+        let changes = cache.update(&mut rows, &snapshot, &projection, presentation, &outputs, 0);
+        assert_eq!(changes.dirty, [0]);
+        assert!(rows[0].compact_after);
+
+        // Removing a neighbor must restore the surviving entry's separator too.
+        let old = rows.clone();
+        rows.truncate(1);
+        rows[0].compact_after = false;
+        let mut changes = ContentChanges::default();
+        cache.finish_reset(&mut rows, old, &mut changes);
+        assert!(!changes.reset);
+        assert_eq!(changes.dirty, [0]);
+    }
+
     #[test]
     fn content_cache_refreshes_only_invalidated_tool_output() {
         let agent = AgentId::root(SessionId::from_bytes([34; 16]));

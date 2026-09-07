@@ -65,6 +65,7 @@ impl Terminal {
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
             .env_remove("NO_COLOR")
+            .env("HOME", root)
             .env("XDG_STATE_HOME", root.join("state"))
             .env("XDG_CONFIG_HOME", root.join("config"))
             .stdin(Stdio::from(slave.try_clone().unwrap()))
@@ -214,6 +215,21 @@ impl Provider {
 
     // Empty chunks select numbered replies; otherwise each supplied SSE chunk is gated.
     fn streaming(delay: Duration, gates: Option<Receiver<()>>, chunks: Vec<String>) -> Self {
+        Self::streaming_responses(delay, gates, chunks, false)
+    }
+
+    // Only the first response uses custom chunks; later requests get numbered final replies.
+    // Every response remains gated so tests can inspect a continuation before it finishes.
+    fn streaming_first(gates: Receiver<()>, chunks: Vec<String>) -> Self {
+        Self::streaming_responses(Duration::ZERO, Some(gates), chunks, true)
+    }
+
+    fn streaming_responses(
+        delay: Duration,
+        gates: Option<Receiver<()>>,
+        chunks: Vec<String>,
+        first_only: bool,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -245,7 +261,7 @@ impl Provider {
                     requests.push(request);
                     requests.len()
                 };
-                let replies = if chunks.is_empty() {
+                let replies = if chunks.is_empty() || (first_only && count > 1) {
                     vec![reply(count)]
                 } else {
                     chunks.clone()
@@ -350,6 +366,145 @@ fn reply(count: usize) -> String {
     )
 }
 
+fn session_directories(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut sessions = std::fs::read_dir(root.join(".skyhook/sessions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    sessions.sort();
+    sessions
+}
+
+#[test]
+fn pristine_launch_typing_and_commands_do_not_create_a_session() {
+    let root = tempfile::tempdir().unwrap();
+    let provider = Provider::new(Duration::ZERO);
+    config(root.path(), &provider.url);
+    let sessions = root.path().join(".skyhook/sessions");
+    let mut terminal = Terminal::launch(root.path(), &[]);
+    terminal.wait("Start a conversation");
+    assert!(
+        !sessions.exists(),
+        "idle startup must not create session storage"
+    );
+
+    terminal.send("Unsent draft");
+    terminal.wait("Unsent draft");
+    assert!(!sessions.exists(), "typing must not create session storage");
+    terminal.send("\x18m");
+    terminal.wait("Model");
+    assert!(
+        !sessions.exists(),
+        "opening the model picker must remain a draft"
+    );
+    terminal.send("\r");
+    terminal.wait_for("model picker closed with draft intact", |screen| {
+        let contents = screen.contents();
+        contents.contains("Unsent draft") && !contents.contains("Model")
+    });
+    assert!(!sessions.exists(), "selecting a model must remain a draft");
+
+    terminal.send("\x03/");
+    terminal.wait("Commands");
+    assert!(
+        !sessions.exists(),
+        "slash commands must not create a session"
+    );
+    terminal.send("\x1b");
+    terminal.wait_for("command palette closed", |screen| {
+        !screen.contents().contains("Commands")
+    });
+    terminal.quit();
+    assert!(
+        !sessions.exists(),
+        "quitting a draft must not create session storage"
+    );
+    assert!(provider.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn new_stays_a_draft_until_submission_and_quitting_does_not_save_it() {
+    // Cover both abandoning the new draft and submitting it for a second session.
+    for submit_second in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Provider::new(Duration::ZERO);
+        config(root.path(), &provider.url);
+        let sessions = root.path().join(".skyhook/sessions");
+        let mut terminal = Terminal::launch(root.path(), &[]);
+        terminal.wait("Start a conversation");
+        terminal.send("/new");
+        terminal.wait("Commands");
+        terminal.send("\r");
+        terminal.wait_for("new draft with command palette closed", |screen| {
+            let contents = screen.contents();
+            contents.contains("Start a conversation") && !contents.contains("Commands")
+        });
+        assert!(
+            !sessions.exists(),
+            "/new in a pristine launch must not create storage"
+        );
+        assert!(provider.requests.lock().unwrap().is_empty());
+
+        terminal.send("First submitted message\r");
+        terminal.wait("Fixture response 1");
+        terminal.wait("84 · 100(80)");
+        let first = session_directories(root.path());
+        assert_eq!(
+            first.len(),
+            1,
+            "first submission must create exactly one session"
+        );
+        assert!(first[0].join("events.jsonl").is_file());
+        terminal.send("/new\r");
+        terminal.wait("Start a conversation");
+        assert_eq!(
+            session_directories(root.path()),
+            first,
+            "/new must only return to a draft"
+        );
+        assert!(
+            !terminal
+                .parser
+                .screen()
+                .contents()
+                .contains("Fixture response 1")
+        );
+
+        terminal.send("Second draft");
+        terminal.wait("Second draft");
+        assert_eq!(
+            session_directories(root.path()),
+            first,
+            "unsent new draft must not create a session"
+        );
+        if submit_second {
+            terminal.send("\r");
+            terminal.wait("Fixture response 2");
+            terminal.wait("84 · 100(80)");
+            let second = session_directories(root.path());
+            assert_eq!(
+                second.len(),
+                2,
+                "submitting the new draft must create one more session"
+            );
+            assert!(
+                second.contains(&first[0]),
+                "the original session must remain"
+            );
+        }
+        terminal.quit();
+        assert_eq!(
+            session_directories(root.path()).len(),
+            if submit_second { 2 } else { 1 }
+        );
+        assert_eq!(
+            provider.requests.lock().unwrap().len(),
+            if submit_second { 2 } else { 1 }
+        );
+    }
+}
+
 #[test]
 fn model_selection_waits_for_submitted_messages_and_reply_footers_survive_resume() {
     let root = tempfile::tempdir().unwrap();
@@ -396,13 +551,19 @@ fn model_selection_waits_for_submitted_messages_and_reply_footers_survive_resume
     // Select A again before either queued message runs; their captured choices must win.
     terminal.send("\x18m\x1b[A\r");
     advance.send(()).unwrap();
-    terminal.wait_for("queued A request", |_| requests.lock().unwrap().len() == 2);
-    assert_eq!(requests.lock().unwrap()[1]["model"], "fixture");
+    terminal.wait_for("batched queued request", |_| {
+        requests.lock().unwrap().len() == 2
+    });
+    {
+        let requests = requests.lock().unwrap();
+        // Both follow-ups enter the next request; the last captured model wins,
+        // not the unsent selection made afterward.
+        assert_eq!(requests[1]["model"], "model-b");
+        let messages = requests[1]["messages"].to_string();
+        assert!(messages.find("Queued with A").unwrap() < messages.find("Queued with B").unwrap());
+    }
     advance.send(()).unwrap();
-    terminal.wait_for("queued B request", |_| requests.lock().unwrap().len() == 3);
-    assert_eq!(requests.lock().unwrap()[2]["model"], "model-b");
-    advance.send(()).unwrap();
-    terminal.wait("Fixture response 3");
+    terminal.wait("Fixture response 2");
     terminal.wait_for("recorded reply footer", |screen| {
         screen
             .contents()
@@ -416,7 +577,7 @@ fn model_selection_waits_for_submitted_messages_and_reply_footers_survive_resume
     assert!(records.contains("\"type\":\"model_changed\",\"model_profile\":\"second\""));
     // The pending A selection was never sent, so reopening restores B.
     let mut resumed = Terminal::launch(root.path(), &["--resume", &session]);
-    resumed.wait("Fixture response 3");
+    resumed.wait("Fixture response 2");
     resumed.wait_for("restored model B", |screen| {
         screen
             .contents()
@@ -431,7 +592,7 @@ fn model_selection_waits_for_submitted_messages_and_reply_footers_survive_resume
             .lines()
             .filter(|line| line.trim() == "fixture")
             .count(),
-        2
+        1
     );
     assert_eq!(
         screen
@@ -441,6 +602,137 @@ fn model_selection_waits_for_submitted_messages_and_reply_footers_survive_resume
         1
     );
     resumed.quit();
+}
+
+#[test]
+fn queued_input_reaches_next_tool_continuation_request_in_fifo_order() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("queue-fixture.txt"),
+        "Queue fixture contents",
+    )
+    .unwrap();
+    let (advance, gates) = mpsc::channel();
+    let tool_call = serde_json::json!({
+        "id":"fixture", "object":"chat.completion.chunk", "created":0,
+        "model":"fixture", "choices":[{"index":0,"delta":{
+            "role":"assistant", "tool_calls":[{
+                "index":0, "id":"call_queue_read", "type":"function",
+                "function":{"name":"read", "arguments":"{\"path\":\"queue-fixture.txt\"}"}
+            }]
+        },"finish_reason":null}],
+    });
+    let tool_done = serde_json::json!({
+        "id":"fixture", "object":"chat.completion.chunk", "created":0,
+        "model":"fixture", "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],
+    });
+    let provider = Provider::streaming_first(
+        gates,
+        vec![format!(
+            "data: {tool_call}\n\ndata: {tool_done}\n\ndata: [DONE]\n\n"
+        )],
+    );
+    config(root.path(), &provider.url);
+    let requests = &provider.requests;
+    let mut terminal = Terminal::launch(root.path(), &["--prompt", "First question"]);
+    terminal.wait_for("first provider request", |_| {
+        requests.lock().unwrap().len() == 1
+    });
+    terminal.wait("Working");
+    terminal.send("Second question\r");
+    terminal.wait("1 follow-up(s) queued");
+    terminal.send("Discard this queued question\r");
+    terminal.wait("2 follow-up(s) queued");
+    terminal.send("Third question\r");
+    terminal.wait("3 follow-up(s) queued");
+
+    // Remove the middle item through the actual terminal queue UI, not a runtime API.
+    terminal.send("/queue\r");
+    terminal.wait("Queued follow-ups");
+    terminal.wait("Discard this queued question");
+    terminal.send("\x1b[B\x1b[3~");
+    terminal.wait_for("middle queued item removed", |screen| {
+        let contents = screen.contents();
+        contents.contains("Queued follow-ups")
+            && contents.contains("Second question")
+            && contents.contains("Third question")
+            && !contents.contains("Discard this queued question")
+    });
+    terminal.send("\x1b");
+    terminal.wait_for("queue closed with two pending inputs", |screen| {
+        let contents = screen.contents();
+        !contents.contains("Queued follow-ups") && contents.contains("2 follow-up(s) queued")
+    });
+    assert_eq!(requests.lock().unwrap().len(), 1);
+
+    // The first response cannot finish until both inputs have visibly been queued.
+    // A tool call causes request #2 within this same turn, before any final answer.
+    advance.send(()).unwrap();
+    terminal.wait_for("tool continuation request", |_| {
+        requests.lock().unwrap().len() >= 2
+    });
+    let captured = requests.lock().unwrap().clone();
+    assert_eq!(captured.len(), 2);
+    let messages = captured[1]["messages"].as_array().unwrap();
+    let user_texts = messages
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .map(|message| {
+            let content = &message["content"];
+            if let Some(text) = content.as_str() {
+                text.to_owned()
+            } else {
+                content
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|part| part["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        })
+        // The runtime also sends its transient state as a synthetic user message.
+        .filter(|text| !text.starts_with("<skyhook_state>"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        user_texts,
+        ["First question", "Second question", "Third question"],
+        "queued inputs must reach request #2 together in FIFO order, not later turns: {}",
+        captured[1]
+    );
+    assert!(
+        messages.iter().any(|message| {
+            message["role"] == "assistant" && message["tool_calls"][0]["id"] == "call_queue_read"
+        }),
+        "request #2 must continue the tool-calling turn: {}",
+        captured[1]
+    );
+    assert!(
+        messages.iter().any(|message| {
+            message["role"] == "tool"
+                && message["tool_call_id"] == "call_queue_read"
+                && message["content"]
+                    .to_string()
+                    .contains("Queue fixture contents")
+        }),
+        "normal read permissions must produce a real tool result: {}",
+        captured[1]
+    );
+    assert!(
+        !captured[1]
+            .to_string()
+            .contains("Discard this queued question")
+    );
+    assert!(!captured[1].to_string().contains("Fixture response"));
+
+    advance.send(()).unwrap();
+    terminal.wait("Fixture response 2");
+    terminal.quit();
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2,
+        "consumed or removed inputs must not trigger third/fourth requests"
+    );
 }
 
 #[test]
@@ -570,6 +862,11 @@ fn script_launch_uses_regular_approval_and_remains_interactive() {
     .unwrap();
     let mut terminal = Terminal::launch(root.path(), &["--script", script.to_str().unwrap()]);
     terminal.wait("Permission");
+    assert_eq!(
+        session_directories(root.path()).len(),
+        1,
+        "an explicit script must create a session"
+    );
     terminal.send("\r");
     terminal.send("\x10");
     terminal.send("details\r");
@@ -711,8 +1008,8 @@ fn failed_session_switch_preserves_draft_and_original_agent_then_can_retry() {
     let root = tempfile::tempdir().unwrap();
     let provider = Provider::new(Duration::from_millis(10));
     config(root.path(), &provider.url);
-    let mut owner = Terminal::launch(root.path(), &[]);
-    owner.wait("Start a conversation");
+    let mut owner = Terminal::launch(root.path(), &["--prompt", "Locked session"]);
+    owner.wait("Fixture response 1");
     let locked_id = std::fs::read_dir(root.path().join(".skyhook/sessions"))
         .unwrap()
         .next()
@@ -723,7 +1020,7 @@ fn failed_session_switch_preserves_draft_and_original_agent_then_can_retry() {
         .unwrap()
         .to_owned();
     let mut terminal = Terminal::launch(root.path(), &["--prompt", "Original session"]);
-    terminal.wait("Fixture response 1");
+    terminal.wait("Fixture response 2");
     terminal.send("Unsent draft");
     terminal.send("\x18l");
     terminal.wait("Resume session");
@@ -731,13 +1028,20 @@ fn failed_session_switch_preserves_draft_and_original_agent_then_can_retry() {
     terminal.wait("already open");
     assert!(terminal.parser.screen().contents().contains("Unsent draft"));
     terminal.send("\x03Follow-up after rejected switch\r");
-    terminal.wait("Fixture response 2");
+    terminal.wait("Fixture response 3");
     owner.quit();
     terminal.send("\x18l");
     terminal.wait("Resume session");
     terminal.send(&format!("{locked_id}\r"));
-    terminal.wait("Start a conversation");
+    terminal.wait_for("locked session successfully resumed", |screen| {
+        screen
+            .contents()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .contains(&locked_id)
+    });
     terminal.send("Message in resumed session\r");
-    terminal.wait("Fixture response 3");
+    terminal.wait("Fixture response 4");
     terminal.quit();
 }

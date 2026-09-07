@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 pub struct StatusLog(mpsc::UnboundedSender<Request>);
 enum Request {
     Record {
-        session: SessionHandle,
+        session: Option<SessionHandle>,
         agent: AgentId,
         message: String,
     },
@@ -16,7 +16,7 @@ enum Request {
 #[derive(Clone)]
 pub struct StatusSender {
     log: StatusLog,
-    session: SessionHandle,
+    session: Option<SessionHandle>,
     agent: AgentId,
 }
 impl StatusLog {
@@ -30,13 +30,24 @@ impl StatusLog {
                         agent,
                         message,
                     } => {
-                        if let Err(error) =
-                            session.record_status(agent.clone(), message.clone()).await
-                        {
+                        if let Some(session) = session {
+                            if let Err(error) =
+                                session.record_status(agent.clone(), message.clone()).await
+                            {
+                                let _ = work.send(Work::StatusFailed {
+                                    session: Some(session.id()),
+                                    agent,
+                                    message: format!(
+                                        "{message}\nCould not save this status: {error}"
+                                    ),
+                                });
+                            }
+                        } else {
+                            // Before the first message, notices are UI-only.
                             let _ = work.send(Work::StatusFailed {
-                                session: session.id(),
+                                session: None,
                                 agent,
-                                message: format!("{message}\nCould not save this status: {error}"),
+                                message,
                             });
                         }
                     }
@@ -48,10 +59,10 @@ impl StatusLog {
         });
         Self(tx)
     }
-    pub fn sender(&self, session: &SessionHandle, agent: &AgentId) -> StatusSender {
+    pub fn sender(&self, session: Option<&SessionHandle>, agent: &AgentId) -> StatusSender {
         StatusSender {
             log: self.clone(),
-            session: session.clone(),
+            session: session.cloned(),
             agent: agent.clone(),
         }
     }

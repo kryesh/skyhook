@@ -1,7 +1,7 @@
 //! Provider-neutral session runtime and agent loop.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock, RwLock as StdRwLock, Weak},
 };
@@ -50,6 +50,10 @@ use context::AgentContext;
 pub(super) use context::recorded_context;
 mod prompt;
 mod questions;
+mod queue;
+pub use queue::{QueuedPrompt, QueuedPromptToken};
+#[cfg(test)]
+mod queue_tests;
 mod tools;
 
 const AGENT_CHANNEL_CAPACITY: usize = 64;
@@ -303,12 +307,14 @@ pub struct SessionHandle {
     runtime: Arc<SessionRuntime>,
     root: AgentId,
     root_tx: mpsc::Sender<AgentCommand>,
+    enqueue_preparation: Arc<Mutex<()>>,
 }
 
 /// Options captured when a user submits a message, including queued messages.
 #[derive(Clone, Debug, Default)]
 pub struct PromptOptions {
-    /// Configured model profile for this turn. Omitted retains the agent's active model.
+    /// Configured model profile when this input is consumed. Omitted retains the
+    /// agent's active model; later explicit queued selections can change it.
     pub model: Option<String>,
 }
 
@@ -433,13 +439,112 @@ impl SessionHandle {
             .await
     }
 
-    /// Submit a user message with a model fixed for the entire resulting turn.
+    /// Submit a user message and wait for the resulting turn to finish.
+    /// Explicit request-boundary enqueues may change the model during that turn.
     pub async fn prompt_with_options(
         &self,
         text: impl Into<String>,
         paths: &[PathBuf],
         options: PromptOptions,
     ) -> Result<String, HarnessError> {
+        let content = self.prepare_prompt(text.into(), paths, &options).await?;
+        self.submit(content, options.model).await
+    }
+
+    /// Queue a message for the next safe model-request boundary, including while a
+    /// request or tool is running. Images and the selected model are captured at
+    /// submission. Returns after history commit, NOT after the model finishes.
+    ///
+    /// Retain a clone of `token` to cancel an unclaimed submission. A successful
+    /// cancellation guarantees that its message will not enter history. Cancelled
+    /// submissions return [`HarnessError::Interrupted`]. Once claimed, await this
+    /// receipt before editing or retrying the message. A dropped receipt does not
+    /// cancel the input. Errors mean the user message was not committed.
+    ///
+    /// Concurrent preparations are serialized in polling order. All available
+    /// messages are committed FIFO before compaction and the next provider request;
+    /// the last explicit model selection governs that request. Ordinary `prompt`
+    /// calls retain their turn-completion semantics.
+    pub async fn enqueue_prompt_with_options(
+        &self,
+        text: impl Into<String>,
+        paths: &[PathBuf],
+        options: PromptOptions,
+        token: QueuedPromptToken,
+    ) -> Result<(), HarnessError> {
+        self.enqueue_prompts_with_options(vec![QueuedPrompt {
+            text: text.into(),
+            paths: paths.to_vec(),
+            options,
+            token,
+        }])
+        .await
+        .pop()
+        .expect("one queued prompt has one receipt")
+    }
+
+    /// Prepare and enqueue a group atomically at a model-request boundary.
+    /// Results correspond to input order and acknowledge history commits, not
+    /// turn completion. Invalid or cancelled items do not prevent the remaining
+    /// items from committing FIFO. The whole group is prepared before it becomes
+    /// visible to the runtime, even when preparing attachments yields.
+    pub async fn enqueue_prompts_with_options(
+        &self,
+        inputs: Vec<QueuedPrompt>,
+    ) -> Vec<Result<(), HarnessError>> {
+        let preparation = self.enqueue_preparation.lock().await;
+        let mut batch = Vec::with_capacity(inputs.len());
+        let mut receipts = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            if input.token.is_cancelled() {
+                receipts.push(Err(HarnessError::Interrupted));
+                continue;
+            }
+            match self
+                .prepare_prompt(input.text, &input.paths, &input.options)
+                .await
+            {
+                Ok(content) => {
+                    let (committed, receipt) = oneshot::channel();
+                    batch.push(queue::QueuedInput {
+                        content,
+                        model: input.options.model,
+                        token: input.token,
+                        committed,
+                    });
+                    receipts.push(Ok(receipt));
+                }
+                Err(error) => receipts.push(Err(error)),
+            }
+        }
+        if !batch.is_empty()
+            && !self
+                .runtime
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // A failed send drops every sender, resolving each receipt as stopped.
+            let _ = self.root_tx.send(AgentCommand::QueuedInputs(batch)).await;
+        } else {
+            drop(batch);
+        }
+        drop(preparation);
+        let mut results = Vec::with_capacity(receipts.len());
+        for receipt in receipts {
+            results.push(match receipt {
+                Ok(receipt) => receipt.await.unwrap_or(Err(HarnessError::AgentStopped)),
+                Err(error) => Err(error),
+            });
+        }
+        results
+    }
+
+    async fn prepare_prompt(
+        &self,
+        text: String,
+        paths: &[PathBuf],
+        options: &PromptOptions,
+    ) -> Result<Vec<UserContent>, HarnessError> {
         if let Some(model) = &options.model
             && !self.runtime.harness.model_profiles.contains_key(model)
         {
@@ -475,7 +580,7 @@ impl SessionHandle {
                 .await?;
             content.push(UserContent::Image { image });
         }
-        self.submit(content, options.model).await
+        Ok(content)
     }
 
     async fn submit(
@@ -499,6 +604,9 @@ impl SessionHandle {
     }
 
     pub async fn shutdown(&self) -> Result<(), HarnessError> {
+        self.runtime
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::Release);
         self.runtime.interrupt_tree(&self.root).await;
         self.runtime.router.shutdown().await;
         // A closed command channel means the root already stopped. Shutdown is idempotent.
@@ -527,6 +635,7 @@ struct SessionRuntime {
     events: RuntimeEvents,
     // Fully replayed journal prefix, not the highest (possibly out-of-order) live event.
     caught_up_sequence: Mutex<u64>,
+    shutting_down: std::sync::atomic::AtomicBool,
 }
 
 struct LiveAgent {
@@ -537,6 +646,7 @@ struct LiveAgent {
 }
 
 enum AgentCommand {
+    QueuedInputs(Vec<queue::QueuedInput>),
     Input {
         model: Option<String>,
         content: Vec<UserContent>,
@@ -664,6 +774,7 @@ impl SessionRuntime {
             harness.questions.clone(),
         ));
         let runtime = Arc::new(Self {
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
             todos: TodoStore::restore(store.clone(), &prior_records),
             harness,
             store: store.clone(),
@@ -714,6 +825,7 @@ impl SessionRuntime {
             runtime: self.clone(),
             root,
             root_tx,
+            enqueue_preparation: Arc::new(Mutex::new(())),
         })
     }
 
@@ -1049,17 +1161,41 @@ impl SessionRuntime {
         };
         let mut child_done: Option<oneshot::Sender<Result<String, String>>> = None;
         let mut child_answer = None;
+        let mut deferred = VecDeque::new();
         loop {
-            let command = tokio::select! {
-                biased;
-                () = owner_cancellation.cancelled() => {
-                    if let Some(done) = child_done.take() { let _ = done.send(Err("child agent cancelled".to_owned())); }
-                    let _ = self.store.append(id.clone(), SessionEvent::AgentInterrupted).await;
-                    break;
+            let command = if let Some(command) = deferred.pop_front() {
+                command
+            } else {
+                tokio::select! {
+                    biased;
+                    () = owner_cancellation.cancelled() => {
+                        if let Some(done) = child_done.take() { let _ = done.send(Err("child agent cancelled".to_owned())); }
+                        let _ = self.store.append(id.clone(), SessionEvent::AgentInterrupted).await;
+                        break;
+                    }
+                    command = rx.recv() => match command { Some(command) => command, None => break },
                 }
-                command = rx.recv() => match command { Some(command) => command, None => break },
             };
+            // Register before claiming/persisting a queued message: interrupt must
+            // not be lost while a commit is in flight.
+            let cancellation = self.begin_turn(&id);
             let (content, done, selected_model) = match command {
+                AgentCommand::QueuedInputs(inputs) => {
+                    if !self
+                        .consume_queued_batch(
+                            &id,
+                            &mut context,
+                            &mut model_profile,
+                            &capabilities,
+                            &cancellation,
+                            inputs,
+                        )
+                        .await
+                    {
+                        continue;
+                    }
+                    (Vec::new(), None, None)
+                }
                 AgentCommand::Shutdown => {
                     let _ = self
                         .store
@@ -1119,66 +1255,15 @@ impl SessionRuntime {
                     (content, None, None)
                 }
             };
-            // Register cancellation before persisting a model change, which may yield.
-            let cancellation = self.begin_turn(&id);
             if let Some(model) = selected_model.filter(|model| model != &model_profile) {
-                let result = async {
-                    let selected = self
-                        .harness
-                        .model_profiles
-                        .get(&model)
-                        .cloned()
-                        .ok_or_else(|| HarnessError::UnknownModelProfile(model.clone()))?;
-                    let replacement = if selected != context.profile {
-                        let replacement = self
-                            .open_agent_context(
-                                &id,
-                                selected.clone(),
-                                context.template.system.clone(),
-                                &capabilities,
-                                false,
-                            )
-                            .await?;
-                        if !selected.supports_images && replacement.contains_images() {
-                            return Err(HarnessError::ImagesUnsupported(selected.model.clone()));
-                        }
-                        Some(replacement)
-                    } else {
-                        None
-                    };
-                    self.store
-                        .append(
-                            id.clone(),
-                            SessionEvent::ModelChanged {
-                                model_profile: model.clone(),
-                                max_context: selected.max_context,
-                            },
-                        )
-                        .await?;
-                    Ok::<_, HarnessError>(replacement)
-                }
-                .await;
-                match result {
-                    Ok(replacement) => {
-                        if let Some(replacement) = replacement {
-                            context = replacement;
-                        }
-                        model_profile = model;
-                        if let Some(agent) = self
-                            .agents
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .get_mut(&id)
-                        {
-                            agent.model_profile.clone_from(&model_profile);
-                        }
+                if let Err(error) = self
+                    .select_model(&id, &mut context, &mut model_profile, &capabilities, model)
+                    .await
+                {
+                    if let Some(done) = done {
+                        let _ = done.send(Err(error.to_string()));
                     }
-                    Err(error) => {
-                        if let Some(done) = done {
-                            let _ = done.send(Err(error.to_string()));
-                        }
-                        continue;
-                    }
+                    continue;
                 }
             }
             let done = if one_shot {
@@ -1219,8 +1304,16 @@ impl SessionRuntime {
                         capabilities: &capabilities,
                     },
                     &mut context,
+                    &mut model_profile,
+                    &mut rx,
+                    &mut deferred,
                 ) => result,
             };
+            if result.is_err() {
+                // Unclaimed queue entries remain caller-owned after an interrupt;
+                // do not silently start a new turn for them.
+                queue::reject_pending(&mut rx, &mut deferred);
+            }
             self.activity(
                 &id,
                 match &result {
@@ -1288,6 +1381,9 @@ impl SessionRuntime {
         &self,
         turn: TurnContext<'_>,
         agent_context: &mut AgentContext,
+        model_profile: &mut String,
+        rx: &mut mpsc::Receiver<AgentCommand>,
+        deferred: &mut VecDeque<AgentCommand>,
     ) -> Result<String, HarnessError> {
         let TurnContext {
             agent,
@@ -1296,11 +1392,6 @@ impl SessionRuntime {
             location,
             capabilities,
         } = turn;
-        let profile = agent_context.profile.clone();
-        if !profile.supports_images && agent_context.contains_images() {
-            return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
-        }
-        let template = agent_context.template.clone();
         let mut context_sequence = None;
         let mut final_text = String::new();
         let mut force_compaction = false;
@@ -1310,6 +1401,31 @@ impl SessionRuntime {
             if cancellation.is_cancelled() {
                 return Err(HarnessError::Interrupted);
             }
+            if self
+                .consume_queued_inputs(
+                    agent,
+                    agent_context,
+                    model_profile,
+                    capabilities,
+                    cancellation,
+                    rx,
+                    deferred,
+                )
+                .await
+            {
+                // A model change can replace both the template and its token meter.
+                context_sequence = None;
+                compaction_checked = false;
+                provider_attempt = 0;
+            }
+            if cancellation.is_cancelled() {
+                return Err(HarnessError::Interrupted);
+            }
+            let profile = agent_context.profile.clone();
+            if !profile.supports_images && agent_context.contains_images() {
+                return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
+            }
+            let template = agent_context.template.clone();
             let context = match context_sequence {
                 Some(sequence) => sequence,
                 None => {
@@ -1343,11 +1459,9 @@ impl SessionRuntime {
                 .await?;
                 force_compaction = false;
                 compaction_checked = true;
-                agent_context.refresh(&self.store.records().await, agent)?;
-                let runtime =
-                    prompt::runtime_state_content(&self.jobs, &self.todos, agent, capabilities)
-                        .await;
-                request = agent_context.request(runtime);
+                // Consume input received during compaction before starting the
+                // normal request, rather than delaying it by another request.
+                continue 'requests;
             }
             let mut messages = compact::context_sources(&agent_context.projected);
             messages.push(crate::session::ContextMessage::Inline {

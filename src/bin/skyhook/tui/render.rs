@@ -134,6 +134,7 @@ pub struct Row {
     width: u16,
     surface: Surface,
     pub entry: usize,
+    pub selectable: bool,
     blank: bool,
     continued: bool,
 }
@@ -142,6 +143,13 @@ pub struct Row {
 pub struct TextPosition {
     pub row: usize,
     pub byte: usize,
+}
+
+/// Inline reasoning and activity spinners are not navigable or copyable entries.
+pub fn entry_selectable(entry: &model::Entry) -> bool {
+    entry.expandable
+        || !(entry.surface == Surface::Reasoning
+            || (entry.surface == Surface::Muted && entry.running))
 }
 
 impl Row {
@@ -169,7 +177,7 @@ impl Row {
     ) -> Option<std::ops::Range<usize>> {
         let (a, b) = selection?;
         let (start, end) = (a.min(b), a.max(b));
-        if self.blank || start == end || row < start.row || row > end.row {
+        if !self.selectable || self.blank || start == end || row < start.row || row > end.row {
             return None;
         }
         let length = self.line.spans.iter().map(|span| span.content.len()).sum();
@@ -218,7 +226,10 @@ fn selection_unchanged<'a>(
             let Some(after) = current.next() else {
                 return false;
             };
-            if before.entry != after.entry || before.continued != after.continued {
+            if before.entry != after.entry
+                || before.continued != after.continued
+                || before.selectable != after.selectable
+            {
                 return false;
             }
             if std::sync::Arc::ptr_eq(&before.line, &after.line) {
@@ -350,7 +361,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .map_or("skyhook", |a| a.name.as_str());
     // Keep the session ID visible alongside the workspace on narrow terminals.
     let workspace = app.launch.workspace.display().to_string();
-    let session = app.session.id().to_string();
+    let session = app.session.as_ref().map_or_else(
+        || "new session".to_owned(),
+        |session| session.id().to_string(),
+    );
     let available = width.saturating_sub(4);
     let name_width = if available >= 60 {
         (name.width() as u16).min(20)
@@ -597,8 +611,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let rect = r(row.x, y, row.width, 1);
         let selected = row.selection_range(scroll + offset, app.selection);
         let entry = app.entries.get(row.entry);
-        let focused =
-            navigation_active && app.focus == Focus::Content && row.entry == selected_entry;
+        let focused = navigation_active
+            && app.focus == Focus::Content
+            && row.selectable
+            && row.entry == selected_entry;
         let hovered = app.hover.is_some_and(|point| rect.contains(point.into()))
             && entry.is_some_and(|e| e.expandable);
         let bg = if !row.blank
@@ -662,13 +678,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 focus_cursor(frame, row.x.saturating_sub(1), y, p.base);
                 cursor_drawn = true;
             }
-            app.hits.push((
-                rect,
-                Hit::Entry(
-                    row.entry,
-                    row.header || entry.is_some_and(|entry| entry.expandable),
-                ),
-            ));
+            if row.selectable {
+                app.hits.push((
+                    rect,
+                    Hit::Entry(
+                        row.entry,
+                        row.header || entry.is_some_and(|entry| entry.expandable),
+                    ),
+                ));
+            }
         }
     }
     {
@@ -800,34 +818,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             p.panel
         };
         fill(frame, rect, bg);
-        let (running, mut status) = app.projection.status(agent, &app.snapshot);
-        let pending = app.prompts.iter().find(|prompt| match &prompt.kind {
-            crate::interaction::PromptKind::Approval(request) => request.agent == agent.id,
-            crate::interaction::PromptKind::Questions { agent: owner, .. } => owner == &agent.id,
-            _ => false,
-        });
-        if let Some(prompt) = pending {
-            status = match prompt.kind {
-                crate::interaction::PromptKind::Approval(_) => "Waiting for permission",
-                _ => "Waiting for user input",
-            }
-            .into();
-        }
-        let running = running && pending.is_none();
+        let (running, status) = app.agent_status(agent);
         app.animating |= running;
-        let symbol = if running {
-            spinner(app.tick_count)
-        } else if status.contains("permission") {
-            "◇"
-        } else if status.contains("input") {
-            "?"
-        } else if status.starts_with("Waiting") {
-            "◷"
-        } else if agent.terminal {
-            "✓"
-        } else {
-            "·"
-        };
+        let symbol = agent_symbol(running, &status, agent.terminal, app.tick_count);
         let indent = (agent.id.depth() as u16 * 4).min(width / 3);
         let target = model::target_suffix(&agent.target);
         let stats = agent_stats[index].clone();
@@ -1109,6 +1102,18 @@ fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette) {
     } else {
         model::clean(&app.prompt_editor.text)
     };
+    let input_label = match app.prompts.front().map(|prompt| &prompt.kind) {
+        Some(crate::interaction::PromptKind::Questions { questions, .. }) => {
+            match questions.get(app.question_index) {
+                Some(question) if app.prompt_choice < question.options.len() => {
+                    "Comment (optional): "
+                }
+                Some(_) => "Answer: ",
+                None => "",
+            }
+        }
+        _ => "",
+    };
     text(
         frame,
         r(
@@ -1117,7 +1122,7 @@ fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette) {
             rect.width.saturating_sub(4),
             1,
         ),
-        format!("{input}▏"),
+        format!("{input_label}{input}▏"),
         p.fg,
         p.input,
     );
@@ -1134,11 +1139,28 @@ fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette) {
         p.input,
     );
 }
+fn agent_symbol(running: bool, status: &str, terminal: bool, tick: usize) -> &'static str {
+    if running {
+        spinner(tick)
+    } else if status.contains("permission") {
+        "◇"
+    } else if status.contains("input") {
+        "?"
+    } else if status.starts_with("Waiting") {
+        "◷"
+    } else if terminal {
+        "✓"
+    } else {
+        "·"
+    }
+}
 fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
+    app.refresh_agent_menu();
     let Some(menu) = &app.menu else { return };
     let area = app.content_rect;
-    let width = area.width.saturating_sub(4).min(110);
-    let rect = r((area.width - width) / 2, area.y, width, area.height);
+    let margin = 7.min(area.width.saturating_sub(20) / 2);
+    let width = area.width.saturating_sub(margin * 2);
+    let rect = r(area.x + margin, area.y, width, area.height);
     fill(frame, rect, p.input);
     text(
         frame,
@@ -1155,23 +1177,119 @@ fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
         p.input,
     );
     let items = menu.filtered();
-    let height = rect.height.saturating_sub(3) as usize;
+    let agent_menu = matches!(menu.kind, MenuKind::Agents);
+    let stats_width = if agent_menu {
+        app.projection
+            .agents
+            .iter()
+            .map(|agent| {
+                model::agent_footer(&app.snapshot, &app.projection, &agent.id).width() as u16
+            })
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    // Match the inline tree's aligned status/token columns. On narrow screens,
+    // use a second line so the picker still exposes both status and token usage.
+    let compact_agents = agent_menu && width.saturating_sub(2) < stats_width + 50;
+    let stacked_stats = compact_agents && width.saturating_sub(2) < stats_width + 30;
+    let row_height = if stacked_stats {
+        3
+    } else if compact_agents {
+        2
+    } else {
+        1
+    };
+    let height = rect.height.saturating_sub(3) as usize / row_height;
     let top = menu.selected.saturating_sub(height.saturating_sub(1));
     for (i, item) in items.iter().enumerate().skip(top).take(height) {
-        let y = rect.y + 2 + (i - top) as u16;
+        let y = rect.y + 2 + ((i - top) * row_height) as u16;
         let selected = i == menu.selected;
         let bg = if selected { p.selected } else { p.input };
         let row = r(rect.x + 1, y, width.saturating_sub(2), 1);
-        let text_value = if item.detail.is_empty() {
-            item.label.clone()
+        if agent_menu {
+            if let Some(agent) = app
+                .projection
+                .agents
+                .iter()
+                .find(|agent| agent.id.to_string() == item.value)
+            {
+                let (running, status) = app.agent_status(agent);
+                app.animating |= running;
+                let symbol = agent_symbol(running, &status, agent.terminal, app.tick_count);
+                let stats = model::agent_footer(&app.snapshot, &app.projection, &agent.id);
+                let target = model::target_suffix(&agent.target);
+                let indent = (agent.id.depth() as u16 * 4).min(row.width / 3);
+                let name_width = if compact_agents {
+                    row.width
+                } else {
+                    row.width.saturating_sub(stats_width + 32)
+                };
+                let name = format!(
+                    "{}{symbol} {}{}",
+                    " ".repeat(indent as usize),
+                    clipped_header(
+                        &model::clean(&agent.name),
+                        name_width.saturating_sub(indent + 2 + target.width() as u16)
+                    ),
+                    target
+                );
+                fill(frame, r(row.x, row.y, row.width, row_height as u16), bg);
+                text(
+                    frame,
+                    r(row.x, y, name_width, 1),
+                    model::clean(&name),
+                    p.fg,
+                    bg,
+                );
+                let status_row = if stacked_stats {
+                    r(row.x, y + 1, row.width, 1)
+                } else if compact_agents {
+                    r(row.x, y + 1, row.width.saturating_sub(stats_width + 2), 1)
+                } else {
+                    r(row.x + name_width + 2, y, 28, 1)
+                };
+                text(
+                    frame,
+                    status_row,
+                    status.clone(),
+                    if status.starts_with("Waiting") {
+                        p.warning
+                    } else {
+                        p.muted
+                    },
+                    bg,
+                );
+                let stats_width = stats.width() as u16;
+                if stats_width <= row.width {
+                    text(
+                        frame,
+                        r(
+                            row.right() - stats_width,
+                            status_row.y + u16::from(stacked_stats),
+                            stats_width,
+                            1,
+                        ),
+                        stats,
+                        p.muted,
+                        bg,
+                    );
+                }
+            }
         } else {
-            format!("{}   {}", item.label, item.detail)
-        };
-        text(frame, row, model::clean(&text_value), p.fg, bg);
+            let text_value = if item.detail.is_empty() {
+                item.label.clone()
+            } else {
+                format!("{}   {}", item.label, item.detail)
+            };
+            text(frame, row, model::clean(&text_value), p.fg, bg);
+        }
         if selected {
             focus_cursor(frame, rect.x, y, p.input);
         }
-        app.hits.push((row, Hit::Menu(i)));
+        app.hits
+            .push((r(row.x, row.y, row.width, row_height as u16), Hit::Menu(i)));
     }
     if items.is_empty() && !matches!(menu.kind, MenuKind::Attach | MenuKind::OutputSearch(_)) {
         text(
@@ -1306,6 +1424,7 @@ struct EntryGeometry {
     body_width: u16,
     surface: Surface,
     entry: usize,
+    selectable: bool,
 }
 impl EntryGeometry {
     fn new(entry: &model::Entry, width: u16, index: usize) -> Self {
@@ -1330,6 +1449,7 @@ impl EntryGeometry {
                 .max(1),
             surface: entry.surface,
             entry: index,
+            selectable: entry_selectable(entry),
         }
     }
     fn row(&self, line: Line<'static>, header: bool, continued: bool) -> Row {
@@ -1340,6 +1460,7 @@ impl EntryGeometry {
             width: self.row_width,
             surface: self.surface,
             entry: self.entry,
+            selectable: self.selectable,
             blank: false,
             continued,
         }
@@ -1352,6 +1473,7 @@ impl EntryGeometry {
             width,
             surface,
             entry: self.entry,
+            selectable: self.selectable,
             blank: true,
             continued: false,
         }
@@ -1394,7 +1516,9 @@ fn layout_document_or_plain(
     if block {
         rows.push(geometry.blank(entry.surface, geometry.x, geometry.block_width));
     }
-    rows.push(geometry.blank(Surface::Muted, 0, width));
+    if !entry.compact_after {
+        rows.push(geometry.blank(Surface::Muted, 0, width));
+    }
     rows
 }
 
@@ -1668,7 +1792,9 @@ mod tests {
             if block {
                 rows.push(geometry.blank(entry.surface, geometry.x, geometry.block_width));
             }
-            rows.push(geometry.blank(Surface::Muted, 0, width));
+            if !entry.compact_after {
+                rows.push(geometry.blank(Surface::Muted, 0, width));
+            }
         }
         rows
     }
@@ -1706,6 +1832,129 @@ mod tests {
     }
 
     #[test]
+    fn compact_tools_keep_reasoning_padding_in_cached_layout() {
+        let p = Palette::new(false);
+        let highlights = super::super::tool_view::HighlightCache::default();
+        for width in [12, 80] {
+            for expanded in [false, true] {
+                let make_entry = |key: &str, surface, compact_after| model::Entry {
+                    key: key.into(),
+                    text: key.into(),
+                    surface,
+                    expandable: false,
+                    default_open: false,
+                    running: false,
+                    footer: None,
+                    indent: 0,
+                    job: None,
+                    document: None,
+                    compact_after,
+                };
+                let mut entries = vec![
+                    make_entry("reasoning before", Surface::Reasoning, false),
+                    make_entry("tool one", Surface::Tool, true),
+                    make_entry("tool two", Surface::Tool, false),
+                    make_entry("reasoning after", Surface::Reasoning, false),
+                ];
+                if expanded {
+                    for entry in &mut entries[1..3] {
+                        let mut document = super::super::tool_view::Document::default();
+                        document.line(entry.text.clone(), super::super::tool_view::Role::Heading);
+                        document.line("output", super::super::tool_view::Role::Plain);
+                        entry.document = Some(document);
+                    }
+                }
+                let mut all_rows = Vec::new();
+                for (index, entry) in entries.iter().enumerate() {
+                    let mut rows = Vec::new();
+                    update_entry_rows(
+                        &mut rows,
+                        &mut CachedEntry::default(),
+                        entry,
+                        index,
+                        EntryLayout {
+                            width,
+                            palette: p,
+                            highlights: &highlights,
+                        },
+                        None,
+                    );
+                    assert_eq!(rows.last().unwrap().text().is_empty(), index != 1);
+                    all_rows.extend(rows);
+                }
+                let oracle = layout(&entries, width, p, Some(&highlights));
+                assert_eq!(
+                    all_rows.iter().map(Row::text).collect::<Vec<_>>(),
+                    oracle.iter().map(Row::text).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inline_reasoning_is_excluded_from_selection_but_expandable_reasoning_is_not() {
+        let entry = |text: &str, surface, expandable| model::Entry {
+            key: text.into(),
+            text: text.into(),
+            surface,
+            expandable,
+            default_open: false,
+            running: false,
+            footer: None,
+            indent: 0,
+            job: None,
+            compact_after: false,
+            document: None,
+        };
+        for expandable in [false, true] {
+            let entries = [
+                entry("before", Surface::Tool, false),
+                entry("reasoning", Surface::Reasoning, expandable),
+                entry("after", Surface::Tool, false),
+            ];
+            let mut blocks = RowBlocks::default();
+            let highlights = super::super::tool_view::HighlightCache::default();
+            for (index, entry) in entries.iter().enumerate() {
+                update_entry_rows(
+                    blocks.block_mut(index),
+                    &mut CachedEntry::default(),
+                    entry,
+                    index,
+                    EntryLayout {
+                        width: 60,
+                        palette: Palette::new(false),
+                        highlights: &highlights,
+                    },
+                    None,
+                );
+                blocks.finish_update(index);
+            }
+            let reasoning = blocks.entry_start(1).unwrap();
+            assert_eq!(blocks[reasoning].selectable, expandable);
+            let selection = (
+                TextPosition { row: 0, byte: 0 },
+                TextPosition {
+                    row: blocks.len() - 1,
+                    byte: 0,
+                },
+            );
+            assert_eq!(
+                blocks[reasoning]
+                    .selection_range(reasoning, Some(selection))
+                    .is_some(),
+                expandable,
+            );
+            let expected = if expandable {
+                "before\nreasoning\nafter"
+            } else {
+                "before\nafter"
+            };
+            assert_eq!(selected_text(&blocks, selection), expected);
+            assert_eq!(selected_text(&blocks, (selection.1, selection.0)), expected);
+        }
+    }
+
+    #[test]
     fn selection_preserves_soft_wrapped_text_and_code_whitespace() {
         let source = "  first line with enough text to wrap\n    second line  ";
         let entry = model::Entry {
@@ -1718,6 +1967,7 @@ mod tests {
             footer: None,
             indent: 0,
             job: None,
+            compact_after: false,
             document: None,
         };
         let rows = layout(std::slice::from_ref(&entry), 30, Palette::new(false), None);
@@ -1796,6 +2046,7 @@ mod tests {
                     footer: None,
                     document,
                     job: None,
+                    compact_after: false,
                 };
                 for light in [false, true] {
                     for width in [0, 1, 6, 30, 80] {
@@ -1868,6 +2119,7 @@ mod tests {
                         footer: None,
                         document: None,
                         job: None,
+                        compact_after: false,
                     };
                     let mut rows = Vec::new();
                     let mut cache = CachedEntry::default();
@@ -1983,6 +2235,7 @@ mod tests {
                 footer: None,
                 indent: 0,
                 job: None,
+                compact_after: false,
                 document: None,
             };
             let rows = layout(std::slice::from_ref(&reasoning), 120, palette, None);
@@ -2031,6 +2284,7 @@ mod tests {
             footer: Some("recorded-model-id".into()),
             indent: 0,
             job: None,
+            compact_after: false,
             document: None,
         };
         for light in [false, true] {
@@ -2062,6 +2316,7 @@ mod tests {
                 footer: None,
                 indent: 0,
                 job: None,
+                compact_after: false,
                 document: None,
             },
             model::Entry {
@@ -2074,6 +2329,7 @@ mod tests {
                 footer: None,
                 indent: 0,
                 job: None,
+                compact_after: false,
                 document: None,
             },
         ];

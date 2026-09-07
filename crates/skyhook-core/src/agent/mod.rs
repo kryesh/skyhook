@@ -15,7 +15,9 @@ pub use observation::{
     AgentActivity, ContextUsage, LiveResponse, Observation, ObservationSnapshot, ObservedEvent,
 };
 pub use profile::AgentProfile;
-pub use runtime::{Harness, HarnessBuilder, PromptOptions, SessionHandle};
+pub use runtime::{
+    Harness, HarnessBuilder, PromptOptions, QueuedPrompt, QueuedPromptToken, SessionHandle,
+};
 pub use todo::{TodoItem, TodoSnapshot, TodoStatus};
 
 pub(crate) use interaction::QuestionOutput;

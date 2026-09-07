@@ -47,6 +47,10 @@ Skyhook opens a full-screen terminal interface. `--prompt` submits an initial me
 for inspection and follow-up input after the work finishes. An interactive terminal is required;
 there is no plain-output or redirected-input conversation mode.
 
+Startup and `/new` open an empty draft without creating a session or its files. The session is
+created when you send the first message or explicitly run a script; leaving an unused draft
+behind does not create an empty saved session. Resuming an existing session still opens it immediately.
+
 Use `--config path.toml` for explicit configuration, `--workspace PATH` for the workspace,
 `--resume SESSION_ID` to reopen a session, and `-m/--model PROFILE` to choose a model for a new
 session. `--image PATH` attaches an image to the initial `--prompt`. `--approve-all` or
@@ -73,8 +77,10 @@ same per-agent summary when the terminal is too narrow to show it in the tree.
 Status messages, including interruptions and errors, appear as distinct rows in the conversation
 log and are saved with the session. They are excluded from the model’s context.
 Completed final replies show their recorded model ID in a muted footer below the answer.
-The composer always sends to the root agent. While root is busy, Enter queues a follow-up;
-`/queue` edits/removes queued input, and `/resume` resumes a queue paused by interruption.
+The composer always sends to the root agent. While root is busy, Enter queues a follow-up
+for its next model request, without interrupting the current request or tools. It does not wait
+for the entire turn to finish. `/queue` edits/removes input that has not yet been consumed,
+and `/resume` resumes a queue paused by interruption.
 `/retry` continues a failed or interrupted root turn without duplicating the original prompt.
 
 The inspector provides Conversation, Requests, Jobs, and State tabs. Requests show the recorded
@@ -83,8 +89,8 @@ is paged and searchable without acknowledging the agent's pending notifications.
 and press `o` for output fields, regex search, and the next page; `c` requests cancellation.
 Remote output is available after transfer completes. Provider-supplied reasoning streams in a separate
 expanded block with an animated spinner and collapses as soon as answer text starts (or the response
-finishes). Single-line reasoning stays inline without an expand/collapse control, even when it wraps
-in a narrow terminal. Reasoning uses the same Markdown rendering as replies. A separate working
+finishes). Single-line reasoning stays inline without an expand/collapse control and is not
+selectable, even when it wraps in a narrow terminal. Reasoning uses the same Markdown rendering as replies. A separate working
 spinner appears while a request is active without a reasoning spinner. Click a multi-line block or press Enter when selected to
 reopen it, including after resuming a session. `/thinking` toggles expansion of saved reasoning.
 
@@ -96,6 +102,8 @@ The old `default_model_profile` configuration key is accepted but ignored. `/mod
 selects the model for subsequent user messages in the current session. Selection stays in the UI
 until a message is sent; cancelling the picker or leaving without sending does not change the
 session's recorded model. Each submitted message captures its model, including queued messages.
+Queued messages are submitted together as one batch, in order, including their attachments.
+The batch cannot be split across requests; the last message's captured model is used for that request.
 Tool follow-ups, retries, compaction, and `/retry` retain the active turn's model. The bottom bar
 shows the choice for the next message; reply footers identify the model that actually answered.
 Resumed sessions retain their last applied model and instruction profile. Instruction-profile
@@ -156,13 +164,20 @@ The workspace path and session ID in the top bar are plain text; use the termina
 selection gesture (usually Shift-drag) and copy shortcut. The bottom bar shows the model ID
 and token statistics. Copy uses the terminal's OSC 52 clipboard support. `@` attaches a workspace file; `/attach`
 adds an image. Large pastes appear as attachments; click their chips or use `/attachments` to
-inspect or remove them. Pending requests can be reopened with `/attention`. `/diagnostics` lists
-startup warnings such as skipped skills.
+inspect or remove them. Questions and permissions open even while inspecting the agent tree or
+conversation; open menus and search keep input focus until closed. Dismissed requests can be
+reopened with `/attention`. SSH authentication/askpass prompts take priority over questions,
+permissions, menus, and search; interrupted question drafts resume afterward. `/diagnostics`
+lists startup warnings such as skipped skills.
 
 Within questions and permissions, `↑`/`↓` selects an answer, `PageUp`/`PageDown` scrolls
 the prompt text, and `Ctrl+PageUp`/`Ctrl+PageDown` scrolls long answer descriptions.
 The mouse wheel scrolls the text or choices beneath the pointer. Drafts remain intact while
 answering questions or inspecting details.
+Question choices are suggestions: you can select one, optionally add a comment, or provide
+a free-form answer. A suggestion without a non-whitespace comment returns its label as a string;
+with a comment it returns `{"answer": "selected label", "comment": "user text"}`. Free-form
+answers remain strings.
 
 Optional settings live in `$XDG_CONFIG_HOME/skyhook/tui.toml` (or `~/.config/skyhook/tui.toml`):
 
@@ -507,7 +522,10 @@ errors include it in an `output` field; JavaScript callers can catch the error a
   question batch changes its stable agent job to `waiting_input`; answer that job with
   `tool.job(id).send({value: answer})` in a script. For a merged batch, use
   `tool.job(id).send({value: {question_id: answer, another_id: answer}})`; the keys are the IDs
-  included in the waiting job's `questions` output.
+  included in the waiting job's `questions` output. Each answer can be a string (a suggestion
+  label or free-form text), or `{"answer": "selected label", "comment": "user text"}` for a
+  suggestion with a non-whitespace comment. A single question returns that value directly;
+  a merged batch keeps each value under its question ID.
   Root-agent questions still go directly to the host question handler.
 
 `agent` accepts an optional `depth` delegation budget. It defaults to zero, making the launched

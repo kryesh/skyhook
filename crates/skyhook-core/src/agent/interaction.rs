@@ -11,7 +11,7 @@ use crate::{identity::AgentId, session::EventRecord};
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
 pub struct QuestionOption {
-    /// Short answer label returned to the agent.
+    /// Short answer label returned as a string, or as `answer` alongside an optional `comment`.
     pub label: String,
     /// Explanation of this choice's effect or tradeoff.
     pub description: String,
@@ -23,7 +23,8 @@ pub struct Question {
     pub id: String,
     /// Complete question shown to the user or owning parent agent.
     pub prompt: String,
-    /// Suggested mutually exclusive answers. An empty list permits free-form input.
+    /// Suggested mutually exclusive answers; free-form input is always allowed. Selecting a
+    /// suggestion returns its label, or {"answer": "label", "comment": "text"} with a non-blank comment.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<QuestionOption>,
 }
@@ -40,6 +41,12 @@ pub type QuestionFuture =
 pub trait QuestionHandler: Send + Sync {
     /// Present a runtime-merged question batch. A single question accepts any JSON answer;
     /// multiple questions require an object keyed by each stable `Question::id`.
+    ///
+    /// Host interfaces return a selected suggestion's label or free-form input as a string.
+    /// A suggestion with a non-whitespace comment returns
+    /// `{"answer": "selected label", "comment": "user text"}` instead; blank comments leave
+    /// the label as a string. Each value in a multi-question answer object uses the same
+    /// format. The runtime preserves these answer values without interpreting their fields.
     fn ask(&self, agent: AgentId, questions: Vec<Question>) -> QuestionFuture;
 }
 
