@@ -5,8 +5,8 @@ use flux_provider::{Credential, NativeProvider, TokenSource};
 use flux_providers::anthropic::{AnthropicMessages, ApiKeyAnthropic, OAuthAnthropic};
 use flux_providers::openai::{OpenAiChat, OpenAiResponses};
 
-use super::FluxProvider;
 use super::schema::{SchemaCodec, SchemaFormat};
+use super::{FluxBackends, FluxProvider};
 
 #[derive(Clone, Copy, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -24,6 +24,7 @@ pub fn openai_compatible(
     api: OpenAiApi,
     api_key: Option<String>,
 ) -> FluxProvider {
+    let name = name.into();
     let endpoint = endpoint(base_url.into(), api);
     let codec: Arc<dyn flux_provider::WireCodec> = match api {
         OpenAiApi::ChatCompletions => Arc::new(SchemaCodec {
@@ -35,11 +36,16 @@ pub fn openai_compatible(
             format: SchemaFormat::Responses,
         }),
     };
-    FluxProvider::with_schema_provider(NativeProvider::new(
-        name,
-        codec,
-        Arc::new(HttpCredential { endpoint, api_key }),
-    ))
+    FluxProvider::with_schema_provider(move || {
+        NativeProvider::new(
+            name.clone(),
+            codec.clone(),
+            Arc::new(HttpCredential {
+                endpoint: endpoint.clone(),
+                api_key: api_key.clone(),
+            }),
+        )
+    })
 }
 
 #[must_use]
@@ -65,33 +71,40 @@ pub fn claude_oauth(tokens: Arc<dyn TokenSource>) -> FluxProvider {
 }
 
 fn anthropic(name: &str, credential: impl Credential + 'static) -> FluxProvider {
-    FluxProvider::with_schema_provider(NativeProvider::new(
-        name,
-        Arc::new(SchemaCodec {
-            inner: AnthropicMessages::direct(),
-            format: SchemaFormat::Anthropic,
-        }),
-        Arc::new(credential),
-    ))
+    let name = name.to_owned();
+    let credential = Arc::new(credential);
+    FluxProvider::with_schema_provider(move || {
+        NativeProvider::new(
+            name.clone(),
+            Arc::new(SchemaCodec {
+                inner: AnthropicMessages::direct(),
+                format: SchemaFormat::Anthropic,
+            }),
+            credential.clone(),
+        )
+    })
 }
 
 /// Ordinary requests retain Flux's session-scoped WebSocket transport. Schema
 /// requests use HTTP because Flux's Codex constructor does not expose its codec.
 #[must_use]
 pub fn codex_oauth(tokens: Arc<dyn TokenSource>) -> FluxProvider {
-    let mut provider = FluxProvider::new(flux_providers::codex::oauth(tokens.clone()));
-    provider.schema_inner = Some(Arc::new(NativeProvider::new(
-        "codex",
-        Arc::new(SchemaCodec {
-            inner: OpenAiResponses { codex: true },
-            format: SchemaFormat::Responses,
+    FluxProvider {
+        factory: Arc::new(move || FluxBackends {
+            inner: Arc::new(flux_providers::codex::oauth(tokens.clone())),
+            schema_inner: Some(Arc::new(NativeProvider::new(
+                "codex",
+                Arc::new(SchemaCodec {
+                    inner: OpenAiResponses { codex: true },
+                    format: SchemaFormat::Responses,
+                }),
+                Arc::new(CodexSchemaCredential {
+                    tokens: tokens.clone(),
+                    turn_state: std::sync::Mutex::new(None),
+                }),
+            ))),
         }),
-        Arc::new(CodexSchemaCredential {
-            tokens,
-            turn_state: std::sync::Mutex::new(None),
-        }),
-    )));
-    provider
+    }
 }
 
 struct CodexSchemaCredential {

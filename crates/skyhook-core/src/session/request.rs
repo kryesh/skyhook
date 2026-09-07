@@ -1,5 +1,7 @@
 //! Reconstruct model-visible history and exact provider requests from durable events.
 
+use std::collections::BTreeMap;
+
 use crate::{
     identity::AgentId,
     provider::protocol::{AssistantContent, Message, ModelRequest},
@@ -61,7 +63,7 @@ pub(super) fn validate_compaction(
     let SessionEvent::Compaction { checkpoint } = &record.event else {
         return Ok(());
     };
-    if checkpoint.schema_version != 1 {
+    if !matches!(checkpoint.schema_version, 1 | 2) {
         return Err(invalid("unsupported compaction schema version"));
     }
     if checkpoint
@@ -236,6 +238,55 @@ pub(super) fn reconstruct_from_prefix(
     records: &[EventRecord],
     call: &EventRecord,
 ) -> Result<(String, ModelRequest), SessionError> {
+    // Verify strict ordering before using binary search. Unordered or duplicate
+    // sequences retain the slice API's original first-matching-record semantics.
+    let sorted = records
+        .windows(2)
+        .all(|pair| pair[0].sequence < pair[1].sequence);
+    reconstruct_with_lookup(call, |sequence| {
+        if sorted {
+            records
+                .binary_search_by_key(&sequence, |record| record.sequence)
+                .ok()
+                .map(|index| &records[index])
+        } else {
+            records
+                .iter()
+                .find(|record| record.sequence == sequence && record.agent == call.agent)
+        }
+    })
+}
+
+/// Reconstruct a request directly from a borrowed, sequence-keyed event index.
+///
+/// This clones only the provider name and request contents, not unrelated events.
+/// Each referenced event is resolved in O(log n) time without scanning history.
+/// Keys must equal their records' sequence IDs. Only records with a sequence
+/// strictly before the requested event can supply its context or messages.
+/// Image payload hydration remains the caller's responsibility.
+pub fn reconstruct_model_request_indexed(
+    records: &BTreeMap<u64, EventRecord>,
+    sequence: u64,
+) -> Result<(String, ModelRequest), SessionError> {
+    let call = records
+        .get(&sequence)
+        .filter(|record| record.sequence == sequence)
+        .ok_or(SessionError::ModelRequestReplay {
+            sequence,
+            reason: "event not found",
+        })?;
+    reconstruct_with_lookup(call, |source| {
+        (source < sequence)
+            .then(|| records.get(&source))
+            .flatten()
+            .filter(|record| record.sequence == source)
+    })
+}
+
+fn reconstruct_with_lookup<'a>(
+    call: &EventRecord,
+    mut lookup: impl FnMut(u64) -> Option<&'a EventRecord>,
+) -> Result<(String, ModelRequest), SessionError> {
     let invalid = |reason| SessionError::ModelRequestReplay {
         sequence: call.sequence,
         reason,
@@ -246,9 +297,8 @@ pub(super) fn reconstruct_from_prefix(
     else {
         return Err(invalid("event is not a model request"));
     };
-    let context = records
-        .iter()
-        .find(|record| record.sequence == *context && record.agent == call.agent)
+    let context = lookup(*context)
+        .filter(|record| record.agent == call.agent)
         .ok_or_else(|| invalid("context must precede the call and belong to the same agent"))?;
     let SessionEvent::ModelContext { provider, template } = &context.event else {
         return Err(invalid("referenced event is not a model context"));
@@ -259,13 +309,13 @@ pub(super) fn reconstruct_from_prefix(
         ));
     }
     let mut request = template.clone();
+    request.messages.reserve(messages.len());
     for message in messages {
         request.messages.push(match message {
             ContextMessage::Inline { message } => message.clone(),
             ContextMessage::Source { sequence } => {
-                let source = records
-                    .iter()
-                    .find(|record| record.sequence == *sequence && record.agent == call.agent)
+                let source = lookup(*sequence)
+                    .filter(|record| record.agent == call.agent)
                     .ok_or_else(|| {
                         invalid("message source must precede the call and belong to the same agent")
                     })?;
@@ -441,6 +491,7 @@ mod tests {
         let mut expected = template;
         expected.messages = vec![user, assistant, tool, Message::User(vec![runtime])];
         assert_eq!(restored, expected);
+        assert_indexed_equivalent(&records, call.sequence);
         store.hydrate_model_request(&mut restored).await.unwrap();
         store.hydrate_model_request(&mut expected).await.unwrap();
         assert_eq!(restored, expected);
@@ -572,6 +623,134 @@ mod tests {
             })
             .collect();
         (agent, records)
+    }
+
+    fn assert_indexed_equivalent(records: &[EventRecord], sequence: u64) {
+        let index = records
+            .iter()
+            .map(|record| (record.sequence, record.clone()))
+            .collect();
+        let slice = reconstruct_model_request(records, sequence);
+        let indexed = reconstruct_model_request_indexed(&index, sequence);
+        match (slice, indexed) {
+            (Ok(slice), Ok(indexed)) => assert_eq!(slice, indexed),
+            (
+                Err(SessionError::ModelRequestReplay {
+                    sequence: a,
+                    reason: ar,
+                }),
+                Err(SessionError::ModelRequestReplay {
+                    sequence: b,
+                    reason: br,
+                }),
+            ) => assert_eq!((a, ar), (b, br)),
+            results => panic!("reconstruction differs: {results:?}"),
+        }
+    }
+
+    #[test]
+    fn indexed_reconstruction_matches_slice_and_replay_errors() {
+        let (agent, records) = projection_fixture();
+        // Includes compaction sources, inline messages, non-monotonic source
+        // ordering, a prior context, and later events that must not leak in.
+        for sequence in 0..=10 {
+            assert_indexed_equivalent(&records, sequence);
+        }
+        for context in [0, 1, 4, 8, 9, 99] {
+            let mut invalid = records.clone();
+            let SessionEvent::ModelRequested {
+                context: reference, ..
+            } = &mut invalid[7].event
+            else {
+                unreachable!()
+            };
+            *reference = context;
+            assert!(reconstruct_model_request(&invalid, 8).is_err());
+            assert_indexed_equivalent(&invalid, 8);
+        }
+        for source in [0, 3, 4, 8, 9, 99] {
+            let mut invalid = records.clone();
+            let SessionEvent::ModelRequested { messages, .. } = &mut invalid[7].event else {
+                unreachable!()
+            };
+            messages[0] = ContextMessage::Source { sequence: source };
+            assert!(reconstruct_model_request(&invalid, 8).is_err());
+            assert_indexed_equivalent(&invalid, 8);
+        }
+        for index in [0, 2, 5] {
+            let mut invalid = records.clone();
+            invalid[index].agent = agent.child(1);
+            assert!(reconstruct_model_request(&invalid, 8).is_err());
+            assert_indexed_equivalent(&invalid, 8);
+        }
+        let mut invalid = records.clone();
+        let SessionEvent::ModelContext { template, .. } = &mut invalid[2].event else {
+            unreachable!()
+        };
+        template.messages.push(text_message("duplicated history"));
+        assert!(reconstruct_model_request(&invalid, 8).is_err());
+        assert_indexed_equivalent(&invalid, 8);
+
+        let mut repeated = records.clone();
+        let SessionEvent::ModelRequested { messages, .. } = &mut repeated[7].event else {
+            unreachable!()
+        };
+        messages.push(ContextMessage::Source { sequence: 1 });
+        assert_indexed_equivalent(&repeated, 8);
+    }
+
+    #[test]
+    fn slice_reconstruction_preserves_unordered_and_duplicate_sequence_behavior() {
+        let (agent, records) = projection_fixture();
+        let expected = reconstruct_model_request(&records, 8).unwrap();
+        let mut unordered = records.clone();
+        unordered[..7].reverse();
+        assert_eq!(reconstruct_model_request(&unordered, 8).unwrap(), expected);
+
+        let mut duplicate = records[0].clone();
+        duplicate.agent = agent.child(1);
+        duplicate.event = SessionEvent::MessageCommitted {
+            message: text_message("other agent duplicate is skipped"),
+        };
+        unordered.insert(0, duplicate);
+        assert_eq!(reconstruct_model_request(&unordered, 8).unwrap(), expected);
+
+        // The first same-agent duplicate wins, even when it has the wrong type.
+        let mut duplicate = records[2].clone();
+        duplicate.sequence = 1;
+        unordered.insert(0, duplicate);
+        assert!(matches!(
+            reconstruct_model_request(&unordered, 8),
+            Err(SessionError::ModelRequestReplay {
+                sequence: 8,
+                reason: "referenced event does not contain a conversation message",
+            })
+        ));
+    }
+
+    #[test]
+    fn indexed_reconstruction_rejects_mismatched_keys() {
+        let (_, records) = projection_fixture();
+        let mut index: BTreeMap<_, _> = records
+            .into_iter()
+            .map(|record| (record.sequence, record))
+            .collect();
+        index.get_mut(&1).unwrap().sequence = 99;
+        assert!(matches!(
+            reconstruct_model_request_indexed(&index, 8),
+            Err(SessionError::ModelRequestReplay {
+                sequence: 8,
+                reason: "message source must precede the call and belong to the same agent",
+            })
+        ));
+        index.get_mut(&8).unwrap().sequence = 99;
+        assert!(matches!(
+            reconstruct_model_request_indexed(&index, 8),
+            Err(SessionError::ModelRequestReplay {
+                sequence: 8,
+                reason: "event not found",
+            })
+        ));
     }
 
     #[test]

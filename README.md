@@ -29,8 +29,10 @@ cargo install --path . --locked
 The shims are compiled dynamically for `x86_64-unknown-linux-musl` and
 `aarch64-unknown-linux-musl`, validated as static ELF executables, and embedded in the installed
 `skyhook` command. No prebuilt shim binaries are stored in Git or the Cargo source package. A
-local-only build that does not require Cross is available with `--no-default-features`; SSH use from
-that build returns an explicit missing-shim error.
+local-only build that does not require Cross is available with
+`--no-default-features --features tui`; SSH use from that build returns an explicit missing-shim
+error. The default `tui` feature enables the interactive binary and its UI dependencies;
+`--no-default-features --features shim-bin` builds only the remote shim without those dependencies.
 
 ## Run
 
@@ -40,18 +42,148 @@ export OPENAI_API_KEY=...
 skyhook --prompt "inspect this repository"
 ```
 
-Use `--config path.toml` to use an explicit config instead of the user config, `-m/--model PROFILE`
-to override the root model profile, `--approve-all` to skip all tool approval prompts, and `--workspace PATH`
-to choose the tool root, and `--resume SESSION_ID` to reopen a durable session. Pass a one-shot
-prompt with `-p/--prompt`, or run a JavaScript workflow file through the registered script tool with
-`-s/--script`. Without either option, the CLI reads prompts interactively. Its default policy allows
-reads, agent state operations, and writes inside the root workspace. Process execution, remote
-access, target configuration changes, and writes outside the root workspace require confirmation.
-Set top-level `approve_all = true` in the config for the same non-interactive approval behavior.
-Streamed assistant messages and concise tool-start summaries are prefixed with their session-local
-agent ID (`root`, `1`, `1:1`, and so on), so root and child-agent activity remains distinguishable
-during concurrent workflows. When the CLI closes the session, it prints cumulative output, total
-input, and uncached input token counts.
+Skyhook opens a full-screen terminal interface. `--prompt` submits an initial message;
+`--script workflow.js` starts a JavaScript workflow in the same interface. Both remain open
+for inspection and follow-up input after the work finishes. An interactive terminal is required;
+there is no plain-output or redirected-input conversation mode.
+
+Use `--config path.toml` for explicit configuration, `--workspace PATH` for the workspace,
+`--resume SESSION_ID` to reopen a session, and `-m/--model PROFILE` to choose a model for a new
+session. `--image PATH` attaches an image to the initial `--prompt`. `--approve-all` or
+`approve_all = true` bypasses approval prompts. Otherwise reads, agent operations, and writes
+inside the root workspace are allowed; execution, remote access, target changes, and writes
+outside the workspace require confirmation. Questions and SSH authentication appear in the
+interface for every launch mode.
+
+User messages appear on the right and assistant messages on the left. Tool previews show their
+remote execution target after the tool name, such as `exec @lab-monitoring`; local calls omit `@root`. Tool calls expand inline
+with named argument fields, nested lists, and syntax-highlighted scripts, commands, file content,
+and diffs. JSON results and result pages are pretty-printed; source and plain-text log whitespace
+is preserved. Light and dark themes each control the background and syntax colours; dark mode
+uses a pure black background. All
+formatting is local to the UI and leaves session records unchanged. Click an expanded body to
+collapse it, or drag to select text. The agent tree appears above the composer while children
+are active or a child agent is being viewed, with blank padding matching the input. Click an agent to inspect its conversation
+without mixing its output with other agents. Each agent retains its reading position and expanded rows.
+Agent tree rows show `@target` for non-root agents. Agent call previews show the child's target,
+including while queued or running; an omitted target inherits the calling agent's target.
+Agent rows show their own token totals and context usage in the same compact format as the
+bottom-right session summary: output · input (uncached) · context. The State tab includes the
+same per-agent summary when the terminal is too narrow to show it in the tree.
+Status messages, including interruptions and errors, appear as distinct rows in the conversation
+log and are saved with the session. They are excluded from the model’s context.
+Completed final replies show their recorded model ID in a muted footer below the answer.
+The composer always sends to the root agent. While root is busy, Enter queues a follow-up;
+`/queue` edits/removes queued input, and `/resume` resumes a queue paused by interruption.
+`/retry` continues a failed or interrupted root turn without duplicating the original prompt.
+
+The inspector provides Conversation, Requests, Jobs, and State tabs. Requests show the recorded
+provider-neutral input, committed responses, usage, and compaction checkpoints, including retries. Job output
+is paged and searchable without acknowledging the agent's pending notifications. Select a job
+and press `o` for output fields, regex search, and the next page; `c` requests cancellation.
+Remote output is available after transfer completes. Provider-supplied reasoning streams in a separate
+expanded block with an animated spinner and collapses as soon as answer text starts (or the response
+finishes). Single-line reasoning stays inline without an expand/collapse control, even when it wraps
+in a narrow terminal. Reasoning uses the same Markdown rendering as replies. A separate working
+spinner appears while a request is active without a reasoning spinner. Click a multi-line block or press Enter when selected to
+reopen it, including after resuming a session. `/thinking` toggles expansion of saved reasoning.
+
+### Model selection and UI state
+
+Models are listed in configuration declaration order. For a new session, selection uses
+`--model`, then the most recently submitted configured model, then the first model in the list.
+The old `default_model_profile` configuration key is accepted but ignored. `/model` (or `Ctrl+X M`)
+selects the model for subsequent user messages in the current session. Selection stays in the UI
+until a message is sent; cancelling the picker or leaving without sending does not change the
+session's recorded model. Each submitted message captures its model, including queued messages.
+Tool follow-ups, retries, compaction, and `/retry` retain the active turn's model. The bottom bar
+shows the choice for the next message; reply footers identify the model that actually answered.
+Resumed sessions retain their last applied model and instruction profile. Instruction-profile
+changes still apply only to new sessions. `/models` remains an alias for `/model`.
+Restore a missing recorded profile before resuming rather than substituting another model.
+
+The interface stores the last submitted model and theme selection in `$XDG_STATE_HOME/skyhook/ui.json`, falling back
+to `~/.local/state/skyhook/ui.json`. Writes are atomic and do not rewrite the model configuration.
+Session titles are stored separately from conversation history in each session's `ui.json`.
+
+The bottom bar uses this format:
+
+```text
+default · openai       8.4k · 200k(31.2k) · 42% (54k/128k)
+```
+
+Values are session output tokens, session total input tokens (uncached input), and the selected
+agent's estimated current context occupancy (current tokens/model capacity). Session totals
+include children and compaction. Context includes instructions, tools, history, and runtime
+state; it is not cumulative usage. Missing context data appears as `—`.
+
+### Keyboard and mouse
+
+`Ctrl+X` is a leader: release it, then press the next key within two seconds.
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+P`, `/` | Commands |
+| `Ctrl+X N`, `Ctrl+X L` | New session, session picker |
+| `Ctrl+X M`, `/model` | Model for subsequent user messages |
+| `/profiles` | Instruction profile for new sessions |
+| `Ctrl+X A`, `Ctrl+X I` | Agent picker, conversation inspector |
+| `Ctrl+X S`, `/requests`, `/jobs` | State, requests, jobs |
+| `Ctrl+X ↑`, `Ctrl+X ↓` | Parent, first child |
+| `Ctrl+X T` | Dark/light theme |
+| `Ctrl+X E` | Edit draft in `$EDITOR` |
+| `Ctrl+X Y`, `Ctrl+X X` | Copy message/selection, export conversation |
+| `Tab`, `Shift+Tab` | Focus composer, tree, content |
+| `Enter` | Send/queue, select, expand |
+| `Alt+Enter`, `Ctrl+J`, supported `Shift+Enter` | Newline |
+| `PageUp`, `PageDown` | Scroll history |
+| `Ctrl+Alt+U`, `Ctrl+Alt+D` | Half-page scrolling |
+| `Home`, `End` in content | Beginning, latest |
+| `/`, `n`, `N` in content | Search, next/previous match |
+| `[`, `]` in content | Previous/next inspector tab |
+| `Esc` | Dismiss local interaction or interrupt work |
+| `Ctrl+C` | Clear draft, otherwise interrupt/quit |
+| `Ctrl+X Q` | Quit |
+
+Menus use arrows, the mouse wheel, or `Ctrl+P/N`; Enter or Tab selects. Theme choices
+preview immediately; Escape restores the previous theme and Enter saves the choice. The composer supports word movement,
+selection, `Ctrl+A/E`, `Ctrl+W`, `Ctrl+U/K`, and undo/redo with `Ctrl+-` / `Ctrl+.`.
+Click agent and tool rows, scroll the relevant panel, or drag across text in user/agent messages
+and tool output, then copy the selected characters with `Ctrl+X Y` (or `y` while content is focused).
+Selection supports parts of a line and multiple lines; copying preserves Unicode and code indentation
+without adding newlines at visual wraps.
+The workspace path and session ID in the top bar are plain text; use the terminal emulator’s
+selection gesture (usually Shift-drag) and copy shortcut. The bottom bar shows the model ID
+and token statistics. Copy uses the terminal's OSC 52 clipboard support. `@` attaches a workspace file; `/attach`
+adds an image. Large pastes appear as attachments; click their chips or use `/attachments` to
+inspect or remove them. Pending requests can be reopened with `/attention`. `/diagnostics` lists
+startup warnings such as skipped skills.
+
+Within questions and permissions, `↑`/`↓` selects an answer, `PageUp`/`PageDown` scrolls
+the prompt text, and `Ctrl+PageUp`/`Ctrl+PageDown` scrolls long answer descriptions.
+The mouse wheel scrolls the text or choices beneath the pointer. Drafts remain intact while
+answering questions or inspecting details.
+
+Optional settings live in `$XDG_CONFIG_HOME/skyhook/tui.toml` (or `~/.config/skyhook/tui.toml`):
+
+```toml
+theme = "dark"
+
+[keybinds]
+model = "ctrl+x m"
+inspect = "ctrl+x i"
+# Disable an action binding with "none". /help lists available actions.
+```
+
+### Host observation API
+
+`Config::harness_builder(workspace, model)` takes an explicit model choice from its host.
+`SessionHandle::observe()` returns an atomic snapshot/receiver pair with revisioned updates,
+request-scoped live responses, current activity, and context estimates. On receiver lag, replace
+both with a fresh observation. Durable records are identified by their original sequence.
+`inspect_jobs` and `inspect_output` inspect metadata and saved output without claiming jobs or
+consuming notifications; `cancel_job` explicitly requests cancellation. `SessionStore::read_records`
+reads an archive without acquiring a writer lock or repairing a partial final line.
 
 ## Reconstructing model calls
 
@@ -96,7 +228,7 @@ Historical tool calls and results remain available as evidence. Subsequent agent
 their normal tool definitions. The directive and resulting
 compaction message occupy the user role with separate harness provenance. The model returns a
 structured JSON final answer with an objective and resumption point as strings, all other narrative
-sections as arrays of strings, and a complete current todo list. Empty arrays represent inapplicable
+sections as arrays of strings, a `jobs` array of positive integer job IDs, and a complete current todo list. Empty arrays represent inapplicable
 sections. Reasoning is streamed separately and is not parsed as JSON. Skyhook renders entries in
 order, separated by blank lines, without rewriting their contents. Entries can include Markdown;
 each verbatim plan remains one complete entry, with its status recorded separately.
@@ -133,26 +265,21 @@ request still ends with a fresh state block containing current todos and active 
 independently of reasoning settings. Built-in Flux adapters transmit it through OpenAI Chat
 Completions, Responses, and Anthropic Messages formats. Codex OAuth schema calls use HTTP while
 ordinary calls retain Flux's WebSocket transport. Models/endpoints must support structured output;
-an opaque provider wrapped with `FluxProvider::new` rejects schemas explicitly instead of ignoring
+an opaque backend factory wrapped with `FluxProvider::new` rejects schemas explicitly instead of ignoring
 them. Ordinary agent requests have no response schema.
 
-Original messages and saved job artifacts remain available. The `history` tool reads only the
-calling agent's conversation, including prior compaction messages and job notifications, without
-consuming notifications or exposing reasoning blocks. It supports an exact `source`, a literal
-case-insensitive `query`, and up to 100 text chunks per page, with the complete response limited to
-8 KiB. Use returned `next_cursor` and `through` together, keeping the same source/query, to browse
-a stable snapshot. Returned entry offsets are byte positions in original source text.
+Compaction includes a required `jobs` array of job IDs selected by the compactor, or `[]`.
+Skyhook supplies those jobs' original parameters and normally truncated outputs in the continuation.
+IDs are deduplicated against retained tool results, job notifications, and embedded child results.
+These are saved execution facts, not requests to run the jobs again. The snapshots are persisted
+with the checkpoint; runtime state and `job_output` provide current status and full results.
+Inspection during compaction does not consume pending notifications. Older conversation details
+must be preserved in the continuation; original messages remain journaled for host replay, but
+there is no callable `history` tool.
 
 ```javascript
-const page = await tool.history({query: "rejected approach", limit: 10});
-return page.next_cursor === null ? page : await tool.history({
-  query: "rejected approach", limit: 10, cursor: page.next_cursor, through: page.through
-});
+return tool.job(17).output({field: "/result/stdout", start: 101, limit: 100});
 ```
-
-Sources use `m42/b0` for original text, `m43/b0/result` or `/console` for tool output, and `c50/b0`
-for compaction text. Tool-call arguments are available at `m42/b0/arguments`. Existing job retrieval
-continues to provide complete saved outputs.
 
 Invalid structured responses, truncation, failed persistence, and cancellation leave the preceding
 context and todos active. If the continuation and retained messages do not reduce context, Skyhook skips installing it and continues with
@@ -271,7 +398,6 @@ they are not stored in the TOML file. `openai_compatible` accepts an optional `a
 local endpoint can be keyless. Its `api` is either `chat_completions` or `responses`.
 
 ```toml
-default_model_profile = "local"
 approve_all = false
 targets_enabled = false
 
@@ -357,13 +483,23 @@ errors include it in an `output` field; JavaScript callers can catch the error a
 
 ## Library architecture
 
-- `provider::Provider` returns a boxed asynchronous response stream; concrete
-  adapters live under `provider::backends` and wire types under `provider::protocol`.
+- `provider::Provider` is a shared factory: `open_context(correlation)` creates an owned
+  `ProviderContext`, whose `invoke(&mut self, request)` returns an asynchronous response stream.
+  Adapters live under `provider::backends` and wire types under `provider::protocol`.
+  Custom providers implement both traits; `FluxProvider::new` takes a closure that creates a
+  fresh backend per context. A request's correlation must match its context's identity.
+- Each agent loop owns an `AgentContext`: projected journal history, model profile and request
+  template, token accounting, and its provider handle. Codex contexts have separate WebSocket
+  connection slots and ordinary/schema HTTP routing state, with shared authentication tokens.
+  Handles survive turns, retries, questions, and compaction, and are released when the agent exits.
+  Model-profile changes prepare a replacement before committing, preserve history, and reset token
+  calibration. Equivalent profiles retain their handle. Resuming opens a fresh handle with the
+  same agent cache identity; compaction clears calibration from the previous history projection.
 - `tool::ToolRegistryBuilder` supports typed and JSON-based tools, while `tool::executor::ToolExecutor`
   turns every invocation into a supervised job. Typed registrations generate both input and output
   schemas; compact result shapes are included in model and script documentation.
 - `session::SessionStore` persists a versioned append-only JSONL log, content-addressed image blobs, job
-  outputs, and cursor-addressable job progress.
+  outputs, and line-addressable job output.
 - `agent::Harness` owns profiles and policy; each `agent::SessionHandle` owns an isolated agent tree
   and registry.
 - Child agents are one-shot, profile-selectable agents. Each model-facing `ask` contains one
@@ -379,7 +515,11 @@ child a leaf. A caller may grant less than its own available depth; once no dept
 is omitted from both model tools and script bindings. Its optional `workspace` accepts relative or
 absolute directories for both local and remote children. Relative overrides resolve against the
 workspace selected by the target rules. Children receive a fresh conversation, shared harness
-instructions and host-owned skills, and harness model/profile defaults unless overridden. Agents on
+instructions and host-owned skills, and their parent's active model, including model switches and
+restored session selections. An explicit child `model` takes precedence over the model in an
+explicitly selected `profile`; otherwise the child inherits its parent's model. The harness default
+agent profile still supplies instructions when `profile` is omitted, without changing the inherited
+model. This applies equally to local children, remote children, and deeper descendants. Agents on
 the same target share files; a workspace override creates no filesystem isolation. Children must
 finish or cancel all owned jobs and descendants before their agent job completes. Only root agents
 may leave background services running after answering.
@@ -391,7 +531,7 @@ approval covers descendants. Read and write grants are separate. Process executi
 to confirmation on each invocation.
 
 Background-capable tools accept an optional `bg` argument. Model-facing calls return a job view
-with `id`, `tool`, `state`, and `location`, plus a structured `result`. Only annotated fields are shortened; `truncated` lists their continuation cursors.
+with `id`, `state`, the actual `target` when enabled, and `result`. Workspace is included when it differs from the caller. Listings and notifications also include tool identity and applicable name/parent metadata. Only annotated fields are shortened; `truncated` lists their total line counts and next read positions.
 JavaScript foreground calls return the handler's full native result; background launches return
 a job reference. A child question has `state: "waiting_input"`; `job_output` returns its stable
 question IDs and text in `question`, regardless of its size.
@@ -423,22 +563,22 @@ service survival across harness restarts. `SessionHandle::interrupt` stops activ
 and cancels jobs across the session's agent tree.
 
 `agent`, `exec`, and `shell` accept an optional `name` describing the work. Names must use
-lowercase snake_case: start with a letter, then use lowercase ASCII letters, digits, and single
-underscores between nonempty words. Examples include `inspect_config`, `run_tests`, and `build_v2`.
+lowercase kebab-case: start with a letter, then use lowercase ASCII letters, digits, and single
+hyphens between nonempty words. Examples include `inspect-config`, `run-tests`, and `build-v2`.
 Names are descriptive labels, do not need to be unique, and do not replace job IDs.
 
 ```js
-return tool.exec({argv: ["cargo", "test"], name: "run_tests", bg: true});
+return tool.exec({argv: ["cargo", "test"], name: "run-tests", bg: true});
 ```
 
 Names appear in active-job state, job envelopes (including notifications and inspection), and
 durable job records. They survive session resume. Omitted or null names leave jobs unnamed;
-invalid names are rejected before execution. JavaScript builders also support `.name("run_tests")`.
+invalid names are rejected before execution. JavaScript builders also support `.name("run-tests")`.
 
 ## Todos and runtime context
 
 Every agent has an ordered advisory todo list. `todo()` reads the caller's list;
-`todo({items:[...]})` replaces the whole list, and an empty array clears it. Each item has
+`todo({items:[...]})` replaces the whole list and returns `{updated:true}`; an empty array clears it. Each item has
 `text` and a `status` of `pending`, `in_progress`, or `completed`. Multiple items may be in
 progress. Unfinished items do not prevent an agent from finishing.
 
@@ -459,7 +599,7 @@ return tool.todo({job: child.id});
 The child owns subsequent edits. Ancestors can inspect a descendant using its agent job ID,
 including after it finishes; `items` and `job` cannot be combined. Inspection is available once
 the child has initialized; a queued launch may not have a list yet. Reads and updates return
-`{agent, items}`. An agent without todos has an empty list. Inside the child, progress can be
+`{items}`. An agent without todos has an empty list. Inside the child, progress can be
 updated with the same tool:
 
 ```js
@@ -490,7 +630,7 @@ otherwise it contains only `workspace`.
   "active_jobs": [{
     "job": 7,
     "tool": "exec",
-    "name": "run_tests",
+    "name": "run-tests",
     "state": "running",
     "location": {"workspace": "/home/user/project"},
     "age_seconds": 12
@@ -521,46 +661,98 @@ subsequent retrieval does not reread changed files. Search and glob capture thei
 sets. There is no configured capture-size cap or automatic eviction; storage failures are reported
 as failures, with retained partial output marked incomplete.
 
-Model-facing responses include the job ID, tool, state, location, and a structured `result`.
+Search and glob patterns filter eligible files without overriding hidden-file or ignore settings.
+Tool-owned null metadata is omitted; literal nulls inside file contents, script returns, or user JSON are preserved.
+Process results omit empty streams and false timeout flags, keeping exit code zero and nonempty stderr.
+Completed agent calls return their complete answer string without automatic truncation. Child questions return `{questions:[{id,prompt,options?}]}`.
+
+Directory reads return grouped entries with file sizes, for example:
+`{kind:"directory",path:"src",entries:{files:[{name:"main.rs",bytes:4096}],directories:["lib"]}}`.
+Groups are `files`, `directories`, `symlinks`, and `other`, with sorted names and empty groups omitted.
+`read({path:"src",details:true})` returns flat `{name,kind,bytes?}` entries; regular files include sizes in both forms.
+Search returns `{matches:{"src/main.rs":["12: matching text"]}}`, preserving source whitespace.
+`search({pattern:"...",details:true})` returns structured `{path,line,column,text}` matches instead.
+Empty compact directory/search maps are `{}`. Grouped maps share a single normal preview budget.
+`targets({details:true})` returns full target metadata without nulls; defaults and `target_add` use compact
+name/type/host records with nondefault origin/workspace and configured via where applicable.
+All defaulted input fields, including `details: false`, are optional in tool schemas.
+
+By default, hidden entries (including `.git`) and ignored files are excluded. `hidden: true`
+includes hidden entries, while `no_ignore: true` independently disables ignore files. Searches
+rooted in subdirectories inherit ancestor ignore rules; explicitly requested paths remain accessible.
+
+Model-facing direct responses include the job ID, state, applicable target/workspace, and `result`.
 Only output fields annotated with `x-skyhook-truncatable: true` may be shortened. Each annotated
 field independently retains at most 100 lines or 2 KiB (2048 bytes), whichever is reached first.
-Strings count UTF-8 content bytes before JSON escaping; arrays count their saved JSON text and
-retain only complete items. All other fields remain intact regardless of size, so there is no
+Strings count UTF-8 content bytes before JSON escaping; arrays and grouped maps count their saved JSON text and
+retain only complete items. Grouped maps share one budget across all groups. All other fields remain intact regardless of size, so there is no
 aggregate response-size limit or whole-result fallback.
 
 Annotations cover file `content`, directory `entries`, process `stdout` and `stderr`, search
 `matches`, glob `paths`, skill asset `content`, and shared `console` text. Skill instructions
 remain complete. Shortened fields keep their original types;
-`truncated: [{field, next}]` identifies each one and supplies a cursor starting at the remaining
-content. `capture_complete` separately reports whether capture finished successfully. Errors
+`truncated: [{field, total_lines, next_start, next_offset?}]` identifies each one, reports its
+total source lines, and supplies the exact first unread position. Finished jobs with an incomplete capture include an `Output incomplete.` notice. Errors
 and questions are returned in full. Schemas are persisted with jobs so these rules also apply
 after session resume and to completed remote jobs.
 
-Full JavaScript tool results remain available for programmatic transformations. Arbitrary script
-return values have no truncation annotations and are returned in full; script console text uses
-the shared per-field limit. Explicit `job_output` selections return a `preview`, defaulting to
+Full JavaScript tool results remain available for programmatic transformations. When a script
+returns an unchanged tool-result object or array, it is presented as that child's native job view,
+wherever it appears in the return structure. The view replaces the raw tool result and carries
+the child job ID, bounded annotated fields, and child read positions. A script still produces
+one tool response; custom objects and array ordering are preserved.
+
+Edited tool results remain script-owned data with their original field annotations. Extracted
+original arrays and grouped maps retain annotations; extracted primitive strings and newly constructed data do not.
+Their unannotated content remains complete. Script-owned truncation markers and console text use
+the script job ID; child-view read positions use the child job ID. Presentation never changes the full
+saved return value. Default script output retrieval reproduces the composed views; explicit field
+selections read the saved script data. Background handles and existing job views are not wrapped
+again. Logging and returning the same data explicitly produces both outputs.
+
+Script console text uses the shared per-field limit. Explicit `job_output` selections return a `preview`, defaulting to
 100 lines with bounded page content. Unannotated job metadata is always returned in full.
 
 ```js
 // Read a selected part of a saved result.
 job_output({job:42, field:"/result/stdout", start:300, limit:80})
-// Search stored text, with source line numbers and surrounding context.
+// Search stored text, with surrounding context.
 job_output({job:42, field:"/result/stderr", pattern:"(?i)error|warning", context:2})
-// Resume an opaque saved cursor, optionally waiting for new output.
-job_output({job:42, cursor:"...", wait:30})
+// Continue at the returned source line and UTF-8 byte offset.
+job_output({job:42, field:"/result/stdout", start:22, offset:54, limit:100, wait:30})
 ```
 
 `field` is a JSON Pointer: `/result/content` selects a file snapshot, `/result/stdout` and
 `/result/stderr` select process streams, and `/console` selects script console text. Objects and
 arrays have deterministic JSON text views. Long lines are split into UTF-8-safe fragments;
-`line` and `offset` identify each fragment. Regex matching is case-sensitive unless inline flags override it. Matching supports lines up to 4 MiB and reports
-an explicit resource error for larger lines; ordinary paging can still read those lines.
+the next position identifies where to continue. Regex matching is case-sensitive unless inline
+flags override it. Matching supports lines up to 4 MiB and reports an explicit resource error
+for larger lines; ordinary paging can still read those lines.
 
-`limit` is 1–1000 lines, `start` is one-based, `context` is 0–20 surrounding lines, and `wait`
-is 0–3600 seconds (default 0). A cursor retains its field and query: do not combine it with
-`field`, `start`, `pattern`, or `context`; `limit` and `wait` can change. Cursors are repeatable
-and survive session resume. `next` continues retained content; `capture_complete` separately
-reports whether capture finished successfully. A wait timeout never stops the original job.
+`start` is one-based (default 1); `offset` is a zero-based UTF-8 byte offset within that
+starting line (default 0). `limit` is 1–1000 returned source lines (default 100), including
+match context. `context` is 0–20 surrounding lines (default 0); positive context requires `pattern`; `wait` is 0–3600
+seconds (default 0). Every argument with a default is optional in the tool schema.
+
+Explicit read pages contain `field` and `lines`, plus `total_lines` when known and a next position when more content may be available.
+`lines` is an array of strings, one per returned line (or fragment of an oversized line),
+without per-line objects or match flags. Empty fields have zero lines;
+a final unterminated line counts, and a trailing newline does not add an empty line.
+Read pages and automatic string previews prefer whole lines; oversized lines are split at
+UTF-8 boundaries. The page byte budget may return fewer lines than `limit`: use the returned
+position instead of computing `start + limit`. Offsets beyond a line or inside a UTF-8
+character are rejected. A start past the available lines returns an empty page with the total.
+
+For closed fields, an omitted `next_start` means no selected content remains. Omitted `next_offset` means zero.
+For running fields, the total describes currently captured output and the numeric next position
+can be retried with `wait`, even when no content is currently available. Unavailable output omits
+`total_lines`; known empty output retains zero. Repeat the field, regex, and context when continuing a search; overlapping
+match context is reconstructed from saved text. Live searches defer incomplete lines and context
+windows until more output arrives or capture closes. A wait timeout never stops the original job.
+
+Reads are repeatable and survive session resume, without opaque tokens or saved query state.
+The old `cursor` argument is no longer accepted. Capture completeness remains internal; finished
+jobs with retained partial output have an `Output incomplete.` notice.
 
 Local process output can be read while running. Remote shims capture first and transfer their
 results in bounded frames after execution completes. Once transferred, output can be queried
@@ -577,8 +769,8 @@ configuration directory and `.agents/skills` directories along the workspace anc
 
 ```sh
 cargo test -p skyhook-agent-core --all-targets
-cargo test -p skyhook-agent --all-targets --no-default-features
-cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+cargo test -p skyhook-agent --all-targets --no-default-features --features tui
+cargo clippy --workspace --all-targets --no-default-features --features tui -- -D warnings
 ```
 
 Build both statically linked Linux shims and the release CLI with

@@ -1080,8 +1080,12 @@ mod tests {
                     result.map_err(RemoteError::into_tool_error)?.map(Into::into).map_err(|e| ToolError::Failed(e.message))
                 }
             }).unwrap();
-            let result = runtime
-                .executor(builder)
+            let script_slot = Arc::new(std::sync::OnceLock::new());
+            crate::tool::builtins::install_script_tool(&mut builder, Arc::downgrade(&script_slot))
+                .unwrap();
+            let executor = runtime.executor(builder);
+            script_slot.set(executor.clone()).ok().unwrap();
+            let result = executor
                 .execute(
                     runtime.agent.clone(),
                     "remote_fixture",
@@ -1103,6 +1107,26 @@ mod tests {
                 assert_eq!(view["result"]["stdout"], "line\n".repeat(100));
                 assert_eq!(view["result"]["exit_code"], 0);
                 assert_eq!(view["truncated"][0]["field"], "/result/stdout");
+                let script = executor.execute_model(runtime.agent.clone(), "script", serde_json::json!({
+                    "source":"const remote = await tool.remote_fixture({}); if (remote.stdout.length !== 1250000) throw new Error('truncated inside script'); return {remote};"
+                }), None).await.unwrap();
+                let child = &script.output.value["result"]["remote"];
+                assert_eq!(child["tool"], "remote_fixture");
+                assert_eq!(child["result"]["stdout"], "line\n".repeat(100));
+                let mut query = crate::job::output::OutputArgs::new(
+                    serde_json::from_value(child["id"].clone()).unwrap(),
+                );
+                query.field = Some(child["truncated"][0]["field"].as_str().unwrap().into());
+                query.start = Some(child["truncated"][0]["next_start"].as_u64().unwrap() as usize);
+                query.offset =
+                    Some(child["truncated"][0]["next_offset"].as_u64().unwrap_or(0) as usize);
+                let page = runtime
+                    .jobs
+                    .present_output(query, &Default::default())
+                    .await
+                    .unwrap();
+                assert_eq!(child["truncated"][0]["next_start"], 101);
+                assert_eq!(page["preview"]["lines"][0], "line");
             } else {
                 assert!(result.is_err());
                 let job = runtime.jobs.list(&runtime.agent).await[0].id;
@@ -1114,8 +1138,9 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(view["state"], "failed");
-                assert_eq!(view["preview"]["lines"][0]["text"], "retained prefix");
-                assert_eq!(view["preview"]["capture_complete"], false);
+                assert_eq!(view["preview"]["lines"][0], "retained prefix");
+                assert_eq!(view["notice"], "Output incomplete.");
+                assert!(view["preview"].get("capture_complete").is_none());
             }
         }
     }

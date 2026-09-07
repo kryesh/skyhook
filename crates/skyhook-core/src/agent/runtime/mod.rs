@@ -35,13 +35,19 @@ use crate::{
 
 pub use super::error::HarnessError;
 use super::interaction::{QuestionHandler, RuntimeEvent};
+use super::observation::RuntimeEvents;
+use super::{AgentActivity, Observation};
 use super::{TodoItem, TodoSnapshot, todo::TodoStore};
 
 mod compact;
 #[cfg(test)]
 mod compact_tests;
 mod compaction;
-mod history;
+mod context;
+#[cfg(test)]
+mod context_tests;
+use context::AgentContext;
+pub(super) use context::recorded_context;
 mod prompt;
 mod questions;
 mod tools;
@@ -280,18 +286,15 @@ impl Harness {
             )
             .await?;
         let runtime = SessionRuntime::build(self.inner.clone(), store, vec![started]).await?;
-        runtime.start_root(Vec::new()).await
+        runtime.start_root(None).await
     }
 
     pub async fn resume_session(&self, id: SessionId) -> Result<SessionHandle, HarnessError> {
         let (store, records) = SessionStore::open(&self.inner.session_root, id).await?;
         let root = AgentId::root(id);
-        let history = crate::session::project_history(&records, &root)?
-            .into_iter()
-            .map(|(_, message)| message)
-            .collect();
+        let selection = crate::session::agent_selection(&records, &root);
         let runtime = SessionRuntime::build(self.inner.clone(), store, records).await?;
-        runtime.start_root(history).await
+        runtime.start_root(selection).await
     }
 }
 
@@ -300,6 +303,13 @@ pub struct SessionHandle {
     runtime: Arc<SessionRuntime>,
     root: AgentId,
     root_tx: mpsc::Sender<AgentCommand>,
+}
+
+/// Options captured when a user submits a message, including queued messages.
+#[derive(Clone, Debug, Default)]
+pub struct PromptOptions {
+    /// Configured model profile for this turn. Omitted retains the agent's active model.
+    pub model: Option<String>,
 }
 
 impl SessionHandle {
@@ -318,7 +328,52 @@ impl SessionHandle {
         self.runtime.events.subscribe()
     }
 
-    /// Returns cumulative model usage for the session, including usage restored on resume.
+    /// Observe without a gap between the initial snapshot and subsequent updates.
+    pub async fn observe(&self) -> Observation {
+        self.runtime.catch_up_store_events().await;
+        self.runtime.events.observe()
+    }
+
+    /// Host diagnostics that must not write directly to a terminal.
+    pub fn warnings(&self) -> &[String] {
+        self.runtime.harness.skills.warnings()
+    }
+
+    pub fn directory(&self) -> &Path {
+        self.runtime.store.directory()
+    }
+
+    /// Persist a host-facing status without adding it to the agent's model context.
+    pub async fn record_status(&self, agent: AgentId, message: String) -> Result<(), HarnessError> {
+        self.runtime
+            .store
+            .append(agent, SessionEvent::Status { message })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn inspect_jobs(&self, agent: &AgentId) -> Vec<crate::job::JobEnvelope> {
+        self.runtime.jobs.list(agent).await
+    }
+
+    pub async fn inspect_output(
+        &self,
+        mut query: crate::job::JobOutputQuery,
+    ) -> Result<serde_json::Value, crate::tool::ToolError> {
+        query.wait = Some(0);
+        self.runtime
+            .jobs
+            .inspect_output(query, &self.runtime.harness.capabilities)
+            .await
+    }
+
+    pub async fn cancel_job(
+        &self,
+        job: JobId,
+    ) -> Result<crate::job::JobEnvelope, crate::job::JobError> {
+        self.runtime.jobs.cancel(job).await
+    }
+
     pub async fn usage(&self) -> Usage {
         *self.runtime.usage.lock().await
     }
@@ -335,8 +390,13 @@ impl SessionHandle {
     }
 
     pub async fn prompt(&self, text: impl Into<String>) -> Result<String, HarnessError> {
-        self.submit(vec![UserContent::Text { text: text.into() }])
+        self.prompt_with_options(text, &[], PromptOptions::default())
             .await
+    }
+
+    /// Continue retained history after a failed/interrupted turn, without duplicating its input.
+    pub async fn continue_turn(&self) -> Result<String, HarnessError> {
+        self.submit(Vec::new(), None).await
     }
 
     /// Execute a JavaScript workflow through the session's registered `script` tool.
@@ -369,6 +429,22 @@ impl SessionHandle {
         text: impl Into<String>,
         paths: &[PathBuf],
     ) -> Result<String, HarnessError> {
+        self.prompt_with_options(text, paths, PromptOptions::default())
+            .await
+    }
+
+    /// Submit a user message with a model fixed for the entire resulting turn.
+    pub async fn prompt_with_options(
+        &self,
+        text: impl Into<String>,
+        paths: &[PathBuf],
+        options: PromptOptions,
+    ) -> Result<String, HarnessError> {
+        if let Some(model) = &options.model
+            && !self.runtime.harness.model_profiles.contains_key(model)
+        {
+            return Err(HarnessError::UnknownModelProfile(model.clone()));
+        }
         if paths.len() > MAX_IMAGES_PER_SUBMISSION {
             return Err(HarnessError::ImageLimit);
         }
@@ -399,13 +475,18 @@ impl SessionHandle {
                 .await?;
             content.push(UserContent::Image { image });
         }
-        self.submit(content).await
+        self.submit(content, options.model).await
     }
 
-    async fn submit(&self, content: Vec<UserContent>) -> Result<String, HarnessError> {
+    async fn submit(
+        &self,
+        content: Vec<UserContent>,
+        model: Option<String>,
+    ) -> Result<String, HarnessError> {
         let (done_tx, done_rx) = oneshot::channel();
         self.root_tx
             .send(AgentCommand::Input {
+                model,
                 content,
                 done: Some(done_tx),
             })
@@ -420,10 +501,9 @@ impl SessionHandle {
     pub async fn shutdown(&self) -> Result<(), HarnessError> {
         self.runtime.interrupt_tree(&self.root).await;
         self.runtime.router.shutdown().await;
-        self.root_tx
-            .send(AgentCommand::Shutdown)
-            .await
-            .map_err(|_| HarnessError::AgentStopped)
+        // A closed command channel means the root already stopped. Shutdown is idempotent.
+        let _ = self.root_tx.send(AgentCommand::Shutdown).await;
+        Ok(())
     }
 
     pub async fn interrupt(&self) -> usize {
@@ -444,10 +524,13 @@ struct SessionRuntime {
     child_counters: RwLock<HashMap<AgentId, u32>>,
     questions: Arc<questions::QuestionCoordinator>,
     usage: Mutex<Usage>,
-    events: broadcast::Sender<RuntimeEvent>,
+    events: RuntimeEvents,
+    // Fully replayed journal prefix, not the highest (possibly out-of-order) live event.
+    caught_up_sequence: Mutex<u64>,
 }
 
 struct LiveAgent {
+    model_profile: String,
     sender: mpsc::Sender<AgentCommand>,
     cancellation: CancellationToken,
     available_depth: usize,
@@ -455,6 +538,7 @@ struct LiveAgent {
 
 enum AgentCommand {
     Input {
+        model: Option<String>,
         content: Vec<UserContent>,
         done: Option<oneshot::Sender<Result<String, String>>>,
     },
@@ -468,7 +552,6 @@ struct AgentLaunch {
     owner_job: Option<JobId>,
     model_profile: String,
     agent_profile: Option<String>,
-    history: Vec<Message>,
     todos: Option<Vec<TodoItem>>,
     one_shot: bool,
     available_depth: usize,
@@ -478,9 +561,8 @@ struct AgentLaunch {
 struct AgentLoop {
     id: AgentId,
     owner_job: Option<JobId>,
-    profile: ModelProfile,
-    system: Vec<SystemSegment>,
-    history: Vec<Message>,
+    context: AgentContext,
+    model_profile: String,
     one_shot: bool,
     location: crate::execution::ExecutionLocation,
     capabilities: CapabilitySet,
@@ -489,8 +571,6 @@ struct AgentLoop {
 
 struct TurnContext<'a> {
     agent: &'a AgentId,
-    profile: &'a ModelProfile,
-    system: &'a [SystemSegment],
     owner_job: Option<JobId>,
     cancellation: &'a CancellationToken,
     location: &'a crate::execution::ExecutionLocation,
@@ -498,6 +578,13 @@ struct TurnContext<'a> {
 }
 
 impl SessionRuntime {
+    fn activity(&self, agent: &AgentId, activity: AgentActivity) {
+        let _ = self.events.send(RuntimeEvent::Activity {
+            agent: agent.clone(),
+            activity,
+        });
+    }
+
     async fn build(
         harness: Arc<HarnessInner>,
         store: SessionStore,
@@ -551,7 +638,9 @@ impl SessionRuntime {
         executor_slot
             .set(executor.clone())
             .map_err(|_| HarnessError::Initialization("executor already set".to_owned()))?;
-        let (events, _) = broadcast::channel(1024);
+        let records = store.records().await;
+        let caught_up_sequence = Mutex::new(records.last().map_or(0, |record| record.sequence));
+        let events = RuntimeEvents::new(&records);
         let mut usage = Usage::default();
         for record in &prior_records {
             if let SessionEvent::Usage { usage: value, .. } = &record.event {
@@ -587,6 +676,7 @@ impl SessionRuntime {
             questions,
             usage: Mutex::new(usage),
             events,
+            caught_up_sequence,
         });
         runtime_slot
             .set(Arc::downgrade(&runtime))
@@ -598,17 +688,22 @@ impl SessionRuntime {
 
     async fn start_root(
         self: &Arc<Self>,
-        history: Vec<Message>,
+        selection: Option<(String, Option<String>)>,
     ) -> Result<SessionHandle, HarnessError> {
         let root = AgentId::root(self.store.id());
+        let (model_profile, agent_profile) = selection.unwrap_or_else(|| {
+            (
+                self.harness.default_model_profile.clone(),
+                self.harness.default_agent_profile.clone(),
+            )
+        });
         let root_tx = self
             .spawn_agent(AgentLaunch {
                 id: root.clone(),
                 parent: None,
                 owner_job: None,
-                model_profile: self.harness.default_model_profile.clone(),
-                agent_profile: self.harness.default_agent_profile.clone(),
-                history,
+                model_profile,
+                agent_profile,
                 todos: None,
                 one_shot: false,
                 available_depth: self.harness.max_child_depth,
@@ -622,16 +717,33 @@ impl SessionRuntime {
         })
     }
 
+    async fn catch_up_store_events(&self) {
+        // Serialize catchups so the cursor advances only after the entire prefix is
+        // published. Live forwarding may race ahead; RuntimeEvents deduplicates it.
+        let mut sequence = self.caught_up_sequence.lock().await;
+        for record in self.store.records_after(*sequence).await {
+            let next_sequence = record.sequence;
+            let _ = self.events.send(RuntimeEvent::Record(Box::new(record)));
+            *sequence = next_sequence;
+        }
+    }
+
     fn forward_store_events(self: &Arc<Self>) {
         let mut source = self.store.subscribe();
         let events = self.events.clone();
+        let runtime = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
                 match source.recv().await {
                     Ok(record) => {
                         let _ = events.send(RuntimeEvent::Record(Box::new(record)));
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let Some(runtime) = runtime.upgrade() else {
+                            break;
+                        };
+                        runtime.catch_up_store_events().await;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -672,6 +784,7 @@ impl SessionRuntime {
         let mut cancelled = 0;
         for (agent, cancellation) in targets {
             cancellation.cancel();
+            self.activity(&agent, AgentActivity::Interrupted);
             cancelled += self.jobs.cancel_all(&agent).await;
         }
         cancelled
@@ -687,7 +800,6 @@ impl SessionRuntime {
             owner_job,
             model_profile,
             agent_profile,
-            history,
             todos,
             one_shot,
             available_depth,
@@ -711,6 +823,9 @@ impl SessionRuntime {
                 &capabilities,
             )
             .await?;
+        let context = self
+            .open_agent_context(&id, profile, system, &capabilities, true)
+            .await?;
         self.store
             .append(
                 id.clone(),
@@ -718,6 +833,7 @@ impl SessionRuntime {
                     parent,
                     owner_job,
                     model_profile: model_profile.clone(),
+                    max_context: Some(context.profile.max_context),
                     agent_profile: agent_profile.clone(),
                     location: location.clone(),
                 },
@@ -734,20 +850,21 @@ impl SessionRuntime {
             .insert(
                 id.clone(),
                 LiveAgent {
+                    model_profile: model_profile.clone(),
                     sender: tx.clone(),
                     cancellation: CancellationToken::new(),
                     available_depth,
                 },
             );
+        self.activity(&id, AgentActivity::Idle);
         let runtime = self.clone();
         tokio::spawn(async move {
             runtime
                 .run_agent(AgentLoop {
                     id,
                     owner_job,
-                    profile,
-                    system,
-                    history,
+                    context,
+                    model_profile,
                     one_shot,
                     location,
                     capabilities,
@@ -835,16 +952,12 @@ impl SessionRuntime {
         available_depth: usize,
         capabilities: &CapabilitySet,
     ) -> Result<(ModelProfile, Vec<SystemSegment>), HarnessError> {
-        let mut selected_model = model_profile.to_owned();
         let profile_instructions = if let Some(name) = agent_profile {
             let profile = self
                 .harness
                 .agent_profiles
                 .get(name)
                 .ok_or_else(|| HarnessError::UnknownAgentProfile(name.to_owned()))?;
-            if let Some(name) = &profile.model_profile {
-                selected_model.clone_from(name);
-            }
             Some(profile.instructions.as_str())
         } else {
             None
@@ -852,9 +965,9 @@ impl SessionRuntime {
         let profile = self
             .harness
             .model_profiles
-            .get(&selected_model)
+            .get(model_profile)
             .cloned()
-            .ok_or(HarnessError::UnknownModelProfile(selected_model))?;
+            .ok_or_else(|| HarnessError::UnknownModelProfile(model_profile.to_owned()))?;
         let target = if location.is_root() {
             None
         } else {
@@ -872,13 +985,50 @@ impl SessionRuntime {
         Ok((profile, system))
     }
 
+    async fn open_agent_context(
+        &self,
+        agent: &AgentId,
+        profile: ModelProfile,
+        system: Vec<SystemSegment>,
+        capabilities: &CapabilitySet,
+        restore_meter: bool,
+    ) -> Result<AgentContext, HarnessError> {
+        let factory = self
+            .harness
+            .providers
+            .get(&profile.provider)
+            .ok_or_else(|| HarnessError::UnknownProvider(profile.provider.clone()))?;
+        let template = ModelRequest {
+            model: profile.model.clone(),
+            system,
+            messages: Vec::new(),
+            tools: self
+                .executor
+                .clone()
+                .with_capabilities(capabilities.clone())
+                .surface()
+                .definitions(),
+            reasoning: profile.reasoning.clone(),
+            response_schema: None,
+            max_output_tokens: Some(profile.max_output),
+            correlation: Some(agent.to_string()),
+        };
+        AgentContext::open(
+            agent,
+            profile,
+            template,
+            factory.as_ref(),
+            &self.store.records().await,
+            restore_meter,
+        )
+    }
+
     async fn run_agent(self: Arc<Self>, agent_loop: AgentLoop) {
         let AgentLoop {
             id,
             owner_job,
-            profile,
-            system,
-            mut history,
+            mut context,
+            mut model_profile,
             one_shot,
             location,
             capabilities,
@@ -909,7 +1059,7 @@ impl SessionRuntime {
                 }
                 command = rx.recv() => match command { Some(command) => command, None => break },
             };
-            let (content, done) = match command {
+            let (content, done, selected_model) = match command {
                 AgentCommand::Shutdown => {
                     let _ = self
                         .store
@@ -917,7 +1067,11 @@ impl SessionRuntime {
                         .await;
                     break;
                 }
-                AgentCommand::Input { content, done } => (content, done),
+                AgentCommand::Input {
+                    content,
+                    done,
+                    model,
+                } => (content, done, model),
                 AgentCommand::JobsReady => {
                     let pending = match self.jobs.take_pending(&id).await {
                         Ok(pending) if !pending.is_empty() => pending,
@@ -942,9 +1096,11 @@ impl SessionRuntime {
                     for job in &pending {
                         match self
                             .jobs
-                            .present_output(
+                            .present_output_for(
                                 crate::job::output::OutputArgs::new(job.id),
                                 &capabilities,
+                                &location,
+                                true,
                             )
                             .await
                         {
@@ -960,9 +1116,71 @@ impl SessionRuntime {
                             serde_json::to_string(&presented).unwrap_or_else(|_| "[]".to_owned())
                         ),
                     }];
-                    (content, None)
+                    (content, None, None)
                 }
             };
+            // Register cancellation before persisting a model change, which may yield.
+            let cancellation = self.begin_turn(&id);
+            if let Some(model) = selected_model.filter(|model| model != &model_profile) {
+                let result = async {
+                    let selected = self
+                        .harness
+                        .model_profiles
+                        .get(&model)
+                        .cloned()
+                        .ok_or_else(|| HarnessError::UnknownModelProfile(model.clone()))?;
+                    let replacement = if selected != context.profile {
+                        let replacement = self
+                            .open_agent_context(
+                                &id,
+                                selected.clone(),
+                                context.template.system.clone(),
+                                &capabilities,
+                                false,
+                            )
+                            .await?;
+                        if !selected.supports_images && replacement.contains_images() {
+                            return Err(HarnessError::ImagesUnsupported(selected.model.clone()));
+                        }
+                        Some(replacement)
+                    } else {
+                        None
+                    };
+                    self.store
+                        .append(
+                            id.clone(),
+                            SessionEvent::ModelChanged {
+                                model_profile: model.clone(),
+                                max_context: selected.max_context,
+                            },
+                        )
+                        .await?;
+                    Ok::<_, HarnessError>(replacement)
+                }
+                .await;
+                match result {
+                    Ok(replacement) => {
+                        if let Some(replacement) = replacement {
+                            context = replacement;
+                        }
+                        model_profile = model;
+                        if let Some(agent) = self
+                            .agents
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get_mut(&id)
+                        {
+                            agent.model_profile.clone_from(&model_profile);
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(done) = done {
+                            let _ = done.send(Err(error.to_string()));
+                        }
+                        continue;
+                    }
+                }
+            }
             let done = if one_shot {
                 if done.is_some() {
                     child_done = done;
@@ -971,35 +1189,49 @@ impl SessionRuntime {
             } else {
                 done
             };
-            let cancellation = self.begin_turn(&id);
-            let message = Message::User(content);
-            if let Err(error) = self.commit(&id, message.clone()).await {
-                if let Some(done) = done.or_else(|| child_done.take()) {
-                    let _ = done.send(Err(error.to_string()));
+            self.activity(&id, AgentActivity::Working);
+            if !content.is_empty() {
+                let message = Message::User(content);
+                let committed = self.commit(&id, message.clone()).await;
+                if let Err(error) = &committed {
+                    if let Some(done) = done.or_else(|| child_done.take()) {
+                        let _ = done.send(Err(error.to_string()));
+                    }
+                    if one_shot {
+                        self.interrupt_tree(&id).await;
+                        break;
+                    }
+                    continue;
                 }
-                if one_shot {
-                    self.interrupt_tree(&id).await;
-                    break;
-                }
-                continue;
+                context
+                    .projected
+                    .push((committed.expect("commit succeeded"), message));
             }
-            history.push(message);
             let result = tokio::select! {
                 biased;
                 () = owner_cancellation.cancelled() => Err(HarnessError::Interrupted),
                 result = self.run_turn(
                     TurnContext {
                         agent: &id,
-                        profile: &profile,
-                        system: &system,
                         owner_job,
                         cancellation: &cancellation,
                         location: &location,
                         capabilities: &capabilities,
                     },
-                    &mut history,
+                    &mut context,
                 ) => result,
             };
+            self.activity(
+                &id,
+                match &result {
+                    Err(HarnessError::Interrupted) => AgentActivity::Interrupted,
+                    Err(error) => AgentActivity::Failed(error.to_string()),
+                    Ok(_) if one_shot && self.jobs.has_running(&id).await => {
+                        AgentActivity::WaitingChildren
+                    }
+                    Ok(_) => AgentActivity::Idle,
+                },
+            );
             if let Some(done) = done {
                 let _ = done.send(
                     result
@@ -1055,44 +1287,22 @@ impl SessionRuntime {
     async fn run_turn(
         &self,
         turn: TurnContext<'_>,
-        history: &mut Vec<Message>,
+        agent_context: &mut AgentContext,
     ) -> Result<String, HarnessError> {
         let TurnContext {
             agent,
-            profile,
-            system,
             owner_job,
             cancellation,
             location,
             capabilities,
         } = turn;
-        if !profile.supports_images && contains_images(history) {
+        let profile = agent_context.profile.clone();
+        if !profile.supports_images && agent_context.contains_images() {
             return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
         }
-        let provider = self
-            .harness
-            .providers
-            .get(&profile.provider)
-            .cloned()
-            .ok_or_else(|| HarnessError::UnknownProvider(profile.provider.clone()))?;
-        let template = ModelRequest {
-            model: profile.model.clone(),
-            system: system.to_vec(),
-            messages: Vec::new(),
-            tools: self
-                .executor
-                .clone()
-                .with_capabilities(capabilities.clone())
-                .surface()
-                .definitions(),
-            reasoning: profile.reasoning.clone(),
-            response_schema: None,
-            max_output_tokens: Some(profile.max_output),
-            correlation: Some(agent.to_string()),
-        };
+        let template = agent_context.template.clone();
         let mut context_sequence = None;
         let mut final_text = String::new();
-        let mut meter = compact::TokenMeter::restore(&self.store.records().await, agent, &template);
         let mut force_compaction = false;
         let mut provider_attempt = 0u8;
         let mut compaction_checked = false;
@@ -1117,53 +1327,29 @@ impl SessionRuntime {
                     record.sequence
                 }
             };
-            let mut projected =
-                crate::session::project_history(&self.store.records().await, agent)?;
+            agent_context.refresh(&self.store.records().await, agent)?;
             let runtime =
                 prompt::runtime_state_content(&self.jobs, &self.todos, agent, capabilities).await;
-            let mut request = template.clone();
-            request.messages = projected
-                .iter()
-                .map(|(_, message)| message.clone())
-                .collect();
-            request.messages.push(Message::User(vec![runtime]));
-            if force_compaction
-                || (!compaction_checked
-                    && meter.estimate(&request)
-                        >= profile.max_context.saturating_sub(profile.max_output))
+            let mut request = agent_context.request(runtime);
+            if force_compaction || (!compaction_checked && agent_context.needs_compaction(&request))
             {
                 self.compact_history(
-                    &TurnContext {
-                        agent,
-                        profile,
-                        system,
-                        owner_job,
-                        cancellation,
-                        location,
-                        capabilities,
-                    },
-                    provider.as_ref(),
+                    &turn,
+                    agent_context.provider.as_mut(),
                     context,
                     &request,
+                    profile.max_context,
                 )
                 .await?;
                 force_compaction = false;
                 compaction_checked = true;
-                projected = crate::session::project_history(&self.store.records().await, agent)?;
-                request.messages = projected
-                    .iter()
-                    .map(|(_, message)| message.clone())
-                    .collect();
+                agent_context.refresh(&self.store.records().await, agent)?;
                 let runtime =
                     prompt::runtime_state_content(&self.jobs, &self.todos, agent, capabilities)
                         .await;
-                request.messages.push(Message::User(vec![runtime]));
+                request = agent_context.request(runtime);
             }
-            *history = projected
-                .iter()
-                .map(|(_, message)| message.clone())
-                .collect();
-            let mut messages = compact::context_sources(&projected);
+            let mut messages = compact::context_sources(&agent_context.projected);
             messages.push(crate::session::ContextMessage::Inline {
                 message: request
                     .messages
@@ -1182,11 +1368,17 @@ impl SessionRuntime {
                     },
                 )
                 .await?;
+            self.activity(agent, AgentActivity::Working);
+            let _ = self.events.send(RuntimeEvent::Context {
+                agent: agent.clone(),
+                tokens: agent_context.meter.estimate(&request),
+                capacity: profile.max_context,
+            });
             let input_estimate = compaction::estimate_request(&request);
             self.store.hydrate_model_request(&mut request).await?;
             provider_attempt += 1;
             let invoked = tokio::select! {
-                response = provider.invoke(request) => response,
+                response = agent_context.provider.invoke(request) => response,
                 () = cancellation.cancelled() => return Err(HarnessError::Interrupted),
             };
             let mut response = match invoked {
@@ -1213,6 +1405,7 @@ impl SessionRuntime {
             };
             let mut blocks = Vec::new();
             let mut streamed_text = String::new();
+            let mut streamed_reasoning = String::new();
             let mut usage = Usage::default();
             loop {
                 let chunk = tokio::select! {
@@ -1252,13 +1445,16 @@ impl SessionRuntime {
                     ResponseChunk::TextDelta { text } => {
                         let _ = self.events.send(RuntimeEvent::TextDelta {
                             agent: agent.clone(),
+                            request: requested.sequence,
                             text: text.clone(),
                         });
                         streamed_text.push_str(&text);
                     }
                     ResponseChunk::ReasoningDelta { text } => {
+                        streamed_reasoning.push_str(&text);
                         let _ = self.events.send(RuntimeEvent::ReasoningDelta {
                             agent: agent.clone(),
+                            request: requested.sequence,
                             text,
                         });
                     }
@@ -1267,7 +1463,7 @@ impl SessionRuntime {
                     ResponseChunk::Finished { .. } => {}
                 }
             }
-            let response = match finish_response(blocks, streamed_text, usage) {
+            let response = match finish_response(blocks, streamed_text, streamed_reasoning, usage) {
                 Ok(response) => response,
                 Err(error) => {
                     if usage != Usage::default() {
@@ -1294,10 +1490,24 @@ impl SessionRuntime {
             final_text.push_str(&response.text);
             let assistant = Message::Assistant(response.blocks);
             let origin = self.commit(agent, assistant.clone()).await?;
-            history.push(assistant);
+            agent_context.projected.push((origin, assistant));
+            let _ = self.events.send(RuntimeEvent::ResponseSettled {
+                agent: agent.clone(),
+                request: requested.sequence,
+                message: Some(origin),
+                error: None,
+            });
             self.record_model_usage(agent, requested.sequence, response.usage)
                 .await?;
-            meter.observe(input_estimate, response.usage);
+            agent_context.meter.observe(input_estimate, response.usage);
+            let runtime =
+                prompt::runtime_state_content(&self.jobs, &self.todos, agent, capabilities).await;
+            let current = agent_context.request(runtime);
+            let _ = self.events.send(RuntimeEvent::Context {
+                agent: agent.clone(),
+                tokens: agent_context.meter.estimate(&current),
+                capacity: profile.max_context,
+            });
             provider_attempt = 0;
             compaction_checked = false;
             if response.calls.is_empty() {
@@ -1310,13 +1520,14 @@ impl SessionRuntime {
             self.questions
                 .prepare_question_batch(agent, &response.calls)
                 .await;
+            self.activity(agent, AgentActivity::Tools);
             let results = join_all(response.calls.iter().map(|call| {
                 self.execute_call(agent, owner_job, call, origin, location, capabilities)
             }))
             .await;
             let tools = Message::Tool(results);
-            self.commit(agent, tools.clone()).await?;
-            history.push(tools);
+            let sequence = self.commit(agent, tools.clone()).await?;
+            agent_context.projected.push((sequence, tools));
         }
     }
 
@@ -1392,6 +1603,7 @@ struct FoldedResponse {
 fn finish_response(
     mut blocks: Vec<AssistantContent>,
     streamed_text: String,
+    streamed_reasoning: String,
     usage: Usage,
 ) -> Result<FoldedResponse, HarnessError> {
     if !streamed_text.is_empty()
@@ -1403,6 +1615,22 @@ fn finish_response(
             0,
             AssistantContent::Text {
                 text: streamed_text,
+            },
+        );
+    }
+    // Some providers emit reasoning deltas without a completed reasoning block.
+    // Preserve those deltas in the journal, but prefer complete provider blocks
+    // (including their signatures) whenever they contain visible reasoning.
+    if !streamed_reasoning.is_empty()
+        && !blocks.iter().any(
+            |block| matches!(block, AssistantContent::Reasoning { text, .. } if !text.is_empty()),
+        )
+    {
+        blocks.insert(
+            0,
+            AssistantContent::Reasoning {
+                text: streamed_reasoning,
+                opaque: None,
             },
         );
     }
@@ -1538,11 +1766,12 @@ mod tests {
     use crate::{
         agent::Question,
         provider::protocol::ToolCall,
-        provider::{ProviderFuture, ResponseStream},
+        provider::{ProviderContext, ProviderError, ProviderFuture, ResponseStream},
     };
 
+    #[derive(Clone)]
     struct ScriptedProvider {
-        responses: StdMutex<VecDeque<Vec<ResponseChunk>>>,
+        responses: Arc<StdMutex<VecDeque<Vec<ResponseChunk>>>>,
         requests: Arc<StdMutex<Vec<ModelRequest>>>,
     }
 
@@ -1552,17 +1781,18 @@ mod tests {
     ) -> Arc<ScriptedProvider> {
         Arc::new(ScriptedProvider {
             requests: requests.clone(),
-            responses: StdMutex::new(responses.into_iter().collect()),
+            responses: Arc::new(StdMutex::new(responses.into_iter().collect())),
         })
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct HangingProvider {
         invocations: Option<Arc<AtomicUsize>>,
     }
 
+    #[derive(Clone)]
     struct BlockingFirstProvider {
-        calls: AtomicUsize,
+        calls: Arc<AtomicUsize>,
         requests: Arc<StdMutex<Vec<ModelRequest>>>,
         release: Arc<tokio::sync::Semaphore>,
     }
@@ -1598,7 +1828,16 @@ mod tests {
     }
 
     impl Provider for HangingProvider {
-        fn invoke(&self, _request: ModelRequest) -> ProviderFuture {
+        fn open_context(
+            &self,
+            _correlation: String,
+        ) -> Result<Box<dyn ProviderContext>, ProviderError> {
+            Ok(Box::new(self.clone()))
+        }
+    }
+
+    impl ProviderContext for HangingProvider {
+        fn invoke(&mut self, _request: ModelRequest) -> ProviderFuture {
             if let Some(invocations) = &self.invocations {
                 invocations.fetch_add(1, Ordering::SeqCst);
             }
@@ -1607,7 +1846,16 @@ mod tests {
     }
 
     impl Provider for ScriptedProvider {
-        fn invoke(&self, request: ModelRequest) -> ProviderFuture {
+        fn open_context(
+            &self,
+            _correlation: String,
+        ) -> Result<Box<dyn ProviderContext>, ProviderError> {
+            Ok(Box::new(self.clone()))
+        }
+    }
+
+    impl ProviderContext for ScriptedProvider {
+        fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
             self.requests.lock().unwrap().push(request);
             let chunks = self
                 .responses
@@ -1622,7 +1870,16 @@ mod tests {
     }
 
     impl Provider for BlockingFirstProvider {
-        fn invoke(&self, request: ModelRequest) -> ProviderFuture {
+        fn open_context(
+            &self,
+            _correlation: String,
+        ) -> Result<Box<dyn ProviderContext>, ProviderError> {
+            Ok(Box::new(self.clone()))
+        }
+    }
+
+    impl ProviderContext for BlockingFirstProvider {
+        fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
             self.requests.lock().unwrap().push(request);
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             let release = self.release.clone();
@@ -1761,6 +2018,156 @@ mod tests {
             .unwrap()
     }
 
+    async fn observation_session(workspace: &Path, sessions: &Path) -> SessionHandle {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let harness = test_harness(workspace, sessions, scripted_provider(&requests, [])).await;
+        let store = SessionStore::create_ephemeral(sessions).await.unwrap();
+        let started = store
+            .append(
+                AgentId::root(store.id()),
+                SessionEvent::SessionStarted {
+                    targets: harness.inner.target_definitions.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let runtime = SessionRuntime::build(harness.inner.clone(), store, vec![started])
+            .await
+            .unwrap();
+        runtime.start_root(None).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn observation_catchup_is_idempotent_and_preserves_legacy_subscription() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let session = observation_session(workspace.path(), sessions.path()).await;
+        let mut observation = session.observe().await;
+        let mut legacy = session.subscribe();
+        let record = session
+            .runtime
+            .store
+            .append(session.root.clone(), SessionEvent::AgentInterrupted)
+            .await
+            .unwrap();
+        let refreshed = session.observe().await;
+        assert_eq!(
+            refreshed.snapshot.records.get(&record.sequence),
+            Some(&record)
+        );
+        assert!(
+            matches!(legacy.recv().await.unwrap(), RuntimeEvent::Record(value) if *value == record)
+        );
+        observation
+            .snapshot
+            .apply(observation.updates.recv().await.unwrap());
+        assert_eq!(observation.snapshot.records, refreshed.snapshot.records);
+        assert_eq!(observation.snapshot.revision, refreshed.snapshot.revision);
+
+        let repeated = session.observe().await;
+        assert_eq!(repeated.snapshot.revision, refreshed.snapshot.revision);
+        assert!(matches!(
+            legacy.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            observation.updates.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            *session.runtime.caught_up_sequence.lock().await,
+            record.sequence
+        );
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observation_catchup_does_not_skip_gaps_before_live_records() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let session = observation_session(workspace.path(), sessions.path()).await;
+        session.observe().await;
+        // Keep the forwarder from running until a later live record is projected.
+        let (first, second) = tokio::task::unconstrained(async {
+            let first = session
+                .runtime
+                .store
+                .append(session.root.clone(), SessionEvent::AgentInterrupted)
+                .await
+                .unwrap();
+            let second = session
+                .runtime
+                .store
+                .append(session.root.clone(), SessionEvent::AgentCompleted)
+                .await
+                .unwrap();
+            let _ = session
+                .runtime
+                .events
+                .send(RuntimeEvent::Record(Box::new(second.clone())));
+            let snapshot = session.runtime.events.observe().snapshot;
+            assert!(!snapshot.records.contains_key(&first.sequence));
+            assert_eq!(snapshot.records.get(&second.sequence), Some(&second));
+            (first, second)
+        })
+        .await;
+        let (left, right) = tokio::join!(session.observe(), session.observe());
+        for snapshot in [&left.snapshot, &right.snapshot] {
+            assert_eq!(snapshot.records.get(&first.sequence), Some(&first));
+            assert_eq!(snapshot.records.get(&second.sequence), Some(&second));
+        }
+        assert_eq!(left.snapshot.revision, right.snapshot.revision);
+        assert_eq!(
+            *session.runtime.caught_up_sequence.lock().await,
+            second.sequence
+        );
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observation_forwarder_catches_up_after_store_lag() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let session = observation_session(workspace.path(), sessions.path()).await;
+        let mut observation = session.observe().await;
+        let initial_count = observation.snapshot.records.len();
+        // The ephemeral writer has no I/O suspension. Disable cooperative yields
+        // to overflow the store's 512-slot channel before its forwarder can run.
+        let last = tokio::task::unconstrained(async {
+            let mut last = 0;
+            for _ in 0..600 {
+                last = session
+                    .runtime
+                    .store
+                    .append(session.root.clone(), SessionEvent::AgentInterrupted)
+                    .await
+                    .unwrap()
+                    .sequence;
+            }
+            last
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while observation.snapshot.records.len() < initial_count + 600 {
+                observation
+                    .snapshot
+                    .apply(observation.updates.recv().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*session.runtime.caught_up_sequence.lock().await, last);
+        assert_eq!(
+            observation
+                .snapshot
+                .records
+                .into_values()
+                .collect::<Vec<_>>(),
+            session.runtime.store.records().await
+        );
+        session.shutdown().await.unwrap();
+    }
+
     async fn question_harness(
         workspace: &Path,
         sessions: &Path,
@@ -1784,6 +2191,7 @@ mod tests {
         let response = finish_response(
             vec![AssistantContent::ToolCall(call.clone())],
             "working".to_owned(),
+            String::new(),
             Usage {
                 input_tokens: 10,
                 output_tokens: 2,
@@ -1795,6 +2203,539 @@ mod tests {
         assert_eq!(response.calls, vec![call]);
         assert_eq!(response.blocks.len(), 2);
         assert_eq!(response.usage.input_tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn submitted_models_apply_between_turns_and_restore_with_history() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("input.txt"), "tool input")
+            .await
+            .unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let answer = |text: &str| vec![ResponseChunk::TextDelta { text: text.into() }];
+        let original = scripted_provider(
+            &requests,
+            [
+                vec![ResponseChunk::Block {
+                    block: AssistantContent::ToolCall(ToolCall {
+                        id: "read-1".into(),
+                        name: "read".into(),
+                        arguments: json!({"path":"input.txt"}),
+                    }),
+                }],
+                answer("First answer"),
+            ],
+        );
+        let replacement = scripted_provider(
+            &requests,
+            [
+                answer("Second answer"),
+                answer("Continued"),
+                answer("Resumed"),
+            ],
+        );
+        let harness = test_builder(workspace.path(), sessions.path(), original)
+            .provider("replacement", replacement)
+            .model_profile(
+                "second",
+                ModelProfile {
+                    provider: "replacement".into(),
+                    model: "model-b".into(),
+                    reasoning: Some("high".into()),
+                    max_context: 64_000,
+                    max_output: 2048,
+                    supports_images: false,
+                },
+            )
+            .build()
+            .await
+            .unwrap();
+        let session = harness.new_session().await.unwrap();
+        let initial = session.runtime.store.records().await.len();
+        assert!(
+            session
+                .prompt_with_options(
+                    "Invalid",
+                    &[],
+                    PromptOptions {
+                        model: Some("missing".into())
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(session.runtime.store.records().await.len(), initial);
+        assert_eq!(
+            session.prompt("First question").await.unwrap(),
+            "First answer"
+        );
+        assert_eq!(
+            session
+                .prompt_with_options(
+                    "Second question",
+                    &[],
+                    PromptOptions {
+                        model: Some("second".into())
+                    }
+                )
+                .await
+                .unwrap(),
+            "Second answer"
+        );
+        assert_eq!(session.continue_turn().await.unwrap(), "Continued");
+        let records = session.runtime.store.records().await;
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| matches!(r.event, SessionEvent::ModelChanged { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(recorded_context(&records)[&session.root].capacity, 64_000);
+        assert_eq!(
+            crate::session::agent_selection(&records, &session.root)
+                .unwrap()
+                .0,
+            "second"
+        );
+        let projected = crate::session::project_history(&records, &session.root).unwrap();
+        assert_eq!(projected.iter().filter(|(_, m)| matches!(m, Message::User(blocks) if blocks.iter().any(|b| matches!(b, UserContent::Text { text } if text == "Second question")))).count(), 1);
+        let id = session.id();
+        session.shutdown().await.unwrap();
+        session.runtime.store.close().await.unwrap();
+        let resumed = harness.resume_session(id).await.unwrap();
+        assert_eq!(resumed.prompt("After resume").await.unwrap(), "Resumed");
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(
+            captured
+                .iter()
+                .map(|r| r.model.as_str())
+                .collect::<Vec<_>>(),
+            ["test", "test", "model-b", "model-b", "model-b"]
+        );
+        for request in &captured[2..] {
+            assert_eq!(request.reasoning.as_deref(), Some("high"));
+            assert_eq!(request.max_output_tokens, Some(2048));
+            assert_eq!(request.system, captured[0].system);
+            assert!(
+                serde_json::to_string(&request.messages)
+                    .unwrap()
+                    .contains("First question")
+            );
+        }
+        let records = resumed.runtime.store.records().await;
+        let journaled = records
+            .iter()
+            .filter_map(|record| {
+                if matches!(record.event, SessionEvent::ModelRequested { .. }) {
+                    Some(
+                        crate::session::reconstruct_model_request(&records, record.sequence)
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            journaled
+                .iter()
+                .map(|(provider, _)| provider.as_str())
+                .collect::<Vec<_>>(),
+            ["test", "test", "replacement", "replacement", "replacement"]
+        );
+        assert_eq!(
+            journaled.into_iter().map(|(_, r)| r).collect::<Vec<_>>(),
+            captured
+        );
+        resumed.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn children_inherit_active_models_and_explicit_overrides_reach_descendants() {
+        for (overrides, expected) in [
+            (json!({}), "active"),
+            (json!({"model":null,"profile":null}), "active"),
+            (json!({"model":"test"}), "test"),
+            (json!({"profile":"special"}), "special"),
+            (json!({"model":"active","profile":"special"}), "active"),
+            (json!({"profile":"instructions"}), "active"),
+        ] {
+            let workspace = tempfile::tempdir().unwrap();
+            let sessions = tempfile::tempdir().unwrap();
+            let requests = Arc::new(StdMutex::new(Vec::new()));
+            let answer = || {
+                vec![ResponseChunk::TextDelta {
+                    text: "done".into(),
+                }]
+            };
+            let provider = scripted_provider(
+                &requests,
+                [
+                    answer(),
+                    vec![ResponseChunk::Block {
+                        block: AssistantContent::ToolCall(ToolCall {
+                            id: "grandchild".into(),
+                            name: "agent".into(),
+                            arguments: json!({"prompt":"leaf"}),
+                        }),
+                    }],
+                    answer(),
+                    answer(),
+                    answer(),
+                    answer(),
+                    answer(),
+                ],
+            );
+            let mut builder = test_builder(workspace.path(), sessions.path(), provider.clone())
+                .provider("alternate", provider)
+                // Default instructions must not reset an inherited model.
+                .agent_profile(
+                    "default",
+                    AgentProfile {
+                        instructions: "Default instructions".into(),
+                        model_profile: Some("test".into()),
+                    },
+                )
+                .default_agent_profile("default")
+                .agent_profile(
+                    "special",
+                    AgentProfile {
+                        instructions: "Special instructions".into(),
+                        model_profile: Some("special".into()),
+                    },
+                )
+                .agent_profile(
+                    "instructions",
+                    AgentProfile {
+                        instructions: "Instructions only".into(),
+                        model_profile: None,
+                    },
+                );
+            for name in ["active", "special"] {
+                builder = builder.model_profile(
+                    name,
+                    ModelProfile {
+                        provider: "alternate".into(),
+                        model: name.into(),
+                        reasoning: Some("high".into()),
+                        max_context: 64_000,
+                        max_output: 2048,
+                        supports_images: false,
+                    },
+                );
+            }
+            let harness = builder.build().await.unwrap();
+            let session = harness.new_session().await.unwrap();
+            session
+                .prompt_with_options(
+                    "Switch model",
+                    &[],
+                    PromptOptions {
+                        model: Some("active".into()),
+                    },
+                )
+                .await
+                .unwrap();
+            let mut arguments = overrides.clone();
+            arguments["prompt"] = json!("Delegate to a grandchild");
+            arguments["depth"] = json!(1);
+            session
+                .run_script(format!("return await tool.agent({arguments});"))
+                .await
+                .unwrap();
+            let captured = requests.lock().unwrap().clone();
+            assert_eq!(
+                captured
+                    .iter()
+                    .map(|r| r.model.as_str())
+                    .collect::<Vec<_>>(),
+                ["active", expected, expected, expected],
+                "{overrides}"
+            );
+            let records = session.runtime.store.records().await;
+            let children = records
+                .iter()
+                .filter(|r| !r.agent.path().is_empty())
+                .filter_map(|record| {
+                    if let SessionEvent::AgentStarted {
+                        model_profile,
+                        max_context,
+                        ..
+                    } = &record.event
+                    {
+                        Some((model_profile.as_str(), *max_context))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            let capacity = if expected == "test" { 128_000 } else { 64_000 };
+            assert_eq!(
+                children,
+                [(expected, Some(capacity)), (expected, Some(capacity))]
+            );
+            for record in records
+                .iter()
+                .filter(|r| matches!(r.event, SessionEvent::ModelRequested { .. }))
+            {
+                let (provider, request) =
+                    crate::session::reconstruct_model_request(&records, record.sequence).unwrap();
+                assert_eq!(
+                    provider,
+                    if request.model == "test" {
+                        "test"
+                    } else {
+                        "alternate"
+                    }
+                );
+            }
+            let id = session.id();
+            session.shutdown().await.unwrap();
+            session.runtime.store.close().await.unwrap();
+            if overrides == json!({}) {
+                let resumed = harness.resume_session(id).await.unwrap();
+                resumed
+                    .run_script("return await tool.agent({prompt:'After resume'});")
+                    .await
+                    .unwrap();
+                assert_eq!(requests.lock().unwrap().last().unwrap().model, "active");
+                let launched = resumed
+                    .run_script(
+                        "return await tool.agent({prompt:'Background',model:null,bg:true});",
+                    )
+                    .await
+                    .unwrap();
+                let job = JobId::new(launched.value["id"].as_u64().unwrap()).unwrap();
+                resumed
+                    .runtime
+                    .jobs
+                    .wait(job, Some(Duration::from_secs(5)), true)
+                    .await
+                    .unwrap();
+                let records = resumed.runtime.store.records().await;
+                let last = records
+                    .iter()
+                    .rev()
+                    .find_map(|record| match &record.event {
+                        SessionEvent::AgentStarted { model_profile, .. }
+                            if !record.agent.path().is_empty() =>
+                        {
+                            Some(model_profile.as_str())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(last, "active");
+                resumed.shutdown().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn switching_models_preserves_image_history_and_reports_unsupported_images() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let image = workspace.path().join("sample.png");
+        fs::write(&image, b"image fixture").await.unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let provider = scripted_provider(
+            &requests,
+            [
+                vec![ResponseChunk::TextDelta {
+                    text: "Image received".into(),
+                }],
+                vec![ResponseChunk::TextDelta {
+                    text: "Image still present".into(),
+                }],
+            ],
+        );
+        let harness = test_builder(workspace.path(), sessions.path(), provider)
+            .model_profile(
+                "vision",
+                ModelProfile {
+                    provider: "test".into(),
+                    model: "vision-model".into(),
+                    reasoning: None,
+                    max_context: 128_000,
+                    max_output: 4096,
+                    supports_images: true,
+                },
+            )
+            .build()
+            .await
+            .unwrap();
+        let session = harness.new_session().await.unwrap();
+        let before = session.runtime.store.records().await.len();
+        assert!(
+            session
+                .prompt_with_options(
+                    "Missing image",
+                    &[workspace.path().join("missing.png")],
+                    PromptOptions {
+                        model: Some("vision".into())
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(session.runtime.store.records().await.len(), before);
+        session
+            .prompt_with_options(
+                "Look at this",
+                &[image],
+                PromptOptions {
+                    model: Some("vision".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let error = session
+            .prompt_with_options(
+                "Keep going",
+                &[],
+                PromptOptions {
+                    model: Some("test".into()),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("does not support image"),
+            "{error}"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        session
+            .prompt_with_options(
+                "Use vision again",
+                &[],
+                PromptOptions {
+                    model: Some("vision".into()),
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let requests = requests.lock().unwrap();
+            assert!(contains_images(&requests[1].messages));
+        }
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streamed_reasoning_is_journaled_even_without_a_final_provider_block() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(ScriptedProvider {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+                responses: StdMutex::new(VecDeque::from([vec![
+                    ResponseChunk::ReasoningDelta {
+                        text: "First step. ".into(),
+                    },
+                    ResponseChunk::ReasoningDelta {
+                        text: "Second step.".into(),
+                    },
+                    ResponseChunk::TextDelta {
+                        text: "Answer".into(),
+                    },
+                ]]))
+                .into(),
+            }),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(session.prompt("Question").await.unwrap(), "Answer");
+        session.shutdown().await.unwrap();
+        let records = SessionStore::read_records(sessions.path(), session.id())
+            .await
+            .unwrap();
+        let blocks = records
+            .iter()
+            .find_map(|record| match &record.event {
+                SessionEvent::MessageCommitted {
+                    message: Message::Assistant(blocks),
+                } => Some(blocks),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(
+            matches!(&blocks[0], AssistantContent::Reasoning { text, opaque: None } if text == "First step. Second step.")
+        );
+        assert!(matches!(&blocks[1], AssistantContent::Text { text } if text == "Answer"));
+    }
+
+    #[test]
+    fn reasoning_fallback_preserves_complete_blocks_and_signatures_without_duplication() {
+        let blocks = vec![
+            AssistantContent::Reasoning {
+                text: "Complete reasoning".into(),
+                opaque: Some(json!({"signature":"signed"})),
+            },
+            AssistantContent::Text {
+                text: "Answer".into(),
+            },
+        ];
+        let response = finish_response(
+            blocks.clone(),
+            "Answer".into(),
+            "Partial reasoning".into(),
+            Usage::default(),
+        )
+        .unwrap();
+        assert_eq!(response.blocks, blocks);
+    }
+
+    #[tokio::test]
+    async fn continuing_interrupted_turn_retains_input_once_and_shutdown_is_idempotent() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(BlockingFirstProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+                requests: requests.clone(),
+                release: Arc::new(tokio::sync::Semaphore::new(0)),
+            }),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        let task = tokio::spawn({
+            let session = session.clone();
+            async move { session.prompt("retained input").await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while requests.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        session.interrupt().await;
+        assert!(task.await.unwrap().is_err());
+        session
+            .record_status(session.root.clone(), "Interrupted".into())
+            .await
+            .unwrap();
+        assert_eq!(session.continue_turn().await.unwrap(), "jobs handled");
+        let records = session.runtime.store.records().await;
+        assert_eq!(records.iter().filter(|record| matches!(&record.event,
+            SessionEvent::MessageCommitted { message: Message::User(blocks) }
+                if blocks.iter().any(|block| matches!(block, UserContent::Text { text } if text == "retained input"))
+        )).count(), 1);
+        assert!(records.iter().any(|record| matches!(&record.event, SessionEvent::Status { message } if message == "Interrupted")));
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].messages, captured[1].messages);
+        session.shutdown().await.unwrap();
+        tokio::task::yield_now().await;
+        session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1857,7 +2798,9 @@ mod tests {
                                 2048
                             );
                             assert_eq!(result.result["result"]["path"], "large.txt");
-                            assert!(result.result["truncated"][0]["next"].is_string());
+                            assert_eq!(result.result["truncated"][0]["total_lines"], 1);
+                            assert_eq!(result.result["truncated"][0]["next_start"], 1);
+                            assert_eq!(result.result["truncated"][0]["next_offset"], 2048);
                             repeated_large_bytes += bytes;
                         }
                     }
@@ -1913,11 +2856,21 @@ mod tests {
 
     #[tokio::test]
     async fn failed_provider_call_is_journaled_before_invocation() {
+        #[derive(Clone)]
         struct FailingProvider {
             session_root: PathBuf,
         }
         impl Provider for FailingProvider {
-            fn invoke(&self, request: ModelRequest) -> ProviderFuture {
+            fn open_context(
+                &self,
+                _correlation: String,
+            ) -> Result<Box<dyn ProviderContext>, ProviderError> {
+                Ok(Box::new(self.clone()))
+            }
+        }
+
+        impl ProviderContext for FailingProvider {
+            fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
                 let session = request
                     .correlation
                     .as_ref()
@@ -2098,6 +3051,17 @@ mod tests {
             },
         );
         let harness = test_builder(workspace.path(), sessions.path(), provider)
+            .model_profile(
+                "remote-active",
+                ModelProfile {
+                    provider: "test".into(),
+                    model: "remote-active".into(),
+                    reasoning: None,
+                    max_context: 64_000,
+                    max_output: 2048,
+                    supports_images: false,
+                },
+            )
             .capabilities({
                 let mut capabilities = CapabilitySet::default();
                 capabilities.insert(crate::tool::policy::Capability::Targets);
@@ -2113,17 +3077,33 @@ mod tests {
             .run_script(
                 r#"
             const added = await tool.target_add({name:"db", type:"ssh", host:"db.internal"});
-            return {added, listed: await tool.targets()};
+            return {added, listed: await tool.targets(), detailed: await tool.targets({details:true})};
         "#,
             )
             .await
             .unwrap()
             .value;
+        let detailed = targets["detailed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|target| target["name"] == "db")
+            .unwrap();
+        assert_eq!(detailed["origin"], "root");
+        assert_eq!(detailed["ssh_alias"], "db.internal");
+        assert_eq!(detailed["source"], "session");
+        assert!(
+            detailed
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|value| !value.is_null())
+        );
         assert_eq!(targets["added"]["type"], "ssh");
-        assert_eq!(targets["added"]["origin"], "root");
+        assert!(targets["added"].get("origin").is_none());
         assert_eq!(targets["added"]["host"], "db.internal");
-        assert_eq!(targets["added"]["ssh_alias"], "db.internal");
-        assert_eq!(targets["added"]["source"], "session");
+        assert!(targets["added"].get("ssh_alias").is_none());
+        assert!(targets["added"].get("source").is_none());
         assert!(
             targets["listed"]
                 .as_array()
@@ -2133,16 +3113,31 @@ mod tests {
         assert_eq!(
             targets["listed"][0],
             json!({
-                "name":"root", "type":"local", "origin":"root", "ssh_alias":null,
-                "source":"builtin", "host":"localhost", "user":null, "port":null,
-                "workspace":".", "via":null, "auth":"local"
+                "name":"root", "type":"local", "host":"localhost"
             })
         );
-        assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
+        assert_eq!(
+            session
+                .prompt_with_options(
+                    "delegate",
+                    &[],
+                    PromptOptions {
+                        model: Some("remote-active".into())
+                    }
+                )
+                .await
+                .unwrap(),
+            "root done"
+        );
 
         assert_request_journal(&session.runtime.store, &requests).await;
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 3);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.model == "remote-active")
+        );
         let tools_with_target = requests[0]
             .tools
             .iter()
@@ -2218,8 +3213,8 @@ mod tests {
         let Message::Tool(results) = request_history(&requests[2]).last().unwrap() else {
             panic!("root must receive the child result");
         };
-        assert_eq!(results[0].result["result"]["target"], "build");
-        assert_eq!(results[0].result["result"]["result"], "child done");
+        assert_eq!(results[0].result["target"], "build");
+        assert_eq!(results[0].result["result"], "child done");
     }
 
     #[tokio::test]
@@ -2241,6 +3236,7 @@ mod tests {
                 text: text.to_owned(),
             }]
         };
+        let answer = "child work completed\n".repeat(500);
         let harness = test_harness(
             workspace.path(),
             sessions.path(),
@@ -2253,7 +3249,7 @@ mod tests {
                         json!({"source":"return await receive();", "bg":true}),
                     ),
                     text("premature child answer"),
-                    text("child work completed"),
+                    text(&answer),
                     text("root done"),
                 ],
             ),
@@ -2307,10 +3303,16 @@ mod tests {
         else {
             panic!("child result expected")
         };
-        assert_eq!(
-            results[0].result["result"]["result"],
-            "child work completed"
-        );
+        assert_eq!(results[0].result["result"], answer);
+        assert!(results[0].result.get("truncated").is_none());
+        for request in requests.iter() {
+            let system = &request.system[0].text;
+            assert!(!system.contains("compaction"));
+            assert!(system.contains(
+                "Some result fields may be truncated. Use job_output to interact with the results."
+            ));
+            assert!(!system.contains("Continue with the returned"));
+        }
     }
 
     #[tokio::test]
@@ -2322,7 +3324,7 @@ mod tests {
             workspace.path(),
             sessions.path(),
             Arc::new(BlockingFirstProvider {
-                calls: AtomicUsize::new(0),
+                calls: Arc::new(AtomicUsize::new(0)),
                 requests: Arc::new(StdMutex::new(Vec::new())),
                 release: release.clone(),
             }),
@@ -2348,7 +3350,6 @@ mod tests {
                 owner_job: None,
                 model_profile: "test".to_owned(),
                 agent_profile: None,
-                history: Vec::new(),
                 todos: None,
                 one_shot: true,
                 available_depth: 0,
@@ -2360,6 +3361,7 @@ mod tests {
         let mut events = session.runtime.events.subscribe();
         sender
             .send(AgentCommand::Input {
+                model: None,
                 content: vec![UserContent::Text {
                     text: "task".to_owned(),
                 }],
@@ -2958,7 +3960,7 @@ mod tests {
             workspace.path(),
             sessions.path(),
             Arc::new(BlockingFirstProvider {
-                calls: AtomicUsize::new(0),
+                calls: Arc::new(AtomicUsize::new(0)),
                 requests: requests.clone(),
                 release: release.clone(),
             }),
@@ -3457,7 +4459,7 @@ await tool.write({path:"release",content:"go"});
 const completed = await tool.job(job.id).output({wait:10});
 const first = await tool.job(job.id).output({field:"/result/stdout",limit:1});
 const replay = await tool.job(job.id).output({field:"/result/stdout",limit:1});
-const second = await tool.job(job.id).output({cursor:first.preview.next});
+const second = await tool.job(job.id).output({field:first.preview.field, start:first.preview.next_start, offset:first.preview.next_offset});
 return {live,completed,first,replay,second};
 "#)).await.unwrap().unwrap();
         let value = output.value;
@@ -3465,8 +4467,8 @@ return {live,completed,first,replay,second};
         assert_eq!(value["first"], value["replay"]);
         assert_eq!(value["completed"]["state"], "completed");
         assert_eq!(value["completed"]["result"]["stdout"], "before\nafter\n");
-        assert_eq!(value["first"]["preview"]["lines"][0]["text"], "before");
-        assert_eq!(value["second"]["preview"]["lines"][0]["text"], "after");
+        assert_eq!(value["first"]["preview"]["lines"][0], "before");
+        assert_eq!(value["second"]["preview"]["lines"][0], "after");
     }
 
     async fn add_research_for_compaction(
@@ -3580,6 +4582,7 @@ return {live,completed,first,replay,second};
                 "next_actions": ["Continue the existing plan."],
                 "running_work": [],
                 "recovery_details": [],
+                "jobs": [],
                 "additional_context": [],
                 "todo_reconciliation": [],
                 "todos": todos

@@ -71,14 +71,25 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner_job: Option<JobId>,
         model_profile: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_context: Option<u64>,
         agent_profile: Option<String>,
         location: ExecutionLocation,
     },
     TodosReplaced {
         items: Vec<crate::agent::TodoItem>,
     },
+    /// Model applied to a submitted user turn; never a pending UI selection.
+    ModelChanged {
+        model_profile: String,
+        max_context: u64,
+    },
     MessageCommitted {
         message: Message,
+    },
+    /// Host-facing conversation status, excluded from model-visible history.
+    Status {
+        message: String,
     },
     /// Shared request fields; template.messages is empty because history is already journaled.
     ModelContext {

@@ -65,6 +65,7 @@ impl GeneratedToolDefinition {
                 if self.supports_background {
                     add_background(&mut input_schema);
                 }
+                optional_defaults(&mut input_schema);
                 sanitize_schema(&mut input_schema);
                 let result_schema = self.output_schema.as_ref().map(|schema| {
                     let mut schema = schema(capabilities);
@@ -164,7 +165,7 @@ impl ToolOptions {
         self
     }
 
-    /// Expose an optional snake_case job label, handled by the executor.
+    /// Expose an optional kebab-case job label, handled by the executor.
     #[must_use]
     pub const fn named(mut self) -> Self {
         self.execution.supports_name = true;
@@ -324,7 +325,7 @@ impl RegisteredTool {
             None | Some(Value::Null) => Ok(None),
             Some(Value::String(name)) if valid_job_name(&name) => Ok(Some(name)),
             _ => Err(ToolError::InvalidArguments(
-                "name must be lowercase snake_case: start with a letter, use only a-z, 0-9, and single underscores between nonempty words".to_owned(),
+                "name must be lowercase kebab-case: start with a letter, use only a-z, 0-9, and single hyphens between nonempty words".to_owned(),
             )),
         }
     }
@@ -588,8 +589,8 @@ impl ToolRegistryBuilder {
                     "name",
                     serde_json::json!({
                         "type": ["string", "null"],
-                        "pattern": "^[a-z][a-z0-9]*(_[a-z0-9]+)*$",
-                        "description": "Lowercase snake_case name shown in job state and notifications."
+                        "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$",
+                        "description": "Lowercase kebab-case name shown in job state and notifications."
                     }),
                 );
             }
@@ -806,7 +807,7 @@ fn validate_output_schema(schema: &Value) -> Result<(), RegistryError> {
 
 fn valid_job_name(name: &str) -> bool {
     name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-        && name.split('_').all(|word| {
+        && name.split('-').all(|word| {
             !word.is_empty()
                 && word
                     .bytes()
@@ -824,6 +825,75 @@ fn add_background(schema: &mut Value) {
             "description": "Run in background."
         }),
     );
+}
+
+// A documented default always permits omission from tool input. Apply this to
+// schema nodes only, leaving default/example JSON values untouched.
+fn optional_defaults(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    let defaults: BTreeSet<String> = object
+        .get("properties")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(_, field)| field.get("default").is_some())
+        .map(|(name, _)| name.clone())
+        .collect();
+    if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) {
+        required.retain(|name| !name.as_str().is_some_and(|name| defaults.contains(name)));
+    }
+    for key in [
+        "properties",
+        "$defs",
+        "definitions",
+        "patternProperties",
+        "dependentSchemas",
+    ] {
+        if let Some(children) = object.get_mut(key).and_then(Value::as_object_mut) {
+            children.values_mut().for_each(optional_defaults);
+        }
+    }
+    for key in [
+        "items",
+        "additionalProperties",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+    ] {
+        if let Some(child) = object.get_mut(key) {
+            optional_defaults(child);
+        }
+    }
+    for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        if let Some(children) = object.get_mut(key).and_then(Value::as_array_mut) {
+            children.iter_mut().for_each(optional_defaults);
+        }
+    }
+}
+
+#[cfg(test)]
+fn assert_optional_defaults(schema: &Value) {
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        for (name, field) in properties {
+            if field.get("default").is_some() {
+                assert!(
+                    !schema["required"]
+                        .as_array()
+                        .is_some_and(|items| items.iter().any(|item| item == name)),
+                    "default field {name} is required: {schema}"
+                );
+            }
+        }
+    }
+    match schema {
+        Value::Object(object) => object.values().for_each(assert_optional_defaults),
+        Value::Array(values) => values.iter().for_each(assert_optional_defaults),
+        _ => {}
+    }
 }
 
 fn sanitize_schema(value: &mut Value) {
@@ -1052,11 +1122,25 @@ fn output_union(foreground: Value, background: Value) -> Value {
 }
 
 fn schema_type(field: &Value, root: &Value) -> String {
+    schema_type_inner(field, root, false)
+}
+
+fn schema_type_inner(field: &Value, root: &Value, array_item: bool) -> String {
     if let Some(reference) = field.get("$ref").and_then(Value::as_str)
         && let Some(name) = reference.strip_prefix("#/$defs/")
         && let Some(definition) = root.get("$defs").and_then(|defs| defs.get(name))
     {
-        return schema_type(definition, root);
+        return schema_type_inner(definition, root, array_item);
+    }
+    if array_item
+        && ["enum", "anyOf", "oneOf", "type"].iter().any(|key| {
+            field
+                .get(*key)
+                .and_then(Value::as_array)
+                .is_some_and(|values| values.len() > 1)
+        })
+    {
+        return format!("({})", schema_type(field, root));
     }
     if let Some(values) = field.get("enum").and_then(Value::as_array) {
         return values
@@ -1091,7 +1175,7 @@ fn schema_type(field: &Value, root: &Value) -> String {
         Some("string" | "integer" | "number" | "boolean" | "null") => {
             field["type"].as_str().unwrap_or("JSON").to_owned()
         }
-        Some("array") => format!("{}[]", schema_type(&field["items"], root)),
+        Some("array") => format!("{}[]", schema_type_inner(&field["items"], root, true)),
         Some("object") => {
             let required = field["required"]
                 .as_array()
@@ -1099,7 +1183,7 @@ fn schema_type(field: &Value, root: &Value) -> String {
                 .flatten()
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>();
-            let properties = field["properties"]
+            let mut properties = field["properties"]
                 .as_object()
                 .into_iter()
                 .flat_map(|properties| properties.iter())
@@ -1112,6 +1196,12 @@ fn schema_type(field: &Value, root: &Value) -> String {
                     format!("{name}{optional}:{}", schema_type(value, root))
                 })
                 .collect::<Vec<_>>();
+            if let Some(values) = field
+                .get("additionalProperties")
+                .filter(|value| **value != false)
+            {
+                properties.push(format!("[key:string]:{}", schema_type(values, root)));
+            }
             if properties.is_empty() {
                 "object".to_owned()
             } else {
@@ -1161,6 +1251,61 @@ mod tests {
         capabilities
     }
 
+    #[test]
+    fn named_tools_require_kebab_case_in_schema_and_execution() {
+        let mut builder = ToolRegistry::builder();
+        builder
+            .register::<Args, String, _, _>(
+                "agent",
+                "Agent",
+                ToolOptions::default().named(),
+                |_context, args| async move { Ok(args.value) },
+            )
+            .unwrap();
+        let registry = builder.build();
+        let surface = registry.surface(&context(true));
+        let tool = registry.get("agent").unwrap();
+        assert_eq!(
+            surface.get("agent").unwrap().input_schema["properties"]["name"]["pattern"],
+            "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+        );
+        for name in ["worker", "inspect-config", "build-v2", "a-1-b2"] {
+            let mut arguments = serde_json::json!({"value": "task", "name": name});
+            surface.validate_arguments("agent", &arguments).unwrap();
+            assert_eq!(
+                tool.take_job_name(&mut arguments).unwrap().as_deref(),
+                Some(name)
+            );
+            assert_eq!(arguments, serde_json::json!({"value": "task"}));
+        }
+        for name in [
+            "",
+            "inspect_config",
+            "Worker",
+            "1-worker",
+            "-worker",
+            "worker-",
+            "two--words",
+            "two words",
+            "café",
+        ] {
+            let mut arguments = serde_json::json!({"value": "task", "name": name});
+            assert!(
+                tool.take_job_name(&mut arguments)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("kebab-case")
+            );
+        }
+        for mut arguments in [
+            serde_json::json!({"value": "task"}),
+            serde_json::json!({"value": "task", "name": null}),
+        ] {
+            surface.validate_arguments("agent", &arguments).unwrap();
+            assert_eq!(tool.take_job_name(&mut arguments).unwrap(), None);
+        }
+    }
+
     fn target_context(enabled: bool) -> CapabilitySet {
         let mut context = context(true);
         if enabled {
@@ -1180,6 +1325,18 @@ mod tests {
             Value::Array(values) => values.iter().any(contains_metadata),
             Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
         }
+    }
+
+    #[test]
+    fn defaulted_inputs_are_optional_in_nested_schemas() {
+        let mut schema = serde_json::json!({"type":"object", "required":["keep", "count", "enabled"],
+            "properties":{"keep":{"type":"string"},"count":{"type":"integer","default":100},
+                "enabled":{"type":"boolean","default":false}},
+            "$defs":{"nested":{"type":"object","required":["value"],"properties":{"value":{"default":null}}}},
+            "anyOf":[{"type":"object","required":["name"],"properties":{"name":{"default":""}}}]});
+        optional_defaults(&mut schema);
+        assert_eq!(schema["required"], serde_json::json!(["keep"]));
+        assert_optional_defaults(&schema);
     }
 
     #[tokio::test]
@@ -1223,7 +1380,22 @@ mod tests {
         );
         for targets in [false, true] {
             let surface = registry.surface(&target_context(targets));
+            let read = surface.get("read").unwrap().result_schema.as_ref().unwrap();
+            let groups = &read["$defs"]["DirectoryGroups"];
+            assert!(groups["required"].as_array().is_none_or(Vec::is_empty));
+            let read_type = schema_type(read, read);
+            for group in ["files", "directories", "symlinks", "other"] {
+                assert!(read_type.contains(&format!("{group}?:")));
+            }
+            let search = surface
+                .get("search")
+                .unwrap()
+                .result_schema
+                .as_ref()
+                .unwrap();
+            assert!(schema_type(search, search).contains("matches:{[key:string]:string[]}"));
             for tool in surface.tools.values() {
+                assert_optional_defaults(&tool.input_schema);
                 assert_eq!(
                     tool.input_schema["properties"].get("target").is_some(),
                     targets && targeted.contains(tool.name.as_str())
@@ -1285,10 +1457,37 @@ mod tests {
                     .ends_with("Result: `job metadata array`.")
             );
             let shared_type = job_envelope_type(&target_context(targets));
-            assert!(shared_type.contains("workspace:string"));
-            assert_eq!(shared_type.contains("target:string"), targets);
+            assert!(shared_type.contains("workspace?:string"));
+            assert_eq!(shared_type.contains("target?:string"), targets);
             assert!(shared_type.contains("permission_denied"));
             assert!(!shared_type.contains("awaiting_approval"));
+        }
+    }
+
+    #[test]
+    fn array_types_preserve_union_precedence_through_references() {
+        for (item, expected) in [
+            (serde_json::json!({"type":"string"}), "string[]"),
+            (
+                serde_json::json!({"type":["string","null"]}),
+                "(string | null)[]",
+            ),
+            (serde_json::json!({"enum":["a","b"]}), "(\"a\" | \"b\")[]"),
+            (
+                serde_json::json!({"oneOf":[{"type":"string"},{"type":"integer"}]}),
+                "(string | integer)[]",
+            ),
+            (
+                serde_json::json!({"anyOf":[{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]},{"type":"object","properties":{"b":{"type":"integer"}},"required":["b"]}]}),
+                "({a:string} | {b:integer})[]",
+            ),
+            (
+                serde_json::json!({"type":"object","properties":{"a":{"type":["string","null"]}},"required":["a"]}),
+                "{a:string | null}[]",
+            ),
+        ] {
+            let schema = serde_json::json!({"type":"array","items":{"$ref":"#/$defs/Item"},"$defs":{"Item":item}});
+            assert_eq!(schema_type(&schema, &schema), expected);
         }
     }
 

@@ -54,7 +54,6 @@ fn register_read(
                         let metadata = fs::symlink_metadata(entry.path()).await?;
                         entries.push(DirectoryEntry {
                             name: entry.file_name().to_string_lossy().into_owned(),
-                            path: String::new(),
                             kind: if metadata.file_type().is_symlink() {
                                 "symlink"
                             } else if metadata.is_dir() {
@@ -71,17 +70,10 @@ fn register_read(
                     entries.sort_by(|left, right| left.name.cmp(&right.name));
                     let directory_path =
                         relative_path(&context.execution_location.workspace, &path);
-                    for entry in &mut entries {
-                        if directory_path == "." {
-                            entry.name.clone_into(&mut entry.path);
-                        } else {
-                            entry.path = format!("{directory_path}/{}", entry.name);
-                        }
-                    }
                     return Ok(ToolOutput::new(serde_json::to_value(
                         ReadOutput::Directory {
                             path: directory_path,
-                            entries,
+                            entries: if args.details { DirectoryEntries::Detailed(entries) } else { DirectoryEntries::Grouped(DirectoryGroups::from(entries)) },
                         },
                     )?));
                 }
@@ -324,6 +316,9 @@ fn detect_image(bytes: &[u8]) -> Option<&'static str> {
 struct ReadArgs {
     /// File or directory path.
     path: String,
+    /// Include explicit entry kinds in a flat list. File sizes are always included.
+    #[serde(default)]
+    details: bool,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -337,7 +332,7 @@ enum ReadOutput {
     Directory {
         path: String,
         #[schemars(extend("x-skyhook-truncatable" = true))]
-        entries: Vec<DirectoryEntry>,
+        entries: DirectoryEntries,
     },
     Image {
         path: String,
@@ -348,10 +343,52 @@ enum ReadOutput {
 #[derive(Clone, Serialize, JsonSchema)]
 struct DirectoryEntry {
     name: String,
-    #[serde(default)]
-    path: String,
     kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     bytes: Option<u64>,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(untagged)]
+enum DirectoryEntries {
+    Grouped(DirectoryGroups),
+    Detailed(Vec<DirectoryEntry>),
+}
+
+#[derive(Default, Serialize, JsonSchema)]
+struct DirectoryGroups {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    files: Vec<DirectoryFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    directories: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    symlinks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    other: Vec<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct DirectoryFile {
+    name: String,
+    bytes: u64,
+}
+
+impl From<Vec<DirectoryEntry>> for DirectoryGroups {
+    fn from(entries: Vec<DirectoryEntry>) -> Self {
+        let mut groups = Self::default();
+        for entry in entries {
+            match entry.kind.as_str() {
+                "file" => groups.files.push(DirectoryFile {
+                    name: entry.name,
+                    bytes: entry.bytes.expect("regular file size"),
+                }),
+                "directory" => groups.directories.push(entry.name),
+                "symlink" => groups.symlinks.push(entry.name),
+                _ => groups.other.push(entry.name),
+            }
+        }
+        groups
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -438,6 +475,95 @@ mod tests {
     };
     use tokio::sync::Mutex;
 
+    #[tokio::test]
+    async fn grouped_directories_keep_sizes_and_recover_truncated_entries() {
+        use serde_json::json;
+        let runtime = crate::test_support::TestRuntime::new().await;
+        let directory = runtime.root.path().join("files");
+        fs::create_dir(&directory).await.unwrap();
+        fs::create_dir(directory.join("nested")).await.unwrap();
+        fs::write(directory.join("empty"), "").await.unwrap();
+        fs::write(directory.join("utf8"), "λ").await.unwrap();
+        let mut builder = ToolRegistryBuilder::default();
+        register(&mut builder, runtime.store.clone()).unwrap();
+        let executor = runtime.executor(builder);
+        let small = executor
+            .execute(runtime.agent.clone(), "read", json!({"path":"files"}), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            small.output.value,
+            json!({"kind":"directory","path":"files","entries":{
+                "files":[{"name":"empty","bytes":0},{"name":"utf8","bytes":2}], "directories":["nested"]
+            }})
+        );
+        let detailed = executor
+            .execute(
+                runtime.agent.clone(),
+                "read",
+                json!({"path":"files","details":true}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            detailed.output.value["entries"][0],
+            json!({"name":"empty","kind":"file","bytes":0})
+        );
+        assert!(detailed.output.value["entries"][1].get("bytes").is_none());
+        for index in 0..180 {
+            fs::write(
+                directory.join(format!("file-{index:03}")),
+                vec![b'x'; index],
+            )
+            .await
+            .unwrap();
+        }
+        let captured = executor
+            .execute_model(runtime.agent.clone(), "read", json!({"path":"files"}), None)
+            .await
+            .unwrap();
+        let view = captured.output.value;
+        assert_eq!(view["truncated"][0]["field"], "/result/entries");
+        assert!(
+            serde_json::to_vec(&view["result"]["entries"])
+                .unwrap()
+                .len()
+                <= 2048
+        );
+        assert!(
+            view["result"]["entries"]["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|file| file["bytes"].is_u64())
+        );
+        let mut query = crate::job::JobOutputQuery::new(captured.job);
+        query.field = Some("/result/entries".into());
+        query.pattern = Some("file-179".into());
+        let page = runtime
+            .jobs
+            .inspect_output(query, &Default::default())
+            .await
+            .unwrap();
+        assert!(
+            page["preview"]["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|line| line.as_str().unwrap().contains("file-179"))
+        );
+        let complete = runtime
+            .jobs
+            .snapshot(captured.job)
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        assert_eq!(complete["entries"]["files"].as_array().unwrap().len(), 182);
+        assert_eq!(complete["entries"]["files"][180]["bytes"], 179);
+    }
+
     #[derive(Default)]
     struct RecordingPolicy {
         requests: Mutex<Vec<AuthorizationRequest>>,
@@ -489,7 +615,7 @@ mod tests {
             .present_output(args, &Default::default())
             .await
             .unwrap();
-        assert_eq!(page["preview"]["lines"][0]["text"], "two");
+        assert_eq!(page["preview"]["lines"][0], "two");
     }
 
     #[cfg(unix)]

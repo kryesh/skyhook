@@ -35,6 +35,8 @@ struct Summary {
     decisions: Vec<String>,
     /// Important exact outputs or excerpts, commands, errors, file paths, targets, job IDs, URLs, and other references needed to recover details. Explain what each reference provides.
     recovery_details: Vec<String>,
+    /// Jobs whose original parameters and outputs should be handed over. Select relevant completed or running jobs from this session; use an empty array when none are needed. The harness supplies normally truncated outputs, recoverable in full with job_output.
+    jobs: Vec<crate::identity::JobId>,
     /// Any other information important for continuing faithfully that does not fit the other sections. Preserve relevant earlier context even if recent conversation does not mention it.
     additional_context: Vec<String>,
     /// Explain changes made to the supplied todo list and the conversation evidence supporting them, including additions, status changes, removals, or reordering. Explain unresolved uncertainty. Use an empty array if unchanged. Keep explanations consistent with the actual todo statuses.
@@ -47,7 +49,7 @@ struct Summary {
     next_actions: Vec<String>,
 }
 
-pub(crate) const SCHEMA_VERSION: u16 = 1;
+pub(crate) const SCHEMA_VERSION: u16 = 2;
 
 pub(crate) fn response_schema() -> serde_json::Value {
     let settings = schemars::generate::SchemaSettings::default().with(|settings| {
@@ -66,6 +68,7 @@ pub(crate) fn response_schema() -> serde_json::Value {
 pub(crate) struct Continuation {
     pub message: Message,
     pub todos: Vec<TodoItem>,
+    pub jobs: Vec<crate::identity::JobId>,
 }
 
 /// The regular agent prompt and conversation remain present for this request.
@@ -79,7 +82,7 @@ Explicitly preserve applicable session restrictions and rules defined by the use
 If there is a plan, include it verbatim, including a proposed plan awaiting approval. Explain its status and any amendments, replacements, or canceled steps so the next instance follows the right version. Preserve progress accurately and keep it consistent with the reconciled todo state.\n\n\
 Carry forward relevant information from previous continuation prompts as well as the recent conversation. Earlier instructions, decisions, and outstanding work remain relevant even when recent messages do not mention them. Where later conversation explicitly changes earlier state, preserve the current state and enough explanation to understand the change.\n\n\
 Preserve consequential decisions and their reasons, including alternatives considered and rejected and any stated conditions for reconsidering them. Distinguish verified findings, working assumptions, hypotheses, and unresolved questions. Summarize conclusions rather than private reasoning transcripts.\n\n\
-Include completed work, important findings, partial work, blockers, and available verification results. Support completion claims with observed results and their scope. Distinguish an attempted action from a successful result, listing paths from reading their contents, and partial or truncated output from a complete review. If the agent claims completion without confirming evidence, preserve it as the agent's claim with that uncertainty, not as a verified fact. Preserve concrete findings, errors, and source references instead of replacing them with broad evaluations. This records the existing evidence and uncertainty; it does not ask you to redo the investigation or correct its conclusions. Preserve important exact job outputs or excerpts when useful, along with job IDs, file paths, targets, commands, errors, and other references needed to recover details. Explain what relevant running jobs are doing and what results are still awaited. Original conversation and job outputs remain retrievable.\n\n\
+Include completed work, important findings, partial work, blockers, and available verification results. Support completion claims with observed results and their scope. Distinguish an attempted action from a successful result, listing paths from reading their contents, and partial or truncated output from a complete review. If the agent claims completion without confirming evidence, preserve it as the agent's claim with that uncertainty, not as a verified fact. Preserve concrete findings, errors, and source references instead of replacing them with broad evaluations. This records the existing evidence and uncertainty; it does not ask you to redo the investigation or correct its conclusions. Preserve important exact job outputs or excerpts when useful, along with job IDs, file paths, targets, commands, errors, and other references needed to recover details. Explain what relevant running jobs are doing and what results are still awaited. Select useful job IDs in jobs; the harness will include their original parameters and normally truncated outputs. Avoid copying those outputs into narrative sections unless an exact excerpt is needed to explain a finding. Full job results remain retrievable with job_output. Older conversation details must be preserved in this continuation.\n\n\
 Return a complete current todo list for this agent in todos. Start from the supplied current list and reconcile it with the conversation: the agent may have completed work or made commitments without updating its todos. Preserve unaffected items, their wording, order, and status. Change them only when the conversation supports the change. Mark work completed when completion is established; intent alone does not establish progress. Add explicit commitments that are not yet recorded, including unfinished investigation or verification. Do not collapse outstanding work into a presentation-only todo unless the conversation establishes that the preceding work is complete. Do not turn suggestions or unapproved proposals into active commitments. When progress is uncertain, retain the existing status and explain the uncertainty. Retain completed items. Remove canceled or superseded items only when supported by the conversation. Explain changes and their evidence in todo_reconciliation, or use an empty array if unchanged. Keep those explanations and the continuation consistent with the actual todo statuses. Reconcile only this agent's list; describe delegated work separately. Blocked or approval-dependent work can remain pending or in progress, with its dependency recorded in the continuation. The harness will install the reconciled list and include it in the next runtime state block.",
     );
     // Constrained decoders may enforce the shape without exposing it to the model.
@@ -128,6 +131,7 @@ pub(crate) fn continuation(text: &str) -> Result<Continuation, String> {
     Ok(Continuation {
         message: Message::User(vec![UserContent::Compaction { text }]),
         todos: summary.todos,
+        jobs: summary.jobs,
     })
 }
 
@@ -227,6 +231,7 @@ mod tests {
             "next_actions": [],
             "running_work": [],
             "recovery_details": [],
+            "jobs": [],
             "additional_context": [],
             "todo_reconciliation": ["First step completed before the list was updated."],
             "todos": [
@@ -285,7 +290,10 @@ mod tests {
         wrong_type["findings"] = serde_json::Value::Null;
         cases.push(wrong_type);
         for field in summary().as_object().unwrap().keys() {
-            if matches!(field.as_str(), "objective" | "resumption_point" | "todos") {
+            if matches!(
+                field.as_str(),
+                "objective" | "resumption_point" | "todos" | "jobs"
+            ) {
                 continue;
             }
             for invalid in [
@@ -296,6 +304,16 @@ mod tests {
                 wrong_type[field] = invalid;
                 cases.push(wrong_type);
             }
+        }
+        for invalid in [
+            serde_json::json!([0]),
+            serde_json::json!([-1]),
+            serde_json::json!(["17"]),
+            serde_json::Value::Null,
+        ] {
+            let mut value = summary();
+            value["jobs"] = invalid;
+            cases.push(value);
         }
         let mut wrong_status = summary();
         wrong_status["todos"][0]["status"] = "blocked".into();
@@ -334,6 +352,10 @@ mod tests {
                 "objective" | "resumption_point" => {
                     assert_eq!(schema["properties"][key]["type"], "string");
                 }
+                "jobs" => {
+                    assert_eq!(schema["properties"][key]["type"], "array");
+                    assert_eq!(schema["properties"][key]["items"]["type"], "integer");
+                }
                 "todos" => {}
                 _ => {
                     assert_eq!(schema["properties"][key]["type"], "array");
@@ -365,6 +387,7 @@ mod tests {
             "completed_work",
             "decisions",
             "recovery_details",
+            "jobs",
             "additional_context",
             "todo_reconciliation",
             "todos",

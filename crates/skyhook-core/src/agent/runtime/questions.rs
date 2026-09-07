@@ -27,7 +27,6 @@ struct PendingQuestion {
 struct PendingAsk {
     context: crate::tool::ToolContext,
     question: Question,
-    event_id: String,
     result: oneshot::Sender<Result<serde_json::Value, String>>,
 }
 
@@ -71,7 +70,6 @@ impl QuestionCoordinator {
             let batch = batches.entry(agent.clone()).or_default();
             let first = batch.pending.is_empty();
             batch.pending.push(PendingAsk {
-                event_id: format!("q-{}", context.job),
                 context,
                 question,
                 result,
@@ -160,19 +158,11 @@ impl QuestionCoordinator {
     }
 
     async fn present_child_questions(&self, batch: Vec<PendingAsk>, questions: Vec<Question>) {
-        let event_ids = batch
-            .iter()
-            .map(|pending| pending.event_id.clone())
-            .collect::<Vec<_>>();
         let ask_jobs = batch
             .iter()
             .map(|pending| (pending.question.id.clone(), pending.context.job))
             .collect::<Vec<_>>();
-        let output = json!(crate::agent::QuestionOutput::Questions {
-            question_id: event_ids[0].clone(),
-            question_ids: event_ids,
-            questions,
-        });
+        let output = json!(crate::agent::QuestionOutput { questions });
         let owner_job = match self.open_child_questions(ask_jobs, output).await {
             Ok(owner_job) => owner_job,
             Err(error) => {

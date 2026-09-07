@@ -294,7 +294,12 @@ impl ToolExecutor {
             let output = self
                 .shared
                 .jobs
-                .present_output(crate::job::output::OutputArgs::new(job), &self.capabilities)
+                .present_output_for(
+                    crate::job::output::OutputArgs::new(job),
+                    &self.capabilities,
+                    &self.caller_location,
+                    background,
+                )
                 .await?;
             return Ok(ExecutionResult {
                 job,
@@ -647,7 +652,8 @@ impl ToolExecutor {
         let StartedExecution { job, background } = started;
         if background {
             let envelope = self.shared.jobs.metadata(job).await?;
-            let value = envelope.presented(&self.capabilities)?;
+            let value =
+                envelope.presented_for(&self.capabilities, Some(&self.caller_location), true)?;
             return Ok(ExecutionResult {
                 job,
                 background: true,
@@ -663,7 +669,11 @@ impl ToolExecutor {
             return Ok(ExecutionResult {
                 job,
                 background: true,
-                output: ToolOutput::new(envelope.presented(&self.capabilities)?),
+                output: ToolOutput::new(envelope.presented_for(
+                    &self.capabilities,
+                    Some(&self.caller_location),
+                    true,
+                )?),
             });
         }
         if maximum == u64::MAX {

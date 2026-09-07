@@ -311,7 +311,9 @@ mod tests {
         }
         let ordinary_calls = Arc::new(AtomicUsize::new(0));
         let schema_calls = Arc::new(AtomicUsize::new(0));
-        let mut provider = FluxProvider::new(Recorder(ordinary_calls.clone()));
+        let calls = ordinary_calls.clone();
+        let factory = FluxProvider::new(move || Recorder(calls.clone()));
+        let mut provider = factory.open_context("test-session".into()).unwrap();
         let error = provider
             .invoke(request(true))
             .await
@@ -319,7 +321,15 @@ mod tests {
             .expect("unsupported schema");
         assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
         assert_eq!(ordinary_calls.load(Ordering::SeqCst), 0);
-        provider.schema_inner = Some(Arc::new(Recorder(schema_calls.clone())));
+        let ordinary = ordinary_calls.clone();
+        let schema = schema_calls.clone();
+        let factory = FluxProvider {
+            factory: Arc::new(move || super::super::FluxBackends {
+                inner: Arc::new(Recorder(ordinary.clone())),
+                schema_inner: Some(Arc::new(Recorder(schema.clone()))),
+            }),
+        };
+        let mut provider = factory.open_context("test-session".into()).unwrap();
         drop(provider.invoke(request(true)).await.unwrap());
         drop(provider.invoke(request(false)).await.unwrap());
         assert_eq!(schema_calls.load(Ordering::SeqCst), 1);

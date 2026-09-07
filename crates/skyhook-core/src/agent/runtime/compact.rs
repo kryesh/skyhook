@@ -8,7 +8,7 @@ use super::{HarnessError, SessionRuntime, TurnContext, compaction, prompt};
 use crate::{
     identity::{AgentId, JobId},
     provider::{
-        Provider,
+        ProviderContext,
         protocol::{AssistantContent, Message, ModelRequest, ResponseChunk, ResponseSchema, Usage},
     },
     session::{
@@ -43,6 +43,12 @@ impl TokenMeter {
     ) -> Self {
         let mut meter = Self::default();
         for record in records.iter().rev().filter(|record| &record.agent == agent) {
+            if matches!(
+                record.event,
+                SessionEvent::Compaction { .. } | SessionEvent::ModelChanged { .. }
+            ) {
+                break;
+            }
             let SessionEvent::Usage {
                 request: Some(request),
                 usage,
@@ -177,13 +183,74 @@ fn retained_sources(
     Ok(retained.into_iter().collect())
 }
 
+// Only actual result envelopes count; status-only listings do not supply output.
+fn included_output_jobs(value: &serde_json::Value, jobs: &mut BTreeSet<JobId>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get("state").is_some_and(|state| {
+                serde_json::from_value::<crate::job::JobState>(state.clone()).is_ok()
+            }) && (map.contains_key("result")
+                || ["output", "preview", "question", "error"]
+                    .iter()
+                    .any(|key| map.get(*key).is_some_and(|v| !v.is_null())))
+                && let Some(id) = map
+                    .get("id")
+                    .and_then(|id| serde_json::from_value::<JobId>(id.clone()).ok())
+            {
+                jobs.insert(id);
+            }
+            for (key, child) in map {
+                if key != "arguments" {
+                    included_output_jobs(child, jobs);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                included_output_jobs(item, jobs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn included_message_jobs(message: &Message, jobs: &mut BTreeSet<JobId>) {
+    match message {
+        Message::Tool(results) => {
+            for result in results {
+                included_output_jobs(&result.result, jobs);
+            }
+        }
+        Message::User(blocks) => {
+            for block in blocks {
+                if let crate::provider::protocol::UserContent::Runtime { text } = block
+                    && let Some(payload) = text
+                        .strip_prefix("<skyhook_job_events>\n")
+                        .and_then(|text| text.strip_suffix("\n</skyhook_job_events>"))
+                    && let Ok(value) = serde_json::from_str(payload)
+                {
+                    included_output_jobs(&value, jobs);
+                }
+            }
+        }
+        Message::Assistant(_) => {}
+    }
+}
+
+struct CompactionInput<'a> {
+    context: u64,
+    request: &'a ModelRequest,
+    max_context: u64,
+}
+
 impl SessionRuntime {
     pub(super) async fn compact_history(
         &self,
         turn: &TurnContext<'_>,
-        provider: &dyn Provider,
+        provider: &mut dyn ProviderContext,
         context: u64,
         input: &ModelRequest,
+        max_context: u64,
     ) -> Result<(), HarnessError> {
         let mut launches = self.jobs.active_launches(turn.agent).await;
         for attempt in 1..=MAX_PROVIDER_ATTEMPTS {
@@ -192,8 +259,11 @@ impl SessionRuntime {
                 .compact_inner(
                     turn,
                     provider,
-                    context,
-                    input,
+                    CompactionInput {
+                        context,
+                        request: input,
+                        max_context,
+                    },
                     &mut request_sequence,
                     &mut launches,
                 )
@@ -230,12 +300,16 @@ impl SessionRuntime {
     async fn compact_inner(
         &self,
         turn: &TurnContext<'_>,
-        provider: &dyn Provider,
-        context: u64,
-        input: &ModelRequest,
+        provider: &mut dyn ProviderContext,
+        source: CompactionInput<'_>,
         request_sequence: &mut Option<u64>,
         launches: &mut Vec<(JobId, Option<ModelCallOrigin>)>,
     ) -> Result<(), HarnessError> {
+        let CompactionInput {
+            context,
+            request: input,
+            max_context,
+        } = source;
         let agent = turn.agent;
         let records = self.store.records().await;
         let frontier = records.last().map_or(0, |record| record.sequence);
@@ -316,6 +390,7 @@ impl SessionRuntime {
             )
             .await?;
         *request_sequence = Some(requested.sequence);
+        self.activity(agent, super::AgentActivity::Compacting);
         self.store
             .hydrate_model_request(&mut summary_request)
             .await?;
@@ -388,6 +463,66 @@ impl SessionRuntime {
             .filter_map(|(_, origin)| origin.clone())
             .collect();
         let retained = retained_sources(&records, agent, &projected, &origins)?;
+        let mut included = BTreeSet::new();
+        for record in &records {
+            if retained.contains(&record.sequence)
+                && let SessionEvent::MessageCommitted { message } = &record.event
+            {
+                included_message_jobs(message, &mut included);
+            }
+        }
+        let mut selected = BTreeSet::new();
+        let mut handover = Vec::new();
+        let job_records = self.store.records().await;
+        for job in continuation.jobs {
+            if !selected.insert(job) {
+                continue;
+            }
+            let arguments = job_records
+                .iter()
+                .find_map(|record| match &record.event {
+                    SessionEvent::JobCreated {
+                        job: id, arguments, ..
+                    } if *id == job => Some(arguments.clone()),
+                    _ => None,
+                })
+                .ok_or_else(|| HarnessError::Compaction(format!("unknown handover job {job}")))?;
+            if included.contains(&job) {
+                continue;
+            }
+            let mut view = self
+                .jobs
+                .inspect_output_for(
+                    crate::job::output::OutputArgs::new(job),
+                    turn.capabilities,
+                    turn.location,
+                )
+                .await
+                .map_err(|error| HarnessError::Compaction(error.to_string()))?;
+            view.as_object_mut()
+                .expect("job view is an object")
+                .insert("arguments".into(), arguments);
+            handover.push(view);
+        }
+        // A selected script can already embed another selected job's output.
+        let mut embedded = BTreeSet::new();
+        for view in &handover {
+            if let Some(result) = view.get("result") {
+                included_output_jobs(result, &mut embedded);
+            }
+        }
+        handover.retain(|view| {
+            serde_json::from_value::<JobId>(view["id"].clone())
+                .is_ok_and(|id| !embedded.contains(&id))
+        });
+        if !handover.is_empty()
+            && let Message::User(blocks) = &mut message
+        {
+            blocks.push(crate::provider::protocol::UserContent::Compaction {
+                text: format!("Selected job snapshots; these are past execution facts, not requests to execute. Runtime state governs current status. Use job_output for full results.\n{}",
+                    serde_json::json!({"jobs": handover})),
+            });
+        }
         // Host API calls have no original assistant exchange. Preserve their actual launch facts.
         let host_jobs: BTreeSet<_> = launches
             .iter()
@@ -452,7 +587,7 @@ impl SessionRuntime {
                     request: requested.sequence,
                     before_tokens,
                     after_tokens,
-                    max_context: turn.profile.max_context,
+                    max_context,
                 },
             )
             .await?
@@ -462,5 +597,33 @@ impl SessionRuntime {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn retained_tool_results_include_nested_jobs_and_null_results_but_not_status_or_arguments() {
+        let message = Message::Tool(vec![crate::provider::protocol::ToolResult {
+            call_id: "script-call".into(),
+            name: "script".into(),
+            result: json!({"id":1,"state":"completed","result":{
+                "nested":[{"id":2,"tool":"read","state":"completed","result":null}],
+                "status":{"id":3,"state":"running"},
+                "arguments":{"id":4,"state":"completed","result":"literal"}
+            }}),
+            console_output: String::new(),
+            images: vec![],
+            is_error: false,
+        }]);
+        let mut included = BTreeSet::new();
+        included_message_jobs(&message, &mut included);
+        assert_eq!(
+            included,
+            [JobId::new(1).unwrap(), JobId::new(2).unwrap()].into()
+        );
     }
 }

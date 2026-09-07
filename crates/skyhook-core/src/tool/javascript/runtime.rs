@@ -126,7 +126,8 @@ async fn evaluate_inner(
         .build_async(&runtime)
         .await
         .map_err(|error| JsError::Initialization(error.to_string()))?;
-    let builders = executor.surface().script_manifests();
+    let surface = Arc::new(executor.surface());
+    let builders = surface.script_manifests();
     let builders = serde_json::to_string(&builders)
         .map_err(|error| JsError::Initialization(error.to_string()))?;
     let source = source.trim();
@@ -144,6 +145,8 @@ async fn evaluate_inner(
     let images = Arc::new(Mutex::new(Vec::<ImageReference>::new()));
     let returned_images = images.clone();
     let cancelled = context.clone();
+    let presentation_jobs = executor.jobs().clone();
+    let script_job = context.job;
     let execution = js_context.async_with(async move |js| {
         let sleep_context = context.clone();
         let sleep = Function::new(js.clone(), Async(move |milliseconds: f64| {
@@ -181,13 +184,17 @@ async fn evaluate_inner(
                 let host_context = host_context.clone();
                 let host_executor = host_executor.clone();
                 let host_images = host_images.clone();
+                let surface = surface.clone();
                 async move {
                     let request: HostRequest =
                         serde_json::from_str(&request).map_err(|error| bridge_error(&error))?;
                     let mut failure_output = None;
                     let mut denial = None;
+                    let mut source_job = None;
+                    let mut annotations = Default::default();
                     let result = match request {
                         HostRequest::Call { name, arguments } => {
+                            let schema = surface.get(&name).and_then(|tool| tool.result_schema.as_ref());
                             match host_executor
                                 .execute_script(
                                     host_context.agent.clone(),
@@ -198,6 +205,14 @@ async fn evaluate_inner(
                                 .await
                             {
                                 Ok(result) => {
+                                    // Job output queries already return views; background
+                                    // calls return handles rather than completed tool data.
+                                    if !result.background && name != "job_output" {
+                                        source_job = Some(result.job);
+                                        if let Some(schema) = schema {
+                                            annotations = crate::job::output::annotated_fields(&result.output.value, schema);
+                                        }
+                                    }
                                     host_images
                                         .lock()
                                         .await
@@ -233,6 +248,10 @@ async fn evaluate_inner(
                         Ok(value) => serde_json::json!({"ok": true, "value": value}),
                         Err(error) => serde_json::json!({"ok": false, "error": error}),
                     };
+                    if let Some(job) = source_job {
+                        response["source_job"] = serde_json::json!(job);
+                        response["annotations"] = serde_json::json!(annotations);
+                    }
                     if let Some(denial) = denial {
                         response["code"] = serde_json::json!(denial.code);
                         response["executed"] = serde_json::json!(denial.executed);
@@ -279,6 +298,12 @@ async fn evaluate_inner(
         });
     }
     let value = result["value"].clone();
+    let presentation = serde_json::from_value(result["presentation"].clone())
+        .map_err(|error| JsError::InvalidOutput(error.to_string()))?;
+    presentation_jobs
+        .save_script_presentation(script_job, presentation)
+        .await
+        .map_err(|error| JsError::Execution(error.to_string()))?;
     let mut images = returned_images.lock().await.clone();
     images.sort();
     images.dedup();
@@ -322,7 +347,9 @@ fn wrapper_script(source: &str, builders: &str) -> String {
          const value = await (async () => {{\n\
          {USER_SOURCE_MARKER}{source}\n\
          }})();\n\
-         return __stringify({{ok:true, value:await __resolve(value, \"$\", new Set())}});\n\
+         const presentation = {{jobs:Object.create(null), fields:[]}};\n\
+         const resolved = await __resolve(value, \"$\", new Set(), \"/result\", presentation);\n\
+         return __stringify({{ok:true, value:resolved, presentation}});\n\
          }} catch (error) {{ return __stringify({{ok:false, error:__describeError(error)}}); }}\n\
          }})()\n"
     )
@@ -336,6 +363,239 @@ mod tests {
 
     use super::*;
     use crate::tool::{ToolOptions, ToolRegistryBuilder, executor::ToolExecutor};
+
+    async fn presentation_runtime() -> (
+        TestRuntime,
+        ToolExecutor,
+        Arc<std::sync::OnceLock<ToolExecutor>>,
+    ) {
+        let runtime = TestRuntime::new().await;
+        let mut builder = ToolRegistryBuilder::default();
+        crate::tool::builtins::register_worker_tools(&mut builder, runtime.store.clone()).unwrap();
+        crate::tool::builtins::jobs::register(&mut builder, runtime.jobs.clone()).unwrap();
+        let slot = Arc::new(std::sync::OnceLock::new());
+        crate::tool::builtins::install_script_tool(&mut builder, Arc::downgrade(&slot)).unwrap();
+        let executor = runtime.executor(builder);
+        slot.set(executor.clone()).ok().unwrap();
+        (runtime, executor, slot)
+    }
+
+    #[tokio::test]
+    async fn returned_tool_views_keep_full_script_values_and_child_ranges_after_resume() {
+        let (runtime, executor, _slot) = presentation_runtime().await;
+        std::fs::create_dir(runtime.root.path().join("files")).unwrap();
+        for index in 0..150 {
+            std::fs::write(
+                runtime
+                    .root
+                    .path()
+                    .join(format!("files/file-{index:03}.rs")),
+                "needle\n",
+            )
+            .unwrap();
+        }
+        let call = executor
+            .execute_model(
+                runtime.agent.clone(),
+                "script",
+                serde_json::json!({"source":r#"
+const files = await tool.glob({pattern:"*.rs", path:"files"});
+if (files.paths.length !== 150) throw new Error("tool data was truncated inside script");
+console.log("logged\n".repeat(150));
+return {
+  "files/~":files,
+  count:files.paths.length,
+  nested:[files, tool.search({pattern:"needle", path:"files"})],
+  custom:{text:"x".repeat(5000)}
+};
+"#}),
+                None,
+            )
+            .await
+            .unwrap();
+        let view = call.output.value;
+        let child = &view["result"]["files/~"];
+        assert_eq!(child["tool"], "glob");
+        assert!(child["result"]["paths"].as_array().unwrap().len() < 150);
+        assert!(child.get("paths").is_none());
+        assert_eq!(view["result"]["nested"][0], *child);
+        assert_eq!(view["result"]["nested"][1]["tool"], "search");
+        assert_eq!(view["result"]["count"], 150);
+        assert_eq!(
+            view["result"]["custom"]["text"].as_str().unwrap().len(),
+            5000
+        );
+        assert_eq!(view["console"].as_str().unwrap().lines().count(), 100);
+        assert_eq!(view["truncated"].as_array().unwrap().len(), 1);
+        assert_eq!(view["truncated"][0]["field"], "/console");
+        let raw = runtime
+            .jobs
+            .snapshot(call.job)
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        assert_eq!(raw["files/~"]["paths"].as_array().unwrap().len(), 150);
+        assert!(
+            runtime
+                .jobs
+                .take_pending(&runtime.agent)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let child_id = serde_json::from_value(child["id"].clone()).unwrap();
+        let mut query = crate::job::output::OutputArgs::new(child_id);
+        query.field = Some(child["truncated"][0]["field"].as_str().unwrap().into());
+        query.start = Some(child["truncated"][0]["next_start"].as_u64().unwrap() as usize);
+        query.offset = Some(child["truncated"][0]["next_offset"].as_u64().unwrap_or(0) as usize);
+        let page = runtime
+            .jobs
+            .present_output(query.clone(), &Default::default())
+            .await
+            .unwrap();
+        assert!(!page["preview"]["lines"].as_array().unwrap().is_empty());
+        let mut wrong_job = query.clone();
+        wrong_job.job = call.job;
+        assert!(
+            runtime
+                .jobs
+                .present_output(wrong_job, &Default::default())
+                .await
+                .is_err()
+        );
+
+        let session = runtime.store.id();
+        runtime.store.close().await.unwrap();
+        let (store, records) =
+            crate::session::SessionStore::open(&runtime.root.path().join("sessions"), session)
+                .await
+                .unwrap();
+        let restored = crate::job::JobManager::restore(store, &records)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored
+                .present_output_for(
+                    crate::job::output::OutputArgs::new(call.job),
+                    &Default::default(),
+                    &crate::execution::ExecutionLocation::root(runtime.root.path().to_path_buf()),
+                    false,
+                )
+                .await
+                .unwrap(),
+            view
+        );
+        assert_eq!(
+            restored
+                .present_output(query, &Default::default())
+                .await
+                .unwrap(),
+            page
+        );
+    }
+
+    #[tokio::test]
+    async fn edited_results_and_extracted_arrays_use_script_annotations() {
+        let (runtime, executor, _slot) = presentation_runtime().await;
+        let text = "original\n".repeat(200);
+        std::fs::write(runtime.root.path().join("file.txt"), &text).unwrap();
+        let call = executor.execute_model(runtime.agent.clone(), "script", serde_json::json!({"source":r#"
+const original = await tool.read({path:"file.txt"});
+const edited = await tool.read({path:"file.txt"});
+edited.content = "edited\n".repeat(200);
+const files = await tool.glob({pattern:"file.txt"});
+files.paths.push(...Array.from({length:200}, (_, i) => "path-"+i));
+return {original, edited, extracted:original.content, "array/~":files.paths, mapped:files.paths.map(p=>p)};
+"#}), None).await.unwrap();
+        let view = call.output.value;
+        assert_eq!(view["result"]["original"]["tool"], "read");
+        assert!(view["result"]["edited"].get("tool").is_none());
+        assert_eq!(view["result"]["edited"]["content"], "edited\n".repeat(100));
+        assert_eq!(view["result"]["extracted"], text);
+        assert!(view["result"]["array/~"].as_array().unwrap().len() < 201);
+        assert_eq!(view["result"]["mapped"].as_array().unwrap().len(), 201);
+        let truncated = view["truncated"].as_array().unwrap();
+        assert_eq!(truncated.len(), 2);
+        assert!(truncated.iter().any(|t| t["field"] == "/result/array~1~0"));
+        let entry = truncated
+            .iter()
+            .find(|t| t["field"] == "/result/edited/content")
+            .unwrap();
+        let mut query = crate::job::output::OutputArgs::new(call.job);
+        query.field = Some(entry["field"].as_str().unwrap().into());
+        query.start = Some(entry["next_start"].as_u64().unwrap() as usize);
+        query.offset = Some(entry["next_offset"].as_u64().unwrap_or(0) as usize);
+        let page = runtime
+            .jobs
+            .present_output(query, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(page["preview"]["lines"][0], "edited");
+        let saved = runtime
+            .jobs
+            .snapshot(call.job)
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        assert_eq!(saved["edited"]["content"], "edited\n".repeat(200));
+    }
+
+    #[tokio::test]
+    async fn direct_returns_and_existing_job_views_are_not_double_wrapped() {
+        let (runtime, executor, _slot) = presentation_runtime().await;
+        std::fs::write(runtime.root.path().join("file.txt"), "hello").unwrap();
+        let direct = executor
+            .execute_model(
+                runtime.agent.clone(),
+                "script",
+                serde_json::json!({"source":"return tool.read({path:'file.txt'});"}),
+                None,
+            )
+            .await
+            .unwrap();
+        let child = &direct.output.value["result"];
+        assert_eq!(child["tool"], "read");
+        assert_eq!(child["result"]["content"], "hello");
+        let query = executor
+            .execute_model(
+                runtime.agent.clone(),
+                "script",
+                serde_json::json!({"source":format!("return tool.job({}).output();", child["id"])}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(query.output.value["result"]["id"], child["id"]);
+        assert_eq!(query.output.value["result"]["result"], child["result"]);
+        assert!(query.output.value["result"].get("tool").is_none());
+        let background = executor
+            .execute_model(
+                runtime.agent.clone(),
+                "script",
+                serde_json::json!({
+                    "source":"return {handle:await tool.shell({command:'printf hello',bg:true})};"
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let handle = &background.output.value["result"]["handle"];
+        assert_eq!(handle["tool"], "shell");
+        assert!(handle.get("result").is_none());
+        let mut query = crate::job::output::OutputArgs::new(
+            serde_json::from_value(handle["id"].clone()).unwrap(),
+        );
+        query.wait = Some(5);
+        let completed = runtime
+            .jobs
+            .present_output(query, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(completed["result"]["stdout"], "hello");
+    }
 
     #[derive(Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]

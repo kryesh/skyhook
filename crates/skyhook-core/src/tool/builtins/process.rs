@@ -148,8 +148,8 @@ async fn run_process(
         child.kill().await?;
         child.wait().await?
     };
-    let stdout_text = String::new();
-    let stderr_text = String::new();
+    let stdout_text = (stdout_capture.file.metadata().await?.len() > 0).then(String::new);
+    let stderr_text = (stderr_capture.file.metadata().await?.len() > 0).then(String::new);
     let output = ProcessOutput {
         exit_code: status.code(),
         stdout: stdout_text,
@@ -283,11 +283,15 @@ struct ShellArgs {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct ProcessOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     #[schemars(extend("x-skyhook-truncatable" = true))]
-    pub stdout: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
     #[schemars(extend("x-skyhook-truncatable" = true))]
-    pub stderr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub timed_out: bool,
 }
 
@@ -301,7 +305,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        identity::JobId,
         job::JobState,
         tool::{ToolRegistryBuilder, executor::ExecutionError},
     };
@@ -374,6 +377,24 @@ mod tests {
         let mut builder = ToolRegistryBuilder::default();
         register(&mut builder).unwrap();
         let executor = runtime.executor(builder);
+        for (command, expected) in [
+            ("exit 0", serde_json::json!({"exit_code":0})),
+            (
+                "printf warning >&2",
+                serde_json::json!({"exit_code":0,"stderr":"warning"}),
+            ),
+        ] {
+            let output = executor
+                .execute(
+                    agent.clone(),
+                    "shell",
+                    serde_json::json!({"command":command}),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(output.output.value, expected);
+        }
         let output = executor
             .execute(
                 agent.clone(),
@@ -412,7 +433,8 @@ mod tests {
             error => panic!("expected failed output, got {error}"),
         };
         assert_eq!(output.value["timed_out"], true);
-        let envelope = jobs.snapshot(JobId::new(2).unwrap()).await.unwrap();
+        let failed_job = jobs.list(&runtime.agent).await.last().unwrap().id;
+        let envelope = jobs.snapshot(failed_job).await.unwrap();
         assert_eq!(envelope.state, JobState::Failed);
         assert_eq!(envelope.output.unwrap()["timed_out"], true);
     }

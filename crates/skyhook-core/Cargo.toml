@@ -53,7 +53,8 @@ tokio = { version = "1.53.1", features = [
     "time",
 ] }
 tokio-util = "0.7.17"
-toml = "1.1.4"
+toml = { version = "1.1.4", features = ["preserve_order"] }
+indexmap = { version = "2", features = ["serde"] }
 zeroize = "1.8.2"
 
 [target.'cfg(unix)'.dependencies]

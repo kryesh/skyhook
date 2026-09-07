@@ -29,9 +29,35 @@ pub(crate) use event::is_safe_artifact_path;
 pub use event::{
     CompactionCheckpoint, ContextMessage, EventRecord, ModelCallOrigin, ModelPurpose, SessionEvent,
 };
-pub use request::{project_history, reconstruct_model_request};
+pub use request::{project_history, reconstruct_model_request, reconstruct_model_request_indexed};
 
 pub const SESSION_FORMAT_VERSION: u16 = 1;
+
+/// Restore applied model and instructions, including sessions predating per-turn selection.
+pub fn agent_selection(
+    records: &[EventRecord],
+    agent: &AgentId,
+) -> Option<(String, Option<String>)> {
+    let mut selection = None;
+    for record in records.iter().filter(|record| &record.agent == agent) {
+        match &record.event {
+            SessionEvent::AgentStarted {
+                model_profile,
+                agent_profile,
+                ..
+            } => {
+                selection = Some((model_profile.clone(), agent_profile.clone()));
+            }
+            SessionEvent::ModelChanged { model_profile, .. } => {
+                if let Some((model, _)) = &mut selection {
+                    model.clone_from(model_profile);
+                }
+            }
+            _ => {}
+        }
+    }
+    selection
+}
 
 struct SessionWriter {
     file: Option<BufWriter<File>>,
@@ -54,6 +80,21 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
+    /// Read an archive without opening a writer, taking a lock, or repairing a partial tail.
+    pub async fn read_records(
+        root: &Path,
+        id: SessionId,
+    ) -> Result<Vec<EventRecord>, SessionError> {
+        let bytes = fs::read(root.join(id.to_string()).join("events.jsonl")).await?;
+        let end = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let records = parse_lines(&bytes[..end])?;
+        event::validate_records(&records, id)?;
+        Ok(records)
+    }
+
     pub async fn create(root: &Path) -> Result<Self, SessionError> {
         Self::create_with_durability(root, true).await
     }
@@ -164,6 +205,15 @@ impl SessionStore {
     /// A consistent snapshot of all successfully committed events, including ephemeral sessions.
     pub async fn records(&self) -> Vec<EventRecord> {
         self.inner.writer.lock().await.records.clone()
+    }
+
+    /// A consistent committed suffix, cloning only records newer than `sequence`.
+    pub(crate) async fn records_after(&self, sequence: u64) -> Vec<EventRecord> {
+        let writer = self.inner.writer.lock().await;
+        let start = writer
+            .records
+            .partition_point(|record| record.sequence <= sequence);
+        writer.records[start..].to_vec()
     }
 
     pub async fn append(
@@ -355,6 +405,43 @@ pub enum SessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn records_after_returns_only_the_committed_suffix() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(root.path()).await.unwrap();
+        assert!(store.records_after(0).await.is_empty());
+        let agent = AgentId::root(store.id());
+        let first = store
+            .append(agent.clone(), SessionEvent::AgentInterrupted)
+            .await
+            .unwrap();
+        let second = store
+            .append(agent.clone(), SessionEvent::AgentCompleted)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.records_after(0).await,
+            vec![first.clone(), second.clone()]
+        );
+        assert_eq!(
+            store.records_after(first.sequence).await,
+            vec![second.clone()]
+        );
+        assert!(store.records_after(second.sequence).await.is_empty());
+        assert!(store.records_after(u64::MAX).await.is_empty());
+
+        store.close().await.unwrap();
+        let (reopened, _) = SessionStore::open(root.path(), store.id()).await.unwrap();
+        let third = reopened
+            .append(agent, SessionEvent::AgentInterrupted)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.records_after(first.sequence).await,
+            vec![second, third]
+        );
+    }
 
     #[tokio::test]
     async fn append_and_resume_complete_prefix() {

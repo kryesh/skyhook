@@ -32,6 +32,7 @@ pub struct TargetDefinition {
     pub ssh_alias: String,
     pub resolved: Option<crate::remote::ssh::ResolvedSsh>,
     pub workspace: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
     pub source: TargetSource,
     pub revision: u64,
@@ -91,12 +92,16 @@ pub struct TargetRecord {
     /// local identifies the Skyhook session host; ssh identifies a remote target.
     pub r#type: TargetType,
     pub origin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_alias: Option<String>,
     pub source: TargetSource,
     pub host: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
     pub workspace: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
     pub auth: &'static str,
 }

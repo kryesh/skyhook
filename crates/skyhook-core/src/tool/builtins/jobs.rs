@@ -45,7 +45,7 @@ pub(crate) fn register(
                 Ok(Value::Array(
                     envelopes
                         .iter()
-                        .map(|job| job.presented(&context.capabilities))
+                        .map(|job| job.presented_for(&context.capabilities, Some(&context.caller_location), true))
                         .collect::<Result<_, _>>()?,
                 ))
             }
@@ -54,12 +54,12 @@ pub(crate) fn register(
     let output = jobs.clone();
     builder.register::<crate::job::output::OutputArgs, Value, _, _>(
         "job_output",
-        "Read or search saved job output and status. Reads are repeatable. Use wait to await output, a question, or completion; timeout does not stop work. Cursors continue the same selection. Answer questions with tool.job(id).send({value:answer}).",
+        "Read or search saved job output and status. Reads are repeatable. Use wait to await output, a question, or completion; timeout does not stop work. Select a field with start/limit; total_lines reports its size. Continue using next_start/next_offset as start/offset, repeating field and any pattern/context. Answer questions with tool.job(id).send({value:answer}).",
         ToolOptions::default().generated_output_schema(crate::job::output::view_schema).job_method("output", "job"),
         move |context, mut args| {
             let jobs = output.clone();
             args.cancellation = Some(context.cancellation_token());
-            async move { jobs.present_output(args, &context.capabilities).await }
+            async move { jobs.present_output_for(args, &context.capabilities, &context.caller_location, false).await }
         },
     )?;
     let send = jobs.clone();
@@ -94,8 +94,12 @@ pub(crate) fn register(
                     .await
                     .map_err(|error| job_error(&error))
                     .and_then(|job| {
-                        job.presented(&context.capabilities)
-                            .map_err(ToolError::from)
+                        job.presented_for(
+                            &context.capabilities,
+                            Some(&context.caller_location),
+                            false,
+                        )
+                        .map_err(ToolError::from)
                     })
             }
         },
@@ -139,7 +143,6 @@ mod tests {
     use super::*;
     use crate::{
         identity::AgentId,
-        job::JobEnvelope,
         job::JobSpec,
         session::SessionStore,
         tool::{ToolOutput, ToolRegistryBuilder, executor::ToolExecutor, policy::AllowAll},
@@ -230,9 +233,15 @@ mod tests {
             .execute(agent.clone(), "jobs", serde_json::json!({}), None)
             .await
             .unwrap();
-        let current: Vec<JobEnvelope> = serde_json::from_value(current.output.value).unwrap();
+        let current = current.output.value.as_array().unwrap();
         assert_eq!(
-            current.iter().map(|job| job.id).collect::<Vec<_>>(),
+            current
+                .iter()
+                .map(
+                    |job| serde_json::from_value::<crate::identity::JobId>(job["id"].clone())
+                        .unwrap()
+                )
+                .collect::<Vec<_>>(),
             [active]
         );
 
@@ -249,18 +258,32 @@ mod tests {
             .execute(agent.clone(), "jobs", serde_json::json!({}), Some(script))
             .await
             .unwrap();
-        let nested: Vec<JobEnvelope> = serde_json::from_value(nested.output.value).unwrap();
-        assert!(nested.iter().any(|job| job.id == active));
-        assert!(nested.iter().all(|job| job.id != script));
+        let nested = nested.output.value.as_array().unwrap();
+        assert!(
+            nested
+                .iter()
+                .any(|job| job["id"] == serde_json::json!(active))
+        );
+        assert!(
+            nested
+                .iter()
+                .all(|job| job["id"] != serde_json::json!(script))
+        );
 
         let all = executor
             .execute(agent, "jobs", serde_json::json!({"all": true}), None)
             .await
             .unwrap();
         let listing_job = all.job;
-        let all: Vec<JobEnvelope> = serde_json::from_value(all.output.value).unwrap();
-        assert!(all.iter().any(|job| job.id == active));
-        assert!(all.iter().any(|job| job.id == completed));
-        assert!(all.iter().all(|job| job.id != listing_job));
+        let all = all.output.value.as_array().unwrap();
+        assert!(all.iter().any(|job| job["id"] == serde_json::json!(active)));
+        assert!(
+            all.iter()
+                .any(|job| job["id"] == serde_json::json!(completed))
+        );
+        assert!(
+            all.iter()
+                .all(|job| job["id"] != serde_json::json!(listing_job))
+        );
     }
 }

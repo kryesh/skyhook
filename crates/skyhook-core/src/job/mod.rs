@@ -1,4 +1,4 @@
-//! Supervised jobs and durable progress cursors.
+//! Supervised jobs and durable saved output.
 
 use std::{
     collections::HashMap,
@@ -31,6 +31,7 @@ use crate::{
 };
 
 pub(crate) mod output;
+pub use output::OutputArgs as JobOutputQuery;
 mod persistence;
 
 const JOB_INPUT_CAPACITY: usize = 32;
@@ -87,8 +88,27 @@ pub struct JobEnvelope<L = ExecutionLocation, T = String, V = Value> {
 }
 
 #[derive(Serialize, JsonSchema)]
-struct LocalLocation<'a> {
-    workspace: &'a std::path::Path,
+struct PresentedJob<'a> {
+    id: JobId,
+    state: JobState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<JobId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<&'a std::path::Path>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<&'a Value>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    console_output: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+    #[serde(flatten)]
+    denial: Option<crate::tool::Denial>,
 }
 
 /// Minimal job information included in the model's current runtime snapshot.
@@ -111,66 +131,73 @@ struct ActiveJobLocation {
 }
 
 impl JobEnvelope {
-    fn view<L>(&self, location: L) -> JobEnvelope<L, &str, &Value> {
-        JobEnvelope {
-            id: self.id,
-            parent: self.parent,
-            tool: &self.tool,
-            name: self.name.as_deref(),
-            state: self.state.presented(),
-            output: self.output.as_ref(),
-            console_output: self.console_output.clone(),
-            error: self.error.as_deref(),
-            location,
-            denial: self.denial.clone(),
-        }
-    }
-
+    #[cfg(test)]
     pub(crate) fn presented(
         &self,
         capabilities: &CapabilitySet,
     ) -> Result<Value, serde_json::Error> {
-        if capabilities.contains(Capability::Targets) {
-            serde_json::to_value(self.view(&self.location))
-        } else {
-            serde_json::to_value(self.view(LocalLocation {
-                workspace: &self.location.workspace,
-            }))
-        }
+        self.presented_for(capabilities, None, true)
+    }
+
+    pub(crate) fn presented_for(
+        &self,
+        capabilities: &CapabilitySet,
+        viewer: Option<&ExecutionLocation>,
+        detailed: bool,
+    ) -> Result<Value, serde_json::Error> {
+        serde_json::to_value(PresentedJob {
+            id: self.id,
+            state: self.state.presented(),
+            parent: self.parent.filter(|_| detailed),
+            tool: detailed.then_some(self.tool.as_str()),
+            name: self
+                .name
+                .as_deref()
+                .filter(|name| detailed && !name.is_empty()),
+            target: capabilities
+                .contains(Capability::Targets)
+                .then_some(self.location.target.as_str()),
+            workspace: viewer
+                .is_none_or(|location| location.workspace != self.location.workspace)
+                .then_some(self.location.workspace.as_path()),
+            output: self.output.as_ref(),
+            console_output: self.console_output.clone(),
+            error: self.error.as_deref(),
+            denial: self.denial.clone(),
+        })
     }
 }
 
 pub(crate) fn presented_job_schema(capabilities: &CapabilitySet, many: bool) -> Value {
-    fn schema<T: JsonSchema>(many: bool) -> Value {
-        if many {
-            serde_json::to_value(schemars::schema_for!(Vec<T>))
-        } else {
-            serde_json::to_value(schemars::schema_for!(T))
-        }
-        .expect("job presentation schemas serialize")
-    }
-    let mut envelope = if capabilities.contains(Capability::Targets) {
-        schema::<JobEnvelope>(false)
-    } else {
-        schema::<JobEnvelope<LocalLocation<'_>>>(false)
-    };
-    let mut question = schema::<crate::agent::QuestionOutput>(false);
-    if let Some(Value::Object(definitions)) = question
-        .as_object_mut()
-        .and_then(|schema| schema.remove("$defs"))
-    {
-        envelope["$defs"]
+    let mut envelope = serde_json::to_value(schemars::schema_for!(PresentedJob<'_>))
+        .expect("job schema serializes");
+    if !capabilities.contains(Capability::Targets) {
+        envelope["properties"]
             .as_object_mut()
-            .expect("job schema has definitions")
-            .extend(definitions);
+            .unwrap()
+            .remove("target");
     }
+    let settings = schemars::generate::SchemaSettings::default().with(|settings| {
+        settings.meta_schema = None;
+        settings.inline_subschemas = true;
+    });
+    let question = serde_json::to_value(
+        settings
+            .into_generator()
+            .into_root_schema_for::<crate::agent::QuestionOutput>(),
+    )
+    .expect("question schema serializes");
     envelope["allOf"] = serde_json::json!([{
-        "if": {"properties": {"state": {"const": "waiting_input"}, "tool": {"const": "agent"}}, "required": ["state", "tool"]},
-        "then": {"properties": {"output": {"anyOf": [question, {"type": "null"}]}}}
+        "if":{"properties":{"state":{"const":"waiting_input"},"tool":{"const":"agent"}},"required":["state","tool"]},
+        "then":{"properties":{"output":question}}
     }]);
     if many {
-        let definitions = envelope.as_object_mut().unwrap().remove("$defs").unwrap();
-        serde_json::json!({"type": "array", "items": envelope, "$defs": definitions})
+        let definitions = envelope
+            .as_object_mut()
+            .unwrap()
+            .remove("$defs")
+            .unwrap_or_else(|| serde_json::json!({}));
+        serde_json::json!({"type":"array", "items":envelope, "$defs":definitions})
     } else {
         envelope
     }
@@ -1531,8 +1558,31 @@ mod tests {
         };
         let presented = envelope.presented(&CapabilitySet::default()).unwrap();
 
-        assert!(presented["location"].get("target").is_none());
+        assert!(presented.get("target").is_none());
+        assert!(presented.get("location").is_none());
+        assert_eq!(presented["workspace"], "/srv/project");
         assert_eq!(presented["output"]["target"], "application-value");
+        let mut capabilities = CapabilitySet::default();
+        capabilities.insert(Capability::Targets);
+        let direct = envelope
+            .presented_for(&capabilities, Some(&envelope.location), false)
+            .unwrap();
+        assert_eq!(
+            direct,
+            serde_json::json!({"id":1,"state":"completed","target":"build","output":{"target":"application-value"}})
+        );
+        let other_workspace = ExecutionLocation::named("build", "/elsewhere".into());
+        assert_eq!(
+            envelope
+                .presented_for(&capabilities, Some(&other_workspace), false)
+                .unwrap()["workspace"],
+            "/srv/project"
+        );
+        let old = serde_json::to_value(&envelope).unwrap();
+        assert!(
+            serde_json::to_vec(&direct).unwrap().len() < serde_json::to_vec(&old).unwrap().len()
+        );
+
         assert!(
             !presented_job_schema(&CapabilitySet::default(), false)
                 .to_string()
@@ -1559,7 +1609,7 @@ mod tests {
             .execute(
                 agent.clone(),
                 "echo",
-                serde_json::json!({"value":"a", "name":"foreground_echo"}),
+                serde_json::json!({"value":"a", "name":"foreground-echo"}),
                 None,
             )
             .await
@@ -1567,7 +1617,7 @@ mod tests {
         assert_eq!(foreground.output.value, "a");
         assert_eq!(
             jobs.snapshot(foreground.job).await.unwrap().name.as_deref(),
-            Some("foreground_echo")
+            Some("foreground-echo")
         );
         assert_eq!(
             jobs.snapshot(foreground.job).await.unwrap().location,
@@ -1577,13 +1627,13 @@ mod tests {
             .execute(
                 agent.clone(),
                 "echo",
-                serde_json::json!({"value":"b", "bg":true, "name":"background_echo"}),
+                serde_json::json!({"value":"b", "bg":true, "name":"background-echo"}),
                 None,
             )
             .await
             .unwrap();
         assert!(background.background);
-        assert_eq!(background.output.value["name"], "background_echo");
+        assert_eq!(background.output.value["name"], "background-echo");
         assert_eq!(
             jobs.wait(background.job, None, true).await.unwrap().output,
             Some(serde_json::json!("b"))

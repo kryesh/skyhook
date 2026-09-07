@@ -19,7 +19,8 @@ use crate::{
     execution::ExecutionLocation,
     job::{JobOutcome, JobSpec, JobState},
     provider::{
-        Provider, ProviderError, ProviderErrorKind, ProviderFuture, ResponseStream,
+        Provider, ProviderContext, ProviderError, ProviderErrorKind, ProviderFuture,
+        ResponseStream,
         profile::ModelProfile,
         protocol::{AssistantContent, Message, ModelRequest, ResponseChunk, Usage, UserContent},
     },
@@ -28,6 +29,7 @@ use crate::{
 };
 
 struct ControlledProvider {
+    opened: AtomicUsize,
     requests: StdMutex<Vec<ModelRequest>>,
     summary: StdMutex<String>,
     overflow: AtomicBool,
@@ -48,6 +50,7 @@ struct ControlledProvider {
 impl Default for ControlledProvider {
     fn default() -> Self {
         Self {
+            opened: AtomicUsize::new(0),
             requests: StdMutex::new(Vec::new()),
             summary: StdMutex::new(String::new()),
             overflow: AtomicBool::new(false),
@@ -68,7 +71,17 @@ impl Default for ControlledProvider {
 }
 
 impl Provider for Arc<ControlledProvider> {
-    fn invoke(&self, request: ModelRequest) -> ProviderFuture {
+    fn open_context(
+        &self,
+        _correlation: String,
+    ) -> Result<Box<dyn ProviderContext>, ProviderError> {
+        self.opened.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(self.clone()))
+    }
+}
+
+impl ProviderContext for Arc<ControlledProvider> {
+    fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
         let provider = self.clone();
         Box::pin(async move {
             let summary = request.messages.last() == Some(&compaction::directive());
@@ -189,6 +202,7 @@ fn summary_value() -> Value {
         "next_actions": [],
         "running_work": [],
         "recovery_details": [],
+        "jobs": [],
         "additional_context": [],
         "todo_reconciliation": [],
         "todos": []
@@ -212,6 +226,88 @@ struct Fixture {
     session: SessionHandle,
     provider: Arc<ControlledProvider>,
     template: ModelRequest,
+}
+
+#[tokio::test]
+async fn switched_model_controls_compaction_and_retries_for_the_whole_turn() {
+    let workspace = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ControlledProvider::default());
+    *provider.summary.lock().unwrap() = summary_value().to_string();
+    let mut smaller = profile();
+    smaller.model = "smaller-model".into();
+    smaller.max_context = 16_000;
+    smaller.max_output = 2048;
+    let harness = HarnessBuilder::new(workspace.path())
+        .session_root(sessions.path())
+        .provider("test", Arc::new(provider.clone()))
+        .model_profile("test", profile())
+        .model_profile("smaller", smaller)
+        .default_model_profile("test")
+        .build()
+        .await
+        .unwrap();
+    let session = harness.new_session().await.unwrap();
+    session.prompt("Research this task").await.unwrap();
+    session
+        .runtime
+        .commit(
+            &session.root,
+            Message::Assistant(vec![AssistantContent::Text {
+                text: "research ".repeat(12_000),
+            }]),
+        )
+        .await
+        .unwrap();
+    provider.agent_immediate_failures.store(1, Ordering::SeqCst);
+    session
+        .prompt_with_options(
+            "Continue with the smaller model",
+            &[],
+            super::PromptOptions {
+                model: Some("smaller".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let requests = provider.requests.lock().unwrap().clone();
+    assert_eq!(
+        provider.opened.load(Ordering::SeqCst),
+        2,
+        "model swap opens once; compaction and retries reuse the replacement"
+    );
+    assert_eq!(requests[0].model, "test");
+    assert!(
+        requests[1..]
+            .iter()
+            .all(|request| request.model == "smaller-model"
+                && request.max_output_tokens == Some(2048))
+    );
+    assert!(
+        requests[1..]
+            .iter()
+            .any(|request| request.response_schema.is_some())
+    );
+    let records = session.runtime.store.records().await;
+    assert!(records.iter().any(|record| matches!(&record.event, SessionEvent::Compaction { checkpoint } if checkpoint.max_context == 16_000)));
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record.event, SessionEvent::ModelFailed { .. }))
+            .count(),
+        1
+    );
+    let replay = records
+        .iter()
+        .filter(|record| matches!(record.event, SessionEvent::ModelRequested { .. }))
+        .map(|record| {
+            reconstruct_model_request(&records, record.sequence)
+                .unwrap()
+                .1
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(replay, requests);
+    session.shutdown().await.unwrap();
 }
 
 impl Fixture {
@@ -346,16 +442,15 @@ impl Fixture {
             .compact_history(
                 &TurnContext {
                     agent,
-                    profile: &profile(),
-                    system: &input.system,
                     owner_job: None,
                     cancellation,
                     location: &location,
                     capabilities: &capabilities,
                 },
-                &self.provider,
+                self.provider.open_context(agent.to_string())?.as_mut(),
                 context,
                 &input,
+                profile().max_context,
             )
             .await
     }
@@ -367,6 +462,11 @@ async fn stream_overflow_below_threshold_compacts_once_and_replays_every_request
     fixture.add_history(20_000).await;
     fixture.provider.overflow.store(true, Ordering::SeqCst);
     assert_eq!(fixture.session.prompt("Continue.").await.unwrap(), "done");
+    assert_eq!(
+        fixture.provider.opened.load(Ordering::SeqCst),
+        1,
+        "summarization and retry retain the agent's context"
+    );
     let records = fixture.session.runtime.store.records().await;
     let requests = fixture.provider.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 4); // initial response, rejected stream, summary, retry
@@ -698,6 +798,51 @@ async fn token_meter_restores_actual_input_usage_for_the_same_agent_and_template
     changed.model = "another-model".into();
     let other_template = compact::TokenMeter::restore(&records, &fixture.session.root, &changed);
     assert_eq!(other_template.estimate(&captured), estimated);
+    let mut context = fixture
+        .session
+        .runtime
+        .open_agent_context(
+            &fixture.session.root,
+            profile(),
+            fixture.template.system.clone(),
+            &CapabilitySet::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(context.meter.estimate(&captured), estimated + 12_000);
+
+    // Even switching back to an identical template cannot revive calibration from
+    // a provider handle that was replaced in between.
+    let mut changed_records = records.clone();
+    let mut changed_record = records.last().unwrap().clone();
+    changed_record.sequence += 1;
+    changed_record.event = SessionEvent::ModelChanged {
+        model_profile: "other".into(),
+        max_context: 64_000,
+    };
+    changed_records.push(changed_record);
+    assert_eq!(
+        compact::TokenMeter::restore(&changed_records, &fixture.session.root, &fixture.template)
+            .estimate(&captured),
+        estimated
+    );
+
+    fixture.add_history(20_000).await;
+    fixture.compact(&CancellationToken::new()).await.unwrap();
+    let records = fixture.session.runtime.store.records().await;
+    assert!(
+        records
+            .iter()
+            .any(|record| matches!(record.event, SessionEvent::Compaction { .. }))
+    );
+    context.refresh(&records, &fixture.session.root).unwrap();
+    assert_eq!(context.meter.estimate(&captured), estimated);
+    assert_eq!(
+        compact::TokenMeter::restore(&records, &fixture.session.root, &fixture.template)
+            .estimate(&captured),
+        estimated
+    );
     fixture.session.shutdown().await.unwrap();
 }
 
@@ -1290,7 +1435,7 @@ async fn structured_continuation_and_reconciled_todos_activate_together_and_surv
     assert!(
         matches!(&expected, Message::User(blocks) if blocks.iter().any(|block| matches!(block, UserContent::Compaction { text } if text.contains(markdown) && !text.contains("Reasoning before the answer"))))
     );
-    assert_eq!(checkpoint.schema_version, 1);
+    assert_eq!(checkpoint.schema_version, 2);
     assert_eq!(checkpoint.todos, reconciled);
     assert_eq!(
         fixture
@@ -1413,4 +1558,160 @@ async fn structured_continuation_and_reconciled_todos_activate_together_and_surv
         captured
     );
     resumed.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn selected_jobs_preserve_arguments_truncate_outputs_and_replay_without_claiming() {
+    let fixture = Fixture::new().await;
+    let runtime = &fixture.session.runtime;
+    let arguments = json!({"path":"evidence.txt", "literal":null});
+    let output = "evidence\n".repeat(400);
+    let lease = runtime.jobs.create(JobSpec {
+        arguments: arguments.clone(),
+        output_schema: Some(json!({"type":"object","properties":{"content":{"type":"string","x-skyhook-truncatable":true}}})),
+        background: true,
+        ..JobSpec::test(fixture.session.root.child(99), "read")
+    }).await.unwrap();
+    runtime
+        .jobs
+        .finish(
+            lease.id,
+            JobOutcome::Completed(ToolOutput::new(json!({"content":output}))),
+        )
+        .await
+        .unwrap();
+    fixture.add_history(20_000).await;
+    let mut summary = summary_value();
+    summary["jobs"] = json!([lease.id, lease.id]);
+    *fixture.provider.summary.lock().unwrap() = summary.to_string();
+    fixture.compact(&CancellationToken::new()).await.unwrap();
+    let records = runtime.store.records().await;
+    let checkpoint = records
+        .iter()
+        .find_map(|record| match &record.event {
+            SessionEvent::Compaction { checkpoint } => Some(checkpoint),
+            _ => None,
+        })
+        .unwrap();
+    let Message::User(blocks) = &checkpoint.message else {
+        panic!("continuation")
+    };
+    let snapshot: Value = blocks
+        .iter()
+        .find_map(|block| match block {
+            UserContent::Compaction { text } => text
+                .split_once('\n')
+                .and_then(|(_, value)| serde_json::from_str::<Value>(value).ok())
+                .filter(|value| value.get("jobs").is_some()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(snapshot["jobs"].as_array().unwrap().len(), 1);
+    let view = &snapshot["jobs"][0];
+    assert_eq!(view["arguments"], arguments);
+    assert_eq!(view["id"], json!(lease.id));
+    assert_eq!(view["tool"], "read");
+    assert!(view["result"]["content"].as_str().unwrap().len() < output.len());
+    assert_eq!(view["truncated"][0]["field"], "/result/content");
+    assert_eq!(
+        runtime
+            .jobs
+            .snapshot(lease.id)
+            .await
+            .unwrap()
+            .output
+            .unwrap()["content"],
+        output
+    );
+    assert!(
+        runtime
+            .jobs
+            .take_pending(&fixture.session.root.child(99))
+            .await
+            .unwrap()
+            .iter()
+            .any(|job| job.id == lease.id)
+    );
+    assert!(
+        project_history(&records, &fixture.session.root)
+            .unwrap()
+            .iter()
+            .any(|(_, message)| message == &checkpoint.message)
+    );
+    // Repeated compaction can select the same saved job again, without duplicating it.
+    fixture.add_history(20_000).await;
+    fixture.compact(&CancellationToken::new()).await.unwrap();
+    fixture.assert_exact_requests().await;
+}
+
+#[tokio::test]
+async fn selected_jobs_are_deduplicated_against_retained_notifications_and_nested_results() {
+    let fixture = Fixture::new().await;
+    fixture.add_history(20_000).await;
+    let runtime = &fixture.session.runtime;
+    let lease = runtime
+        .jobs
+        .create(JobSpec::test(fixture.session.root.clone(), "read"))
+        .await
+        .unwrap();
+    runtime
+        .jobs
+        .finish(
+            lease.id,
+            JobOutcome::Completed(ToolOutput::new(json!({"content":"retained evidence"}))),
+        )
+        .await
+        .unwrap();
+    let child = runtime
+        .jobs
+        .inspect_output(
+            crate::job::JobOutputQuery::new(lease.id),
+            &CapabilitySet::default(),
+        )
+        .await
+        .unwrap();
+    runtime
+        .commit(
+            &fixture.session.root,
+            Message::User(vec![UserContent::Runtime {
+                text: format!(
+                    "<skyhook_job_events>\n{}\n</skyhook_job_events>",
+                    json!([{ "id":900, "state":"completed", "result":{"nested":[child]} }])
+                ),
+            }]),
+        )
+        .await
+        .unwrap();
+    let mut summary = summary_value();
+    summary["jobs"] = json!([lease.id, lease.id]);
+    *fixture.provider.summary.lock().unwrap() = summary.to_string();
+    fixture.compact(&CancellationToken::new()).await.unwrap();
+    let records = runtime.store.records().await;
+    let projected = project_history(&records, &fixture.session.root).unwrap();
+    let text = serde_json::to_string(&projected).unwrap();
+    assert_eq!(text.matches("retained evidence").count(), 1);
+    assert!(!text.contains("Selected job snapshots"));
+}
+
+#[tokio::test]
+async fn invalid_selected_job_retries_without_installing_compaction() {
+    let fixture = Fixture::new().await;
+    fixture.add_history(20_000).await;
+    let mut summary = summary_value();
+    summary["jobs"] = json!([99999]);
+    *fixture.provider.summary.lock().unwrap() = summary.to_string();
+    assert!(fixture.compact(&CancellationToken::new()).await.is_err());
+    let records = fixture.session.runtime.store.records().await;
+    assert!(
+        !records
+            .iter()
+            .any(|record| matches!(record.event, SessionEvent::Compaction { .. }))
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record.event, SessionEvent::CompactionFailed { .. }))
+            .count(),
+        3
+    );
 }

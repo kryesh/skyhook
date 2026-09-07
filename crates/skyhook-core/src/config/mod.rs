@@ -23,7 +23,9 @@ pub(crate) use paths::user_config_directory;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub default_model_profile: String,
+    // Accepted only for compatibility; model selection belongs to the host.
+    #[serde(default, rename = "default_model_profile")]
+    _legacy_model: Option<serde::de::IgnoredAny>,
     pub default_agent_profile: Option<String>,
     pub session_root: Option<PathBuf>,
     /// Approve all tool calls without consulting an interactive policy.
@@ -34,7 +36,7 @@ pub struct Config {
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
-    pub models: BTreeMap<String, ModelProfile>,
+    pub models: indexmap::IndexMap<String, ModelProfile>,
     #[serde(default)]
     pub agents: BTreeMap<String, AgentProfile>,
     #[serde(default)]
@@ -86,6 +88,7 @@ impl Config {
     pub fn harness_builder(
         &self,
         workspace: impl Into<PathBuf>,
+        model: &str,
     ) -> Result<HarnessBuilder, ConfigError> {
         for (name, profile) in &self.models {
             profile
@@ -97,7 +100,7 @@ impl Config {
             capabilities.insert(crate::tool::policy::Capability::Targets);
         }
         let mut builder = HarnessBuilder::new(workspace)
-            .default_model_profile(self.default_model_profile.clone())
+            .default_model_profile(model)
             .max_child_depth(self.max_child_depth)
             .capabilities(capabilities)
             .targets_config(self.targets.clone());
@@ -156,7 +159,7 @@ mod tests {
         .await
         .unwrap();
         let config = Config::load(Some(&path)).await.unwrap();
-        assert_eq!(config.default_model_profile, "local");
+        assert_eq!(config.models.first().unwrap().0, "local");
         assert!(!config.approve_all);
         assert!(!config.targets_enabled);
     }
@@ -189,7 +192,7 @@ mod tests {
             let config: Config = toml::from_str(&format!(
                 "default_model_profile = 'test'\n[providers.test]\nkind = 'anthropic'\n[models.test]\nprovider = 'test'\nmodel = 'test'\nmax_context = {max_context}\nmax_output = {max_output}\n"
             )).unwrap();
-            let Err(ConfigError::Model(name, message)) = config.harness_builder(".") else {
+            let Err(ConfigError::Model(name, message)) = config.harness_builder(".", "test") else {
                 panic!("expected limit validation before credential loading");
             };
             assert_eq!(name, "test");
@@ -213,7 +216,7 @@ mod tests {
         let config: Config =
             toml::from_str(include_str!("../../../../skyhook.example.toml")).unwrap();
         assert!(config.providers.contains_key("codex"));
-        assert!(config.models.contains_key(&config.default_model_profile));
+        assert!(!config.models.is_empty());
     }
 
     #[test]

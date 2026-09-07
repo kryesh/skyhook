@@ -3,6 +3,34 @@ const __executions = new WeakMap();
 const __callData = new WeakMap();
 const __parse = JSON.parse;
 const __stringify = JSON.stringify;
+const __resultSources = new WeakMap();
+const __annotatedArrays = new WeakSet();
+const __annotatedProperties = new WeakMap();
+
+function __rememberResult(value, job, annotations) {
+  if (value === null || typeof value !== "object") return;
+  __resultSources.set(value, {job, baseline: __stringify(value)});
+  for (const pointer of annotations) {
+    const keys = pointer === "" ? [] : pointer.slice(1).split("/").map(key => key.replace(/~1/g, "/").replace(/~0/g, "~"));
+    let child = value, parent, key;
+    for (key of keys) { parent = child; child = child[key]; }
+    if (child !== null && typeof child === "object") __annotatedArrays.add(child);
+    if (parent) {
+      let properties = __annotatedProperties.get(parent);
+      if (!properties) __annotatedProperties.set(parent, properties = new Set());
+      properties.add(key);
+    }
+  }
+}
+
+function __sameJson(left, right) {
+  if (left === right) return true;
+  if (left === null || right === null || typeof left !== "object" || typeof right !== "object"
+      || Array.isArray(left) !== Array.isArray(right)) return false;
+  const keys = Object.keys(left);
+  return keys.length === Object.keys(right).length
+    && keys.every(key => Object.hasOwn(right, key) && __sameJson(left[key], right[key]));
+}
 
 function __consoleFormat(value) {
   if (typeof value === "string") return value;
@@ -125,6 +153,7 @@ async function __request(request) {
     }
     throw error;
   }
+  if (response.source_job) __rememberResult(response.value, response.source_job, response.annotations);
   return response.value;
 }
 
@@ -198,9 +227,9 @@ class WorkPool {
 
 const receive = async () => __request({type:"receive"});
 
-async function __resolve(value, path, ancestors) {
+async function __resolve(value, path, ancestors, pointer, presentation) {
   if (value && value[__callKind] === true) {
-    return __execute(value).catch(error => {
+    value = await __execute(value).catch(error => {
       throw __toolError(`deferred tool call at ${path} failed: ${error?.message ?? error}`, error);
     });
   }
@@ -216,9 +245,17 @@ async function __resolve(value, path, ancestors) {
   if (typeof value !== "object") throw new TypeError(`${typeof value} at ${path} is not JSON-compatible`);
   if (ancestors.has(value)) throw new TypeError(`circular value at ${path}`);
   const nested = new Set(ancestors); nested.add(value);
-  if (Array.isArray(value)) return Promise.all(value.map((item, index) => __resolve(item, `${path}[${index}]`, nested)));
-  const output = {};
-  await Promise.all(Object.keys(value).map(async key => { output[key] = await __resolve(value[key], `${path}.${key}`, nested); }));
+  if (__annotatedArrays.has(value)) presentation.fields.push(pointer);
+  const properties = __annotatedProperties.get(value);
+  const output = Array.isArray(value) ? new Array(value.length) : Object.create(null);
+  const keys = Array.isArray(value) ? value.map((_, index) => String(index)) : Object.keys(value);
+  await Promise.all(keys.map(async key => {
+    const childPointer = `${pointer}/${key.replace(/~/g, "~0").replace(/\//g, "~1")}`;
+    if (properties?.has(key)) presentation.fields.push(childPointer);
+    output[key] = await __resolve(value[key], Array.isArray(value) ? `${path}[${key}]` : `${path}.${key}`, nested, childPointer, presentation);
+  }));
+  const source = __resultSources.get(value);
+  if (source && __sameJson(output, __parse(source.baseline))) presentation.jobs[pointer] = source.job;
   return output;
 }
 

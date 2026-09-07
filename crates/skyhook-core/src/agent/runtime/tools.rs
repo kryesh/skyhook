@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use crate::{
-    agent::{Question, TodoItem, TodoSnapshot, TodoStatus, todo::TodoStore},
+    agent::{Question, TodoItem, TodoStatus, todo::TodoStore},
     provider::protocol::UserContent,
     session::SessionEvent,
     tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::Capability},
@@ -29,9 +29,9 @@ pub(super) struct AgentArgs {
     /// Further child generations.
     #[serde(default)]
     pub(super) depth: usize,
-    /// Model profile override.
+    /// Model profile override; omitted/null inherits the parent's active model unless an explicit profile selects one.
     pub(super) model: Option<String>,
-    /// Agent profile override.
+    /// Agent profile override; its model is used unless model is explicitly supplied.
     pub(super) profile: Option<String>,
     /// Child target; omitted inherits.
     #[schemars(skip)]
@@ -41,18 +41,16 @@ pub(super) struct AgentArgs {
 }
 
 #[derive(Serialize, JsonSchema)]
-struct AgentOutput {
-    agent: crate::identity::AgentId,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    target: Option<String>,
-    result: String,
+#[serde(untagged)]
+enum TodoOutput {
+    Updated { updated: bool },
+    Items { items: Vec<TodoItem> },
 }
 
 pub(super) fn register(
     builder: &mut ToolRegistryBuilder,
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
 ) -> Result<(), RegistryError> {
-    super::history::register(builder, runtime_slot.clone())?;
     register_ask(builder, runtime_slot.clone())?;
     register_todo(builder, runtime_slot.clone())?;
     register_child_agent(builder, runtime_slot)
@@ -71,7 +69,7 @@ fn register_todo(
     builder: &mut ToolRegistryBuilder,
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
 ) -> Result<(), RegistryError> {
-    builder.register::<TodoArgs, TodoSnapshot, _, _>(
+    builder.register::<TodoArgs, TodoOutput, _, _>(
         "todo",
         "Read your list, replace it with items, or inspect a descendant by agent job ID. Only the owner can edit.",
         ToolOptions::default(),
@@ -84,9 +82,10 @@ fn register_todo(
                         return Err(ToolError::InvalidArguments("items and job cannot be combined".to_owned()));
                     }
                     TodoStore::validate(&items)?;
-                    runtime.todos.replace(&context.agent, items).await.map_err(|error| tool_error(&error))
+                    runtime.todos.replace(&context.agent, items).await.map_err(|error| tool_error(&error))?;
+                    Ok(TodoOutput::Updated { updated: true })
                 } else {
-                    runtime.todos.inspect(&context.agent, input.job).await
+                    Ok(TodoOutput::Items { items: runtime.todos.inspect(&context.agent, input.job).await?.items })
                 }
             }
         },
@@ -144,18 +143,11 @@ fn register_child_agent(
     builder: &mut ToolRegistryBuilder,
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
 ) -> Result<(), RegistryError> {
-    builder.register::<AgentArgs, AgentOutput, _, _>(
+    builder.register::<AgentArgs, String, _, _>(
         "agent",
         "Run a one-shot child agent with fresh history; questions suspend it.",
         ToolOptions::default()
             .named()
-            .generated_output_schema(|capabilities| {
-                let mut schema = serde_json::to_value(schemars::schema_for!(AgentOutput)).expect("agent output schema serializes");
-                if !capabilities.contains(Capability::Targets) {
-                    schema["properties"].as_object_mut().unwrap().remove("target");
-                }
-                schema
-            })
             .requires(Capability::Agents)
             .conditional_input(
                 "target",
@@ -182,9 +174,13 @@ fn register_child_agent(
                     )));
                 }
                 let child = runtime.next_child(&context.agent).await;
-                let model = input
-                    .model
-                    .unwrap_or_else(|| runtime.harness.default_model_profile.clone());
+                let model = input.model.or_else(|| input.profile.as_ref()
+                    .and_then(|name| runtime.harness.agent_profiles.get(name))
+                    .and_then(|profile| profile.model_profile.clone()))
+                    .or_else(|| runtime.agents.read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&context.agent).map(|agent| agent.model_profile.clone()))
+                    .ok_or_else(|| ToolError::Failed("parent agent is no longer running".into()))?;
                 let agent_profile = input
                     .profile
                     .or_else(|| runtime.harness.default_agent_profile.clone());
@@ -206,18 +202,12 @@ fn register_child_agent(
                     }
                     location.workspace = location.workspace.join(workspace);
                 }
-                let result_target = context
-                    .capabilities
-                    .contains(Capability::Targets)
-                    .then_some(location.target.clone())
-                    .filter(|target| target != crate::target::ROOT_TARGET);
                 let sender = runtime.spawn_agent(AgentLaunch {
                     id: child.clone(),
                     parent: Some(context.agent.clone()),
                     owner_job: Some(context.job),
                     model_profile: model,
                     agent_profile,
-                    history: Vec::new(),
                     todos,
                     one_shot: true,
                     available_depth: input.depth,
@@ -225,6 +215,7 @@ fn register_child_agent(
                 }).await.map_err(|error| tool_error(&error))?;
                 let (done_tx, mut done_rx) = oneshot::channel();
                 sender.send(AgentCommand::Input {
+                    model: None,
                     content: vec![UserContent::Text { text: input.prompt }],
                     done: Some(done_tx),
                 }).await.map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?;
@@ -234,7 +225,7 @@ fn register_child_agent(
                             let text = result
                                 .map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?
                                 .map_err(ToolError::Failed)?;
-                            return Ok(AgentOutput { agent: child, target: result_target, result: text });
+                            return Ok(text);
                         }
                         value = context.receive() => {
                             let value = match value {
@@ -249,6 +240,7 @@ fn register_child_agent(
                                 .map_err(|error| tool_error(&error))?
                             {
                                 sender.send(AgentCommand::Input {
+                                    model: None,
                                     content: vec![UserContent::ParentInput { text: format!("Owner input: {value}") }],
                                     done: None,
                                 }).await.map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?;

@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use grep_matcher::Matcher as _;
 use grep_regex::RegexMatcherBuilder;
@@ -16,7 +19,7 @@ use crate::tool::{
 pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
     builder.register::<SearchArgs, SearchOutput, _, _>(
         "search",
-        "Search files with ripgrep regex, glob, and ignore semantics.",
+        "Search files with ripgrep regex, glob, and ignore semantics. Matches map file paths to arrays of \"line: text\" strings; details returns structured matches.",
         ToolOptions::new(vec![Capability::Read])
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .path_argument("path", PathAccess::Read, PathKind::Existing),
@@ -51,17 +54,34 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
     Ok(())
 }
 
-fn walk_builder(root: &Path, hidden: bool, no_ignore: bool) -> WalkBuilder {
+fn walk_builder(
+    root: &Path,
+    hidden: bool,
+    no_ignore: bool,
+    patterns: &[String],
+) -> Result<WalkBuilder, ToolError> {
+    let patterns = overrides(root, patterns)?;
     let mut walk = WalkBuilder::new(root);
     walk.hidden(!hidden)
         .ignore(!no_ignore)
         .git_ignore(!no_ignore)
         .git_exclude(!no_ignore)
         .git_global(false)
-        .parents(false)
+        .parents(!no_ignore)
         .follow_links(false)
-        .sort_by_file_path(std::cmp::Ord::cmp);
-    walk
+        .sort_by_file_path(std::cmp::Ord::cmp)
+        // Apply globs after normal ignore eligibility, including directory
+        // exclusions so excluded subtrees are never traversed.
+        .filter_entry(move |entry| {
+            entry.depth() == 0
+                || !patterns
+                    .matched(
+                        entry.path(),
+                        entry.file_type().is_some_and(|kind| kind.is_dir()),
+                    )
+                    .is_ignore()
+        });
+    Ok(walk)
 }
 
 fn overrides(root: &Path, patterns: &[String]) -> Result<ignore::overrides::Override, ToolError> {
@@ -103,10 +123,7 @@ fn search_blocking(
     let files: Box<dyn Iterator<Item = Result<PathBuf, ToolError>>> = if root.is_file() {
         Box::new(std::iter::once(Ok(root.to_owned())))
     } else if root.is_dir() {
-        let mut walk = walk_builder(root, args.hidden, args.no_ignore);
-        if !args.glob.is_empty() {
-            walk.overrides(overrides(root, &args.glob)?);
-        }
+        let walk = walk_builder(root, args.hidden, args.no_ignore, &args.glob)?;
         Box::new(walk.build().filter_map(|entry| match entry {
             Ok(entry) if entry.file_type().is_some_and(|kind| kind.is_file()) => {
                 Some(Ok(entry.into_path()))
@@ -125,6 +142,14 @@ fn search_blocking(
         .heap_limit(Some(4 * 1024 * 1024))
         .build();
     let mut matches = CapturedArray::new(capture)?;
+    if !args.details {
+        matches.grouped = true;
+        if let Some(file) = &mut matches.file {
+            use std::io::{Seek as _, Write as _};
+            file.seek(std::io::SeekFrom::Start(0))?;
+            file.write_all(b"{\n")?;
+        }
+    }
     for path in files {
         if context.is_some_and(crate::tool::ToolContext::is_cancelled) {
             return Err(ToolError::Cancelled);
@@ -146,7 +171,18 @@ fn search_blocking(
         }
     }
     Ok(SearchOutput {
-        matches: matches.finish()?,
+        matches: if args.details {
+            SearchMatches::Detailed(matches.finish()?)
+        } else {
+            let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for item in matches.finish()? {
+                groups
+                    .entry(item.path)
+                    .or_default()
+                    .push(format!("{}: {}", item.line, item.text));
+            }
+            SearchMatches::Grouped(groups)
+        },
     })
 }
 
@@ -160,8 +196,12 @@ fn glob_blocking(
     if !root.is_dir() {
         return Err(ToolError::Failed("glob root is not a directory".into()));
     }
-    let mut walk = walk_builder(root, args.hidden, args.no_ignore);
-    walk.overrides(overrides(root, std::slice::from_ref(&args.pattern))?);
+    let walk = walk_builder(
+        root,
+        args.hidden,
+        args.no_ignore,
+        std::slice::from_ref(&args.pattern),
+    )?;
     let mut paths = CapturedArray::new(capture)?;
     for entry in walk.build() {
         if context.is_some_and(crate::tool::ToolContext::is_cancelled) {
@@ -181,6 +221,8 @@ struct CapturedArray<T> {
     file: Option<std::io::BufWriter<std::fs::File>>,
     values: Vec<T>,
     count: usize,
+    grouped: bool,
+    group: Option<String>,
 }
 impl<T: Serialize> CapturedArray<T> {
     fn new(path: Option<&Path>) -> std::io::Result<Self> {
@@ -196,6 +238,8 @@ impl<T: Serialize> CapturedArray<T> {
             file,
             values: Vec::new(),
             count: 0,
+            grouped: false,
+            group: None,
         })
     }
     fn push(&mut self, value: T) -> std::io::Result<()> {
@@ -211,7 +255,7 @@ impl<T: Serialize> CapturedArray<T> {
         self.count += 1;
         Ok(())
     }
-    fn checkpoint(&mut self) -> std::io::Result<(usize, u64)> {
+    fn checkpoint(&mut self) -> std::io::Result<(usize, u64, Option<String>)> {
         use std::io::Seek as _;
         Ok((
             self.count,
@@ -220,11 +264,13 @@ impl<T: Serialize> CapturedArray<T> {
                 .map(std::io::BufWriter::stream_position)
                 .transpose()?
                 .unwrap_or(0),
+            self.group.clone(),
         ))
     }
-    fn rollback(&mut self, checkpoint: (usize, u64)) -> std::io::Result<()> {
+    fn rollback(&mut self, checkpoint: (usize, u64, Option<String>)) -> std::io::Result<()> {
         use std::io::{Seek as _, Write as _};
         self.count = checkpoint.0;
+        self.group = checkpoint.2;
         self.values.truncate(checkpoint.0);
         if let Some(file) = &mut self.file {
             file.flush()?;
@@ -236,12 +282,42 @@ impl<T: Serialize> CapturedArray<T> {
     fn finish(mut self) -> std::io::Result<Vec<T>> {
         use std::io::Write as _;
         if let Some(file) = &mut self.file {
-            file.write_all(b"\n]")?;
+            if self.grouped {
+                if self.group.is_some() {
+                    file.write_all(b"\n]")?;
+                }
+                file.write_all(b"\n}")?;
+            } else {
+                file.write_all(b"\n]")?;
+            }
             file.flush()?;
         }
         Ok(self.values)
     }
 }
+impl CapturedArray<SearchMatch> {
+    fn push_match(&mut self, value: SearchMatch) -> std::io::Result<()> {
+        use std::io::Write as _;
+        if !self.grouped || self.file.is_none() {
+            return self.push(value);
+        }
+        let file = self.file.as_mut().expect("capture file");
+        if self.group.as_deref() == Some(&value.path) {
+            file.write_all(b",\n")?;
+        } else {
+            if self.group.is_some() {
+                file.write_all(b"\n],\n")?;
+            }
+            serde_json::to_writer(&mut *file, &value.path)?;
+            file.write_all(b": [\n")?;
+            self.group = Some(value.path);
+        }
+        serde_json::to_writer(file, &format!("{}: {}", value.line, value.text))?;
+        self.count += 1;
+        Ok(())
+    }
+}
+
 struct SearchSink<'a> {
     matcher: &'a grep_regex::RegexMatcher,
     path: String,
@@ -268,7 +344,7 @@ impl Sink for SearchSink<'_> {
             .find(bytes)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         if let Some(first) = first {
-            self.matches.push(SearchMatch {
+            self.matches.push_match(SearchMatch {
                 path: self.path.clone(),
                 line: matched.line_number().unwrap_or(1),
                 column: first.start() + 1,
@@ -299,6 +375,9 @@ enum Case {
 struct SearchArgs {
     /// Rust-regex pattern, using ripgrep syntax. Set `fixed` to match it literally.
     pattern: String,
+    /// Return structured matches including columns instead of grouping by file.
+    #[serde(default)]
+    details: bool,
     /// File or directory to search.
     #[serde(default = "default_dot")]
     path: String,
@@ -325,7 +404,25 @@ struct SearchArgs {
 #[derive(Serialize, JsonSchema)]
 struct SearchOutput {
     #[schemars(extend("x-skyhook-truncatable" = true))]
-    matches: Vec<SearchMatch>,
+    matches: SearchMatches,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(untagged)]
+enum SearchMatches {
+    Grouped(BTreeMap<String, Vec<String>>),
+    Detailed(Vec<SearchMatch>),
+}
+
+#[cfg(test)]
+impl std::ops::Deref for SearchMatches {
+    type Target = Vec<SearchMatch>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Detailed(items) => items,
+            _ => panic!("expected detailed matches"),
+        }
+    }
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -381,6 +478,197 @@ pub(crate) fn output_matcher(pattern: &str) -> Result<grep_regex::RegexMatcher, 
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn grouped_search_is_captured_and_preserves_whitespace_and_binary_rollback() {
+        use serde_json::json;
+        let runtime = crate::test_support::TestRuntime::new().await;
+        let directory = runtime.root.path().join("files");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("a.txt"), "  needle  \nneedle again\n").unwrap();
+        std::fs::write(directory.join("b.bin"), b"needle\n\0hidden").unwrap();
+        std::fs::write(directory.join("z.txt"), "needle last\n").unwrap();
+        let mut builder = ToolRegistryBuilder::default();
+        register(&mut builder).unwrap();
+        let executor = runtime.executor(builder);
+        let captured = executor
+            .execute(
+                runtime.agent.clone(),
+                "search",
+                json!({"path":"files","pattern":"needle"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            captured.output.value,
+            json!({"matches":{
+                "files/a.txt":["1:   needle  ", "2: needle again"], "files/z.txt":["1: needle last"]
+            }})
+        );
+        let empty = executor
+            .execute(
+                runtime.agent.clone(),
+                "search",
+                json!({"path":"files","pattern":"absent"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty.output.value, json!({"matches":{}}));
+        let detailed = executor
+            .execute(
+                runtime.agent.clone(),
+                "search",
+                json!({"path":"files","pattern":"needle","details":true}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            detailed.output.value["matches"][0],
+            json!({"path":"files/a.txt","line":1,"column":3,"text":"  needle  "})
+        );
+        std::fs::write(directory.join("a.txt"), "needle λ\n".repeat(500)).unwrap();
+        let preview = executor
+            .execute_model(
+                runtime.agent.clone(),
+                "search",
+                json!({"path":"files","pattern":"needle"}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            serde_json::to_vec(&preview.output.value["result"]["matches"])
+                .unwrap()
+                .len()
+                <= 2048
+        );
+        assert_eq!(
+            preview.output.value["truncated"][0]["field"],
+            "/result/matches"
+        );
+        let mut query = crate::job::JobOutputQuery::new(preview.job);
+        query.field = Some("/result/matches".into());
+        query.pattern = Some("500: needle".into());
+        let page = runtime
+            .jobs
+            .inspect_output(query, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(page["preview"]["lines"].as_array().unwrap().len(), 1);
+        assert!(
+            page["preview"]["lines"][0]
+                .as_str()
+                .unwrap()
+                .contains("500: needle λ")
+        );
+    }
+
+    #[test]
+    fn wildcard_filters_respect_hidden_and_ignore_flags() {
+        let root = tempfile::tempdir().unwrap();
+        for directory in [".git", ".hidden", "build", "src"] {
+            std::fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        std::fs::write(root.path().join(".gitignore"), "build/\n").unwrap();
+        for path in [
+            ".git/config",
+            ".hidden/secret",
+            "build/generated",
+            "src/visible",
+        ] {
+            std::fs::write(root.path().join(path), "needle\n").unwrap();
+        }
+        for hidden in [false, true] {
+            for no_ignore in [false, true] {
+                for pattern in ["*", "**/*"] {
+                    let args = GlobArgs {
+                        pattern: pattern.into(),
+                        path: ".".into(),
+                        hidden,
+                        no_ignore,
+                    };
+                    let paths = glob_blocking(root.path(), root.path(), &args, None, None)
+                        .unwrap()
+                        .paths;
+                    assert!(paths.iter().any(|p| p == "src/visible"));
+                    assert_eq!(paths.iter().any(|p| p == ".git/config"), hidden);
+                    assert_eq!(paths.iter().any(|p| p == ".hidden/secret"), hidden);
+                    assert_eq!(paths.iter().any(|p| p == "build/generated"), no_ignore);
+                    let args: SearchArgs = serde_json::from_value(serde_json::json!({
+                        "pattern":"needle", "details":true, "glob":[pattern], "hidden":hidden, "no_ignore":no_ignore
+                    }))
+                    .unwrap();
+                    let matches = search_blocking(root.path(), root.path(), &args, None, None)
+                        .unwrap()
+                        .matches;
+                    assert_eq!(matches.iter().any(|m| m.path == ".git/config"), hidden);
+                    assert_eq!(
+                        matches.iter().any(|m| m.path == "build/generated"),
+                        no_ignore
+                    );
+                    assert!(matches.iter().any(|m| m.path == "src/visible"));
+                }
+            }
+        }
+        // An explicitly requested hidden root remains accessible.
+        let args: GlobArgs =
+            serde_json::from_value(serde_json::json!({"pattern":"*", "path":".git"})).unwrap();
+        assert_eq!(
+            glob_blocking(root.path(), &root.path().join(".git"), &args, None, None)
+                .unwrap()
+                .paths,
+            [".git/config"]
+        );
+    }
+
+    #[test]
+    fn subdirectory_roots_inherit_ignores_and_globs_keep_precedence() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::create_dir(root.path().join("src/nested")).unwrap();
+        std::fs::write(root.path().join("src/nested/file.rs"), "needle\n").unwrap();
+        std::fs::write(root.path().join(".gitignore"), "/src/generated.rs\n").unwrap();
+        std::fs::write(root.path().join(".ignore"), "skip.rs\n").unwrap();
+        for name in ["a.rs", "b.rs", "generated.rs", "skip.rs"] {
+            std::fs::write(root.path().join("src").join(name), "needle\n").unwrap();
+        }
+        let args: GlobArgs =
+            serde_json::from_value(serde_json::json!({"pattern":"*.rs", "path":"src"})).unwrap();
+        assert_eq!(
+            glob_blocking(root.path(), &root.path().join("src"), &args, None, None)
+                .unwrap()
+                .paths,
+            ["src/a.rs", "src/b.rs", "src/nested/file.rs"]
+        );
+        for (glob, expected) in [
+            (
+                vec!["*.rs", "!b.rs"],
+                vec!["src/a.rs", "src/nested/file.rs"],
+            ),
+            (
+                vec!["*.rs", "!b.rs", "b.rs"],
+                vec!["src/a.rs", "src/b.rs", "src/nested/file.rs"],
+            ),
+            (vec!["!b.rs"], vec!["src/a.rs", "src/nested/file.rs"]),
+            (vec!["*.rs", "!nested/"], vec!["src/a.rs", "src/b.rs"]),
+        ] {
+            let args: SearchArgs = serde_json::from_value(
+                serde_json::json!({"pattern":"needle", "details":true, "path":"src", "glob":glob}),
+            )
+            .unwrap();
+            let matches = search_blocking(root.path(), &root.path().join("src"), &args, None, None)
+                .unwrap()
+                .matches;
+            assert_eq!(
+                matches.iter().map(|m| m.path.as_str()).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn ripgrep_search_supports_smart_case_globs_and_binary_detection() {
         let root = tempfile::tempdir().unwrap();
@@ -393,6 +681,7 @@ mod tests {
             root.path(),
             &SearchArgs {
                 pattern: "Needle".to_owned(),
+                details: true,
                 path: ".".to_owned(),
                 glob: vec!["*.rs".to_owned(), "!binary.rs".to_owned()],
                 fixed: false,
@@ -412,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn glob_uses_relative_sorted_paths_and_lookahead_truncation() {
+    fn glob_uses_relative_sorted_paths() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("b.rs"), "").unwrap();
         std::fs::write(root.path().join("a.rs"), "").unwrap();

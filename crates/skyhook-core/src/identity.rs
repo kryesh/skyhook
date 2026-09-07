@@ -144,7 +144,7 @@ impl fmt::Display for AgentId {
     Clone, Copy, Debug, Hash, Deserialize, JsonSchema, Serialize, PartialEq, Eq, PartialOrd, Ord,
 )]
 #[serde(transparent)]
-pub struct JobId(#[schemars(with = "u64")] NonZeroU64);
+pub struct JobId(#[schemars(with = "u64", range(min = 1))] NonZeroU64);
 
 impl JobId {
     pub fn new(value: u64) -> Result<Self, IdentityError> {

@@ -24,19 +24,14 @@ pub struct Question {
     /// Complete question shown to the user or owning parent agent.
     pub prompt: String,
     /// Suggested mutually exclusive answers. An empty list permits free-form input.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<QuestionOption>,
 }
 
 /// A suspended child's question batch, returned in its agent job's output.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum QuestionOutput {
-    Questions {
-        question_id: String,
-        question_ids: Vec<String>,
-        questions: Vec<Question>,
-    },
+pub(crate) struct QuestionOutput {
+    pub questions: Vec<Question>,
 }
 
 pub type QuestionFuture =
@@ -59,7 +54,33 @@ pub enum QuestionError {
 #[derive(Clone, Debug)]
 pub enum RuntimeEvent {
     Record(Box<EventRecord>),
-    TextDelta { agent: AgentId, text: String },
-    ReasoningDelta { agent: AgentId, text: String },
-    TurnCompleted { agent: AgentId, text: String },
+    TextDelta {
+        agent: AgentId,
+        request: u64,
+        text: String,
+    },
+    ReasoningDelta {
+        agent: AgentId,
+        request: u64,
+        text: String,
+    },
+    ResponseSettled {
+        agent: AgentId,
+        request: u64,
+        message: Option<u64>,
+        error: Option<String>,
+    },
+    Activity {
+        agent: AgentId,
+        activity: super::AgentActivity,
+    },
+    Context {
+        agent: AgentId,
+        tokens: u64,
+        capacity: u64,
+    },
+    TurnCompleted {
+        agent: AgentId,
+        text: String,
+    },
 }

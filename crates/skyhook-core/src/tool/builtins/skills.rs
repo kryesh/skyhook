@@ -21,6 +21,7 @@ const MAX_DESCRIPTION_CHARS: usize = 512;
 #[derive(Clone, Default)]
 pub struct HostSkills {
     entries: Arc<BTreeMap<String, SkillEntry>>,
+    warnings: Arc<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -38,17 +39,28 @@ impl HostSkills {
 
     async fn discover_from(workspace: &Path, user_root: Option<&Path>) -> Self {
         let mut entries = BTreeMap::new();
+        let mut warnings = Vec::new();
         if let Some(user_root) = user_root {
-            scan_root(user_root, &mut entries).await;
+            scan_root(user_root, &mut entries, &mut warnings).await;
         }
         let mut ancestors = workspace.ancestors().collect::<Vec<_>>();
         ancestors.reverse();
         for ancestor in ancestors {
-            scan_root(&ancestor.join(".agents/skills"), &mut entries).await;
+            scan_root(
+                &ancestor.join(".agents/skills"),
+                &mut entries,
+                &mut warnings,
+            )
+            .await;
         }
         Self {
             entries: Arc::new(entries),
+            warnings: Arc::new(warnings),
         }
+    }
+
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     fn summaries(&self) -> Vec<SkillSummary> {
@@ -72,12 +84,16 @@ fn user_skills_root() -> Option<PathBuf> {
     crate::config::user_config_directory().map(|root| root.join(".agents/skills"))
 }
 
-async fn scan_root(root: &Path, entries: &mut BTreeMap<String, SkillEntry>) {
+async fn scan_root(
+    root: &Path,
+    entries: &mut BTreeMap<String, SkillEntry>,
+    warnings: &mut Vec<String>,
+) {
     let mut directory = match fs::read_dir(root).await {
         Ok(directory) => directory,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
         Err(error) => {
-            eprintln!("skyhook: cannot scan skills at {}: {error}", root.display());
+            warnings.push(format!("Cannot scan skills at {}: {error}", root.display()));
             return;
         }
     };
@@ -87,7 +103,7 @@ async fn scan_root(root: &Path, entries: &mut BTreeMap<String, SkillEntry>) {
             Ok(Some(entry)) => paths.push(entry.path()),
             Ok(None) => break,
             Err(error) => {
-                eprintln!("skyhook: cannot scan skills at {}: {error}", root.display());
+                warnings.push(format!("Cannot scan skills at {}: {error}", root.display()));
                 return;
             }
         }
@@ -98,7 +114,7 @@ async fn scan_root(root: &Path, entries: &mut BTreeMap<String, SkillEntry>) {
             Ok(entry) => {
                 entries.insert(entry.name.clone(), entry);
             }
-            Err(error) => eprintln!("skyhook: skipping skill at {}: {error}", path.display()),
+            Err(error) => warnings.push(format!("Skipping skill at {}: {error}", path.display())),
         }
     }
 }
@@ -408,13 +424,16 @@ mod tests {
             asset
         );
         let mut args = crate::job::output::OutputArgs::new(loaded.job);
-        args.cursor = Some(view["truncated"][0]["next"].as_str().unwrap().into());
+        args.field = Some(view["truncated"][0]["field"].as_str().unwrap().into());
+        args.start = Some(view["truncated"][0]["next_start"].as_u64().unwrap() as usize);
+        args.offset = Some(view["truncated"][0]["next_offset"].as_u64().unwrap_or(0) as usize);
         let page = runtime
             .jobs
             .present_output(args, &Default::default())
             .await
             .unwrap();
-        assert_eq!(page["preview"]["lines"][0]["offset"], 2048);
+        assert_eq!(view["truncated"][0]["next_offset"], 2048);
+        assert!(asset[2048..].starts_with(page["preview"]["lines"][0].as_str().unwrap()));
     }
 
     #[tokio::test]
