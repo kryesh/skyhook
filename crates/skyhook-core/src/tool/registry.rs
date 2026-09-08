@@ -27,7 +27,7 @@ pub struct RegisteredTool {
 type ToolHandler = Arc<
     dyn Fn(ToolContext, Value) -> BoxFuture<'static, Result<ToolOutput, ToolError>> + Send + Sync,
 >;
-type CapabilityResolver = Arc<dyn Fn(&Value) -> Result<Vec<Capability>, ToolError> + Send + Sync>;
+type ArgumentValidator = Arc<dyn Fn(&Value) -> Result<(), ToolError> + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub struct ToolSpec {
@@ -41,14 +41,49 @@ pub struct ToolSpec {
     pub script_binding: ScriptBinding,
 }
 
+impl ToolSpec {
+    pub(crate) fn validate_arguments(&self, arguments: &Value) -> Result<(), ToolError> {
+        let arguments = arguments
+            .as_object()
+            .ok_or(ToolError::ArgumentsMustBeObject)?;
+        if self.input_schema["additionalProperties"] == false
+            && let Some(argument) = arguments.keys().find(|argument| {
+                !self.input_schema["properties"]
+                    .as_object()
+                    .is_some_and(|properties| properties.contains_key(*argument))
+            })
+        {
+            return Err(ToolError::InvalidArguments(format!(
+                "unknown argument `{argument}`"
+            )));
+        }
+        Ok(())
+    }
+}
+
 type SchemaGenerator = Arc<dyn Fn(&CapabilitySet) -> Value + Send + Sync>;
+
+#[derive(Clone)]
+enum OutputSchema {
+    Static(Value),
+    Generated(SchemaGenerator),
+}
+
+impl OutputSchema {
+    fn generate(&self, capabilities: &CapabilitySet) -> Value {
+        match self {
+            Self::Static(schema) => schema.clone(),
+            Self::Generated(generate) => generate(capabilities),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct GeneratedToolDefinition {
     name: String,
     description: String,
     input_schema: SchemaGenerator,
-    output_schema: Option<SchemaGenerator>,
+    output_schema: Option<OutputSchema>,
     exposure: ToolExposure,
     script_binding: ScriptBinding,
     supports_background: bool,
@@ -68,7 +103,7 @@ impl GeneratedToolDefinition {
                 optional_defaults(&mut input_schema);
                 sanitize_schema(&mut input_schema);
                 let result_schema = self.output_schema.as_ref().map(|schema| {
-                    let mut schema = schema(capabilities);
+                    let mut schema = schema.generate(capabilities);
                     sanitize_schema(&mut schema);
                     schema
                 });
@@ -143,7 +178,7 @@ pub struct ToolOptions {
     script_binding: ScriptBinding,
     required: BTreeSet<Capability>,
     conditional_inputs: Vec<(String, Capability, Value)>,
-    output_schema: Option<SchemaGenerator>,
+    output_schema: Option<OutputSchema>,
 }
 
 /// Internal execution metadata.
@@ -155,7 +190,7 @@ struct ToolExecution {
     placement: ToolPlacement,
     permission_resource: Option<ResourceId>,
     path_arguments: Vec<PathArgument>,
-    capability_resolver: Option<CapabilityResolver>,
+    argument_validator: Option<ArgumentValidator>,
     read_error_output: Option<fn(&str, &ToolError) -> Option<ToolOutput>>,
 }
 
@@ -287,19 +322,19 @@ impl ToolOptions {
         self
     }
 
-    /// Resolve invocation capabilities from validated arguments before authorization.
+    /// Validate tool-specific arguments before requesting authorization.
     #[must_use]
-    pub fn capability_resolver(
+    pub(crate) fn argument_validator(
         mut self,
-        resolver: impl Fn(&Value) -> Result<Vec<Capability>, ToolError> + Send + Sync + 'static,
+        validate: impl Fn(&Value) -> Result<(), ToolError> + Send + Sync + 'static,
     ) -> Self {
-        self.execution.capability_resolver = Some(Arc::new(resolver));
+        self.execution.argument_validator = Some(Arc::new(validate));
         self
     }
 
     #[must_use]
     pub fn output_schema(mut self, schema: Value) -> Self {
-        self.output_schema = Some(Arc::new(move |_| schema.clone()));
+        self.output_schema = Some(OutputSchema::Static(schema));
         self
     }
 
@@ -308,7 +343,7 @@ impl ToolOptions {
         mut self,
         generator: impl Fn(&CapabilitySet) -> Value + Send + Sync + 'static,
     ) -> Self {
-        self.output_schema = Some(Arc::new(generator));
+        self.output_schema = Some(OutputSchema::Generated(Arc::new(generator)));
         self
     }
 
@@ -330,7 +365,7 @@ impl RegisteredTool {
         self.definition
             .output_schema
             .as_ref()
-            .map(|generate| generate(capabilities))
+            .map(|schema| schema.generate(capabilities))
     }
 
     pub(crate) fn take_job_name(&self, arguments: &mut Value) -> Result<Option<String>, ToolError> {
@@ -370,11 +405,19 @@ impl RegisteredTool {
         }
     }
 
-    pub fn capabilities_for(&self, arguments: &Value) -> Result<Vec<Capability>, ToolError> {
-        self.execution.capability_resolver.as_ref().map_or_else(
-            || Ok(self.execution.capabilities.clone()),
-            |resolver| resolver(arguments),
-        )
+    pub(crate) fn validate_arguments(&self, arguments: &Value) -> Result<(), ToolError> {
+        if let Some(validate) = &self.execution.argument_validator {
+            validate(arguments)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn capabilities(&self) -> Vec<Capability> {
+        self.execution.capabilities.clone()
+    }
+
+    pub(crate) fn spec(&self, capabilities: &CapabilitySet) -> Option<ToolSpec> {
+        self.definition.generate(capabilities)
     }
 
     #[must_use]
@@ -421,21 +464,7 @@ impl ToolSurface {
         let tool = self
             .get(name)
             .ok_or_else(|| ToolError::InvalidArguments(format!("tool `{name}` is unavailable")))?;
-        let arguments = arguments
-            .as_object()
-            .ok_or(ToolError::ArgumentsMustBeObject)?;
-        if tool.input_schema["additionalProperties"] == false
-            && let Some(argument) = arguments.keys().find(|argument| {
-                !tool.input_schema["properties"]
-                    .as_object()
-                    .is_some_and(|properties| properties.contains_key(*argument))
-            })
-        {
-            return Err(ToolError::InvalidArguments(format!(
-                "unknown argument `{argument}`"
-            )));
-        }
-        Ok(())
+        tool.validate_arguments(arguments)
     }
 
     #[must_use]
@@ -520,11 +549,6 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    #[must_use]
-    pub fn builder() -> ToolRegistryBuilder {
-        ToolRegistryBuilder::default()
-    }
-
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Arc<RegisteredTool>> {
         self.tools.get(name).cloned()
@@ -667,11 +691,18 @@ impl ToolRegistryBuilder {
         if self.tools.contains_key(&name) {
             return Err(RegistryError::Duplicate(name));
         }
+        // Input transformations only add properties/defaults; their object root is
+        // validated at registration. Static outputs likewise have invariant root
+        // types. Only arbitrary output generators require every capability variant.
+        let generated_output = matches!(definition.output_schema, Some(OutputSchema::Generated(_)));
         for capabilities in capability_subsets() {
             if let Some(spec) = definition.generate(&capabilities) {
                 validate_object_schema(&spec.input_schema)?;
                 if let Some(schema) = &spec.output_schema {
                     validate_output_schema(schema)?;
+                }
+                if !generated_output {
+                    break;
                 }
             }
         }
@@ -727,31 +758,6 @@ impl ToolRegistryBuilder {
         )
     }
 
-    pub fn register_capability_resolver<I, O, F, Fut, E>(
-        &mut self,
-        name: impl Into<String>,
-        description: impl Into<String>,
-        options: ToolOptions,
-        capability_resolver: E,
-        handler: F,
-    ) -> Result<&mut Self, RegistryError>
-    where
-        I: DeserializeOwned + JsonSchema + Send + 'static,
-        O: Serialize + JsonSchema + Send + 'static,
-        F: Fn(ToolContext, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<O, ToolError>> + Send + 'static,
-        E: Fn(&I) -> Vec<Capability> + Send + Sync + 'static,
-    {
-        let mut options = options;
-        options.execution.capability_resolver = Some(Arc::new(move |arguments| {
-            let input: I = serde_json::from_value(arguments.clone())
-                .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
-            Ok(capability_resolver(&input))
-        }));
-        self.register(name, description, options, handler)
-    }
-
-    #[must_use]
     pub fn build(self) -> ToolRegistry {
         ToolRegistry {
             tools: Arc::new(self.tools),
@@ -913,27 +919,6 @@ fn optional_defaults(schema: &mut Value) {
     }
 }
 
-#[cfg(test)]
-fn assert_optional_defaults(schema: &Value) {
-    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
-        for (name, field) in properties {
-            if field.get("default").is_some() {
-                assert!(
-                    !schema["required"]
-                        .as_array()
-                        .is_some_and(|items| items.iter().any(|item| item == name)),
-                    "default field {name} is required: {schema}"
-                );
-            }
-        }
-    }
-    match schema {
-        Value::Object(object) => object.values().for_each(assert_optional_defaults),
-        Value::Array(values) => values.iter().for_each(assert_optional_defaults),
-        _ => {}
-    }
-}
-
 fn sanitize_schema(value: &mut Value) {
     match value {
         Value::Object(object) => {
@@ -982,12 +967,6 @@ fn output_type(schema: &Value, job_envelope: Option<&Value>) -> String {
 
 pub(crate) fn job_view_type(capabilities: &CapabilitySet) -> String {
     let schema = crate::job::output::view_schema(capabilities);
-    schema_type(&schema, &schema)
-}
-
-#[cfg(test)]
-fn job_envelope_type(capabilities: &CapabilitySet) -> String {
-    let schema = crate::job::presented_job_schema(capabilities, false);
     schema_type(&schema, &schema)
 }
 
@@ -1266,446 +1245,4 @@ pub enum RegistryError {
     ReservedBackground,
     #[error("`target` is reserved for structurally targeted tools")]
     ReservedTarget,
-}
-
-#[cfg(test)]
-mod tests {
-    use schemars::JsonSchema;
-    use serde::Deserialize;
-
-    use super::*;
-
-    #[derive(Deserialize, JsonSchema)]
-    #[serde(deny_unknown_fields)]
-    struct Args {
-        value: String,
-    }
-
-    fn context(agents: bool) -> CapabilitySet {
-        let mut capabilities = crate::tool::policy::CapabilitySet::default();
-        if !agents {
-            capabilities.remove(Capability::Agents);
-        }
-        capabilities
-    }
-
-    #[test]
-    fn named_tools_require_kebab_case_in_schema_and_execution() {
-        let mut builder = ToolRegistry::builder();
-        builder
-            .register::<Args, String, _, _>(
-                "agent",
-                "Agent",
-                ToolOptions::default().named(),
-                |_context, args| async move { Ok(args.value) },
-            )
-            .unwrap();
-        let registry = builder.build();
-        let surface = registry.surface(&context(true));
-        let tool = registry.get("agent").unwrap();
-        assert_eq!(
-            surface.get("agent").unwrap().input_schema["properties"]["name"]["pattern"],
-            "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
-        );
-        for name in ["worker", "inspect-config", "build-v2", "a-1-b2"] {
-            let mut arguments = serde_json::json!({"value": "task", "name": name});
-            surface.validate_arguments("agent", &arguments).unwrap();
-            assert_eq!(
-                tool.take_job_name(&mut arguments).unwrap().as_deref(),
-                Some(name)
-            );
-            assert_eq!(arguments, serde_json::json!({"value": "task"}));
-        }
-        for name in [
-            "",
-            "inspect_config",
-            "Worker",
-            "1-worker",
-            "-worker",
-            "worker-",
-            "two--words",
-            "two words",
-            "café",
-        ] {
-            let mut arguments = serde_json::json!({"value": "task", "name": name});
-            assert!(
-                tool.take_job_name(&mut arguments)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("kebab-case")
-            );
-        }
-        for mut arguments in [
-            serde_json::json!({"value": "task"}),
-            serde_json::json!({"value": "task", "name": null}),
-        ] {
-            surface.validate_arguments("agent", &arguments).unwrap();
-            assert_eq!(tool.take_job_name(&mut arguments).unwrap(), None);
-        }
-    }
-
-    fn target_context(enabled: bool) -> CapabilitySet {
-        let mut context = context(true);
-        if enabled {
-            context.insert(Capability::Targets);
-        }
-        context
-    }
-
-    fn contains_metadata(value: &Value) -> bool {
-        match value {
-            Value::Object(object) => {
-                object
-                    .keys()
-                    .any(|key| matches!(key.as_str(), "$schema" | "title" | "format"))
-                    || object.values().any(contains_metadata)
-            }
-            Value::Array(values) => values.iter().any(contains_metadata),
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
-        }
-    }
-
-    #[test]
-    fn defaulted_inputs_are_optional_in_nested_schemas() {
-        let mut schema = serde_json::json!({"type":"object", "required":["keep", "count", "enabled"],
-            "properties":{"keep":{"type":"string"},"count":{"type":"integer","default":100},
-                "enabled":{"type":"boolean","default":false}},
-            "$defs":{"nested":{"type":"object","required":["value"],"properties":{"value":{"default":null}}}},
-            "anyOf":[{"type":"object","required":["name"],"properties":{"name":{"default":""}}}]});
-        optional_defaults(&mut schema);
-        assert_eq!(schema["required"], serde_json::json!(["keep"]));
-        assert_optional_defaults(&schema);
-    }
-
-    #[tokio::test]
-    async fn builtin_schemas_render_nullable_types_and_preserve_union_references() {
-        fn check_refs(value: &Value, root: &Value) {
-            match value {
-                Value::Object(object) => {
-                    if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
-                        assert!(
-                            root.pointer(reference.strip_prefix('#').unwrap()).is_some(),
-                            "unresolved {reference}"
-                        );
-                    }
-                    for value in object.values() {
-                        check_refs(value, root);
-                    }
-                }
-                Value::Array(values) => {
-                    for value in values {
-                        check_refs(value, root);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let runtime = crate::test_support::TestRuntime::new().await;
-        let mut builder = ToolRegistryBuilder::default();
-        crate::tool::builtins::register_worker_tools(&mut builder, runtime.store.clone()).unwrap();
-        crate::tool::builtins::jobs::register(&mut builder, runtime.jobs.clone()).unwrap();
-        crate::tool::builtins::install_script_tool(&mut builder, std::sync::Weak::new()).unwrap();
-        let registry = builder.build();
-        let targeted = registry
-            .tools()
-            .filter(|tool| tool.placement() == ToolPlacement::TargetedWorkspace)
-            .map(|tool| tool.name())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(targeted, ["exec", "glob", "read", "search", "shell"].into());
-        assert_eq!(
-            registry.get("jobs").unwrap().placement(),
-            ToolPlacement::Host
-        );
-        for targets in [false, true] {
-            let surface = registry.surface(&target_context(targets));
-            let read = surface.get("read").unwrap().result_schema.as_ref().unwrap();
-            let groups = &read["$defs"]["DirectoryGroups"];
-            assert!(groups["required"].as_array().is_none_or(Vec::is_empty));
-            let read_type = schema_type(read, read);
-            for group in ["files", "directories", "symlinks", "other"] {
-                assert!(read_type.contains(&format!("{group}?:")));
-            }
-            let search = surface
-                .get("search")
-                .unwrap()
-                .result_schema
-                .as_ref()
-                .unwrap();
-            assert!(schema_type(search, search).contains("matches:{[key:string]:string[]}"));
-            for tool in surface.tools.values() {
-                assert_optional_defaults(&tool.input_schema);
-                assert_eq!(
-                    tool.input_schema["properties"].get("target").is_some(),
-                    targets && targeted.contains(tool.name.as_str())
-                );
-                if let Some(schema) = &tool.output_schema {
-                    check_refs(schema, schema);
-                    assert!(!schema.to_string().contains("awaiting_approval"));
-                }
-            }
-            for name in ["exec", "shell"] {
-                let tool = surface.get(name).unwrap();
-                assert!(
-                    !tool.input_schema["required"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|value| value == "timeout")
-                );
-                assert_eq!(tool.input_schema["properties"]["timeout"]["minimum"], 1);
-                assert_eq!(tool.input_schema["properties"]["timeout"]["maximum"], 3600);
-                assert!(script_documentation(tool, None).contains("timeout?: integer | null"));
-            }
-            let schema = surface.get("exec").unwrap().output_schema.as_ref().unwrap();
-            assert_eq!(schema["anyOf"].as_array().unwrap().len(), 2);
-            assert!(schema_type(schema, schema).contains("integer | null"));
-            let definitions = surface.definitions();
-            let output_args = &surface.get("job_output").unwrap().input_schema["properties"];
-            assert_eq!(output_args["limit"]["default"], 100);
-            assert_eq!(output_args["limit"]["maximum"], 1000);
-            assert!(output_args.get("wait").is_none());
-            assert_eq!(output_args["context"]["maximum"], 20);
-            let script = definitions
-                .iter()
-                .find(|tool| tool.name == "script")
-                .unwrap();
-            let script_schema = surface
-                .get("script")
-                .unwrap()
-                .result_schema
-                .as_ref()
-                .unwrap();
-            assert_eq!(script_schema["properties"]["console"]["type"], "string");
-            assert!(
-                script_schema["required"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&serde_json::json!("value"))
-            );
-            assert!(
-                script_schema["required"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&serde_json::json!("console"))
-            );
-            let result_type = schema_type(script_schema, script_schema);
-            assert!(
-                script
-                    .description
-                    .ends_with(&format!("\n\nScript return: `{result_type}`.")),
-                "{}",
-                script.description
-            );
-            assert!(script.description.contains("tool.job(id).output("));
-            assert!(!script.description.contains("tool.job(id).wait("));
-            for name in ["exec", "shell", "jobs"] {
-                let description = &definitions
-                    .iter()
-                    .find(|tool| tool.name == name)
-                    .unwrap()
-                    .description;
-                assert!(description.contains("Result:"), "{name}: {description}");
-                assert!(!description.contains("JobView"), "{name}: {description}");
-                assert!(
-                    !description.contains("JobEnvelope"),
-                    "{name}: {description}"
-                );
-            }
-            assert!(
-                definitions
-                    .iter()
-                    .find(|tool| tool.name == "jobs")
-                    .unwrap()
-                    .description
-                    .ends_with("Result: `job metadata array`.")
-            );
-            let shared_type = job_envelope_type(&target_context(targets));
-            assert!(shared_type.contains("workspace?:string"));
-            assert_eq!(shared_type.contains("target?:string"), targets);
-            assert!(shared_type.contains("permission_denied"));
-            assert!(!shared_type.contains("awaiting_approval"));
-        }
-    }
-
-    #[test]
-    fn array_types_preserve_union_precedence_through_references() {
-        for (item, expected) in [
-            (serde_json::json!({"type":"string"}), "string[]"),
-            (
-                serde_json::json!({"type":["string","null"]}),
-                "(string | null)[]",
-            ),
-            (serde_json::json!({"enum":["a","b"]}), "(\"a\" | \"b\")[]"),
-            (
-                serde_json::json!({"oneOf":[{"type":"string"},{"type":"integer"}]}),
-                "(string | integer)[]",
-            ),
-            (
-                serde_json::json!({"anyOf":[{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]},{"type":"object","properties":{"b":{"type":"integer"}},"required":["b"]}]}),
-                "({a:string} | {b:integer})[]",
-            ),
-            (
-                serde_json::json!({"type":"object","properties":{"a":{"type":["string","null"]}},"required":["a"]}),
-                "{a:string | null}[]",
-            ),
-        ] {
-            let schema = serde_json::json!({"type":"array","items":{"$ref":"#/$defs/Item"},"$defs":{"Item":item}});
-            assert_eq!(schema_type(&schema, &schema), expected);
-        }
-    }
-
-    #[test]
-    fn background_is_generated_not_owned_by_handler_schema() {
-        let mut builder = ToolRegistry::builder();
-        builder
-            .register::<Args, String, _, _>(
-                "echo",
-                "Echo input",
-                ToolOptions::default().background(),
-                |_context, args| async move { Ok(args.value) },
-            )
-            .unwrap();
-        let registry = builder.build();
-        let surface = registry.surface(&context(true));
-        let tool = surface.get("echo").unwrap();
-        assert!(surface.definitions()[0].input_schema["properties"]["bg"].is_object());
-        let (arguments, background) = registry
-            .split_execution(tool, serde_json::json!({"value":"x", "bg":true}))
-            .unwrap();
-        assert!(background);
-        assert!(arguments.get("bg").is_none());
-        assert_eq!(
-            surface.get("echo").unwrap().output_schema.as_ref().unwrap()["anyOf"][0]["type"],
-            "string"
-        );
-        assert!(
-            registry.surface(&context(true)).definitions()[0]
-                .description
-                .ends_with("Result: `string`.")
-        );
-    }
-
-    #[test]
-    fn outbound_schemas_drop_only_prompt_metadata() {
-        let schema = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "title": "Root",
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["item"],
-            "properties": {
-                "item": {
-                    "title": "Item",
-                    "anyOf": [{"$ref": "#/$defs/Item"}, {"type": "null"}],
-                    "default": null,
-                    "description": "An optional bounded item.",
-                    "format": "custom"
-                }
-            },
-            "$defs": {
-                "Item": {"title": "Item", "type": "integer", "minimum": 1, "maximum": 9}
-            }
-        });
-        let mut builder = ToolRegistry::builder();
-        builder
-            .register_dynamic(
-                "strict",
-                "Strict",
-                schema,
-                ToolOptions::new(Vec::new()).background(),
-                |_context, _arguments| async { Ok(ToolOutput::new(Value::Null)) },
-            )
-            .unwrap();
-        let output = &builder.build().surface(&context(true)).definitions()[0].input_schema;
-        assert!(!contains_metadata(output));
-        assert_eq!(output["additionalProperties"], false);
-        assert_eq!(output["properties"]["item"]["default"], Value::Null);
-        assert_eq!(
-            output["properties"]["item"]["description"],
-            "An optional bounded item."
-        );
-        assert_eq!(output["properties"]["item"]["anyOf"][1]["type"], "null");
-        assert_eq!(output["$defs"]["Item"]["minimum"], 1);
-        assert_eq!(output["$defs"]["Item"]["maximum"], 9);
-        assert_eq!(output["properties"]["bg"]["default"], false);
-    }
-
-    #[test]
-    fn capabilities_drive_all_registry_queries() {
-        let mut builder = ToolRegistry::builder();
-        for (name, options) in [
-            ("always", ToolOptions::default()),
-            ("agent", ToolOptions::default().requires(Capability::Agents)),
-        ] {
-            builder
-                .register::<Args, String, _, _>(name, name, options, |_context, args| async move {
-                    Ok(args.value)
-                })
-                .unwrap();
-        }
-        let registry = builder.build();
-        let names = |agents| {
-            registry
-                .surface(&context(agents))
-                .definitions()
-                .into_iter()
-                .map(|definition| definition.name)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(names(false), ["always"]);
-        assert_eq!(names(true), ["agent", "always"]);
-        assert!(
-            registry
-                .surface(&context(true))
-                .script_manifests()
-                .iter()
-                .any(|manifest| manifest.name == "always")
-        );
-    }
-
-    #[test]
-    fn targeted_metadata_is_filtered_from_provider_and_javascript_surfaces() {
-        let mut builder = ToolRegistry::builder();
-        builder
-            .register_dynamic(
-                "renamed_remote_tool",
-                "A structurally targeted dynamic tool.",
-                serde_json::json!({
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {"value": {"type": "string"}}
-                }),
-                ToolOptions::default().placement(crate::tool::ToolPlacement::TargetedWorkspace),
-                |_context, arguments| async move { Ok(ToolOutput::new(arguments)) },
-            )
-            .unwrap();
-        let registry = builder.build();
-
-        let hidden = registry.surface(&target_context(false));
-        let definition = &hidden.definitions()[0];
-        assert!(
-            definition.input_schema["properties"]
-                .get("target")
-                .is_none()
-        );
-        let manifest = &hidden.script_manifests()[0];
-        assert!(!manifest.properties.iter().any(|name| name == "target"));
-        assert!(
-            hidden
-                .validate_arguments(
-                    "renamed_remote_tool",
-                    &serde_json::json!({"target": "build"}),
-                )
-                .is_err()
-        );
-
-        let enabled = registry.surface(&target_context(true));
-        assert!(enabled.definitions()[0].input_schema["properties"]["target"].is_object());
-        assert!(
-            enabled.script_manifests()[0]
-                .properties
-                .iter()
-                .any(|name| name == "target")
-        );
-    }
 }

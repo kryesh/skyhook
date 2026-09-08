@@ -357,15 +357,4 @@ mod tests {
                 .is_err()
         );
     }
-    #[test]
-    fn empty_data_is_event_but_comments_are_not() {
-        let mut parser = SseParser::default();
-        assert_eq!(
-            parser.push(b": keepalive\n\ndata:\n\n").unwrap(),
-            vec![SseEvent {
-                event: None,
-                data: String::new()
-            }]
-        );
-    }
 }

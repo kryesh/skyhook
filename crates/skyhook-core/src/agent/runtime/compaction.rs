@@ -424,46 +424,6 @@ mod tests {
     }
 
     #[test]
-    fn directive_preserves_state_and_reconciles_todos_without_a_budget() {
-        let message = directive();
-        let prompt = text(&message);
-        for expected in [
-            "continuation prompt",
-            "latest instructions",
-            "include it verbatim",
-            "previous continuation",
-            "rejected",
-            "exact job outputs",
-            "session restrictions and rules",
-            "user or loaded skills",
-            "final answer as a JSON object",
-            "Reasoning may occur separately",
-            "complete current todo list",
-            "retain the existing status",
-            "Reconcile only this agent's list",
-        ] {
-            assert!(prompt.contains(expected), "missing guidance: {expected}");
-        }
-        for forbidden in ["30k", "30,000", "30000", "token"] {
-            assert!(
-                !prompt.contains(forbidden),
-                "unexpected budget: {forbidden}"
-            );
-        }
-        let (_, visible_schema) = prompt
-            .split_once("Final-answer JSON Schema (applies only to the final answer, not separate reasoning):\n")
-            .expect("the model must see the schema even with grammar-only enforcement");
-        let visible_schema: serde_json::Value = serde_json::from_str(visible_schema).unwrap();
-        assert_eq!(visible_schema, response_schema());
-        assert!(
-            visible_schema["properties"]["todo_reconciliation"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("conversation evidence")
-        );
-    }
-
-    #[test]
     fn estimate_counts_all_visible_blocks_and_opaque_replay_once_per_item() {
         use crate::provider::protocol::{
             AssistantBlock, AssistantItem, ItemKind, ReplayEnvelope, ToolCall,

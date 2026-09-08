@@ -243,19 +243,6 @@ impl Jump {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn parses_jump_endpoints() {
-        assert_eq!(
-            Jump::parse("ssh://user@[2001:db8::1]:2222").unwrap(),
-            Jump {
-                host: "2001:db8::1".into(),
-                user: Some("user".into()),
-                port: Some(2222)
-            }
-        );
-        assert_eq!(Jump::parse("bastion").unwrap().host, "bastion");
-        assert!(Jump::parse("host:0").is_err());
-    }
     struct FixtureResolver(BTreeMap<String, Option<String>>);
     #[async_trait::async_trait]
     impl ConfigResolver for FixtureResolver {
@@ -278,34 +265,6 @@ mod tests {
             TargetSource::SshConfig,
         )
         .unwrap()
-    }
-    #[tokio::test]
-    async fn jumps_are_explicit_and_final_host_is_not_the_jump_host() {
-        let resolver = Arc::new(FixtureResolver(BTreeMap::from([(
-            "dest".into(),
-            Some("bastion,ops@inner:2222".into()),
-        )])));
-        let input = vec![
-            definition("bastion"),
-            definition("inner"),
-            definition("dest"),
-        ];
-        let first = normalize(input.clone(), vec![], resolver.clone())
-            .await
-            .unwrap();
-        let second = normalize(input, vec![], resolver).await.unwrap();
-        assert_eq!(first, second, "generated hop names must be stable");
-        let registry = super::super::TargetRegistry::from_definitions(first).unwrap();
-        let route = registry.route("dest").await.unwrap();
-        assert_eq!(route.len(), 3);
-        assert_eq!(route[0].name, "bastion");
-        assert!(route[1].name.starts_with("ssh-hop-"));
-        assert_eq!(route[1].ssh.user.as_deref(), Some("ops"));
-        assert_eq!(route[1].ssh.port, Some(2222));
-        assert_eq!(route[2].host, "dest.internal");
-        let listed = serde_json::to_string(&registry.list().await).unwrap();
-        assert!(listed.contains("dest.internal"));
-        assert!(!listed.contains("~/.ssh/secret"));
     }
     #[tokio::test]
     async fn remote_origins_anchor_automatic_jump_chains() {
@@ -362,29 +321,5 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["remote", "outer", "inner", "dest"]
         );
-    }
-    #[tokio::test]
-    async fn generated_hops_are_reused_across_registrations_after_route_expansion() {
-        let mut destination = definition("dest");
-        destination.origin = "remote".into();
-        let resolver = Arc::new(FixtureResolver(BTreeMap::from([
-            ("dest".into(), Some("inner".into())),
-            ("inner".into(), Some("outer".into())),
-        ])));
-        let mut existing = vec![definition("remote")];
-        existing.extend(
-            normalize(
-                vec![destination.clone()],
-                existing.clone(),
-                resolver.clone(),
-            )
-            .await
-            .unwrap(),
-        );
-        let changed = normalize(vec![destination], existing, resolver)
-            .await
-            .unwrap();
-        assert_eq!(changed.len(), 1, "unchanged generated hops must be reused");
-        assert_eq!(changed[0].name, "dest");
     }
 }

@@ -3,7 +3,6 @@
 mod artifact;
 mod askpass;
 pub(crate) mod authentication;
-mod backend;
 mod manager;
 mod prompt;
 mod protocol;

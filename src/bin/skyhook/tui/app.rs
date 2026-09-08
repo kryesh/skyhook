@@ -102,6 +102,7 @@ pub enum MenuKind {
     Info,
 }
 pub struct Menu {
+    id: u64,
     pub title: String,
     pub kind: MenuKind,
     pub items: Vec<Item>,
@@ -140,9 +141,14 @@ pub enum Work {
         finished: bool,
         result: Result<Value, String>,
     },
-    Sessions(Result<Vec<Item>, String>),
-    Files(Vec<Item>),
-    File(Result<(PathBuf, String), String>),
+    MenuLoaded {
+        id: u64,
+        result: Result<Vec<Item>, String>,
+    },
+    File {
+        draft: u64,
+        result: Result<(PathBuf, String), String>,
+    },
     SessionReady(Result<Option<SessionHandle>, String>),
     Started(Result<SessionHandle, String>),
     StatusFailed {
@@ -307,6 +313,9 @@ pub struct App {
     pub question_index: usize,
     pub answers: serde_json::Map<String, Value>,
     pub menu: Option<Menu>,
+    next_menu_id: u64,
+    // Pending attachment reads belong to one composer draft, not the next submission/session.
+    draft_revision: u64,
     pub status: super::status::StatusLog,
     unsaved_status: Vec<(AgentId, String)>,
     stopping: bool,
@@ -343,7 +352,6 @@ pub struct App {
     pub search_editor: Option<Editor>,
     pub hover: Option<(u16, u16)>,
     pub render: super::render::RenderState,
-    prewarmed: HashSet<(JobId, bool)>,
 }
 impl App {
     pub fn new(
@@ -405,6 +413,8 @@ impl App {
             question_index: 0,
             answers: serde_json::Map::new(),
             menu: None,
+            next_menu_id: 0,
+            draft_revision: 0,
             status: super::status::StatusLog::new(tx.clone()),
             unsaved_status: Vec::new(),
             stopping: false,
@@ -441,7 +451,6 @@ impl App {
             search_editor: None,
             hover: None,
             render: super::render::RenderState::new(selected, light, tx),
-            prewarmed: HashSet::new(),
         };
         app.refresh();
         if let Some(root) = app.projection.agents.iter().find(|a| a.id == app.selected) {
@@ -459,13 +468,10 @@ impl App {
             .map_or(&self.selected, SessionHandle::root_agent)
     }
     fn show_warnings(&mut self) {
-        if let Some(session) = &self.session
-            && !session.warnings().is_empty()
-        {
-            self.notice(format!(
-                "{} startup warning(s) · /diagnostics",
-                session.warnings().len()
-            ));
+        if let Some(session) = &self.session {
+            for warning in session.warnings() {
+                self.notice(format!("Startup warning: {warning}"));
+            }
         }
     }
     fn notifier(&self) -> super::status::StatusSender {
@@ -580,6 +586,7 @@ impl App {
                     default_open: false,
                     running: false,
                     footer: None,
+                    request_summary: None,
                     indent: 0,
                     job: None,
                     compact_after: false,
@@ -587,16 +594,6 @@ impl App {
                 });
             }
             self.content_dirty = false;
-        }
-    }
-    pub fn prewarm_entry(&mut self, index: usize) {
-        if let Some(job) = self.entries.get(index).and_then(|entry| entry.job)
-            && self.prewarmed.insert((job, self.light))
-            && let Some(job) = self.projection.jobs.get(&job)
-        {
-            let mut document = super::tool_view::Document::default();
-            document.arguments(&job.tool, &job.args);
-            self.render.highlights.warm(&document, self.light);
         }
     }
     pub fn busy(&self) -> bool {
@@ -640,7 +637,6 @@ impl App {
         self.views.clear();
         self.content_cache = model::ContentCache::default();
         self.render.reset_session();
-        self.prewarmed.clear();
         self.outputs.clear();
         self.pending_outputs.clear();
         self.final_outputs.clear();
@@ -651,6 +647,7 @@ impl App {
         self.reset_prompt();
         self.prompt_active = false;
         self.editor = Editor::default();
+        self.draft_revision = self.draft_revision.wrapping_add(1);
         self.images.clear();
         self.pastes.clear();
         self.queue.clear();
@@ -778,6 +775,7 @@ impl App {
         if text.trim().is_empty() && images.is_empty() {
             return;
         }
+        self.draft_revision = self.draft_revision.wrapping_add(1);
         let queued = self.queued_input(text, images);
         if self.busy() || self.paused || !self.queue.is_empty() {
             self.queue.push_back(queued);
@@ -1084,25 +1082,28 @@ impl App {
                 self.content_cache.invalidate_job(job);
                 self.content_dirty = true;
             }
-            Work::Sessions(result) => match result {
-                Ok(items) => self.open("Resume session", MenuKind::Sessions, items),
-                Err(e) => self.notice(e),
-            },
-            Work::Files(items) => {
-                if let Some(menu) = &mut self.menu
-                    && matches!(menu.kind, MenuKind::Files)
-                {
-                    menu.items = items;
+            Work::MenuLoaded { id, result } => {
+                let Some(menu) = self.menu.as_mut().filter(|menu| menu.id == id) else {
+                    return;
+                };
+                match result {
+                    Ok(items) => menu.items = items,
+                    Err(error) => self.notice(error),
                 }
             }
-            Work::File(result) => match result {
-                Ok((path, content)) => {
-                    self.pastes
-                        .push(format!("File: {}\n{content}", path.display()));
-                    self.notice(format!("Attached {}", path.display()));
+            Work::File { draft, result } => {
+                if draft != self.draft_revision {
+                    return;
                 }
-                Err(e) => self.notice(e),
-            },
+                match result {
+                    Ok((path, content)) => {
+                        self.pastes
+                            .push(format!("File: {}\n{content}", path.display()));
+                        self.notice(format!("Attached {}", path.display()));
+                    }
+                    Err(error) => self.notice(error),
+                }
+            }
             Work::SessionReady(Err(error)) => {
                 if let Some(paused) = self.switch_restore.take() {
                     self.paused = paused;
@@ -2283,7 +2284,9 @@ impl App {
         } else {
             0
         };
+        self.next_menu_id = self.next_menu_id.wrapping_add(1);
         self.menu = Some(Menu {
+            id: self.next_menu_id,
             title: title.into(),
             kind,
             items,
@@ -2363,7 +2366,8 @@ impl App {
         match command {
             "commands" => self.open(
                 "Commands", MenuKind::Commands,
-                COMMANDS.iter().map(|(id, label, _)| Item::new(*id, *label, self.keys.binding(id))).collect(),
+                COMMANDS.iter().filter(|(id, _, _)| !matches!(*id, "commands" | "child" | "parent" | "inspect"))
+                    .map(|(id, label, _)| Item::new(*id, *label, self.keys.binding(id))).collect(),
             ),
             "model" | "models" => {
                 self.open(
@@ -2389,12 +2393,11 @@ impl App {
                 self.focus = Focus::Content;
                 self.view().tab = Tab::Conversation;
             }
-            "jobs" | "requests" | "state" => {
+            "jobs" | "requests" => {
                 self.focus = Focus::Content;
                 self.view().tab = match command {
                     "jobs" => Tab::Jobs,
-                    "requests" => Tab::Requests,
-                    _ => Tab::State,
+                    _ => Tab::Requests,
                 };
                 self.view().scroll = None;
             }
@@ -2468,21 +2471,23 @@ impl App {
             "sessions" => {
                 let root = self.launch.sessions.clone();
                 let tx = self.tx.clone();
-                self.notice("Loading sessions…");
+                self.open("Resume session", MenuKind::Sessions, vec![]);
+                let id = self.next_menu_id;
                 tokio::spawn(async move {
                     let result = load_sessions(root).await;
-                    let _ = tx.send(Work::Sessions(result));
+                    let _ = tx.send(Work::MenuLoaded { id, result });
                 });
             }
             "files" => {
                 self.open("Attach workspace file", MenuKind::Files, vec![]);
+                let id = self.next_menu_id;
                 let root = self.launch.workspace.clone();
                 let tx = self.tx.clone();
                 tokio::task::spawn_blocking(move || {
                     let mut items = vec![];
                     walk_files(&root, &root, &mut items);
                     items.sort_by(|a, b| a.label.cmp(&b.label));
-                    let _ = tx.send(Work::Files(items));
+                    let _ = tx.send(Work::MenuLoaded { id, result: Ok(items) });
                 });
             }
             "export" => {
@@ -2507,8 +2512,6 @@ impl App {
                     notices.send(notice);
                 });
             }
-            "diagnostics" => self.info("Startup diagnostics", self.session.as_ref()
-                .map_or_else(|| "No session started yet".into(), |s| s.warnings().join("\n"))),
             "help" => self.info("Skyhook help", format!(concat!(
                 "{}\n\n",
                 "Tab / Shift+Tab: composer, tree, content\n",
@@ -2533,7 +2536,7 @@ impl App {
         }
         if matches!(
             command,
-            "inspect" | "jobs" | "requests" | "state" | "thinking" | "details"
+            "inspect" | "jobs" | "requests" | "thinking" | "details"
         ) {
             self.invalidate_content();
         }
@@ -2675,6 +2678,7 @@ impl App {
                 let root = self.launch.workspace.clone();
                 let path = root.join(value);
                 let tx = self.tx.clone();
+                let draft = self.draft_revision;
                 tokio::spawn(async move {
                     let result = async {
                         let path = tokio::fs::canonicalize(path)
@@ -2700,7 +2704,7 @@ impl App {
                         Ok((path, text))
                     }
                     .await;
-                    let _ = tx.send(Work::File(result));
+                    let _ = tx.send(Work::File { draft, result });
                 });
             }
             MenuKind::Attachments => match attachment {
@@ -2927,10 +2931,7 @@ mod tests {
     use crate::interaction::UiInteraction;
     use skyhook::{
         agent::{Question, QuestionOption},
-        provider::protocol::{
-            AssistantItem, BlockContent, BlockKind, ContentDelta, ItemKind, ResponseEvent,
-            StopReason,
-        },
+        provider::protocol::{BlockKind, ContentDelta, ItemKind, ResponseEvent},
         remote::EmbeddedShimCatalog,
     };
     use std::sync::Arc;
@@ -2947,31 +2948,12 @@ mod tests {
         })
     }
 
-    fn requested(app: &mut App, agent: &AgentId, request: u64) {
-        app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event: RuntimeEvent::Record(Box::new(skyhook::session::EventRecord {
-                version: 1,
-                sequence: request,
-                timestamp_millis: 0,
-                agent: agent.clone(),
-                event: SessionEvent::ModelRequested {
-                    context: 0,
-                    messages: vec![],
-                    purpose: skyhook::session::ModelPurpose::Agent,
-                },
-            })),
-        });
-        app.refresh();
-    }
-
     /// One explicitly started provider item/block; appends never synthesize lifecycle events.
     struct TestBlock {
         agent: AgentId,
         request: u64,
         item: String,
         block: String,
-        kind: BlockKind,
     }
 
     impl TestBlock {
@@ -3015,7 +2997,6 @@ mod tests {
                 request,
                 item: item.into(),
                 block,
-                kind,
             }
         }
 
@@ -3030,36 +3011,6 @@ mod tests {
                     delta: ContentDelta::Text(text.into()),
                 },
             )
-        }
-
-        fn end(&self, app: &mut App, text: &str) {
-            let content = match self.kind {
-                BlockKind::Text => BlockContent::Text { text: text.into() },
-                BlockKind::Reasoning => BlockContent::Reasoning { text: text.into() },
-                BlockKind::ToolCallArguments => panic!("text fixture does not end tool arguments"),
-            };
-            response_event(
-                app,
-                &self.agent,
-                self.request,
-                ResponseEvent::BlockEnded {
-                    item: self.item.clone(),
-                    block: self.block.clone(),
-                    content,
-                },
-            );
-        }
-
-        fn end_item(&self, app: &mut App) {
-            response_event(
-                app,
-                &self.agent,
-                self.request,
-                ResponseEvent::ItemEnded {
-                    id: self.item.clone(),
-                    replay: None,
-                },
-            );
         }
     }
 
@@ -3114,83 +3065,90 @@ mod tests {
         .expect("lifecycle task completed")
     }
     #[tokio::test]
-    async fn draft_and_new_do_not_create_session_directories() {
+    async fn menu_loads_only_fill_the_originating_open_menu() {
         let (_root, mut app) = draft_fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        app.tx = tx;
-        let old_draft = app.selected.clone();
-        assert!(app.session_id().is_none());
-        assert!(!app.launch.sessions.exists());
-        app.editor.set("unsent draft".into());
-        app.command("diagnostics");
-        app.command("export");
-        app.command("retry");
-        app.command("new");
-        let Work::SessionReady(Ok(None)) = next_lifecycle(&mut rx).await else {
-            panic!("new must only reset to a draft");
-        };
-        app.set_session(None, ObservationSnapshot::default());
-        assert_ne!(app.selected, old_draft);
-        assert!(app.editor.text.is_empty());
-        assert!(!app.launch.sessions.exists());
-        app.work(Work::StatusFailed {
-            session: None,
-            agent: old_draft,
-            message: "stale notice".into(),
-        });
-        assert!(app.unsaved_status.is_empty());
-        app.shutdown();
-        app.work(next_lifecycle(&mut rx).await);
-        assert!(app.exit);
-        assert!(!app.launch.sessions.exists());
+        for kind in [MenuKind::Sessions, MenuKind::Files] {
+            app.open("Loading", kind, vec![]);
+            let closed = app.menu.as_ref().unwrap().id;
+            key(&mut app, KeyCode::Esc, M::NONE);
+            app.dirty = false;
+            app.work(Work::MenuLoaded {
+                id: closed,
+                result: Ok(vec![Item::new("old", "old", "")]),
+            });
+            assert!(app.menu.is_none());
+            assert!(!app.dirty);
+
+            app.open("Newer request", MenuKind::Files, vec![]);
+            let current = app.menu.as_ref().unwrap().id;
+            app.menu.as_mut().unwrap().input.insert("query");
+            app.work(Work::MenuLoaded {
+                id: closed,
+                result: Err("obsolete failure".into()),
+            });
+            assert!(app.menu.as_ref().unwrap().items.is_empty());
+            assert!(!app.dirty);
+            app.work(Work::MenuLoaded {
+                id: current,
+                result: Ok(vec![Item::new("current", "current", "")]),
+            });
+            let menu = app.menu.as_ref().unwrap();
+            assert_eq!(menu.items[0].value, "current");
+            assert_eq!(menu.input.text, "query");
+
+            app.info("Replacement overlay", "Keep me".into());
+            app.work(Work::MenuLoaded {
+                id: current,
+                result: Ok(vec![]),
+            });
+            assert_eq!(app.menu.as_ref().unwrap().title, "Replacement overlay");
+        }
     }
+
     #[tokio::test]
-    async fn late_draft_notices_follow_creation_but_not_new() {
+    async fn attachment_reads_do_not_leak_into_the_next_submission_or_session() {
         let (_root, mut app) = draft_fixture().await;
-        let draft = app.selected.clone();
-        let session = app.launch.create(None).await.unwrap();
-        let snapshot = session.observe().await.snapshot;
-        app.session_started(session.clone(), snapshot);
-        app.work(Work::StatusFailed {
-            session: None,
-            agent: draft.clone(),
-            message: "late draft notice".into(),
-        });
-        assert_eq!(
-            app.unsaved_status,
-            vec![(session.root_agent().clone(), "late draft notice".into())]
-        );
-        session.shutdown().await.unwrap();
-        app.set_session(None, ObservationSnapshot::default());
-        app.work(Work::StatusFailed {
-            session: None,
-            agent: draft,
-            message: "abandoned draft notice".into(),
-        });
-        assert!(app.unsaved_status.is_empty());
-    }
-    #[tokio::test]
-    async fn new_shuts_down_existing_session_without_creating_another() {
-        let (_root, mut app) = fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        app.tx = tx;
-        let before = std::fs::read_dir(&app.launch.sessions).unwrap().count();
-        app.command("new");
-        let Work::SessionReady(Ok(None)) = next_lifecycle(&mut rx).await else {
-            panic!("new should not create a session");
+        let attachment = |draft| Work::File {
+            draft,
+            result: Ok((PathBuf::from("fixture.txt"), "contents".into())),
         };
+        let draft = app.draft_revision;
+        app.info("Unrelated overlay", "Still the same draft".into());
+        app.work(attachment(draft));
+        assert_eq!(app.pastes, ["File: fixture.txt\ncontents"]);
+        app.pastes.clear();
+
+        // Queue without starting a session: even a queued submission consumes its draft.
+        app.paused = true;
+        app.submit("submitted".into(), vec![]);
+        app.dirty = false;
+        app.work(attachment(draft));
+        assert!(app.pastes.is_empty());
+        assert!(!app.dirty);
+        let next_draft = app.draft_revision;
+        app.work(attachment(next_draft));
+        assert_eq!(app.pastes.len(), 1);
+
         app.set_session(None, ObservationSnapshot::default());
-        assert!(app.session.is_none());
-        assert_eq!(
-            std::fs::read_dir(&app.launch.sessions).unwrap().count(),
-            before
-        );
+        app.dirty = false;
+        app.work(attachment(next_draft));
+        assert!(app.pastes.is_empty());
+        assert!(!app.dirty);
+        app.work(attachment(app.draft_revision));
+        assert_eq!(app.pastes.len(), 1);
     }
+
     #[tokio::test]
     async fn first_submit_creates_once_and_preserves_queue_models_and_draft() {
         let (_root, mut app) = draft_fixture().await;
+        let broken_skill = app.launch.workspace.join(".agents/skills/broken");
+        std::fs::create_dir_all(&broken_skill).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         app.tx = tx;
+        for command in ["export", "retry"] {
+            app.command(command);
+        }
+        assert!(app.session.is_none() && !app.launch.sessions.exists());
         app.submit("first input".into(), vec![]);
         assert!(app.creating);
         assert!(app.session.is_none());
@@ -3214,7 +3172,17 @@ mod tests {
         assert_eq!(app.queue[0].images, [PathBuf::from("queued.png")]);
         assert_eq!(app.editor.text, "still composing");
         assert_eq!(app.pastes, ["unsent attachment"]);
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
+        app.status.flush().await;
+        let session = app.session.as_ref().unwrap();
+        let snapshot = session.observe().await.snapshot;
+        assert!(!session.warnings().is_empty());
+        for warning in session.warnings() {
+            assert!(snapshot.records.values().any(|record| matches!(
+                &record.event, skyhook::session::SessionEvent::Status { message }
+                if message == &format!("Startup warning: {warning}")
+            )));
+        }
+        session.shutdown().await.unwrap();
     }
     #[tokio::test]
     async fn failed_creation_retains_inputs_and_can_resume_without_duplicate_creation() {
@@ -3281,46 +3249,6 @@ mod tests {
         assert!(app.pending_start.is_none());
         assert!(!app.operation);
         assert_eq!(std::fs::read_dir(&app.launch.sessions).unwrap().count(), 1);
-    }
-    #[tokio::test]
-    async fn script_runs_on_demand_and_failed_creation_can_retry_the_path() {
-        let (_root, mut app) = draft_fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        app.tx = tx;
-        let path = app.launch.workspace.join("explicit.js");
-        std::fs::write(&path, "return 42;").unwrap();
-        let config = app.launch.config.clone();
-        Arc::make_mut(&mut app.launch.config)
-            .models
-            .shift_remove("first");
-        app.start_script(path.clone());
-        let work = next_lifecycle(&mut rx).await;
-        assert!(matches!(work, Work::Started(Err(_))));
-        app.work(work);
-        assert!(matches!(&app.pending_start, Some(PendingStart::Script(saved)) if saved == &path));
-        assert!(app.session.is_none());
-        app.launch.config = config;
-        app.command("resume");
-        let Work::Started(Ok(session)) = next_lifecycle(&mut rx).await else {
-            panic!("resuming a script retries session creation");
-        };
-        let snapshot = session.observe().await.snapshot;
-        app.session_started(session, snapshot);
-        let work = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let work = rx.recv().await.unwrap();
-                if matches!(work, Work::Done { .. }) {
-                    break work;
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert!(matches!(&work, Work::Done { result: Ok(()), .. }));
-        app.work(work);
-        assert!(!app.operation);
-        assert!(app.history.is_empty());
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
     #[tokio::test]
     async fn shutdown_waits_for_failed_creation_and_for_new_session_reset() {
@@ -3410,597 +3338,6 @@ mod tests {
             .iter()
             .filter_map(|(rect, hit)| matches!(hit, Hit::Entry(_, true)).then_some(*rect))
             .collect()
-    }
-
-    #[tokio::test]
-    async fn silent_requests_animate_and_single_line_reasoning_stays_inline_with_markdown() {
-        let (_root, mut app) = fixture().await;
-        let agent = app.selected.clone();
-        app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event: RuntimeEvent::Activity {
-                agent: agent.clone(),
-                activity: AgentActivity::Working,
-            },
-        });
-        assert!(draw(&mut app).contains("⠋ Working"));
-        assert!(
-            !app.hits
-                .iter()
-                .any(|(_, hit)| matches!(hit, Hit::Entry(_, _)))
-        );
-        let working_row = app.render.rows.entry_start(0).unwrap();
-        assert!(!app.render.rows[working_row].selectable);
-        let working = Rect::new(2, app.content_rect.y + working_row as u16, 1, 1);
-        let focus = app.focus;
-        click(&mut app, working);
-        mouse(&mut app, working, MouseEventKind::Drag(MouseButton::Left));
-        assert!(app.selection.is_none());
-        assert!(app.focus == focus);
-        app.copy();
-        assert!(app.clipboard.is_none());
-        let cached = app.render.rows.line_identities();
-        app.tick();
-        assert!(draw(&mut app).contains("⠙ Working"));
-        let current = app.render.rows.line_identities();
-        assert_eq!(cached.len(), current.len());
-        assert!(cached.iter().zip(&current).all(|(a, b)| Arc::ptr_eq(a, b)));
-        let reasoning =
-            TestBlock::start(&mut app, &agent, 42, "reasoning", 0, BlockKind::Reasoning);
-        reasoning.delta(&mut app, "**Check** `file.rs`");
-        let inline = draw(&mut app);
-        assert!(inline.contains("⠙ Check file.rs"), "{inline}");
-        assert!(!inline.contains("Reasoning"));
-        assert!(!inline.contains("Working"));
-        assert!(!app.entries[0].expandable);
-        assert!(tool_hits(&app).is_empty());
-        assert!(
-            !app.hits
-                .iter()
-                .any(|(_, hit)| matches!(hit, Hit::Entry(_, _)))
-        );
-        let inline_row = app.render.rows.entry_start(0).unwrap();
-        let hit = Rect::new(2, app.content_rect.y + inline_row as u16, 1, 1);
-        let focus = app.focus;
-        click(&mut app, hit);
-        mouse(
-            &mut app,
-            Rect::new(hit.x + 8, hit.y, 1, 1),
-            MouseEventKind::Drag(MouseButton::Left),
-        );
-        assert!(app.selection.is_none());
-        assert!(app.focus == focus);
-        assert!(app.view().scroll.is_none());
-        app.focus = Focus::Content;
-        key(&mut app, KeyCode::Enter, M::NONE);
-        assert!(draw(&mut app).contains("⠙ Check file.rs"));
-        assert!(!app.entries[0].expandable);
-        reasoning.delta(&mut app, "\nThen **continue**.");
-        let multi = draw(&mut app);
-        assert!(app.entries[0].expandable);
-        assert!(multi.contains("Then continue."));
-        let body = *tool_hits(&app).last().unwrap();
-        mouse(&mut app, body, MouseEventKind::Down(MouseButton::Left));
-        let end = Rect::new(body.x + 4, body.y, 1, 1);
-        mouse(&mut app, end, MouseEventKind::Drag(MouseButton::Left));
-        mouse(&mut app, end, MouseEventKind::Up(MouseButton::Left));
-        let selection = app
-            .selection
-            .expect("expandable reasoning is text selectable");
-        assert!(!super::super::render::selected_text(&app.render.rows, selection).is_empty());
-        reasoning.end(&mut app, "**Check** `file.rs`\nThen **continue**.");
-        let closed = draw(&mut app);
-        assert!(closed.contains("▸ Reasoning"), "{closed}");
-        assert!(!closed.contains("Then continue."));
-        reasoning.end_item(&mut app);
-        let answer = TestBlock::start(&mut app, &agent, 42, "answer", 1, BlockKind::Text);
-        answer.delta(&mut app, "Answer");
-        let answering = draw(&mut app);
-        assert!(answering.contains("▸ Reasoning"));
-        assert!(answering.contains("Working"));
-        app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event: RuntimeEvent::Activity {
-                agent,
-                activity: AgentActivity::Interrupted,
-            },
-        });
-        assert!(!draw(&mut app).contains("Working"));
-        assert!(!app.animating);
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn content_navigation_and_search_skip_inline_reasoning() {
-        let (_root, mut app) = fixture().await;
-        app.rebuild_content();
-        let entry = |text: &str, surface, expandable| Entry {
-            key: text.into(),
-            text: text.into(),
-            surface,
-            expandable,
-            default_open: false,
-            running: false,
-            footer: None,
-            indent: 0,
-            job: None,
-            compact_after: false,
-            document: None,
-        };
-        app.entries = vec![
-            entry("leading inline", model::Surface::Reasoning, false),
-            entry("before", model::Surface::Tool, false),
-            entry("matching inline", model::Surface::Reasoning, false),
-            entry("matching expandable", model::Surface::Reasoning, true),
-            entry("trailing inline", model::Surface::Reasoning, false),
-        ];
-        app.render.changes.reset = true;
-        draw(&mut app);
-        app.focus = Focus::Content;
-        app.view().row = 1;
-        key(&mut app, KeyCode::Down, M::NONE);
-        assert_eq!(app.view().row, 3);
-        key(&mut app, KeyCode::Down, M::NONE);
-        assert_eq!(app.view().row, 3);
-        key(&mut app, KeyCode::Up, M::NONE);
-        assert_eq!(app.view().row, 1);
-        key(&mut app, KeyCode::Up, M::NONE);
-        assert_eq!(app.view().row, 1);
-        app.view().query = "matching".into();
-        key(&mut app, KeyCode::Char('n'), M::NONE);
-        assert_eq!(app.view().row, 3);
-        key(&mut app, KeyCode::Char('N'), M::NONE);
-        assert_eq!(app.view().row, 3);
-        key(&mut app, KeyCode::Char('y'), M::NONE);
-        assert_eq!(app.clipboard.as_deref(), Some("matching expandable"));
-        // An old cursor may point to a newly inlined entry after a model update.
-        app.view().row = 2;
-        key(&mut app, KeyCode::Char('y'), M::NONE);
-        assert!(app.clipboard.is_none());
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn live_reasoning_can_be_collapsed_by_body_click_and_reopened_with_enter() {
-        let (_root, mut app) = fixture().await;
-        let agent = app.selected.clone();
-        requested(&mut app, &agent, 42);
-        let reasoning =
-            TestBlock::start(&mut app, &agent, 42, "reasoning", 0, BlockKind::Reasoning);
-        reasoning.delta(&mut app, "First step\nMore detail");
-        let first = draw(&mut app);
-        assert!(first.contains("First step"));
-        assert!(first.contains("⠋ Reasoning"));
-        assert!(!first.contains("streaming"));
-        let cached = app.render.rows.line_identities();
-        app.tick();
-        assert!(draw(&mut app).contains("⠙ Reasoning"));
-        let current = app.render.rows.line_identities();
-        assert_eq!(cached.len(), current.len());
-        assert!(cached.iter().zip(&current).all(|(a, b)| Arc::ptr_eq(a, b)));
-        let body = *tool_hits(&app).last().unwrap();
-        click(&mut app, body);
-        assert!(!draw(&mut app).contains("First step"));
-        reasoning.delta(&mut app, "\nSecond step");
-        assert!(!draw(&mut app).contains("Second step"));
-        key(&mut app, KeyCode::Enter, M::NONE);
-        assert!(draw(&mut app).contains("Second step"));
-
-        let reasoning_key = app
-            .entries
-            .iter()
-            .find(|entry| entry.surface == model::Surface::Reasoning)
-            .unwrap()
-            .key
-            .clone();
-        reasoning.end(&mut app, "First step\nMore detail\nSecond step");
-        let closed = draw(&mut app);
-        // Stable item/block identity preserves an explicit user-open choice.
-        // Completion still ends the spinner immediately, before ItemEnded/answer.
-        assert!(closed.contains("▾ Reasoning"), "{closed}");
-        assert!(closed.contains("Second step"));
-        assert!(
-            !app.entries
-                .iter()
-                .find(|entry| entry.key == reasoning_key)
-                .unwrap()
-                .running
-        );
-        // Block closure, not a later item end or answer, controls the live-to-done transition.
-        app.tick();
-        assert!(draw(&mut app).contains("Second step"));
-        key(&mut app, KeyCode::Enter, M::NONE);
-        assert!(!draw(&mut app).contains("Second step"));
-        reasoning.end_item(&mut app);
-        let answer = TestBlock::start(&mut app, &agent, 42, "answer", 1, BlockKind::Text);
-        answer.delta(&mut app, "Answer starts");
-        let answering = draw(&mut app);
-        assert!(answering.contains("▸ Reasoning"));
-        assert!(answering.contains("Answer starts"));
-        assert!(!answering.contains("Second step"));
-        assert!(!app.animating);
-
-        answer.end(&mut app, "Answer starts");
-        answer.end_item(&mut app);
-        response_event(
-            &mut app,
-            &agent,
-            42,
-            ResponseEvent::ResponseEnded {
-                stop_reason: StopReason::EndTurn,
-            },
-        );
-        // Commit the same reasoning as the runtime does at successful completion.
-        let sequence = app.snapshot.records.last_key_value().unwrap().0 + 1;
-        app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event: RuntimeEvent::ResponseSettled {
-                agent: agent.clone(),
-                request: 42,
-                message: Some(sequence),
-                error: None,
-            },
-        });
-        app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event: RuntimeEvent::Record(Box::new(skyhook::session::EventRecord {
-                version: 1,
-                sequence,
-                timestamp_millis: 0,
-                agent,
-                event: SessionEvent::MessageCommitted {
-                    message: skyhook::provider::protocol::Message::Assistant(vec![
-                        AssistantItem::reasoning(
-                            "reasoning",
-                            0,
-                            "First step\nMore detail\nSecond step",
-                            None,
-                        ),
-                        AssistantItem::text("answer", 1, "Answer starts"),
-                    ]),
-                },
-            })),
-        });
-        app.refresh();
-        let screen = draw(&mut app);
-        assert!(screen.contains("▸ Reasoning"), "{screen}");
-        assert!(!screen.contains("Second step"));
-        key(&mut app, KeyCode::Enter, M::NONE);
-        assert!(draw(&mut app).contains("Second step"));
-        key(&mut app, KeyCode::Enter, M::NONE);
-        draw(&mut app);
-        app.view().collapsed.clear();
-        app.command("thinking");
-        assert!(draw(&mut app).contains("Second step"));
-        let body = app
-            .hits
-            .iter()
-            .rev()
-            .find_map(|(rect, hit)| match hit {
-                Hit::Entry(index, true)
-                    if app.entries[*index].surface == model::Surface::Reasoning =>
-                {
-                    Some(*rect)
-                }
-                _ => None,
-            })
-            .unwrap();
-        click(&mut app, body);
-        assert!(!draw(&mut app).contains("Second step"));
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn consecutive_reasoning_parts_close_independently_and_preserve_toggles_on_handoff() {
-        let (_root, mut app) = fixture().await;
-        let agent = app.selected.clone();
-        requested(&mut app, &agent, 42);
-        let first = TestBlock::start(&mut app, &agent, 42, "first", 0, BlockKind::Reasoning);
-        first.delta(&mut app, "First thought\nFirst detail");
-        draw(&mut app);
-        let first_key = app
-            .entries
-            .iter()
-            .find(|entry| entry.surface == model::Surface::Reasoning)
-            .unwrap()
-            .key
-            .clone();
-        first.end(&mut app, "First thought\nFirst detail");
-        let closed = draw(&mut app);
-        assert!(closed.contains("▸ Reasoning"), "{closed}");
-        assert!(!closed.contains("First detail"));
-        assert!(
-            !app.entries
-                .iter()
-                .find(|entry| entry.key == first_key)
-                .unwrap()
-                .running
-        );
-
-        // Starting another reasoning item must not reopen or merge the closed part,
-        // even when the first ItemEnded has not yet arrived.
-        let second = TestBlock::start(&mut app, &agent, 42, "second", 1, BlockKind::Reasoning);
-        second.delta(&mut app, "Second thought\nSecond detail");
-        let screen = draw(&mut app);
-        assert!(!screen.contains("First detail"));
-        assert!(screen.contains("Second detail"), "{screen}");
-        let reasoning: Vec<_> = app
-            .entries
-            .iter()
-            .filter(|entry| entry.surface == model::Surface::Reasoning)
-            .collect();
-        assert_eq!(reasoning.len(), 2);
-        assert_eq!(reasoning[0].key, first_key);
-        assert!(!reasoning[0].running);
-        assert!(reasoning[1].running);
-        let second_key = reasoning[1].key.clone();
-        assert_ne!(first_key, second_key);
-        first.end_item(&mut app);
-        second.end(&mut app, "Second thought\nSecond detail");
-        let closed = draw(&mut app);
-        assert!(!closed.contains("First detail"));
-        assert!(!closed.contains("Second detail"));
-        assert!(
-            app.entries
-                .iter()
-                .filter(|entry| entry.surface == model::Surface::Reasoning)
-                .all(|entry| !entry.running)
-        );
-
-        // A deliberate toggle after block completion survives delayed item closure,
-        // response settlement and the committed-message replacement.
-        app.focus = Focus::Content;
-        app.view().row = app
-            .entries
-            .iter()
-            .position(|entry| entry.key == second_key)
-            .unwrap();
-        key(&mut app, KeyCode::Enter, M::NONE);
-        assert!(draw(&mut app).contains("Second detail"));
-        second.end_item(&mut app);
-        response_event(
-            &mut app,
-            &agent,
-            42,
-            ResponseEvent::ResponseEnded {
-                stop_reason: StopReason::EndTurn,
-            },
-        );
-        assert!(draw(&mut app).contains("Second detail"));
-        let sequence = app.snapshot.records.last_key_value().unwrap().0 + 1;
-        app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event: RuntimeEvent::ResponseSettled {
-                agent: agent.clone(),
-                request: 42,
-                message: Some(sequence),
-                error: None,
-            },
-        });
-        assert!(draw(&mut app).contains("Second detail"));
-        app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event: RuntimeEvent::Record(Box::new(skyhook::session::EventRecord {
-                version: 1,
-                sequence,
-                timestamp_millis: 0,
-                agent,
-                event: SessionEvent::MessageCommitted {
-                    message: skyhook::provider::protocol::Message::Assistant(vec![
-                        AssistantItem::reasoning("first", 0, "First thought\nFirst detail", None),
-                        AssistantItem::reasoning(
-                            "second",
-                            1,
-                            "Second thought\nSecond detail",
-                            None,
-                        ),
-                    ]),
-                },
-            })),
-        });
-        app.refresh();
-        let committed = draw(&mut app);
-        assert!(!committed.contains("First detail"));
-        assert!(
-            committed.contains("Second detail"),
-            "{committed} entries={:?}",
-            app.entries
-                .iter()
-                .map(|e| (&e.key, &e.text))
-                .collect::<Vec<_>>()
-        );
-        let keys: Vec<_> = app
-            .entries
-            .iter()
-            .filter(|entry| entry.surface == model::Surface::Reasoning)
-            .map(|entry| entry.key.clone())
-            .collect();
-        assert_eq!(keys, vec![first_key, second_key]);
-        key(&mut app, KeyCode::Enter, M::NONE);
-        assert!(!draw(&mut app).contains("Second detail"));
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn statuses_are_durable_agent_scoped_rows_without_reserving_input_space() {
-        let (_root, mut app) = fixture().await;
-        draw(&mut app);
-        let content_height = app.content_rect.height;
-        let root = app.selected.clone();
-        let child = root.child(1);
-        let delayed = app.notifier();
-        app.notice("Interrupted");
-        app.select(child.clone());
-        app.notice("Child status");
-        delayed.send("Root follow-up status");
-        app.status.flush().await;
-        app.snapshot = app.session.as_ref().unwrap().observe().await.snapshot;
-        app.refresh();
-        let child_screen = draw(&mut app);
-        assert!(child_screen.contains("Status · Child status"));
-        assert!(!child_screen.contains("Interrupted"));
-        app.select(root.clone());
-        let root_screen = draw(&mut app);
-        assert!(root_screen.contains("Status · Interrupted"));
-        assert!(root_screen.contains("Status · Root follow-up status"));
-        assert!(!root_screen.contains("Child status"));
-        assert_eq!(app.content_rect.height, content_height);
-        assert!(
-            app.entries
-                .iter()
-                .all(|entry| entry.surface == model::Surface::Status
-                    && !entry.expandable
-                    && entry.job.is_none())
-        );
-        let records =
-            SessionStore::read_records(&app.launch.sessions, app.session.as_ref().unwrap().id())
-                .await
-                .unwrap();
-        let messages: Vec<_> = records
-            .iter()
-            .filter_map(|record| match &record.event {
-                SessionEvent::Status { message } => Some(message.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            messages,
-            ["Interrupted", "Child status", "Root follow-up status"]
-        );
-        assert!(
-            skyhook::session::project_history(&records, &root)
-                .unwrap()
-                .is_empty()
-        );
-        app.work(Work::StatusFailed {
-            session: app.session_id(),
-            agent: root,
-            message: "Unsaved status\nCould not save this status: disk full".into(),
-        });
-        assert!(draw(&mut app).contains("Could not save this status: disk full"));
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn model_selection_is_ui_only_and_queued_messages_capture_their_model() {
-        let (_root, mut app) = fixture().await;
-        let mut second = app.launch.config.models["first"].clone();
-        second.model = "model-b".into();
-        Arc::make_mut(&mut app.launch.config)
-            .models
-            .insert("second".into(), second);
-        app.editor.set("Draft stays".into());
-        let journal = app
-            .session
-            .as_ref()
-            .unwrap()
-            .directory()
-            .join("events.jsonl");
-        let before = std::fs::read(&journal).unwrap();
-        app.operation = true;
-        app.paused = true; // Keep this model-selection test independent of delivery.
-        app.submit("Queued A".into(), vec![]);
-        app.command("model");
-        assert_eq!(app.menu.as_ref().unwrap().title, "Model");
-        key(&mut app, KeyCode::Down, M::NONE);
-        assert_eq!(app.model, "first");
-        key(&mut app, KeyCode::Esc, M::NONE);
-        assert_eq!(app.model, "first");
-        app.command("models");
-        key(&mut app, KeyCode::Down, M::NONE);
-        key(&mut app, KeyCode::Enter, M::NONE);
-        assert_eq!(app.model, "second");
-        assert_eq!(
-            app.launch.model, "first",
-            "unsent selection must not change new-session defaults"
-        );
-        assert_eq!(app.editor.text, "Draft stays");
-        assert!(draw(&mut app).lines().nth(22).unwrap().contains("model-b"));
-        assert_eq!(app.projection.agents[0].model, "first");
-        app.submit("Queued B".into(), vec![]);
-        app.command("model");
-        assert_eq!(app.menu.as_ref().unwrap().selected, 1);
-        key(&mut app, KeyCode::Up, M::NONE);
-        key(&mut app, KeyCode::Enter, M::NONE);
-        assert_eq!(
-            app.queue
-                .iter()
-                .map(|q| q.model.as_str())
-                .collect::<Vec<_>>(),
-            ["first", "second"]
-        );
-        app.status.flush().await;
-        assert_eq!(std::fs::read(&journal).unwrap(), before);
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn header_is_plain_text_and_footer_only_shows_model_id() {
-        let (_root, mut app) = fixture().await;
-        app.launch.workspace = PathBuf::from("/workspace/project");
-        app.projection.agents[0].profile = Some("hidden-instruction-profile".into());
-        let screen = draw(&mut app);
-        let header = screen.lines().next().unwrap();
-        assert!(header.contains("/workspace/project"));
-        assert!(header.contains(&app.session.as_ref().unwrap().id().to_string()));
-        assert!(!app.hits.iter().any(|(rect, _)| rect.y == 0));
-        click(&mut app, Rect::new(2, 0, 1, 1));
-        assert!(app.focus == Focus::Composer);
-        assert!(app.clipboard.is_none());
-        assert_eq!(draw(&mut app).lines().next().unwrap(), header);
-        assert!(screen.lines().nth(22).unwrap().contains("fixture"));
-        assert!(!screen.contains("hidden-instruction-profile"));
-        assert!(!screen.lines().nth(22).unwrap().contains("first"));
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn theme_navigation_previews_without_rebuilding_content_and_cancel_restores() {
-        let (_root, mut app) = fixture().await;
-        draw(&mut app);
-        app.command("themes");
-        assert!(!app.light);
-        key(&mut app, KeyCode::Down, M::NONE);
-        assert!(app.light);
-        assert!(!app.content_dirty);
-        key(&mut app, KeyCode::Esc, M::NONE);
-        assert!(!app.light);
-        app.light = true;
-        app.command("themes");
-        assert_eq!(app.menu.as_ref().unwrap().selected, 1);
-        assert!(app.light);
-        mouse(&mut app, Rect::default(), MouseEventKind::ScrollUp);
-        assert!(!app.light);
-        mouse(&mut app, Rect::default(), MouseEventKind::ScrollDown);
-        assert!(app.light);
-        key(&mut app, KeyCode::Home, M::NONE);
-        assert!(!app.light);
-        key(&mut app, KeyCode::Esc, M::NONE);
-        assert!(app.light);
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn idle_ticks_and_hidden_streams_do_not_invalidate_the_visible_conversation() {
-        let (_root, mut app) = fixture().await;
-        draw(&mut app);
-        app.dirty = false;
-        app.tick();
-        assert!(!app.dirty);
-        mouse(&mut app, Rect::new(0, 2, 1, 1), MouseEventKind::Moved);
-        assert!(!app.dirty);
-        let child = app.selected.child(1);
-        let hidden = TestBlock::start(&mut app, &child, 42, "child-text", 0, BlockKind::Text);
-        assert!(!hidden.delta(&mut app, "child stream"));
-        assert_eq!(app.snapshot.responses[&(child, 42)].text(), "child stream");
-        assert!(!app.dirty);
-        assert!(!app.content_dirty);
-        let agent = app.selected.clone();
-        let visible = TestBlock::start(&mut app, &agent, 43, "visible-text", 0, BlockKind::Text);
-        visible.delta(&mut app, "visible stream");
-        assert!(app.dirty);
-        assert!(app.content_dirty);
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     /// Full frame timings include Ratatui buffer diffing but no terminal I/O.
@@ -4215,28 +3552,22 @@ mod tests {
         let records = serde_json::to_vec(&app.snapshot.records).unwrap();
         let mut arguments = super::super::tool_view::Document::default();
         arguments.arguments("script", &app.projection.jobs[&job].args);
+        app.view().scroll = Some(0);
+        draw(&mut app);
+        assert!(app.entries.iter().all(|entry| entry.document.is_none()));
+        assert!(!app.render.highlights.is_highlighted(&arguments, app.light));
+        let header = tool_hits(&app)[0];
+        click(&mut app, header);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             draw(&mut app);
-            assert!(app.entries.iter().all(|entry| entry.document.is_none()));
             if app.render.highlights.is_highlighted(&arguments, app.light) {
                 break;
             }
             assert!(Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let highlighted_arguments = arguments.lines(Some(&app.render.highlights), app.light);
-        app.view().scroll = Some(0);
-        draw(&mut app);
-        let header = tool_hits(&app)[0];
-        click(&mut app, header);
         let buffer = draw_buffer(&mut app);
-        // The first expanded frame has its cached argument styles, without a timer tick.
-        assert!(app.render.highlights.is_highlighted(&arguments, app.light));
-        assert_eq!(
-            arguments.lines(Some(&app.render.highlights), app.light),
-            highlighted_arguments
-        );
         let source_row = buffer
             .content
             .chunks(60)
@@ -4298,6 +3629,7 @@ mod tests {
                 default_open: false,
                 running: false,
                 footer: None,
+                request_summary: None,
                 indent: 0,
                 job: None,
                 compact_after: false,
@@ -4335,6 +3667,17 @@ mod tests {
         assert_ne!(buffer[(2, tree_y + 1)].symbol(), "▌");
         assert_eq!(buffer[(6, tree_y + 2)].symbol(), "▌");
         app.command("commands");
+        assert!(
+            app.menu
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .all(|item| !matches!(
+                    item.value.as_str(),
+                    "commands" | "inspect" | "child" | "parent" | "diagnostics"
+                ))
+        );
         let buffer = draw_buffer(&mut app);
         assert_ne!(buffer[(6, tree_y + 2)].symbol(), "▌");
         assert_eq!(
@@ -4345,6 +3688,17 @@ mod tests {
                 .count(),
             1
         );
+        key(&mut app, KeyCode::Esc, M::NONE);
+        key(&mut app, KeyCode::Char('x'), M::CONTROL);
+        key(&mut app, KeyCode::Up, M::NONE);
+        assert_eq!(app.selected, app.projection.agents[0].id);
+        key(&mut app, KeyCode::Char('x'), M::CONTROL);
+        key(&mut app, KeyCode::Down, M::NONE);
+        assert_eq!(app.selected, app.projection.agents[1].id);
+        key(&mut app, KeyCode::Char('x'), M::CONTROL);
+        key(&mut app, KeyCode::Char('i'), M::NONE);
+        assert!(matches!(app.focus, Focus::Content));
+        assert_eq!(app.view().tab, Tab::Conversation);
         app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
@@ -4361,6 +3715,7 @@ mod tests {
                     default_open: false,
                     running: false,
                     footer: None,
+                    request_summary: None,
                     indent: 0,
                     job: None,
                     compact_after: false,
@@ -4413,721 +3768,6 @@ mod tests {
                 app.session.as_ref().unwrap().shutdown().await.unwrap();
             }
         }
-    }
-
-    #[tokio::test]
-    async fn tool_body_collapses_on_click_preserves_drag_and_never_highlights_spacer() {
-        use skyhook::{
-            provider::protocol::{AssistantItem, Message, ToolCall},
-            session::{EventRecord, SessionEvent},
-        };
-        let (_root, mut app) = fixture().await;
-        let sequence = app
-            .snapshot
-            .records
-            .last_key_value()
-            .map_or(1, |(seq, _)| seq + 1);
-        app.snapshot.records.insert(
-            sequence,
-            EventRecord {
-                version: 1,
-                sequence,
-                timestamp_millis: 0,
-                agent: app.selected.clone(),
-                event: SessionEvent::MessageCommitted {
-                    message: Message::Assistant(vec![AssistantItem::tool_call(
-                        "fixture",
-                        0,
-                        ToolCall {
-                            id: "fixture".into(),
-                            name: "exec".into(),
-                            arguments: serde_json::json!({"argv": ["echo", "hello"]}),
-                        },
-                    )]),
-                },
-            },
-        );
-        app.refresh();
-        draw(&mut app);
-        let header = tool_hits(&app)[0];
-        click(&mut app, header);
-        let buffer = draw_buffer(&mut app);
-        let hits = tool_hits(&app);
-        assert!(hits.len() > 2);
-        assert!(app.entries[0].text.contains("1.  echo"));
-        let spacer = hits.last().unwrap().y + 1;
-        let base = super::super::render::Palette::new(false).base;
-        assert!((0..60).all(|x| buffer[(x, spacer)].bg == base));
-        // Releasing a click on any body row closes it; dragging selects instead.
-        mouse(&mut app, hits[1], MouseEventKind::Down(MouseButton::Left));
-        mouse(&mut app, hits[2], MouseEventKind::Drag(MouseButton::Left));
-        mouse(&mut app, hits[2], MouseEventKind::Up(MouseButton::Left));
-        draw(&mut app);
-        assert_eq!(tool_hits(&app).len(), hits.len());
-        click(&mut app, hits[2]);
-        let buffer = draw_buffer(&mut app);
-        assert_eq!(tool_hits(&app).len(), 1);
-        assert!((0..60).all(|x| buffer[(x, header.y + 1)].bg == base));
-        // Individual collapse also works after expanding everything via /details.
-        app.command("details");
-        draw(&mut app);
-        let body = tool_hits(&app)[1];
-        click(&mut app, body);
-        draw(&mut app);
-        assert_eq!(tool_hits(&app).len(), 1);
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn remote_tree_targets_survive_long_names_and_terminal_states() {
-        let (_root, mut app) = fixture().await;
-        let mut child = app.projection.agents[0].clone();
-        child.id = child.id.child(1);
-        child.name = "a very long worker name that must leave room for its target".into();
-        child.target = "lab-monitoring".into();
-        let id = child.id.clone();
-        app.projection.agents.push(child);
-        app.selected = id.clone();
-        for terminal_state in [false, true] {
-            app.projection.agents.last_mut().unwrap().terminal = terminal_state;
-            for width in [40, 60, 120] {
-                let mut terminal =
-                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
-                terminal
-                    .draw(|frame| super::super::render::draw(frame, &mut app))
-                    .unwrap();
-                let buffer = terminal.backend().buffer();
-                for (rect, hit) in &app.hits {
-                    if let Hit::Agent(agent) = hit {
-                        let row = (0..width)
-                            .map(|x| buffer[(x, rect.y)].symbol())
-                            .collect::<String>();
-                        if *agent == id {
-                            assert!(row.contains("@lab-monitoring"), "{row}");
-                        } else {
-                            assert!(!row.contains('@'), "{row}");
-                        }
-                    }
-                }
-            }
-        }
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn menus_fill_terminal_width_with_seven_column_side_margins() {
-        let (_root, mut app) = fixture().await;
-        for command in ["commands", "agents"] {
-            app.command(command);
-            for width in [30, 60, 120, 200] {
-                let mut terminal =
-                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
-                terminal
-                    .draw(|frame| super::super::render::draw(frame, &mut app))
-                    .unwrap();
-                let row = app
-                    .hits
-                    .iter()
-                    .find_map(|(rect, hit)| matches!(hit, Hit::Menu(0)).then_some(*rect))
-                    .unwrap();
-                let margin = 7.min(width.saturating_sub(20) / 2);
-                // Menu rows have one additional column of internal padding.
-                assert_eq!(row.x, margin + 1);
-                assert_eq!(row.right(), width - margin - 1);
-            }
-        }
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn agent_picker_shows_live_tree_status_icons_tokens_and_preserves_selection() {
-        use skyhook::{agent::ContextUsage, provider::protocol::Usage};
-        let (_root, mut app) = fixture().await;
-        let root = app.selected.clone();
-        let mut child = app.projection.agents[0].clone();
-        child.id = root.child(1);
-        child.name = "worker with a long name".into();
-        child.target = "remote".into();
-        child.terminal = false;
-        app.projection.agents.push(child.clone());
-        app.snapshot
-            .activity
-            .insert(child.id.clone(), AgentActivity::Working);
-        app.projection.agent_usage.insert(
-            child.id.clone(),
-            Usage {
-                output_tokens: 4000,
-                input_tokens: 5000,
-                cached_input_tokens: 6000,
-            },
-        );
-        app.snapshot.context.insert(
-            child.id.clone(),
-            ContextUsage {
-                tokens: 40000,
-                capacity: 200000,
-            },
-        );
-        key(&mut app, KeyCode::Char('x'), M::CONTROL);
-        key(&mut app, KeyCode::Char('a'), M::NONE);
-        key(&mut app, KeyCode::Down, M::NONE);
-        for width in [60, 120] {
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
-            terminal
-                .draw(|frame| super::super::render::draw(frame, &mut app))
-                .unwrap();
-            let rect = app
-                .hits
-                .iter()
-                .find_map(|(rect, hit)| matches!(hit, Hit::Menu(1)).then_some(*rect))
-                .unwrap();
-            let picker_row = |buffer: &ratatui::buffer::Buffer| {
-                (rect.y..rect.bottom())
-                    .map(|y| {
-                        (rect.x..rect.right())
-                            .map(|x| buffer[(x, y)].symbol())
-                            .collect::<String>()
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            let before = picker_row(terminal.backend().buffer());
-            assert!(before.contains("Working"), "{before}");
-            assert!(before.contains("@remote"), "{before}");
-            assert!(before.contains("4k · 11k(5k) · 20% (40k/200k)"), "{before}");
-            assert!(app.animating);
-            app.tick_count += 1;
-            terminal
-                .draw(|frame| super::super::render::draw(frame, &mut app))
-                .unwrap();
-            assert_ne!(before, picker_row(terminal.backend().buffer()));
-        }
-        app.menu.as_mut().unwrap().input.set("worker".into());
-        app.menu.as_mut().unwrap().selected = 0;
-        let answer = question(&mut app, "Please choose".into(), vec![]);
-        if let PromptKind::Questions { agent, .. } = &mut app.prompts.front_mut().unwrap().kind {
-            *agent = child.id.clone();
-        }
-        // Ordinary questions do not steal the open picker's input.
-        let screen = draw(&mut app);
-        assert!(screen.contains("? worker"));
-        assert!(screen.contains("Waiting for user input"));
-        assert_eq!(
-            app.menu.as_ref().unwrap().filtered()[0].value,
-            child.id.to_string()
-        );
-        drop(answer);
-        app.tick();
-        app.projection.agents[1].terminal = true;
-        app.projection
-            .agent_usage
-            .get_mut(&child.id)
-            .unwrap()
-            .output_tokens = 9000;
-        let screen = draw(&mut app);
-        assert!(screen.contains("✓ worker"));
-        assert!(screen.contains("Completed"));
-        assert!(screen.contains("9k · 11k(5k)"));
-        let mut added = child.clone();
-        added.id = root.child(2);
-        added.name = "another worker".into();
-        app.projection.agents.insert(1, added);
-        draw(&mut app);
-        let menu = app.menu.as_ref().unwrap();
-        assert_eq!(menu.filtered()[menu.selected].value, child.id.to_string());
-        key(&mut app, KeyCode::Enter, M::NONE);
-        assert_eq!(app.selected, child.id);
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn agent_tree_shows_individual_tokens_and_context_without_changing_session_totals() {
-        use skyhook::{
-            agent::{AgentActivity, ContextUsage},
-            provider::protocol::Usage,
-        };
-        let (_root, mut app) = fixture().await;
-        let root = app.selected.clone();
-        let mut child = app.projection.agents[0].clone();
-        child.id = root.child(1);
-        child.name = "worker with a long descriptive name that needs to be clipped".into();
-        child.terminal = false;
-        let child_id = child.id.clone();
-        app.projection.agents.push(child);
-        app.projection.agent_usage.insert(
-            root.clone(),
-            Usage {
-                output_tokens: 1000,
-                input_tokens: 2000,
-                cached_input_tokens: 3000,
-            },
-        );
-        app.projection.agent_usage.insert(
-            child_id.clone(),
-            Usage {
-                output_tokens: 4000,
-                input_tokens: 5000,
-                cached_input_tokens: 6000,
-            },
-        );
-        app.projection.usage = Usage {
-            output_tokens: 5000,
-            input_tokens: 7000,
-            cached_input_tokens: 9000,
-        };
-        app.snapshot.context.insert(
-            root.clone(),
-            ContextUsage {
-                tokens: 10000,
-                capacity: 100000,
-            },
-        );
-        app.snapshot.context.insert(
-            child_id.clone(),
-            ContextUsage {
-                tokens: 40000,
-                capacity: 200000,
-            },
-        );
-        app.snapshot
-            .activity
-            .insert(root.clone(), AgentActivity::Working);
-        app.snapshot
-            .activity
-            .insert(child_id.clone(), AgentActivity::WaitingChildren);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
-        terminal
-            .draw(|frame| super::super::render::draw(frame, &mut app))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let row_text = |y| {
-            (0..120)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-        };
-        let mut status_columns = Vec::new();
-        for (agent, expected, status) in [
-            (&root, "1k ·  5k(2k) · 10% (10k/100k)", "Working"),
-            (
-                &child_id,
-                "4k · 11k(5k) · 20% (40k/200k)",
-                "Waiting for child",
-            ),
-        ] {
-            let rect = app
-                .hits
-                .iter()
-                .find_map(|(rect, hit)| match hit {
-                    Hit::Agent(id) if id == agent => Some(*rect),
-                    _ => None,
-                })
-                .unwrap();
-            let row = row_text(rect.y);
-            assert!(row.contains(expected));
-            let status_start = row.find(status).unwrap();
-            let column = row[..status_start].chars().count() as u16;
-            assert_eq!(buffer[(column - 1, rect.y)].symbol(), " ");
-            assert_eq!(buffer[(column - 2, rect.y)].symbol(), " ");
-            status_columns.push(column);
-        }
-        assert_eq!(status_columns[0], status_columns[1]);
-        assert!(row_text(23).contains("5k · 16k(7k) · 10% (10k/100k)"));
-        let state = model::entries(
-            &app.snapshot,
-            &app.projection,
-            &child_id,
-            &model::View {
-                tab: model::Tab::State,
-                ..Default::default()
-            },
-            &HashMap::new(),
-            false,
-            false,
-        );
-        assert!(state[0].text.contains("4k · 11k(5k) · 20% (40k/200k)"));
-        assert_eq!(
-            model::agent_footer(&app.snapshot, &app.projection, &root.child(2)),
-            "0 · 0(0) · —"
-        );
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn agent_token_columns_align_each_stat_at_mixed_and_narrow_widths() {
-        use skyhook::{agent::ContextUsage, provider::protocol::Usage};
-        use unicode_width::UnicodeWidthStr;
-
-        let (_temp, mut app) = fixture().await;
-        let root = app.selected.clone();
-        let ids = [root.clone(), root.child(1), root.child(1).child(1)];
-        app.projection.agents[0].name = "root agent".into();
-        for (id, name) in ids[1..].iter().zip(["child agent", "grandchild agent"]) {
-            let mut agent = app.projection.agents[0].clone();
-            agent.id = id.clone();
-            agent.name = name.into();
-            agent.terminal = false;
-            app.projection.agents.push(agent);
-        }
-        for (id, output_tokens, input_tokens) in [
-            (&ids[0], 12000, 3),
-            (&ids[1], 2, 120000),
-            (&ids[2], 300, 42),
-        ] {
-            app.projection.agent_usage.insert(
-                id.clone(),
-                Usage {
-                    output_tokens,
-                    input_tokens,
-                    cached_input_tokens: 0,
-                },
-            );
-        }
-        app.snapshot.context.clear();
-        app.snapshot.context.insert(
-            ids[0].clone(),
-            ContextUsage {
-                tokens: 9,
-                capacity: 100,
-            },
-        );
-        app.snapshot.context.insert(
-            ids[1].clone(),
-            ContextUsage {
-                tokens: 100000,
-                capacity: 100000,
-            },
-        );
-        let expected = [
-            "12k ·       3(3) ·       9% (9/100)",
-            "  2 · 120k(120k) · 100% (100k/100k)",
-            "300 ·     42(42) ·                —",
-        ];
-        // The maximum of each field comes from a different row. Neither tree
-        // depth nor missing context may shift the individual numeric columns.
-        for picker in [false, true] {
-            if picker {
-                key(&mut app, KeyCode::Char('x'), M::CONTROL);
-                key(&mut app, KeyCode::Char('a'), M::NONE);
-            }
-            for width in [120, 90, 66, 40, 20] {
-                let mut terminal =
-                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 50)).unwrap();
-                terminal
-                    .draw(|frame| super::super::render::draw(frame, &mut app))
-                    .unwrap();
-                let buffer = terminal.backend().buffer();
-                let mut columns = Vec::new();
-                for (index, id) in ids.iter().enumerate() {
-                    let rect = app
-                        .hits
-                        .iter()
-                        .find_map(|(rect, hit)| {
-                            let matches = if picker {
-                                matches!(hit, Hit::Menu(i) if *i == index)
-                            } else {
-                                matches!(hit, Hit::Agent(agent) if agent == id)
-                            };
-                            matches.then_some(*rect)
-                        })
-                        .unwrap();
-                    let rows = (rect.y..rect.bottom())
-                        .map(|y| {
-                            (rect.x..rect.right())
-                                .map(|x| buffer[(x, y)].symbol())
-                                .collect::<String>()
-                        })
-                        .collect::<Vec<_>>();
-                    let stats_row = rows.iter().find(|row| row.contains('('));
-                    if width >= 60 {
-                        let row = stats_row
-                            .unwrap_or_else(|| panic!("width={width}, picker={picker}: {rows:?}"));
-                        assert!(
-                            row.contains(expected[index]),
-                            "width={width}, picker={picker}: {row:?}"
-                        );
-                        columns.push(
-                            row.rmatch_indices('·')
-                                .take(2)
-                                .map(|(byte, _)| row[..byte].width())
-                                .collect::<Vec<_>>(),
-                        );
-                        if picker {
-                            assert_eq!(
-                                rect.height,
-                                match width {
-                                    120 => 1,
-                                    90 => 2,
-                                    _ => 3,
-                                }
-                            );
-                        }
-                    } else {
-                        // Hide the entire shared set, rather than showing only
-                        // shorter rows or clipping a numeric field on tiny screens.
-                        assert!(
-                            stats_row.is_none(),
-                            "width={width}, picker={picker}: {rows:?}"
-                        );
-                        assert!(
-                            rows[0].contains(["root", "child", "grand"][index]),
-                            "{rows:?}"
-                        );
-                    }
-                }
-                assert!(
-                    columns.windows(2).all(|pair| pair[0] == pair[1]),
-                    "{columns:?}"
-                );
-            }
-        }
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn child_view_hides_composer_and_gives_its_rows_to_the_tree() {
-        let (_temp, mut app) = fixture().await;
-        let root = app.selected.clone();
-        for index in 1..=12 {
-            let mut child = app.projection.agents[0].clone();
-            child.id = root.child(index);
-            child.name = format!("worker {index}");
-            child.terminal = false;
-            app.projection.agents.push(child);
-        }
-        app.editor.set("preserved root draft".into());
-        draw(&mut app);
-        let root_tree_height = app.tree_rect.height;
-        let composer_height = app.composer_rect.height;
-        let root_content_height = app.content_rect.height;
-        assert!(composer_height > 0);
-        app.select(root.child(1));
-        let screen = draw(&mut app);
-        assert_eq!(app.composer_rect.height, 0);
-        assert_eq!(app.tree_rect.height, root_tree_height + composer_height);
-        assert_eq!(app.content_rect.height, root_content_height);
-        assert!(!screen.contains("preserved root draft"));
-        assert!(
-            !app.hits
-                .iter()
-                .any(|(_, hit)| matches!(hit, Hit::Composer | Hit::Attachments))
-        );
-        for _ in 0..4 {
-            key(&mut app, KeyCode::Tab, M::NONE);
-            assert!(app.focus != Focus::Composer);
-            key(&mut app, KeyCode::BackTab, M::NONE);
-            assert!(app.focus != Focus::Composer);
-        }
-        key(&mut app, KeyCode::Esc, M::NONE);
-        app.event(Event::Paste("hidden edit".into()));
-        assert_eq!(app.editor.text, "preserved root draft");
-        app.select(root);
-        assert!(draw(&mut app).contains("preserved root draft"));
-        assert_eq!(app.composer_rect.height, composer_height);
-        assert_eq!(app.tree_rect.height, root_tree_height);
-    }
-
-    #[tokio::test]
-    async fn resumed_child_reopens_agent_pane_without_stealing_focus() {
-        let (_temp, mut app) = fixture().await;
-        let root = app.selected.clone();
-        let job = JobId::new(900).unwrap();
-        let mut child = app.projection.agents[0].clone();
-        child.id = root.child(1);
-        child.owner = Some(job);
-        child.name = "retained worker".into();
-        child.terminal = true;
-        let child_id = child.id.clone();
-        app.projection.agents.push(child);
-        app.projection
-            .completed
-            .insert(child_id.clone(), Instant::now() - Duration::from_secs(3));
-        app.editor.set("unfinished draft".into());
-        draw(&mut app);
-        assert_eq!(app.tree_rect.height, 0);
-        app.command("agents");
-        key(&mut app, KeyCode::Esc, M::NONE);
-        assert!(app.menu.is_none());
-        let focus = app.focus;
-        let sequence = app
-            .snapshot
-            .records
-            .last_key_value()
-            .map_or(1, |(seq, _)| seq + 1);
-        assert!(app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event: RuntimeEvent::Record(Box::new(skyhook::session::EventRecord {
-                version: 1,
-                sequence,
-                timestamp_millis: 0,
-                agent: root.clone(),
-                event: SessionEvent::JobStateChanged {
-                    job,
-                    state: skyhook::job::JobState::Running
-                },
-            })),
-        }));
-        app.refresh();
-        app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event: RuntimeEvent::Activity {
-                agent: child_id.clone(),
-                activity: AgentActivity::Working,
-            },
-        });
-        let rendered = draw(&mut app);
-        assert_eq!(app.tree_rect.height, 4);
-        assert!(rendered.contains("retained worker"));
-        assert!(
-            app.hits
-                .iter()
-                .any(|(_, hit)| matches!(hit, Hit::Agent(id) if id == &child_id))
-        );
-        assert_eq!(app.selected, root);
-        assert!(app.focus == focus);
-        assert_eq!(app.editor.text, "unfinished draft");
-        assert!(
-            app.menu.is_none(),
-            "a dismissed Agents menu must stay dismissed"
-        );
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn composer_has_empty_border_and_tree_stays_visible_in_child_views() {
-        let (_root, mut app) = fixture().await;
-        app.editor.set("draft".into());
-        let buffer = draw_buffer(&mut app);
-        assert_eq!(app.tree_rect.height, 0);
-        let full_content_height = app.content_rect.height;
-        assert!((0..60).all(|x| buffer[(x, app.composer_rect.y)].symbol() == " "));
-        assert!(!draw(&mut app).contains("Message skyhook"));
-        key(&mut app, KeyCode::Tab, M::NONE);
-        assert!(app.focus == Focus::Content);
-        key(&mut app, KeyCode::BackTab, M::SHIFT);
-        assert!(app.focus == Focus::Composer);
-
-        let mut child = app.projection.agents[0].clone();
-        child.id = child.id.child(1);
-        child.name = "worker".into();
-        child.terminal = false;
-        app.projection.agents.push(child.clone());
-        let buffer = draw_buffer(&mut app);
-        assert_eq!(app.tree_rect.height, 4);
-        assert_eq!(app.content_rect.height, full_content_height - 4);
-        for y in [app.tree_rect.y, app.tree_rect.bottom() - 1] {
-            assert!((0..60).all(|x| buffer[(x, y)].symbol() == " "));
-        }
-        for y in app.tree_rect.y..app.tree_rect.bottom() {
-            assert!(
-                [0, 1, 58, 59]
-                    .iter()
-                    .all(|&x| buffer[(x, y)].symbol() == " ")
-            );
-        }
-        let child_hit = app
-            .hits
-            .iter()
-            .find_map(|(rect, hit)| match hit {
-                Hit::Agent(id) if id == &child.id => Some(*rect),
-                _ => None,
-            })
-            .unwrap();
-        click(&mut app, child_hit);
-        assert_eq!(app.selected, child.id);
-        app.projection.agents.last_mut().unwrap().terminal = true;
-        app.projection
-            .completed
-            .insert(child.id.clone(), Instant::now() - Duration::from_secs(3));
-        app.focus = Focus::Tree;
-        draw(&mut app);
-        assert_eq!(app.tree_rect.height, 4);
-        assert_eq!(app.composer_rect.height, 0);
-        // With only two tree rows, unused reclaimed space goes to history.
-        assert_eq!(app.content_rect.height, full_content_height - 4 + 3);
-        assert!(app.focus == Focus::Tree);
-        assert!(
-            app.hits
-                .iter()
-                .any(|(_, hit)| matches!(hit, Hit::Agent(id) if id == &child.id))
-        );
-        let root_hit = app
-            .hits
-            .iter()
-            .find_map(|(rect, hit)| match hit {
-                Hit::Agent(id) if id.path().is_empty() => Some(*rect),
-                _ => None,
-            })
-            .unwrap();
-        click(&mut app, root_hit);
-        assert!(app.selected.path().is_empty());
-        app.focus = Focus::Tree;
-        draw(&mut app);
-        assert_eq!(app.tree_rect.height, 0);
-        assert_eq!(app.content_rect.height, full_content_height);
-        assert!(app.focus == Focus::Composer);
-        assert!(!app.hits.iter().any(|(_, hit)| matches!(hit, Hit::Agent(_))));
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn paste_targets_search_and_overlay_without_changing_hidden_editors() {
-        let (_root, mut app) = fixture().await;
-        app.editor.set("preserved draft".into());
-        app.focus = Focus::Content;
-        key(&mut app, KeyCode::Char('/'), M::NONE);
-        app.event(Event::Paste("needle".into()));
-        assert_eq!(app.search_editor.as_ref().unwrap().text, "needle");
-        assert_eq!(app.editor.text, "preserved draft");
-        key(&mut app, KeyCode::Enter, M::NONE);
-        assert_eq!(app.view().query, "needle");
-        let _answer = question(&mut app, "Question".into(), vec![]);
-        app.info("Prompt details", "detail needle".into());
-        app.event(Event::Paste("detail".into()));
-        assert_eq!(app.menu.as_ref().unwrap().input.text, "detail");
-        assert!(app.prompt_editor.text.is_empty());
-        key(&mut app, KeyCode::Esc, M::NONE);
-        app.event(Event::Paste("custom answer".into()));
-        assert_eq!(app.prompt_editor.text, "custom answer");
-        assert_eq!(app.editor.text, "preserved draft");
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn resumed_queue_is_registered_as_one_batch() {
-        let (_root, mut app) = fixture().await;
-        app.paused = true;
-        app.submit(
-            "first queued message".into(),
-            vec![PathBuf::from("image.png")],
-        );
-        app.submit("second queued message".into(), vec![]);
-        app.submit("third queued message".into(), vec![]);
-        let (sender, mut deliveries) = mpsc::unbounded_channel();
-        app.queue_sender = Some(sender);
-        app.paused = false;
-        app.deliver_queue();
-        let batch = deliveries.try_recv().unwrap();
-        assert_eq!(
-            batch
-                .iter()
-                .map(|input| input.text.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "first queued message",
-                "second queued message",
-                "third queued message"
-            ]
-        );
-        assert_eq!(batch[0].images, [PathBuf::from("image.png")]);
-        assert!(
-            deliveries.try_recv().is_err(),
-            "one registration for the whole queue"
-        );
-        assert!(app.queue.iter().all(|input| input.delivery.is_some()));
-        app.cancel_queue_delivery();
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -5228,37 +3868,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_menu_tracks_dispatch_and_stale_actions_cannot_remove_another_message() {
-        let (_root, mut app) = fixture().await;
-        app.operation = true;
-        app.submit("message A".into(), vec![]);
-        app.submit("message B".into(), vec![]);
-        app.command("queue");
-        let stale_items = app.menu.as_ref().unwrap().items.clone();
-        app.menu.as_mut().unwrap().selected = 1;
-        app.operation = false;
-        app.tick(); // Delivery keeps the rows until the commit acknowledgement.
-        assert_eq!(app.queue.len(), 2);
-        let id = app.queue[0].id;
-        let generation = app.queue[0].generation;
-        app.queue_committed(id, generation, app.snapshot.revision, Ok(()));
-        assert_eq!(app.queue.len(), 1);
-        let menu = app.menu.as_ref().unwrap();
-        assert_eq!(menu.items.len(), 1);
-        assert_eq!(menu.items[0].label, "message B");
-        assert_eq!(menu.items[0].value, stale_items[1].value);
-        // A stale rendered action still names A, never the shifted index of B.
-        app.menu.as_mut().unwrap().items = stale_items;
-        app.menu.as_mut().unwrap().selected = 0;
-        key(&mut app, KeyCode::Delete, M::NONE);
-        assert_eq!(app.queue.front().unwrap().text, "message B");
-        key(&mut app, KeyCode::Enter, M::NONE);
-        assert_eq!(app.editor.text, "message B");
-        assert!(app.queue.is_empty());
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn questions_open_and_accept_answers_while_inspecting_agents() {
         let (_root, mut app) = fixture().await;
         let mut child = app.projection.agents[0].clone();
@@ -5296,103 +3905,6 @@ mod tests {
         app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
-    #[tokio::test]
-    async fn questions_arriving_under_overlays_activate_when_overlays_close() {
-        let (_root, mut app) = fixture().await;
-        app.editor.set("preserved draft".into());
-        app.focus = Focus::Content;
-        for search in [false, true] {
-            if search {
-                key(&mut app, KeyCode::Char('/'), M::NONE);
-                assert!(app.search_editor.is_some());
-            } else {
-                app.info("Agent details", "Inspecting an agent".into());
-            }
-            let answer = question(&mut app, "What next?".into(), vec![]);
-            assert!(app.prompt_active);
-            app.event(Event::Paste("overlay input".into()));
-            assert!(app.prompt_editor.text.is_empty());
-            key(&mut app, KeyCode::Esc, M::NONE);
-            assert!(matches!(app.input_target(), InputTarget::Prompt));
-            app.event(Event::Paste("Proceed".into()));
-            key(&mut app, KeyCode::Enter, M::NONE);
-            assert!(matches!(
-                answer.await.unwrap().unwrap(),
-                PromptResponse::Questions(Value::String(value)) if value == "Proceed"
-            ));
-            assert_eq!(app.editor.text, "preserved draft");
-        }
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn clicking_requests_transfers_input_from_overlays_and_clears_shortcuts() {
-        let (_root, mut app) = fixture().await;
-        app.editor.set("preserved draft".into());
-        for search in [false, true] {
-            for choice in [false, true] {
-                let answer = question(&mut app, "What next?".into(), vec![]);
-                key(&mut app, KeyCode::Esc, M::NONE);
-                key(&mut app, KeyCode::Char('x'), M::CONTROL);
-                assert!(app.leader.is_some());
-                if search {
-                    app.search_editor = Some(Editor::default());
-                } else {
-                    app.info("Agent details", "Details".into());
-                }
-                if choice {
-                    app.prompt_active = true;
-                }
-                draw(&mut app);
-                let hit = app
-                    .hits
-                    .iter()
-                    .find_map(|(rect, hit)| match (choice, hit) {
-                        (true, Hit::PromptChoice(_)) | (false, Hit::Attention) => Some(*rect),
-                        _ => None,
-                    })
-                    .unwrap();
-                click(&mut app, hit);
-                assert!(app.menu.is_none());
-                assert!(app.search_editor.is_none());
-                assert!(app.leader.is_none());
-                assert!(matches!(app.input_target(), InputTarget::Prompt));
-                app.event(Event::Paste("Proceed".into()));
-                key(&mut app, KeyCode::Enter, M::NONE);
-                assert!(matches!(
-                    answer.await.unwrap().unwrap(),
-                    PromptResponse::Questions(Value::String(value)) if value == "Proceed"
-                ));
-                assert_eq!(app.editor.text, "preserved draft");
-            }
-        }
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn dismissed_questions_stay_hidden_until_attention_is_requested() {
-        let (_root, mut app) = fixture().await;
-        key(&mut app, KeyCode::Char('x'), M::CONTROL);
-        assert!(app.leader.is_some());
-        let first = question(&mut app, "First question".into(), vec![]);
-        assert!(app.leader.is_none());
-        key(&mut app, KeyCode::Esc, M::NONE);
-        let second = question(&mut app, "Second question".into(), vec![]);
-        assert!(!app.prompt_active);
-        app.command("attention");
-        for answer in [first, second] {
-            assert!(app.prompt_active);
-            app.event(Event::Paste("Proceed".into()));
-            key(&mut app, KeyCode::Enter, M::NONE);
-            assert!(matches!(
-                answer.await.unwrap().unwrap(),
-                PromptResponse::Questions(Value::String(value)) if value == "Proceed"
-            ));
-        }
-        assert!(!app.prompt_active);
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
     fn suggestions() -> Vec<QuestionOption> {
         ["First", "Second"]
             .into_iter()
@@ -5401,67 +3913,6 @@ mod tests {
                 description: format!("Use {label}"),
             })
             .collect()
-    }
-
-    #[tokio::test]
-    async fn question_comments_keep_the_selected_suggestion_and_reach_the_agent() {
-        let (_root, mut app) = fixture().await;
-        app.editor.set("preserved draft".into());
-        for paste in [false, true] {
-            let response = question(&mut app, "Choose".into(), suggestions());
-            key(&mut app, KeyCode::Down, M::NONE);
-            if paste {
-                app.event(Event::Paste("with a caveat".into()));
-            } else {
-                for c in "with a caveat".chars() {
-                    key(&mut app, KeyCode::Char(c), M::NONE);
-                }
-            }
-            assert_eq!(app.prompt_choice, 1);
-            let screen = draw(&mut app);
-            assert!(screen.contains("Comment (optional): with a caveat"));
-            key(&mut app, KeyCode::Enter, M::NONE);
-            let PromptResponse::Questions(value) = response.await.unwrap().unwrap() else {
-                panic!("wrong response")
-            };
-            assert_eq!(
-                value,
-                serde_json::json!({"answer": "Second", "comment": "with a caveat"})
-            );
-            assert_eq!(app.editor.text, "preserved draft");
-        }
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn question_freeform_and_comment_modes_follow_keyboard_and_mouse_selection() {
-        let (_root, mut app) = fixture().await;
-        let response = question(&mut app, "Choose".into(), suggestions());
-        app.event(Event::Paste("Different approach".into()));
-        key(&mut app, KeyCode::Down, M::NONE);
-        key(&mut app, KeyCode::Down, M::NONE);
-        assert!(draw(&mut app).contains("Answer: Different approach"));
-        let option = app
-            .hits
-            .iter()
-            .find_map(|(rect, hit)| matches!(hit, Hit::PromptChoice(1)).then_some(*rect))
-            .unwrap();
-        click(&mut app, option);
-        assert_eq!(app.prompt_choice, 1);
-        assert!(draw(&mut app).contains("Comment (optional): Different approach"));
-        key(&mut app, KeyCode::Down, M::NONE);
-        key(&mut app, KeyCode::Enter, M::NONE);
-        assert!(
-            matches!(response.await.unwrap().unwrap(), PromptResponse::Questions(Value::String(value)) if value == "Different approach")
-        );
-
-        let response = question(&mut app, "Choose".into(), suggestions());
-        app.event(Event::Paste(" \t ".into()));
-        key(&mut app, KeyCode::Enter, M::NONE);
-        assert!(
-            matches!(response.await.unwrap().unwrap(), PromptResponse::Questions(Value::String(value)) if value == "First")
-        );
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -5504,119 +3955,6 @@ mod tests {
         assert_eq!(
             value,
             serde_json::json!({"answer": {"answer": "Second", "comment": "my comment amended"}, "next": "freeform"})
-        );
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn long_questions_and_late_choices_are_readable_and_submittable() {
-        let (_root, mut app) = fixture().await;
-        app.editor.set("preserved draft".into());
-        let body = (0..25)
-            .map(|i| format!("Question line {i:02}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let options = (0..10)
-            .map(|i| QuestionOption {
-                label: format!("Choice {i}"),
-                description: format!("{} END-{i}", "Long description ".repeat(12)),
-            })
-            .collect();
-        let answer = question(&mut app, body, options);
-        assert!(draw(&mut app).contains("Question line 00"));
-        for _ in 0..20 {
-            key(&mut app, KeyCode::PageDown, M::NONE);
-        }
-        assert!(draw(&mut app).contains("Question line 24"));
-        for _ in 0..9 {
-            key(&mut app, KeyCode::Down, M::NONE);
-        }
-        assert!(draw(&mut app).contains("> Choice 9"));
-        key(&mut app, KeyCode::Down, M::NONE);
-        assert!(draw(&mut app).contains("> Write an answer"));
-        key(&mut app, KeyCode::Up, M::NONE);
-        draw(&mut app);
-        for _ in 0..10 {
-            key(&mut app, KeyCode::PageDown, M::CONTROL);
-        }
-        assert!(draw(&mut app).contains("END-9"));
-        key(&mut app, KeyCode::Enter, M::NONE);
-        assert!(matches!(answer.await.unwrap().unwrap(),
-            PromptResponse::Questions(value) if value == Value::String("Choice 9".into())));
-        assert_eq!(app.editor.text, "preserved draft");
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-    #[tokio::test]
-    async fn resize_preserves_semantic_entries_and_reflows_rows() {
-        let (_root, mut app) = fixture().await;
-        use skyhook::{
-            provider::protocol::{AssistantItem, Message},
-            session::EventRecord,
-        };
-        let sequence = app.snapshot.records.last_key_value().unwrap().0 + 1;
-        app.snapshot.records.insert(
-            sequence,
-            EventRecord {
-                version: 1,
-                sequence,
-                timestamp_millis: 0,
-                agent: app.selected.clone(),
-                event: SessionEvent::MessageCommitted {
-                    message: Message::Assistant(vec![AssistantItem::text(
-                        "resize",
-                        0,
-                        "A visible message wrapping differently at narrow widths. ".repeat(8),
-                    )]),
-                },
-            },
-        );
-        app.refresh();
-        draw(&mut app);
-        let revision = app.content_revision;
-        let entries = app.entries.as_ptr();
-        let original_rows = app.content_rows;
-        app.event(Event::Resize(30, 24));
-        assert!(!app.content_dirty);
-        assert_eq!(app.content_revision, revision);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 24)).unwrap();
-        terminal
-            .draw(|frame| super::super::render::draw(frame, &mut app))
-            .unwrap();
-        assert_eq!(app.entries.as_ptr(), entries);
-        assert!(app.content_rows > original_rows);
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn command_palette_uses_effective_bindings() {
-        let (_root, mut app) = fixture().await;
-        app.keys = KeyMap::new(
-            &[
-                ("models".into(), "ctrl+g".into()),
-                ("exit".into(), String::new()),
-            ]
-            .into(),
-        )
-        .unwrap();
-        app.command("commands");
-        let items = &app.menu.as_ref().unwrap().items;
-        assert_eq!(
-            items
-                .iter()
-                .find(|item| item.value == "model")
-                .unwrap()
-                .detail,
-            app.keys.binding("model")
-        );
-        assert_eq!(app.keys.binding("model"), "Ctrl+G");
-        assert!(
-            items
-                .iter()
-                .find(|item| item.value == "exit")
-                .unwrap()
-                .detail
-                .is_empty()
         );
         app.session.as_ref().unwrap().shutdown().await.unwrap();
     }

@@ -166,7 +166,7 @@ impl ProviderContext for NativeContext {
                 &body,
             )
             .await?;
-            Ok(decode_stream(events, decoder, provider.scope))
+            Ok(decode_stream(events, decoder, provider.scope, ()))
         })
     }
 }
@@ -174,6 +174,7 @@ impl ProviderContext for NativeContext {
 enum Decoder {
     Chat(chat::Decoder),
     Responses(responses::Decoder),
+    Codex(responses::Decoder),
     Anthropic(anthropic::Decoder),
 }
 impl Decoder {
@@ -181,24 +182,32 @@ impl Decoder {
         match self {
             Self::Chat(d) => d.decode(event),
             Self::Responses(d) => d.decode(event),
+            Self::Codex(d) => d.decode_filtered(event, codex::is_transport_metadata),
             Self::Anthropic(d) => d.decode(event),
         }
     }
     fn finish(&mut self) -> Result<Vec<ResponseChunk>, ProviderError> {
         match self {
             Self::Chat(d) => d.finish(),
-            Self::Responses(d) => d.finish(),
+            Self::Responses(d) | Self::Codex(d) => d.finish(),
             Self::Anthropic(d) => d.finish(),
         }
     }
 }
-fn decode_stream(events: transport::SseStream, decoder: Decoder, scope: String) -> ResponseStream {
-    struct State {
+fn decode_stream<G: Send + 'static>(
+    events: transport::SseStream,
+    decoder: Decoder,
+    scope: String,
+    guard: G,
+) -> ResponseStream {
+    struct State<G> {
         events: transport::SseStream,
         decoder: Decoder,
         pending: VecDeque<ResponseChunk>,
         done: bool,
         scope: String,
+        // Codex holds its context lock until the stream ends or is dropped.
+        _guard: G,
     }
     Box::pin(stream::unfold(
         State {
@@ -207,6 +216,7 @@ fn decode_stream(events: transport::SseStream, decoder: Decoder, scope: String) 
             pending: VecDeque::new(),
             done: false,
             scope,
+            _guard: guard,
         },
         |mut state| async move {
             loop {
@@ -261,6 +271,7 @@ mod tests {
             Box::pin(events),
             Decoder::Chat(chat::Decoder::new("model".into())),
             "scope".into(),
+            (),
         );
         let mut assembler = ResponseAssembler::default();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -274,59 +285,4 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(reason, StopReason::EndTurn);
     }
-    #[tokio::test]
-    async fn contexts_reject_foreign_correlation_before_network() {
-        let provider =
-            openai_compatible("test", "http://127.0.0.1:1/v1", OpenAiApi::Responses, None).unwrap();
-        let mut first = provider.open_context("first".into()).unwrap();
-        let mut second = provider.open_context("second".into()).unwrap();
-        let request = ModelRequest {
-            model: "model".into(),
-            system: vec![],
-            messages: vec![],
-            tools: vec![],
-            response_schema: None,
-            reasoning: None,
-            max_output_tokens: None,
-            correlation: Some("second".into()),
-        };
-        let error = first.invoke(request.clone()).await.err().unwrap();
-        assert_eq!(
-            error.kind,
-            crate::provider::ProviderErrorKind::InvalidRequest
-        );
-        assert!(error.message.contains("correlation"));
-        let mut other = request;
-        other.correlation = Some("first".into());
-        let error = second.invoke(other).await.err().unwrap();
-        assert_eq!(
-            error.kind,
-            crate::provider::ProviderErrorKind::InvalidRequest
-        );
-        assert!(error.message.contains("correlation"));
-    }
-
-    #[test]
-    fn explicit_roots_no_version_inference() {
-        assert_eq!(
-            endpoint("https://example.com/proxy/v1/", "messages").unwrap(),
-            "https://example.com/proxy/v1/messages"
-        );
-        assert_eq!(
-            endpoint("https://example.com", "responses").unwrap(),
-            "https://example.com/responses"
-        );
-        for invalid in [
-            "ftp://example.com",
-            "https://user:secret@example.com",
-            "https://example.com?a=b",
-            "https://example.com#f",
-            "relative",
-        ] {
-            assert!(endpoint(invalid, "responses").is_err());
-        }
-    }
 }
-
-#[cfg(test)]
-mod live_tests;

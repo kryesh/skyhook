@@ -35,49 +35,6 @@ fn executor(
     (executor, slot)
 }
 
-#[tokio::test]
-async fn output_wait_is_rejected_by_direct_and_script_calls() {
-    let runtime = TestRuntime::new().await;
-    let (executor, _slot) = executor(
-        runtime.store.clone(),
-        runtime.jobs.clone(),
-        runtime.root.path(),
-    );
-    for wait in [json!(null), json!(0), json!(0.5), json!(5)] {
-        let direct = executor
-            .execute_model(
-                runtime.agent.clone(),
-                "job_output",
-                json!({"job":1,"wait":wait}),
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                direct,
-                crate::tool::executor::ExecutionError::Tool(
-                    crate::tool::ToolError::InvalidArguments(_)
-                )
-            ),
-            "{direct:?}"
-        );
-        let script = executor
-            .execute_model(
-                runtime.agent.clone(),
-                "script",
-                json!({"source":format!("return tool.job(1).output({{wait:{wait}}});")}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(script.output.value["state"], "failed");
-        let error = script.output.value["error"].as_str().unwrap();
-        assert!(error.contains("wait"), "{error}");
-        assert!(!error.contains("unknown job"), "{error}");
-    }
-}
-
 async fn assert_hydrated(store: &SessionStore, images: Vec<ImageReference>) {
     assert_eq!(images.len(), 1);
     assert!(
@@ -199,7 +156,6 @@ async fn background_image_output_attaches_directly_and_through_javascript() {
         .unwrap();
     assert_eq!(output.output.value["state"], "completed");
     assert_hydrated(&runtime.store, output.output.images).await;
-    runtime.store.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -283,7 +239,6 @@ async fn image_output_text_selections_do_not_attach_and_invalid_queries_fail() {
             .await
             .is_err()
     );
-    runtime.store.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -313,7 +268,8 @@ async fn retrieved_images_survive_resume_including_failed_tool_output() {
         .await
         .unwrap();
     let id = runtime.store.id();
-    runtime.store.close().await.unwrap();
+    drop(runtime.jobs);
+    drop(runtime.store);
     let (store, records) = SessionStore::open(&runtime.root.path().join("sessions"), id)
         .await
         .unwrap();
@@ -332,5 +288,4 @@ async fn retrieved_images_survive_resume_including_failed_tool_output() {
         .await
         .unwrap();
     assert_hydrated(&store, output.output.images).await;
-    store.close().await.unwrap();
 }

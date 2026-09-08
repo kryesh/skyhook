@@ -135,15 +135,6 @@ impl RowBlocks {
     pub(super) fn finish_update(&mut self, index: usize) {
         self.heights.set(index, self.blocks[index].len());
     }
-    /// Retain each actual line allocation, not merely the outer block vector.
-    #[cfg(test)]
-    pub fn line_identities(&self) -> Vec<std::sync::Arc<ratatui::text::Line<'static>>> {
-        self.blocks
-            .iter()
-            .flatten()
-            .map(|row| row.line.clone())
-            .collect()
-    }
 }
 impl Index<usize> for RowBlocks {
     type Output = Row;

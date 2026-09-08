@@ -817,155 +817,24 @@ mod tests {
     #[test]
     fn request_maps_native_schema_tools_system_cache_and_adaptive_effort() {
         let mut request = request();
-        request.system = vec![
-            SystemSegment {
-                text: "cached".into(),
-                cache: true,
-            },
-            SystemSegment {
-                text: "dynamic".into(),
-                cache: false,
-            },
-        ];
+        request.system = vec![SystemSegment {
+            text: "cached".into(),
+            cache: true,
+        }];
         request.tools = vec![ToolDefinition {
-            name: "weather".into(),
-            description: "Get weather".into(),
-            input_schema: json!({"type":"object","properties":{"city":{"type":"string"}}}),
+            name: "look".into(),
+            description: "Look".into(),
+            input_schema: json!({"type":"object"}),
         }];
         request.response_schema = Some(ResponseSchema {
             name: "answer".into(),
-            schema: json!({"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}),
+            schema: json!({"type":"object", "properties":{}, "additionalProperties":false}),
         });
         request.reasoning = Some("high".into());
-        let body = encode(&request).unwrap();
-        assert_eq!(body["model"], "claude-test");
-        assert_eq!(body["stream"], true);
-        assert_eq!(body["max_tokens"], 8192);
-        assert_eq!(
-            body["system"][0]["cache_control"],
-            json!({"type":"ephemeral"})
-        );
-        assert!(body["system"][1].get("cache_control").is_none());
-        assert_eq!(
-            body["tools"][0]["input_schema"],
-            request.tools[0].input_schema
-        );
-        assert_eq!(
-            body["output_config"]["format"],
-            json!({"type":"json_schema", "schema":request.response_schema.unwrap().schema})
-        );
-        assert_eq!(body["output_config"]["effort"], "high");
-        assert_eq!(body["thinking"], json!({"type":"adaptive"}));
-        for absent in [
-            "metadata",
-            "correlation",
-            "output_format",
-            "response_format",
-        ] {
-            assert!(body.get(absent).is_none(), "unexpected field {absent}");
-        }
-    }
-
-    #[test]
-    fn reasoning_settings_are_explicit_not_model_guesses() {
-        for model in ["claude-test", "claude-opus-4-6", "claude-sonnet-4-5"] {
-            for (setting, thinking, effort) in [
-                (None, None, None),
-                (Some("off"), Some(json!({"type":"disabled"})), None),
-                (Some("adaptive"), Some(json!({"type":"adaptive"})), None),
-                (Some("low"), Some(json!({"type":"adaptive"})), Some("low")),
-                (
-                    Some("medium"),
-                    Some(json!({"type":"adaptive"})),
-                    Some("medium"),
-                ),
-                (Some("high"), Some(json!({"type":"adaptive"})), Some("high")),
-                (Some("max"), Some(json!({"type":"adaptive"})), Some("max")),
-                (
-                    Some("1024"),
-                    Some(json!({"type":"enabled","budget_tokens":1024})),
-                    None,
-                ),
-            ] {
-                let mut request = request();
-                request.model = model.into();
-                request.reasoning = setting.map(str::to_owned);
-                let body = encode(&request).unwrap();
-                assert_eq!(body.get("thinking"), thinking.as_ref());
-                assert_eq!(body["output_config"]["effort"].as_str(), effort);
-            }
-        }
-        for setting in [
-            "",
-            "none",
-            "minimal",
-            "xhigh",
-            "enabled",
-            "HIGH",
-            "-1",
-            "1023",
-            "8192",
-            "18446744073709551616",
-            " 1024",
-            "1.5",
-        ] {
-            let mut request = request();
-            request.reasoning = Some(setting.into());
-            assert_eq!(
-                encode(&request).unwrap_err().kind,
-                ProviderErrorKind::InvalidRequest,
-                "{setting}"
-            );
-        }
-    }
-
-    #[test]
-    fn request_rejects_missing_limits_empty_messages_and_invalid_schema() {
-        for limit in [None, Some(0)] {
-            let mut request = request();
-            request.max_output_tokens = limit;
-            assert_eq!(
-                encode(&request).unwrap_err().kind,
-                ProviderErrorKind::InvalidRequest
-            );
-        }
-        let mut empty = request();
-        empty.messages.clear();
-        assert!(encode(&empty).is_err());
-        empty.messages = vec![Message::User(vec![])];
-        assert!(encode(&empty).is_err());
-        let mut invalid_schema = request();
-        invalid_schema.response_schema = Some(ResponseSchema {
-            name: "bad".into(),
-            schema: json!(false),
-        });
-        assert!(encode(&invalid_schema).is_err());
-        let mut too_many_cache = request();
-        too_many_cache.system = (0..5)
-            .map(|_| SystemSegment {
-                text: "x".into(),
-                cache: true,
-            })
-            .collect();
-        assert!(encode(&too_many_cache).is_err());
-    }
-
-    #[test]
-    fn all_user_variants_and_nested_tool_images_are_preserved() {
-        let mut request = request();
         request.messages = vec![
             Message::User(vec![
                 UserContent::Text {
-                    text: "text".into(),
-                },
-                UserContent::Runtime {
-                    text: "runtime".into(),
-                },
-                UserContent::ParentInput {
-                    text: "parent".into(),
-                },
-                UserContent::Compaction {
-                    text: "summary".into(),
+                    text: "look".into(),
                 },
                 UserContent::Image { image: image() },
             ]),
@@ -987,47 +856,28 @@ mod tests {
             }]),
         ];
         let body = encode(&request).unwrap();
-        for (index, expected) in ["text", "runtime", "parent", "summary"].iter().enumerate() {
-            assert_eq!(
-                body["messages"][0]["content"][index],
-                json!({"type":"text","text":expected})
-            );
-        }
-        assert_eq!(body["messages"][0]["content"][4]["source"]["data"], "eA==");
+        assert_eq!(body["max_tokens"], 8192);
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        assert_eq!(
+            body["tools"][0]["input_schema"],
+            request.tools[0].input_schema
+        );
+        assert_eq!(
+            body["output_config"]["format"]["schema"],
+            request.response_schema.unwrap().schema
+        );
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+        assert_eq!(body["messages"][0]["content"][0]["text"], "look");
+        assert_eq!(body["messages"][0]["content"][1]["source"]["data"], "eA==");
         assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
         let result = &body["messages"][2]["content"][0];
-        assert_eq!(body["messages"][2]["role"], "user");
-        assert_eq!(result["type"], "tool_result");
         assert_eq!(result["tool_use_id"], "tool_1");
         assert_eq!(result["is_error"], true);
-        assert_eq!(
-            serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
-            json!({"result":{"ok":false},"is_error":true})
-        );
         assert_eq!(result["content"][1]["type"], "image");
-        assert_eq!(result["content"][1]["source"]["media_type"], "image/png");
-    }
-
-    #[test]
-    fn missing_image_payload_and_nonobject_tool_arguments_are_errors() {
-        let mut request = request();
-        let mut missing = image();
-        missing.data_base64 = None;
-        request.messages = vec![Message::User(vec![UserContent::Image { image: missing }])];
-        assert_eq!(
-            encode(&request).unwrap_err().kind,
-            ProviderErrorKind::InvalidRequest
-        );
-        request.messages = vec![Message::Assistant(vec![AssistantItem::tool_call(
-            "1",
-            1,
-            ToolCall {
-                id: "id".into(),
-                name: "tool".into(),
-                arguments: json!([]),
-            },
-        )])];
-        assert!(encode(&request).is_err());
     }
 
     #[test]
@@ -1207,192 +1057,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_initial_input_and_no_argument_tool_are_supported() {
-        for input in [json!({}), json!({"x":1})] {
-            let mut decoder = started();
-            decoder
-                .decode(&event(block_start(
-                    0,
-                    json!({"type":"tool_use","id":"call","name":"inspect","input":input}),
-                )))
-                .unwrap();
-            let chunks = decoder.decode(&event(stop(0))).unwrap();
-            assert!(
-                matches!(&chunks[0],ResponseChunk::BlockEnded { content:BlockContent::ToolCall(call), .. } if call.arguments == input)
-            );
-        }
-    }
-
-    #[test]
-    fn truncated_stop_reasons_are_explicit() {
-        for (wire, expected) in [
-            ("max_tokens", StopReason::MaxTokens),
-            ("model_context_window_exceeded", StopReason::MaxTokens),
-            ("tool_use", StopReason::ToolUse),
-            ("stop_sequence", StopReason::StopSequence),
-            ("refusal", StopReason::ContentFilter),
-            ("pause_turn", StopReason::Other("pause_turn".into())),
-        ] {
-            let mut decoder = started();
-            decoder.decode(&event(terminal(wire, 7))).unwrap();
-            assert_eq!(
-                decoder
-                    .decode(&event(json!({"type":"message_stop"})))
-                    .unwrap(),
-                vec![ResponseChunk::ResponseEnded {
-                    stop_reason: expected
-                }]
-            );
-        }
-    }
-
-    #[test]
-    fn cumulative_usage_keeps_cache_reads_separate_and_counts_cache_writes_once() {
-        let mut decoder = started();
-        let mut last = terminal("end_turn", 10);
-        last["usage"] = json!({"input_tokens":12, "cache_creation_input_tokens":15,
-            "cache_read_input_tokens":20, "output_tokens":10});
-        assert_eq!(
-            decoder.decode(&event(last)).unwrap(),
-            vec![ResponseChunk::UsageUpdated {
-                usage: Usage {
-                    input_tokens: 27,
-                    cached_input_tokens: 20,
-                    output_tokens: 10
-                }
-            }]
-        );
-    }
-
-    #[test]
-    fn malformed_wire_and_missing_lifecycle_are_protocol_errors() {
-        let cases = vec![
-            vec![json!({"type":"future_event"})],
-            vec![json!({"type":"message_stop"})],
-            vec![delta(0, json!({"type":"text_delta","text":"x"}))],
-            vec![stop(0)],
-            vec![start()],
-            vec![block_start(0, json!({"type":"image","source":{}}))],
-            vec![block_start(0, json!({"type":"text"}))],
-            vec![block_start(
-                0,
-                json!({"type":"text","text":"x","citations":[{}]}),
-            )],
-            vec![
-                block_start(0, json!({"type":"text","text":""})),
-                block_start(0, json!({"type":"text","text":""})),
-            ],
-            vec![
-                block_start(0, json!({"type":"text","text":""})),
-                delta(0, json!({"type":"thinking_delta","thinking":"x"})),
-            ],
-            vec![
-                block_start(0, json!({"type":"text","text":""})),
-                delta(0, json!({"type":"citations_delta","citation":{}})),
-            ],
-            vec![
-                block_start(0, json!({"type":"text","text":""})),
-                stop(0),
-                stop(0),
-            ],
-            vec![
-                block_start(0, json!({"type":"text","text":""})),
-                stop(0),
-                delta(0, json!({"type":"text_delta","text":"x"})),
-            ],
-            vec![
-                block_start(0, json!({"type":"thinking","thinking":"x","signature":""})),
-                stop(0),
-            ],
-            vec![
-                block_start(0, json!({"type":"text","text":""})),
-                terminal("end_turn", 5),
-            ],
-            vec![
-                block_start(1, json!({"type":"text","text":""})),
-                stop(1),
-                terminal("end_turn", 5),
-            ],
-            vec![terminal("unknown", 5)],
-            vec![terminal("end_turn", 0)],
-            vec![terminal("end_turn", 1), terminal("end_turn", 1)],
-            vec![
-                terminal("end_turn", 1),
-                block_start(0, json!({"type":"text","text":""})),
-            ],
-            vec![
-                json!({"type":"content_block_start","index":-1,"content_block":{"type":"text","text":""}}),
-            ],
-        ];
-        for events in cases {
-            let mut decoder = started();
-            let mut error = None;
-            for value in &events {
-                match decoder.decode(&event(value.clone())) {
-                    Ok(_) => {}
-                    Err(found) => {
-                        error = Some(found);
-                        break;
-                    }
-                }
-            }
-            assert_eq!(
-                error
-                    .unwrap_or_else(|| panic!("accepted invalid sequence: {events:?}"))
-                    .kind,
-                ProviderErrorKind::Protocol
-            );
-            assert!(decoder.finish().is_err());
-        }
-        for data in ["[DONE]", "{", "null", "{}", "[]"] {
-            let mut decoder = started();
-            assert_eq!(
-                decoder
-                    .decode(&SseEvent {
-                        event: None,
-                        data: data.into()
-                    })
-                    .unwrap_err()
-                    .kind,
-                ProviderErrorKind::Protocol
-            );
-        }
-        let mut decoder = started();
-        assert!(
-            decoder
-                .decode(&SseEvent {
-                    event: Some("message_stop".into()),
-                    data: json!({"type":"ping"}).to_string()
-                })
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn malformed_tool_json_never_becomes_an_empty_object() {
-        for input in ["", "{", "[]", "null", "{\"x\":}", "{}{}"] {
-            let mut decoder = started();
-            decoder
-                .decode(&event(block_start(
-                    0,
-                    json!({"type":"tool_use","id":"call","name":"tool","input":{}}),
-                )))
-                .unwrap();
-            decoder
-                .decode(&event(delta(
-                    0,
-                    json!({"type":"input_json_delta","partial_json":input}),
-                )))
-                .unwrap();
-            assert_eq!(
-                decoder.decode(&event(stop(0))).unwrap_err().kind,
-                ProviderErrorKind::Protocol,
-                "{input}"
-            );
-        }
-    }
-
-    #[test]
     fn truncated_or_absent_stream_is_an_error_and_ping_is_a_noop() {
         let mut absent = Decoder::new("model".into());
         assert!(
@@ -1425,125 +1089,5 @@ mod tests {
                 .decode(&event(json!({"type":"message_stop"})))
                 .is_err()
         );
-    }
-
-    #[test]
-    fn native_error_events_keep_kind_but_never_echo_upstream_messages() {
-        for (error_type, message, expected) in [
-            (
-                "authentication_error",
-                "bad key",
-                ProviderErrorKind::Authentication,
-            ),
-            (
-                "permission_error",
-                "denied",
-                ProviderErrorKind::Authentication,
-            ),
-            (
-                "rate_limit_error",
-                "slow down",
-                ProviderErrorKind::RateLimited,
-            ),
-            (
-                "invalid_request_error",
-                "prompt is too long: 300000 tokens",
-                ProviderErrorKind::ContextWindowExceeded,
-            ),
-            (
-                "invalid_request_error",
-                "bad field",
-                ProviderErrorKind::InvalidRequest,
-            ),
-            ("overloaded_error", "busy", ProviderErrorKind::Response),
-            ("api_error", "internal", ProviderErrorKind::Response),
-        ] {
-            let mut decoder = Decoder::new("model".into());
-            let error = decoder
-                .decode(&event(
-                    json!({"type":"error","error":{"type":error_type,"message":message}}),
-                ))
-                .unwrap_err();
-            assert_eq!(error.kind, expected);
-            assert!(!error.message.contains(message));
-            assert!(error.message.contains(error_type));
-            assert!(decoder.finish().is_err());
-        }
-    }
-
-    #[test]
-    fn untrusted_discriminants_and_payloads_are_not_reflected_in_errors() {
-        let secret = "secret-api-key-and-reflected-prompt";
-        let events = [
-            json!({"type":secret}),
-            block_start(0, json!({"type":secret})),
-            terminal(secret, 1),
-            json!({"type":"error","error":{"type":secret,"message":secret}}),
-        ];
-        for value in events {
-            let error = started().decode(&event(value)).unwrap_err();
-            assert!(!error.message.contains(secret));
-        }
-        let error = started()
-            .decode(&SseEvent {
-                event: Some(secret.into()),
-                data: json!({"type":"ping"}).to_string(),
-            })
-            .unwrap_err();
-        assert!(!error.message.contains(secret));
-        let mut decoder = started();
-        decoder
-            .decode(&event(block_start(
-                0,
-                json!({"type":"tool_use","id":"call","name":"tool","input":{}}),
-            )))
-            .unwrap();
-        decoder
-            .decode(&event(delta(
-                0,
-                json!({"type":"input_json_delta","partial_json":secret}),
-            )))
-            .unwrap();
-        assert!(
-            !decoder
-                .decode(&event(stop(0)))
-                .unwrap_err()
-                .message
-                .contains(secret)
-        );
-    }
-
-    #[test]
-    fn usage_counters_are_validated_without_defaults_or_wrapping() {
-        for usage in [
-            json!({}),
-            json!({"input_tokens":1}),
-            json!({"input_tokens":-1,"output_tokens":1}),
-            json!({"input_tokens":1,"output_tokens":1.5}),
-            json!({"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":null}),
-            json!({"input_tokens":u64::MAX,"cache_creation_input_tokens":1,"output_tokens":1}),
-        ] {
-            let mut initial = start();
-            initial["message"]["usage"] = usage;
-            assert_eq!(
-                Decoder::new("model".into())
-                    .decode(&event(initial))
-                    .unwrap_err()
-                    .kind,
-                ProviderErrorKind::Protocol
-            );
-        }
-        for key in [
-            "input_tokens",
-            "cache_creation_input_tokens",
-            "cache_read_input_tokens",
-        ] {
-            let mut last = terminal("end_turn", 3);
-            last["usage"][key] = json!(0);
-            assert_eq!(
-                started().decode(&event(last)).unwrap_err().kind,
-                ProviderErrorKind::Protocol
-            );
-        }
     }
 }

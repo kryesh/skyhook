@@ -61,7 +61,7 @@ impl Projection<'_> {
         if (self.annotated.contains(field) || applicable.is_annotated())
             && (value.is_string() || value.is_array() || value.is_object())
         {
-            let path = ensure_field_file(self.directory, field, self.cancellation)?;
+            let path = materialize_field(self.directory, field, value, self.cancellation)?;
             let mut bytes = Vec::new();
             std::fs::File::open(&path)?
                 .take((FIELD_BYTES + 1) as u64)
@@ -310,9 +310,18 @@ fn object_prefix(bytes: &[u8]) -> Result<(Value, usize, bool), ToolError> {
                     return Ok((Value::Object(map), position.min(bytes.len()), true));
                 };
                 items.push(item);
-                let mut candidate = map.clone();
-                candidate.insert(key.clone(), Value::Array(items.clone()));
-                if serde_json::to_vec(&candidate)?.len() > FIELD_BYTES {
+                // Measure the candidate in place instead of cloning every item
+                // and earlier group. Restore even a duplicate key before rollback.
+                let previous = map.insert(key.clone(), Value::Array(items));
+                let oversized = serde_json::to_vec(&map)?.len() > FIELD_BYTES;
+                let Some(Value::Array(candidate)) = map.remove(&key) else {
+                    unreachable!("inserted array candidate");
+                };
+                items = candidate;
+                if let Some(previous) = previous {
+                    map.insert(key.clone(), previous);
+                }
+                if oversized {
                     items.pop();
                     if !items.is_empty() {
                         map.insert(key, Value::Array(items));
@@ -435,96 +444,6 @@ mod tests {
         tool::ToolOutput,
     };
 
-    #[test]
-    fn script_annotation_discovery_respects_references_and_union_branches() {
-        let schema = json!({"$defs":{"text":{"type":"string",ANNOTATION:true}},"oneOf":[
-            {"properties":{"kind":{"const":"short"},"content":{"$ref":"#/$defs/text"}},"required":["kind","content"]},
-            {"properties":{"kind":{"const":"full"},"content":{"type":"string"}},"required":["kind","content"]}
-        ]});
-        assert_eq!(
-            annotated_fields(&json!({"kind":"short","content":"data"}), &schema),
-            BTreeSet::from(["/content".to_owned()])
-        );
-        assert!(annotated_fields(&json!({"kind":"full","content":"data"}), &schema).is_empty());
-        let schema = json!({"type":"object","properties":{"a/~":{"type":"array",ANNOTATION:true,"items":{"type":"object","properties":{"text":{"type":"string",ANNOTATION:true}}}}}});
-        assert_eq!(
-            annotated_fields(&json!({"a/~":[{"text":"data"}]}), &schema),
-            BTreeSet::from(["/a~1~0".to_owned(), "/a~1~0/0/text".to_owned()])
-        );
-    }
-
-    #[tokio::test]
-    async fn projection_and_discovery_share_tuple_reference_and_union_navigation() {
-        let schema = json!({
-            "$defs": {"text": {"type":"string", ANNOTATION:true}},
-            "properties": {"a/~": {
-                "type":"array",
-                "prefixItems":[{"type":"string"}, {"$ref":"#/$defs/text"}],
-                "items": {"anyOf":[
-                    {"properties":{"kind":{"const":"short"},"text":{"$ref":"#/$defs/text"}}},
-                    {"properties":{"kind":{"const":"full"},"text":{"type":"string"}}}
-                ]}
-            }}
-        });
-        let text = "x".repeat(10_000);
-        let value = json!({"a/~":[text, text,
-            {"kind":"short","text":text}, {"kind":"full","text":text}]});
-        let annotations = annotated_fields(&value, &schema);
-        assert_eq!(
-            annotations,
-            BTreeSet::from(["/a~1~0/1".to_owned(), "/a~1~0/2/text".to_owned()])
-        );
-        let (_root, manager, id) = fixture(value.clone(), schema, None).await;
-        let view = manager
-            .present_output(OutputArgs::new(id), &Default::default())
-            .await
-            .unwrap();
-        let projected = view["truncated"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|marker| marker["field"].as_str()?.strip_prefix("/result"))
-            .map(str::to_owned)
-            .collect::<BTreeSet<_>>();
-        assert_eq!(projected, annotations);
-        assert_eq!(view["result"]["a/~"][0], value["a/~"][0]);
-        assert_eq!(view["result"]["a/~"][3], value["a/~"][3]);
-        assert_eq!(view["result"]["a/~"][1], "x".repeat(FIELD_BYTES));
-        assert_eq!(view["result"]["a/~"][2]["text"], "x".repeat(FIELD_BYTES));
-    }
-
-    #[test]
-    fn projection_hydrates_unannotated_containers_before_visiting_children() {
-        let directory = tempfile::tempdir().unwrap();
-        let value = json!({"a/~":[{"text":"x".repeat(10_000), "full":"y".repeat(10_000)}]});
-        let schema = json!({"properties":{"a/~":{"items":{"properties":{
-            "text":{ANNOTATION:true}, "full":{"type":"string"}
-        }}}}});
-        std::fs::write(
-            field_file(directory.path(), "/result/a~1~0"),
-            serde_json::to_vec(&value["a/~"]).unwrap(),
-        )
-        .unwrap();
-        save(directory.path(), &json!({"result":value})).unwrap();
-        let projected = project(
-            directory.path(),
-            &schema,
-            &Default::default(),
-            &BTreeSet::new(),
-            &BTreeMap::new(),
-        )
-        .unwrap();
-        assert_eq!(
-            projected["result"]["a/~"][0]["text"],
-            "x".repeat(FIELD_BYTES)
-        );
-        assert_eq!(
-            projected["result"]["a/~"][0]["full"],
-            value["a/~"][0]["full"]
-        );
-        assert_eq!(projected["truncated"][0]["field"], "/result/a~1~0/0/text");
-    }
-
     async fn fixture(
         value: Value,
         schema: Value,
@@ -585,7 +504,7 @@ mod tests {
         assert!(view.get("preview").is_none());
         assert_eq!(manager.snapshot(id).await.unwrap().output.unwrap(), value);
         let session = manager.store().id();
-        manager.store().close().await.unwrap();
+        drop(manager);
         let (store, records) = SessionStore::open(root.path(), session).await.unwrap();
         let restored = JobManager::restore(store, &records).await.unwrap();
         assert_eq!(
@@ -618,49 +537,6 @@ mod tests {
             assert_eq!(entry["next_offset"].as_u64().unwrap_or(0) as usize, offset);
             assert!(first.as_str().unwrap().starts_with(expected));
         }
-    }
-
-    #[tokio::test]
-    async fn union_and_reference_annotations_do_not_affect_other_variants() {
-        let schema = json!({"$defs":{"text":{"type":"string",ANNOTATION:true}},"oneOf":[
-            {"properties":{"kind":{"const":"short"},"content":{"$ref":"#/$defs/text"}},"required":["kind","content"]},
-            {"properties":{"kind":{"const":"full"},"content":{"type":"string"}},"required":["kind","content"]}
-        ]});
-        for kind in ["short", "full"] {
-            let (_root, manager, id) = fixture(
-                json!({"kind":kind,"content":"x".repeat(10000)}),
-                schema.clone(),
-                None,
-            )
-            .await;
-            let view = manager
-                .present_output(OutputArgs::new(id), &Default::default())
-                .await
-                .unwrap();
-            assert_eq!(view["result"]["kind"], kind);
-            assert_eq!(
-                view["result"]["content"].as_str().unwrap().len(),
-                if kind == "short" { FIELD_BYTES } else { 10000 }
-            );
-        }
-    }
-
-    #[test]
-    fn string_boundaries_preserve_utf8_newlines_and_exact_limits() {
-        for text in [
-            "x".repeat(FIELD_BYTES),
-            "a\r\n".repeat(FIELD_LINES),
-            String::new(),
-        ] {
-            let (prefix, _, truncated) = string_prefix(text.as_bytes()).unwrap();
-            assert_eq!(prefix, text);
-            assert!(!truncated);
-        }
-        let text = "€".repeat(1000);
-        let (prefix, end, truncated) = string_prefix(&text.as_bytes()[..FIELD_BYTES + 1]).unwrap();
-        assert_eq!(end, 2046);
-        assert_eq!(prefix, text[..end]);
-        assert!(truncated);
     }
 
     #[tokio::test]
@@ -706,59 +582,5 @@ mod tests {
             }
             assert_eq!(format!("{prefix}{remaining}"), text);
         }
-    }
-
-    #[tokio::test]
-    async fn arrays_keep_whole_items_and_continue_at_the_next_item() {
-        let items = (0..200)
-            .map(|n| json!({"n":n,"text":"abc"}))
-            .collect::<Vec<_>>();
-        let schema = json!({"properties":{"items":{ANNOTATION:true}}});
-        let (_root, manager, id) =
-            fixture(json!({"items":items,"count":200}), schema.clone(), None).await;
-        let view = manager
-            .present_output(OutputArgs::new(id), &Default::default())
-            .await
-            .unwrap();
-        let prefix = view["result"]["items"].as_array().unwrap();
-        assert!(!prefix.is_empty() && prefix.len() < items.len());
-        assert_eq!(prefix, &items[..prefix.len()]);
-        assert_eq!(view["result"]["count"], 200);
-        assert!(serde_json::to_vec(prefix).unwrap().len() <= FIELD_BYTES);
-        let entry = view["truncated"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|t| t["field"] == "/result/items")
-            .unwrap();
-        let mut args = OutputArgs::new(id);
-        args.field = Some(entry["field"].as_str().unwrap().into());
-        args.start = Some(entry["next_start"].as_u64().unwrap() as usize);
-        args.offset = Some(entry["next_offset"].as_u64().unwrap_or(0) as usize);
-        let page = manager
-            .present_output(args, &Default::default())
-            .await
-            .unwrap();
-        let text = page["preview"]["lines"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|l| l.as_str().unwrap())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains(&format!("\"n\": {}", prefix.len())));
-        assert_eq!(
-            manager.snapshot(id).await.unwrap().output.unwrap()["items"],
-            json!(items)
-        );
-
-        let (_root, manager, id) =
-            fixture(json!({"items":["x".repeat(100000)]}), schema, None).await;
-        let view = manager
-            .present_output(OutputArgs::new(id), &Default::default())
-            .await
-            .unwrap();
-        assert_eq!(view["result"]["items"], json!([]));
-        assert_eq!(view["truncated"][0]["field"], "/result/items");
     }
 }

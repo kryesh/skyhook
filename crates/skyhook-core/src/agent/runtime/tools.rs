@@ -223,12 +223,10 @@ fn register_child_agent(
                 }
                 let sender = runtime.spawn_agent(AgentLaunch {
                     id: child.clone(),
-                    parent: Some(context.agent.clone()),
                     owner_job: Some(context.job),
                     model_profile: model,
                     agent_profile,
                     todos,
-                    one_shot: true,
                     available_depth: input.depth,
                     location,
                 }).await.map_err(|error| tool_error(&error))?;

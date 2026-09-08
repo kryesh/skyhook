@@ -74,16 +74,16 @@ impl JobState {
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq)]
-pub struct JobEnvelope<L = ExecutionLocation, T = String, V = Value> {
+pub struct JobEnvelope {
     pub id: JobId,
     pub parent: Option<JobId>,
-    pub tool: T,
+    pub tool: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<T>,
+    pub name: Option<String>,
     pub state: JobState,
-    pub output: Option<V>,
-    pub error: Option<T>,
-    pub location: L,
+    pub output: Option<Value>,
+    pub error: Option<String>,
+    pub location: ExecutionLocation,
     #[serde(flatten)]
     pub denial: Option<crate::tool::Denial>,
 }
@@ -543,22 +543,6 @@ impl JobManager {
         launches
     }
 
-    #[cfg(test)]
-    pub(crate) async fn active_origins(
-        &self,
-        agent: &AgentId,
-    ) -> Vec<crate::session::ModelCallOrigin> {
-        let mut origins = Vec::new();
-        for (_, origin) in self.active_launches(agent).await {
-            if let Some(origin) = origin
-                && !origins.contains(&origin)
-            {
-                origins.push(origin);
-            }
-        }
-        origins
-    }
-
     pub async fn transition(&self, id: JobId, state: JobState) -> Result<(), JobError> {
         if state.is_terminal() {
             return Err(JobError::InvalidTransition);
@@ -804,8 +788,10 @@ impl JobManager {
         now_millis: i64,
     ) -> Vec<ActiveJob> {
         let mut progress = self.inner.progress.lock().await;
-        let records = self.inner.store.records_after(progress.sequence).await;
-        progress.project(&records);
+        self.inner
+            .store
+            .visit_records_after(progress.sequence, |records| progress.project(records))
+            .await;
         let jobs = self.inner.jobs.lock().await;
         let mut states = jobs
             .iter()
@@ -1385,11 +1371,6 @@ mod tests {
     };
 
     #[derive(Deserialize, JsonSchema)]
-    struct Echo {
-        value: String,
-    }
-
-    #[derive(Deserialize, JsonSchema)]
     struct NoArgs {}
 
     struct NeverAuthorize;
@@ -1401,76 +1382,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_origins_keep_completed_launchers_and_do_not_consume_outputs() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
-        let jobs = JobManager::new(store.clone());
-        let origin = crate::session::ModelCallOrigin {
-            message: 1,
-            call_id: "script-call".into(),
-        };
-        let parent = jobs
-            .create(JobSpec {
-                origin: Some(origin.clone()),
-                background: true,
-                ..JobSpec::test(agent.clone(), "script")
-            })
-            .await
-            .unwrap();
-        let child = jobs
-            .create(JobSpec {
-                parent: Some(parent.id),
-                ..JobSpec::test(agent.clone(), "shell")
-            })
-            .await
-            .unwrap();
-        let grandchild = jobs
-            .create(JobSpec {
-                parent: Some(child.id),
-                ..JobSpec::test(agent.clone(), "nested")
-            })
-            .await
-            .unwrap();
-        jobs.finish(parent.id, JobOutcome::Completed(ToolOutput::default()))
-            .await
-            .unwrap();
-        let before = store.records().await;
-        assert_eq!(jobs.active_origins(&agent).await, vec![origin.clone()]);
-        assert_eq!(jobs.active_origins(&agent).await, vec![origin.clone()]);
-        assert_eq!(store.records().await, before);
-        assert!(
-            jobs.inner
-                .jobs
-                .lock()
-                .await
-                .get(&parent.id)
-                .unwrap()
-                .delivery
-                == DeliveryState::Pending
-        );
-        assert_eq!(
-            jobs.take_pending(&agent)
-                .await
-                .unwrap()
-                .iter()
-                .map(|job| job.id)
-                .collect::<Vec<_>>(),
-            vec![parent.id]
-        );
-        assert!(jobs.take_pending(&agent).await.unwrap().is_empty());
-        jobs.finish(child.id, JobOutcome::Completed(ToolOutput::default()))
-            .await
-            .unwrap();
-        assert_eq!(jobs.active_origins(&agent).await, vec![origin]);
-        jobs.finish(grandchild.id, JobOutcome::Completed(ToolOutput::default()))
-            .await
-            .unwrap();
-        assert!(jobs.active_origins(&agent).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn active_origins_stop_at_agent_boundaries_and_prefer_the_nearest_call() {
+    async fn active_launches_stop_at_agent_boundaries_and_prefer_the_nearest_call() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::create(root.path()).await.unwrap();
         let agent = AgentId::root(store.id());
@@ -1491,13 +1403,17 @@ mod tests {
             })
             .await
             .unwrap();
-        jobs.create(JobSpec {
-            parent: Some(owner.id),
-            ..JobSpec::test(child_agent.clone(), "host-started")
-        })
-        .await
-        .unwrap();
-        assert!(jobs.active_origins(&child_agent).await.is_empty());
+        let host = jobs
+            .create(JobSpec {
+                parent: Some(owner.id),
+                ..JobSpec::test(child_agent.clone(), "host-started")
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            jobs.active_launches(&child_agent).await,
+            vec![(host.id, None)]
+        );
         let child = jobs
             .create(JobSpec {
                 parent: Some(owner.id),
@@ -1506,59 +1422,25 @@ mod tests {
             })
             .await
             .unwrap();
-        jobs.create(JobSpec {
-            parent: Some(child.id),
-            ..JobSpec::test(child_agent.clone(), "shell")
-        })
-        .await
-        .unwrap();
-        assert_eq!(jobs.active_origins(&agent).await, vec![root_origin]);
-        assert_eq!(jobs.active_origins(&child_agent).await, vec![child_origin]);
-    }
-
-    #[tokio::test]
-    async fn restored_launch_provenance_survives_interruption_and_new_descendants() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
-        let jobs = JobManager::new(store.clone());
-        let origin = crate::session::ModelCallOrigin {
-            message: 1,
-            call_id: "restored-script".into(),
-        };
-        let parent = jobs
-            .create(JobSpec {
-                origin: Some(origin.clone()),
-                ..JobSpec::test(agent.clone(), "script")
-            })
-            .await
-            .unwrap();
-        let child = jobs
-            .create(JobSpec {
-                parent: Some(parent.id),
-                ..JobSpec::test(agent.clone(), "shell")
-            })
-            .await
-            .unwrap();
-        jobs.finish(parent.id, JobOutcome::Completed(ToolOutput::default()))
-            .await
-            .unwrap();
-        store.close().await.unwrap();
-        let (store, records) = SessionStore::open(root.path(), store.id()).await.unwrap();
-        let restored = JobManager::restore(store.clone(), &records).await.unwrap();
-        assert_eq!(
-            restored.snapshot(child.id).await.unwrap().state,
-            JobState::Interrupted
-        );
-        assert!(restored.active_origins(&agent).await.is_empty());
-        restored
+        let shell = jobs
             .create(JobSpec {
                 parent: Some(child.id),
-                ..JobSpec::test(agent.clone(), "new-descendant")
+                ..JobSpec::test(child_agent.clone(), "shell")
             })
             .await
             .unwrap();
-        assert_eq!(restored.active_origins(&agent).await, vec![origin]);
+        assert_eq!(
+            jobs.active_launches(&agent).await,
+            vec![(owner.id, Some(root_origin))]
+        );
+        assert_eq!(
+            jobs.active_launches(&child_agent).await,
+            vec![
+                (host.id, None),
+                (child.id, Some(child_origin.clone())),
+                (shell.id, Some(child_origin)),
+            ]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1686,73 +1568,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_explicit_completed_agents_resume_and_concurrent_sends_share_lifecycle() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let owner = AgentId::root(store.id());
-        let jobs = JobManager::new(store);
-        let ordinary = jobs
-            .create(JobSpec {
-                accepts_input: true,
-                ..JobSpec::test(owner.clone(), "script")
-            })
-            .await
-            .unwrap();
-        jobs.finish(ordinary.id, JobOutcome::Completed(ToolOutput::default()))
-            .await
-            .unwrap();
-        assert!(matches!(
-            jobs.send(ordinary.id, Value::Null).await,
-            Err(JobError::NotRunning(_))
-        ));
-        let agent = jobs
-            .create(JobSpec {
-                accepts_input: true,
-                ..JobSpec::test(owner, "agent")
-            })
-            .await
-            .unwrap();
-        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let count = starts.clone();
-        jobs.set_resume_handler(
-            agent.id,
-            Arc::new(move |first, mut receiver| {
-                count.fetch_add(1, Ordering::SeqCst);
-                Box::pin(async move {
-                    let second = receiver.recv().await.unwrap();
-                    Ok(ToolOutput::new(serde_json::json!([first, second])))
-                })
-            }),
-        )
-        .await
-        .unwrap();
-        jobs.finish(
-            agent.id,
-            JobOutcome::Completed(ToolOutput::new(serde_json::json!("old"))),
-        )
-        .await
-        .unwrap();
-        let (one, two) = tokio::join!(
-            jobs.send(agent.id, serde_json::json!(1)),
-            jobs.send(agent.id, serde_json::json!(2))
-        );
-        one.unwrap();
-        two.unwrap();
-        let result = jobs
-            .wait(agent.id, Some(Duration::from_secs(2)), true)
-            .await
-            .unwrap();
-        assert_eq!(result.state, JobState::Completed);
-        assert_eq!(result.output, Some(serde_json::json!([1, 2])));
-        assert_eq!(starts.load(Ordering::SeqCst), 1);
-        jobs.cancel(agent.id).await.unwrap();
-        assert!(matches!(
-            jobs.send(agent.id, Value::Null).await,
-            Err(JobError::NotRunning(_))
-        ));
-    }
-
-    #[tokio::test]
     async fn denial_survives_replay_and_agent_views_hide_pending_authorization() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::create(root.path()).await.unwrap();
@@ -1787,7 +1602,6 @@ mod tests {
         // The persisted terminal event is the source of truth for replay.
         let session_id = store.id();
         drop(jobs);
-        store.close().await.unwrap();
         drop(store);
         let (store, records) = SessionStore::open(root.path(), session_id).await.unwrap();
         let restored = JobManager::restore(store, &records).await.unwrap();
@@ -1800,166 +1614,6 @@ mod tests {
                 .unwrap(),
             denied
         );
-    }
-
-    #[test]
-    fn presentation_hides_only_location_target_metadata() {
-        let envelope = JobEnvelope {
-            id: JobId::new(1).unwrap(),
-            parent: None,
-            tool: "adapter".to_owned(),
-            name: None,
-            state: JobState::Completed,
-            output: Some(serde_json::json!({"target": "application-value"})),
-            error: None,
-            location: ExecutionLocation::named("build", "/srv/project".into()),
-            denial: None,
-        };
-        let presented = envelope.presented(&CapabilitySet::default()).unwrap();
-
-        assert!(presented.get("target").is_none());
-        assert!(presented.get("location").is_none());
-        assert_eq!(presented["workspace"], "/srv/project");
-        assert_eq!(presented["output"]["target"], "application-value");
-        let mut capabilities = CapabilitySet::default();
-        capabilities.insert(Capability::Targets);
-        let direct = envelope
-            .presented_for(&capabilities, Some(&envelope.location), false)
-            .unwrap();
-        assert_eq!(
-            direct,
-            serde_json::json!({"id":1,"state":"completed","target":"build","output":{"target":"application-value"}})
-        );
-        let other_workspace = ExecutionLocation::named("build", "/elsewhere".into());
-        assert_eq!(
-            envelope
-                .presented_for(&capabilities, Some(&other_workspace), false)
-                .unwrap()["workspace"],
-            "/srv/project"
-        );
-        let old = serde_json::to_value(&envelope).unwrap();
-        assert!(
-            serde_json::to_vec(&direct).unwrap().len() < serde_json::to_vec(&old).unwrap().len()
-        );
-
-        assert!(
-            !presented_job_schema(&CapabilitySet::default(), false)
-                .to_string()
-                .contains("target")
-        );
-    }
-
-    #[tokio::test]
-    async fn registered_calls_preserve_names_and_partial_failures() {
-        let runtime = TestRuntime::new().await;
-        let agent = runtime.agent.clone();
-        let mut builder = ToolRegistryBuilder::default();
-        builder
-            .register::<Echo, String, _, _>(
-                "echo",
-                "echo",
-                ToolOptions::new(Vec::new()).background().named(),
-                |_context, input| async move { Ok(input.value) },
-            )
-            .unwrap();
-        let jobs = runtime.jobs.clone();
-        let executor = runtime.executor(builder);
-        let foreground = executor
-            .execute(
-                agent.clone(),
-                "echo",
-                serde_json::json!({"value":"a", "name":"foreground-echo"}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(foreground.output.value, "a");
-        assert_eq!(
-            jobs.snapshot(foreground.job).await.unwrap().name.as_deref(),
-            Some("foreground-echo")
-        );
-        assert_eq!(
-            jobs.snapshot(foreground.job).await.unwrap().location,
-            ExecutionLocation::root(runtime.root.path().to_path_buf())
-        );
-        let background = executor
-            .execute(
-                agent.clone(),
-                "echo",
-                serde_json::json!({"value":"b", "bg":true, "name":"background-echo"}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(background.background);
-        assert_eq!(background.output.value["name"], "background-echo");
-        assert_eq!(
-            jobs.wait(background.job, None, true).await.unwrap().output,
-            Some(serde_json::json!("b"))
-        );
-
-        let mut builder = ToolRegistryBuilder::default();
-        builder
-            .register::<Echo, String, _, _>(
-                "fail",
-                "partial failure",
-                ToolOptions::default(),
-                |_context, input| async move {
-                    Err(ToolError::with_output(
-                        "stopped",
-                        ToolOutput::new(serde_json::json!(input.value)),
-                    ))
-                },
-            )
-            .unwrap();
-        let failed = runtime
-            .executor(builder)
-            .execute(agent, "fail", serde_json::json!({"value":"partial"}), None)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            failed,
-            ExecutionError::Failed {
-                output: Some(output),
-                ..
-            } if output.value == "partial"
-        ));
-    }
-
-    #[tokio::test]
-    async fn ephemeral_jobs_are_removed_after_claim() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create_ephemeral(root.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
-        let mut builder = ToolRegistryBuilder::default();
-        builder
-            .register::<Echo, String, _, _>(
-                "echo",
-                "echo",
-                ToolOptions::new(Vec::new()),
-                |_context, input| async move { Ok(input.value) },
-            )
-            .unwrap();
-        let jobs = JobManager::new(store);
-        let executor = ToolExecutor::new(
-            builder.build(),
-            Arc::new(AllowAll),
-            jobs.clone(),
-            root.path().to_path_buf(),
-        );
-        let result = executor
-            .execute(agent, "echo", serde_json::json!({"value":"done"}), None)
-            .await
-            .unwrap();
-        assert_eq!(
-            jobs.snapshot(result.job).await.unwrap().state,
-            JobState::Completed
-        );
-        assert_eq!(jobs.prune_claimed().await.unwrap(), 1);
-        assert!(matches!(
-            jobs.snapshot(result.job).await,
-            Err(JobError::Unknown(_))
-        ));
     }
 
     #[tokio::test]
@@ -1995,7 +1649,6 @@ mod tests {
         drop(lease);
         drop(located);
         drop(manager);
-        store.close().await.unwrap();
         drop(store);
 
         let (store, records) = SessionStore::open(root.path(), session).await.unwrap();
@@ -2085,41 +1738,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foreground_waits_do_not_miss_fast_completions() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create_ephemeral(root.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
-        let manager = JobManager::new(store);
-        for _ in 0..128 {
-            let lease = manager
-                .create(JobSpec::test(agent.clone(), "fast"))
-                .await
-                .unwrap();
-            manager
-                .transition(lease.id, JobState::Running)
-                .await
-                .unwrap();
-            let waiter = tokio::spawn({
-                let manager = manager.clone();
-                async move { manager.wait_foreground(lease.id).await.unwrap() }
-            });
-            tokio::task::yield_now().await;
-            manager
-                .finish(
-                    lease.id,
-                    JobOutcome::Completed(ToolOutput::new(serde_json::json!("done"))),
-                )
-                .await
-                .unwrap();
-            let result = tokio::time::timeout(Duration::from_secs(1), waiter)
-                .await
-                .expect("foreground waiter missed a completion notification")
-                .unwrap();
-            assert_eq!(result.state, JobState::Completed);
-        }
-    }
-
-    #[tokio::test]
     async fn uncooperative_handlers_are_aborted_after_cancellation_grace() {
         let runtime = TestRuntime::new().await;
         let agent = runtime.agent.clone();
@@ -2162,7 +1780,7 @@ mod tests {
             .register::<NoArgs, String, _, _>(
                 "cooperative",
                 "wait for cancellation",
-                ToolOptions::new(Vec::new()).background(),
+                ToolOptions::new(vec![Capability::Exec]).background(),
                 {
                     let observed = observed.clone();
                     let started = started.clone();

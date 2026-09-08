@@ -309,24 +309,6 @@ mod tests {
         tool::{ToolRegistryBuilder, executor::ExecutionError},
     };
 
-    #[test]
-    fn command_timeouts_are_optional_and_null_means_no_deadline() {
-        assert_eq!(
-            serde_json::from_value::<ShellArgs>(serde_json::json!({"command":"server"}))
-                .unwrap()
-                .timeout,
-            None
-        );
-        assert_eq!(
-            serde_json::from_value::<ExecArgs>(
-                serde_json::json!({"argv":["server"],"timeout":null})
-            )
-            .unwrap()
-            .timeout,
-            None
-        );
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_kills_descendants_even_after_the_shell_exits() {

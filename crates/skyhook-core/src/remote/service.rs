@@ -2,12 +2,11 @@
 use super::{
     SensitivePrompt, SensitivePromptError, SensitivePromptFuture, SensitivePromptHandler,
     askpass::{AskpassServer, PromptAnswer},
-    authentication::{AgentRelay, ProcessEnvironment},
+    authentication::ProcessEnvironment,
     protocol::{Request, Response, write_frame},
 };
 use std::{
     collections::HashMap,
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -92,11 +91,10 @@ pub(super) struct WorkerServices<W> {
     output: Arc<Mutex<W>>,
     answers: Answers,
     streams: HashMap<u64, WorkerStream>,
-    pub tasks: tokio::task::JoinSet<()>,
+    pub tasks: tokio::task::JoinSet<std::io::Result<()>>,
     prompts: Arc<dyn SensitivePromptHandler>,
     pub environment: ProcessEnvironment,
     _askpass: AskpassServer,
-    _agent: Option<AgentRelay>,
 }
 impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
     pub fn new(output: Arc<Mutex<W>>) -> Result<Self, std::io::Error> {
@@ -108,13 +106,12 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
         });
         let askpass = AskpassServer::start(prompts.clone())?;
         let mut environment = askpass.environment();
-        let agent = std::env::var_os("SSH_AUTH_SOCK")
-            .map(|path| AgentRelay::start(PathBuf::from(path)))
-            .transpose()?;
-        if let Some(agent) = &agent {
+        // OpenSSH already owns a private forwarded socket for this connection.
+        // Pass it through; a second forwarding listener adds no isolation or lifetime.
+        if let Some(socket) = std::env::var_os("SSH_AUTH_SOCK") {
             environment.insert(
                 "SSH_AUTH_SOCK".into(),
-                agent.socket.to_string_lossy().into_owned(),
+                socket.to_string_lossy().into_owned(),
             );
         }
         Ok(Self {
@@ -125,7 +122,6 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
             prompts,
             environment,
             _askpass: askpass,
-            _agent: agent,
         })
     }
     pub async fn handle(&mut self, request: Request) -> Result<(), std::io::Error> {
@@ -141,11 +137,11 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
                     let result = super::ssh::resolve_local(&target)
                         .await
                         .map_err(|e| e.to_string());
-                    let _ = write_frame(
+                    write_frame(
                         &mut *output.lock().await,
                         &Response::ResolvedSsh { request_id, result },
                     )
-                    .await;
+                    .await
                 });
             }
             Request::OpenSsh {
@@ -211,7 +207,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
                         }
                         Ok::<(), super::RemoteError>(())
                     }.await;
-                    let _ = write_frame(&mut *output.lock().await, &Response::StreamClosed { channel, error: result.err().map(|e| e.to_string()) }).await;
+                    write_frame(&mut *output.lock().await, &Response::StreamClosed { channel, error: result.err().map(|e| e.to_string()) }).await
                 });
             }
             Request::StreamData { channel, data } => {

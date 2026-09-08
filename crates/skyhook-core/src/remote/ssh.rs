@@ -374,7 +374,7 @@ pub(crate) async fn open(
 }
 
 pub(crate) struct SshLauncher {
-    pub origin: Option<super::backend::Session>,
+    pub origin: Option<super::manager::Session>,
     pub route: Vec<TargetDefinition>,
     pub environment: super::authentication::ProcessEnvironment,
     pub prompts: Arc<dyn SensitivePromptHandler>,

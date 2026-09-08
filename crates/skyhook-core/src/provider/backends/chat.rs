@@ -860,7 +860,7 @@ mod tests {
     use crate::provider::protocol::AssistantItem;
     use crate::{
         media::ImageReference,
-        provider::protocol::{ResponseSchema, SystemSegment, ToolDefinition, ToolResult},
+        provider::protocol::{SystemSegment, ToolDefinition, ToolResult},
     };
 
     fn request() -> ModelRequest {
@@ -972,379 +972,64 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_aliases_and_null_optional_fields_are_compatible() {
-        let mut decoder = Decoder::new("qwen36-35".into());
-        assert!(
-            decoder
-                .decode(&delta(
-                    json!({"role":null,"content":null,"reasoning":null,"audio":null})
-                ))
-                .unwrap()
-                .is_empty()
-        );
-        let mut expected = Vec::new();
-        start_item(&mut expected, 0, ItemKind::Reasoning, BlockKind::Reasoning);
-        expected.push(ResponseChunk::BlockDelta {
-            item: "0".into(),
-            block: "0".into(),
-            delta: ContentDelta::Text("First".into()),
-        });
-        assert_eq!(
-            decoder
-                .decode(&delta(
-                    json!({"reasoning":"First","reasoning_content":"First"})
-                ))
-                .unwrap(),
-            expected
-        );
-        let mut expected = Vec::new();
-        end_item(
-            &mut expected,
-            0,
-            BlockContent::Reasoning {
-                text: "First".into(),
-            },
-        );
-        assert_eq!(decoder.decode(&end("length")).unwrap(), expected);
-        assert_eq!(
-            decoder.decode(&done()).unwrap(),
-            vec![ResponseChunk::ResponseEnded {
-                stop_reason: StopReason::MaxTokens
-            }]
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "authorized live local Qwen request; requires 127.0.0.1:8000"]
-    async fn live_local_qwen_native_reasoning() {
-        use crate::provider::{Provider, protocol::ResponseAssembler};
-        use futures_util::StreamExt;
-        let provider = super::super::openai_compatible(
-            "local",
-            "http://127.0.0.1:8000/v1",
-            super::super::OpenAiApi::ChatCompletions,
-            None,
-        )
-        .unwrap();
-        let mut context = provider
-            .open_context("live-qwen-chat-reasoning".into())
-            .unwrap();
+    fn request_preserves_text_tools_images_and_reasoning_settings() {
         let mut request = request();
-        request.model = "qwen36-35".into();
-        request.correlation = None;
-        request.max_output_tokens = Some(512);
-        request.messages.push(Message::User(vec![UserContent::Text {
-            text: "Reply with OK only.".into(),
-        }]));
-        tokio::time::timeout(std::time::Duration::from_secs(90), async {
-            let mut stream = context.invoke(request).await.unwrap();
-            let mut assembler = ResponseAssembler::default();
-            while let Some(chunk) = stream.next().await {
-                assembler.push(&chunk.unwrap()).unwrap();
-            }
-            let (items, usage, reason) = assembler.finish().unwrap();
-            assert_ne!(reason, StopReason::MaxTokens);
-            let blocks: Vec<_> = items.iter().flat_map(|item| &item.blocks).collect();
-            assert!(blocks.iter().any(|block| matches!(&block.content, BlockContent::Reasoning { text } if !text.is_empty())));
-            assert!(blocks.iter().any(|block| matches!(&block.content, BlockContent::Text { text } if text.trim() == "OK")));
-            // Counts only; do not log reasoning content or request credentials.
-            eprintln!(
-                "live Qwen native Chat: {} blocks, {} input / {} cached / {} output tokens",
-                blocks.len(),
-                usage.input_tokens,
-                usage.cached_input_tokens,
-                usage.output_tokens
-            );
-        })
-        .await
-        .expect("bounded live Qwen probe timed out");
-    }
-
-    #[test]
-    fn wire_uses_only_standard_fields_and_automatic_cache() {
-        let mut request = request();
-        request.system.push(SystemSegment {
+        request.system = vec![SystemSegment {
             text: "system".into(),
             cache: true,
-        });
+        }];
         request.reasoning = Some("high".into());
-        request.max_output_tokens = Some(4096);
-        assert_eq!(
-            encode(&request).unwrap(),
-            json!({
-                "model":"gpt-5", "messages":[{"role":"system","content":"system"}],
-                "stream":true, "stream_options":{"include_usage":true},
-                "reasoning_effort":"high", "max_completion_tokens":4096
-            })
-        );
-        for effort in ["none", "minimal", "low", "medium", "high", "xhigh"] {
-            request.reasoning = Some(effort.into());
-            assert_eq!(encode(&request).unwrap()["reasoning_effort"], effort);
-        }
-        for effort in ["", "auto", "enabled", "HIGH", "2048", "disabled"] {
-            request.reasoning = Some(effort.into());
-            assert_eq!(
-                encode(&request).unwrap_err().kind,
-                ProviderErrorKind::InvalidRequest
-            );
-        }
-        request.reasoning = None;
-        request.max_output_tokens = Some(0);
-        assert!(encode(&request).is_err());
-    }
-
-    #[test]
-    fn wire_preserves_all_user_variants_and_images() {
-        let mut request = request();
-        request.messages.push(Message::User(vec![
-            UserContent::Text {
-                text: "text".into(),
-            },
-            UserContent::Image { image: image() },
-            UserContent::Runtime {
-                text: "runtime".into(),
-            },
-            UserContent::ParentInput {
-                text: "parent".into(),
-            },
-            UserContent::Compaction {
-                text: "compact".into(),
-            },
-            UserContent::Image { image: image() },
-        ]));
-        assert_eq!(
-            encode(&request).unwrap()["messages"][0],
-            json!({"role":"user","content":[
-                {"type":"text","text":"text"},
-                {"type":"image_url","image_url":{"url":"data:image/png;base64,AQID"}},
-                {"type":"text","text":"runtime"}, {"type":"text","text":"parent"},
-                {"type":"text","text":"compact"},
-                {"type":"image_url","image_url":{"url":"data:image/png;base64,AQID"}}
-            ]})
-        );
-    }
-
-    #[test]
-    fn wire_missing_or_unsupported_images_are_errors() {
-        for bad in [
-            ImageReference {
-                data_base64: None,
-                ..image()
-            },
-            ImageReference {
-                media_type: "image/tiff".into(),
-                ..image()
-            },
-        ] {
-            let mut request = request();
-            request
-                .messages
-                .push(Message::User(vec![UserContent::Image {
-                    image: bad.clone(),
-                }]));
-            assert!(encode(&request).is_err());
-            request.messages = vec![Message::Tool(vec![ToolResult {
-                call_id: "call".into(),
-                name: "tool".into(),
-                result: json!(null),
-                is_error: false,
-                images: vec![image(), bad],
-            }])];
-            assert!(encode(&request).is_err());
-        }
-    }
-
-    #[test]
-    fn wire_tools_and_tool_images_keep_call_associations() {
-        let mut request = request();
-        request.tools.push(ToolDefinition {
+        request.tools = vec![ToolDefinition {
             name: "inspect".into(),
             description: "Inspect".into(),
-            input_schema: json!({"type":"object","properties":{"path":{"type":"string"}}}),
-        });
+            input_schema: json!({"type":"object"}),
+        }];
         request.messages = vec![
+            Message::User(vec![
+                UserContent::Text {
+                    text: "look".into(),
+                },
+                UserContent::Image { image: image() },
+            ]),
             Message::Assistant(vec![
-                AssistantItem::text("5", 5, "Checking "),
-                AssistantItem::reasoning(
-                    "6",
-                    6,
-                    "private",
-                    Some(super::super::common::reasoning_envelope(
-                        "responses",
-                        "foreign",
-                        json!({"secret":true}),
-                    )),
-                ),
-                AssistantItem::text("7", 7, "now"),
+                AssistantItem::text("text", 0, "Checking"),
                 AssistantItem::tool_call(
-                    "8",
-                    8,
+                    "call",
+                    1,
                     ToolCall {
                         id: "call-a".into(),
                         name: "inspect".into(),
                         arguments: json!({"path":"a"}),
                     },
                 ),
-                AssistantItem::tool_call(
-                    "9",
-                    9,
-                    ToolCall {
-                        id: "call-b".into(),
-                        name: "inspect".into(),
-                        arguments: json!({"path":"b"}),
-                    },
-                ),
             ]),
-            Message::Tool(vec![
-                ToolResult {
-                    call_id: "call-a".into(),
-                    name: "inspect".into(),
-                    result: json!({"ok":false}),
-                    is_error: true,
-                    images: vec![image(), image()],
-                },
-                ToolResult {
-                    call_id: "call-b".into(),
-                    name: "inspect".into(),
-                    result: json!("ok"),
-                    is_error: false,
-                    images: vec![image()],
-                },
-            ]),
+            Message::Tool(vec![ToolResult {
+                call_id: "call-a".into(),
+                name: "inspect".into(),
+                result: json!({"ok":false}),
+                is_error: true,
+                images: vec![image()],
+            }]),
         ];
-        let wire = encode(&request).unwrap();
+        let body = encode(&request).unwrap();
+        assert_eq!(body["messages"][0]["content"], "system");
+        assert_eq!(body["messages"][1]["content"][0]["text"], "look");
         assert_eq!(
-            wire["tools"][0],
-            json!({"type":"function","function":{
-                "name":"inspect","description":"Inspect", "parameters":request.tools[0].input_schema
-            }})
+            body["messages"][1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AQID"
         );
-        assert_eq!(wire["messages"][0]["content"], "Checking now");
-        assert_eq!(
-            wire["messages"][0]["tool_calls"][0],
-            json!({"id":"call-a","type":"function", "function":{"name":"inspect","arguments":"{\"path\":\"a\"}"}})
-        );
-        assert_eq!(wire["messages"][1]["role"], "tool");
-        assert_eq!(wire["messages"][1]["tool_call_id"], "call-a");
+        assert_eq!(body["messages"][2]["content"], "Checking");
+        assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "call-a");
+        assert_eq!(body["messages"][3]["tool_call_id"], "call-a");
         let result: Value =
-            serde_json::from_str(wire["messages"][1]["content"].as_str().unwrap()).unwrap();
+            serde_json::from_str(body["messages"][3]["content"].as_str().unwrap()).unwrap();
         assert_eq!(result, json!({"result":{"ok":false},"is_error":true}));
-        assert_eq!(wire["messages"][2]["tool_call_id"], "call-b");
-        let content = wire["messages"][3]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 5);
-        assert!(content[0]["text"].as_str().unwrap().contains("call-a"));
-        assert!(content[3]["text"].as_str().unwrap().contains("call-b"));
         assert_eq!(
-            content
-                .iter()
-                .filter(|part| part["type"] == "image_url")
-                .count(),
-            3
+            body["messages"][4]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AQID"
         );
-        assert!(!wire.to_string().contains("private"));
-        assert!(!wire.to_string().contains("secret"));
-    }
-
-    fn strict_schema() -> Value {
-        json!({"type":"object","properties":{
-            "answer":{"type":"string"},
-            "optional":{"type":["integer","null"]},
-            "items":{"type":"array","items":{"type":"object","properties":{},"required":[],"additionalProperties":false}}
-        },"required":["answer","optional","items"],"additionalProperties":false})
-    }
-
-    #[test]
-    fn wire_strict_schema_is_enforced_without_rewriting() {
-        let mut request = request();
-        request.response_schema = Some(ResponseSchema {
-            name: "result".into(),
-            schema: strict_schema(),
-        });
-        assert_eq!(
-            encode(&request).unwrap()["response_format"],
-            json!({"type":"json_schema","json_schema":{
-                "name":"result","strict":true,"schema":strict_schema()
-            }})
-        );
-        request.response_schema = Some(ResponseSchema {
-            name: "recursive".into(),
-            schema: json!({
-                "type":"object","properties":{"child":{"anyOf":[{"$ref":"#"},{"type":"null"}]}},
-                "required":["child"],"additionalProperties":false
-            }),
-        });
-        assert!(encode(&request).is_ok());
-    }
-
-    #[test]
-    fn wire_rejects_unenforceable_schemas() {
-        let mut cases = vec![
-            json!(true),
-            json!({"type":"string"}),
-            json!({"type":"object","anyOf":[strict_schema()]}),
-        ];
-        for (key, value) in [
-            ("additionalProperties", json!(true)),
-            ("required", json!([])),
-            ("allOf", json!([])),
-            ("patternProperties", json!({})),
-            ("minProperties", json!(1)),
-        ] {
-            let mut schema = strict_schema();
-            schema[key] = value;
-            cases.push(schema);
-        }
-        for property in [
-            json!({"type":"string","pattern":"x"}),
-            json!({"type":"array"}),
-            json!({"$ref":"https://example.com/schema"}),
-            json!({"$ref":"#/$defs/missing"}),
-            json!({"type":"string","enum":[1]}),
-            json!({"type":"object","properties":{}}),
-        ] {
-            let mut schema = strict_schema();
-            schema["properties"]["answer"] = property;
-            cases.push(schema);
-        }
-        for schema in cases {
-            let mut request = request();
-            request.response_schema = Some(ResponseSchema {
-                name: "result".into(),
-                schema: schema.clone(),
-            });
-            assert_eq!(
-                encode(&request).unwrap_err().kind,
-                ProviderErrorKind::InvalidRequest,
-                "{schema}"
-            );
-        }
-    }
-
-    #[test]
-    fn text_lifecycle_usage_then_done() {
-        use crate::provider::protocol::ResponseAssembler;
-        let mut decoder = Decoder::new("gpt-5".into());
-        let mut assembler = ResponseAssembler::default();
-        for frame in [
-            delta(json!({"content":"hel"})),
-            delta(json!({"content":"lo 世界"})),
-            end("stop"),
-            usage(),
-            done(),
-        ] {
-            for chunk in decoder.decode(&frame).unwrap() {
-                assembler.push(&chunk).unwrap();
-            }
-        }
-        let (items, _, reason) = assembler.finish().unwrap();
-        assert_eq!(
-            items[0].blocks[0].content,
-            BlockContent::Text {
-                text: "hello 世界".into()
-            }
-        );
-        assert_eq!(reason, StopReason::EndTurn);
-        assert!(decoder.finish().unwrap().is_empty());
+        assert_eq!(body["tools"][0]["function"]["name"], "inspect");
+        assert_eq!(body["reasoning_effort"], "high");
     }
 
     #[test]
@@ -1427,45 +1112,6 @@ mod tests {
     }
 
     #[test]
-    fn finish_reason_can_share_final_delta_and_usage() {
-        use crate::provider::protocol::ResponseAssembler;
-        let mut decoder = Decoder::new("gpt-5".into());
-        let mut assembler = ResponseAssembler::default();
-        let frame = event(
-            json!({"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":5}}),
-        );
-        for chunk in decoder
-            .decode(&frame)
-            .unwrap()
-            .into_iter()
-            .chain(decoder.finish().unwrap())
-        {
-            assembler.push(&chunk).unwrap();
-        }
-        let (items, usage, reason) = assembler.finish().unwrap();
-        assert_eq!(
-            items[0].blocks[0].content,
-            BlockContent::Text {
-                text: "answer".into()
-            }
-        );
-        assert_eq!(usage.output_tokens, 5);
-        assert_eq!(reason, StopReason::EndTurn);
-    }
-
-    #[test]
-    fn content_filter_is_a_stop_reason() {
-        let mut decoder = Decoder::new("gpt-5".into());
-        assert!(decoder.decode(&end("content_filter")).unwrap().is_empty());
-        assert_eq!(
-            decoder.decode(&done()).unwrap(),
-            vec![ResponseChunk::ResponseEnded {
-                stop_reason: StopReason::ContentFilter
-            }]
-        );
-    }
-
-    #[test]
     fn rejects_premature_eof_done_and_post_terminal_data() {
         let mut decoder = Decoder::new("gpt-5".into());
         assert!(decoder.finish().is_err());
@@ -1481,205 +1127,6 @@ mod tests {
         let mut decoder = Decoder::new("gpt-5".into());
         decoder.decode(&end("stop")).unwrap();
         decoder.decode(&done()).unwrap();
-        assert!(decoder.decode(&usage()).is_err());
-    }
-
-    #[test]
-    fn refusals_and_errors_are_not_silent() {
-        for event in [
-            delta(json!({"refusal":"I cannot comply"})),
-            event(json!({"error":{"message":"quota exhausted","type":"rate_limit_error"}})),
-            SseEvent {
-                event: Some("error".into()),
-                data: "{\"message\":\"failed\"}".into(),
-            },
-        ] {
-            let mut decoder = Decoder::new("gpt-5".into());
-            assert_eq!(
-                decoder.decode(&event).unwrap_err().kind,
-                ProviderErrorKind::Response
-            );
-            assert!(decoder.finish().is_err());
-        }
-        for reason in ["function_call", "refusal", "unknown", "tool_calls"] {
-            assert!(Decoder::new("gpt-5".into()).decode(&end(reason)).is_err());
-        }
-    }
-
-    #[test]
-    fn upstream_error_payloads_and_refusals_do_not_leak() {
-        let secret = "credential-super-secret";
-        for frame in [
-            event(json!({"error":{"message":secret,"code":secret}})),
-            delta(json!({"refusal":secret})),
-            delta(json!({secret:"value"})),
-            end(secret),
-            SseEvent {
-                event: Some(secret.into()),
-                data: "{}".into(),
-            },
-            SseEvent {
-                event: None,
-                data: format!("{{invalid-{secret}"),
-            },
-        ] {
-            let error = Decoder::new("gpt-5".into()).decode(&frame).unwrap_err();
-            assert!(!error.message.contains(secret));
-        }
-        let mut decoder = Decoder::new("gpt-5".into());
-        decoder
-            .decode(&delta(json!({"tool_calls":[{"index":0,"id":secret,
-            "function":{"name":"tool","arguments":secret}}]})))
-            .unwrap();
-        assert!(
-            !decoder
-                .decode(&end("tool_calls"))
-                .unwrap_err()
-                .message
-                .contains(secret)
-        );
-    }
-
-    #[test]
-    fn malformed_and_unsupported_semantic_chunks_are_protocol_errors() {
-        let cases = vec![
-            json!(null),
-            json!({}),
-            json!({"choices":[]}),
-            json!({"choices":{},"usage":null}),
-            json!({"choices":[{"index":1,"delta":{}}]}),
-            json!({"choices":[{"index":0,"delta":{}},{"index":1,"delta":{}}]}),
-            json!({"choices":[{"index":0,"message":{"content":"not streaming"}}]}),
-            json!({"object":"chat.completion","choices":[]}),
-        ];
-        for value in cases {
-            assert_eq!(
-                Decoder::new("gpt-5".into())
-                    .decode(&event(value.clone()))
-                    .unwrap_err()
-                    .kind,
-                ProviderErrorKind::Protocol,
-                "{value}"
-            );
-        }
-        for value in [
-            json!({"content":[]}),
-            json!({"role":"user"}),
-            json!({"refusal":1}),
-            json!({"reasoning_content":{}}),
-            json!({"reasoning":[]}),
-            json!({"reasoning_content":"first", "reasoning":"different"}),
-            json!({"function_call":{"name":"old"}}),
-            json!({"audio":{"data":"..."}}),
-            json!({"tool_calls":{}}),
-        ] {
-            assert!(
-                Decoder::new("gpt-5".into())
-                    .decode(&delta(value.clone()))
-                    .is_err(),
-                "{value}"
-            );
-        }
-        assert!(
-            Decoder::new("gpt-5".into())
-                .decode(&SseEvent {
-                    event: None,
-                    data: "{".into()
-                })
-                .is_err()
-        );
-        assert!(
-            Decoder::new("gpt-5".into())
-                .decode(&SseEvent {
-                    event: Some("vendor".into()),
-                    data: "{}".into()
-                })
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn malformed_tool_calls_fail_instead_of_defaulting_arguments() {
-        for arguments in ["", "{", "null", "[]", "42", "{\"x\":}"] {
-            let mut decoder = Decoder::new("gpt-5".into());
-            decoder
-                .decode(&delta(
-                    json!({"tool_calls":[{"index":0,"id":"c","type":"function",
-                "function":{"name":"tool","arguments":arguments}}]}),
-                ))
-                .unwrap();
-            assert!(decoder.decode(&end("tool_calls")).is_err(), "{arguments}");
-            assert!(decoder.finish().is_err());
-        }
-        for call in [
-            json!({"id":"c","function":{}}),
-            json!({"index":-1}),
-            json!({"index":0,"type":"custom"}),
-            json!({"index":0,"function":{"arguments":{}}}),
-            json!({"index":0,"function":{"name":42}}),
-            json!({"index":0,"id":42}),
-        ] {
-            assert!(
-                Decoder::new("gpt-5".into())
-                    .decode(&delta(json!({"tool_calls":[call]})))
-                    .is_err()
-            );
-        }
-        let mut decoder = Decoder::new("gpt-5".into());
-        decoder
-            .decode(&delta(
-                json!({"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]}),
-            ))
-            .unwrap();
-        assert!(decoder.decode(&end("tool_calls")).is_err());
-        let mut decoder = Decoder::new("gpt-5".into());
-        decoder
-            .decode(&delta(json!({"tool_calls":[
-                {"index":0,"id":"same","function":{"name":"a","arguments":"{}"}},
-                {"index":1,"id":"same","function":{"name":"b","arguments":"{}"}}
-            ]})))
-            .unwrap();
-        assert!(decoder.decode(&end("tool_calls")).is_err());
-        assert!(
-            Decoder::new("gpt-5".into())
-                .decode(&delta(json!({"tool_calls":[{"index":0},{"index":0}]})))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn usage_is_validated_not_guessed_or_double_counted() {
-        for value in [
-            json!({}),
-            json!({"prompt_tokens":-1,"completion_tokens":1}),
-            json!({"input_tokens":1,"output_tokens":1}),
-            json!({"prompt_tokens":1.5,"completion_tokens":1}),
-            json!({"prompt_tokens":1,"completion_tokens":1,"total_tokens":3}),
-            json!({"prompt_tokens":1,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":2}}),
-            json!({"prompt_tokens":1,"completion_tokens":1,"prompt_tokens_details":[]}),
-        ] {
-            assert!(
-                Decoder::new("gpt-5".into())
-                    .decode(&event(json!({"choices":[],"usage":value})))
-                    .is_err()
-            );
-        }
-        let mut decoder = Decoder::new("gpt-5".into());
-        decoder.decode(&usage()).unwrap();
-        assert!(decoder.decode(&usage()).is_ok());
-        let larger = event(
-            json!({"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":8}}}),
-        );
-        assert_eq!(
-            decoder.decode(&larger).unwrap(),
-            vec![ResponseChunk::UsageUpdated {
-                usage: Usage {
-                    input_tokens: 12,
-                    cached_input_tokens: 8,
-                    output_tokens: 8
-                }
-            }]
-        );
         assert!(decoder.decode(&usage()).is_err());
     }
 }

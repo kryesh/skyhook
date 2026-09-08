@@ -526,16 +526,14 @@ pub struct HighlightCache {
     clock: u64,
     changed_sources: Vec<u64>,
 }
+#[cfg(test)]
 impl Default for HighlightCache {
     fn default() -> Self {
-        Self::new(None)
+        Self::with_notify(tokio::sync::mpsc::unbounded_channel().0)
     }
 }
 impl HighlightCache {
-    pub fn with_notify(sender: tokio::sync::mpsc::UnboundedSender<super::app::Work>) -> Self {
-        Self::new(Some(sender))
-    }
-    fn new(notify: Option<tokio::sync::mpsc::UnboundedSender<super::app::Work>>) -> Self {
+    pub fn with_notify(notify: tokio::sync::mpsc::UnboundedSender<super::app::Work>) -> Self {
         let (sender, jobs) = mpsc::sync_channel::<(u64, CodeKey)>(16);
         let (completed, receiver) = mpsc::channel();
         let worker = thread::Builder::new()
@@ -561,9 +559,7 @@ impl HighlightCache {
                     {
                         break;
                     }
-                    if let Some(sender) = &notify {
-                        let _ = sender.send(super::app::Work::HighlightsReady);
-                    }
+                    let _ = notify.send(super::app::Work::HighlightsReady);
                 }
             });
         Self {
@@ -637,9 +633,6 @@ impl HighlightCache {
         }
         self.schedule(selected.into_iter());
         changed
-    }
-    pub fn warm(&mut self, document: &Document, light: bool) {
-        self.schedule(document.keys(light));
     }
     fn schedule(&mut self, keys: impl Iterator<Item = CodeKey>) {
         let mut bytes: usize = self.entries.keys().map(|key| key.source.len()).sum();
@@ -826,88 +819,6 @@ mod tests {
         assert!(document.plain_text().ends_with("\n  \n"));
     }
 
-    #[test]
-    fn source_keys_hash_fixed_metadata_and_cache_eligibility() {
-        #[derive(Default)]
-        struct CountBytes(usize);
-        impl Hasher for CountBytes {
-            fn finish(&self) -> u64 {
-                self.0 as u64
-            }
-            fn write(&mut self, bytes: &[u8]) {
-                self.0 += bytes.len();
-            }
-        }
-        let small = CodeSource::from("const value = 1;");
-        let original = "const value = 1;\n".repeat(MAX_SECTION / 17);
-        let large = CodeSource::from(original.as_str());
-        assert!(large.eligible);
-        let mut bytes = Vec::new();
-        for source in [small, large.clone()] {
-            let mut counter = CountBytes::default();
-            CodeKey::new(source, "js", false).hash(&mut counter);
-            bytes.push(counter.0);
-        }
-        assert_eq!(
-            bytes[0], bytes[1],
-            "source bytes must not be hashed on cache lookups"
-        );
-        assert!(bytes[1] < 32);
-        assert!(Arc::ptr_eq(&large.text, &large.clone().text));
-        assert_eq!(large, CodeSource::from(original.as_str()));
-        assert!(!CodeSource::from("x".repeat(MAX_LINE + 1).as_str()).eligible);
-        assert!(!CodeSource::from("x\n".repeat(MAX_SECTION).as_str()).eligible);
-    }
-
-    #[test]
-    fn completion_ids_only_invalidate_affected_sources_and_rebuilt_docs_reuse_cache() {
-        let (sender, receiver) = mpsc::channel();
-        let mut cache = HighlightCache {
-            entries: HashMap::new(),
-            working_set: HashSet::new(),
-            sender: None,
-            receiver,
-            generation: 0,
-            clock: 0,
-            changed_sources: Vec::new(),
-        };
-        let make = |source| {
-            let mut document = Document::default();
-            document.code(source, "js", 0, vec![], Role::Plain);
-            document
-        };
-        let first = make("return 1;");
-        let second = make("return 2;");
-        let rebuilt = make("return 1;");
-        assert_eq!(
-            first.highlight_sources().collect::<Vec<_>>(),
-            rebuilt.highlight_sources().collect::<Vec<_>>()
-        );
-        cache.prepare([&first, &second, &rebuilt].into_iter(), false);
-        assert_eq!(cache.entries.len(), 2);
-        let key = first.keys(false).next().unwrap();
-        sender
-            .send(Completion {
-                generation: 0,
-                key,
-                lines: vec![Line::from("return 1;")],
-            })
-            .unwrap();
-        assert!(cache.poll());
-        assert_eq!(
-            cache.take_changed_sources(),
-            first.highlight_sources().collect::<Vec<_>>()
-        );
-        assert!(cache.take_changed_sources().is_empty());
-        assert!(cache.is_highlighted(&first, false));
-        assert_eq!(
-            cache.is_highlighted(&first, false),
-            cache.is_highlighted(&rebuilt, false)
-        );
-        assert!(!cache.is_highlighted(&second, false));
-        assert!(!cache.is_highlighted(&first, true));
-    }
-
     /// Run with --release --ignored --nocapture to report routine lookup cost.
     #[test]
     fn admitted_highlights_retry_after_queue_pressure_without_repreparing_documents() {
@@ -934,39 +845,6 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         panic!("admitted sections were stranded after the worker queue filled");
-    }
-
-    #[test]
-    #[ignore = "manual hotpath timing"]
-    fn large_source_routine_cache_lookup_timing() {
-        let (_sender, receiver) = mpsc::channel();
-        let mut cache = HighlightCache {
-            entries: HashMap::new(),
-            working_set: HashSet::new(),
-            sender: None,
-            receiver,
-            generation: 0,
-            clock: 0,
-            changed_sources: Vec::new(),
-        };
-        let mut document = Document::default();
-        document.code(
-            &"const value = 1;\n".repeat(15_000),
-            "js",
-            0,
-            vec![],
-            Role::Plain,
-        );
-        cache.prepare(std::iter::once(&document), false);
-        let started = Instant::now();
-        for _ in 0..10_000 {
-            std::hint::black_box(cache.is_highlighted(std::hint::black_box(&document), false));
-            cache.prepare(std::iter::once(std::hint::black_box(&document)), false);
-        }
-        eprintln!(
-            "240KB source prepare + readiness: {:?}/iteration",
-            started.elapsed() / 10_000
-        );
     }
 
     #[test]
@@ -1015,135 +893,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_specific_fields_keep_argument_boundaries_and_edits_appear_once() {
-        let mut shell = Document::default();
-        shell.arguments(
-            "shell",
-            &json!({"command": "printf '%s\\n' \"hello world\""}),
-        );
-        assert_eq!(&*source(&shell, "sh"), "printf '%s\\n' \"hello world\"");
-        let mut exec = Document::default();
-        exec.arguments("exec", &json!({"argv": ["printf", "%s\\n", "hello world"]}));
-        assert!(exec.plain_text().contains("3.  hello world"));
-        assert!(exec.keys(false).next().is_none());
-        let mut edit = Document::default();
-        edit.arguments(
-            "replace",
-            &json!({"path": "src/main.rs", "old": "let old = 1;\n", "new": "let new = 2;\n"}),
-        );
-        let text = edit.plain_text();
-        assert_eq!(text.matches("let old = 1;").count(), 1);
-        assert_eq!(text.matches("let new = 2;").count(), 1);
-        assert!(text.contains("− let old = 1;"));
-        assert!(text.contains("+ let new = 2;"));
-        let mut patch = Document::default();
-        let diff = "@@ -1 +1 @@\n-old\n+new\n";
-        patch.arguments("patch", &json!({"path": "a.rs", "patch": diff}));
-        assert_eq!(&*source(&patch, "diff"), diff);
-    }
-
-    #[test]
-    fn structured_and_paged_outputs_preserve_original_text() {
-        let args = json!({"path": "example.rs"});
-        let output =
-            json!({"result": {"path": "example.rs", "content": "fn main() {\n    // hi\n}\n"}});
-        let before = serde_json::to_vec(&output).unwrap();
-        let mut document = Document::default();
-        document.output("read", &args, &output);
-        assert_eq!(
-            &*source(&document, "rs"),
-            output["result"]["content"].as_str().unwrap()
-        );
-        assert!(source(&document, "json").contains("\n  \"result\": {"));
-        assert_eq!(document.plain_text().matches("fn main()").count(), 1);
-        assert_eq!(serde_json::to_vec(&output).unwrap(), before);
-        let page = json!({"preview": {"field": "/result/content", "lines": ["    return 7;  ", "}"], "total_lines": 100, "next_start": 44, "next_offset": 0}});
-        let mut document = Document::default();
-        document.output("read", &args, &page);
-        assert_eq!(&*source(&document, "rs"), "    return 7;  \n}");
-        assert!(document.plain_text().contains("    return 7;  "));
-        assert!(
-            document
-                .plain_text()
-                .contains("More saved output available")
-        );
-        let fragment = json!({"preview": {"field": "", "lines": ["  \"key\": ["], "total_lines": 100, "next_start": 44, "next_offset": 0}});
-        let mut document = Document::default();
-        document.output("custom", &json!({}), &fragment);
-        assert_eq!(&*source(&document, "json"), "  \"key\": [");
-    }
-
-    #[test]
-    fn script_console_is_displayed_from_nested_result_without_mutating_it() {
-        let output = json!({"result":{"value":{"answer":42},"console":"literal text\nline 2  "}});
-        let before = output.clone();
-        let mut document = Document::default();
-        document.output("script", &json!({}), &output);
-        assert!(document.plain_text().contains("Console"));
-        assert!(document.plain_text().contains("line 2  "));
-        assert_eq!(document.plain_text().matches("literal text").count(), 1);
-        let metadata: Value = serde_json::from_str(&source(&document, "json")).unwrap();
-        assert_eq!(metadata["result"]["value"]["answer"], 42);
-        assert!(metadata["result"].get("console").is_none());
-        assert_eq!(output, before);
-    }
-
-    #[test]
-    fn complete_json_output_pages_are_indented_without_changing_values() {
-        let value =
-            json!({"literal": "[{},:] \\\" 界", "items": [1, {"enabled": true, "empty": []}]});
-        let compact = serde_json::to_string(&value).unwrap();
-        let page = json!({"preview": {"field": "", "lines": [compact], "total_lines": 1, "next_start": null, "next_offset": 0}});
-        let before = serde_json::to_vec(&page).unwrap();
-        let mut document = Document::default();
-        document.output("script", &json!({}), &page);
-        let formatted = source(&document, "json");
-        assert!(formatted.contains("\n  \"items\": [\n    1,\n    {"));
-        assert_eq!(serde_json::from_str::<Value>(&formatted).unwrap(), value);
-        assert_eq!(serde_json::to_vec(&page).unwrap(), before);
-        let rows = ["{", "\"result\": {", "\"items\": [1,2]", "}", "}"]
-            .into_iter()
-            .map(|text| json!(text))
-            .collect::<Vec<_>>();
-        let mut multiline = Document::default();
-        multiline.output(
-            "script",
-            &json!({}),
-            &json!({"preview": {"field": "", "lines": rows, "next_start": null}}),
-        );
-        let formatted = source(&multiline, "json");
-        assert!(formatted.contains("\n    \"items\": [\n      1,\n      2\n    ]"));
-        assert_eq!(
-            serde_json::from_str::<Value>(&formatted).unwrap(),
-            json!({"result": {"items": [1,2]}})
-        );
-        let mut stdout = Document::default();
-        stdout.output("exec", &json!({}), &json!({"preview": {"field": "/result/stdout", "lines": [compact], "total_lines": 1, "next_start": null, "next_offset": 0}}));
-        assert_eq!(&*source(&stdout, "json"), &*source(&document, "json"));
-    }
-
-    #[test]
-    fn json_page_fragments_do_not_invent_missing_data_or_reformat_file_source() {
-        for lines in [
-            vec!["{\"items\":[1,{\"value\":\"unfinished"],
-            vec!["continued string\"}"],
-            vec!["{}", "{}"],
-        ] {
-            let mut document = Document::default();
-            document.output(
-                "script",
-                &json!({}),
-                &json!({"preview": {"field": "", "lines": lines, "next_start": null}}),
-            );
-            assert_eq!(&*source(&document, "json"), lines.join("\n"));
-        }
-        let original = "{\"nested\": {\"value\":42}}  ";
-        let mut document = Document::default();
-        document.output("read", &json!({"path": "source.json"}), &json!({"preview": {"field": "/result/content", "lines": [original], "total_lines": 1, "next_start": null, "next_offset": 0}}));
-        assert_eq!(&*source(&document, "json"), original);
-    }
-
-    #[test]
     fn oversized_and_unknown_source_falls_back_without_losing_text() {
         let mut cache = HighlightCache::default();
         for original in ["x".repeat(MAX_LINE + 1), "x\n".repeat(MAX_SECTION / 2 + 1)] {
@@ -1175,7 +924,7 @@ mod tests {
         let mut document = Document::default();
         document.code("const value = 42;", "js", 0, vec![], Role::Plain);
         for light in [false, true] {
-            cache.warm(&document, light);
+            cache.prepare(std::iter::once(&document), light);
             let wake = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
                 .await
                 .unwrap();

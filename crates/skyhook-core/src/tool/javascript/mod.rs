@@ -3,6 +3,6 @@
 mod console;
 mod runtime;
 
-pub use runtime::{JsError, evaluate};
+pub use runtime::JsError;
 
 pub(crate) use runtime::evaluate_captured;

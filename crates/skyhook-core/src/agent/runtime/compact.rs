@@ -331,14 +331,25 @@ impl SessionRuntime {
         }
         // Retry against current history and runtime state, including any todo
         // changes that invalidated an earlier attempt's snapshot.
-        let mut input = input.clone();
-        input.messages = projected
-            .iter()
-            .map(|(_, message)| message.clone())
-            .collect();
+        let mut input = ModelRequest {
+            model: input.model.clone(),
+            system: input.system.clone(),
+            messages: projected
+                .iter()
+                .map(|(_, message)| message.clone())
+                .collect(),
+            tools: input.tools.clone(),
+            reasoning: input.reasoning.clone(),
+            response_schema: input.response_schema.clone(),
+            max_output_tokens: input.max_output_tokens,
+            correlation: input.correlation.clone(),
+        };
         input.messages.push(Message::User(vec![
             prompt::runtime_state_content(&self.jobs, &self.todos, agent, turn.capabilities).await,
         ]));
+        let before_tokens = compaction::estimate_request(&input);
+        // Keep only the original template for the post-compaction estimate.
+        let summary_messages = std::mem::take(&mut input.messages);
         let directive = compaction::directive();
         let mut summary_request = input.clone();
         // Summarization cannot execute tools. Keep their historical calls/results
@@ -348,13 +359,17 @@ impl SessionRuntime {
             name: "skyhook_compaction".into(),
             schema: compaction::response_schema(),
         });
+        let template = summary_request.clone();
+        summary_request.messages = summary_messages;
         summary_request.messages.push(directive.clone());
         let mut messages = context_sources(&projected);
-        // input ends in the exact transient runtime state used for this attempt.
+        // The penultimate message is the exact transient state for this attempt.
         messages.push(ContextMessage::Inline {
-            message: input
+            message: summary_request
                 .messages
-                .last()
+                .iter()
+                .rev()
+                .nth(1)
                 .expect("runtime state is present")
                 .clone(),
         });
@@ -372,8 +387,6 @@ impl SessionRuntime {
                 }
             })
             .ok_or_else(|| HarnessError::Compaction("model context is missing".into()))?;
-        let mut template = summary_request.clone();
-        template.messages.clear();
         let summary_context = self
             .store
             .append(
@@ -567,7 +580,6 @@ impl SessionRuntime {
         )
         .await;
         compacted.messages.push(Message::User(vec![runtime]));
-        let before_tokens = compaction::estimate_request(&input);
         let after_tokens = compaction::estimate_request(&compacted);
         if after_tokens >= before_tokens {
             self.store.append(agent.clone(), SessionEvent::CompactionSkipped {

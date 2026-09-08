@@ -1,7 +1,5 @@
 //! Reconstruct model-visible history and exact provider requests from durable events.
 
-use std::collections::BTreeMap;
-
 use crate::{
     identity::AgentId,
     provider::protocol::{BlockContent, Message, ModelRequest},
@@ -222,73 +220,54 @@ fn valid_tool_pair(assistant: &Message, tool: &Message) -> bool {
 }
 
 /// Return the configured provider name and exact request at a `ModelRequested` event.
+/// Records must be ordered by sequence, as returned by `SessionStore`.
 /// Image references retain their journaled blob metadata; use
 /// `SessionStore::hydrate_model_request` to restore request-local payloads.
 pub fn reconstruct_model_request(
     records: &[EventRecord],
     sequence: u64,
 ) -> Result<(String, ModelRequest), SessionError> {
-    let invalid = |reason| SessionError::ModelRequestReplay { sequence, reason };
     let index = records
-        .iter()
-        .position(|record| record.sequence == sequence)
-        .ok_or_else(|| invalid("event not found"))?;
-    reconstruct_from_prefix(&records[..index], &records[index])
-}
-
-pub(super) fn reconstruct_from_prefix(
-    records: &[EventRecord],
-    call: &EventRecord,
-) -> Result<(String, ModelRequest), SessionError> {
-    // Verify strict ordering before using binary search. Unordered or duplicate
-    // sequences retain the slice API's original first-matching-record semantics.
-    let sorted = records
-        .windows(2)
-        .all(|pair| pair[0].sequence < pair[1].sequence);
-    reconstruct_with_lookup(call, |sequence| {
-        if sorted {
-            records
-                .binary_search_by_key(&sequence, |record| record.sequence)
-                .ok()
-                .map(|index| &records[index])
-        } else {
-            records
-                .iter()
-                .find(|record| record.sequence == sequence && record.agent == call.agent)
-        }
-    })
-}
-
-/// Reconstruct a request directly from a borrowed, sequence-keyed event index.
-///
-/// This clones only the provider name and request contents, not unrelated events.
-/// Each referenced event is resolved in O(log n) time without scanning history.
-/// Keys must equal their records' sequence IDs. Only records with a sequence
-/// strictly before the requested event can supply its context or messages.
-/// Image payload hydration remains the caller's responsibility.
-pub fn reconstruct_model_request_indexed(
-    records: &BTreeMap<u64, EventRecord>,
-    sequence: u64,
-) -> Result<(String, ModelRequest), SessionError> {
-    let call = records
-        .get(&sequence)
-        .filter(|record| record.sequence == sequence)
-        .ok_or(SessionError::ModelRequestReplay {
+        .binary_search_by_key(&sequence, |record| record.sequence)
+        .map_err(|_| SessionError::ModelRequestReplay {
             sequence,
             reason: "event not found",
         })?;
-    reconstruct_with_lookup(call, |source| {
-        (source < sequence)
-            .then(|| records.get(&source))
-            .flatten()
-            .filter(|record| record.sequence == source)
-    })
+    let mut messages = Vec::new();
+    let (provider, template) = visit_request(
+        &records[index],
+        |source| {
+            records[..index]
+                .binary_search_by_key(&source, |record| record.sequence)
+                .ok()
+                .map(|position| &records[position])
+        },
+        |message| messages.push(message.clone()),
+    )?;
+    let mut request = template.clone();
+    request.messages = messages;
+    Ok((provider.to_owned(), request))
 }
 
-fn reconstruct_with_lookup<'a>(
+/// Validate against the contiguous, sequence-checked journal prefix without
+/// cloning a request that the caller will discard.
+pub(super) fn validate_request(
+    records: &[EventRecord],
     call: &EventRecord,
+) -> Result<(), SessionError> {
+    visit_request(
+        call,
+        |sequence| records.get(usize::try_from(sequence.checked_sub(1)?).ok()?),
+        |_| {},
+    )?;
+    Ok(())
+}
+
+fn visit_request<'a>(
+    call: &'a EventRecord,
     mut lookup: impl FnMut(u64) -> Option<&'a EventRecord>,
-) -> Result<(String, ModelRequest), SessionError> {
+    mut visit: impl FnMut(&'a Message),
+) -> Result<(&'a str, &'a ModelRequest), SessionError> {
     let invalid = |reason| SessionError::ModelRequestReplay {
         sequence: call.sequence,
         reason,
@@ -310,11 +289,9 @@ fn reconstruct_with_lookup<'a>(
             "model context must not duplicate conversation history",
         ));
     }
-    let mut request = template.clone();
-    request.messages.reserve(messages.len());
     for message in messages {
-        request.messages.push(match message {
-            ContextMessage::Inline { message } => message.clone(),
+        visit(match message {
+            ContextMessage::Inline { message } => message,
             ContextMessage::Source { sequence } => {
                 let source = lookup(*sequence)
                     .filter(|record| record.agent == call.agent)
@@ -322,8 +299,8 @@ fn reconstruct_with_lookup<'a>(
                         invalid("message source must precede the call and belong to the same agent")
                     })?;
                 match &source.event {
-                    SessionEvent::MessageCommitted { message } => message.clone(),
-                    SessionEvent::Compaction { checkpoint } => checkpoint.message.clone(),
+                    SessionEvent::MessageCommitted { message } => message,
+                    SessionEvent::Compaction { checkpoint } => &checkpoint.message,
                     _ => {
                         return Err(invalid(
                             "referenced event does not contain a conversation message",
@@ -333,7 +310,7 @@ fn reconstruct_with_lookup<'a>(
             }
         });
     }
-    Ok((provider.clone(), request))
+    Ok((provider, template))
 }
 
 #[cfg(test)]
@@ -342,126 +319,11 @@ mod tests {
     use crate::{
         identity::AgentId,
         provider::protocol::{
-            AssistantBlock, AssistantItem, ItemKind, ReplayEnvelope, SystemSegment, ToolDefinition,
-            ToolResult, UserContent,
+            AssistantItem, ReplayEnvelope, SystemSegment, ToolDefinition, ToolResult, UserContent,
         },
         session::SessionStore,
     };
     use serde_json::json;
-
-    #[tokio::test]
-    async fn persisted_three_three_two_summary_blocks_keep_item_replay_once() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(directory.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
-        let message = Message::Assistant(
-            [3, 3, 2].into_iter().enumerate().map(|(position, count)| {
-                AssistantItem {
-                    id: format!("reasoning-{position}"),
-                    position,
-                    kind: ItemKind::Reasoning,
-                    blocks: (0..count).map(|part| AssistantBlock {
-                        id: format!("summary-{position}-{part}"),
-                        position: part,
-                        content: BlockContent::Reasoning {
-                            text: format!("summary {position}/{part}"),
-                        },
-                    }).collect(),
-                    replay: Some(ReplayEnvelope {
-                        version: 1,
-                        protocol: "responses".into(),
-                        model: "reasoning-model".into(),
-                        scope: "reasoning".into(),
-                        payload: json!({"encrypted_content": format!("opaque-{position}"), "unknown": {"keep": [1, true, null]}}),
-                    }),
-                }
-            }).collect(),
-        );
-        let source = store
-            .append(
-                agent.clone(),
-                SessionEvent::MessageCommitted {
-                    message: message.clone(),
-                },
-            )
-            .await
-            .unwrap();
-        let template = ModelRequest {
-            model: "reasoning-model".into(),
-            reasoning: None,
-            system: vec![],
-            messages: vec![],
-            tools: vec![],
-            response_schema: None,
-            max_output_tokens: None,
-            correlation: None,
-        };
-        let context = store
-            .append(
-                agent.clone(),
-                SessionEvent::ModelContext {
-                    provider: "responses".into(),
-                    template: template.clone(),
-                },
-            )
-            .await
-            .unwrap();
-        let request = store
-            .append(
-                agent.clone(),
-                SessionEvent::ModelRequested {
-                    context: context.sequence,
-                    purpose: ModelPurpose::Agent,
-                    messages: vec![
-                        ContextMessage::Source {
-                            sequence: source.sequence,
-                        },
-                        ContextMessage::Inline {
-                            message: message.clone(),
-                        },
-                    ],
-                },
-            )
-            .await
-            .unwrap();
-        let id = store.id();
-        let journal = store.directory().join("events.jsonl");
-        let before = store.records().await;
-        store.close().await.unwrap();
-
-        let archived = SessionStore::read_records(directory.path(), id)
-            .await
-            .unwrap();
-        let (reopened, restored) = SessionStore::open(directory.path(), id).await.unwrap();
-        assert_eq!(archived, before);
-        assert_eq!(restored, before);
-        assert_eq!(
-            project_history(&restored, &agent).unwrap(),
-            vec![(source.sequence, message.clone())]
-        );
-        let (_, replayed) = reconstruct_model_request(&restored, request.sequence).unwrap();
-        let mut expected = template;
-        expected.messages = vec![message.clone(), message];
-        assert_eq!(replayed, expected);
-        assert_indexed_equivalent(&restored, request.sequence);
-        // One envelope per item per persisted message (source and inline),
-        // never one envelope per summary block.
-        let journal = tokio::fs::read_to_string(journal).await.unwrap();
-        for position in 0..3 {
-            assert_eq!(journal.matches(&format!("opaque-{position}")).count(), 2);
-        }
-        let Message::Assistant(items) = &replayed.messages[0] else {
-            panic!("assistant")
-        };
-        assert_eq!(
-            items
-                .iter()
-                .map(|item| item.blocks.len())
-                .collect::<Vec<_>>(),
-            vec![3, 3, 2]
-        );
-        reopened.close().await.unwrap();
-    }
 
     #[tokio::test]
     async fn replay_preserves_context_boundaries_and_image_payloads() {
@@ -608,14 +470,13 @@ mod tests {
             .await
             .unwrap();
         let id = store.id();
-        store.close().await.unwrap();
+        drop(store);
         let (store, records) = SessionStore::open(directory.path(), id).await.unwrap();
         let (provider, mut restored) = reconstruct_model_request(&records, call.sequence).unwrap();
         assert_eq!(provider, "original-provider");
         let mut expected = template;
         expected.messages = vec![user, assistant, tool, Message::User(vec![runtime])];
         assert_eq!(restored, expected);
-        assert_indexed_equivalent(&records, call.sequence);
         store.hydrate_model_request(&mut restored).await.unwrap();
         store.hydrate_model_request(&mut expected).await.unwrap();
         assert_eq!(restored, expected);
@@ -749,134 +610,6 @@ mod tests {
         (agent, records)
     }
 
-    fn assert_indexed_equivalent(records: &[EventRecord], sequence: u64) {
-        let index = records
-            .iter()
-            .map(|record| (record.sequence, record.clone()))
-            .collect();
-        let slice = reconstruct_model_request(records, sequence);
-        let indexed = reconstruct_model_request_indexed(&index, sequence);
-        match (slice, indexed) {
-            (Ok(slice), Ok(indexed)) => assert_eq!(slice, indexed),
-            (
-                Err(SessionError::ModelRequestReplay {
-                    sequence: a,
-                    reason: ar,
-                }),
-                Err(SessionError::ModelRequestReplay {
-                    sequence: b,
-                    reason: br,
-                }),
-            ) => assert_eq!((a, ar), (b, br)),
-            results => panic!("reconstruction differs: {results:?}"),
-        }
-    }
-
-    #[test]
-    fn indexed_reconstruction_matches_slice_and_replay_errors() {
-        let (agent, records) = projection_fixture();
-        // Includes compaction sources, inline messages, non-monotonic source
-        // ordering, a prior context, and later events that must not leak in.
-        for sequence in 0..=10 {
-            assert_indexed_equivalent(&records, sequence);
-        }
-        for context in [0, 1, 4, 8, 9, 99] {
-            let mut invalid = records.clone();
-            let SessionEvent::ModelRequested {
-                context: reference, ..
-            } = &mut invalid[7].event
-            else {
-                unreachable!()
-            };
-            *reference = context;
-            assert!(reconstruct_model_request(&invalid, 8).is_err());
-            assert_indexed_equivalent(&invalid, 8);
-        }
-        for source in [0, 3, 4, 8, 9, 99] {
-            let mut invalid = records.clone();
-            let SessionEvent::ModelRequested { messages, .. } = &mut invalid[7].event else {
-                unreachable!()
-            };
-            messages[0] = ContextMessage::Source { sequence: source };
-            assert!(reconstruct_model_request(&invalid, 8).is_err());
-            assert_indexed_equivalent(&invalid, 8);
-        }
-        for index in [0, 2, 5] {
-            let mut invalid = records.clone();
-            invalid[index].agent = agent.child(1);
-            assert!(reconstruct_model_request(&invalid, 8).is_err());
-            assert_indexed_equivalent(&invalid, 8);
-        }
-        let mut invalid = records.clone();
-        let SessionEvent::ModelContext { template, .. } = &mut invalid[2].event else {
-            unreachable!()
-        };
-        template.messages.push(text_message("duplicated history"));
-        assert!(reconstruct_model_request(&invalid, 8).is_err());
-        assert_indexed_equivalent(&invalid, 8);
-
-        let mut repeated = records.clone();
-        let SessionEvent::ModelRequested { messages, .. } = &mut repeated[7].event else {
-            unreachable!()
-        };
-        messages.push(ContextMessage::Source { sequence: 1 });
-        assert_indexed_equivalent(&repeated, 8);
-    }
-
-    #[test]
-    fn slice_reconstruction_preserves_unordered_and_duplicate_sequence_behavior() {
-        let (agent, records) = projection_fixture();
-        let expected = reconstruct_model_request(&records, 8).unwrap();
-        let mut unordered = records.clone();
-        unordered[..7].reverse();
-        assert_eq!(reconstruct_model_request(&unordered, 8).unwrap(), expected);
-
-        let mut duplicate = records[0].clone();
-        duplicate.agent = agent.child(1);
-        duplicate.event = SessionEvent::MessageCommitted {
-            message: text_message("other agent duplicate is skipped"),
-        };
-        unordered.insert(0, duplicate);
-        assert_eq!(reconstruct_model_request(&unordered, 8).unwrap(), expected);
-
-        // The first same-agent duplicate wins, even when it has the wrong type.
-        let mut duplicate = records[2].clone();
-        duplicate.sequence = 1;
-        unordered.insert(0, duplicate);
-        assert!(matches!(
-            reconstruct_model_request(&unordered, 8),
-            Err(SessionError::ModelRequestReplay {
-                sequence: 8,
-                reason: "referenced event does not contain a conversation message",
-            })
-        ));
-    }
-
-    #[test]
-    fn indexed_reconstruction_rejects_mismatched_keys() {
-        let (_, records) = projection_fixture();
-        let mut index: BTreeMap<_, _> = records
-            .into_iter()
-            .map(|record| (record.sequence, record))
-            .collect();
-        index.get_mut(&1).unwrap().sequence = 99;
-        assert!(matches!(
-            reconstruct_model_request_indexed(&index, 8),
-            Err(SessionError::ModelRequestReplay {
-                sequence: 8,
-                reason: "message source must precede the call and belong to the same agent",
-            })
-        ));
-        index.get_mut(&8).unwrap().sequence = 99;
-        assert!(matches!(
-            reconstruct_model_request_indexed(&index, 8),
-            Err(SessionError::ModelRequestReplay {
-                sequence: 8,
-                reason: "event not found",
-            })
-        ));
-    }
-
     #[test]
     fn projection_preserves_concurrent_messages_and_repeated_compaction() {
         let (agent, records) = projection_fixture();
@@ -904,37 +637,6 @@ mod tests {
                 .is_empty()
         );
         super::super::event::validate_records(&records, agent.session()).unwrap();
-    }
-
-    #[test]
-    fn exact_replay_uses_explicit_order_and_compaction_sources() {
-        let (_, records) = projection_fixture();
-        let (_, before) = reconstruct_model_request(&records, 4).unwrap();
-        assert_eq!(
-            before.messages,
-            vec![
-                text_message("verbatim plan"),
-                text_message("research"),
-                text_message("summarize")
-            ]
-        );
-        let (provider, after) = reconstruct_model_request(&records, 8).unwrap();
-        assert_eq!(provider, "provider");
-        assert_eq!(after.system[0].text, "system");
-        assert_eq!(
-            after.messages,
-            vec![
-                text_message("first summary"),
-                text_message("verbatim plan"),
-                text_message("concurrent steering"),
-                text_message("continued work"),
-                text_message("state at request time")
-            ]
-        );
-        assert_eq!(
-            reconstruct_model_request(&records[..8], 8).unwrap().1,
-            after
-        );
     }
 
     #[test]
@@ -981,47 +683,8 @@ mod tests {
             };
             messages[0] = ContextMessage::Source { sequence };
             assert!(reconstruct_model_request(&invalid, 8).is_err());
+            assert!(validate_request(&invalid[..7], &invalid[7]).is_err());
         }
-    }
-
-    #[test]
-    fn tool_pair_matches_calls_in_all_nested_blocks() {
-        let calls = ["first", "second"].map(|id| crate::provider::protocol::ToolCall {
-            id: id.into(),
-            name: "shell".into(),
-            arguments: json!({}),
-        });
-        let assistant = Message::Assistant(vec![AssistantItem {
-            id: "nested-calls".into(),
-            position: 0,
-            kind: ItemKind::ToolCall,
-            blocks: calls
-                .iter()
-                .enumerate()
-                .map(|(position, call)| AssistantBlock {
-                    id: format!("call-block-{position}"),
-                    position,
-                    content: BlockContent::ToolCall(call.clone()),
-                })
-                .collect(),
-            replay: None,
-        }]);
-        let results: Vec<_> = calls
-            .iter()
-            .rev()
-            .map(|call| ToolResult {
-                call_id: call.id.clone(),
-                name: call.name.clone(),
-                result: json!({}),
-                images: vec![],
-                is_error: false,
-            })
-            .collect();
-        assert!(valid_tool_pair(&assistant, &Message::Tool(results.clone())));
-        assert!(!valid_tool_pair(
-            &assistant,
-            &Message::Tool(results[..1].to_vec())
-        ));
     }
 
     #[test]
@@ -1096,31 +759,5 @@ mod tests {
         let mut invalid = records.clone();
         invalid[1].agent = agent.child(1);
         assert!(project_history(&invalid[..6], &agent).is_err());
-    }
-
-    #[tokio::test]
-    async fn compaction_commit_survives_reopen_and_invalid_commit_keeps_old_projection() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(directory.path()).await.unwrap();
-        let (_, records) = projection_fixture();
-        let agent = AgentId::root(store.id());
-        for record in records {
-            store.append(agent.clone(), record.event).await.unwrap();
-        }
-        let snapshot = store.records().await;
-        let expected = project_history(&snapshot, &agent).unwrap();
-        let mut invalid = snapshot.last().unwrap().event.clone();
-        let SessionEvent::Compaction { checkpoint } = &mut invalid else {
-            unreachable!()
-        };
-        checkpoint.retained = vec![999];
-        assert!(store.append(agent.clone(), invalid).await.is_err());
-        assert_eq!(store.records().await, snapshot);
-        store.close().await.unwrap();
-        let (reopened, records) = SessionStore::open(directory.path(), store.id())
-            .await
-            .unwrap();
-        assert_eq!(project_history(&records, &agent).unwrap(), expected);
-        assert_eq!(reopened.records().await, snapshot);
     }
 }

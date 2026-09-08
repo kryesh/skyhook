@@ -199,22 +199,30 @@ pub(crate) async fn write_tool_result<W: AsyncWrite + Unpin>(
     result: &Result<RemoteToolOutput, RemoteToolError>,
 ) -> std::io::Result<()> {
     use std::io::{Seek as _, Write as _};
-    let mut file = tempfile::tempfile()?;
+    let mut file = tempfile::spooled_tempfile(64 * 1024);
     {
         let mut buffered = std::io::BufWriter::new(&mut file);
         serde_json::to_writer(&mut buffered, result)?;
         buffered.flush()?;
     }
     file.rewind()?;
-    if file.metadata()?.len() <= 64 * 1024 {
-        let result = serde_json::from_reader(std::io::BufReader::new(file))?;
+    if !file.is_rolled() {
+        // Borrow the original result: no disk I/O, deserialization, or payload clone.
+        #[derive(Serialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum BorrowedResponse<'a> {
+            Tool {
+                request_id: u64,
+                result: &'a Result<RemoteToolOutput, RemoteToolError>,
+            },
+        }
         return write_frame(
             &mut *writer.lock().await,
-            &Response::Tool { request_id, result },
+            &BorrowedResponse::Tool { request_id, result },
         )
         .await;
     }
-    let mut file = tokio::fs::File::from_std(file);
+    let mut file = tokio::fs::File::from_std(file.into_file()?);
     let mut offset = 0;
     let mut buffer = vec![0; 64 * 1024];
     loop {
@@ -269,68 +277,60 @@ pub(crate) async fn write_artifact<W: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
 
-    #[test]
-    fn remote_output_keeps_console_only_inside_script_result() {
-        let output: RemoteToolOutput = serde_json::from_value(serde_json::json!({
-            "value":{"value":42,"console":"captured\n"},
-            "images":[]
-        }))
-        .unwrap();
-        let serialized = serde_json::to_value(&output).unwrap();
-        assert!(serialized.get("console_output").is_none());
-        assert!(serialized.get("console").is_none());
-        let native: ToolOutput = output.into();
-        assert_eq!(
-            native.value,
-            serde_json::json!({"value":42,"console":"captured\n"})
-        );
-    }
-
     #[tokio::test]
-    async fn frames_round_trip() {
-        let (mut left, mut right) = tokio::io::duplex(4096);
-        let sent = Request::Hello;
-        let write = tokio::spawn(async move { write_frame(&mut left, &sent).await.unwrap() });
-        let received: Request = read_frame(&mut right).await.unwrap().unwrap();
-        write.await.unwrap();
-        assert!(matches!(received, Request::Hello));
-
-        let (mut left, mut right) = tokio::io::duplex(4096);
-        let sent = Response::Tool {
-            request_id: 7,
-            result: Err(RemoteToolError {
-                message: "timed out".to_owned(),
+    async fn tool_results_round_trip_in_small_and_spilled_forms() {
+        for length in [0, 70 * 1024] {
+            let value = "x".repeat(length);
+            let result = Err(RemoteToolError {
+                message: "timed out".into(),
                 denial: None,
                 output: Some(Box::new(RemoteToolOutput {
-                    value: serde_json::json!({"stdout":"partial"}),
+                    value: serde_json::json!({"stdout":value}),
                     images: Vec::new(),
                 })),
-            }),
-        };
-        let write = tokio::spawn(async move { write_frame(&mut left, &sent).await.unwrap() });
-        let received: Response = read_frame(&mut right).await.unwrap().unwrap();
-        write.await.unwrap();
-        assert!(matches!(
-            received,
-            Response::Tool {
-                request_id: 7,
-                result: Err(RemoteToolError {
-                    output: Some(output),
-                    ..
-                })
-            } if output.value["stdout"] == "partial"
-        ));
-
-        let (mut left, mut right) = tokio::io::duplex(4096);
-        let write = tokio::spawn(async move {
-            write_frame(&mut left, &Request::Cancel { request_id: 9 })
-                .await
-                .unwrap();
-        });
-        assert!(matches!(
-            read_frame::<_, Request>(&mut right).await.unwrap(),
-            Some(Request::Cancel { request_id: 9 })
-        ));
-        write.await.unwrap();
+            });
+            let (writer, mut reader) = tokio::io::duplex(4096);
+            let send = tokio::spawn(async move {
+                write_tool_result(&tokio::sync::Mutex::new(writer), 7, &result)
+                    .await
+                    .unwrap();
+            });
+            let mut bytes = Vec::new();
+            let received = loop {
+                match read_frame::<_, Response>(&mut reader)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
+                    Response::Tool {
+                        request_id: 7,
+                        result,
+                    } => {
+                        assert!(length < 64 * 1024);
+                        break result;
+                    }
+                    Response::ToolChunk {
+                        request_id: 7,
+                        offset,
+                        data,
+                        finished,
+                    } => {
+                        assert_eq!(offset, bytes.len() as u64);
+                        assert!(data.len() <= 64 * 1024);
+                        if finished {
+                            assert!(data.is_empty());
+                            break serde_json::from_slice::<
+                                Result<RemoteToolOutput, RemoteToolError>,
+                            >(&bytes)
+                            .unwrap();
+                        }
+                        bytes.extend(data);
+                    }
+                    frame => panic!("unexpected result frame: {frame:?}"),
+                }
+            };
+            assert_eq!(received.unwrap_err().output.unwrap().value["stdout"], value);
+            send.await.unwrap();
+        }
     }
 }

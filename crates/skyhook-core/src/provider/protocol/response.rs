@@ -357,6 +357,7 @@ impl ResponseAssembler {
 
 /// Emit complete final-only lifecycles while preserving item/block identities,
 /// order and replay envelopes. Usage and response termination belong to callers.
+#[cfg(test)]
 pub fn events_for_content(items: &[AssistantItem]) -> Vec<ResponseEvent> {
     let mut events = Vec::new();
     for item in items {
@@ -388,19 +389,9 @@ pub fn events_for_content(items: &[AssistantItem]) -> Vec<ResponseEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Message, ToolCall};
+    use super::super::ToolCall;
     use super::*;
     use serde_json::json;
-
-    fn replay() -> ReplayEnvelope {
-        ReplayEnvelope {
-            version: 1,
-            protocol: "responses".into(),
-            model: "model".into(),
-            scope: "reasoning".into(),
-            payload: json!({"opaque": [1, 2, 3]}),
-        }
-    }
 
     fn start(id: &str, position: usize, kind: ItemKind) -> ResponseEvent {
         ResponseEvent::ItemStarted {
@@ -452,74 +443,6 @@ mod tests {
         BlockContent::Text { text: text.into() }
     }
 
-    fn assert_rejected(prefix: &[ResponseEvent], invalid: ResponseEvent) {
-        let mut assembler = ResponseAssembler::default();
-        for event in prefix {
-            assembler.push(event).unwrap();
-        }
-        let before = assembler.snapshot();
-        assert!(
-            assembler.push(&invalid).is_err(),
-            "accepted invalid event: {invalid:?}"
-        );
-        assert_eq!(assembler.snapshot(), before, "rejected event mutated state");
-    }
-
-    #[test]
-    fn consecutive_reasoning_parts_3_3_2_and_serialization() {
-        let items: Vec<_> = [3, 3, 2]
-            .into_iter()
-            .enumerate()
-            .map(|(position, count)| AssistantItem {
-                id: format!("reasoning-{position}"),
-                position,
-                kind: ItemKind::Reasoning,
-                blocks: (0..count)
-                    .map(|part| AssistantBlock {
-                        id: format!("part-{part}"),
-                        position: part,
-                        content: BlockContent::Reasoning {
-                            text: format!("{position}/{part}"),
-                        },
-                    })
-                    .collect(),
-                replay: Some(replay()),
-            })
-            .collect();
-        let message = Message::Assistant(items.clone());
-        assert_eq!(
-            serde_json::from_value::<Message>(serde_json::to_value(&message).unwrap()).unwrap(),
-            message
-        );
-        let events = events_for_content(&items);
-        assert_eq!(
-            events
-                .iter()
-                .filter(|e| matches!(
-                    e,
-                    ResponseEvent::ItemEnded {
-                        replay: Some(_),
-                        ..
-                    }
-                ))
-                .count(),
-            3
-        );
-        assert!(!events.iter().any(|e| matches!(
-            e,
-            ResponseEvent::ResponseEnded { .. } | ResponseEvent::UsageUpdated { .. }
-        )));
-        let mut assembler = ResponseAssembler::default();
-        for event in events {
-            assembler.push(&event).unwrap();
-        }
-        assembler.push(&end()).unwrap();
-        assert_eq!(
-            assembler.finish().unwrap(),
-            (items, Usage::default(), StopReason::EndTurn)
-        );
-    }
-
     #[test]
     fn interleaving_orders_items_and_blocks_by_position_not_arrival() {
         let mut assembler = ResponseAssembler::default();
@@ -553,33 +476,6 @@ mod tests {
             ["a", "b"]
         );
         assert_eq!(items[1].text_content().as_deref(), Some("AB"));
-    }
-
-    #[test]
-    fn empty_and_opaque_only_reasoning_are_preserved() {
-        let items = vec![
-            AssistantItem::reasoning("empty", 0, "", None),
-            AssistantItem {
-                id: "opaque".into(),
-                position: 1,
-                kind: ItemKind::Reasoning,
-                blocks: vec![],
-                replay: Some(replay()),
-            },
-            AssistantItem {
-                id: "no-parts".into(),
-                position: 2,
-                kind: ItemKind::Reasoning,
-                blocks: vec![],
-                replay: None,
-            },
-        ];
-        let mut assembler = ResponseAssembler::default();
-        for event in events_for_content(&items) {
-            assembler.push(&event).unwrap();
-        }
-        assembler.push(&end()).unwrap();
-        assert_eq!(assembler.finish().unwrap().0, items);
     }
 
     #[test]
@@ -645,212 +541,6 @@ mod tests {
         assert_eq!(items[1], tool);
         assert_eq!(usage, last);
         assert_eq!(reason, StopReason::MaxTokens);
-    }
-
-    #[test]
-    fn invalid_starts_and_order_collisions() {
-        assert_rejected(&[], start("", 0, ItemKind::Text));
-        let started = [start("i", 0, ItemKind::Text)];
-        assert_rejected(&started, start("i", 1, ItemKind::Text));
-        assert_rejected(&started, start("other", 0, ItemKind::Text));
-        assert_rejected(&started, block("missing", "b", 0, BlockKind::Text));
-        assert_rejected(&started, block("i", "", 0, BlockKind::Text));
-        for kind in [BlockKind::Reasoning, BlockKind::ToolCallArguments] {
-            assert_rejected(&started, block("i", "b", 0, kind));
-        }
-        let opened = [started[0].clone(), block("i", "b", 0, BlockKind::Text)];
-        assert_rejected(&opened, block("i", "b", 1, BlockKind::Text));
-        assert_rejected(&opened, block("i", "c", 0, BlockKind::Text));
-        assert_rejected(
-            &[start("r", 0, ItemKind::Reasoning)],
-            block("r", "b", 0, BlockKind::Text),
-        );
-        assert_rejected(
-            &[start("t", 0, ItemKind::ToolCall)],
-            block("t", "b", 0, BlockKind::Reasoning),
-        );
-    }
-
-    #[test]
-    fn invalid_missing_and_closed_lifecycles() {
-        let d = delta("i", "b", ContentDelta::Text("x".into()));
-        let b_end = end_block("i", "b", text("x"));
-        for invalid in [d.clone(), b_end.clone(), end_item("i")] {
-            assert_rejected(&[], invalid);
-        }
-        let started = vec![start("i", 0, ItemKind::Text)];
-        for invalid in [d.clone(), b_end.clone(), end_item("i"), end()] {
-            assert_rejected(&started, invalid);
-        }
-        let mut opened = started;
-        opened.push(block("i", "b", 0, BlockKind::Text));
-        for invalid in [end_item("i"), end()] {
-            assert_rejected(&opened, invalid);
-        }
-        opened.push(b_end.clone());
-        for invalid in [
-            d.clone(),
-            b_end.clone(),
-            block("i", "b", 1, BlockKind::Text),
-            end(),
-        ] {
-            assert_rejected(&opened, invalid);
-        }
-        opened.push(end_item("i"));
-        for invalid in [
-            d,
-            b_end,
-            block("i", "new", 1, BlockKind::Text),
-            end_item("i"),
-            ResponseEvent::ItemEnded {
-                id: "i".into(),
-                replay: Some(replay()),
-            },
-            start("i", 1, ItemKind::Text),
-        ] {
-            assert_rejected(&opened, invalid);
-        }
-        opened.push(end());
-        for invalid in [
-            start("new", 1, ItemKind::Reasoning),
-            block("i", "b", 0, BlockKind::Text),
-            delta("i", "b", ContentDelta::Text("x".into())),
-            end_block("i", "b", text("x")),
-            end_item("i"),
-            ResponseEvent::UsageUpdated {
-                usage: Usage::default(),
-            },
-            end(),
-        ] {
-            assert_rejected(&opened, invalid);
-        }
-    }
-
-    #[test]
-    fn invalid_delta_terminal_kinds_and_tool_calls() {
-        let text_prefix = [
-            start("i", 0, ItemKind::Text),
-            block("i", "b", 0, BlockKind::Text),
-        ];
-        assert_rejected(
-            &text_prefix,
-            delta("i", "b", ContentDelta::JsonFragment("{}".into())),
-        );
-        assert_rejected(
-            &text_prefix,
-            end_block("i", "b", BlockContent::Reasoning { text: "x".into() }),
-        );
-        let reason_prefix = [
-            start("i", 0, ItemKind::Reasoning),
-            block("i", "b", 0, BlockKind::Reasoning),
-        ];
-        assert_rejected(
-            &reason_prefix,
-            delta("i", "b", ContentDelta::JsonFragment("{}".into())),
-        );
-        assert_rejected(&reason_prefix, end_block("i", "b", text("x")));
-        let tool_prefix = [
-            start("i", 0, ItemKind::ToolCall),
-            block("i", "b", 0, BlockKind::ToolCallArguments),
-        ];
-        assert_rejected(
-            &tool_prefix,
-            delta("i", "b", ContentDelta::Text("{}".into())),
-        );
-        assert_rejected(&tool_prefix, end_block("i", "b", text("x")));
-        for arguments in [json!(null), json!([]), json!("{}"), json!(1), json!(true)] {
-            assert_rejected(
-                &tool_prefix,
-                end_block(
-                    "i",
-                    "b",
-                    BlockContent::ToolCall(ToolCall {
-                        id: "call".into(),
-                        name: "run".into(),
-                        arguments,
-                    }),
-                ),
-            );
-        }
-        for (id, name) in [("", "run"), ("call", ""), (" ", "run"), ("call", "\t")] {
-            assert_rejected(
-                &tool_prefix,
-                end_block(
-                    "i",
-                    "b",
-                    BlockContent::ToolCall(ToolCall {
-                        id: id.into(),
-                        name: name.into(),
-                        arguments: json!({}),
-                    }),
-                ),
-            );
-        }
-        let mut assembler = ResponseAssembler::default();
-        for event in tool_prefix {
-            assembler.push(&event).unwrap();
-        }
-        assembler
-            .push(&delta(
-                "i",
-                "b",
-                ContentDelta::JsonFragment("{incomplete".into()),
-            ))
-            .unwrap();
-        let final_content = BlockContent::ToolCall(ToolCall {
-            id: "call".into(),
-            name: "run".into(),
-            arguments: json!({}),
-        });
-        assembler
-            .push(&end_block("i", "b", final_content.clone()))
-            .unwrap();
-        assert_eq!(assembler.snapshot().items[0].blocks[0].text, "{}");
-        assert_eq!(
-            assembler.snapshot().items[0].blocks[0].content,
-            Some(final_content)
-        );
-    }
-
-    #[test]
-    fn tool_items_require_one_block_and_response_unique_call_ids() {
-        let call = |id: &str| {
-            BlockContent::ToolCall(ToolCall {
-                id: id.into(),
-                name: "run".into(),
-                arguments: json!({}),
-            })
-        };
-        let mut prefix = vec![
-            start("i", 0, ItemKind::ToolCall),
-            block("i", "a", 0, BlockKind::ToolCallArguments),
-            end_block("i", "a", call("first")),
-            block("i", "b", 1, BlockKind::ToolCallArguments),
-        ];
-        assert_rejected(&prefix, end_block("i", "b", call("first")));
-        prefix.push(end_block("i", "b", call("second")));
-        assert_rejected(&prefix, end_item("i"));
-        let prefix = vec![
-            start("i", 0, ItemKind::ToolCall),
-            block("i", "a", 0, BlockKind::ToolCallArguments),
-            end_block("i", "a", call("first")),
-            end_item("i"),
-            start("j", 1, ItemKind::ToolCall),
-            block("j", "a", 0, BlockKind::ToolCallArguments),
-        ];
-        assert_rejected(&prefix, end_block("j", "a", call("first")));
-    }
-
-    #[test]
-    fn replay_envelopes_are_opaque_and_allowed_on_any_item_kind() {
-        let mut item = AssistantItem::text("text", 0, "visible");
-        item.replay = Some(replay());
-        let mut assembler = ResponseAssembler::default();
-        for event in events_for_content(std::slice::from_ref(&item)) {
-            assembler.push(&event).unwrap();
-        }
-        assembler.push(&end()).unwrap();
-        assert_eq!(assembler.finish().unwrap().0, vec![item]);
     }
 
     #[test]

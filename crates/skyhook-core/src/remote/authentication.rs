@@ -1,6 +1,6 @@
 //! Session-owned OpenSSH agent and per-process authentication environment.
 use super::{RemoteError, SensitivePromptHandler, askpass::AskpassServer};
-use std::{collections::BTreeMap, path::PathBuf, process::Stdio, sync::Arc};
+use std::{collections::BTreeMap, process::Stdio, sync::Arc};
 use tokio::{
     process::{Child, Command},
     sync::Mutex,
@@ -19,12 +19,6 @@ struct Agent {
     _askpass: AskpassServer,
     environment: ProcessEnvironment,
 }
-impl Drop for Agent {
-    fn drop(&mut self) {
-        let _ = self.child.start_kill();
-    }
-}
-
 impl Authentication {
     pub fn new(prompts: Arc<dyn SensitivePromptHandler>) -> Self {
         Self {
@@ -98,48 +92,5 @@ impl Authentication {
             let _ = agent.child.kill().await;
             let _ = agent.child.wait().await;
         }
-    }
-}
-
-/// A socket owned by this worker, backed by the SSH-forwarded root agent.
-pub(crate) struct AgentRelay {
-    pub socket: PathBuf,
-    _directory: tempfile::TempDir,
-    task: tokio::task::JoinHandle<()>,
-}
-impl AgentRelay {
-    pub fn start(upstream: PathBuf) -> Result<Self, std::io::Error> {
-        let directory = tempfile::Builder::new()
-            .prefix("skyhook-agent-relay-")
-            .tempdir()?;
-        let socket = directory.path().join("agent.sock");
-        let listener = tokio::net::UnixListener::bind(&socket)?;
-        let task = tokio::spawn(async move {
-            let mut tasks = tokio::task::JoinSet::new();
-            loop {
-                tokio::select! {
-                    accepted = listener.accept() => {
-                        let Ok((mut client, _)) = accepted else { break };
-                        let upstream = upstream.clone();
-                        tasks.spawn(async move {
-                            if let Ok(mut server) = tokio::net::UnixStream::connect(upstream).await {
-                                let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
-                            }
-                        });
-                    }
-                    _ = tasks.join_next(), if !tasks.is_empty() => {}
-                }
-            }
-        });
-        Ok(Self {
-            socket,
-            _directory: directory,
-            task,
-        })
-    }
-}
-impl Drop for AgentRelay {
-    fn drop(&mut self) {
-        self.task.abort();
     }
 }

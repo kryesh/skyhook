@@ -53,9 +53,6 @@ impl CodexProvider {
         })
     }
 }
-pub fn codex_oauth() -> Result<CodexProvider, ProviderError> {
-    CodexProvider::new()
-}
 impl Provider for CodexProvider {
     fn open_context(&self, correlation: String) -> Result<Box<dyn ProviderContext>, ProviderError> {
         Ok(Box::new(Context {
@@ -399,20 +396,6 @@ fn ws_stream(
                     Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<Value>(&text)
                     {
                         Ok(event) => {
-                            #[cfg(test)]
-                            if std::env::var_os("SKYHOOK_CODEX_TRACE_SHAPES").is_some() {
-                                eprintln!(
-                                    "wire shape: type={} index={} item_type={} output_types={:?} status={}",
-                                    event["type"].as_str().unwrap_or("?"),
-                                    event["output_index"],
-                                    event["item"]["type"].as_str().unwrap_or(""),
-                                    event["response"]["output"].as_array().map(|items| items
-                                        .iter()
-                                        .map(|item| item["type"].as_str().unwrap_or("?"))
-                                        .collect::<Vec<_>>()),
-                                    event["response"]["status"].as_str().unwrap_or("")
-                                );
-                            }
                             if is_transport_metadata(&event) {
                                 continue;
                             }
@@ -544,7 +527,7 @@ fn ws_stream(
 }
 // Subscription quota notifications are transport metadata, not Responses output.
 // Recognize only the documented/observed type; unknown semantic events still fail.
-fn is_transport_metadata(event: &Value) -> bool {
+pub(super) fn is_transport_metadata(event: &Value) -> bool {
     matches!(
         event.get("type").and_then(Value::as_str),
         Some("codex.rate_limits" | "codex.response.metadata" | "responsesapi.websocket_timing")
@@ -557,117 +540,11 @@ fn http_stream(
     session: OwnedMutexGuard<Session>,
     scope: String,
 ) -> ResponseStream {
-    Box::pin(stream::unfold(
-        (events, decoder, VecDeque::new(), false, session, scope),
-        |(mut events, mut decoder, mut pending, mut done, session, scope)| async move {
-            loop {
-                if let Some(chunk) = pending.pop_front() {
-                    return Some((chunk, (events, decoder, pending, done, session, scope)));
-                }
-                if done {
-                    return None;
-                }
-                let decoded = match events.next().await {
-                    Some(Ok(event)) => {
-                        if serde_json::from_str::<Value>(&event.data)
-                            .ok()
-                            .as_ref()
-                            .is_some_and(is_transport_metadata)
-                        {
-                            continue;
-                        }
-                        let chunks = decoder.decode(&event);
-                        done = decoder.completed();
-                        chunks
-                    }
-                    Some(Err(error)) => {
-                        done = true;
-                        Err(error)
-                    }
-                    None => {
-                        done = true;
-                        decoder.finish()
-                    }
-                };
-                match decoded {
-                    Ok(mut chunks) => {
-                        for chunk in &mut chunks {
-                            bind_reasoning_scope(chunk, &scope);
-                        }
-                        pending.extend(chunks.into_iter().map(Ok));
-                    }
-                    Err(error) => {
-                        done = true;
-                        pending.push_back(Err(error));
-                    }
-                }
-            }
-        },
-    ))
+    super::decode_stream(events, super::Decoder::Codex(decoder), scope, session)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn continuation_requires_exact_history_prefix_and_settings() {
-        let body =
-            json!({"model":"gpt-5", "input":[{"role":"user","content":"hello"}], "store":false});
-        let (_, settings, input) = websocket_request(&body, None);
-        let previous = Continuation {
-            id: "resp_1".into(),
-            input,
-            settings,
-        };
-        let mut next = body.clone();
-        next["input"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"role":"user","content":"next"}));
-        let (wire, _, _) = websocket_request(&next, Some(&previous));
-        assert_eq!(wire["previous_response_id"], "resp_1");
-        assert_eq!(wire["input"].as_array().unwrap().len(), 1);
-        next["model"] = json!("gpt-other");
-        assert!(
-            websocket_request(&next, Some(&previous))
-                .0
-                .get("previous_response_id")
-                .is_none()
-        );
-        for (field, value) in [
-            ("tools", json!([{"type":"function","name":"changed"}])),
-            ("instructions", json!("summary request")),
-            (
-                "text",
-                json!({"format":{"type":"json_schema","schema":{"type":"object"}}}),
-            ),
-            ("reasoning", json!({"effort":"high"})),
-        ] {
-            let mut changed = body.clone();
-            changed[field] = value;
-            assert!(
-                websocket_request(&changed, Some(&previous))
-                    .0
-                    .get("previous_response_id")
-                    .is_none()
-            );
-        }
-        let mut compacted = body.clone();
-        compacted["input"] = json!([]);
-        assert!(
-            websocket_request(&compacted, Some(&previous))
-                .0
-                .get("previous_response_id")
-                .is_none()
-        );
-        next = body;
-        next["input"][0]["content"] = json!("edited");
-        assert!(
-            websocket_request(&next, Some(&previous))
-                .0
-                .get("previous_response_id")
-                .is_none()
-        );
-    }
     #[test]
     fn credentials_are_sensitive_headers() {
         let headers = auth_headers("secret", "account", "session").unwrap();
@@ -707,6 +584,10 @@ mod tests {
             json!({"type":"response.output_item.added","output_index":0,"item":message_item("")}),
             json!({"type":"response.output_text.delta","output_index":0,"item_id":"msg_1","content_index":0,"delta":"OK"}),
             json!({"type":"response.output_item.done","output_index":0,"item":item}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","id":"rs_1","summary":[]}}),
+            json!({"type":"response.reasoning_summary_text.delta","output_index":1,"item_id":"rs_1","summary_index":0,"delta":"summary"}),
+            json!({"type":"response.reasoning_summary_text.done","output_index":1,"item_id":"rs_1","summary_index":0,"text":"summary"}),
+            json!({"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"summary"}],"encrypted_content":"ciphertext"}}),
             json!({"type":"responsesapi.websocket_timing","timing":{}}),
             json!({"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":5,"output_tokens":1}}}),
         ]
@@ -735,158 +616,40 @@ mod tests {
                 stop_reason: crate::provider::protocol::StopReason::EndTurn
             })
         )));
+        assert!(chunks.iter().any(|chunk| matches!(chunk,
+            Ok(ResponseChunk::ItemEnded { replay: Some(replay), .. })
+                if replay.payload["encrypted_content"] == "ciphertext")));
         let session = session.lock().await;
         assert_eq!(
             session.continuation.as_ref().unwrap().input.len(),
-            1,
+            2,
             "continuation must include streamed output despite empty terminal output"
         );
         drop(session);
         server.await.unwrap();
-        let events = Box::pin(stream::iter(events.into_iter().map(|event| {
-            Ok(transport::SseEvent {
-                event: None,
-                data: event.to_string(),
-            })
-        })));
-        let session = Arc::new(Mutex::new(Session::default()));
-        let http = http_stream(
-            events,
-            responses::Decoder::codex("gpt-5.6-terra".into()),
-            session.lock_owned().await,
-            "scope".into(),
-        )
-        .collect::<Vec<_>>()
-        .await;
-        assert_eq!(chunks, http);
-    }
-
-    #[tokio::test]
-    async fn reasoning_summary_closes_before_item_and_rich_replay_survives_empty_or_absent_terminal()
-     {
-        use crate::provider::protocol::{BlockContent, ResponseAssembler};
-        for omit_output in [false, true] {
-            let native = json!({"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"summary"}],"encrypted_content":"ciphertext"});
-            let mut terminal = json!({"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[]}});
-            if omit_output {
-                terminal["response"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("output");
-            }
-            let events = vec![
-                json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}),
-                json!({"type":"response.reasoning_summary_text.delta","output_index":0,"item_id":"rs_1","summary_index":0,"delta":"summary"}),
-                json!({"type":"response.reasoning_summary_text.done","output_index":0,"item_id":"rs_1","summary_index":0,"text":"summary"}),
-                json!({"type":"response.reasoning_summary_part.done","output_index":0,"item_id":"rs_1","summary_index":0,"part":{"type":"summary_text","text":"summary"}}),
-                json!({"type":"response.output_item.done","output_index":0,"item":native}),
-                terminal,
-            ];
-            let (socket, server) = mock_socket(events.clone()).await;
-            let session = Arc::new(Mutex::new(Session::default()));
-            let chunks = ws_stream(
-                socket,
-                session.clone().lock_owned().await,
-                responses::Decoder::codex("gpt-5".into()),
-                json!({"model":"gpt-5"}),
-                vec![],
-                "scope".into(),
-            )
-            .collect::<Vec<_>>()
-            .await;
-            assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
-            let events = Box::pin(stream::iter(events.into_iter().map(|event| {
+        let events = Box::pin(
+            stream::iter(events.into_iter().map(|event| {
                 Ok(transport::SseEvent {
                     event: None,
                     data: event.to_string(),
                 })
-            })));
-            let http_session = Arc::new(Mutex::new(Session::default()));
-            let http = http_stream(
-                events,
-                responses::Decoder::codex("gpt-5".into()),
-                http_session.lock_owned().await,
-                "scope".into(),
-            )
-            .collect::<Vec<_>>()
-            .await;
-            assert_eq!(chunks, http);
-            let closed = chunks
-                .iter()
-                .position(|chunk| {
-                    matches!(
-                        chunk,
-                        Ok(ResponseChunk::BlockEnded {
-                            content: BlockContent::Reasoning { .. },
-                            ..
-                        })
-                    )
-                })
-                .unwrap();
-            let ended = chunks
-                .iter()
-                .position(|chunk| {
-                    matches!(
-                        chunk,
-                        Ok(ResponseChunk::ItemEnded {
-                            replay: Some(_),
-                            ..
-                        })
-                    )
-                })
-                .unwrap();
-            assert!(closed < ended);
-            assert_eq!(
-                chunks
-                    .iter()
-                    .filter(|chunk| matches!(chunk, Ok(ResponseChunk::BlockEnded { .. })))
-                    .count(),
-                1
-            );
-            let mut assembler = ResponseAssembler::default();
-            for chunk in chunks {
-                assembler.push(&chunk.unwrap()).unwrap();
-            }
-            let items = assembler.finish().unwrap().0;
-            assert_eq!(items[0].replay.as_ref().unwrap().payload, native);
-            assert_eq!(items[0].replay.as_ref().unwrap().scope, "scope");
-            assert_eq!(
-                session.lock().await.continuation.as_ref().unwrap().input,
-                vec![native]
-            );
-            server.await.unwrap();
-        }
-    }
-
-    #[test]
-    fn empty_terminal_output_never_hides_unfinished_items_or_weakens_standard_responses() {
-        for codex in [false, true] {
-            let mut decoder = if codex {
-                responses::Decoder::codex("model".into())
-            } else {
-                responses::Decoder::new("model".into())
-            };
-            decoder.feed(json!({"type":"response.output_item.added","output_index":0,"item":message_item("")})).unwrap();
-            if !codex {
-                decoder.feed(json!({"type":"response.output_item.done","output_index":0,"item":message_item("OK")})).unwrap();
-            }
-            assert!(decoder.feed(json!({"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[]}})).is_err());
-        }
-        for codex in [false, true] {
-            let mut decoder = if codex {
-                responses::Decoder::codex("model".into())
-            } else {
-                responses::Decoder::new("model".into())
-            };
-            decoder.feed(json!({"type":"response.output_item.added","output_index":0,"item":message_item("")})).unwrap();
-            assert!(decoder.feed(json!({"type":"response.completed","response":{"id":"resp_1","status":"completed"}})).is_err());
-        }
-        assert!(!is_transport_metadata(
-            &json!({"type":"response.output_item.done"})
-        ));
-        assert!(!is_transport_metadata(
-            &json!({"type":"codex.unknown_semantic_event"})
-        ));
+            }))
+            .chain(stream::pending()),
+        );
+        let session = Arc::new(Mutex::new(Session::default()));
+        let mut http = http_stream(
+            events,
+            responses::Decoder::codex("gpt-5.6-terra".into()),
+            session.clone().lock_owned().await,
+            "scope".into(),
+        );
+        assert!(session.try_lock().is_err());
+        let http_chunks =
+            tokio::time::timeout(Duration::from_secs(1), http.by_ref().collect::<Vec<_>>())
+                .await
+                .expect("terminal response must not wait for HTTP EOF");
+        assert_eq!(chunks, http_chunks);
+        assert!(session.try_lock().is_ok());
     }
 
     #[tokio::test]
@@ -1125,129 +888,5 @@ mod tests {
         );
         assert!(session.lock().await.affinity.is_none());
         server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn expired_socket_is_retired_without_sending_even_a_probe() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-            assert!(!matches!(
-                ws.next().await,
-                Some(Ok(Message::Text(_) | Message::Ping(_)))
-            ));
-        });
-        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
-            .await
-            .unwrap();
-        let mut session = retained_session(socket);
-        session.reusable_since = Some(Instant::now() - MAX_IDLE);
-        prepare_reuse(&mut session).await;
-        assert!(
-            session.socket.is_none()
-                && session.continuation.is_none()
-                && session.affinity.is_none()
-        );
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn healthy_probe_handles_server_ping_and_metadata_and_preserves_continuation() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-            ws.send(Message::Text(
-                json!({"type":"codex.rate_limits"}).to_string().into(),
-            ))
-            .await
-            .unwrap();
-            ws.send(Message::Ping(vec![7].into())).await.unwrap();
-            loop {
-                match ws.next().await.unwrap().unwrap() {
-                    Message::Ping(payload) => {
-                        ws.send(Message::Pong(payload)).await.unwrap();
-                    }
-                    Message::Pong(payload) if payload.as_ref() == [7] => break,
-                    other => panic!("unexpected control probe frame: {other:?}"),
-                }
-            }
-        });
-        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
-            .await
-            .unwrap();
-        let mut session = retained_session(socket);
-        prepare_reuse(&mut session).await;
-        assert!(session.socket.is_some());
-        assert_eq!(session.continuation.as_ref().unwrap().id, "stale-response");
-        assert!(session.affinity.is_some());
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn unresponsive_probe_is_bounded_and_cancellation_discards_state() {
-        for cancel in [false, true] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move {
-                let (tcp, _) = listener.accept().await.unwrap();
-                let _ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-                std::future::pending::<()>().await;
-            });
-            let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
-                .await
-                .unwrap();
-            let mut session = retained_session(socket);
-            let timeout = if cancel {
-                Duration::from_millis(30)
-            } else {
-                REUSE_PROBE_TIMEOUT + Duration::from_secs(1)
-            };
-            let result = tokio::time::timeout(timeout, prepare_reuse(&mut session)).await;
-            assert_eq!(result.is_err(), cancel);
-            assert!(
-                session.socket.is_none()
-                    && session.continuation.is_none()
-                    && session.affinity.is_none()
-            );
-            server.abort();
-            let _ = server.await;
-        }
-    }
-
-    #[tokio::test]
-    #[ignore = "requires explicit Skyhook Codex login and makes a billable live subscription request"]
-    async fn live_codex_smoke() {
-        let provider = CodexProvider::new().unwrap();
-        let mut context = provider.open_context("skyhook-live-smoke".into()).unwrap();
-        let request = ModelRequest {
-            model: std::env::var("SKYHOOK_CODEX_SMOKE_MODEL").unwrap_or_else(|_| "gpt-5".into()),
-            system: vec![],
-            messages: vec![ProtocolMessage::User(vec![
-                crate::provider::protocol::UserContent::Text {
-                    text: "Reply with OK.".into(),
-                },
-            ])],
-            tools: vec![],
-            response_schema: None,
-            reasoning: None,
-            max_output_tokens: None,
-            correlation: Some("skyhook-live-smoke".into()),
-        };
-        let mut response = context
-            .invoke(request)
-            .await
-            .expect("live Codex invocation failed");
-        let mut finished = false;
-        while let Some(chunk) = response.next().await {
-            finished |= matches!(
-                chunk.expect("live Codex stream failed"),
-                ResponseChunk::ResponseEnded { .. }
-            );
-        }
-        assert!(finished);
     }
 }

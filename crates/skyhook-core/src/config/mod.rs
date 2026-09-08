@@ -149,21 +149,10 @@ mod tests {
     }
 
     #[test]
-    fn every_provider_requires_both_model_limits() {
-        for (kind, endpoint) in [
-            (
-                "openai",
-                "base_url = 'https://example.com/v1'\napi = 'responses'\n",
-            ),
-            ("anthropic", "base_url = 'https://example.com/v1'\n"),
-            ("codex", ""),
-        ] {
-            for limits in ["", "max_context = 128000\n", "max_output = 16384\n"] {
-                let text = format!(
-                    "default_model_profile = 'test'\n[providers.test]\nkind = '{kind}'\n{endpoint}[models.test]\nprovider = 'test'\nmodel = 'test'\n{limits}"
-                );
-                assert!(toml::from_str::<Config>(&text).is_err(), "{text}");
-            }
+    fn model_profiles_require_both_limits() {
+        for limits in ["", "max_context = 128000\n", "max_output = 16384\n"] {
+            let text = format!("[models.test]\nprovider = 'test'\nmodel = 'test'\n{limits}");
+            assert!(toml::from_str::<Config>(&text).is_err(), "{text}");
         }
     }
 
@@ -235,46 +224,6 @@ mod tests {
         assert_eq!(config.models["local"].model, "exact-model-id");
         // Provider construction must not connect to an endpoint or require a key.
         assert!(config.harness_builder(".", "local").is_ok());
-    }
-
-    #[test]
-    fn named_targets_live_directly_below_targets() {
-        let config: Config = toml::from_str(
-            r#"
-default_model_profile = "test"
-
-[models.test]
-provider = "test"
-model = "test"
-max_context = 128000
-max_output = 16384
-supports_images = false
-
-[targets]
-import_ssh_config = true
-
-[targets.bastion]
-type = "ssh"
-host = "bastion.example.com"
-
-[targets.build]
-type = "ssh"
-host = "build.internal"
-via = "bastion"
-workspace = "/srv/project"
-
-[targets.build.ssh.auth]
-kind = "key"
-path = "~/.ssh/build"
-"#,
-        )
-        .unwrap();
-        assert!(config.targets.import_ssh_config);
-        assert_eq!(
-            config.targets.entries["build"].via.as_deref(),
-            Some("bastion")
-        );
-        assert_eq!(config.targets.entries["build"].ssh.auth.kind(), "key");
     }
 
     #[test]

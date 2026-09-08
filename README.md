@@ -72,8 +72,7 @@ without mixing its output with other agents. Each agent retains its reading posi
 Agent tree rows show `@target` for non-root agents. Agent call previews show the child's target,
 including while queued or running; an omitted target inherits the calling agent's target.
 Agent rows show their own token totals and context usage in the same compact format as the
-bottom-right session summary: output · input (uncached) · context. The State tab includes the
-same per-agent summary when the terminal is too narrow to show it in the tree.
+bottom-right session summary: output · input (uncached) · context.
 Status messages, including interruptions and errors, appear as distinct rows in the conversation
 log and are saved with the session. They are excluded from the model’s context.
 Completed final replies show their recorded model ID in a muted footer below the answer.
@@ -83,9 +82,11 @@ for the entire turn to finish. `/queue` edits/removes input that has not yet bee
 and `/resume` resumes a queue paused by interruption.
 `/retry` continues a failed or interrupted root turn without duplicating the original prompt.
 
-The inspector provides Conversation, Requests, Jobs, and State tabs. Requests show the recorded
-provider-neutral input, committed responses, usage, and compaction checkpoints, including retries. Job output
-is paged and searchable without acknowledging the agent's pending notifications. Select a job
+The inspector provides Conversation, Requests, and Jobs tabs. Requests show one metadata row per
+model call, including retries and compaction calls, with token summaries alongside the row. Full
+request bodies remain in the session journal for reconstruction but are not rendered in the UI.
+Startup warnings appear directly in the conversation log rather than a separate diagnostics page.
+Job output is paged and searchable without acknowledging the agent's pending notifications. Select a job
 and press `o` for output fields, regex search, and the next page; `c` requests cancellation.
 Remote output is available after transfer completes. Provider-supplied reasoning streams in a separate
 expanded block with an animated spinner and collapses as soon as answer text starts (or the response
@@ -135,8 +136,8 @@ state; it is not cumulative usage. Missing context data appears as `—`.
 | `Ctrl+X N`, `Ctrl+X L` | New session, session picker |
 | `Ctrl+X M`, `/model` | Model for subsequent user messages |
 | `/profiles` | Instruction profile for new sessions |
-| `Ctrl+X A`, `Ctrl+X I` | Agent picker, conversation inspector |
-| `Ctrl+X S`, `/requests`, `/jobs` | State, requests, jobs |
+| `Ctrl+X A`, `Ctrl+X I` | Agent picker, focus conversation |
+| `/requests`, `/jobs` | Requests, jobs |
 | `Ctrl+X ↑`, `Ctrl+X ↓` | Parent, first child |
 | `Ctrl+X T` | Dark/light theme |
 | `Ctrl+X E` | Edit draft in `$EDITOR` |
@@ -153,6 +154,8 @@ state; it is not cumulative usage. Missing context data appears as `—`.
 | `Ctrl+C` | Clear draft, otherwise interrupt/quit |
 | `Ctrl+X Q` | Quit |
 
+The command palette omits navigation-only actions; `Ctrl+X I`, `Ctrl+X ↑`, and `Ctrl+X ↓`
+remain available to focus the conversation, select the parent, and select the first child.
 Menus use arrows, the mouse wheel, or `Ctrl+P/N`; Enter or Tab selects. Theme choices
 preview immediately; Escape restores the previous theme and Enter saves the choice. The composer supports word movement,
 selection, `Ctrl+A/E`, `Ctrl+W`, `Ctrl+U/K`, and undo/redo with `Ctrl+-` / `Ctrl+.`.
@@ -224,7 +227,8 @@ boundary. It stores no backend-specific request bodies or authentication headers
   their originating request, including summarization calls.
 
 `session::reconstruct_model_request(&records, sequence)` returns the provider name and reconstructed
-`ModelRequest` for a `model_requested` sequence. Image metadata references the existing session blobs;
+`ModelRequest` for a `model_requested` sequence, using sequence-ordered records from `SessionStore`.
+Image metadata references the existing session blobs;
 `store.hydrate_model_request(&mut request).await` restores their payloads when needed. This reconstructs
 Skyhook's provider-neutral input, not an API-specific wire encoding. Format versions remain at 1;
 there is no compatibility or migration layer for earlier layouts.
@@ -370,7 +374,7 @@ a connection segment must share its configuration origin; use an explicit remote
 a shim-owned continuation. This prevents remote credential paths being interpreted on root.
 
 One private, session-owned SSH agent runs on root. SSH loads keys lazily from their configuration
-origin into this central agent. Remote Skyhook commands receive a private relay socket in
+origin into this central agent. Remote Skyhook commands receive OpenSSH’s private forwarded socket in
 `SSH_AUTH_SOCK`, allowing commands such as `git`, `ssh`, and `ssh-add` to use the same identities.
 Skyhook does not inherit an existing user agent. Agent state is discarded at session shutdown and
 is not restored when resuming a session.
@@ -453,22 +457,6 @@ log in separately for Codex.
 
 Instructions in `AGENTS.md` files are loaded from outermost ancestor to workspace, followed by
 instructions configured through the library.
-
-### Native provider smoke tests
-
-Ordinary tests use local mock HTTP/WebSocket servers; they never require provider credentials.
-Live tests are ignored by default and make billable requests when explicitly selected:
-
-```sh
-cargo test -p skyhook-agent-core provider::backends::live_tests::openai_chat -- --ignored --exact
-cargo test -p skyhook-agent-core provider::backends::live_tests::openai_responses -- --ignored --exact
-cargo test -p skyhook-agent-core provider::backends::live_tests::anthropic_messages -- --ignored --exact
-```
-
-Supply `SKYHOOK_LIVE_OPENAI_BASE_URL`, `SKYHOOK_LIVE_OPENAI_MODEL`, and
-`SKYHOOK_LIVE_OPENAI_API_KEY` for OpenAI tests, or the corresponding
-`SKYHOOK_LIVE_ANTHROPIC_*` variables for Anthropic. Choose endpoints/models that support the requested
-standard protocol. Codex has a separate ignored smoke test using an existing Skyhook-owned login.
 
 ## Embedded JavaScript
 

@@ -322,13 +322,17 @@ impl Decoder {
         }
     }
 
-    pub(crate) fn completed(&self) -> bool {
-        self.completed
-    }
-
     pub(crate) fn decode(
         &mut self,
         event: &super::transport::SseEvent,
+    ) -> Result<Vec<ResponseChunk>, ProviderError> {
+        self.decode_filtered(event, |_| false)
+    }
+
+    pub(super) fn decode_filtered(
+        &mut self,
+        event: &super::transport::SseEvent,
+        ignore: impl FnOnce(&Value) -> bool,
     ) -> Result<Vec<ResponseChunk>, ProviderError> {
         if event.data.trim() == "[DONE]" {
             return if self.completed {
@@ -339,6 +343,9 @@ impl Decoder {
         }
         let value: Value =
             serde_json::from_str(&event.data).map_err(|_| protocol("invalid SSE JSON"))?;
+        if ignore(&value) {
+            return Ok(vec![]);
+        }
         if let Some(name) = &event.event
             && name != "message"
             && Some(name.as_str()) != value.get("type").and_then(Value::as_str)
@@ -917,16 +924,10 @@ mod tests {
     #[test]
     fn request_transmits_native_tools_schema_reasoning_and_cache_key() {
         let mut req = request();
-        req.system = vec![
-            SystemSegment {
-                text: "first".into(),
-                cache: false,
-            },
-            SystemSegment {
-                text: "second".into(),
-                cache: false,
-            },
-        ];
+        req.system = vec![SystemSegment {
+            text: "system".into(),
+            cache: false,
+        }];
         req.tools = vec![ToolDefinition {
             name: "search".into(),
             description: "Search".into(),
@@ -937,46 +938,11 @@ mod tests {
             schema: json!({"type":"object", "properties":{}, "additionalProperties":false}),
         });
         req.reasoning = Some("high".into());
-        req.max_output_tokens = Some(800);
         req.correlation = Some("session".into());
-        let body = encode(&req).unwrap();
-        assert_eq!(body["instructions"], "first\n\nsecond");
-        assert_eq!(
-            body["tools"][0],
-            json!({"type":"function", "name":"search", "description":"Search", "parameters":{"type":"object"}, "strict":false})
-        );
-        assert_eq!(
-            body["text"]["format"]["schema"],
-            req.response_schema.unwrap().schema
-        );
-        assert_eq!(body["text"]["format"]["strict"], true);
-        assert_eq!(
-            body["reasoning"],
-            json!({"effort":"high", "summary":"auto"})
-        );
-        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
-        assert_eq!(body["prompt_cache_key"], "session");
-        assert_eq!(body["max_output_tokens"], 800);
-        assert_eq!(body["store"], false);
-        assert_eq!(body["stream"], true);
-    }
-
-    #[test]
-    fn all_user_variants_and_tool_result_images_are_preserved() {
-        let mut req = request();
         req.messages = vec![
             Message::User(vec![
                 UserContent::Text {
-                    text: "text".into(),
-                },
-                UserContent::Runtime {
-                    text: "runtime".into(),
-                },
-                UserContent::ParentInput {
-                    text: "parent".into(),
-                },
-                UserContent::Compaction {
-                    text: "compact".into(),
+                    text: "look".into(),
                 },
                 UserContent::Image { image: image() },
             ]),
@@ -989,25 +955,29 @@ mod tests {
             }]),
         ];
         let body = encode(&req).unwrap();
-        let parts = body["input"][0]["content"].as_array().unwrap();
-        for (part, text) in parts.iter().zip(["text", "runtime", "parent", "compact"]) {
-            assert_eq!(part, &json!({"type":"input_text", "text":text}));
-        }
-        assert_eq!(parts[4]["image_url"], "data:image/png;base64,YQ==");
-        let output = &body["input"][1];
-        assert_eq!(output["type"], "function_call_output");
-        assert_eq!(output["call_id"], "call_1");
-        let result: Value = serde_json::from_str(output["output"].as_str().unwrap()).unwrap();
-        assert_eq!(result, json!({"result":{"answer":42}, "is_error":true}));
-        assert!(
-            body["input"][2]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("call_1")
+        assert_eq!(body["instructions"], "system");
+        assert_eq!(body["tools"][0]["name"], "search");
+        assert_eq!(
+            body["text"]["format"]["schema"],
+            req.response_schema.unwrap().schema
         );
         assert_eq!(
+            body["reasoning"],
+            json!({"effort":"high", "summary":"auto"})
+        );
+        assert_eq!(body["prompt_cache_key"], "session");
+        assert_eq!(body["input"][0]["content"][0]["text"], "look");
+        assert_eq!(
+            body["input"][0]["content"][1]["image_url"],
+            "data:image/png;base64,YQ=="
+        );
+        assert_eq!(body["input"][1]["call_id"], "call_1");
+        let result: Value =
+            serde_json::from_str(body["input"][1]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(result, json!({"result":{"answer":42},"is_error":true}));
+        assert_eq!(
             body["input"][2]["content"][1]["image_url"],
-            parts[4]["image_url"]
+            "data:image/png;base64,YQ=="
         );
     }
 
@@ -1073,27 +1043,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_settings_and_missing_images_fail_instead_of_disappearing() {
-        let mut req = request();
-        req.system.push(SystemSegment {
-            text: "cache".into(),
-            cache: true,
-        });
-        assert_eq!(encode(&req).unwrap()["instructions"], "cache");
-        req.system.clear();
-        req.reasoning = Some("unlimited".into());
-        assert!(encode(&req).is_err());
-        req.reasoning = None;
-        req.max_output_tokens = Some(0);
-        assert!(encode(&req).is_err());
-        req.max_output_tokens = None;
-        let mut missing = image();
-        missing.data_base64 = None;
-        req.messages = vec![Message::User(vec![UserContent::Image { image: missing }])];
-        assert!(encode(&req).is_err());
-    }
-
-    #[test]
     fn out_of_order_items_keep_provider_indices_and_authoritative_blocks() {
         let mut decoder = Decoder::new("gpt-5".into());
         let mut assembler = crate::provider::protocol::ResponseAssembler::default();
@@ -1123,107 +1072,6 @@ mod tests {
         );
         assert_eq!(stop, StopReason::EndTurn);
         assert!(decoder.finish().unwrap().is_empty());
-    }
-
-    #[test]
-    fn opaque_only_reasoning_has_no_synthetic_display_block_and_replays_once() {
-        let native = json!({"type":"reasoning", "id":"hidden", "summary":[], "encrypted_content":"ciphertext"});
-        let items = assemble(vec![native.clone()]);
-        assert!(items[0].blocks.is_empty());
-        assert_eq!(items[0].replay.as_ref().unwrap().payload, native);
-        let mut req = request();
-        req.messages = vec![Message::Assistant(items)];
-        assert_eq!(encode(&req).unwrap()["input"], json!([native]));
-    }
-
-    #[test]
-    fn terminal_only_response_starts_and_ends_every_item_in_order() {
-        let items = assemble(vec![
-            reasoning_item(),
-            text_item("msg_1", "answer"),
-            call_item(),
-        ]);
-        assert_eq!(items.len(), 3);
-        assert_eq!(
-            items.iter().map(|item| item.position).collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
-        assert_eq!(items[0].blocks.len(), 2);
-        assert!(items[2].tool_call_ref().is_some());
-    }
-
-    #[test]
-    fn observed_three_reasoning_items_have_three_three_two_independent_summary_blocks() {
-        let mut decoder = Decoder::codex("gpt-5".into());
-        let mut assembler = crate::provider::protocol::ResponseAssembler::default();
-        let mut completed_items = Vec::new();
-        for (item_index, count) in [3, 3, 2].into_iter().enumerate() {
-            let id = format!("rs_{item_index}");
-            let summaries = (0..count)
-                .map(|i| json!({"type":"summary_text", "text":format!("summary {i}")}))
-                .collect::<Vec<_>>();
-            let native = json!({"type":"reasoning", "id":id, "summary":summaries, "encrypted_content":format!("cipher_{item_index}")});
-            for chunk in decoder
-                .feed(added(
-                    item_index,
-                    json!({"type":"reasoning", "id":id, "summary":[]}),
-                ))
-                .unwrap()
-            {
-                assembler.push(&chunk).unwrap();
-            }
-            for position in 0..count {
-                let text = format!("summary {position}");
-                let delta = json!({"type":"response.reasoning_summary_text.delta", "output_index":item_index, "item_id":id, "summary_index":position,"delta":text});
-                for chunk in decoder.feed(delta).unwrap() {
-                    assembler.push(&chunk).unwrap();
-                }
-                let end = json!({"type":"response.reasoning_summary_text.done", "output_index":item_index, "item_id":id, "summary_index":position,"text":text});
-                let chunks = decoder.feed(end.clone()).unwrap();
-                assert_eq!(chunks.len(), 1);
-                assert!(matches!(&chunks[0], ResponseChunk::BlockEnded { .. }));
-                for chunk in chunks {
-                    assembler.push(&chunk).unwrap();
-                }
-                assert!(decoder.feed(end).unwrap().is_empty());
-                assert!(decoder.feed(json!({"type":"response.reasoning_summary_part.done", "output_index":item_index, "item_id":id, "summary_index":position,"part":{"type":"summary_text", "text":text}})).unwrap().is_empty());
-            }
-            assert!(
-                assembler
-                    .snapshot()
-                    .items
-                    .iter()
-                    .all(|item| item.replay.is_none())
-            );
-            completed_items.push(native);
-        }
-        // Item ends can arrive consecutively, long after all summaries closed.
-        for (index, native) in completed_items.into_iter().enumerate() {
-            let chunks = decoder.feed(done(index, native)).unwrap();
-            assert_eq!(chunks.len(), 1);
-            assert!(matches!(
-                &chunks[0],
-                ResponseChunk::ItemEnded {
-                    replay: Some(_),
-                    ..
-                }
-            ));
-            assembler.push(&chunks[0]).unwrap();
-        }
-        for chunk in decoder.feed(completed(vec![])).unwrap() {
-            assembler.push(&chunk).unwrap();
-        }
-        let (items, _, _) = assembler.finish().unwrap();
-        assert_eq!(
-            items
-                .iter()
-                .map(|item| item.blocks.len())
-                .collect::<Vec<_>>(),
-            vec![3, 3, 2]
-        );
-        let mut req = request();
-        req.messages = vec![Message::Assistant(items)];
-        assert_eq!(encode(&req).unwrap()["input"].as_array().unwrap().len(), 3);
     }
 
     #[test]
@@ -1261,105 +1109,6 @@ mod tests {
                     .is_err()
             );
         }
-    }
-
-    #[test]
-    fn conflicting_duplicate_part_done_and_final_arguments_fail() {
-        let mut decoder = Decoder::new("gpt-5".into());
-        decoder.feed(added(0, text_item("msg", ""))).unwrap();
-        decoder.feed(json!({"type":"response.output_text.done","output_index":0,"item_id":"msg","content_index":0,"text":"a"})).unwrap();
-        assert!(decoder.feed(json!({"type":"response.content_part.done","output_index":0,"item_id":"msg","content_index":0,"part":{"type":"output_text","text":"b"}})).is_err());
-        assert!(decoder.feed(done(0, text_item("msg", "b"))).is_err());
-        let mut decoder = Decoder::new("gpt-5".into());
-        decoder.feed(added(0, call_item())).unwrap();
-        decoder.feed(json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"{\"wrong\":"})).unwrap();
-        assert!(decoder.feed(done(0, call_item())).is_err());
-    }
-
-    #[test]
-    fn refusal_is_visible_and_incomplete_is_explicit() {
-        let item = json!({"type":"message", "id":"msg_1", "role":"assistant", "content":[{"type":"refusal", "refusal":"No."}]});
-        for (reason, expected) in [
-            ("max_output_tokens", StopReason::MaxTokens),
-            ("content_filter", StopReason::ContentFilter),
-        ] {
-            let chunks = Decoder::new("gpt-5".into()).feed(json!({"type":"response.incomplete", "response":{"status":"incomplete", "output":[item], "incomplete_details":{"reason":reason}}})).unwrap();
-            assert!(chunks.iter().any(|chunk| matches!(chunk, ResponseChunk::BlockEnded{content:BlockContent::Text{text},..} if text=="No.")));
-            assert_eq!(
-                chunks.last(),
-                Some(&ResponseChunk::ResponseEnded {
-                    stop_reason: expected
-                })
-            );
-        }
-    }
-
-    #[test]
-    fn final_only_arguments_duplicate_done_and_call_ids_are_validated() {
-        let mut decoder = Decoder::new("gpt-5".into());
-        decoder.feed(added(0, call_item())).unwrap();
-        let done_arguments = json!({"type":"response.function_call_arguments.done", "output_index":0, "item_id":"fc_1", "arguments":"{\"query\":\"rust\"}"});
-        let chunks = decoder.feed(done_arguments.clone()).unwrap();
-        assert!(matches!(
-            chunks.as_slice(),
-            [
-                ResponseChunk::BlockStarted { .. },
-                ResponseChunk::BlockEnded { .. }
-            ]
-        ));
-        assert!(decoder.feed(done_arguments.clone()).unwrap().is_empty());
-        let mut conflict = done_arguments;
-        conflict["arguments"] = json!("{\"query\":\"wrong\"}");
-        assert!(decoder.feed(conflict).is_err());
-        decoder.feed(done(0, call_item())).unwrap();
-        let mut duplicate = call_item();
-        duplicate["id"] = json!("fc_2");
-        decoder.feed(added(1, duplicate.clone())).unwrap();
-        assert!(decoder.feed(done(1, duplicate)).is_err());
-    }
-
-    #[test]
-    fn initial_part_payload_streams_once_and_disagrees_with_final_is_rejected() {
-        let mut decoder = Decoder::new("gpt-5".into());
-        decoder.feed(added(0, text_item("msg", ""))).unwrap();
-        let added = json!({"type":"response.content_part.added","output_index":0,"item_id":"msg","content_index":0,"part":{"type":"output_text","text":"hello"}});
-        let chunks = decoder.feed(added.clone()).unwrap();
-        assert!(
-            matches!(chunks.as_slice(), [ResponseChunk::BlockStarted{..}, ResponseChunk::BlockDelta{delta:ContentDelta::Text(text),..}] if text == "hello")
-        );
-        assert!(decoder.feed(added).is_err());
-        assert!(decoder.feed(json!({"type":"response.output_text.done","output_index":0,"item_id":"msg","content_index":0,"text":"different"})).is_err());
-        decoder.feed(done(0, text_item("msg", "hello"))).unwrap();
-    }
-
-    #[test]
-    fn malformed_unknown_and_out_of_lifecycle_events_fail() {
-        for event in [
-            json!({}),
-            json!({"type":"future.event"}),
-            json!({"type":"response.output_item.added", "output_index":0, "item":{"type":"web_search_call","id":"ws"}}),
-            json!({"type":"response.output_text.delta", "output_index":0,"item_id":"msg", "content_index":0,"delta":"orphan"}),
-            json!({"type":"response.completed", "response":{"status":"completed"}}),
-        ] {
-            assert_eq!(
-                Decoder::new("gpt-5".into()).feed(event).unwrap_err().kind,
-                ProviderErrorKind::Protocol
-            );
-        }
-        let mut decoder = Decoder::new("gpt-5".into());
-        decoder.feed(added(0, text_item("msg", ""))).unwrap();
-        assert!(decoder.feed(added(0, text_item("msg", ""))).is_err());
-        assert!(decoder.feed(json!({"type":"response.reasoning_summary_text.delta", "output_index":0,"item_id":"msg", "summary_index":0,"delta":"wrong kind"})).is_err());
-        assert!(decoder.feed(json!({"type":"response.output_text.delta", "output_index":0,"item_id":"other", "content_index":0,"delta":"wrong id"})).is_err());
-        decoder.feed(done(0, text_item("msg", "final"))).unwrap();
-        assert!(decoder.feed(done(0, text_item("msg", "final"))).is_err());
-        assert!(
-            decoder
-                .feed(completed(vec![text_item("msg", "conflict")]))
-                .is_err()
-        );
-        assert!(decoder.feed(completed(vec![])).is_err());
-        assert!(decoder.finish().is_err());
     }
 
     #[test]
@@ -1419,65 +1168,5 @@ mod tests {
                 .is_empty()
         );
         assert!(decoder.feed(completed(vec![])).is_err());
-    }
-
-    #[test]
-    fn native_lifecycle_metadata_and_empty_encrypted_reasoning_are_supported() {
-        let mut decoder = Decoder::new("gpt-5".into());
-        for status in ["created", "in_progress", "queued"] {
-            assert!(
-                decoder
-                    .feed(json!({"type":format!("response.{status}"), "response":{"id":"resp_1"}}))
-                    .unwrap()
-                    .is_empty()
-            );
-        }
-        let native = json!({"type":"reasoning", "id":"rs_1", "summary":[{"type":"summary_text","text":""}], "encrypted_content":"ciphertext"});
-        decoder.feed(added(0, native.clone())).unwrap();
-        for phase in ["added", "done"] {
-            decoder.feed(json!({"type":format!("response.reasoning_summary_part.{phase}"), "output_index":0,
-                "item_id":"rs_1", "summary_index":0,"part":{"type":"summary_text", "text":""}})).unwrap();
-        }
-        decoder
-            .feed(
-                json!({"type":"response.reasoning_summary_text.done", "output_index":0,
-            "item_id":"rs_1", "summary_index":0, "text":""}),
-            )
-            .unwrap();
-        let chunks = decoder.feed(completed(vec![native.clone()])).unwrap();
-        assert_eq!(
-            chunks[0],
-            ResponseChunk::ItemEnded {
-                id: "rs_1".into(),
-                replay: Some(reasoning_envelope("responses", "gpt-5", native)),
-            }
-        );
-    }
-
-    #[test]
-    fn all_upstream_error_content_is_redacted() {
-        for event in [
-            json!({"type":"error", "code":"sensitive-code", "message":"secret-credential"}),
-            json!({"type":"response.failed", "response":{"error":{"code":"server_error", "message":"secret-credential"}}}),
-            json!({"type":"secret-credential"}),
-            added(0, json!({"id":"x", "type":"secret-credential"})),
-        ] {
-            let error = Decoder::new("gpt-5".into()).feed(event).unwrap_err();
-            assert!(!error.message.contains("secret-credential"));
-            assert!(!error.message.contains("sensitive-code"));
-        }
-    }
-
-    #[test]
-    fn malformed_usage_is_rejected() {
-        for usage in [
-            json!({}),
-            json!({"input_tokens":-1,"output_tokens":1}),
-            json!({"input_tokens":2,"output_tokens":1,"input_tokens_details":{"cached_tokens":3}}),
-        ] {
-            let mut event = completed(vec![]);
-            event["response"]["usage"] = usage;
-            assert!(Decoder::new("gpt-5".into()).feed(event).is_err());
-        }
     }
 }

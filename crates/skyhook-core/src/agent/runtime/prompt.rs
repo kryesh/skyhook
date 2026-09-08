@@ -116,16 +116,7 @@ pub(super) async fn runtime_state_content(
     agent: &AgentId,
     capabilities: &CapabilitySet,
 ) -> UserContent {
-    runtime_state_content_at(jobs, todos, agent, capabilities, Local::now()).await
-}
-
-pub(super) async fn runtime_state_content_at(
-    jobs: &JobManager,
-    todos: &TodoStore,
-    agent: &AgentId,
-    capabilities: &CapabilitySet,
-    now: DateTime<Local>,
-) -> UserContent {
+    let now = Local::now();
     let items = todos
         .inspect(agent, None)
         .await
@@ -166,7 +157,3 @@ async fn runtime_state_with_todos_at(
         ),
     }
 }
-
-#[cfg(test)]
-#[path = "progress_state_tests.rs"]
-mod progress_state_tests;

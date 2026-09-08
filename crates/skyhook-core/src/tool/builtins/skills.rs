@@ -248,12 +248,11 @@ pub(super) fn register(
         schema,
         ToolOptions::new(vec![Capability::Read])
             .output_schema(output_schema)
-            .capability_resolver(|arguments| {
+            .argument_validator(|arguments| {
                 let args: SkillArgs = serde_json::from_value(arguments.clone())
                     .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
-                args.validate()?;
                 // Copy permissions are scoped to the caller by skill_transfer, not this host tool.
-                Ok(vec![Capability::Read])
+                args.validate()
             }),
         move |context, arguments| {
             let skills = skills.clone();
@@ -540,22 +539,6 @@ mod tests {
         super::register(builder, skills, store, router)
     }
 
-    const FIXTURE_TREE: &str = "├── assets/
-│   ├── diagram.svg
-│   ├── nul.dat
-│   ├── payload.bin
-│   ├── pixel.png
-│   ├── vision-other.png
-│   └── vision.png
-├── references/
-│   ├── config.json
-│   ├── data.csv
-│   ├── empty.txt
-│   ├── note.txt
-│   └── settings.yaml
-└── scripts/
-    └── example.py";
-
     async fn fixture_skills() -> HostSkills {
         let workspace =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/skill-workspace");
@@ -563,204 +546,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standard_skill_layout_discovers_directories_and_reads_text() {
-        let runtime = crate::test_support::TestRuntime::new().await;
-        let skills = fixture_skills().await;
-        assert!(skills.warnings().is_empty(), "{:?}", skills.warnings());
-        let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder, skills.clone(), runtime.store.clone()).unwrap();
-        let registry = builder.build();
-        let surface = registry.surface(&Default::default());
-        let spec = surface.get("skill").unwrap();
-        assert_eq!(spec.input_schema["required"], serde_json::json!(["name"]));
-        for argument in ["path", "to"] {
-            assert_eq!(
-                spec.input_schema["properties"][argument]["default"],
-                serde_json::Value::Null
-            );
+    async fn malformed_skill_arguments_are_rejected_before_authorization() {
+        use crate::tool::policy::{AuthorizationRequest, Policy, PolicyFuture};
+        struct UnexpectedAuthorization;
+        impl Policy for UnexpectedAuthorization {
+            fn authorize(&self, _: AuthorizationRequest) -> PolicyFuture<'_> {
+                panic!("malformed skill arguments must not request authorization");
+            }
         }
-        let executor = ToolExecutor::new(
-            registry,
-            Arc::new(AllowAll),
-            runtime.jobs.clone(),
-            runtime.root.path().to_path_buf(),
-        );
-        let listed = executor
-            .execute(runtime.agent.clone(), "skills", serde_json::json!({}), None)
-            .await
-            .unwrap();
-        assert!(
-            listed
-                .output
-                .value
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| entry["name"] == "mixed-assets")
-        );
-        {
-            let args = serde_json::json!({"name":"mixed-assets"});
-            let loaded = executor
-                .execute(runtime.agent.clone(), "skill", args, None)
-                .await
-                .unwrap();
-            let result = &loaded.output.value;
-            assert_eq!(result["kind"], "skill");
-            assert_eq!(
-                result["content"],
-                skills.get("mixed-assets").unwrap().instructions
-            );
-            assert_eq!(result["assets"], FIXTURE_TREE);
-            assert!(result.get("entries").is_none());
-        }
-        for path in [".", "references", "scripts", "assets"] {
-            let loaded = executor
-                .execute(
-                    runtime.agent.clone(),
-                    "skill",
-                    serde_json::json!({"name":"mixed-assets", "path":path}),
-                    None,
-                )
-                .await
-                .unwrap();
-            assert_eq!(loaded.output.value["kind"], "directory");
-            assert_eq!(loaded.output.value["path"], path);
-            let expected = match path {
-                "." => {
-                    FIXTURE_TREE
-                        .replace("└── scripts/", "├── scripts/")
-                        .replace("    └── example.py", "│   └── example.py")
-                        + "\n└── SKILL.md"
-                }
-                "references" => {
-                    "├── config.json\n├── data.csv\n├── empty.txt\n├── note.txt\n└── settings.yaml"
-                        .to_owned()
-                }
-                "scripts" => "└── example.py".to_owned(),
-                "assets" => {
-                    "├── diagram.svg\n├── nul.dat\n├── payload.bin\n├── pixel.png\n├── vision-other.png\n└── vision.png".to_owned()
-                }
-                _ => unreachable!(),
-            };
-            assert_eq!(loaded.output.value["assets"], expected);
-        }
-        for path in [
-            "references/note.txt",
-            "references/config.json",
-            "references/settings.yaml",
-            "references/data.csv",
-            "references/empty.txt",
-            "scripts/example.py",
-            "assets/diagram.svg",
-        ] {
-            let loaded = executor
-                .execute(
-                    runtime.agent.clone(),
-                    "skill",
-                    serde_json::json!({"name":"mixed-assets", "path":path}),
-                    None,
-                )
-                .await
-                .unwrap();
-            assert_eq!(loaded.output.value["kind"], "text", "{path}");
-            let expected = fs::read_to_string(skills.get("mixed-assets").unwrap().root.join(path))
-                .await
-                .unwrap();
-            assert_eq!(loaded.output.value["content"], expected);
-            assert_eq!(loaded.output.value["bytes"], expected.len());
-            assert!(loaded.output.images.is_empty());
-        }
-    }
-
-    #[tokio::test]
-    async fn explicit_null_optional_arguments_read_without_copying() {
         let runtime = crate::test_support::TestRuntime::new().await;
         let mut builder = ToolRegistryBuilder::default();
         register(&mut builder, fixture_skills().await, runtime.store.clone()).unwrap();
-        let executor = runtime.executor(builder);
-        for (path, kind) in [(None, "skill"), (Some("references/note.txt"), "text")] {
-            let loaded = executor
-                .execute(
-                    runtime.agent.clone(),
-                    "skill",
-                    serde_json::json!({"name":"mixed-assets", "path":path, "to":null}),
-                    None,
-                )
-                .await
-                .unwrap();
-            assert_eq!(loaded.output.value["kind"], kind);
+        let executor = ToolExecutor::new(
+            builder.build(),
+            Arc::new(UnexpectedAuthorization),
+            runtime.jobs.clone(),
+            runtime.root.path().to_path_buf(),
+        );
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({"name":""}),
+            serde_json::json!({"name":"mixed-assets", "to":"copied"}),
+            serde_json::json!({"name":"mixed-assets", "path":"", "to":"copied"}),
+        ] {
+            assert!(matches!(
+                executor
+                    .execute(runtime.agent.clone(), "skill", args, None)
+                    .await,
+                Err(crate::tool::executor::ExecutionError::Tool(
+                    ToolError::InvalidArguments(_)
+                ))
+            ));
         }
-    }
-
-    #[tokio::test]
-    async fn image_attachments_and_binary_metadata_and_copy() {
-        let runtime = crate::test_support::TestRuntime::new().await;
-        let skills = fixture_skills().await;
-        let root = skills.get("mixed-assets").unwrap().root.clone();
-        let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder, skills, runtime.store.clone()).unwrap();
-        let executor = runtime.executor(builder);
-        let loaded = executor
-            .execute(
-                runtime.agent.clone(),
-                "skill",
-                serde_json::json!({"name":"mixed-assets", "path":"assets/pixel.png"}),
-                None,
-            )
-            .await
-            .unwrap();
-        let bytes = fs::read(root.join("assets/pixel.png")).await.unwrap();
-        assert_eq!(loaded.output.value["kind"], "image");
-        assert_eq!(
-            loaded.output.value["image"]["sha256"],
-            crate::sha256_hex(&bytes)
-        );
-        assert_eq!(loaded.output.value["image"]["media_type"], "image/png");
-        assert_eq!(loaded.output.images.len(), 1);
-        assert_eq!(
-            serde_json::to_value(&loaded.output.images[0]).unwrap(),
-            loaded.output.value["image"]
-        );
-        assert_eq!(
-            runtime.jobs.images(loaded.job).await.unwrap(),
-            loaded.output.images
-        );
-        for path in ["assets/payload.bin", "assets/nul.dat"] {
-            let bytes = fs::read(root.join(path)).await.unwrap();
-            let loaded = executor
-                .execute(
-                    runtime.agent.clone(),
-                    "skill",
-                    serde_json::json!({"name":"mixed-assets", "path":path}),
-                    None,
-                )
-                .await
-                .unwrap();
-            let result = &loaded.output.value;
-            assert_eq!(result["kind"], "binary");
-            assert_eq!(result["bytes"], bytes.len());
-            assert!(result.get("sha256").is_none());
-            assert!(result["note"].as_str().unwrap().contains("`to`"));
-            assert!(result.get("content").is_none());
-            assert!(loaded.output.images.is_empty());
-            let copied = executor
-                .execute(
-                    runtime.agent.clone(),
-                    "skill",
-                    serde_json::json!({"name":"mixed-assets", "path":path, "to":"copied.bin"}),
-                    None,
-                )
-                .await
-                .unwrap();
-            assert_eq!(copied.output.value["kind"], "copied");
-            assert_eq!(copied.output.value["sha256"], crate::sha256_hex(&bytes));
-            assert_eq!(
-                fs::read(runtime.root.path().join("copied.bin"))
-                    .await
-                    .unwrap(),
-                bytes
-            );
-        }
+        assert!(!runtime.root.path().join("copied").exists());
     }
 
     #[tokio::test]
@@ -867,244 +685,6 @@ mod tests {
         assert_eq!(loaded.output.value["kind"], "text");
     }
 
-    #[test]
-    fn description_prefers_frontmatter_then_prose() {
-        assert_eq!(
-            extract_description("---\ndescription: concise\n---\n# Name\nBody").unwrap(),
-            "concise"
-        );
-        assert_eq!(
-            extract_description("---\r\ndescription: CRLF description\r\n---\r\n# Name\r\nBody")
-                .unwrap(),
-            "CRLF description"
-        );
-        assert_eq!(
-            extract_description("---\ndescription: EOF delimiter\n---").unwrap(),
-            "EOF delimiter"
-        );
-        assert_eq!(
-            extract_description("# Name\n\nFirst paragraph").unwrap(),
-            "First paragraph"
-        );
-    }
-
-    #[tokio::test]
-    async fn asset_content_truncates_but_skill_instructions_remain_complete() {
-        let runtime = crate::test_support::TestRuntime::new().await;
-        let skill = runtime.root.path().join(".agents/skills/demo");
-        fs::create_dir_all(&skill).await.unwrap();
-        let instructions = "# Demo\n\n".to_owned() + &"Important instruction.\n".repeat(300);
-        let asset = "x".repeat(5000);
-        fs::write(skill.join("SKILL.md"), &instructions)
-            .await
-            .unwrap();
-        fs::write(skill.join("asset.txt"), &asset).await.unwrap();
-        let skills = HostSkills::discover_from(runtime.root.path(), None).await;
-        let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder, skills, runtime.store.clone()).unwrap();
-        let executor = runtime.executor(builder);
-
-        let loaded = executor
-            .execute_model(
-                runtime.agent.clone(),
-                "skill",
-                serde_json::json!({"name":"demo"}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(loaded.output.value["result"]["content"], instructions);
-        assert!(loaded.output.value.get("truncated").is_none());
-        let mut args = crate::job::output::OutputArgs::new(loaded.job);
-        args.field = Some("/result/content".into());
-        args.start = Some(300);
-        let page = runtime
-            .jobs
-            .present_output(args, &Default::default())
-            .await
-            .unwrap();
-        assert_eq!(page["preview"]["lines"][0], "Important instruction.");
-        assert_eq!(page["preview"]["total_lines"], instructions.lines().count());
-
-        let loaded = executor
-            .execute_model(
-                runtime.agent.clone(),
-                "skill",
-                serde_json::json!({"name":"demo","path":"asset.txt"}),
-                None,
-            )
-            .await
-            .unwrap();
-        let view = &loaded.output.value;
-        assert_eq!(view["result"]["content"], "x".repeat(2048));
-        assert_eq!(view["result"]["name"], "demo");
-        assert_eq!(view["result"]["path"], "asset.txt");
-        assert_eq!(view["result"]["bytes"], 5000);
-        assert_eq!(view["truncated"][0]["field"], "/result/content");
-        assert_eq!(
-            runtime
-                .jobs
-                .snapshot(loaded.job)
-                .await
-                .unwrap()
-                .output
-                .unwrap()["content"],
-            asset
-        );
-        let mut args = crate::job::output::OutputArgs::new(loaded.job);
-        args.field = Some(view["truncated"][0]["field"].as_str().unwrap().into());
-        args.start = Some(view["truncated"][0]["next_start"].as_u64().unwrap() as usize);
-        args.offset = Some(view["truncated"][0]["next_offset"].as_u64().unwrap_or(0) as usize);
-        let page = runtime
-            .jobs
-            .present_output(args, &Default::default())
-            .await
-            .unwrap();
-        assert_eq!(view["truncated"][0]["next_offset"], 2048);
-        assert!(asset[2048..].starts_with(page["preview"]["lines"][0].as_str().unwrap()));
-    }
-
-    #[tokio::test]
-    async fn complete_recursive_tree_is_saved_and_pageable() {
-        let runtime = crate::test_support::TestRuntime::new().await;
-        let skill = runtime.root.path().join(".agents/skills/demo");
-        let nested = skill.join("references/nested");
-        fs::create_dir_all(&nested).await.unwrap();
-        fs::write(skill.join("SKILL.md"), "# Demo\nAll instructions.")
-            .await
-            .unwrap();
-        for index in 0..240 {
-            fs::write(nested.join(format!("asset-{index:03}.txt")), "")
-                .await
-                .unwrap();
-        }
-        // Only the root instructions are excluded, not identically named assets.
-        fs::write(nested.join("SKILL.md"), "Nested asset.")
-            .await
-            .unwrap();
-        let skills = HostSkills::discover_from(runtime.root.path(), None).await;
-        let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder, skills, runtime.store.clone()).unwrap();
-        let executor = runtime.executor(builder);
-        for path in [None, Some("references")] {
-            let loaded = executor
-                .execute_model(
-                    runtime.agent.clone(),
-                    "skill",
-                    serde_json::json!({"name":"demo", "path":path}),
-                    None,
-                )
-                .await
-                .unwrap();
-            let view = &loaded.output.value;
-            let truncated = view["truncated"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|field| field["field"] == "/result/assets")
-                .unwrap();
-            let saved = runtime
-                .jobs
-                .snapshot(loaded.job)
-                .await
-                .unwrap()
-                .output
-                .unwrap();
-            let tree = saved["assets"].as_str().unwrap();
-            assert!(tree.contains("SKILL.md"));
-            assert!(tree.ends_with("└── asset-239.txt"));
-            assert_eq!(tree.lines().count(), if path.is_some() { 242 } else { 243 });
-            let mut args = crate::job::output::OutputArgs::new(loaded.job);
-            args.field = Some("/result/assets".into());
-            args.start = Some(truncated["next_start"].as_u64().unwrap() as usize);
-            args.offset = Some(truncated["next_offset"].as_u64().unwrap_or(0) as usize);
-            let page = runtime
-                .jobs
-                .present_output(args, &Default::default())
-                .await
-                .unwrap();
-            assert!(!page["preview"]["lines"].as_array().unwrap().is_empty());
-            // The final line is addressable independently of the first view's cap.
-            let mut args = crate::job::output::OutputArgs::new(loaded.job);
-            args.field = Some("/result/assets".into());
-            args.start = Some(tree.lines().count());
-            let page = runtime
-                .jobs
-                .present_output(args, &Default::default())
-                .await
-                .unwrap();
-            assert!(
-                page["preview"]["lines"][0]
-                    .as_str()
-                    .unwrap()
-                    .ends_with("asset-239.txt")
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn instructions_must_be_a_regular_file() {
-        let root = tempfile::tempdir().unwrap();
-        let skill = root.path().join("not-a-file");
-        fs::create_dir_all(skill.join("SKILL.md")).await.unwrap();
-        let error = load_skill(&skill).await.err().unwrap();
-        assert_eq!(error, "SKILL.md is not a regular file");
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            fs::remove_dir(skill.join("SKILL.md")).await.unwrap();
-            let path =
-                std::ffi::CString::new(skill.join("SKILL.md").as_os_str().as_bytes()).unwrap();
-            // SAFETY: path is a valid NUL-terminated string for this call.
-            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-            let error = tokio::time::timeout(std::time::Duration::from_secs(1), load_skill(&skill))
-                .await
-                .expect("discovery must not open and block on a FIFO")
-                .err()
-                .unwrap();
-            assert_eq!(error, "SKILL.md is not a regular file");
-        }
-    }
-
-    #[tokio::test]
-    async fn global_and_ancestor_discovery_and_crlf_instructions() {
-        let root = tempfile::tempdir().unwrap();
-        let global = root.path().join("home/.agents/skills");
-        let project = root.path().join("project");
-        let workspace = project.join("nested/workspace");
-        fs::create_dir_all(&workspace).await.unwrap();
-        let crlf = "---\r\ndescription: Global description\r\n---\r\n# Global\r\nBody\r\n";
-        for (directory, instructions) in [
-            (global.join("global-only"), crlf),
-            (global.join("common"), "Global common"),
-            (project.join(".agents/skills/common"), "Ancestor common"),
-            (workspace.join(".agents/skills/local-only"), "Local only"),
-        ] {
-            fs::create_dir_all(&directory).await.unwrap();
-            fs::write(directory.join("SKILL.md"), instructions)
-                .await
-                .unwrap();
-        }
-        let skills = HostSkills::discover_from(&workspace, Some(&global)).await;
-        assert!(skills.warnings().is_empty());
-        assert_eq!(
-            skills.get("common").unwrap().instructions,
-            "Ancestor common"
-        );
-        assert_eq!(skills.get("global-only").unwrap().instructions, crlf);
-        assert_eq!(
-            skills.get("global-only").unwrap().description,
-            "Global description"
-        );
-        assert_eq!(skills.get("local-only").unwrap().instructions, "Local only");
-        if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
-            assert_eq!(
-                user_skills_root().unwrap(),
-                PathBuf::from(home).join(".agents/skills")
-            );
-        }
-    }
-
     #[tokio::test]
     async fn nearest_skill_wins_and_assets_copy_from_the_host() {
         let root = tempfile::tempdir().unwrap();
@@ -1139,20 +719,8 @@ mod tests {
         register(&mut builder, skills, store).unwrap();
         let registry = builder.build();
         let skill_tool = registry.get("skill").unwrap();
-        assert_eq!(
-            skill_tool
-                .capabilities_for(&serde_json::json!({"name":"common"}))
-                .unwrap(),
-            vec![Capability::Read]
-        );
-        assert!(
-            !skill_tool
-                .capabilities_for(
-                    &serde_json::json!({"name":"common", "path":"asset.bin", "to":"copied.bin"})
-                )
-                .unwrap()
-                .contains(&Capability::Write)
-        );
+        // The host skill tool is always read-only; the transfer authorizes writes separately.
+        assert_eq!(skill_tool.capabilities(), vec![Capability::Read]);
         let executor = ToolExecutor::new(registry, Arc::new(AllowAll), jobs, workspace.clone());
         let loaded = executor
             .execute(

@@ -28,7 +28,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             let capture = context.capture_path("/result/matches").await?;
             let workspace = context.execution_location.workspace.clone();
             tokio::task::spawn_blocking(move || {
-                search_blocking(&workspace, &root, &args, Some(&capture), Some(&context))
+                search_blocking(&workspace, &root, &args, &capture, &context.cancellation_token())
             })
             .await
             .map_err(|error| ToolError::Failed(error.to_string()))?
@@ -45,7 +45,13 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             let capture = context.capture_path("/result/paths").await?;
             let workspace = context.execution_location.workspace.clone();
             tokio::task::spawn_blocking(move || {
-                glob_blocking(&workspace, &root, &args, Some(&capture), Some(&context))
+                glob_blocking(
+                    &workspace,
+                    &root,
+                    &args,
+                    &capture,
+                    &context.cancellation_token(),
+                )
             })
             .await
             .map_err(|error| ToolError::Failed(error.to_string()))?
@@ -100,8 +106,8 @@ fn search_blocking(
     workspace: &Path,
     root: &Path,
     args: &SearchArgs,
-    capture: Option<&Path>,
-    context: Option<&crate::tool::ToolContext>,
+    capture: &Path,
+    cancellation: &crate::job::CancellationToken,
 ) -> Result<SearchOutput, ToolError> {
     let mut matcher_builder = common_matcher();
     matcher_builder.fixed_strings(args.fixed).word(args.word);
@@ -141,17 +147,9 @@ fn search_blocking(
         .binary_detection(BinaryDetection::quit(b'\0'))
         .heap_limit(Some(4 * 1024 * 1024))
         .build();
-    let mut matches = CapturedArray::new(capture)?;
-    if !args.details {
-        matches.grouped = true;
-        if let Some(file) = &mut matches.file {
-            use std::io::{Seek as _, Write as _};
-            file.seek(std::io::SeekFrom::Start(0))?;
-            file.write_all(b"{\n")?;
-        }
-    }
+    let mut matches = CapturedOutput::new(capture, !args.details)?;
     for path in files {
-        if context.is_some_and(crate::tool::ToolContext::is_cancelled) {
+        if cancellation.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
         let path = path?;
@@ -161,7 +159,7 @@ fn search_blocking(
             path: relative_path(workspace, &path),
             matches: &mut matches,
             binary: false,
-            context,
+            cancellation,
         };
         searcher
             .search_path(&matcher, &path, &mut sink)
@@ -170,18 +168,12 @@ fn search_blocking(
             matches.rollback(checkpoint)?;
         }
     }
+    matches.finish()?;
     Ok(SearchOutput {
         matches: if args.details {
-            SearchMatches::Detailed(matches.finish()?)
+            SearchMatches::Detailed(Vec::new())
         } else {
-            let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            for item in matches.finish()? {
-                groups
-                    .entry(item.path)
-                    .or_default()
-                    .push(format!("{}: {}", item.line, item.text));
-            }
-            SearchMatches::Grouped(groups)
+            SearchMatches::Grouped(BTreeMap::new())
         },
     })
 }
@@ -190,8 +182,8 @@ fn glob_blocking(
     workspace: &Path,
     root: &Path,
     args: &GlobArgs,
-    capture: Option<&Path>,
-    context: Option<&crate::tool::ToolContext>,
+    capture: &Path,
+    cancellation: &crate::job::CancellationToken,
 ) -> Result<GlobOutput, ToolError> {
     if !root.is_dir() {
         return Err(ToolError::Failed("glob root is not a directory".into()));
@@ -202,9 +194,9 @@ fn glob_blocking(
         args.no_ignore,
         std::slice::from_ref(&args.pattern),
     )?;
-    let mut paths = CapturedArray::new(capture)?;
+    let mut paths = CapturedOutput::new(capture, false)?;
     for entry in walk.build() {
-        if context.is_some_and(crate::tool::ToolContext::is_cancelled) {
+        if cancellation.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
         let entry = entry.map_err(|error| ToolError::Failed(error.to_string()))?;
@@ -212,107 +204,80 @@ fn glob_blocking(
             paths.push(relative_path(workspace, entry.path()))?;
         }
     }
-    Ok(GlobOutput {
-        paths: paths.finish()?,
-    })
+    paths.finish()?;
+    Ok(GlobOutput { paths: Vec::new() })
 }
 
-struct CapturedArray<T> {
-    file: Option<std::io::BufWriter<std::fs::File>>,
-    values: Vec<T>,
+/// Streams the complete result into the owning job's capture. The handler returns
+/// only an empty placeholder; job collection hydrates the saved field.
+struct CapturedOutput {
+    file: std::io::BufWriter<std::fs::File>,
     count: usize,
     grouped: bool,
     group: Option<String>,
 }
-impl<T: Serialize> CapturedArray<T> {
-    fn new(path: Option<&Path>) -> std::io::Result<Self> {
+impl CapturedOutput {
+    fn new(path: &Path, grouped: bool) -> std::io::Result<Self> {
         use std::io::Write as _;
-        let mut file = path
-            .map(std::fs::File::create)
-            .transpose()?
-            .map(std::io::BufWriter::new);
-        if let Some(file) = &mut file {
-            file.write_all(b"[\n")?;
-        }
+        let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+        file.write_all(if grouped { b"{\n" } else { b"[\n" })?;
         Ok(Self {
             file,
-            values: Vec::new(),
             count: 0,
-            grouped: false,
+            grouped,
             group: None,
         })
     }
-    fn push(&mut self, value: T) -> std::io::Result<()> {
+    fn push(&mut self, value: impl Serialize) -> std::io::Result<()> {
         use std::io::Write as _;
-        if let Some(file) = &mut self.file {
-            if self.count > 0 {
-                file.write_all(b",\n")?;
-            }
-            serde_json::to_writer(file, &value)?;
-        } else {
-            self.values.push(value);
+        if self.count > 0 {
+            self.file.write_all(b",\n")?;
         }
+        serde_json::to_writer(&mut self.file, &value)?;
         self.count += 1;
         Ok(())
     }
     fn checkpoint(&mut self) -> std::io::Result<(usize, u64, Option<String>)> {
         use std::io::Seek as _;
-        Ok((
-            self.count,
-            self.file
-                .as_mut()
-                .map(std::io::BufWriter::stream_position)
-                .transpose()?
-                .unwrap_or(0),
-            self.group.clone(),
-        ))
+        Ok((self.count, self.file.stream_position()?, self.group.clone()))
     }
     fn rollback(&mut self, checkpoint: (usize, u64, Option<String>)) -> std::io::Result<()> {
         use std::io::{Seek as _, Write as _};
         self.count = checkpoint.0;
         self.group = checkpoint.2;
-        self.values.truncate(checkpoint.0);
-        if let Some(file) = &mut self.file {
-            file.flush()?;
-            file.get_ref().set_len(checkpoint.1)?;
-            file.seek(std::io::SeekFrom::Start(checkpoint.1))?;
-        }
+        self.file.flush()?;
+        self.file.get_ref().set_len(checkpoint.1)?;
+        self.file.seek(std::io::SeekFrom::Start(checkpoint.1))?;
         Ok(())
     }
-    fn finish(mut self) -> std::io::Result<Vec<T>> {
+    fn finish(mut self) -> std::io::Result<()> {
         use std::io::Write as _;
-        if let Some(file) = &mut self.file {
-            if self.grouped {
-                if self.group.is_some() {
-                    file.write_all(b"\n]")?;
-                }
-                file.write_all(b"\n}")?;
-            } else {
-                file.write_all(b"\n]")?;
+        if self.grouped {
+            if self.group.is_some() {
+                self.file.write_all(b"\n]")?;
             }
-            file.flush()?;
+            self.file.write_all(b"\n}")?;
+        } else {
+            self.file.write_all(b"\n]")?;
         }
-        Ok(self.values)
+        self.file.flush()
     }
-}
-impl CapturedArray<SearchMatch> {
     fn push_match(&mut self, value: SearchMatch) -> std::io::Result<()> {
         use std::io::Write as _;
-        if !self.grouped || self.file.is_none() {
+        if !self.grouped {
             return self.push(value);
         }
-        let file = self.file.as_mut().expect("capture file");
         if self.group.as_deref() == Some(&value.path) {
-            file.write_all(b",\n")?;
+            self.file.write_all(b",\n")?;
         } else {
             if self.group.is_some() {
-                file.write_all(b"\n],\n")?;
+                self.file.write_all(b"\n],\n")?;
             }
-            serde_json::to_writer(&mut *file, &value.path)?;
-            file.write_all(b": [\n")?;
+            serde_json::to_writer(&mut self.file, &value.path)?;
+            self.file.write_all(b": [\n")?;
             self.group = Some(value.path);
         }
-        serde_json::to_writer(file, &format!("{}: {}", value.line, value.text))?;
+        serde_json::to_writer(&mut self.file, &format!("{}: {}", value.line, value.text))?;
         self.count += 1;
         Ok(())
     }
@@ -321,9 +286,9 @@ impl CapturedArray<SearchMatch> {
 struct SearchSink<'a> {
     matcher: &'a grep_regex::RegexMatcher,
     path: String,
-    matches: &'a mut CapturedArray<SearchMatch>,
+    matches: &'a mut CapturedOutput,
     binary: bool,
-    context: Option<&'a crate::tool::ToolContext>,
+    cancellation: &'a crate::job::CancellationToken,
 }
 impl Sink for SearchSink<'_> {
     type Error = std::io::Error;
@@ -332,10 +297,7 @@ impl Sink for SearchSink<'_> {
         _searcher: &Searcher,
         matched: &SinkMatch<'_>,
     ) -> Result<bool, Self::Error> {
-        if self
-            .context
-            .is_some_and(crate::tool::ToolContext::is_cancelled)
-        {
+        if self.cancellation.is_cancelled() {
             return Err(std::io::Error::other("search cancelled"));
         }
         let bytes = matched.bytes();
@@ -414,18 +376,8 @@ enum SearchMatches {
     Detailed(Vec<SearchMatch>),
 }
 
-#[cfg(test)]
-impl std::ops::Deref for SearchMatches {
-    type Target = Vec<SearchMatch>;
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Detailed(items) => items,
-            _ => panic!("expected detailed matches"),
-        }
-    }
-}
-
 #[derive(Serialize, JsonSchema)]
+#[cfg_attr(test, derive(Deserialize))]
 struct SearchMatch {
     path: String,
     line: u64,
@@ -477,6 +429,41 @@ pub(crate) fn output_matcher(pattern: &str) -> Result<grep_regex::RegexMatcher, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn captured_search(
+        workspace: &Path,
+        root: &Path,
+        args: &SearchArgs,
+    ) -> Result<Vec<SearchMatch>, ToolError> {
+        assert!(args.details);
+        let capture = tempfile::NamedTempFile::new()?;
+        search_blocking(
+            workspace,
+            root,
+            args,
+            capture.path(),
+            &crate::job::CancellationToken::new(),
+        )?;
+        Ok(serde_json::from_reader(capture.reopen()?)?)
+    }
+
+    fn captured_glob(
+        workspace: &Path,
+        root: &Path,
+        args: &GlobArgs,
+    ) -> Result<GlobOutput, ToolError> {
+        let capture = tempfile::NamedTempFile::new()?;
+        glob_blocking(
+            workspace,
+            root,
+            args,
+            capture.path(),
+            &crate::job::CancellationToken::new(),
+        )?;
+        Ok(GlobOutput {
+            paths: serde_json::from_reader(capture.reopen()?)?,
+        })
+    }
 
     #[tokio::test]
     async fn grouped_search_is_captured_and_preserves_whitespace_and_binary_rollback() {
@@ -589,7 +576,7 @@ mod tests {
                         hidden,
                         no_ignore,
                     };
-                    let paths = glob_blocking(root.path(), root.path(), &args, None, None)
+                    let paths = captured_glob(root.path(), root.path(), &args)
                         .unwrap()
                         .paths;
                     assert!(paths.iter().any(|p| p == "src/visible"));
@@ -600,9 +587,7 @@ mod tests {
                         "pattern":"needle", "details":true, "glob":[pattern], "hidden":hidden, "no_ignore":no_ignore
                     }))
                     .unwrap();
-                    let matches = search_blocking(root.path(), root.path(), &args, None, None)
-                        .unwrap()
-                        .matches;
+                    let matches = captured_search(root.path(), root.path(), &args).unwrap();
                     assert_eq!(matches.iter().any(|m| m.path == ".git/config"), hidden);
                     assert_eq!(
                         matches.iter().any(|m| m.path == "build/generated"),
@@ -616,7 +601,7 @@ mod tests {
         let args: GlobArgs =
             serde_json::from_value(serde_json::json!({"pattern":"*", "path":".git"})).unwrap();
         assert_eq!(
-            glob_blocking(root.path(), &root.path().join(".git"), &args, None, None)
+            captured_glob(root.path(), &root.path().join(".git"), &args)
                 .unwrap()
                 .paths,
             [".git/config"]
@@ -638,7 +623,7 @@ mod tests {
         let args: GlobArgs =
             serde_json::from_value(serde_json::json!({"pattern":"*.rs", "path":"src"})).unwrap();
         assert_eq!(
-            glob_blocking(root.path(), &root.path().join("src"), &args, None, None)
+            captured_glob(root.path(), &root.path().join("src"), &args)
                 .unwrap()
                 .paths,
             ["src/a.rs", "src/b.rs", "src/nested/file.rs"]
@@ -659,9 +644,7 @@ mod tests {
                 serde_json::json!({"pattern":"needle", "details":true, "path":"src", "glob":glob}),
             )
             .unwrap();
-            let matches = search_blocking(root.path(), &root.path().join("src"), &args, None, None)
-                .unwrap()
-                .matches;
+            let matches = captured_search(root.path(), &root.path().join("src"), &args).unwrap();
             assert_eq!(
                 matches.iter().map(|m| m.path.as_str()).collect::<Vec<_>>(),
                 expected
@@ -676,7 +659,7 @@ mod tests {
         std::fs::write(root.path().join("lower.rs"), "needle\n").unwrap();
         std::fs::write(root.path().join("skip.txt"), "Needle\n").unwrap();
         std::fs::write(root.path().join("binary.rs"), b"Needle\0hidden\n").unwrap();
-        let output = search_blocking(
+        let output = captured_search(
             root.path(),
             root.path(),
             &SearchArgs {
@@ -690,14 +673,12 @@ mod tests {
                 hidden: false,
                 no_ignore: false,
             },
-            None,
-            None,
         )
         .unwrap();
-        assert_eq!(output.matches.len(), 1);
-        assert_eq!(output.matches[0].path, "upper.rs");
-        assert_eq!(output.matches[0].line, 1);
-        assert_eq!(output.matches[0].column, 1);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].path, "upper.rs");
+        assert_eq!(output[0].line, 1);
+        assert_eq!(output[0].column, 1);
     }
 
     #[test]
@@ -705,7 +686,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("b.rs"), "").unwrap();
         std::fs::write(root.path().join("a.rs"), "").unwrap();
-        let output = glob_blocking(
+        let output = captured_glob(
             root.path(),
             root.path(),
             &GlobArgs {
@@ -714,8 +695,6 @@ mod tests {
                 hidden: false,
                 no_ignore: false,
             },
-            None,
-            None,
         )
         .unwrap();
         assert_eq!(output.paths, vec!["a.rs", "b.rs"]);

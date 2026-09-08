@@ -191,21 +191,6 @@ impl TargetRegistry {
         self.entries.read().await.values().cloned().collect()
     }
 
-    pub async fn upsert(
-        &self,
-        definition: TargetDefinition,
-    ) -> Result<(TargetDefinition, Vec<String>), TargetError> {
-        let name = definition.name.clone();
-        let (definitions, invalidated) = self.upsert_many(vec![definition]).await?;
-        Ok((
-            definitions
-                .into_iter()
-                .find(|d| d.name == name)
-                .expect("upserted target"),
-            invalidated,
-        ))
-    }
-
     pub async fn upsert_many(
         &self,
         definitions: Vec<TargetDefinition>,
@@ -393,7 +378,7 @@ mod tests {
         let mut changed = target("edge", Some("build"));
         changed.source = TargetSource::Session;
         assert!(matches!(
-            registry.upsert(changed).await,
+            registry.upsert_many(vec![changed]).await,
             Err(TargetError::Cycle(_))
         ));
     }

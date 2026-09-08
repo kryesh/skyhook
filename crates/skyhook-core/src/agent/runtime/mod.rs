@@ -672,12 +672,10 @@ enum AgentCommand {
 
 struct AgentLaunch {
     id: AgentId,
-    parent: Option<AgentId>,
     owner_job: Option<JobId>,
     model_profile: String,
     agent_profile: Option<String>,
     todos: Option<Vec<TodoItem>>,
-    one_shot: bool,
     available_depth: usize,
     location: crate::execution::ExecutionLocation,
 }
@@ -687,7 +685,6 @@ struct AgentLoop {
     owner_job: Option<JobId>,
     context: AgentContext,
     model_profile: String,
-    one_shot: bool,
     location: crate::execution::ExecutionLocation,
     capabilities: CapabilitySet,
     rx: mpsc::Receiver<AgentCommand>,
@@ -703,7 +700,7 @@ struct TurnContext<'a> {
 
 impl SessionRuntime {
     fn activity(&self, agent: &AgentId, activity: AgentActivity) {
-        let _ = self.events.send(RuntimeEvent::Activity {
+        self.events.send(RuntimeEvent::Activity {
             agent: agent.clone(),
             activity,
         });
@@ -825,12 +822,10 @@ impl SessionRuntime {
         let root_tx = self
             .spawn_agent(AgentLaunch {
                 id: root.clone(),
-                parent: None,
                 owner_job: None,
                 model_profile,
                 agent_profile,
                 todos: None,
-                one_shot: false,
                 available_depth: self.harness.max_child_depth,
                 location: crate::execution::ExecutionLocation::root(self.harness.workspace.clone()),
             })
@@ -847,11 +842,15 @@ impl SessionRuntime {
         // Serialize catchups so the cursor advances only after the entire prefix is
         // published. Live forwarding may race ahead; RuntimeEvents deduplicates it.
         let mut sequence = self.caught_up_sequence.lock().await;
-        for record in self.store.records_after(*sequence).await {
-            let next_sequence = record.sequence;
-            let _ = self.events.send(RuntimeEvent::Record(Box::new(record)));
-            *sequence = next_sequence;
-        }
+        self.store
+            .visit_records_after(*sequence, |records| {
+                for record in records {
+                    self.events
+                        .send(RuntimeEvent::Record(Box::new(record.clone())));
+                    *sequence = record.sequence;
+                }
+            })
+            .await;
     }
 
     fn forward_store_events(self: &Arc<Self>) {
@@ -862,7 +861,7 @@ impl SessionRuntime {
             loop {
                 match source.recv().await {
                     Ok(record) => {
-                        let _ = events.send(RuntimeEvent::Record(Box::new(record)));
+                        events.send(RuntimeEvent::Record(Box::new(record)));
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let Some(runtime) = runtime.upgrade() else {
@@ -939,12 +938,10 @@ impl SessionRuntime {
     ) -> Result<AgentSender, HarnessError> {
         let AgentLaunch {
             id,
-            parent,
             owner_job,
             model_profile,
             agent_profile,
             todos,
-            one_shot,
             available_depth,
             location,
         } = launch;
@@ -973,7 +970,7 @@ impl SessionRuntime {
             .append(
                 id.clone(),
                 SessionEvent::AgentStarted {
-                    parent,
+                    parent: id.parent(),
                     owner_job,
                     model_profile: model_profile.clone(),
                     max_context: Some(context.profile.max_context),
@@ -1010,7 +1007,6 @@ impl SessionRuntime {
                     owner_job,
                     context,
                     model_profile,
-                    one_shot,
                     location,
                     capabilities,
                     rx,
@@ -1170,11 +1166,11 @@ impl SessionRuntime {
             owner_job,
             mut context,
             mut model_profile,
-            one_shot,
             location,
             capabilities,
             mut rx,
         } = agent_loop;
+        let is_child = owner_job.is_some();
         let owner_cancellation = match owner_job {
             Some(job) => match self.jobs.cancellation_token(job).await {
                 Ok(token) => token,
@@ -1253,7 +1249,7 @@ impl SessionRuntime {
                     let pending = match self.jobs.take_pending(&id).await {
                         Ok(pending) if !pending.is_empty() => pending,
                         Ok(_)
-                            if one_shot
+                            if is_child
                                 && child_answer.is_some()
                                 && !self.jobs.has_running(&id).await =>
                         {
@@ -1276,9 +1272,6 @@ impl SessionRuntime {
                                 .store
                                 .append(id.clone(), SessionEvent::AgentCompleted)
                                 .await;
-                            if owner_job.is_none() {
-                                break;
-                            }
                             continue;
                         }
                         _ => continue,
@@ -1299,7 +1292,7 @@ impl SessionRuntime {
                 }
                 continue;
             }
-            let done = if one_shot {
+            let done = if is_child {
                 if done.is_some() {
                     child_done = done;
                 }
@@ -1315,7 +1308,7 @@ impl SessionRuntime {
                     if let Some(done) = done.or_else(|| child_done.take()) {
                         let _ = done.send(Err(error.to_string()));
                     }
-                    if one_shot {
+                    if is_child {
                         self.interrupt_tree(&id).await;
                         break;
                     }
@@ -1350,7 +1343,7 @@ impl SessionRuntime {
             // Serialize the final mailbox check with owner forwarding. An accepted
             // update either joins this request cycle or starts a new retained turn.
             let mut completing = completion_gate.lock().await;
-            if one_shot && result.is_ok() {
+            if is_child && result.is_ok() {
                 while let Ok(command) = rx.try_recv() {
                     deferred.push_back(command);
                 }
@@ -1366,7 +1359,7 @@ impl SessionRuntime {
                 match &result {
                     Err(HarnessError::Interrupted) => AgentActivity::Interrupted,
                     Err(error) => AgentActivity::Failed(error.to_string()),
-                    Ok(_) if one_shot && self.jobs.has_running(&id).await => {
+                    Ok(_) if is_child && self.jobs.has_running(&id).await => {
                         AgentActivity::WaitingChildren
                     }
                     Ok(_) => AgentActivity::Idle,
@@ -1380,7 +1373,7 @@ impl SessionRuntime {
                         .map_err(ToString::to_string),
                 );
             }
-            if one_shot && result.is_err() {
+            if is_child && result.is_err() {
                 self.interrupt_tree(&id).await;
                 // A cancelled child must not keep its command loop alive.
                 if let Some(done) = child_done.take() {
@@ -1397,10 +1390,10 @@ impl SessionRuntime {
                     .await;
                 break;
             }
-            if one_shot {
+            if is_child {
                 child_answer = result.as_ref().ok().cloned();
             }
-            if one_shot && !self.jobs.has_running(&id).await {
+            if is_child && !self.jobs.has_running(&id).await {
                 *completing = false;
                 if let Some(done) = child_done.take() {
                     let _ = done.send(
@@ -1410,18 +1403,13 @@ impl SessionRuntime {
                             .map_err(ToString::to_string),
                     );
                 }
-                let terminal = if result.is_ok() {
-                    SessionEvent::AgentCompleted
-                } else {
-                    SessionEvent::AgentInterrupted
-                };
-                let _ = self.store.append(id.clone(), terminal).await;
+                let _ = self
+                    .store
+                    .append(id.clone(), SessionEvent::AgentCompleted)
+                    .await;
                 // Retain the provider session and full projected history while idle.
                 // A fresh owner request resumes this same child, never a new agent.
                 child_answer = None;
-                if owner_job.is_none() {
-                    break;
-                }
                 continue;
             }
         }
@@ -1543,7 +1531,7 @@ impl SessionRuntime {
                 )
                 .await?;
             self.activity(agent, AgentActivity::Working);
-            let _ = self.events.send(RuntimeEvent::Context {
+            self.events.send(RuntimeEvent::Context {
                 agent: agent.clone(),
                 tokens: agent_context.meter.estimate(&request),
                 capacity: profile.max_context,
@@ -1558,16 +1546,14 @@ impl SessionRuntime {
             let mut response = match invoked {
                 Ok(response) => response,
                 Err(error) => {
-                    self.store
-                        .append(
-                            agent.clone(),
-                            SessionEvent::ModelFailed {
-                                request: requested.sequence,
-                                attempt: provider_attempt,
-                                error: error.to_string(),
-                            },
-                        )
-                        .await?;
+                    self.record_model_failure(
+                        agent,
+                        requested.sequence,
+                        provider_attempt,
+                        Usage::default(),
+                        error.to_string(),
+                    )
+                    .await?;
                     if provider_attempt < compact::MAX_PROVIDER_ATTEMPTS {
                         force_compaction =
                             error.kind == crate::provider::ProviderErrorKind::ContextWindowExceeded;
@@ -1593,20 +1579,14 @@ impl SessionRuntime {
                 }) {
                     Ok(chunk) => chunk,
                     Err(error) => {
-                        if usage != Usage::default() {
-                            self.record_model_usage(agent, requested.sequence, usage)
-                                .await?;
-                        }
-                        self.store
-                            .append(
-                                agent.clone(),
-                                SessionEvent::ModelFailed {
-                                    request: requested.sequence,
-                                    attempt: provider_attempt,
-                                    error: error.to_string(),
-                                },
-                            )
-                            .await?;
+                        self.record_model_failure(
+                            agent,
+                            requested.sequence,
+                            provider_attempt,
+                            usage,
+                            error.to_string(),
+                        )
+                        .await?;
                         if provider_attempt < compact::MAX_PROVIDER_ATTEMPTS {
                             force_compaction = error.kind
                                 == crate::provider::ProviderErrorKind::ContextWindowExceeded;
@@ -1619,7 +1599,7 @@ impl SessionRuntime {
                 if let ResponseChunk::UsageUpdated { usage: value } = &chunk {
                     usage = *value;
                 }
-                let _ = self.events.send(RuntimeEvent::ResponseEvent {
+                self.events.send(RuntimeEvent::ResponseEvent {
                     agent: agent.clone(),
                     request: requested.sequence,
                     event: chunk,
@@ -1628,20 +1608,14 @@ impl SessionRuntime {
             let response = match finish_response(assembler, usage) {
                 Ok(response) => response,
                 Err(error) => {
-                    if usage != Usage::default() {
-                        self.record_model_usage(agent, requested.sequence, usage)
-                            .await?;
-                    }
-                    self.store
-                        .append(
-                            agent.clone(),
-                            SessionEvent::ModelFailed {
-                                request: requested.sequence,
-                                attempt: provider_attempt,
-                                error: error.to_string(),
-                            },
-                        )
-                        .await?;
+                    self.record_model_failure(
+                        agent,
+                        requested.sequence,
+                        provider_attempt,
+                        usage,
+                        error.to_string(),
+                    )
+                    .await?;
                     if provider_attempt < compact::MAX_PROVIDER_ATTEMPTS {
                         compact::retry_delay(cancellation, provider_attempt).await?;
                         continue;
@@ -1653,7 +1627,7 @@ impl SessionRuntime {
             let assistant = Message::Assistant(response.blocks);
             let origin = self.commit(agent, assistant.clone()).await?;
             agent_context.projected.push((origin, assistant));
-            let _ = self.events.send(RuntimeEvent::ResponseSettled {
+            self.events.send(RuntimeEvent::ResponseSettled {
                 agent: agent.clone(),
                 request: requested.sequence,
                 message: Some(origin),
@@ -1665,7 +1639,7 @@ impl SessionRuntime {
             let runtime =
                 prompt::runtime_state_content(&self.jobs, &self.todos, agent, capabilities).await;
             let current = agent_context.request(runtime);
-            let _ = self.events.send(RuntimeEvent::Context {
+            self.events.send(RuntimeEvent::Context {
                 agent: agent.clone(),
                 tokens: agent_context.meter.estimate(&current),
                 capacity: profile.max_context,
@@ -1684,7 +1658,7 @@ impl SessionRuntime {
                     final_text.clear();
                     continue 'requests;
                 }
-                let _ = self.events.send(RuntimeEvent::TurnCompleted {
+                self.events.send(RuntimeEvent::TurnCompleted {
                     agent: agent.clone(),
                     text: final_text.clone(),
                 });
@@ -1702,6 +1676,30 @@ impl SessionRuntime {
             let sequence = self.commit(agent, tools.clone()).await?;
             agent_context.projected.push((sequence, tools));
         }
+    }
+
+    async fn record_model_failure(
+        &self,
+        agent: &AgentId,
+        request: u64,
+        attempt: u8,
+        usage: Usage,
+        error: String,
+    ) -> Result<(), HarnessError> {
+        if usage != Usage::default() {
+            self.record_model_usage(agent, request, usage).await?;
+        }
+        self.store
+            .append(
+                agent.clone(),
+                SessionEvent::ModelFailed {
+                    request,
+                    attempt,
+                    error,
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     async fn record_model_usage(
@@ -1910,8 +1908,7 @@ mod tests {
     use crate::{
         agent::Question,
         provider::protocol::{
-            BlockContent, ContentDelta, ItemKind, ReplayEnvelope, StopReason, ToolCall,
-            events_for_content,
+            ContentDelta, ItemKind, ReplayEnvelope, StopReason, ToolCall, events_for_content,
         },
         provider::{ProviderContext, ProviderError, ProviderFuture, ResponseStream},
     };
@@ -1932,10 +1929,8 @@ mod tests {
         })
     }
 
-    #[derive(Clone, Default)]
-    struct HangingProvider {
-        invocations: Option<Arc<AtomicUsize>>,
-    }
+    #[derive(Clone)]
+    struct HangingProvider;
 
     #[derive(Clone)]
     struct BlockingFirstProvider {
@@ -1986,9 +1981,6 @@ mod tests {
 
     impl ProviderContext for HangingProvider {
         fn invoke(&mut self, _request: ModelRequest) -> ProviderFuture {
-            if let Some(invocations) = &self.invocations {
-                invocations.fetch_add(1, Ordering::SeqCst);
-            }
             Box::pin(async { Ok(Box::pin(stream::pending()) as ResponseStream) })
         }
     }
@@ -2081,10 +2073,6 @@ mod tests {
         history
     }
 
-    fn request_has_tool(request: &ModelRequest, name: &str) -> bool {
-        request.tools.iter().any(|tool| tool.name == name)
-    }
-
     async fn assert_request_journal(
         store: &SessionStore,
         captured: &Arc<StdMutex<Vec<ModelRequest>>>,
@@ -2165,6 +2153,20 @@ mod tests {
             .unwrap()
     }
 
+    // Wait for owned agent loops to release the runtime before reopening its journal.
+    pub(super) async fn shutdown_session(session: SessionHandle) {
+        let runtime = Arc::downgrade(&session.runtime);
+        session.shutdown().await.unwrap();
+        drop(session);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.strong_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("session runtime released after shutdown");
+    }
+
     async fn observation_session(workspace: &Path, sessions: &Path) -> SessionHandle {
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let harness = test_harness(workspace, sessions, scripted_provider(&requests, [])).await;
@@ -2182,50 +2184,6 @@ mod tests {
             .await
             .unwrap();
         runtime.start_root(None).await.unwrap()
-    }
-
-    #[tokio::test]
-    async fn observation_catchup_is_idempotent_and_preserves_legacy_subscription() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let session = observation_session(workspace.path(), sessions.path()).await;
-        let mut observation = session.observe().await;
-        let mut legacy = session.subscribe();
-        let record = session
-            .runtime
-            .store
-            .append(session.root.clone(), SessionEvent::AgentInterrupted)
-            .await
-            .unwrap();
-        let refreshed = session.observe().await;
-        assert_eq!(
-            refreshed.snapshot.records.get(&record.sequence),
-            Some(&record)
-        );
-        assert!(
-            matches!(legacy.recv().await.unwrap(), RuntimeEvent::Record(value) if *value == record)
-        );
-        observation
-            .snapshot
-            .apply(observation.updates.recv().await.unwrap());
-        assert_eq!(observation.snapshot.records, refreshed.snapshot.records);
-        assert_eq!(observation.snapshot.revision, refreshed.snapshot.revision);
-
-        let repeated = session.observe().await;
-        assert_eq!(repeated.snapshot.revision, refreshed.snapshot.revision);
-        assert!(matches!(
-            legacy.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
-        assert!(matches!(
-            observation.updates.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
-        assert_eq!(
-            *session.runtime.caught_up_sequence.lock().await,
-            record.sequence
-        );
-        session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -2248,7 +2206,7 @@ mod tests {
                 .append(session.root.clone(), SessionEvent::AgentCompleted)
                 .await
                 .unwrap();
-            let _ = session
+            session
                 .runtime
                 .events
                 .send(RuntimeEvent::Record(Box::new(second.clone())));
@@ -2343,12 +2301,6 @@ mod tests {
         response(vec![AssistantContent::text("answer", 0, text)])
     }
 
-    fn response_with_usage(items: Vec<AssistantContent>, usage: Usage) -> Vec<ResponseChunk> {
-        let mut events = response(items);
-        events.insert(events.len() - 1, ResponseChunk::UsageUpdated { usage });
-        events
-    }
-
     fn replay(payload: serde_json::Value) -> ReplayEnvelope {
         ReplayEnvelope {
             version: 1,
@@ -2356,374 +2308,6 @@ mod tests {
             model: "native".into(),
             scope: "reasoning".into(),
             payload,
-        }
-    }
-
-    fn test_fold_response(
-        items: Vec<AssistantContent>,
-        usage: Usage,
-    ) -> Result<FoldedResponse, HarnessError> {
-        let mut assembler = ResponseAssembler::default();
-        for event in response_with_usage(items, usage) {
-            assembler.push(&event)?;
-        }
-        finish_response(assembler, usage)
-    }
-
-    #[test]
-    fn response_folding_keeps_only_the_current_assistant_turn() {
-        let call = ToolCall {
-            id: "call-1".to_owned(),
-            name: "read".to_owned(),
-            arguments: json!({"path":"README.md"}),
-        };
-        let response = test_fold_response(
-            vec![
-                AssistantContent::text("working", 0, "working"),
-                AssistantContent::tool_call("call-1", 1, call.clone()),
-            ],
-            Usage {
-                input_tokens: 10,
-                output_tokens: 2,
-                ..Usage::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(response.text, "working");
-        assert_eq!(response.calls, vec![call]);
-        assert_eq!(response.blocks.len(), 2);
-        assert_eq!(response.blocks[0].id, "working");
-        assert_eq!(response.blocks[0].blocks[0].id, "working:0");
-        assert_eq!(response.blocks[1].id, "call-1");
-        assert_eq!(response.blocks[1].blocks[0].id, "call-1:0");
-        assert_eq!(response.usage.input_tokens, 10);
-    }
-
-    #[tokio::test]
-    async fn submitted_models_apply_between_turns_and_restore_with_history() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        fs::write(workspace.path().join("input.txt"), "tool input")
-            .await
-            .unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
-        let answer = |text: &str| response(vec![AssistantContent::text("answer", 0, text)]);
-        let original = scripted_provider(
-            &requests,
-            [
-                response(vec![AssistantContent::tool_call(
-                    "tool-0",
-                    0,
-                    ToolCall {
-                        id: "read-1".into(),
-                        name: "read".into(),
-                        arguments: json!({"path":"input.txt"}),
-                    },
-                )]),
-                answer("First answer"),
-            ],
-        );
-        let replacement = scripted_provider(
-            &requests,
-            [
-                answer("Second answer"),
-                answer("Continued"),
-                answer("Resumed"),
-            ],
-        );
-        let harness = test_builder(workspace.path(), sessions.path(), original)
-            .provider("replacement", replacement)
-            .model_profile(
-                "second",
-                ModelProfile {
-                    provider: "replacement".into(),
-                    model: "model-b".into(),
-                    reasoning: Some("high".into()),
-                    max_context: 64_000,
-                    max_output: 2048,
-                    supports_images: false,
-                },
-            )
-            .build()
-            .await
-            .unwrap();
-        let session = harness.new_session().await.unwrap();
-        let initial = session.runtime.store.records().await.len();
-        assert!(
-            session
-                .prompt_with_options(
-                    "Invalid",
-                    &[],
-                    PromptOptions {
-                        model: Some("missing".into())
-                    }
-                )
-                .await
-                .is_err()
-        );
-        assert_eq!(session.runtime.store.records().await.len(), initial);
-        assert_eq!(
-            session.prompt("First question").await.unwrap(),
-            "First answer"
-        );
-        assert_eq!(
-            session
-                .prompt_with_options(
-                    "Second question",
-                    &[],
-                    PromptOptions {
-                        model: Some("second".into())
-                    }
-                )
-                .await
-                .unwrap(),
-            "Second answer"
-        );
-        assert_eq!(session.continue_turn().await.unwrap(), "Continued");
-        let records = session.runtime.store.records().await;
-        assert_eq!(
-            records
-                .iter()
-                .filter(|r| matches!(r.event, SessionEvent::ModelChanged { .. }))
-                .count(),
-            1
-        );
-        assert_eq!(recorded_context(&records)[&session.root].capacity, 64_000);
-        assert_eq!(
-            crate::session::agent_selection(&records, &session.root)
-                .unwrap()
-                .0,
-            "second"
-        );
-        let projected = crate::session::project_history(&records, &session.root).unwrap();
-        assert_eq!(projected.iter().filter(|(_, m)| matches!(m, Message::User(blocks) if blocks.iter().any(|b| matches!(b, UserContent::Text { text } if text == "Second question")))).count(), 1);
-        let id = session.id();
-        session.shutdown().await.unwrap();
-        session.runtime.store.close().await.unwrap();
-        let resumed = harness.resume_session(id).await.unwrap();
-        assert_eq!(resumed.prompt("After resume").await.unwrap(), "Resumed");
-        let captured = requests.lock().unwrap().clone();
-        assert_eq!(
-            captured
-                .iter()
-                .map(|r| r.model.as_str())
-                .collect::<Vec<_>>(),
-            ["test", "test", "model-b", "model-b", "model-b"]
-        );
-        for request in &captured[2..] {
-            assert_eq!(request.reasoning.as_deref(), Some("high"));
-            assert_eq!(request.max_output_tokens, Some(2048));
-            assert_eq!(request.system, captured[0].system);
-            assert!(
-                serde_json::to_string(&request.messages)
-                    .unwrap()
-                    .contains("First question")
-            );
-        }
-        let records = resumed.runtime.store.records().await;
-        let journaled = records
-            .iter()
-            .filter_map(|record| {
-                if matches!(record.event, SessionEvent::ModelRequested { .. }) {
-                    Some(
-                        crate::session::reconstruct_model_request(&records, record.sequence)
-                            .unwrap(),
-                    )
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            journaled
-                .iter()
-                .map(|(provider, _)| provider.as_str())
-                .collect::<Vec<_>>(),
-            ["test", "test", "replacement", "replacement", "replacement"]
-        );
-        assert_eq!(
-            journaled.into_iter().map(|(_, r)| r).collect::<Vec<_>>(),
-            captured
-        );
-        resumed.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn children_inherit_active_models_and_explicit_overrides_reach_descendants() {
-        for (overrides, expected) in [
-            (json!({}), "active"),
-            (json!({"model":null,"profile":null}), "active"),
-            (json!({"model":"test"}), "test"),
-            (json!({"profile":"special"}), "special"),
-            (json!({"model":"active","profile":"special"}), "active"),
-            (json!({"profile":"instructions"}), "active"),
-        ] {
-            let workspace = tempfile::tempdir().unwrap();
-            let sessions = tempfile::tempdir().unwrap();
-            let requests = Arc::new(StdMutex::new(Vec::new()));
-            let answer = || response(vec![AssistantContent::text("answer", 0, "done")]);
-            let provider = scripted_provider(
-                &requests,
-                [
-                    answer(),
-                    response(vec![AssistantContent::tool_call(
-                        "tool-0",
-                        0,
-                        ToolCall {
-                            id: "grandchild".into(),
-                            name: "agent".into(),
-                            arguments: json!({"prompt":"leaf"}),
-                        },
-                    )]),
-                    answer(),
-                    answer(),
-                    answer(),
-                    answer(),
-                    answer(),
-                ],
-            );
-            let mut builder = test_builder(workspace.path(), sessions.path(), provider.clone())
-                .provider("alternate", provider)
-                // Default instructions must not reset an inherited model.
-                .agent_profile(
-                    "default",
-                    AgentProfile {
-                        instructions: "Default instructions".into(),
-                        model_profile: Some("test".into()),
-                    },
-                )
-                .default_agent_profile("default")
-                .agent_profile(
-                    "special",
-                    AgentProfile {
-                        instructions: "Special instructions".into(),
-                        model_profile: Some("special".into()),
-                    },
-                )
-                .agent_profile(
-                    "instructions",
-                    AgentProfile {
-                        instructions: "Instructions only".into(),
-                        model_profile: None,
-                    },
-                );
-            for name in ["active", "special"] {
-                builder = builder.model_profile(
-                    name,
-                    ModelProfile {
-                        provider: "alternate".into(),
-                        model: name.into(),
-                        reasoning: Some("high".into()),
-                        max_context: 64_000,
-                        max_output: 2048,
-                        supports_images: false,
-                    },
-                );
-            }
-            let harness = builder.build().await.unwrap();
-            let session = harness.new_session().await.unwrap();
-            session
-                .prompt_with_options(
-                    "Switch model",
-                    &[],
-                    PromptOptions {
-                        model: Some("active".into()),
-                    },
-                )
-                .await
-                .unwrap();
-            let mut arguments = overrides.clone();
-            arguments["prompt"] = json!("Delegate to a grandchild");
-            arguments["depth"] = json!(1);
-            session
-                .run_script(format!("return await tool.agent({arguments});"))
-                .await
-                .unwrap();
-            let captured = requests.lock().unwrap().clone();
-            assert_eq!(
-                captured
-                    .iter()
-                    .map(|r| r.model.as_str())
-                    .collect::<Vec<_>>(),
-                ["active", expected, expected, expected],
-                "{overrides}"
-            );
-            let records = session.runtime.store.records().await;
-            let children = records
-                .iter()
-                .filter(|r| !r.agent.path().is_empty())
-                .filter_map(|record| {
-                    if let SessionEvent::AgentStarted {
-                        model_profile,
-                        max_context,
-                        ..
-                    } = &record.event
-                    {
-                        Some((model_profile.as_str(), *max_context))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            let capacity = if expected == "test" { 128_000 } else { 64_000 };
-            assert_eq!(
-                children,
-                [(expected, Some(capacity)), (expected, Some(capacity))]
-            );
-            for record in records
-                .iter()
-                .filter(|r| matches!(r.event, SessionEvent::ModelRequested { .. }))
-            {
-                let (provider, request) =
-                    crate::session::reconstruct_model_request(&records, record.sequence).unwrap();
-                assert_eq!(
-                    provider,
-                    if request.model == "test" {
-                        "test"
-                    } else {
-                        "alternate"
-                    }
-                );
-            }
-            let id = session.id();
-            session.shutdown().await.unwrap();
-            session.runtime.store.close().await.unwrap();
-            if overrides == json!({}) {
-                let resumed = harness.resume_session(id).await.unwrap();
-                resumed
-                    .run_script("return await tool.agent({prompt:'After resume'});")
-                    .await
-                    .unwrap();
-                assert_eq!(requests.lock().unwrap().last().unwrap().model, "active");
-                let launched = resumed
-                    .run_script(
-                        "return await tool.agent({prompt:'Background',model:null,bg:true});",
-                    )
-                    .await
-                    .unwrap();
-                let job = JobId::new(launched.value["value"]["id"].as_u64().unwrap()).unwrap();
-                resumed
-                    .runtime
-                    .jobs
-                    .wait(job, Some(Duration::from_secs(5)), true)
-                    .await
-                    .unwrap();
-                let records = resumed.runtime.store.records().await;
-                let last = records
-                    .iter()
-                    .rev()
-                    .find_map(|record| match &record.event {
-                        SessionEvent::AgentStarted { model_profile, .. }
-                            if !record.agent.path().is_empty() =>
-                        {
-                            Some(model_profile.as_str())
-                        }
-                        _ => None,
-                    })
-                    .unwrap();
-                assert_eq!(last, "active");
-                resumed.shutdown().await.unwrap();
-            }
         }
     }
 
@@ -2968,8 +2552,9 @@ mod tests {
             .unwrap();
         assert!(records.iter().any(|record| matches!(&record.event,
             SessionEvent::MessageCommitted { message: Message::Assistant(actual) } if actual == &blocks)));
-        session.runtime.store.close().await.unwrap();
-        let resumed = harness.resume_session(session.id()).await.unwrap();
+        let id = session.id();
+        shutdown_session(session).await;
+        let resumed = harness.resume_session(id).await.unwrap();
         assert_eq!(resumed.prompt("After reload").await.unwrap(), "Resumed");
         assert!(
             requests.lock().unwrap()[2]
@@ -2977,89 +2562,6 @@ mod tests {
                 .contains(&Message::Assistant(blocks))
         );
         resumed.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn final_only_reasoning_is_journaled_without_provisional_deltas() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            Arc::new(ScriptedProvider {
-                requests: Arc::new(StdMutex::new(Vec::new())),
-                responses: StdMutex::new(VecDeque::from([response(vec![
-                    AssistantContent::reasoning("reasoning", 0, "First step. Second step.", None),
-                    AssistantContent::text("answer", 1, "Answer"),
-                ])]))
-                .into(),
-            }),
-        )
-        .await;
-        let session = harness.new_session().await.unwrap();
-        assert_eq!(session.prompt("Question").await.unwrap(), "Answer");
-        session.shutdown().await.unwrap();
-        let records = SessionStore::read_records(sessions.path(), session.id())
-            .await
-            .unwrap();
-        let blocks = records
-            .iter()
-            .find_map(|record| match &record.event {
-                SessionEvent::MessageCommitted {
-                    message: Message::Assistant(blocks),
-                } => Some(blocks),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(blocks.len(), 2);
-        assert!(
-            matches!(&blocks[0].blocks[0].content, BlockContent::Reasoning { text } if text == "First step. Second step.")
-        );
-        assert!(blocks[0].replay.is_none());
-        assert_eq!(blocks[0].id, "reasoning");
-        assert_eq!(blocks[0].blocks[0].id, "reasoning:0");
-        assert!(
-            matches!(&blocks[1].blocks[0].content, BlockContent::Text { text } if text == "Answer")
-        );
-    }
-
-    #[test]
-    fn authoritative_reasoning_preserves_complete_blocks_and_signatures_without_duplication() {
-        let blocks = vec![
-            AssistantContent::reasoning(
-                "reasoning",
-                0,
-                "Complete reasoning",
-                Some(replay(json!({"signature":"signed"}))),
-            ),
-            AssistantContent::text("answer", 1, "Answer"),
-        ];
-        let mut assembler = ResponseAssembler::default();
-        for event in response(blocks.clone()) {
-            if let ResponseChunk::BlockEnded {
-                item,
-                block,
-                content,
-            } = &event
-            {
-                let partial = match content {
-                    BlockContent::Reasoning { .. } => "Partial reasoning",
-                    BlockContent::Text { .. } => "Partial answer",
-                    BlockContent::ToolCall(_) => unreachable!(),
-                };
-                assembler
-                    .push(&ResponseChunk::BlockDelta {
-                        item: item.clone(),
-                        block: block.clone(),
-                        delta: ContentDelta::Text(partial.into()),
-                    })
-                    .unwrap();
-            }
-            assembler.push(&event).unwrap();
-        }
-        let response = finish_response(assembler, Usage::default()).unwrap();
-        assert_eq!(response.text, "Answer");
-        assert_eq!(response.blocks, blocks);
     }
 
     #[tokio::test]
@@ -3108,122 +2610,6 @@ mod tests {
         session.shutdown().await.unwrap();
         tokio::task::yield_now().await;
         session.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn annotated_output_remains_bounded_and_requests_reconstruct_exactly() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
-        let call = |id: &str, name: &str, arguments| {
-            response(vec![AssistantContent::tool_call(
-                "tool-0",
-                0,
-                ToolCall {
-                    id: id.into(),
-                    name: name.into(),
-                    arguments,
-                },
-            )])
-        };
-        tokio::fs::write(workspace.path().join("large.txt"), "x".repeat(92_000))
-            .await
-            .unwrap();
-        let mut responses = vec![call("large", "read", json!({"path":"large.txt"}))];
-        responses.push(call(
-            "page",
-            "job_output",
-            json!({"job":1,"field":"/result/content","limit":2}),
-        ));
-        for n in 0..10 {
-            responses.push(call(
-                &format!("small{n}"),
-                "script",
-                json!({"source":"return 1;"}),
-            ));
-        }
-        responses.push(response(vec![AssistantContent::text("answer", 0, "done")]));
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            scripted_provider(&requests, responses),
-        )
-        .await;
-        let session = harness.new_session().await.unwrap();
-        assert_eq!(
-            session.prompt("inspect saved output").await.unwrap(),
-            "done"
-        );
-        assert_request_journal(&session.runtime.store, &requests).await;
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 13);
-        let mut repeated_large_bytes = 0;
-        for request in &requests[1..] {
-            for message in &request.messages {
-                if let Message::Tool(results) = message {
-                    for result in results {
-                        if result.call_id == "large" {
-                            let bytes = serde_json::to_vec(&result.result).unwrap().len();
-                            assert!(bytes <= crate::job::output::PAGE_BYTES);
-                            assert_eq!(
-                                result.result["result"]["content"].as_str().unwrap().len(),
-                                2048
-                            );
-                            assert_eq!(result.result["result"]["path"], "large.txt");
-                            assert_eq!(result.result["truncated"][0]["total_lines"], 1);
-                            assert_eq!(result.result["truncated"][0]["next_start"], 1);
-                            assert_eq!(result.result["truncated"][0]["next_offset"], 2048);
-                            repeated_large_bytes += bytes;
-                        }
-                    }
-                }
-            }
-        }
-        assert!(repeated_large_bytes < 12 * crate::job::output::PAGE_BYTES);
-    }
-
-    #[tokio::test]
-    async fn unannotated_script_results_are_sent_to_the_model_in_full() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
-        let responses = vec![
-            response(vec![AssistantContent::tool_call(
-                "tool-0",
-                0,
-                ToolCall {
-                    id: "full".into(),
-                    name: "script".into(),
-                    arguments: json!({"source":"return {text:'x'.repeat(92000),ok:true};"}),
-                },
-            )]),
-            response(vec![AssistantContent::text("answer", 0, "done")]),
-        ];
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            scripted_provider(&requests, responses),
-        )
-        .await;
-        let session = harness.new_session().await.unwrap();
-        session.prompt("return the result").await.unwrap();
-        assert_request_journal(&session.runtime.store, &requests).await;
-        let requests = requests.lock().unwrap();
-        let result = requests[1]
-            .messages
-            .iter()
-            .find_map(|message| {
-                if let Message::Tool(results) = message {
-                    results.iter().find(|result| result.call_id == "full")
-                } else {
-                    None
-                }
-            })
-            .unwrap();
-        assert_eq!(result.result["result"]["value"]["text"], "x".repeat(92_000));
-        assert_eq!(result.result["result"]["value"]["ok"], true);
-        assert!(result.result.get("truncated").is_none());
-        assert!(result.result.get("preview").is_none());
     }
 
     #[tokio::test]
@@ -3391,214 +2777,6 @@ mod tests {
         };
         assert_eq!(results.len(), 2);
         assert_eq!(runtime_state_count(&requests[1].messages), 1);
-    }
-
-    #[tokio::test]
-    async fn remote_children_use_the_shared_host_agent_loop() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
-        let provider = scripted_provider(
-            &requests,
-            [
-                response(vec![AssistantContent::tool_call(
-                    "tool-0",
-                    0,
-                    ToolCall {
-                        id: "agent-1".to_owned(),
-                        name: "agent".to_owned(),
-                        arguments: json!({"prompt":"inspect", "target":"build", "workspace":"child"}),
-                    },
-                )]),
-                response(vec![AssistantContent::text(
-                    "answer",
-                    0,
-                    "child done".to_owned(),
-                )]),
-                response(vec![AssistantContent::text(
-                    "answer",
-                    0,
-                    "root done".to_owned(),
-                )]),
-            ],
-        );
-        let mut targets = TargetsConfig::default();
-        targets.entries.insert(
-            "build".to_owned(),
-            crate::target::TargetConfig {
-                host: "build.example.com".to_owned(),
-
-                workspace: PathBuf::from("/srv/project"),
-                via: None,
-                r#type: crate::target::TargetConfigType::Ssh,
-                ssh: crate::target::SshOptions::default(),
-            },
-        );
-        let harness = test_builder(workspace.path(), sessions.path(), provider)
-            .model_profile(
-                "remote-active",
-                ModelProfile {
-                    provider: "test".into(),
-                    model: "remote-active".into(),
-                    reasoning: None,
-                    max_context: 64_000,
-                    max_output: 2048,
-                    supports_images: false,
-                },
-            )
-            .capabilities({
-                let mut capabilities = CapabilitySet::default();
-                capabilities.insert(crate::tool::policy::Capability::Targets);
-                capabilities
-            })
-            .targets_config(targets)
-            .build()
-            .await
-            .unwrap();
-
-        let session = harness.new_session().await.unwrap();
-        let targets = session
-            .run_script(
-                r#"
-            const added = await tool.target_add({name:"db", type:"ssh", host:"db.internal"});
-            return {added, listed: await tool.targets(), detailed: await tool.targets({details:true})};
-        "#,
-            )
-            .await
-            .unwrap()
-            .value["value"].clone();
-        let detailed = targets["detailed"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|target| target["name"] == "db")
-            .unwrap();
-        assert_eq!(detailed["origin"], "root");
-        assert_eq!(detailed["ssh_alias"], "db.internal");
-        assert_eq!(detailed["source"], "session");
-        assert!(
-            detailed
-                .as_object()
-                .unwrap()
-                .values()
-                .all(|value| !value.is_null())
-        );
-        assert_eq!(targets["added"]["type"], "ssh");
-        assert!(targets["added"].get("origin").is_none());
-        assert_eq!(targets["added"]["host"], "db.internal");
-        assert!(targets["added"].get("ssh_alias").is_none());
-        assert!(targets["added"].get("source").is_none());
-        assert!(
-            targets["listed"]
-                .as_array()
-                .unwrap()
-                .contains(&targets["added"])
-        );
-        assert_eq!(
-            targets["listed"][0],
-            json!({
-                "name":"root", "type":"local", "host":"localhost"
-            })
-        );
-        assert_eq!(
-            session
-                .prompt_with_options(
-                    "delegate",
-                    &[],
-                    PromptOptions {
-                        model: Some("remote-active".into())
-                    }
-                )
-                .await
-                .unwrap(),
-            "root done"
-        );
-
-        assert_request_journal(&session.runtime.store, &requests).await;
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
-        assert!(
-            requests
-                .iter()
-                .all(|request| request.model == "remote-active")
-        );
-        let tools_with_target = requests[0]
-            .tools
-            .iter()
-            .filter(|tool| tool.input_schema["properties"]["target"].is_object())
-            .map(|tool| tool.name.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            tools_with_target,
-            ["agent", "exec", "glob", "read", "search", "shell"].into()
-        );
-        assert!(request_has_tool(&requests[0], "targets"));
-        assert!(request_has_tool(&requests[0], "target_add"));
-        assert_eq!(
-            request_location(&requests[0]),
-            json!({
-                "workspace": workspace.path(),
-                "target": {"name":"root", "type":"local", "host":"localhost", "origin":"root", "via":null}
-            })
-        );
-        assert_eq!(
-            request_location(&requests[1]),
-            json!({
-                "workspace": "/srv/project/child",
-                "target": {"name":"build", "type":"ssh", "host":"build.example.com", "origin":"root", "via":null}
-            })
-        );
-        let add = requests[0]
-            .tools
-            .iter()
-            .find(|tool| tool.name == "target_add")
-            .unwrap();
-        let schema = &add.input_schema;
-        let reference = schema["properties"]["type"]["$ref"].as_str().unwrap();
-        assert_eq!(
-            schema
-                .pointer(reference.strip_prefix('#').unwrap())
-                .unwrap()["enum"],
-            json!(["ssh"])
-        );
-        let required = schema["required"].as_array().unwrap();
-        for name in ["name", "type", "host"] {
-            assert!(required.contains(&json!(name)));
-        }
-        assert!(
-            schema["properties"]["origin"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("defaults to your current target")
-        );
-        assert!(
-            schema["properties"]["via"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("SSH ProxyJump")
-        );
-        assert!(
-            add.description
-                .contains(r#"tool.target_add({name:"db", type:"ssh", host:"db.internal"})"#)
-        );
-        assert!(
-            add.description
-                .contains("does not connect to the destination or change your current target")
-        );
-        assert!(add.description.contains("Result:"));
-        assert!(requests[0].system[0].text.contains(prompt::TARGET_PROMPT));
-        assert!(requests[1].system[0].text.contains("\"name\":\"build\""));
-        assert!(requests[1].system[0].text.contains("\"type\":\"ssh\""));
-        assert!(requests[1].system[0].text.contains("/srv/project"));
-        assert!(requests[1].system[0].text.starts_with(prompt::CHILD_PROMPT));
-        assert!(!requests[1].system[0].text.contains("orchestration"));
-        assert!(!requests[1].system[0].text.contains("available_depth"));
-        assert!(!request_has_tool(&requests[1], "agent"));
-        let Message::Tool(results) = request_history(&requests[2]).last().unwrap() else {
-            panic!("root must receive the child result");
-        };
-        assert_eq!(results[0].result["target"], "build");
-        assert_eq!(results[0].result["result"], "child done");
     }
 
     #[tokio::test]
@@ -3819,6 +2997,13 @@ mod tests {
         .await;
         let session = harness.new_session().await.unwrap();
         let child = session.root.child(1);
+        let owner_job = session
+            .runtime
+            .jobs
+            .create(crate::job::JobSpec::test(session.root.clone(), "agent"))
+            .await
+            .unwrap()
+            .id;
         let job = session
             .runtime
             .jobs
@@ -3833,12 +3018,10 @@ mod tests {
             .runtime
             .spawn_agent(AgentLaunch {
                 id: child.clone(),
-                parent: Some(session.root.clone()),
-                owner_job: None,
+                owner_job: Some(owner_job),
                 model_profile: "test".to_owned(),
                 agent_profile: None,
                 todos: None,
-                one_shot: true,
                 available_depth: 0,
                 location: crate::execution::ExecutionLocation::root(workspace.path().to_path_buf()),
             })
@@ -3880,172 +3063,7 @@ mod tests {
                 .unwrap(),
             "initial"
         );
-    }
-
-    #[tokio::test]
-    async fn child_relative_workspaces_and_explicit_root_follow_the_shared_rules() {
-        for (target, expected) in [(None, "nested"), (Some("root"), "")] {
-            let workspace = tempfile::tempdir().unwrap();
-            std::fs::create_dir(workspace.path().join("nested")).unwrap();
-            let sessions = tempfile::tempdir().unwrap();
-            let requests = Arc::new(StdMutex::new(Vec::new()));
-            let call = |arguments| {
-                response(vec![AssistantContent::tool_call(
-                    "tool-0",
-                    0,
-                    ToolCall {
-                        id: "agent".to_owned(),
-                        name: "agent".to_owned(),
-                        arguments,
-                    },
-                )])
-            };
-            let text = || response(vec![AssistantContent::text("answer", 0, "done".to_owned())]);
-            let harness = test_builder(
-                workspace.path(),
-                sessions.path(),
-                scripted_provider(
-                    &requests,
-                    [
-                        call(json!({"prompt":"child", "depth":1, "workspace":"nested"})),
-                        call(json!({"prompt":"grandchild", "target":target})),
-                        text(),
-                        text(),
-                        text(),
-                    ],
-                ),
-            )
-            .capabilities({
-                let mut set = CapabilitySet::default();
-                set.insert(crate::tool::policy::Capability::Targets);
-                set
-            })
-            .build()
-            .await
-            .unwrap();
-            let session = harness.new_session().await.unwrap();
-            session.prompt("delegate").await.unwrap();
-            let requests = requests.lock().unwrap();
-            let expected_path = std::fs::canonicalize(workspace.path().join(expected)).unwrap();
-            assert!(
-                requests[2].system[0]
-                    .text
-                    .contains(&format!("\"workspace\":{}", json!(expected_path)))
-            );
-            assert!(!requests[2].messages.iter().any(|message| matches!(message, Message::User(content) if content.iter().any(|item| matches!(item, UserContent::Text {text} if text == "delegate")))));
-        }
-    }
-
-    #[tokio::test]
-    async fn local_children_honor_absolute_workspace_overrides() {
-        let workspace = tempfile::tempdir().unwrap();
-        let child_workspace = tempfile::tempdir().unwrap();
-        std::fs::write(
-            child_workspace.path().join("note.txt"),
-            "from child workspace",
-        )
-        .unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
-        let child_path = std::fs::canonicalize(child_workspace.path()).unwrap();
-        let provider = scripted_provider(
-            &requests,
-            [
-                response(vec![AssistantContent::tool_call(
-                    "tool-0",
-                    0,
-                    ToolCall {
-                        id: "agent-local".to_owned(),
-                        name: "agent".to_owned(),
-                        arguments: json!({"prompt":"inspect", "workspace": child_path}),
-                    },
-                )]),
-                response(vec![AssistantContent::tool_call(
-                    "tool-0",
-                    0,
-                    ToolCall {
-                        id: "read-child".to_owned(),
-                        name: "read".to_owned(),
-                        arguments: json!({"path":"note.txt"}),
-                    },
-                )]),
-                response(vec![AssistantContent::text(
-                    "answer",
-                    0,
-                    "child done".to_owned(),
-                )]),
-                response(vec![AssistantContent::text(
-                    "answer",
-                    0,
-                    "root done".to_owned(),
-                )]),
-            ],
-        );
-        let harness = test_harness(workspace.path(), sessions.path(), provider).await;
-        let session = harness.new_session().await.unwrap();
-        assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
-
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 4);
-        assert!(
-            requests[1].system[0]
-                .text
-                .contains(&child_path.to_string_lossy().into_owned())
-        );
-        let Message::Tool(results) = request_history(&requests[2]).last().unwrap() else {
-            panic!("child must receive its read result");
-        };
-        assert_eq!(
-            results[0].result["result"]["content"],
-            "from child workspace"
-        );
-    }
-
-    #[tokio::test]
-    async fn delegated_depth_controls_child_agent_visibility() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            scripted_provider(&requests, [
-                    response(vec![AssistantContent::tool_call("tool-0", 0, ToolCall {
-                            id: "root-agent".to_owned(),
-                            name: "agent".to_owned(),
-                            arguments: json!({"prompt":"delegate once", "depth":1}),
-                        })]),
-                    response(vec![AssistantContent::tool_call("tool-0", 0, ToolCall {
-                            id: "child-agent".to_owned(),
-                            name: "agent".to_owned(),
-                            arguments: json!({"prompt":"inspect directly", "todos":["Inspect directly"]}),
-                        })]),
-                    response(vec![AssistantContent::text("answer", 0, "leaf done".to_owned())]),
-                    response(vec![AssistantContent::text("answer", 0, "child done".to_owned())]),
-                    response(vec![AssistantContent::text("answer", 0, "root done".to_owned())]),
-                ]),
-        )
-        .await;
-
-        let session = harness.new_session().await.unwrap();
-        assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
-
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 5);
-        assert!(request_has_tool(&requests[0], "agent"));
-        assert!(requests[0].system[0].text.contains("\"available_depth\":4"));
-        assert!(requests[1].system[0].text.starts_with(prompt::CHILD_PROMPT));
-        assert!(requests[1].system[0].text.contains("\"available_depth\":1"));
-        assert!(request_has_tool(&requests[1], "agent"));
-        assert!(requests[2].system[0].text.starts_with(prompt::CHILD_PROMPT));
-        assert!(!requests[2].system[0].text.contains("available_depth"));
-        assert!(!request_has_tool(&requests[2], "agent"));
-        let Message::User(content) = requests[2].messages.last().unwrap() else {
-            panic!("grandchild runtime state");
-        };
-        assert!(
-            matches!(&content[0], UserContent::Runtime { text } if text.contains(r#""todos":[{"text":"Inspect directly","status":"pending"}]"#))
-        );
+        session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -4268,473 +3286,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupt_stops_a_pending_provider_turn() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let invocations = Arc::new(AtomicUsize::new(0));
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            Arc::new(HangingProvider {
-                invocations: Some(invocations.clone()),
-            }),
-        )
-        .await;
-        let session = harness.new_session().await.unwrap();
-        let pending = tokio::spawn({
-            let session = session.clone();
-            async move { session.prompt("wait forever").await }
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while invocations.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        session.interrupt().await;
-        let error = tokio::time::timeout(Duration::from_secs(1), pending)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap_err();
-        assert!(error.to_string().contains("interrupted"));
-    }
-
-    #[tokio::test]
-    async fn hidden_job_controls_are_documented_and_execute_only_through_scripts() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            Arc::new(HangingProvider::default()),
-        )
-        .await;
-        let session = harness.new_session().await.unwrap();
-        let definitions = session
-            .tools()
-            .surface(&CapabilitySet::default())
-            .definitions();
-        let names = definitions
-            .iter()
-            .map(|definition| definition.name.as_str())
-            .collect::<Vec<_>>();
-        assert!(names.contains(&"jobs"));
-        assert!(names.contains(&"job_output"));
-        for hidden in ["job_inspect", "job_send", "job_cancel", "job_events"] {
-            assert!(!names.contains(&hidden));
-        }
-        let description = &definitions
-            .iter()
-            .find(|definition| definition.name == "script")
-            .unwrap()
-            .description;
-        for signature in [
-            "tool.job(id).output({",
-            "tool.job(id).send({value: JSON})",
-            "tool.job(id).cancel()",
-        ] {
-            assert!(
-                description.contains(signature),
-                "missing {signature}: {description}"
-            );
-        }
-        assert!(!description.contains("$schema"));
-        assert!(description.contains("this script's own job ID"));
-        assert!(description.contains("requires `script` with `bg:true`"));
-        assert!(description.contains("Child-agent input is delivered automatically"));
-        assert!(description.contains("next model-request boundary"));
-        assert!(description.contains("Sending to a completed agent"));
-        assert!(description.contains("same job ID"));
-        let agent_description = &definitions
-            .iter()
-            .find(|definition| definition.name == "agent")
-            .unwrap()
-            .description;
-        assert!(agent_description.contains("completed children resume with retained history"));
-
-        let direct = session
-            .runtime
-            .executor
-            .execute_model(session.root.clone(), "job_inspect", json!({"job": 1}), None)
-            .await
-            .err()
-            .unwrap();
-        assert!(direct.to_string().contains("unknown tool"));
-
-        let running = session
-            .runtime
-            .executor
-            .execute(
-                session.root.clone(),
-                "script",
-                json!({"source":"return 7;", "bg":true}),
-                None,
-            )
-            .await
-            .unwrap();
-        session
-            .runtime
-            .jobs
-            .wait(running.job, None, true)
-            .await
-            .unwrap();
-        let inspected = session
-            .run_script(format!(
-                "await tool.job({}).output(); return tool.job({}).output();",
-                running.job, running.job
-            ))
-            .await
-            .unwrap();
-        assert_eq!(inspected.value["value"]["id"], running.job.get());
-    }
-
-    #[tokio::test]
-    async fn resumed_sessions_do_not_append_empty_state_or_rewrite_history() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            scripted_provider(
-                &requests,
-                [
-                    response_with_usage(
-                        vec![AssistantContent::text("answer", 0, "done".to_owned())],
-                        Usage {
-                            input_tokens: 10,
-                            cached_input_tokens: 2,
-                            output_tokens: 3,
-                        },
-                    ),
-                    response_with_usage(
-                        vec![AssistantContent::text("answer", 0, "done".to_owned())],
-                        Usage {
-                            input_tokens: 20,
-                            cached_input_tokens: 4,
-                            output_tokens: 5,
-                        },
-                    ),
-                ],
-            ),
-        )
-        .await;
-        let session = harness.new_session().await.unwrap();
-        let session_id = session.id();
-        assert_eq!(session.prompt("first").await.unwrap(), "done");
-        assert_eq!(
-            session.usage().await,
-            Usage {
-                input_tokens: 10,
-                cached_input_tokens: 2,
-                output_tokens: 3,
-            }
-        );
-        session.shutdown().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while session.runtime.agent_sender(&session.root).is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        drop(session);
-
-        let resumed = harness.resume_session(session_id).await.unwrap();
-        assert_eq!(
-            resumed.usage().await,
-            Usage {
-                input_tokens: 10,
-                cached_input_tokens: 2,
-                output_tokens: 3,
-            }
-        );
-        assert_eq!(resumed.prompt("second").await.unwrap(), "done");
-        assert_eq!(
-            resumed.usage().await,
-            Usage {
-                input_tokens: 30,
-                cached_input_tokens: 6,
-                output_tokens: 8,
-            }
-        );
-        assert_request_journal(&resumed.runtime.store, &requests).await;
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        assert!(request_history(&requests[1]).starts_with(request_history(&requests[0])));
-        assert_eq!(runtime_state_count(&requests[0].messages), 1);
-        assert_eq!(runtime_state_count(&requests[1].messages), 1);
-    }
-
-    #[tokio::test]
-    async fn background_completions_batch_events_with_one_state_snapshot() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
-        let release = Arc::new(tokio::sync::Semaphore::new(0));
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            Arc::new(BlockingFirstProvider {
-                calls: Arc::new(AtomicUsize::new(0)),
-                requests: requests.clone(),
-                release: release.clone(),
-            }),
-        )
-        .await;
-        let session = harness.new_session().await.unwrap();
-        let prompt = tokio::spawn({
-            let session = session.clone();
-            async move { session.prompt("start").await }
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while requests.lock().unwrap().is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-
-        for value in ["first", "second"] {
-            let lease = session
-                .runtime
-                .jobs
-                .create(crate::job::JobSpec {
-                    background: true,
-                    name: Some(value.to_owned()),
-                    ..crate::job::JobSpec::test(session.root.clone(), "test")
-                })
-                .await
-                .unwrap();
-            session
-                .runtime
-                .jobs
-                .transition(lease.id, crate::job::JobState::Running)
-                .await
-                .unwrap();
-            session
-                .runtime
-                .jobs
-                .finish(
-                    lease.id,
-                    crate::job::JobOutcome::Completed(crate::tool::ToolOutput::new(
-                        json!({"value": value}),
-                    )),
-                )
-                .await
-                .unwrap();
-        }
-        tokio::task::yield_now().await;
-        release.add_permits(1);
-        assert_eq!(prompt.await.unwrap().unwrap(), "initial");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while requests.lock().unwrap().len() < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        session.root_tx.send(AgentCommand::JobsReady).await.unwrap();
-        assert_eq!(session.prompt("barrier").await.unwrap(), "jobs handled");
-
-        assert_request_journal(&session.runtime.store, &requests).await;
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
-        assert!(request_history(&requests[1]).starts_with(request_history(&requests[0])));
-        let Message::User(content) = request_history(&requests[1]).last().unwrap() else {
-            panic!("job wakeup must append one runtime user message");
-        };
-        assert_eq!(content.len(), 1);
-        let UserContent::Runtime { text: events } = &content[0] else {
-            panic!("job events must be runtime content");
-        };
-        assert_eq!(events.matches("\"id\"").count(), 2);
-        assert!(events.contains(r#""name":"first""#));
-        assert!(events.contains(r#""name":"second""#));
-        assert_eq!(runtime_state_count(&requests[1].messages), 1);
-        let event_messages = requests[2]
-            .messages
-            .iter()
-            .filter_map(|message| match message {
-                Message::User(content) => Some(content),
-                Message::Assistant(_) | Message::Tool(_) => None,
-            })
-            .flatten()
-            .filter(|content| {
-                matches!(
-                    content,
-                    UserContent::Runtime { text } if text.contains("<skyhook_job_events>")
-                )
-            })
-            .count();
-        assert_eq!(event_messages, 1, "redundant wakeups must commit nothing");
-        assert_eq!(runtime_state_count(&requests[2].messages), 1);
-    }
-
-    struct GatedQuestions {
-        opened: Arc<tokio::sync::Semaphore>,
-        answer: Arc<tokio::sync::Semaphore>,
-    }
-
-    impl QuestionHandler for GatedQuestions {
-        fn ask(&self, _agent: AgentId, _questions: Vec<Question>) -> crate::agent::QuestionFuture {
-            let opened = self.opened.clone();
-            let answer = self.answer.clone();
-            Box::pin(async move {
-                opened.add_permits(1);
-                answer.acquire_owned().await.unwrap().forget();
-                Ok(json!("host answer"))
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn background_ask_returns_and_accepts_job_input_while_independent_work_progresses() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let opened = Arc::new(tokio::sync::Semaphore::new(0));
-        let answer = Arc::new(tokio::sync::Semaphore::new(0));
-        let harness = question_harness(
-            workspace.path(),
-            sessions.path(),
-            Arc::new(HangingProvider::default()),
-            Arc::new(GatedQuestions {
-                opened: opened.clone(),
-                answer,
-            }),
-        )
-        .await;
-        let session = harness.new_session().await.unwrap();
-        let ask = tokio::time::timeout(
-            Duration::from_secs(2),
-            session.runtime.executor.execute_model(
-                session.root.clone(),
-                "ask",
-                json!({"id":"choose-color", "prompt":"Which color?", "bg":true}),
-                None,
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(ask.background);
-        assert_eq!(ask.output.value["id"], ask.job.get());
-        tokio::time::timeout(Duration::from_secs(2), opened.acquire())
-            .await
-            .unwrap()
-            .unwrap()
-            .forget();
-        let output = session
-            .runtime
-            .executor
-            .execute_model(
-                session.root.clone(),
-                "job_output",
-                json!({"job":ask.job}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(output.output.value["state"], "waiting_input");
-        assert_eq!(
-            output.output.value["question"]["questions"][0]["id"],
-            "choose-color"
-        );
-        assert_eq!(
-            session.run_script("return 6 * 7;").await.unwrap().value["value"],
-            json!(42)
-        );
-        session
-            .run_script(format!(
-                "return tool.job({}).send({{value:'blue'}});",
-                ask.job
-            ))
-            .await
-            .unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            session.runtime.jobs.wait(ask.job, None, true),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let completed = session
-            .runtime
-            .executor
-            .execute_model(
-                session.root.clone(),
-                "job_output",
-                json!({"job":ask.job}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(completed.output.value["result"], "blue");
-        let events = session.runtime.store.records().await;
-        assert!(events.iter().any(|record| matches!(&record.event,
-            SessionEvent::QuestionResolved { job, answers, .. } if *job == ask.job && answers == &json!("blue")
-        )));
-    }
-
-    #[tokio::test]
-    async fn foreground_ask_omitted_or_false_waits_for_the_host_answer() {
-        for bg in [None, Some(false)] {
-            let workspace = tempfile::tempdir().unwrap();
-            let sessions = tempfile::tempdir().unwrap();
-            let opened = Arc::new(tokio::sync::Semaphore::new(0));
-            let answer = Arc::new(tokio::sync::Semaphore::new(0));
-            let harness = question_harness(
-                workspace.path(),
-                sessions.path(),
-                Arc::new(HangingProvider::default()),
-                Arc::new(GatedQuestions {
-                    opened: opened.clone(),
-                    answer: answer.clone(),
-                }),
-            )
-            .await;
-            let session = harness.new_session().await.unwrap();
-            let mut input = json!({"id":"foreground", "prompt":"Continue?"});
-            if let Some(bg) = bg {
-                input["bg"] = json!(bg);
-            }
-            let ask =
-                session
-                    .runtime
-                    .executor
-                    .execute_model(session.root.clone(), "ask", input, None);
-            tokio::pin!(ask);
-            tokio::select! {
-                result = &mut ask => panic!("foreground returned before answer: {result:?}"),
-                permit = opened.acquire() => permit.unwrap().forget(),
-            }
-            assert!(
-                tokio::time::timeout(Duration::from_millis(20), &mut ask)
-                    .await
-                    .is_err()
-            );
-            answer.add_permits(1);
-            let result = tokio::time::timeout(Duration::from_secs(2), ask)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(!result.background);
-            assert_eq!(result.output.value["result"], "host answer");
-        }
-    }
-
-    #[tokio::test]
     async fn background_child_asks_merge_across_turns_and_resolve_independently() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            Arc::new(HangingProvider::default()),
-        )
-        .await;
+        let harness =
+            test_harness(workspace.path(), sessions.path(), Arc::new(HangingProvider)).await;
         let session = harness.new_session().await.unwrap();
         let child = session.root.child(1);
         let owner = session
@@ -4922,12 +3478,8 @@ mod tests {
     async fn child_questions_route_through_the_stable_agent_job() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            Arc::new(HangingProvider::default()),
-        )
-        .await;
+        let harness =
+            test_harness(workspace.path(), sessions.path(), Arc::new(HangingProvider)).await;
         let session = harness.new_session().await.unwrap();
         let root = session.root.clone();
         let child = root.child(1);
@@ -5056,273 +3608,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn script_receive_requires_background_and_accepts_job_input() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            Arc::new(HangingProvider::default()),
-        )
-        .await;
-        let session = harness.new_session().await.unwrap();
-        let error = session
-            .run_script("return await receive();")
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("requires the script tool"));
-
-        let running = session
-            .runtime
-            .executor
-            .execute(
-                session.root.clone(),
-                "script",
-                json!({"source":"return await receive();", "bg":true}),
-                None,
-            )
-            .await
-            .unwrap();
-        session
-            .runtime
-            .jobs
-            .send(running.job, json!("hello"))
-            .await
-            .unwrap();
-        let completed = session
-            .runtime
-            .jobs
-            .wait(running.job, Some(Duration::from_secs(2)), true)
-            .await
-            .unwrap();
-        assert_eq!(
-            completed.output,
-            Some(json!({"value":"hello", "console":""}))
-        );
-    }
-
-    #[tokio::test]
-    async fn script_console_reaches_the_agent_on_success_and_failure() {
-        let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(workspace.path().join("note.txt"), "hello").unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
-        let scripts = [
-            (
-                "success",
-                r#"console.log("Processed", 12, {files: true}); return {changed:3};"#,
-            ),
-            (
-                "failure",
-                r#"console.log("before failure"); throw new Error("boom");"#,
-            ),
-            ("silent", "return 42;"),
-            (
-                "serialization",
-                "console.log('before serialization'); return {bad: undefined};",
-            ),
-            (
-                "pool",
-                // Invalid path types still throw; missing files now resolve with structured read errors.
-                "const inputs=[17,'note.txt',false,'note.txt']; const results=[]; for await(const {index,value} of new WorkPool(2).map(inputs, path=>tool.read({path}))) results.push({index,content:value.content}); return results.sort((a,b)=>a.index-b.index);",
-            ),
-        ];
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            scripted_provider(
-                &requests,
-                [
-                    response(
-                        scripts
-                            .into_iter()
-                            .enumerate()
-                            .map(|(position, (id, source))| {
-                                AssistantContent::tool_call(
-                                    id,
-                                    position,
-                                    ToolCall {
-                                        id: id.to_owned(),
-                                        name: "script".to_owned(),
-                                        arguments: json!({"source": source}),
-                                    },
-                                )
-                            })
-                            .collect(),
-                    ),
-                    response(vec![AssistantContent::text("answer", 0, "done".to_owned())]),
-                ],
-            ),
-        )
-        .await;
-        let session = harness.new_session().await.unwrap();
-        assert_eq!(session.prompt("run scripts").await.unwrap(), "done");
-        let requests = requests.lock().unwrap();
-        let results = requests[1]
-            .messages
-            .iter()
-            .filter_map(|message| {
-                if let Message::Tool(results) = message {
-                    Some(results)
-                } else {
-                    None
-                }
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-        let result = |id: &str| *results.iter().find(|result| result.call_id == id).unwrap();
-        assert_eq!(
-            result("success").result["result"]["value"],
-            json!({"changed":3})
-        );
-        assert_eq!(
-            result("success").result["result"]["console"],
-            "Processed 12 {\"files\":true}\n"
-        );
-        assert!(!result("success").is_error);
-        assert!(result("failure").is_error);
-        assert_eq!(result("failure").result["result"]["value"], json!(null));
-        assert_eq!(
-            result("failure").result["result"]["console"],
-            "before failure\n"
-        );
-        assert_eq!(
-            result("failure").result["result"]["failure"]["message"],
-            "boom"
-        );
-        assert_eq!(result("silent").result["result"]["value"], json!(42));
-        assert_eq!(result("silent").result["result"]["console"], "");
-        assert!(
-            serde_json::to_value(result("silent"))
-                .unwrap()
-                .get("console_output")
-                .is_none()
-        );
-        assert!(result("serialization").is_error);
-        assert_eq!(
-            result("serialization").result["result"]["console"],
-            "before serialization\n"
-        );
-        assert!(!result("pool").is_error, "{:?}", result("pool"));
-        assert_eq!(
-            result("pool").result["result"]["value"],
-            json!([
-                {"index":1,"content":"hello"}, {"index":3,"content":"hello"}
-            ])
-        );
-        assert!(
-            result("pool").result["result"]["console"]
-                .as_str()
-                .unwrap()
-                .contains("WorkPool item 0 failed:")
-        );
-        assert!(
-            result("pool").result["result"]["console"]
-                .as_str()
-                .unwrap()
-                .contains("WorkPool item 2 failed:")
-        );
-    }
-
-    #[tokio::test]
-    async fn background_script_console_survives_wait_and_replay() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            Arc::new(HangingProvider::default()),
-        )
-        .await;
-        let session = harness.new_session().await.unwrap();
-        for source in [
-            "console.log('background'); return 7;",
-            "console.log('background'); throw new Error('failed');",
-        ] {
-            let running = session
-                .runtime
-                .executor
-                .execute(
-                    session.root.clone(),
-                    "script",
-                    json!({"source":source, "bg":true}),
-                    None,
-                )
-                .await
-                .unwrap();
-            session
-                .runtime
-                .jobs
-                .wait(running.job, None, true)
-                .await
-                .unwrap();
-            let completed = session
-                .run_script(format!("return tool.job({}).output();", running.job.get()))
-                .await
-                .unwrap();
-            assert_eq!(
-                completed.value["value"]["result"]["console"],
-                "background\n"
-            );
-            assert_eq!(completed.value["console"], "");
-            assert!(completed.value["value"].get("console").is_none());
-            let page_source = format!(
-                "return tool.job({}).output({{field:'/result/console',limit:1}});",
-                running.job.get()
-            );
-            let page = session.run_script(&page_source).await.unwrap();
-            let replay = session.run_script(&page_source).await.unwrap();
-            assert_eq!(page.value, replay.value);
-            assert_eq!(page.value["value"]["preview"]["field"], "/result/console");
-            assert_eq!(
-                page.value["value"]["preview"]["lines"],
-                json!(["background"])
-            );
-            if source.contains("return") {
-                assert_eq!(completed.value["value"]["result"]["value"], 7);
-                let returned = session
-                    .run_script(format!(
-                        "return tool.job({}).output({{field:'/result/value'}});",
-                        running.job.get()
-                    ))
-                    .await
-                    .unwrap();
-                assert_eq!(returned.value["value"]["preview"]["field"], "/result/value");
-                assert_eq!(returned.value["value"]["preview"]["lines"], json!(["7"]));
-            } else {
-                assert_eq!(completed.value["value"]["state"], "failed");
-            }
-        }
-        let store = &session.runtime.store;
-        store.close().await.unwrap();
-        let (store, records) = SessionStore::open(sessions.path(), store.id())
-            .await
-            .unwrap();
-        let restored = JobManager::restore(store, &records).await.unwrap();
-        let mut scripts = Vec::new();
-        for job in restored.list(&session.root).await {
-            let job = restored.snapshot(job.id).await.unwrap();
-            if job
-                .output
-                .as_ref()
-                .is_some_and(|output| output["console"] == "background\n")
-            {
-                scripts.push(job);
-            }
-        }
-        assert_eq!(scripts.len(), 2);
-    }
-
-    #[tokio::test]
     async fn script_messages_preserve_order_across_calls_and_cancel_waiting_receivers() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            Arc::new(HangingProvider::default()),
-        )
-        .await;
+        let harness =
+            test_harness(workspace.path(), sessions.path(), Arc::new(HangingProvider)).await;
         let session = harness.new_session().await.unwrap();
         let running = session.runtime.executor.execute(
             session.root.clone(), "script",
@@ -5400,345 +3690,5 @@ return {{accepted, state:pending.state}};
             .await
             .unwrap();
         assert_eq!(cancelled.value["value"]["state"], "cancelled");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn script_output_is_live_replayable_and_paginated() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            Arc::new(HangingProvider::default()),
-        )
-        .await;
-        let session = harness.new_session().await.unwrap();
-        let output = tokio::time::timeout(Duration::from_secs(15), session.run_script(r#"
-const job = await tool.shell({command:"printf 'before\\n'; while [ ! -f release ]; do sleep 0.01; done; printf 'after\\n'",timeout:10,bg:true});
-let live;
-while (true) {
-  live = await tool.job(job.id).output({field:"/result/stdout"});
-  if (live.preview.lines.length > 0) break;
-  await tool.wait({timeout:1});
-}
-await tool.write({path:"release",content:"go"});
-let completed;
-while (true) {
-  completed = await tool.job(job.id).output();
-  if (["completed", "failed", "cancelled", "interrupted"].includes(completed.state)) break;
-  await tool.wait({timeout:1});
-}
-const first = await tool.job(job.id).output({field:"/result/stdout",limit:1});
-const replay = await tool.job(job.id).output({field:"/result/stdout",limit:1});
-const second = await tool.job(job.id).output({field:first.preview.field, start:first.preview.next_start, offset:first.preview.next_offset});
-return {live,completed,first,replay,second};
-"#)).await.unwrap().unwrap();
-        let value = output.value["value"].clone();
-        assert_eq!(value["live"]["state"], "running");
-        assert_eq!(value["first"], value["replay"]);
-        assert_eq!(value["completed"]["state"], "completed");
-        assert_eq!(value["completed"]["result"]["stdout"], "before\nafter\n");
-        assert_eq!(value["first"]["preview"]["lines"][0], "before");
-        assert_eq!(value["second"]["preview"]["lines"][0], "after");
-    }
-
-    async fn add_research_for_compaction(
-        session: &SessionHandle,
-        template: &ModelRequest,
-        target: u64,
-    ) {
-        let mut prospective = template.clone();
-        prospective.messages =
-            crate::session::project_history(&session.runtime.store.records().await, &session.root)
-                .unwrap()
-                .into_iter()
-                .map(|(_, message)| message)
-                .collect();
-        prospective
-            .messages
-            .push(template.messages.last().unwrap().clone());
-        let padding = target.saturating_sub(compaction::estimate_request(&prospective)) * 4;
-        session
-            .runtime
-            .commit(
-                &session.root,
-                Message::Assistant(vec![AssistantContent::text(
-                    "research",
-                    0,
-                    "r".repeat(padding as usize),
-                )]),
-            )
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn structured_compaction_preserves_supplied_text_todos_launches_and_exact_requests() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
-        let plan = "## Implementation plan\n1. Preserve the full original plan.\n2. Run the migration only after approval.\n";
-        let provider = scripted_provider(
-            &requests,
-            [response(vec![AssistantContent::text("answer", 0, plan)])],
-        );
-        let harness = test_harness(workspace.path(), sessions.path(), provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
-        session
-            .prompt("Design the migration, preserving state; do not deploy.")
-            .await
-            .unwrap();
-        let template = requests.lock().unwrap()[0].clone();
-        let todos = vec![TodoItem {
-            text: "Review the exact migration plan".into(),
-            status: super::super::TodoStatus::Pending,
-        }];
-        session
-            .runtime
-            .todos
-            .replace(&session.root, todos.clone())
-            .await
-            .unwrap();
-        let creator = Message::Assistant(vec![AssistantContent::tool_call(
-            "launch-once",
-            0,
-            ToolCall {
-                id: "launch-once".into(),
-                name: "shell".into(),
-                arguments: json!({"command":"long-running research", "bg":true}),
-            },
-        )]);
-        let origin = session
-            .runtime
-            .commit(&session.root, creator.clone())
-            .await
-            .unwrap();
-        let lease = session
-            .runtime
-            .jobs
-            .create(crate::job::JobSpec {
-                origin: Some(crate::session::ModelCallOrigin {
-                    message: origin,
-                    call_id: "launch-once".into(),
-                }),
-                background: true,
-                ..crate::job::JobSpec::test(session.root.clone(), "shell")
-            })
-            .await
-            .unwrap();
-        session
-            .runtime
-            .jobs
-            .transition(lease.id, crate::job::JobState::Running)
-            .await
-            .unwrap();
-        let result = Message::Tool(vec![ToolResult {
-            call_id: "launch-once".into(),
-            name: "shell".into(),
-            result: json!({"id":lease.id,"state":"running"}),
-            images: vec![],
-            is_error: false,
-        }]);
-        session
-            .runtime
-            .commit(&session.root, result.clone())
-            .await
-            .unwrap();
-        for progress in ["Research completed.", "Further research completed."] {
-            let summary = json!({
-                "objective": "Continue the existing migration design task.",
-                "user_instructions": ["Continue."],
-                "session_rules": ["Do not deploy: deployment is not authorized because the user requested design only."],
-                "plan": [plan],
-                "resumption_point": progress,
-                "completed_work": [],
-                "findings": [],
-                "decisions": [],
-                "open_issues": [],
-                "next_actions": ["Continue the existing plan."],
-                "running_work": [],
-                "recovery_details": [],
-                "jobs": [],
-                "additional_context": [],
-                "todo_reconciliation": [],
-                "todos": todos
-            }).to_string();
-            add_research_for_compaction(&session, &template, 114_000).await;
-            provider.responses.lock().unwrap().extend([
-                response_with_usage(
-                    vec![AssistantContent::text("answer", 0, summary)],
-                    Usage {
-                        input_tokens: 10,
-                        output_tokens: 3,
-                        cached_input_tokens: 0,
-                    },
-                ),
-                response(vec![AssistantContent::text(
-                    "answer",
-                    0,
-                    "Continuing the original plan.",
-                )]),
-            ]);
-            session.prompt("Continue.").await.unwrap();
-            let captured = requests.lock().unwrap();
-            let summary_call = &captured[captured.len() - 2];
-            let resumed = captured.last().unwrap();
-            assert_eq!(summary_call.system, template.system);
-            assert!(summary_call.tools.is_empty());
-            assert_eq!(
-                summary_call.response_schema.as_ref().unwrap().schema,
-                compaction::response_schema()
-            );
-            assert!(resumed.response_schema.is_none());
-            assert_eq!(resumed.system, template.system);
-            assert_eq!(resumed.tools, template.tools);
-            assert!(
-                matches!(summary_call.messages.last(),Some(Message::User(blocks)) if matches!(&blocks[0],UserContent::Compaction{text} if !text.contains("30k") && !text.contains("30,000")))
-            );
-            assert_eq!(
-                resumed.messages.iter().filter(|m| **m == creator).count(),
-                1
-            );
-            assert_eq!(resumed.messages.iter().filter(|m| **m == result).count(), 1);
-            let joined = serde_json::to_string(&resumed.messages).unwrap();
-            assert!(joined.contains("Do not deploy"));
-            assert!(joined.contains("deployment is not authorized"));
-            assert!(resumed.messages.iter().any(|message| matches!(message,Message::User(blocks) if blocks.iter().any(|b| matches!(b,UserContent::Compaction{text} if text.contains(plan))))));
-            assert_eq!(runtime_state_count(&resumed.messages), 1);
-            assert!(joined.contains("Review the exact migration plan"));
-        }
-        let records = session.runtime.store.records().await;
-        assert_eq!(
-            records
-                .iter()
-                .filter(|r| matches!(r.event, SessionEvent::Compaction { .. }))
-                .count(),
-            2
-        );
-        assert_eq!(
-            records
-                .iter()
-                .filter(|r| matches!(r.event, SessionEvent::TodosReplaced { .. }))
-                .count(),
-            1
-        );
-        assert_eq!(
-            records
-                .iter()
-                .filter(|r| matches!(r.event, SessionEvent::JobCreated { .. }))
-                .count(),
-            1
-        );
-        assert!(
-            !records
-                .iter()
-                .any(|r| matches!(r.event, SessionEvent::JobClaimed { .. }))
-        );
-        assert_eq!(
-            session
-                .runtime
-                .todos
-                .inspect(&session.root, None)
-                .await
-                .unwrap()
-                .items,
-            todos
-        );
-        assert_eq!(session.usage().await.output_tokens, 6);
-        let reconstructed: Vec<_> = records
-            .iter()
-            .filter(|r| matches!(r.event, SessionEvent::ModelRequested { .. }))
-            .map(|r| {
-                crate::session::reconstruct_model_request(&records, r.sequence)
-                    .unwrap()
-                    .1
-            })
-            .collect();
-        assert_eq!(reconstructed, *requests.lock().unwrap());
-        session.shutdown().await.unwrap();
-        session.runtime.store.close().await.unwrap();
-        let resumed = harness.resume_session(session.id()).await.unwrap();
-        provider
-            .responses
-            .lock()
-            .unwrap()
-            .push_back(response(vec![AssistantContent::text(
-                "answer",
-                0,
-                "Resumed safely.",
-            )]));
-        resumed.prompt("Resume.").await.unwrap();
-        let last = requests.lock().unwrap().last().unwrap().clone();
-        assert!(
-            serde_json::to_string(&last.messages)
-                .unwrap()
-                .contains("Do not deploy")
-        );
-        assert_eq!(
-            resumed
-                .runtime
-                .todos
-                .inspect(&resumed.root, None)
-                .await
-                .unwrap()
-                .items,
-            todos
-        );
-        resumed.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn invalid_compaction_preserves_the_original_projection_and_never_executes_tools() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
-        let provider = scripted_provider(
-            &requests,
-            [response(vec![AssistantContent::text(
-                "answer",
-                0,
-                "## Plan\nKeep this original plan.",
-            )])],
-        );
-        let harness = test_harness(workspace.path(), sessions.path(), provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
-        session.prompt("Plan a change.").await.unwrap();
-        let template = requests.lock().unwrap()[0].clone();
-        add_research_for_compaction(&session, &template, 114_000).await;
-        let before =
-            crate::session::project_history(&session.runtime.store.records().await, &session.root)
-                .unwrap();
-        provider
-            .responses
-            .lock()
-            .unwrap()
-            .extend(std::iter::repeat_n(
-                response(vec![AssistantContent::tool_call(
-                    "tool-0",
-                    0,
-                    ToolCall {
-                        id: "must-not-run".into(),
-                        name: "shell".into(),
-                        arguments: json!({"command":"touch should-not-exist"}),
-                    },
-                )]),
-                super::compact::MAX_PROVIDER_ATTEMPTS as usize,
-            ));
-        assert!(session.prompt("Continue.").await.is_err());
-        let records = session.runtime.store.records().await;
-        assert!(!records.iter().any(|r| matches!(
-            r.event,
-            SessionEvent::Compaction { .. } | SessionEvent::JobCreated { .. }
-        )));
-        assert!(
-            records
-                .iter()
-                .any(|r| matches!(r.event, SessionEvent::CompactionFailed { .. }))
-        );
-        let after = crate::session::project_history(&records, &session.root).unwrap();
-        assert!(after.starts_with(&before));
-        assert!(!workspace.path().join("should-not-exist").exists());
-        session.shutdown().await.unwrap();
     }
 }

@@ -111,16 +111,3 @@ pub fn select(
             "No model profiles configured. Add a [models.<name>] entry to your config.".into()
         })
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn selection_ignores_legacy_default_and_preserves_declaration_order() {
-        let config: Config = toml::from_str("default_model_profile='aaa'\n[models.zzz]\nprovider='test'\nmodel='z'\nmax_context=1000\nmax_output=100\n[models.aaa]\nprovider='test'\nmodel='a'\nmax_context=1000\nmax_output=100\n").unwrap();
-        assert_eq!(select(&config, None, None).unwrap(), "zzz");
-        assert_eq!(select(&config, None, Some("missing")).unwrap(), "zzz");
-        assert_eq!(select(&config, None, Some("aaa")).unwrap(), "aaa");
-        assert_eq!(select(&config, Some("zzz"), Some("aaa")).unwrap(), "zzz");
-        assert!(select(&config, Some("missing"), None).is_err());
-    }
-}

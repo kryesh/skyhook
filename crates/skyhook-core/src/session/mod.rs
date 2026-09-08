@@ -29,7 +29,7 @@ pub(crate) use event::is_safe_artifact_path;
 pub use event::{
     CompactionCheckpoint, ContextMessage, EventRecord, ModelCallOrigin, ModelPurpose, SessionEvent,
 };
-pub use request::{project_history, reconstruct_model_request, reconstruct_model_request_indexed};
+pub use request::{project_history, reconstruct_model_request};
 
 // Version 2 preserves assistant item/block identities and item-scoped replay.
 // The former flat assistant content format is intentionally not migrated.
@@ -61,6 +61,27 @@ pub fn agent_selection(
     selection
 }
 
+struct SessionLock(std::fs::File);
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        // Ownership ends with the store, not with a transient fork-inherited fd.
+        let _ = FileExt::unlock(&self.0);
+    }
+}
+
+fn lock_session(directory: &Path, id: SessionId) -> Result<SessionLock, SessionError> {
+    let lock = StdOpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join("session.lock"))?;
+    lock.try_lock_exclusive()
+        .map_err(|_| SessionError::AlreadyOpen(id))?;
+    Ok(SessionLock(lock))
+}
+
 struct SessionWriter {
     file: Option<BufWriter<File>>,
     next_sequence: u64,
@@ -70,10 +91,9 @@ struct SessionWriter {
 struct StoreInner {
     id: SessionId,
     directory: PathBuf,
-    durable: bool,
     writer: Mutex<SessionWriter>,
     events: broadcast::Sender<EventRecord>,
-    _lock: Mutex<Option<std::fs::File>>,
+    lock: Option<SessionLock>,
 }
 
 #[derive(Clone)]
@@ -111,7 +131,10 @@ impl SessionStore {
             let id = SessionId::generate()?;
             let directory = root.join(id.to_string());
             match fs::create_dir(&directory).await {
-                Ok(()) => return Self::initialize(id, directory, Vec::new(), durable).await,
+                Ok(()) => {
+                    let lock = durable.then(|| lock_session(&directory, id)).transpose()?;
+                    return Self::initialize(id, directory, Vec::new(), lock).await;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error.into()),
             }
@@ -124,6 +147,8 @@ impl SessionStore {
         id: SessionId,
     ) -> Result<(Self, Vec<EventRecord>), SessionError> {
         let directory = root.join(id.to_string());
+        // Acquire ownership before inspecting or repairing a potentially active journal.
+        let lock = lock_session(&directory, id)?;
         let path = directory.join("events.jsonl");
         let bytes = fs::read(&path).await?;
         let complete_len = bytes
@@ -140,7 +165,7 @@ impl SessionStore {
             file.sync_all().await?;
         }
         Ok((
-            Self::initialize(id, directory, records.clone(), true).await?,
+            Self::initialize(id, directory, records.clone(), Some(lock)).await?,
             records,
         ))
     }
@@ -149,42 +174,33 @@ impl SessionStore {
         id: SessionId,
         directory: PathBuf,
         records: Vec<EventRecord>,
-        durable: bool,
+        lock: Option<SessionLock>,
     ) -> Result<Self, SessionError> {
         fs::create_dir_all(directory.join("blobs")).await?;
         fs::create_dir_all(directory.join("jobs")).await?;
-        let (lock, file) = if durable {
-            let lock_path = directory.join("session.lock");
-            let lock = StdOpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(lock_path)?;
-            lock.try_lock_exclusive()
-                .map_err(|_| SessionError::AlreadyOpen(id))?;
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(directory.join("events.jsonl"))
-                .await?;
-            (Some(lock), Some(BufWriter::new(file)))
+        let file = if lock.is_some() {
+            Some(BufWriter::new(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(directory.join("events.jsonl"))
+                    .await?,
+            ))
         } else {
-            (None, None)
+            None
         };
         let (events, _) = broadcast::channel(512);
         Ok(Self {
             inner: Arc::new(StoreInner {
                 id,
                 directory,
-                durable,
                 writer: Mutex::new(SessionWriter {
                     file,
                     next_sequence: records.last().map_or(1, |record| record.sequence + 1),
                     records,
                 }),
                 events,
-                _lock: Mutex::new(lock),
+                lock,
             }),
         })
     }
@@ -209,13 +225,17 @@ impl SessionStore {
         self.inner.writer.lock().await.records.clone()
     }
 
-    /// A consistent committed suffix, cloning only records newer than `sequence`.
-    pub(crate) async fn records_after(&self, sequence: u64) -> Vec<EventRecord> {
+    /// Visit a consistent committed suffix without cloning event payloads.
+    pub(crate) async fn visit_records_after(
+        &self,
+        sequence: u64,
+        visit: impl FnOnce(&[EventRecord]),
+    ) {
         let writer = self.inner.writer.lock().await;
         let start = writer
             .records
             .partition_point(|record| record.sequence <= sequence);
-        writer.records[start..].to_vec()
+        visit(&writer.records[start..]);
     }
 
     pub async fn append(
@@ -236,11 +256,11 @@ impl SessionStore {
         };
         request::validate_compaction(&writer.records, &record)?;
         if matches!(record.event, SessionEvent::ModelRequested { .. }) {
-            request::reconstruct_from_prefix(&writer.records, &record)?;
+            request::validate_request(&writer.records, &record)?;
         }
-        let mut bytes = serde_json::to_vec(&record)?;
-        bytes.push(b'\n');
         if let Some(file) = &mut writer.file {
+            let mut bytes = serde_json::to_vec(&record)?;
+            bytes.push(b'\n');
             file.write_all(&bytes).await?;
             file.flush().await?;
             file.get_ref().sync_data().await?;
@@ -249,21 +269,6 @@ impl SessionStore {
         writer.records.push(record.clone());
         let _ = self.inner.events.send(record.clone());
         Ok(record)
-    }
-
-    /// Flushes this handle and releases its durable session lock even when
-    /// read-only clones remain alive briefly in supervised state.
-    #[cfg(test)]
-    pub(crate) async fn close(&self) -> Result<(), SessionError> {
-        let mut writer = self.inner.writer.lock().await;
-        if let Some(mut file) = writer.file.take() {
-            file.flush().await?;
-            file.get_ref().sync_data().await?;
-        }
-        if let Some(lock) = self.inner._lock.lock().await.take() {
-            FileExt::unlock(&lock)?;
-        }
-        Ok(())
     }
 
     pub(crate) async fn remove_job_artifacts(&self, job: JobId) -> Result<(), SessionError> {
@@ -282,7 +287,7 @@ impl SessionStore {
         media_type: String,
     ) -> Result<ImageReference, SessionError> {
         let hash = crate::sha256_hex(bytes);
-        let data_base64 = if self.inner.durable {
+        let data_base64 = if self.inner.lock.is_some() {
             let destination = self.inner.directory.join("blobs").join(&hash);
             if !fs::try_exists(&destination).await? {
                 atomic_write(&destination, bytes).await?;
@@ -420,43 +425,6 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn records_after_returns_only_the_committed_suffix() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        assert!(store.records_after(0).await.is_empty());
-        let agent = AgentId::root(store.id());
-        let first = store
-            .append(agent.clone(), SessionEvent::AgentInterrupted)
-            .await
-            .unwrap();
-        let second = store
-            .append(agent.clone(), SessionEvent::AgentCompleted)
-            .await
-            .unwrap();
-        assert_eq!(
-            store.records_after(0).await,
-            vec![first.clone(), second.clone()]
-        );
-        assert_eq!(
-            store.records_after(first.sequence).await,
-            vec![second.clone()]
-        );
-        assert!(store.records_after(second.sequence).await.is_empty());
-        assert!(store.records_after(u64::MAX).await.is_empty());
-
-        store.close().await.unwrap();
-        let (reopened, _) = SessionStore::open(root.path(), store.id()).await.unwrap();
-        let third = reopened
-            .append(agent, SessionEvent::AgentInterrupted)
-            .await
-            .unwrap();
-        assert_eq!(
-            reopened.records_after(first.sequence).await,
-            vec![second, third]
-        );
-    }
-
-    #[tokio::test]
     async fn append_and_resume_complete_prefix() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::create(root.path()).await.unwrap();
@@ -466,13 +434,23 @@ mod tests {
             .append(agent, SessionEvent::AgentInterrupted)
             .await
             .unwrap();
-        store.close().await.unwrap();
-        drop(store);
         let path = root.path().join(id.to_string()).join("events.jsonl");
         let mut file = OpenOptions::new().append(true).open(&path).await.unwrap();
         file.write_all(b"{incomplete").await.unwrap();
+        file.flush().await.unwrap();
         drop(file);
+        // A competing opener must not repair a journal whose owner is still alive.
+        let before = fs::read(&path).await.unwrap();
+        assert!(matches!(
+            SessionStore::open(root.path(), id).await,
+            Err(SessionError::AlreadyOpen(locked)) if locked == id
+        ));
+        assert_eq!(fs::read(&path).await.unwrap(), before);
+        // Model a descriptor briefly inherited by a concurrently spawned process.
+        let inherited_lock = store.inner.lock.as_ref().unwrap().0.try_clone().unwrap();
+        drop(store);
         let (store, records) = SessionStore::open(root.path(), id).await.unwrap();
+        drop(inherited_lock);
         assert_eq!(records.len(), 1);
         assert_eq!(store.records().await, records);
         let appended = store
@@ -493,7 +471,7 @@ mod tests {
             .append(AgentId::root(id), SessionEvent::AgentInterrupted)
             .await
             .unwrap();
-        store.close().await.unwrap();
+        drop(store);
         let mut record = serde_json::to_value(record).unwrap();
         for version in [1, SESSION_FORMAT_VERSION + 1] {
             record["version"] = version.into();

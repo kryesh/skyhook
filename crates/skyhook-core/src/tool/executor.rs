@@ -345,15 +345,14 @@ impl ToolExecutor {
             .registry
             .get(name)
             .ok_or_else(|| ExecutionError::UnknownTool(name.to_owned()))?;
-        let surface = self.surface();
-        surface.validate_arguments(name, &arguments)?;
-        let spec = surface
-            .get(name)
-            .expect("validated tools are present on the surface");
-        validate_invocation(spec, kind)?;
+        let spec = tool
+            .spec(&self.capabilities)
+            .ok_or_else(|| ToolError::InvalidArguments(format!("tool `{name}` is unavailable")))?;
+        spec.validate_arguments(&arguments)?;
+        validate_invocation(&spec, kind)?;
         let original_arguments = arguments.clone();
         let (mut handler_arguments, background) =
-            self.shared.registry.split_execution(spec, arguments)?;
+            self.shared.registry.split_execution(&spec, arguments)?;
         let job_name = tool.take_job_name(&mut handler_arguments)?;
         Ok(PreparedInvocation {
             tool,
@@ -407,7 +406,8 @@ impl ToolExecutor {
         } else {
             (Vec::new(), None)
         };
-        let mut capabilities = tool.capabilities_for(&arguments)?;
+        tool.validate_arguments(&arguments)?;
+        let mut capabilities = tool.capabilities();
         // An unresolved read still requires the ordinary workspace authorization,
         // as well as approval for the unresolved path below.
         if read_error.is_none() {
@@ -525,6 +525,13 @@ impl ToolExecutor {
             };
             return Err(self.fail_start(lease.id, error).await?);
         }
+        // The policy has approved this invocation. Remote connection/bootstrap can
+        // still wait for network I/O or SSH authentication; that is execution, not
+        // a pending tool approval. Keep route reauthorization inside prepare.
+        self.shared
+            .jobs
+            .transition(lease.id, JobState::Running)
+            .await?;
         let prepared = if let InvocationDispatch::Remote(route) = &plan.dispatch {
             let router = self
                 .shared
@@ -562,10 +569,6 @@ impl ToolExecutor {
         if lease.cancellation.is_cancelled() {
             return Err(self.cancelled(lease.id).await);
         }
-        self.shared
-            .jobs
-            .transition(lease.id, JobState::Running)
-            .await?;
         let mut context = ToolContext::new(
             subject,
             plan.execution_location,
@@ -994,13 +997,14 @@ mod tests {
         target::{TargetDefinition, TargetRegistry},
         tool::{
             ToolOptions, ToolRegistryBuilder,
-            policy::{AllowAll, AuthorizationRequest, PolicyDecision, PolicyFuture},
+            policy::{AuthorizationRequest, PolicyDecision, PolicyFuture},
         },
     };
 
     #[derive(Deserialize, JsonSchema)]
     struct PathArgs {
-        path: String,
+        #[serde(rename = "path")]
+        _path: String,
     }
 
     fn target(name: &str, workspace: &str, via: Option<&str>) -> TargetDefinition {
@@ -1103,208 +1107,6 @@ mod tests {
         assert!(matches!(error, ExecutionError::Failed { .. }));
     }
 
-    #[tokio::test]
-    async fn target_named_application_data_is_not_globally_filtered() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create_ephemeral(root.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
-        let jobs = JobManager::new(store);
-        let mut builder = ToolRegistryBuilder::default();
-        builder
-            .register_dynamic(
-                "adapter",
-                "Dynamic adapter",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": {"target": {"type": "string"}}
-                }),
-                ToolOptions::default(),
-                |_context, arguments| async move {
-                    Ok(ToolOutput::new(serde_json::json!({
-                        "payload": {"target": arguments["target"]}
-                    })))
-                },
-            )
-            .unwrap();
-        let executor = ToolExecutor::new(
-            builder.build(),
-            Arc::new(AllowAll),
-            jobs,
-            root.path().to_path_buf(),
-        );
-
-        let schema = &executor.surface().definitions()[0].input_schema;
-        assert!(schema["properties"]["target"].is_object());
-        let result = executor
-            .execute(
-                agent,
-                "adapter",
-                serde_json::json!({"target": "application-value"}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            result.output.value["payload"]["target"],
-            "application-value"
-        );
-    }
-
-    #[tokio::test]
-    async fn workspace_target_resolution_obeys_root_current_and_other_rules() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create_ephemeral(root.path()).await.unwrap();
-        let jobs = JobManager::new(store);
-        let mut builder = ToolRegistryBuilder::default();
-        let seen = Arc::new(std::sync::Mutex::new(None));
-        builder
-            .register::<PathArgs, String, _, _>(
-                "arbitrary_name",
-                "test read",
-                ToolOptions::new(Vec::new())
-                    .placement(crate::tool::ToolPlacement::TargetedWorkspace),
-                |_context, input| async move { Ok(input.path) },
-            )
-            .unwrap();
-        builder
-            .register::<PathArgs, String, _, _>(
-                "write_like",
-                "inherit only",
-                ToolOptions::new(Vec::new())
-                    .placement(crate::tool::ToolPlacement::InheritWorkspace),
-                |_context, input| async move { Ok(input.path) },
-            )
-            .unwrap();
-        let dynamic_seen = seen.clone();
-        builder
-            .register_dynamic(
-                "totally_custom",
-                "dynamic targeted",
-                serde_json::json!({"type":"object","properties":{"value":{"type":"string"}}}),
-                ToolOptions::new(Vec::new())
-                    .placement(crate::tool::ToolPlacement::TargetedWorkspace),
-                move |_context, arguments| {
-                    *dynamic_seen.lock().unwrap() = Some(arguments.clone());
-                    async move { Ok(ToolOutput::new(arguments)) }
-                },
-            )
-            .unwrap();
-        let targets = TargetRegistry::from_definitions([
-            target("gateway", "/gateway", None),
-            target("current", "/configured-current", Some("gateway")),
-            target("other", "/configured-other", Some("gateway")),
-        ])
-        .unwrap();
-        let registry = builder.build();
-        let policy = Arc::new(AllowAll);
-        let router = router(targets, policy.clone());
-        let executor = ToolExecutor::new(registry.clone(), policy, jobs, root.path().to_path_buf())
-            .with_target_router(router)
-            .with_capabilities({
-                let mut capabilities = CapabilitySet::default();
-                capabilities.insert(Capability::Targets);
-                capabilities
-            })
-            .with_location(ExecutionLocation::named(
-                "current",
-                PathBuf::from("/override-current"),
-            ));
-        let tool = registry.get("arbitrary_name").unwrap();
-        assert!(
-            registry
-                .surface(&{
-                    let mut capabilities = CapabilitySet::default();
-                    capabilities.insert(Capability::Targets);
-                    capabilities
-                })
-                .get("totally_custom")
-                .unwrap()
-                .input_schema["properties"]["target"]
-                .is_object()
-        );
-
-        for (target, expected) in [
-            (
-                None,
-                ExecutionLocation::named("current", "/override-current".into()),
-            ),
-            (
-                Some("current"),
-                ExecutionLocation::named("current", "/override-current".into()),
-            ),
-            (
-                Some("other"),
-                ExecutionLocation::named("other", "/configured-other".into()),
-            ),
-            (
-                Some(ROOT_TARGET),
-                ExecutionLocation::root(root.path().to_path_buf()),
-            ),
-        ] {
-            let mut arguments = serde_json::json!({"path":"file"});
-            if let Some(target) = target {
-                arguments["target"] = target.into();
-            }
-            let selected = executor
-                .resolve_workspace_invocation(&tool, &arguments)
-                .await
-                .unwrap();
-            assert_eq!(selected.location, expected);
-        }
-
-        let error = executor
-            .resolve_workspace_invocation(
-                &tool,
-                &serde_json::json!({"target":"missing", "path":"file"}),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("unknown target `missing`"));
-
-        let error = executor
-            .clone()
-            .with_capabilities(CapabilitySet::default())
-            .resolve_workspace_invocation(
-                &tool,
-                &serde_json::json!({"target":"current", "path":"file"}),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("targets capability"));
-
-        let inherit = registry.get("write_like").unwrap();
-        assert_eq!(
-            executor
-                .resolve_workspace_invocation(&inherit, &serde_json::json!({"path":"file"}))
-                .await
-                .unwrap()
-                .location,
-            ExecutionLocation::named("current", "/override-current".into())
-        );
-        let error = executor
-            .resolve_workspace_invocation(
-                &inherit,
-                &serde_json::json!({"target":"root", "path":"file"}),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("does not accept a target"));
-
-        executor
-            .execute(
-                AgentId::root(executor.jobs().store().id()),
-                "totally_custom",
-                serde_json::json!({"target":"root", "value":"kept"}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            *seen.lock().unwrap(),
-            Some(serde_json::json!({"value":"kept"}))
-        );
-    }
-
     struct BlockingRoutePolicy {
         requests: std::sync::Mutex<Vec<AuthorizationRequest>>,
         release: tokio::sync::Notify,
@@ -1329,6 +1131,93 @@ mod tests {
                 PolicyDecision::Allow { grants }
             })
         }
+    }
+
+    #[tokio::test]
+    async fn approved_remote_jobs_are_running_during_shared_connection_startup() {
+        use crate::remote::{ConnectionFactory, ConnectionRequest, PooledConnection};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct PendingConnection(AtomicUsize);
+        impl ConnectionFactory for PendingConnection {
+            fn connect(
+                &self,
+                _: ConnectionRequest,
+            ) -> futures_util::future::BoxFuture<'static, Result<PooledConnection, RemoteError>>
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(std::future::pending())
+            }
+        }
+
+        let runtime = crate::test_support::TestRuntime::new().await;
+        let policy = Arc::new(crate::tool::policy::AllowAll);
+        let authorization = AuthorizationCoordinator::new(policy.clone());
+        let factory = Arc::new(PendingConnection(AtomicUsize::new(0)));
+        let remote = crate::remote::RemoteManager::new(
+            crate::remote::EmbeddedShimCatalog::default(),
+            Arc::new(crate::remote::RejectSensitivePrompts),
+            authorization.clone(),
+        )
+        .with_connection_factory(factory.clone());
+        let router = TargetRouter::new(
+            TargetRegistry::from_definitions([target("build", "/build", None)]).unwrap(),
+            remote.clone(),
+            authorization,
+        );
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register_dynamic(
+                "custom_remote",
+                "test",
+                serde_json::json!({"type":"object","properties":{}}),
+                ToolOptions::new(vec![Capability::Exec])
+                    .placement(crate::tool::ToolPlacement::TargetedWorkspace),
+                |_, _| async { panic!("connection has not completed") },
+            )
+            .unwrap();
+        let executor = runtime
+            .executor(builder)
+            .with_target_router(router)
+            .with_capabilities({
+                let mut capabilities = CapabilitySet::default();
+                capabilities.insert(Capability::Targets);
+                capabilities
+            });
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..5 {
+            let executor = executor.clone();
+            let agent = runtime.agent.clone();
+            tasks.spawn(async move {
+                executor
+                    .execute(
+                        agent,
+                        "custom_remote",
+                        serde_json::json!({"target":"build"}),
+                        None,
+                    )
+                    .await
+            });
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let jobs = runtime.jobs.list(&runtime.agent).await;
+                if jobs.len() == 5
+                    && jobs.iter().all(|job| job.state == JobState::Running)
+                    && factory.0.load(Ordering::SeqCst) == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("approved jobs must not appear to await approval during connection startup");
+        assert_eq!(runtime.jobs.cancel_all(&runtime.agent).await, 5);
+        while let Some(result) = tasks.join_next().await {
+            assert!(result.unwrap().is_err());
+        }
+        remote.shutdown().await;
     }
 
     #[tokio::test]

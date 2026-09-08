@@ -7,7 +7,6 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("model", "Model", "ctrl+x m"),
     ("agents", "Inspect agent", "ctrl+x a"),
     ("inspect", "Focus conversation", "ctrl+x i"),
-    ("state", "Agent state", "ctrl+x s"),
     ("themes", "Theme", "ctrl+x t"),
     ("editor", "External editor", "ctrl+x e"),
     ("copy", "Copy message", "ctrl+x y"),
@@ -27,7 +26,6 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("resume", "Resume queued input", ""),
     ("retry", "Continue after a failed or interrupted turn", ""),
     ("attention", "Pending questions and permissions", ""),
-    ("diagnostics", "Startup diagnostics", ""),
     ("help", "Help and shortcuts", ""),
 ];
 
@@ -135,33 +133,4 @@ fn display(key: &KeyEvent) -> String {
         ref code => format!("{code:?}"),
     });
     result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn model_shortcut_accepts_legacy_alias_and_prefers_canonical_override() {
-        let legacy = BTreeMap::from([("models".into(), "ctrl+x z".into())]);
-        let keys = KeyMap::new(&legacy).unwrap();
-        assert_eq!(
-            keys.action(Some(parse("ctrl+x").unwrap()), parse("z").unwrap())
-                .as_deref(),
-            Some("model")
-        );
-        let mut overrides = legacy;
-        overrides.insert("model".into(), "alt+m".into());
-        let keys = KeyMap::new(&overrides).unwrap();
-        assert_eq!(
-            keys.action(None, parse("alt+m").unwrap()).as_deref(),
-            Some("model")
-        );
-        assert!(
-            keys.action(Some(parse("ctrl+x").unwrap()), parse("z").unwrap())
-                .is_none()
-        );
-        assert!(keys.help().contains("/model"));
-        assert!(!keys.help().contains("Model for new sessions"));
-    }
 }

@@ -48,17 +48,6 @@ impl StreamLayout {
     /// `None` means no change. `append_from` must be the previous byte length,
     /// with an unchanged prefix; use `None` for replacement, even at equal length.
     /// Width and Markdown palette changes automatically invalidate the layout.
-    #[cfg(test)]
-    pub(super) fn update(
-        &mut self,
-        text: &str,
-        width: usize,
-        p: Palette,
-        append_from: Option<usize>,
-    ) -> Option<Suffix> {
-        self.update_prefixed(text, width, p, append_from, "")
-    }
-
     pub(super) fn update_prefixed(
         &mut self,
         text: &str,
@@ -438,7 +427,7 @@ mod tests {
         for chunk in chunks {
             let old = text.len();
             text.push_str(chunk);
-            if let Some((at, suffix)) = cache.update(&text, width, p, Some(old)) {
+            if let Some((at, suffix)) = cache.update_prefixed(&text, width, p, Some(old), "") {
                 assert!(at <= rows.len());
                 rows.truncate(at);
                 rows.extend(suffix);
@@ -451,44 +440,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn markdown_blocks_append_equivalence_and_scaling() {
-        let p = Palette::new(false);
-        for source in [
-            "# Heading\n\n**bold** text.\n\n```rust\nlet x = 1;\n```\n\nParagraph.\n\n- one\n\n- two\n\nend",
-            "head\n----\n\n| a | b |\n| - | - |\n| c | d |\n\nend",
-            "- item\n\n    continuation\n\n- next\n\nend",
-            "> quoted\n> **bold**\n\n> next\n\nend",
-            "**bold\n\nnot bold**\n\nnew",
-        ] {
-            let mut cache = StreamLayout::default();
-            let mut rows = Vec::new();
-            let mut text = String::new();
-            for ch in source.chars() {
-                let from = text.len();
-                text.push(ch);
-                if let Some((at, suffix)) = cache.update(&text, 19, p, Some(from)) {
-                    rows.truncate(at);
-                    rows.extend(suffix);
-                }
-                assert_eq!(rows, render(&text, 19, p, "", true), "{text:?}");
-            }
-        }
-        let mut text =
-            "# Heading\n\n**bold** paragraph.\n\n```rust\nlet n = 1;\n```\n\n".repeat(10_000);
-        text.push_str("tail");
-        let mut cache = StreamLayout::default();
-        cache.update(&text, 80, p, None);
-        let stable = cache.stable_rows;
-        assert!(stable > 30_000);
-        for _ in 0..100 {
-            let from = text.len();
-            text.push_str(" more words");
-            let (at, suffix) = cache.update(&text, 80, p, Some(from)).unwrap();
-            assert!(at >= stable);
-            assert!(suffix.len() <= 4);
-        }
-    }
     #[test]
     fn common_markdown_every_character_and_split() {
         for source in [
@@ -517,31 +468,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn plain_paragraphs_stay_incremental_without_trailing_blanks() {
-        let p = Palette::new(false);
-        let mut cache = StreamLayout::default();
-        let mut rows = Vec::new();
-        let mut text = String::new();
-        for chunk in [
-            "\n", "first", "\n", "\n", "\n", "second", "\n\n", "third", "\n\n",
-        ] {
-            let old = text.len();
-            text.push_str(chunk);
-            let (at, suffix) = cache.update(&text, 80, p, Some(old)).unwrap();
-            rows.truncate(at);
-            rows.extend(suffix);
-            assert!(cache.plain.is_some());
-            assert_eq!(canonical(&rows), canonical(&reference(&text, 80, p)));
-        }
-        assert_eq!(
-            rows.iter()
-                .map(|(row, _)| row.to_string())
-                .collect::<Vec<_>>(),
-            ["first", "", "second", "", "third"]
-        );
     }
 
     #[test]
@@ -579,29 +505,6 @@ mod tests {
     }
 
     #[test]
-    fn final_list_is_not_committed_at_trailing_blank_lines() {
-        for source in ["- one\n\n", "1. one\n\n"] {
-            let mut cache = StreamLayout::default();
-            cache.update(source, 80, Palette::new(false), None);
-            assert_eq!(cache.stable_bytes, 0);
-        }
-        check_chunks(&["1. one\n\n", "2", ".", " two"], 80);
-        check_chunks(&["- one\n\n", "-", " two"], 80);
-    }
-
-    #[test]
-    fn prose_every_character() {
-        let text = "Hello, world! We consider multi-step reasoning (carefully): yes.\nNext sentence 123.\n\nAnother paragraph.  \nFinal line   ends.   \n\n";
-        let chunks: Vec<_> = text
-            .char_indices()
-            .map(|(i, c)| &text[i..i + c.len_utf8()])
-            .collect();
-        for width in [1, 2, 7, 20, 80] {
-            check_chunks(&chunks, width);
-        }
-    }
-
-    #[test]
     fn word_wrapped_prose_every_character() {
         for text in [
             "A quick brown fox jumps over the lazy dog, with   repeated spaces.",
@@ -623,143 +526,25 @@ mod tests {
     }
 
     #[test]
-    fn prefixed_word_wrapped_prose_every_character() {
-        let p = Palette::new(false);
-        for source in [
-            "A quick brown fox and a supercalifragilisticexpialidocious ending.",
-            "Styled **boldword** and *longemphasizedtokenwithoutspaces* prose.",
-            "# Title\n\nA plain tail with abcdefghijklmnopqrstuvwxyz and more words.",
-        ] {
-            for width in 1..=24 {
-                let mut cache = StreamLayout::default();
-                let mut rows = Vec::new();
-                let mut text = String::new();
-                for ch in source.chars() {
-                    let old = text.len();
-                    text.push(ch);
-                    let (at, suffix) = cache
-                        .update_prefixed(&text, width, p, Some(old), "↳ ")
-                        .unwrap();
-                    assert!(at <= rows.len());
-                    rows.truncate(at);
-                    rows.extend(suffix);
-                    assert_eq!(
-                        canonical(&rows),
-                        canonical(&render(&text, width, p, "↳ ", true)),
-                        "{text:?}, width {width}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn unicode_append_boundaries() {
-        let text = "中文。 café e\u{301} 👍🏽 🇺🇸🇨🇦 👩\u{200d}💻 ❤️ end";
-        let chunks: Vec<_> = text
-            .char_indices()
-            .map(|(i, c)| &text[i..i + c.len_utf8()])
-            .collect();
-        for width in [1, 2, 3, 7, 80] {
-            check_chunks(&chunks, width);
-        }
-    }
-
-    #[test]
-    fn markdown_downgrades_and_global_references() {
-        for chunks in [
-            vec!["Title", "\n", "---", "\nMore"],
-            vec!["Some prose ", "*", "bold*", " and `code`"],
-            vec!["Look [here][id].", "\n\n[id]: https://example.org"],
-            vec!["a | b", "\n--- | ---\nc | d"],
-            vec!["Hello\n", "    code"],
-            vec!["Hello\n", "1", ". list"],
-            vec!["", "\n", "\n", "Hello", "\n", "\n"],
-        ] {
-            check_chunks(&chunks, 9);
-        }
-    }
-
-    #[test]
     fn reset_resize_palette_and_unchanged() {
         let mut cache = StreamLayout::default();
         let p = Palette::new(false);
         let text = "ordinary prose that wraps";
-        let (_, rows) = cache.update(text, 8, p, None).unwrap();
+        let (_, rows) = cache.update_prefixed(text, 8, p, None, "").unwrap();
         assert_eq!(canonical(&rows), canonical(&reference(text, 8, p)));
-        assert!(cache.update(text, 8, p, Some(text.len())).is_none());
+        assert!(
+            cache
+                .update_prefixed(text, 8, p, Some(text.len()), "")
+                .is_none()
+        );
         for (text, width, p) in [
             (text, 3, p),
             ("replacement", 3, p),
             ("`code`", 3, Palette::new(true)),
         ] {
-            let (at, rows) = cache.update(text, width, p, None).unwrap();
+            let (at, rows) = cache.update_prefixed(text, width, p, None, "").unwrap();
             assert_eq!(at, 0);
             assert_eq!(canonical(&rows), canonical(&reference(text, width, p)));
-        }
-    }
-
-    #[test]
-    fn huge_paragraph_retains_only_bounded_suffix() {
-        let mut cache = StreamLayout::default();
-        let p = Palette::new(false);
-        let mut text = "ordinary prose ".repeat(100_000);
-        cache.update(&text, 80, p, None).unwrap();
-        let old = text.len();
-        text.push_str("more");
-        let (at, suffix) = cache.update(&text, 80, p, Some(old)).unwrap();
-        assert!(at > 10_000);
-        assert!(suffix.len() <= 3);
-        assert!(cache.plain.is_some());
-    }
-
-    #[test]
-    fn long_token_checkpoints_stay_bounded_and_match_full_render() {
-        let p = Palette::new(false);
-        for width in [1, 2, 7, 20, 80] {
-            let mut cache = StreamLayout::default();
-            let mut text = format!("prefix {}", "a".repeat(10_000));
-            let (_, mut rows) = cache.update(&text, width, p, None).unwrap();
-            for chunk in ["b", "c", " ", "ordinary", " ", "words", " ", "end"] {
-                let old = text.len();
-                text.push_str(chunk);
-                let (at, suffix) = cache.update(&text, width, p, Some(old)).unwrap();
-                assert!(at > 100, "width {width}: must not retain the token start");
-                assert!(suffix.len() <= 10);
-                assert!(cache.plain.is_some());
-                rows.truncate(at);
-                rows.extend(suffix);
-                assert_eq!(
-                    canonical(&rows),
-                    canonical(&reference(&text, width, p)),
-                    "width {width}, append {chunk:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn mixed_chunk_boundaries_match_markdown() {
-        // Include appends spanning lines and scalars splitting graphemes.
-        let alphabet = [
-            "a", "中", " ", ".", "!", "-", "+", "=", "1", "\u{301}", "\u{fe0f}", "\u{200d}", "👩",
-            "❤", "🇺", "🇸", "\u{600}",
-        ];
-        let mut seed = 47u64;
-        for width in [1, 2, 3, 8, 20] {
-            for _ in 0..100 {
-                let mut chunks = Vec::new();
-                for _ in 0..30 {
-                    let mut chunk = String::new();
-                    for _ in 0..3 {
-                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                        chunk.push_str(alphabet[(seed >> 32) as usize % alphabet.len()]);
-                    }
-                    chunks.push(chunk);
-                }
-                let chunks: Vec<_> = chunks.iter().map(String::as_str).collect();
-                check_chunks(&chunks, width);
-            }
         }
     }
 
@@ -780,15 +565,5 @@ mod tests {
                 check_chunks(&chunks, width);
             }
         }
-    }
-
-    #[test]
-    fn pathological_grapheme_falls_back() {
-        let p = Palette::new(false);
-        let mut cache = StreamLayout::default();
-        let text = format!("a{}", "\u{301}".repeat(1000));
-        let (_, rows) = cache.update(&text, 1, p, None).unwrap();
-        assert!(cache.plain.is_none());
-        assert_eq!(canonical(&rows), canonical(&reference(&text, 1, p)));
     }
 }

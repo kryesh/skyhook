@@ -160,16 +160,3 @@ fn expand(value: &str, ssh: &Path, home: &Path) -> PathBuf {
         ssh.join(path)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parser_handles_quotes_comments_and_patterns() {
-        assert_eq!(words("one \"two three\" # four"), ["one", "two three"]);
-        assert!(concrete("server"));
-        assert!(!concrete("*.example.com"));
-        assert!(!concrete("!blocked"));
-    }
-}

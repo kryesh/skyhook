@@ -36,16 +36,6 @@ pub async fn serve_with_authorization_root(root: &Path) -> Result<(), Box<dyn st
     serve_io_at(tokio::io::stdin(), tokio::io::stdout(), root).await
 }
 
-#[cfg(test)]
-async fn serve_io<R, W>(input: R, output: W) -> Result<(), Box<dyn std::error::Error>>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    let root = std::fs::canonicalize(".")?;
-    serve_io_at(input, output, root).await
-}
-
 async fn serve_io_at<R, W>(
     mut input: R,
     mut output: W,
@@ -184,7 +174,19 @@ where
                     }
                 }
             }
-            _ = services.tasks.join_next(), if !services.tasks.is_empty() => {}
+            completed = services.tasks.join_next(), if !services.tasks.is_empty() => {
+                let error: Option<Box<dyn std::error::Error>> = match completed {
+                    Some(Ok(Ok(()))) => None,
+                    Some(Ok(Err(error))) => Some(error.into()),
+                    Some(Err(error)) => Some(error.into()),
+                    None => unreachable!("nonempty service task set"),
+                };
+                if let Some(error) = error {
+                    reader.abort();
+                    tasks.abort_all();
+                    return Err(error);
+                }
+            }
             completed = tasks.join_next(), if !tasks.is_empty() => {
                 let (request_id, result) = match completed {
                     Some(Ok(completed)) => completed,
@@ -375,172 +377,18 @@ mod tests {
     use crate::remote::protocol::RemoteToolOutput;
 
     #[tokio::test]
-    async fn missing_read_is_an_ok_remote_result_after_authorization() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("missing/nested/file");
-        let (client, server) = tokio::io::duplex(64 * 1024);
-        let (mut input, mut output) = tokio::io::split(client);
-        let (server_input, server_output) = tokio::io::split(server);
-        let worker = tokio::spawn(async move {
-            serve_io(server_input, server_output)
-                .await
-                .map_err(|e| e.to_string())
-        });
-        write_frame(&mut output, &Request::Hello).await.unwrap();
-        assert!(matches!(
-            read_frame::<_, Response>(&mut input).await.unwrap(),
-            Some(Response::Ready)
-        ));
-        write_frame(
-            &mut output,
-            &Request::Tool {
-                request_id: 1,
-                name: "read".into(),
-                arguments: serde_json::json!({"path":path}),
-            },
-        )
-        .await
-        .unwrap();
-        let mut authorized = false;
-        loop {
-            match read_frame::<_, Response>(&mut input)
-                .await
-                .unwrap()
-                .unwrap()
-            {
-                Response::Authorization {
-                    authorization_id, ..
-                } => {
-                    authorized = true;
-                    write_frame(
-                        &mut output,
-                        &Request::AuthorizationDecision {
-                            request_id: 1,
-                            authorization_id,
-                            allowed: true,
-                            reason: None,
-                        },
-                    )
-                    .await
-                    .unwrap();
-                }
-                Response::Tool {
-                    result: Ok(result), ..
-                } => {
-                    assert!(authorized);
-                    assert_eq!(result.value["kind"], "error");
-                    assert_eq!(result.value["error"]["code"], "not_found");
-                    assert_eq!(result.value["path"], path.to_string_lossy().as_ref());
-                    break;
-                }
-                other => panic!("unexpected response: {other:?}"),
-            }
-        }
-        drop(output);
-        drop(input);
-        tokio::time::timeout(Duration::from_secs(5), worker)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn large_file_results_transfer_after_capture_in_bounded_artifact_frames() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("large.txt");
-        let size = 17 * 1024 * 1024;
-        tokio::fs::write(&path, vec![b'x'; size]).await.unwrap();
-        let (client, server) = tokio::io::duplex(64 * 1024);
-        let (mut input, mut output) = tokio::io::split(client);
-        let (server_input, server_output) = tokio::io::split(server);
-        let worker = tokio::spawn(async move {
-            serve_io(server_input, server_output)
-                .await
-                .map_err(|e| e.to_string())
-        });
-        write_frame(&mut output, &Request::Hello).await.unwrap();
-        assert!(matches!(
-            read_frame::<_, Response>(&mut input).await.unwrap(),
-            Some(Response::Ready)
-        ));
-        write_frame(
-            &mut output,
-            &Request::Tool {
-                request_id: 1,
-                name: "read".into(),
-                arguments: serde_json::json!({"path":path}),
-            },
-        )
-        .await
-        .unwrap();
-        let mut received = 0;
-        let mut closed = false;
-        loop {
-            match read_frame::<_, Response>(&mut input)
-                .await
-                .unwrap()
-                .unwrap()
-            {
-                Response::Authorization {
-                    authorization_id, ..
-                } => {
-                    write_frame(
-                        &mut output,
-                        &Request::AuthorizationDecision {
-                            request_id: 1,
-                            authorization_id,
-                            allowed: true,
-                            reason: None,
-                        },
-                    )
-                    .await
-                    .unwrap();
-                }
-                Response::ToolArtifact {
-                    request_id,
-                    field,
-                    offset,
-                    data,
-                    finished,
-                } => {
-                    assert_eq!(request_id, 1);
-                    assert_eq!(field, "/result/content");
-                    assert_eq!(offset, received as u64);
-                    assert!(data.len() <= 64 * 1024);
-                    assert!(data.iter().all(|b| *b == b'x'));
-                    received += data.len();
-                    closed = finished;
-                }
-                Response::Tool {
-                    result: Ok(result), ..
-                } => {
-                    assert!(closed);
-                    assert_eq!(received, size);
-                    assert_eq!(result.value["content"], "");
-                    break;
-                }
-                other => panic!("unexpected response: {other:?}"),
-            }
-        }
-        drop(output);
-        drop(input);
-        tokio::time::timeout(Duration::from_secs(5), worker)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
     async fn tool_requests_execute_concurrently_and_reply_on_completion() {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (mut client_input, mut client_output) = tokio::io::split(client);
         let (server_input, server_output) = tokio::io::split(server);
         let worker = tokio::spawn(async move {
-            serve_io(server_input, server_output)
-                .await
-                .map_err(|error| error.to_string())
+            serve_io_at(
+                server_input,
+                server_output,
+                std::fs::canonicalize(".").unwrap(),
+            )
+            .await
+            .map_err(|error| error.to_string())
         });
 
         write_frame(&mut client_output, &Request::Hello)

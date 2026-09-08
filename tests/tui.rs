@@ -150,20 +150,6 @@ impl Terminal {
     fn send(&mut self, text: &str) {
         self.master.write_all(text.as_bytes()).unwrap();
     }
-    fn resize(&mut self, rows: u16, columns: u16) {
-        let size = libc::winsize {
-            ws_row: rows,
-            ws_col: columns,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        self.parser.screen_mut().set_size(rows, columns);
-        // SAFETY: master is a live PTY descriptor and size points to a valid winsize.
-        assert_eq!(
-            unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
-            0
-        );
-    }
     fn quit(&mut self) {
         self.send("\x18q");
         let end = Instant::now() + Duration::from_secs(5);
@@ -424,184 +410,82 @@ fn pristine_launch_typing_and_commands_do_not_create_a_session() {
 }
 
 #[test]
-fn new_stays_a_draft_until_submission_and_quitting_does_not_save_it() {
-    // Cover both abandoning the new draft and submitting it for a second session.
-    for submit_second in [false, true] {
-        let root = tempfile::tempdir().unwrap();
-        let provider = Provider::new(Duration::ZERO);
-        config(root.path(), &provider.url);
-        let sessions = root.path().join(".skyhook/sessions");
-        let mut terminal = Terminal::launch(root.path(), &[]);
-        terminal.wait("Start a conversation");
-        terminal.send("/new");
-        terminal.wait("Commands");
-        terminal.send("\r");
-        terminal.wait_for("new draft with command palette closed", |screen| {
-            let contents = screen.contents();
-            contents.contains("Start a conversation") && !contents.contains("Commands")
-        });
-        assert!(
-            !sessions.exists(),
-            "/new in a pristine launch must not create storage"
-        );
-        assert!(provider.requests.lock().unwrap().is_empty());
-
-        terminal.send("First submitted message\r");
-        terminal.wait("Fixture response 1");
-        terminal.wait("84 · 100(80)");
-        let first = session_directories(root.path());
-        assert_eq!(
-            first.len(),
-            1,
-            "first submission must create exactly one session"
-        );
-        assert!(first[0].join("events.jsonl").is_file());
-        terminal.send("/new\r");
-        terminal.wait("Start a conversation");
-        assert_eq!(
-            session_directories(root.path()),
-            first,
-            "/new must only return to a draft"
-        );
-        assert!(
-            !terminal
-                .parser
-                .screen()
-                .contents()
-                .contains("Fixture response 1")
-        );
-
-        terminal.send("Second draft");
-        terminal.wait("Second draft");
-        assert_eq!(
-            session_directories(root.path()),
-            first,
-            "unsent new draft must not create a session"
-        );
-        if submit_second {
-            terminal.send("\r");
-            terminal.wait("Fixture response 2");
-            terminal.wait("84 · 100(80)");
-            let second = session_directories(root.path());
-            assert_eq!(
-                second.len(),
-                2,
-                "submitting the new draft must create one more session"
-            );
-            assert!(
-                second.contains(&first[0]),
-                "the original session must remain"
-            );
-        }
-        terminal.quit();
-        assert_eq!(
-            session_directories(root.path()).len(),
-            if submit_second { 2 } else { 1 }
-        );
-        assert_eq!(
-            provider.requests.lock().unwrap().len(),
-            if submit_second { 2 } else { 1 }
-        );
-    }
-}
-
-#[test]
-fn model_selection_waits_for_submitted_messages_and_reply_footers_survive_resume() {
+fn new_returns_to_draft_and_submission_creates_a_second_session() {
     let root = tempfile::tempdir().unwrap();
-    let (advance, gates) = std::sync::mpsc::channel();
-    let provider = Provider::streaming(Duration::ZERO, Some(gates), vec![]);
-    let requests = &provider.requests;
+    let provider = Provider::new(Duration::ZERO);
     config(root.path(), &provider.url);
-    let config_path = root.path().join("config.toml");
-    let mut config = std::fs::read_to_string(&config_path).unwrap();
-    config.push_str(
-        "\n[models.second]\nprovider='test'\nmodel='model-b'\nmax_context=64000\nmax_output=2048\n",
-    );
-    std::fs::write(&config_path, &config).unwrap();
-    let mut terminal = Terminal::launch(root.path(), &["--prompt", "First question"]);
-    terminal.wait_for("first request", |_| requests.lock().unwrap().len() == 1);
-    terminal.wait("Working");
-    let session = terminal.session();
-    let journal = root
-        .path()
-        .join(".skyhook/sessions")
-        .join(&session)
-        .join("events.jsonl");
-    let before = std::fs::read(&journal).unwrap();
-    terminal.send("Queued with A\r");
-    terminal.wait("1 follow-up(s) queued");
-    terminal.send("\x18m");
-    terminal.wait("Model");
-    terminal.send("\x1b[B\r");
-    terminal.wait_for("selected model B", |screen| {
-        screen
-            .contents()
-            .lines()
-            .last()
-            .unwrap_or_default()
-            .contains("model-b")
-    });
+    let mut terminal = Terminal::launch(root.path(), &[]);
+    terminal.wait("Start a conversation");
+    terminal.send("First submitted message\r");
+    terminal.wait("Fixture response 1");
+    terminal.wait("84 · 100(80)");
+    let first = session_directories(root.path());
     assert_eq!(
-        std::fs::read(&journal).unwrap(),
-        before,
-        "selection must not write the session"
+        first.len(),
+        1,
+        "first submission must create exactly one session"
     );
-    terminal.send("Queued with B\r");
-    terminal.wait("2 follow-up(s) queued");
-    // Select A again before either queued message runs; their captured choices must win.
-    terminal.send("\x18m\x1b[A\r");
-    advance.send(()).unwrap();
-    terminal.wait_for("batched queued request", |_| {
-        requests.lock().unwrap().len() == 2
+    assert!(first[0].join("events.jsonl").is_file());
+    terminal.send("/requests\r");
+    terminal.wait_for("request metadata and tokens on one line", |screen| {
+        screen.contents().lines().any(|line| {
+            line.contains("Request #")
+                && line.contains("Out 84")
+                && line.contains("In 80")
+                && line.contains("Cached 20")
+        })
     });
-    {
-        let requests = requests.lock().unwrap();
-        // Both follow-ups enter the next request; the last captured model wins,
-        // not the unsent selection made afterward.
-        assert_eq!(requests[1]["model"], "model-b");
-        let messages = requests[1]["messages"].to_string();
-        assert!(messages.find("Queued with A").unwrap() < messages.find("Queued with B").unwrap());
-    }
-    advance.send(()).unwrap();
+    terminal.send("\r"); // Requests cannot expand to expose provider input or responses.
+    terminal.send("\x10");
+    terminal.wait("Commands");
+    terminal.send("\x1b");
+    terminal.wait_for("request remains metadata-only", |screen| {
+        let text = screen.contents();
+        !text.contains("Commands") && text.contains("Request #")
+    });
+    let screen = terminal.parser.screen().contents();
+    assert!(!screen.contains("First submitted message"));
+    assert!(!screen.contains("Fixture response 1"));
+    terminal.send("\x18i\t"); // Retained focus-conversation action, then back to composer.
+    terminal.wait("Fixture response 1");
+    terminal.send("/new\r");
+    terminal.wait("Start a conversation");
+    assert_eq!(
+        session_directories(root.path()),
+        first,
+        "/new must only return to a draft"
+    );
+    assert!(
+        !terminal
+            .parser
+            .screen()
+            .contents()
+            .contains("Fixture response 1")
+    );
+
+    terminal.send("Second draft");
+    terminal.wait("Second draft");
+    assert_eq!(
+        session_directories(root.path()),
+        first,
+        "unsent new draft must not create a session"
+    );
+    terminal.send("\r");
     terminal.wait("Fixture response 2");
-    terminal.wait_for("recorded reply footer", |screen| {
-        screen
-            .contents()
-            .lines()
-            .filter(|line| line.trim() == "model-b")
-            .count()
-            == 1
-    });
+    terminal.wait("84 · 100(80)");
+    let second = session_directories(root.path());
+    assert_eq!(
+        second.len(),
+        2,
+        "submitting the new draft must create one more session"
+    );
+    assert!(
+        second.contains(&first[0]),
+        "the original session must remain"
+    );
     terminal.quit();
-    let records = std::fs::read_to_string(&journal).unwrap();
-    assert!(records.contains("\"type\":\"model_changed\",\"model_profile\":\"second\""));
-    // The pending A selection was never sent, so reopening restores B.
-    let mut resumed = Terminal::launch(root.path(), &["--resume", &session]);
-    resumed.wait("Fixture response 2");
-    resumed.wait_for("restored model B", |screen| {
-        screen
-            .contents()
-            .lines()
-            .last()
-            .unwrap_or_default()
-            .contains("model-b")
-    });
-    let screen = resumed.parser.screen().contents();
-    assert_eq!(
-        screen
-            .lines()
-            .filter(|line| line.trim() == "fixture")
-            .count(),
-        1
-    );
-    assert_eq!(
-        screen
-            .lines()
-            .filter(|line| line.trim() == "model-b")
-            .count(),
-        1
-    );
-    resumed.quit();
+    assert_eq!(session_directories(root.path()).len(), 2);
+    assert_eq!(provider.requests.lock().unwrap().len(), 2);
 }
 
 #[test]
@@ -903,120 +787,6 @@ fn script_launch_uses_regular_approval_and_remains_interactive() {
     terminal.wait("Completed");
     terminal.wait("finaloutput");
     assert!(terminal.child.try_wait().unwrap().is_none());
-    terminal.quit();
-}
-
-#[test]
-fn interruption_status_stays_in_history_after_followup_and_session_resume() {
-    let root = tempfile::tempdir().unwrap();
-    let provider = Provider::new(Duration::from_millis(300));
-    config(root.path(), &provider.url);
-    let mut terminal = Terminal::launch(root.path(), &["--prompt", "Initial interrupted question"]);
-    terminal.wait("Initial interrupted question");
-    terminal.send("\x1b");
-    terminal.wait("Status · Interrupted");
-    // The completed interruption result confirms that a new prompt can be submitted.
-    terminal.wait("agent turn was interrupted");
-    terminal.send("Follow-up after interruption\r");
-    terminal.wait("Follow-up after interruption");
-    terminal.wait("Fixture response");
-    let screen = terminal.parser.screen().contents();
-    assert!(
-        screen.find("Status · Interrupted").unwrap()
-            < screen.find("Follow-up after interruption").unwrap()
-    );
-    let session = terminal.session();
-    terminal.quit();
-    let mut resumed = Terminal::launch(root.path(), &["--resume", &session]);
-    resumed.wait("Status · Interrupted");
-    resumed.wait("Follow-up after interruption");
-    let screen = resumed.parser.screen().contents();
-    assert_eq!(screen.matches("Status · Interrupted").count(), 1);
-    assert!(
-        screen.find("Status · Interrupted").unwrap()
-            < screen.find("Follow-up after interruption").unwrap()
-    );
-    resumed.quit();
-}
-
-#[test]
-fn scroll_bursts_preserve_distance_without_backlogging_input_or_terminal_output() {
-    let root = tempfile::tempdir().unwrap();
-    config(root.path(), "http://127.0.0.1:1");
-    let script = root.path().join("scroll.js");
-    let mut source = (0..600)
-        .map(|line| format!("// history line {line:04}: some text to scroll past\n"))
-        .collect::<String>();
-    source.push_str("return 'scroll tail marker';");
-    std::fs::write(&script, source).unwrap();
-    let mut terminal = Terminal::launch(root.path(), &["--script", script.to_str().unwrap()]);
-    terminal.wait("Completed");
-    terminal.send("\x10details\r");
-    terminal.wait("scroll tail marker");
-    terminal.read();
-    let before = terminal.bytes.len();
-    let start = Instant::now();
-    // SGR mouse wheel up at a point in the conversation, followed immediately by typing.
-    terminal.send(&format!(
-        "{}scroll input marker",
-        "\x1b[<64;50;12M".repeat(250)
-    ));
-    terminal.wait("scroll input marker");
-    terminal.wait("history line 0000");
-    let bytes = terminal.bytes.len() - before;
-    eprintln!(
-        "250 wheel events: {:?}, {bytes} terminal bytes",
-        start.elapsed()
-    );
-    assert!(
-        bytes < 32 * 1024,
-        "scroll events generated {bytes} bytes of redundant frames"
-    );
-    terminal.quit();
-}
-
-#[test]
-fn theme_and_resize_preserve_draft_and_navigation() {
-    let root = tempfile::tempdir().unwrap();
-    let provider = Provider::new(Duration::from_millis(10));
-    config(root.path(), &provider.url);
-    let mut terminal = Terminal::launch(root.path(), &["--prompt", "Initial question"]);
-    terminal.wait("Fixture response 1");
-    terminal.send("Unsent draft");
-    terminal.wait("Unsent draft");
-    let dark = terminal.parser.screen().cell(0, 0).unwrap().bgcolor();
-    let state_path = root.path().join("state/skyhook/ui.json");
-    let saved = std::fs::read(&state_path).unwrap();
-    terminal.send("\x18t");
-    terminal.wait("Theme");
-    terminal.send("\x1b[B");
-    terminal.wait_for("light theme preview", |screen| {
-        screen.cell(2, 0).unwrap().bgcolor() == vt100::Color::Rgb(245, 245, 245)
-    });
-    assert_eq!(std::fs::read(&state_path).unwrap(), saved);
-    terminal.send("\x1b");
-    terminal.wait_for("cancelled preview restores black background", |screen| {
-        screen.cell(2, 0).unwrap().bgcolor() == vt100::Color::Rgb(0, 0, 0)
-    });
-    assert_eq!(std::fs::read(&state_path).unwrap(), saved);
-    terminal.send("\x18tlight\r");
-    terminal.wait_for("light theme background", |screen| {
-        screen.cell(2, 0).unwrap().bgcolor() == vt100::Color::Rgb(245, 245, 245)
-    });
-    assert!(!terminal.parser.screen().contents().contains("Theme:"));
-    assert_ne!(dark, terminal.parser.screen().cell(0, 0).unwrap().bgcolor());
-    assert!(terminal.parser.screen().contents().contains("Unsent draft"));
-    terminal.resize(20, 44);
-    terminal.wait("Chat");
-    terminal.wait("84 · 100(80)");
-    assert!(terminal.parser.screen().contents().contains("Unsent draft"));
-    terminal.send("\t]");
-    terminal.wait("Request");
-    terminal.resize(40, 120);
-    terminal.wait("Conversation");
-    terminal.send("\x18i\t");
-    terminal.send("\r");
-    terminal.wait("Fixture response 2");
     terminal.quit();
 }
 

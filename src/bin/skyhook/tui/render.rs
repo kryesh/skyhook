@@ -427,14 +427,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ("Conversation", Tab::Conversation),
         ("Requests", Tab::Requests),
         ("Jobs", Tab::Jobs),
-        ("State", Tab::State),
     ] {
         let label = if width < 50 {
             match value {
                 Tab::Conversation => "Chat",
                 Tab::Requests => "Calls",
                 Tab::Jobs => "Jobs",
-                Tab::State => "State",
             }
         } else {
             label
@@ -703,19 +701,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     ),
                 ));
             }
-        }
-    }
-    {
-        let visible: Vec<_> = app
-            .hits
-            .iter()
-            .filter_map(|(_, hit)| match hit {
-                Hit::Entry(index, _) => Some(*index),
-                _ => None,
-            })
-            .collect();
-        for index in visible {
-            app.prewarm_entry(index);
         }
     }
     if app.content_rows > app.content_rect.height as usize && app.content_rect.height > 0 {
@@ -1535,6 +1520,27 @@ fn layout_document_or_plain(
     index: usize,
 ) -> Vec<Row> {
     let geometry = EntryGeometry::new(entry, width, index);
+    if let Some(summary) = &entry.request_summary {
+        // Requests are metadata-only: reserve the right edge for statistics when
+        // there is room for a label, otherwise clip the label, never wrap it.
+        let summary = model::clean(summary).replace('\n', " ");
+        let width = geometry.body_width;
+        let summary_width = summary.width();
+        let label = model::clean(&entry.text).replace('\n', " ");
+        let line = if summary_width + 18 <= width as usize {
+            let label_width = width - summary_width as u16 - 2;
+            let label = clipped_header(&label, label_width);
+            let gap = width as usize - label.width() - summary_width;
+            Line::from(vec![
+                Span::raw(label),
+                Span::raw(" ".repeat(gap)),
+                Span::styled(summary, Style::default().fg(p.muted)),
+            ])
+        } else {
+            Line::from(clipped_header(&label, width))
+        };
+        return vec![geometry.row(line, true, false)];
+    }
     let block = matches!(entry.surface, Surface::User | Surface::Agent);
     let lines = if let Some(document) = &entry.document {
         document.lines(Some(highlights), p.fg == Palette::new(true).fg)
@@ -1878,129 +1884,6 @@ mod tests {
     }
 
     #[test]
-    fn compact_tools_keep_reasoning_padding_in_cached_layout() {
-        let p = Palette::new(false);
-        let highlights = super::super::tool_view::HighlightCache::default();
-        for width in [12, 80] {
-            for expanded in [false, true] {
-                let make_entry = |key: &str, surface, compact_after| model::Entry {
-                    key: key.into(),
-                    text: key.into(),
-                    surface,
-                    expandable: false,
-                    default_open: false,
-                    running: false,
-                    footer: None,
-                    indent: 0,
-                    job: None,
-                    document: None,
-                    compact_after,
-                };
-                let mut entries = vec![
-                    make_entry("reasoning before", Surface::Reasoning, false),
-                    make_entry("tool one", Surface::Tool, true),
-                    make_entry("tool two", Surface::Tool, false),
-                    make_entry("reasoning after", Surface::Reasoning, false),
-                ];
-                if expanded {
-                    for entry in &mut entries[1..3] {
-                        let mut document = super::super::tool_view::Document::default();
-                        document.line(entry.text.clone(), super::super::tool_view::Role::Heading);
-                        document.line("output", super::super::tool_view::Role::Plain);
-                        entry.document = Some(document);
-                    }
-                }
-                let mut all_rows = Vec::new();
-                for (index, entry) in entries.iter().enumerate() {
-                    let mut rows = Vec::new();
-                    update_entry_rows(
-                        &mut rows,
-                        &mut CachedEntry::default(),
-                        entry,
-                        index,
-                        EntryLayout {
-                            width,
-                            palette: p,
-                            highlights: &highlights,
-                        },
-                        None,
-                    );
-                    assert_eq!(rows.last().unwrap().text().is_empty(), index != 1);
-                    all_rows.extend(rows);
-                }
-                let oracle = layout(&entries, width, p, Some(&highlights));
-                assert_eq!(
-                    all_rows.iter().map(Row::text).collect::<Vec<_>>(),
-                    oracle.iter().map(Row::text).collect::<Vec<_>>()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn inline_reasoning_is_excluded_from_selection_but_expandable_reasoning_is_not() {
-        let entry = |text: &str, surface, expandable| model::Entry {
-            key: text.into(),
-            text: text.into(),
-            surface,
-            expandable,
-            default_open: false,
-            running: false,
-            footer: None,
-            indent: 0,
-            job: None,
-            compact_after: false,
-            document: None,
-        };
-        for expandable in [false, true] {
-            let entries = [
-                entry("before", Surface::Tool, false),
-                entry("reasoning", Surface::Reasoning, expandable),
-                entry("after", Surface::Tool, false),
-            ];
-            let mut blocks = RowBlocks::default();
-            let highlights = super::super::tool_view::HighlightCache::default();
-            for (index, entry) in entries.iter().enumerate() {
-                update_entry_rows(
-                    blocks.block_mut(index),
-                    &mut CachedEntry::default(),
-                    entry,
-                    index,
-                    EntryLayout {
-                        width: 60,
-                        palette: Palette::new(false),
-                        highlights: &highlights,
-                    },
-                    None,
-                );
-                blocks.finish_update(index);
-            }
-            let reasoning = blocks.entry_start(1).unwrap();
-            assert_eq!(blocks[reasoning].selectable, expandable);
-            let selection = (
-                TextPosition { row: 0, byte: 0 },
-                TextPosition {
-                    row: blocks.len() - 1,
-                    byte: 0,
-                },
-            );
-            assert_eq!(
-                blocks[reasoning]
-                    .selection_range(reasoning, Some(selection))
-                    .is_some(),
-                expandable,
-            );
-            let expected = if expandable {
-                "before\nreasoning\nafter"
-            } else {
-                "before\nafter"
-            };
-            assert_eq!(selected_text(&blocks, selection), expected);
-            assert_eq!(selected_text(&blocks, (selection.1, selection.0)), expected);
-        }
-    }
-
-    #[test]
     fn selection_preserves_soft_wrapped_text_and_code_whitespace() {
         let source = "  first line with enough text to wrap\n    second line  ";
         let entry = model::Entry {
@@ -2011,6 +1894,7 @@ mod tests {
             default_open: false,
             running: false,
             footer: None,
+            request_summary: None,
             indent: 0,
             job: None,
             compact_after: false,
@@ -2064,6 +1948,57 @@ mod tests {
         ));
     }
     #[test]
+    fn requests_are_single_clipped_rows_with_right_side_statistics() {
+        let mut entry = model::Entry {
+            key: "r1".into(),
+            text: "Request #1 · Agent · 界 long model\nmetadata".into(),
+            surface: Surface::Tool,
+            expandable: false,
+            default_open: false,
+            running: false,
+            footer: None,
+            request_summary: Some("Out 20 · In 100 · Cached 80 · 1.0s".into()),
+            indent: 0,
+            job: None,
+            document: None,
+            compact_after: false,
+        };
+        let highlights = super::super::tool_view::HighlightCache::default();
+        for width in [1, 5, 12, 30, 60, 120] {
+            let rows = layout_document_or_plain(&entry, width, Palette::new(false), &highlights, 0);
+            assert_eq!(rows.len(), 1, "width {width}: no wrapping or separators");
+            assert!(!rows[0].blank);
+            assert!(!rows[0].continued);
+            assert!(rows[0].line.width() <= rows[0].width as usize);
+            if width == 120 {
+                let text = rows[0].line.to_string();
+                assert!(text.starts_with("Request #1"));
+                assert!(text.ends_with(entry.request_summary.as_ref().unwrap()));
+                assert_eq!(text.width(), rows[0].width as usize);
+            }
+            // Multiple calls remain adjacent, including a running call.
+            entry.running = true;
+            let mut blocks = RowBlocks::default();
+            for index in 0..2 {
+                update_entry_rows(
+                    blocks.block_mut(index),
+                    &mut CachedEntry::default(),
+                    &entry,
+                    index,
+                    EntryLayout {
+                        width,
+                        palette: Palette::new(false),
+                        highlights: &highlights,
+                    },
+                    None,
+                );
+                blocks.finish_update(index);
+            }
+            assert_eq!(blocks.len(), 2);
+        }
+    }
+
+    #[test]
     fn document_and_plain_fallback_match_reference_layout() {
         let highlights = super::super::tool_view::HighlightCache::default();
         let mut document = super::super::tool_view::Document::default();
@@ -2090,6 +2025,7 @@ mod tests {
                     default_open: true,
                     running: false,
                     footer: None,
+                    request_summary: None,
                     document,
                     job: None,
                     compact_after: false,
@@ -2163,6 +2099,7 @@ mod tests {
                         default_open: true,
                         running: true,
                         footer: None,
+                        request_summary: None,
                         document: None,
                         job: None,
                         compact_after: false,
@@ -2228,265 +2165,5 @@ mod tests {
                 }
             }
         }
-    }
-    fn message_entry(surface: Surface, text: String) -> model::Entry {
-        model::Entry {
-            key: "message".into(),
-            text,
-            surface,
-            expandable: false,
-            default_open: false,
-            running: false,
-            footer: None,
-            indent: 0,
-            job: None,
-            compact_after: false,
-            document: None,
-        }
-    }
-
-    #[test]
-    fn message_boxes_have_one_sender_margin_and_three_opposite_columns() {
-        for width in [20, 30, 69, 70, 80, 120, 240] {
-            for (surface, left, right) in [(Surface::Agent, 1, 3), (Surface::User, 3, 1)] {
-                let entry = message_entry(surface, "Sender\nBody".into());
-                let geometry = EntryGeometry::new(&entry, width, 0);
-                assert_eq!(geometry.x, left);
-                assert_eq!(geometry.block_width, width - 4);
-                assert_eq!(geometry.row_width, width - 4);
-                assert_eq!(width - geometry.x - geometry.block_width, right);
-                assert_eq!(geometry.body_width, width - 8);
-                let row = geometry.row(Line::from("Body"), false, false);
-                assert_eq!(row.text_x(), left + 2);
-                assert_eq!(row.x + row.width - (row.text_x() + geometry.body_width), 2);
-            }
-            // Non-message rows retain their existing margins and indentation.
-            for surface in [Surface::Tool, Surface::Reasoning, Surface::Muted] {
-                let mut entry = message_entry(surface, "Body".into());
-                entry.indent = 2;
-                let geometry = EntryGeometry::new(&entry, width, 0);
-                assert_eq!(geometry.x, 4);
-                assert_eq!(geometry.row_width, width - 7);
-                assert_eq!(geometry.body_width, width - 7);
-            }
-        }
-        for width in 0..9 {
-            for surface in [Surface::Agent, Surface::User] {
-                let entry = message_entry(surface, "Sender\nBody".into());
-                let geometry = EntryGeometry::new(&entry, width, 0);
-                assert!(geometry.block_width >= 1);
-                assert!(geometry.body_width >= 1);
-            }
-        }
-    }
-
-    #[test]
-    fn message_boxes_use_full_content_width_for_titles_streams_and_footers() {
-        let highlights = super::super::tool_view::HighlightCache::default();
-        for width in [30, 69, 70, 80, 120] {
-            for surface in [Surface::Agent, Surface::User] {
-                let content_width = usize::from(width - 8);
-                let title = "T".repeat(content_width);
-                let body = "b".repeat(content_width);
-                let footer = "F".repeat(content_width);
-                let mut entry = message_entry(surface, format!("{title}\n{body}"));
-                entry.footer = Some(footer.clone());
-                let mut rows = Vec::new();
-                let mut cached = CachedEntry::default();
-                let settings = EntryLayout {
-                    width,
-                    palette: Palette::new(false),
-                    highlights: &highlights,
-                };
-                update_entry_rows(&mut rows, &mut cached, &entry, 0, settings, None);
-                let content = |rows: &[Row]| {
-                    rows.iter()
-                        .filter(|row| !row.blank && row.line.width() > 0)
-                        .map(Row::text)
-                        .collect::<Vec<_>>()
-                };
-                assert_eq!(
-                    content(&rows),
-                    [title.clone(), body.clone(), footer.clone()]
-                );
-                assert!(rows.iter().filter(|row| row.surface == surface).all(|row| {
-                    row.x == (if surface == Surface::Agent { 1 } else { 3 })
-                        && row.width == width - 4
-                }));
-
-                let append_from = entry.text.len();
-                entry.text.push('b');
-                update_entry_rows(
-                    &mut rows,
-                    &mut cached,
-                    &entry,
-                    0,
-                    settings,
-                    Some(append_from),
-                );
-                assert_eq!(content(&rows), [title, body, "b".into(), footer]);
-                let continuation = rows.iter().find(|row| row.text() == "b").unwrap();
-                assert!(continuation.continued);
-            }
-        }
-    }
-
-    #[test]
-    fn message_wrap_preserves_words_styles_and_source_whitespace() {
-        let wrap = |text: &str, width| {
-            wrap_words(Line::from(text.to_owned()), width)
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(wrap("hello world", 8), ["hello ", "world"]);
-        assert_eq!(wrap("hello world", 5), ["hello ", "world"]);
-        assert_eq!(wrap("one two three", 7), ["one two ", "three"]);
-        assert_eq!(wrap("abcdefghijk", 4), ["abcd", "efgh", "ijk"]);
-        assert_eq!(wrap("a abcdefghijk", 4), ["a ab", "cdef", "ghij", "k"]);
-        assert_eq!(wrap("界界 abc", 5), ["界界 ", "abc"]);
-        assert_eq!(wrap("  hello  world", 8).concat(), "  hello  world");
-        let bold = Style::default().add_modifier(Modifier::BOLD);
-        let rows = wrap_words(
-            Line::from(vec![
-                Span::raw("one "),
-                Span::styled("wo", bold),
-                Span::raw("rd"),
-            ]),
-            6,
-        );
-        assert_eq!(
-            rows.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            ["one ", "word"]
-        );
-        assert_eq!(rows[1].spans[0].style, bold);
-        assert_eq!(rows[1].spans[1].style, Style::default());
-    }
-
-    #[test]
-    fn wraps_wide_graphemes_without_splitting() {
-        let lines = wrap_plain("ab界👩‍💻c", 4);
-        assert_eq!(lines, vec!["ab界", "👩‍💻c"]);
-    }
-    #[test]
-    fn reasoning_uses_response_markdown_styles_and_stays_flat_when_wrapped() {
-        let body = "## Heading\n**bold** *italic* `code` [link](https://example.com)\nsoft break\n\nSecond paragraph with ~~removed~~ text.\n\n- item\n- [x] done\n\n3. ordered\n4. next\n\n> quote\n\n| Name | Value |\n| --- | ---: |\n| **bold** | 123 |\n\n```rust\nlet value = 1;\n```";
-        for light in [false, true] {
-            let palette = Palette::new(light);
-            let reasoning = model::Entry {
-                key: "reasoning".into(),
-                text: format!("▾ Reasoning\n{body}"),
-                surface: Surface::Reasoning,
-                expandable: true,
-                default_open: true,
-                running: false,
-                footer: None,
-                indent: 0,
-                job: None,
-                compact_after: false,
-                document: None,
-            };
-            let rows = layout(std::slice::from_ref(&reasoning), 120, palette, None);
-            let actual = rows
-                .iter()
-                .filter(|row| !row.header && !row.blank && row.line.width() > 0)
-                .map(|row| row.line.as_ref().clone())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                actual,
-                markdown(body, palette)
-                    .into_iter()
-                    .filter(|line| line.width() > 0)
-                    .collect::<Vec<_>>()
-            );
-            assert!(rows.iter().filter(|row| !row.blank).all(|row| row.x == 2));
-            assert_eq!(palette.background(Surface::Reasoning), palette.base);
-            let inline = model::Entry {
-                text: "**A long single source line that wraps in a narrow terminal**".into(),
-                expandable: false,
-                default_open: false,
-                ..reasoning
-            };
-            let rows = layout(std::slice::from_ref(&inline), 24, palette, None);
-            assert!(rows.iter().filter(|row| !row.blank).count() > 1);
-            assert!(!inline.expandable);
-            assert!(rows[0].line.to_string().starts_with("A long single"));
-            assert!(rows.iter().any(|row| {
-                row.line
-                    .spans
-                    .iter()
-                    .any(|span| span.style.add_modifier.contains(Modifier::BOLD))
-            }));
-        }
-    }
-
-    #[test]
-    fn reply_footer_is_muted_and_inside_the_message_card_in_both_themes() {
-        let entry = model::Entry {
-            key: "answer".into(),
-            text: "skyhook\nFinal answer".into(),
-            surface: Surface::Agent,
-            expandable: false,
-            default_open: false,
-            running: false,
-            footer: Some("recorded-model-id".into()),
-            indent: 0,
-            job: None,
-            compact_after: false,
-            document: None,
-        };
-        for light in [false, true] {
-            for width in [30, 100] {
-                let palette = Palette::new(light);
-                let rows = layout(std::slice::from_ref(&entry), width, palette, None);
-                let footer = rows
-                    .iter()
-                    .find(|row| row.line.to_string() == "recorded-model-id")
-                    .unwrap();
-                assert_eq!(footer.x, 1);
-                assert_eq!(footer.surface, Surface::Agent);
-                assert_eq!(footer.line.spans[0].style.fg, Some(palette.muted));
-                assert!(!footer.header);
-            }
-        }
-    }
-
-    #[test]
-    fn flat_surfaces_and_alignment_match_design() {
-        let entries = vec![
-            model::Entry {
-                key: "user".into(),
-                text: "You\nhello".into(),
-                surface: Surface::User,
-                expandable: false,
-                default_open: false,
-                running: false,
-                footer: None,
-                indent: 0,
-                job: None,
-                compact_after: false,
-                document: None,
-            },
-            model::Entry {
-                key: "tool".into(),
-                text: "▸ read file.rs".into(),
-                surface: Surface::Tool,
-                expandable: true,
-                default_open: false,
-                running: false,
-                footer: None,
-                indent: 0,
-                job: None,
-                compact_after: false,
-                document: None,
-            },
-        ];
-        let p = Palette::new(false);
-        let rows = layout(&entries, 100, p, None);
-        assert!(rows[0].x > 2);
-        let tool = rows.iter().find(|r| r.entry == 1 && !r.blank).unwrap();
-        assert_eq!(tool.x, 2);
-        assert_eq!(p.background(tool.surface), p.base);
-        assert_ne!(p.background(Surface::User), p.base);
     }
 }

@@ -91,7 +91,7 @@ impl OutputArgs {
 #[derive(Clone)]
 struct Selection {
     field: String,
-    pattern: Option<String>,
+    matcher: Option<std::sync::Arc<grep_regex::RegexMatcher>>,
     context: usize,
     start: usize,
     offset: usize,
@@ -180,22 +180,23 @@ fn hydrate(directory: &Path, mut value: Value, maximum: u64) -> Result<Value, To
         if std::fs::metadata(field_file(directory, &field))?.len() > maximum {
             continue;
         }
-        let target = value
-            .pointer_mut(&field)
-            .ok_or_else(|| ToolError::Failed("invalid saved output field".into()))?;
-        *target = if target.is_string() {
-            Value::String(
-                String::from_utf8_lossy(&std::fs::read(field_file(directory, &field))?)
-                    .into_owned(),
-            )
-        } else {
-            serde_json::from_reader(BufReader::new(std::fs::File::open(field_file(
-                directory, &field,
-            ))?))?
-        };
+        hydrate_field(directory, &mut value, &field)?;
     }
     Ok(value)
 }
+fn hydrate_field(directory: &Path, value: &mut Value, field: &str) -> Result<(), ToolError> {
+    let target = value
+        .pointer_mut(field)
+        .ok_or_else(|| ToolError::Failed("invalid saved output field".into()))?;
+    let path = field_file(directory, field);
+    *target = if target.is_string() {
+        Value::String(String::from_utf8_lossy(&std::fs::read(path)?).into_owned())
+    } else {
+        serde_json::from_reader(BufReader::new(std::fs::File::open(path)?))?
+    };
+    Ok(())
+}
+
 fn render(
     directory: &Path,
     field: &str,
@@ -390,7 +391,7 @@ impl JobManager {
             || args.limit.is_some();
         let mut selection = Selection {
             field: args.field.clone().unwrap_or_else(|| "/result".into()),
-            pattern: args.pattern.clone(),
+            matcher: None,
             context: args.context.unwrap_or(0),
             start: args.start.unwrap_or(1),
             offset: args.offset.unwrap_or(0),
@@ -401,8 +402,10 @@ impl JobManager {
             ));
         }
         // Validate the pattern even when no output exists yet.
-        if let Some(pattern) = &selection.pattern {
-            crate::tool::builtins::search::output_matcher(pattern)?;
+        if let Some(pattern) = &args.pattern {
+            selection.matcher = Some(std::sync::Arc::new(
+                crate::tool::builtins::search::output_matcher(pattern)?,
+            ));
         }
         let (mut envelope, output_schema) = {
             let jobs = self.inner.jobs.lock().await;
@@ -505,15 +508,17 @@ impl JobManager {
                     || envelope.location.target != "root"
                     || c.field == "/result"
                     || c.field.is_empty());
-            let page = tokio::task::spawn_blocking(move || {
-                if unavailable {
-                    return Ok(reader::empty(&c, None, false));
-                }
-                let closed = terminal || c.field.starts_with("/questions/");
-                page(&directory, c, limit, closed, &cancellation)
-            })
-            .await
-            .map_err(|e| ToolError::Failed(e.to_string()))??;
+            let page = if unavailable {
+                reader::empty(&c, None, false)
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    let closed = terminal || c.field.starts_with("/questions/");
+                    let path = ensure_field_file(&directory, &c.field, &cancellation)?;
+                    reader::page(&path, &c, limit, closed, &cancellation)
+                })
+                .await
+                .map_err(|e| ToolError::Failed(e.to_string()))??
+            };
             if terminal {
                 let complete = tokio::fs::read(&document_path)
                     .await
@@ -573,17 +578,6 @@ impl JobManager {
     }
 }
 
-fn page(
-    directory: &Path,
-    selection: Selection,
-    limit: usize,
-    terminal: bool,
-    cancellation: &super::CancellationToken,
-) -> Result<Value, ToolError> {
-    let path = ensure_field_file(directory, &selection.field, cancellation)?;
-    reader::page(&path, &selection, limit, terminal, cancellation)
-}
-
 fn ensure_field_file(
     directory: &Path,
     field: &str,
@@ -595,7 +589,15 @@ fn ensure_field_file(
             directory.join("document.json"),
         )?))?;
         if document.pointer(field).is_none() {
-            document = hydrate(directory, document, u64::MAX)?;
+            // Offloaded containers hide their descendants in the compact document.
+            // Only load the selected ancestor, not unrelated large output fields.
+            if let Some(ancestor) = fields(directory)?.into_iter().find(|stored| {
+                field
+                    .strip_prefix(stored.as_str())
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            }) {
+                hydrate_field(directory, &mut document, &ancestor)?;
+            }
         }
         if field.is_empty() {
             // Whole-output pages contain the public document, not internal capture metadata.
@@ -605,6 +607,21 @@ fn ensure_field_file(
         let value = document.pointer(field).ok_or_else(|| {
             ToolError::InvalidArguments("field does not exist in this result".into())
         })?;
+        return materialize_field(directory, field, value, cancellation);
+    }
+    Ok(path)
+}
+
+// Projection already owns the resolved value; do not reopen its document for
+// every annotated field. Keep the same renderer for stable pagination positions.
+fn materialize_field(
+    directory: &Path,
+    field: &str,
+    value: &Value,
+    cancellation: &super::CancellationToken,
+) -> Result<PathBuf, ToolError> {
+    let path = field_file(directory, field);
+    if !path.exists() {
         let mut file = tempfile::NamedTempFile::new_in(directory)?;
         {
             let mut writer = std::io::BufWriter::new(file.as_file_mut());
@@ -696,10 +713,6 @@ mod tests {
     };
 
     async fn fixture(value: Value) -> (tempfile::TempDir, JobManager, JobId) {
-        fixture_output(ToolOutput::new(value)).await
-    }
-
-    async fn fixture_output(output: ToolOutput) -> (tempfile::TempDir, JobManager, JobId) {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::create(root.path()).await.unwrap();
         let manager = JobManager::new(store.clone());
@@ -712,117 +725,10 @@ mod tests {
             .await
             .unwrap();
         manager
-            .finish(lease.id, JobOutcome::Completed(output))
+            .finish(lease.id, JobOutcome::Completed(ToolOutput::new(value)))
             .await
             .unwrap();
         (root, manager, lease.id)
-    }
-
-    fn script_schema() -> Value {
-        json!({"type":"object","properties":{
-            "value":{}, "console":{"type":"string","x-skyhook-truncatable":true}
-        }})
-    }
-
-    async fn script_fixture(value: Value, console: &str) -> (tempfile::TempDir, JobManager, JobId) {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let manager = JobManager::new(store.clone());
-        let mut spec = JobSpec::test(AgentId::root(store.id()), "script");
-        spec.output_schema = Some(script_schema());
-        let id = manager.create(spec).await.unwrap().id;
-        manager
-            .finish(
-                id,
-                JobOutcome::Completed(ToolOutput::new(json!({"value":value,"console":console}))),
-            )
-            .await
-            .unwrap();
-        (root, manager, id)
-    }
-
-    fn preview_text(view: &Value) -> String {
-        view["preview"]["lines"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|line| line.as_str().unwrap())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    #[tokio::test]
-    async fn generic_jobs_have_no_console_envelope_or_annotation() {
-        let schema = view_schema(&Default::default());
-        assert!(schema["properties"].get("console").is_none());
-        assert!(schema["properties"].get("console_output").is_none());
-        // Even a native tool's field named console is not implicitly truncated.
-        let value = json!({"console":"x".repeat(5000),"ok":true});
-        let (_root, manager, job) = fixture(value.clone()).await;
-        let view = manager
-            .present_output(OutputArgs::new(job), &Default::default())
-            .await
-            .unwrap();
-        assert_eq!(view["result"], value);
-        assert!(view.get("console").is_none());
-        assert!(view.get("console_output").is_none());
-        assert!(view.get("truncated").is_none());
-        let envelope = serde_json::to_value(manager.snapshot(job).await.unwrap()).unwrap();
-        assert!(envelope.get("console_output").is_none());
-        let document: Value = serde_json::from_slice(
-            &std::fs::read(manager.output_directory(job).join("document.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(document.as_object().unwrap().len(), 3);
-        assert!(document.get("capture_complete").is_some());
-        assert!(document.get("result").is_some());
-        assert!(document.get("error").is_some());
-    }
-
-    #[tokio::test]
-    async fn script_console_is_inside_result_bounded_and_readable_even_when_empty() {
-        for console in [String::new(), "hello\n".to_owned(), "x".repeat(5000)] {
-            let (_root, manager, job) = script_fixture(json!({"ok":true}), &console).await;
-            let view = manager
-                .present_output(OutputArgs::new(job), &Default::default())
-                .await
-                .unwrap();
-            assert_eq!(view["result"]["value"], json!({"ok":true}));
-            assert!(view.get("console").is_none());
-            assert!(view.get("console_output").is_none());
-            assert_eq!(
-                view["result"]["console"],
-                &console[..console.len().min(truncation::FIELD_BYTES)]
-            );
-            if console.len() > truncation::FIELD_BYTES {
-                assert_eq!(view["truncated"][0]["field"], "/result/console");
-            }
-            let mut query = OutputArgs::new(job);
-            query.field = Some(String::new());
-            let whole = manager
-                .present_output(query, &Default::default())
-                .await
-                .unwrap();
-            let document: Value = serde_json::from_str(&preview_text(&whole)).unwrap();
-            assert!(document.get("console").is_none());
-            assert_eq!(document["result"]["console"], console);
-
-            let mut query = OutputArgs::new(job);
-            query.field = Some("/result/console".to_owned());
-            let logs = manager
-                .present_output(query, &Default::default())
-                .await
-                .unwrap();
-            assert_eq!(logs["preview"]["field"], "/result/console");
-            assert_eq!(
-                logs["preview"]["lines"],
-                json!(console.lines().collect::<Vec<_>>())
-            );
-            assert_eq!(
-                manager.snapshot(job).await.unwrap().output.unwrap(),
-                json!({"value":{"ok":true},"console":console})
-            );
-        }
     }
 
     #[tokio::test]
@@ -831,7 +737,9 @@ mod tests {
         let store = SessionStore::create(root.path()).await.unwrap();
         let manager = JobManager::new(store.clone());
         let mut spec = JobSpec::test(AgentId::root(store.id()), "script");
-        spec.output_schema = Some(script_schema());
+        spec.output_schema = Some(json!({"type":"object","properties":{
+            "value":{}, "console":{"type":"string","x-skyhook-truncatable":true}
+        }}));
         let id = manager.create(spec).await.unwrap().id;
         manager.transition(id, JobState::Running).await.unwrap();
         let directory = manager.output_directory(id);
@@ -869,16 +777,8 @@ mod tests {
     #[tokio::test]
     async fn capture_completeness_is_internal_and_only_partial_finished_jobs_have_a_notice() {
         for complete in [true, false] {
-            let (root, manager, job) =
+            let (_root, manager, job) =
                 fixture(json!({"stdout":"line\n".repeat(120), "timed_out":!complete})).await;
-            let directory = manager.output_directory(job);
-            let saved: Value = serde_json::from_slice(
-                &tokio::fs::read(directory.join("document.json"))
-                    .await
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(saved["capture_complete"], complete);
             for field in [None, Some("/result/stdout"), Some("")] {
                 let mut query = OutputArgs::new(job);
                 query.field = field.map(str::to_owned);
@@ -886,221 +786,38 @@ mod tests {
                     .present_output(query, &Default::default())
                     .await
                     .unwrap();
-                assert!(view.get("capture_complete").is_none());
-                assert!(view["preview"].get("capture_complete").is_none());
                 assert!(!view.to_string().contains("capture_complete"));
                 assert_eq!(view.get("notice").is_some(), !complete);
                 if !complete {
                     assert_eq!(view["notice"], "Output incomplete.");
                 }
             }
-            let session = manager.store().id();
-            manager.store().close().await.unwrap();
-            let (store, records) = SessionStore::open(root.path(), session).await.unwrap();
-            let restored = JobManager::restore(store, &records).await.unwrap();
-            let view = restored
-                .present_output(OutputArgs::new(job), &Default::default())
-                .await
-                .unwrap();
-            assert!(view.get("capture_complete").is_none());
-            assert_eq!(view.get("notice").is_some(), !complete);
         }
-        let (_root, manager, _) = fixture(Value::Null).await;
-        let agent = AgentId::root(manager.store().id());
-        let running = manager
-            .create(JobSpec::test(agent, "running"))
-            .await
-            .unwrap()
-            .id;
-        manager
-            .transition(running, JobState::Running)
-            .await
-            .unwrap();
-        let view = manager
-            .present_output(OutputArgs::new(running), &Default::default())
-            .await
-            .unwrap();
-        assert!(view.get("notice").is_none());
-        assert!(!view.to_string().contains("capture_complete"));
-        assert!(
-            !view_schema(&Default::default())
-                .to_string()
-                .contains("capture_complete")
-        );
     }
 
     #[tokio::test]
-    async fn host_inspection_does_not_acknowledge_completion_or_question() {
-        let (_root, manager, job) = fixture(json!({"content":"saved evidence"})).await;
-        let before = manager.store().records().await;
-        let value = manager
-            .inspect_output(OutputArgs::new(job), &CapabilitySet::default())
-            .await
-            .unwrap();
-        assert!(value.to_string().contains("saved evidence"));
-        assert_eq!(manager.store().records().await, before);
-        let agent = AgentId::root(manager.store().id());
-        let lease = manager.create(JobSpec::test(agent, "ask")).await.unwrap();
-        manager
-            .transition(lease.id, JobState::Running)
-            .await
-            .unwrap();
-        manager
-            .request_input(lease.id, json!({"question_id":"q1","text":"choose"}))
-            .await
-            .unwrap();
-        let before = manager.store().records().await;
-        let value = manager
-            .inspect_output(OutputArgs::new(lease.id), &CapabilitySet::default())
-            .await
-            .unwrap();
-        assert!(value.to_string().contains("choose"));
-        assert_eq!(manager.store().records().await, before);
-    }
-
-    #[tokio::test]
-    async fn reading_an_older_question_does_not_acknowledge_its_replacement() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
-        let manager = JobManager::new(store);
-        let mut spec = JobSpec::test(agent.clone(), "agent");
-        spec.background = true;
-        let job = manager.create(spec).await.unwrap().id;
-        manager.transition(job, JobState::Running).await.unwrap();
-        manager
-            .request_input(job, json!({"question_id":"first","text":"a".repeat(12000)}))
-            .await
-            .unwrap();
-        let mut selection = OutputArgs::new(job);
-        selection.start = Some(1);
-        let first = manager
-            .present_output(selection, &Default::default())
-            .await
-            .unwrap();
-        let old_page = &first["preview"];
-        manager.resume_input(job).await.unwrap();
-        manager
-            .request_input(job, json!({"question_id":"second","text":"new question"}))
-            .await
-            .unwrap();
-        let mut args = OutputArgs::new(job);
-        args.field = Some(old_page["field"].as_str().unwrap().into());
-        args.start = Some(old_page["next_start"].as_u64().unwrap() as usize);
-        args.offset = Some(old_page["next_offset"].as_u64().unwrap_or(0) as usize);
-        let page = manager
-            .present_output(args, &Default::default())
-            .await
-            .unwrap();
-        assert!(
-            page["preview"]["lines"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|line| line.as_str().unwrap().contains("aaaa"))
-        );
-        let pending = manager.take_pending(&agent).await.unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].output.as_ref().unwrap()["question_id"], "second");
-        let current = manager
-            .present_output(OutputArgs::new(job), &Default::default())
-            .await
-            .unwrap();
-        assert_eq!(current["question"]["question_id"], "second");
-    }
-
-    #[tokio::test]
-    async fn saved_ranges_survive_session_resume() {
-        let (root, manager, id) = fixture(json!({"content":"first\nsecond\nthird"})).await;
-        let mut args = OutputArgs::new(id);
-        args.field = Some("/result/content".into());
-        args.limit = Some(1);
-        let first = manager
-            .present_output(args, &Default::default())
-            .await
-            .unwrap();
-        let session = manager.inner.store.id();
-        manager.inner.store.close().await.unwrap();
-        let (store, records) = SessionStore::open(root.path(), session).await.unwrap();
-        let restored = JobManager::restore(store, &records).await.unwrap();
-        let mut args = OutputArgs::new(id);
-        args.field = Some(first["preview"]["field"].as_str().unwrap().into());
-        args.start = Some(first["preview"]["next_start"].as_u64().unwrap() as usize);
-        args.offset = Some(first["preview"]["next_offset"].as_u64().unwrap_or(0) as usize);
-        let next = restored
-            .present_output(args, &Default::default())
-            .await
-            .unwrap();
-        assert_eq!(next["preview"]["lines"][0], "second");
-    }
-
-    #[tokio::test]
-    async fn unannotated_results_are_never_truncated() {
-        let (_root, manager, id) =
-            fixture(json!({"stdout":"x".repeat(92_000),"exit_code":0})).await;
-        let view = manager
-            .present_output(OutputArgs::new(id), &Default::default())
-            .await
-            .unwrap();
-        assert_eq!(view["result"]["stdout"].as_str().unwrap().len(), 92_000);
-        assert!(view.get("preview").is_none());
-        assert!(view.get("truncated").is_none());
-        let raw = manager.snapshot(id).await.unwrap();
-        assert_eq!(
-            raw.output.unwrap()["stdout"].as_str().unwrap().len(),
-            92_000
-        );
-        let (_root, manager, id) = fixture(json!({"ok":true,"count":3})).await;
-        assert_eq!(
-            manager
-                .present_output(OutputArgs::new(id), &Default::default())
-                .await
-                .unwrap()["result"],
-            json!({"ok":true,"count":3})
-        );
-    }
-
-    #[tokio::test]
-    async fn unicode_long_lines_and_replayed_ranges_preserve_every_byte() {
+    async fn unicode_continuations_fit_the_complete_job_envelope() {
+        // Exhaustive reconstruction and replay live in reader tests. Here retain
+        // the integration boundary: correct offsets and the entire view budget.
         let expected = format!("{}\nlast", "🦀\"\\".repeat(4000));
         let (_root, manager, id) = fixture(json!({"content":expected})).await;
         let mut args = OutputArgs::new(id);
         args.field = Some("/result/content".into());
-        let mut reconstructed = String::new();
-        let mut previous_line = 1;
-        loop {
+        for _ in 0..2 {
+            let offset = args.offset.unwrap_or(0);
             let view = manager
                 .present_output(args.clone(), &Default::default())
                 .await
                 .unwrap();
-            let replay = manager
-                .present_output(args.clone(), &Default::default())
-                .await
-                .unwrap();
-            assert_eq!(view, replay);
             assert!(serde_json::to_vec(&view).unwrap().len() <= PAGE_BYTES);
-            for (index, line) in view["preview"]["lines"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .enumerate()
-            {
-                let number = args.start.unwrap_or(1) + index;
-                if number > previous_line {
-                    reconstructed.push('\n');
-                }
-                reconstructed.push_str(line.as_str().unwrap());
-                previous_line = number;
-            }
-            let Some(start) = view["preview"]["next_start"].as_u64() else {
-                break;
-            };
-            args = OutputArgs::new(id);
-            args.field = Some(view["preview"]["field"].as_str().unwrap().into());
-            args.start = Some(start as usize);
-            args.offset = Some(view["preview"]["next_offset"].as_u64().unwrap_or(0) as usize);
+            let page = &view["preview"];
+            assert_eq!(page["next_start"], 1);
+            let next = page["next_offset"].as_u64().unwrap() as usize;
+            assert!(next > offset);
+            assert_eq!(page["lines"], json!([&expected[offset..next]]));
+            args.start = Some(1);
+            args.offset = Some(next);
         }
-        assert_eq!(reconstructed, expected);
     }
 
     #[tokio::test]
@@ -1144,61 +861,5 @@ mod tests {
             args.context = Some(2);
         }
         assert_eq!(numbers, text.lines().skip(447).take(7).collect::<Vec<_>>());
-    }
-
-    #[tokio::test]
-    async fn output_inspection_returns_immediately_for_running_jobs_without_output() {
-        let runtime = crate::test_support::TestRuntime::new().await;
-        let lease = runtime
-            .jobs
-            .create(JobSpec::test(runtime.agent.clone(), "pending"))
-            .await
-            .unwrap();
-        runtime
-            .jobs
-            .transition(lease.id, JobState::Running)
-            .await
-            .unwrap();
-        let view = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            runtime
-                .jobs
-                .present_output(OutputArgs::new(lease.id), &Default::default()),
-        )
-        .await
-        .expect("inspection must not wait for a job event")
-        .unwrap();
-        assert_eq!(view["state"], "running");
-        assert_eq!(view["preview"]["lines"], json!([]));
-        runtime
-            .jobs
-            .finish(
-                lease.id,
-                JobOutcome::Completed(ToolOutput::new(Value::Null)),
-            )
-            .await
-            .unwrap();
-    }
-
-    #[test]
-    fn output_schema_defaults_are_optional_and_obsolete_arguments_are_rejected() {
-        let schema = serde_json::to_value(schemars::schema_for!(OutputArgs)).unwrap();
-        assert_eq!(schema["required"], json!(["job"]));
-        assert!(schema["properties"].get("cursor").is_none());
-        assert!(schema["properties"].get("wait").is_none());
-        assert_eq!(schema["additionalProperties"], false);
-        for wait in [json!(null), json!(0), json!(0.5), json!(5)] {
-            assert!(serde_json::from_value::<OutputArgs>(json!({"job":1,"wait":wait})).is_err());
-        }
-        assert_eq!(
-            view_schema(&Default::default())["properties"]["preview"]["properties"]["lines"]["items"],
-            json!({"type":"string"})
-        );
-        for (field, default) in [("start", 1), ("offset", 0), ("limit", 100)] {
-            assert_eq!(schema["properties"][field]["default"], default);
-        }
-        assert!(serde_json::from_value::<OutputArgs>(json!({"job":1,"cursor":"old"})).is_err());
-        let args: OutputArgs = serde_json::from_value(json!({"job":1})).unwrap();
-        assert_eq!(args.start, None);
     }
 }

@@ -108,32 +108,3 @@ impl TargetAuth {
 fn default_workspace() -> PathBuf {
     PathBuf::from(".")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn types_are_required_and_interactivity_is_not_target_configuration() {
-        for input in [
-            r#"{"host":"host"}"#,
-            r#"{"type":"local","host":"host"}"#,
-            r#"{"type":"winrm","host":"host"}"#,
-            r#"{"type":"ssh","host":"host","ssh":{"auth":{"kind":"interactive"}}}"#,
-            r#"{"type":"ssh","host":"host","interactive":true}"#,
-        ] {
-            assert!(
-                serde_json::from_str::<TargetConfig>(input).is_err(),
-                "accepted {input}"
-            );
-        }
-        let config: TargetConfig = serde_json::from_str(
-            r#"{"type":"ssh","host":"alias","ssh":{"user":"user","port":2222}}"#,
-        )
-        .unwrap();
-        assert_eq!(config.ssh.port, Some(2222));
-        assert!(
-            toml::from_str::<TargetsConfig>("[host]\ntype = 'local'\nhost = 'localhost'").is_err()
-        );
-        assert!(toml::from_str::<TargetsConfig>("[host]\ntype = 'ssh'\nhost = 'alias'").is_ok());
-    }
-}

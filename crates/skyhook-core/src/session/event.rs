@@ -199,7 +199,7 @@ pub(super) fn validate_records(records: &[EventRecord], id: SessionId) -> Result
                 super::request::validate_compaction(&records[..index], record)?;
             }
             SessionEvent::ModelRequested { .. } => {
-                super::reconstruct_model_request(records, record.sequence)?;
+                super::request::validate_request(&records[..index], record)?;
             }
             SessionEvent::JobCreated { job, .. } if !jobs.insert(*job) => {
                 return Err(SessionError::DuplicateJob(*job));

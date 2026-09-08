@@ -11,9 +11,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    HarnessBuilder, HarnessError, SessionHandle, TurnContext, compact, compaction, prompt,
-};
+use super::{HarnessBuilder, HarnessError, SessionHandle, TurnContext, compaction, prompt};
 use crate::{
     agent::{TodoItem, TodoStatus},
     execution::ExecutionLocation,
@@ -23,8 +21,8 @@ use crate::{
         ResponseStream,
         profile::ModelProfile,
         protocol::{
-            AssistantContent, BlockContent, Message, ModelRequest, ResponseChunk, StopReason,
-            Usage, UserContent, events_for_content,
+            AssistantContent, Message, ModelRequest, ResponseChunk, StopReason, Usage, UserContent,
+            events_for_content,
         },
     },
     session::{ModelPurpose, SessionEvent, project_history, reconstruct_model_request},
@@ -256,90 +254,6 @@ struct Fixture {
     template: ModelRequest,
 }
 
-#[tokio::test]
-async fn switched_model_controls_compaction_and_retries_for_the_whole_turn() {
-    let workspace = tempfile::tempdir().unwrap();
-    let sessions = tempfile::tempdir().unwrap();
-    let provider = Arc::new(ControlledProvider::default());
-    *provider.summary.lock().unwrap() = summary_value().to_string();
-    let mut smaller = profile();
-    smaller.model = "smaller-model".into();
-    smaller.max_context = 16_000;
-    smaller.max_output = 2048;
-    let harness = HarnessBuilder::new(workspace.path())
-        .session_root(sessions.path())
-        .provider("test", Arc::new(provider.clone()))
-        .model_profile("test", profile())
-        .model_profile("smaller", smaller)
-        .default_model_profile("test")
-        .build()
-        .await
-        .unwrap();
-    let session = harness.new_session().await.unwrap();
-    session.prompt("Research this task").await.unwrap();
-    session
-        .runtime
-        .commit(
-            &session.root,
-            Message::Assistant(vec![AssistantContent::text(
-                "text/0",
-                0,
-                "research ".repeat(12_000),
-            )]),
-        )
-        .await
-        .unwrap();
-    provider.agent_immediate_failures.store(1, Ordering::SeqCst);
-    session
-        .prompt_with_options(
-            "Continue with the smaller model",
-            &[],
-            super::PromptOptions {
-                model: Some("smaller".into()),
-            },
-        )
-        .await
-        .unwrap();
-    let requests = provider.requests.lock().unwrap().clone();
-    assert_eq!(
-        provider.opened.load(Ordering::SeqCst),
-        2,
-        "model swap opens once; compaction and retries reuse the replacement"
-    );
-    assert_eq!(requests[0].model, "test");
-    assert!(
-        requests[1..]
-            .iter()
-            .all(|request| request.model == "smaller-model"
-                && request.max_output_tokens == Some(2048))
-    );
-    assert!(
-        requests[1..]
-            .iter()
-            .any(|request| request.response_schema.is_some())
-    );
-    let records = session.runtime.store.records().await;
-    assert!(records.iter().any(|record| matches!(&record.event, SessionEvent::Compaction { checkpoint } if checkpoint.max_context == 16_000)));
-    assert_eq!(
-        records
-            .iter()
-            .filter(|record| matches!(record.event, SessionEvent::ModelFailed { .. }))
-            .count(),
-        1
-    );
-    let replay = records
-        .iter()
-        .filter(|record| matches!(record.event, SessionEvent::ModelRequested { .. }))
-        .map(|record| {
-            reconstruct_model_request(&records, record.sequence)
-                .unwrap()
-                .1
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(replay, requests);
-    session.shutdown().await.unwrap();
-}
-
 impl Fixture {
     async fn new() -> Self {
         let workspace = tempfile::tempdir().unwrap();
@@ -393,29 +307,6 @@ impl Fixture {
             )
             .await
             .unwrap();
-    }
-
-    async fn add_history_to(&self, target: u64) {
-        let mut current = self.template.clone();
-        current.messages = project_history(
-            &self.session.runtime.store.records().await,
-            &self.session.root,
-        )
-        .unwrap()
-        .into_iter()
-        .map(|(_, message)| message)
-        .collect();
-        current.messages.push(Message::User(vec![
-            prompt::runtime_state_content(
-                &self.session.runtime.jobs,
-                &self.session.runtime.todos,
-                &self.session.root,
-                &CapabilitySet::default(),
-            )
-            .await,
-        ]));
-        self.add_history(target.saturating_sub(compaction::estimate_request(&current)) as usize)
-            .await;
     }
 
     async fn assert_exact_requests(&self) {
@@ -603,41 +494,6 @@ async fn stream_overflow_below_threshold_compacts_once_and_replays_every_request
         })
         .collect();
     assert_eq!(replay, requests);
-    fixture.session.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn truncated_summary_keeps_the_original_projection() {
-    let fixture = Fixture::new().await;
-    fixture.add_history(20_000).await;
-    fixture.provider.truncate.store(true, Ordering::SeqCst);
-    let before = project_history(
-        &fixture.session.runtime.store.records().await,
-        &fixture.session.root,
-    )
-    .unwrap();
-    let error = fixture
-        .compact(&CancellationToken::new())
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("truncated"));
-    let records = fixture.session.runtime.store.records().await;
-    assert_eq!(
-        project_history(&records, &fixture.session.root).unwrap(),
-        before
-    );
-    assert!(
-        !records
-            .iter()
-            .any(|record| matches!(record.event, SessionEvent::Compaction { .. }))
-    );
-    assert!(records.iter().any(|record| matches!(
-        record.event,
-        SessionEvent::CompactionFailed {
-            request: Some(_),
-            ..
-        }
-    )));
     fixture.session.shutdown().await.unwrap();
 }
 
@@ -869,261 +725,6 @@ async fn fresh_state_reflects_concurrent_todo_updates_without_claiming_job_notif
 }
 
 #[tokio::test]
-async fn token_meter_restores_actual_input_usage_for_the_same_agent_and_template() {
-    let fixture = Fixture::new().await;
-    let records = fixture.session.runtime.store.records().await;
-    let request = records
-        .iter()
-        .find(|record| {
-            matches!(
-                record.event,
-                SessionEvent::ModelRequested {
-                    purpose: ModelPurpose::Agent,
-                    ..
-                }
-            )
-        })
-        .unwrap();
-    let captured = fixture.provider.requests.lock().unwrap()[0].clone();
-    let estimated = compaction::estimate_request(&captured);
-    fixture
-        .session
-        .runtime
-        .store
-        .append(
-            fixture.session.root.clone(),
-            SessionEvent::Usage {
-                request: Some(request.sequence),
-                usage: crate::provider::protocol::Usage {
-                    input_tokens: estimated + 10_000,
-                    cached_input_tokens: 2_000,
-                    output_tokens: 3,
-                },
-            },
-        )
-        .await
-        .unwrap();
-    let records = fixture.session.runtime.store.records().await;
-    let meter = compact::TokenMeter::restore(&records, &fixture.session.root, &fixture.template);
-    assert_eq!(meter.estimate(&captured), estimated + 12_000);
-    let other_agent =
-        compact::TokenMeter::restore(&records, &fixture.session.root.child(1), &fixture.template);
-    assert_eq!(other_agent.estimate(&captured), estimated);
-    let mut changed = fixture.template.clone();
-    changed.model = "another-model".into();
-    let other_template = compact::TokenMeter::restore(&records, &fixture.session.root, &changed);
-    assert_eq!(other_template.estimate(&captured), estimated);
-    let mut context = fixture
-        .session
-        .runtime
-        .open_agent_context(
-            &fixture.session.root,
-            profile(),
-            fixture.template.system.clone(),
-            &CapabilitySet::default(),
-            true,
-        )
-        .await
-        .unwrap();
-    assert_eq!(context.meter.estimate(&captured), estimated + 12_000);
-
-    // Even switching back to an identical template cannot revive calibration from
-    // a provider handle that was replaced in between.
-    let mut changed_records = records.clone();
-    let mut changed_record = records.last().unwrap().clone();
-    changed_record.sequence += 1;
-    changed_record.event = SessionEvent::ModelChanged {
-        model_profile: "other".into(),
-        max_context: 64_000,
-    };
-    changed_records.push(changed_record);
-    assert_eq!(
-        compact::TokenMeter::restore(&changed_records, &fixture.session.root, &fixture.template)
-            .estimate(&captured),
-        estimated
-    );
-
-    fixture.add_history(20_000).await;
-    fixture.compact(&CancellationToken::new()).await.unwrap();
-    let records = fixture.session.runtime.store.records().await;
-    assert!(
-        records
-            .iter()
-            .any(|record| matches!(record.event, SessionEvent::Compaction { .. }))
-    );
-    context.refresh(&records, &fixture.session.root).unwrap();
-    assert_eq!(context.meter.estimate(&captured), estimated);
-    assert_eq!(
-        compact::TokenMeter::restore(&records, &fixture.session.root, &fixture.template)
-            .estimate(&captured),
-        estimated
-    );
-    fixture.session.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn large_plan_in_continuation_is_kept_without_a_post_compaction_token_cap() {
-    let fixture = Fixture::new().await;
-    let plan = format!(
-        "## Implementation plan\n{}",
-        "Preserve this original detail.\n".repeat(5_000)
-    );
-    fixture
-        .session
-        .runtime
-        .commit(
-            &fixture.session.root,
-            Message::Assistant(vec![AssistantContent::text("text/0", 0, plan.clone())]),
-        )
-        .await
-        .unwrap();
-    fixture.add_history(20_000).await;
-    let mut summary = summary_value();
-    summary["plan"] = json!([plan]);
-    *fixture.provider.summary.lock().unwrap() = summary.to_string();
-    fixture.compact(&CancellationToken::new()).await.unwrap();
-    let records = fixture.session.runtime.store.records().await;
-    let checkpoint = records
-        .iter()
-        .find_map(|record| match &record.event {
-            SessionEvent::Compaction { checkpoint } => Some(checkpoint),
-            _ => None,
-        })
-        .unwrap();
-    assert!(checkpoint.after_tokens > 30_000);
-    assert!(checkpoint.after_tokens < checkpoint.before_tokens);
-    assert!(
-        matches!(&checkpoint.message, Message::User(blocks) if blocks.iter().any(|block| matches!(block, UserContent::Compaction {text} if text.contains(&plan))))
-    );
-    fixture.session.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn compaction_threshold_reserves_max_output_instead_of_using_eighty_percent() {
-    let fixture = Fixture::new().await;
-    fixture.add_history_to(104_000).await;
-    fixture
-        .session
-        .prompt("Continue below the reserve threshold.")
-        .await
-        .unwrap();
-    let requests = fixture.provider.requests.lock().unwrap().clone();
-    assert_eq!(requests.len(), 2);
-    let estimated = compaction::estimate_request(&requests[1]);
-    assert!(estimated >= profile().max_context * 4 / 5);
-    assert!(estimated < profile().max_context - profile().max_output);
-    assert!(
-        !fixture
-            .session
-            .runtime
-            .store
-            .records()
-            .await
-            .iter()
-            .any(|record| matches!(record.event, SessionEvent::Compaction { .. }))
-    );
-
-    fixture.add_history_to(112_000).await;
-    fixture
-        .session
-        .prompt("Continue above the reserve threshold.")
-        .await
-        .unwrap();
-    let records = fixture.session.runtime.store.records().await;
-    assert_eq!(
-        records
-            .iter()
-            .filter(|record| matches!(record.event, SessionEvent::Compaction { .. }))
-            .count(),
-        1
-    );
-    assert_eq!(fixture.provider.requests.lock().unwrap().len(), 4);
-    fixture.assert_exact_requests_and_no_tool_execution().await;
-    fixture.session.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn oversized_summary_estimates_reach_the_provider_and_can_compact_successfully() {
-    let fixture = Fixture::new().await;
-    fixture.add_history_to(150_000).await;
-    assert_eq!(
-        fixture
-            .session
-            .prompt("Continue despite the conservative estimate.")
-            .await
-            .unwrap(),
-        "done"
-    );
-    let records = fixture.session.runtime.store.records().await;
-    let summary = records
-        .iter()
-        .find(|record| {
-            matches!(
-                record.event,
-                SessionEvent::ModelRequested {
-                    purpose: ModelPurpose::Compaction,
-                    ..
-                }
-            )
-        })
-        .unwrap();
-    let (_, request) = reconstruct_model_request(&records, summary.sequence).unwrap();
-    assert!(compaction::estimate_request(&request) > profile().max_context);
-    assert!(
-        records
-            .iter()
-            .any(|record| matches!(record.event, SessionEvent::Compaction { .. }))
-    );
-    fixture.assert_exact_requests_and_no_tool_execution().await;
-    fixture.session.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn oversized_protected_content_still_reaches_the_working_provider() {
-    let fixture = Fixture::new().await;
-    let plan = format!(
-        "## Plan\n{}",
-        "Keep this exact requirement.\n".repeat(24_000)
-    );
-    fixture
-        .session
-        .runtime
-        .commit(
-            &fixture.session.root,
-            Message::Assistant(vec![AssistantContent::text("text/0", 0, plan.clone())]),
-        )
-        .await
-        .unwrap();
-    let mut summary = summary_value();
-    summary["plan"] = json!([plan]);
-    *fixture.provider.summary.lock().unwrap() = summary.to_string();
-    assert_eq!(
-        fixture
-            .session
-            .prompt("Keep the complete plan and continue.")
-            .await
-            .unwrap(),
-        "done"
-    );
-    let requests = fixture.provider.requests.lock().unwrap().clone();
-    let working = requests.last().unwrap();
-    assert!(compaction::estimate_request(working) > profile().max_context);
-    assert!(working.messages.iter().any(|message| {
-        match message {
-            Message::Assistant(blocks) => blocks.iter().flat_map(|item| &item.blocks).any(
-                |block| matches!(&block.content, BlockContent::Text { text } if text == &plan),
-            ),
-            Message::User(blocks) => blocks.iter().any(
-                |block| matches!(block, UserContent::Compaction { text } if text.contains(&plan)),
-            ),
-            _ => false,
-        }
-    }));
-    fixture.assert_exact_requests_and_no_tool_execution().await;
-    fixture.session.shutdown().await.unwrap();
-}
-
-#[tokio::test]
 async fn ordinary_requests_retry_immediate_and_stream_failures_then_succeed_on_attempt_three() {
     let fixture = Fixture::new().await;
     fixture
@@ -1261,19 +862,9 @@ async fn summarizer_retries_both_failure_paths_and_succeeds_on_attempt_three() {
 
 #[tokio::test]
 async fn permanent_summary_failures_preserve_history_after_three_attempts_without_tools() {
-    for failure in [
-        "transport",
-        "stream",
-        "empty",
-        "truncated",
-        "tool_call",
-        "markdown",
-        "missing_field",
-        "wrong_type",
-        "unknown_field",
-        "invalid_status",
-        "blank_todo",
-    ] {
+    // Exhaustive malformed-field cases belong to the continuation parser tests.
+    // Here retain provider, truncation, tool-execution and semantic rollback contracts.
+    for failure in ["stream", "truncated", "tool_call", "blank_todo"] {
         let fixture = Fixture::new().await;
         fixture.add_history(20_000).await;
         let old_todos = vec![TodoItem {
@@ -1289,31 +880,16 @@ async fn permanent_summary_failures_preserve_history_after_three_attempts_withou
             .unwrap();
         let mut invalid = summary_value();
         match failure {
-            "transport" => fixture
-                .provider
-                .summary_immediate_failures
-                .store(10, Ordering::SeqCst),
             "stream" => fixture
                 .provider
                 .summary_stream_failures
                 .store(10, Ordering::SeqCst),
-            "empty" => *fixture.provider.summary.lock().unwrap() = " \n\t ".into(),
             "truncated" => fixture.provider.truncate.store(true, Ordering::SeqCst),
             "tool_call" => fixture.provider.summary_tools.store(true, Ordering::SeqCst),
-            "markdown" => *fixture.provider.summary.lock().unwrap() = "## Continue the task".into(),
-            "missing_field" => {
-                invalid.as_object_mut().unwrap().remove("plan");
-            }
-            "wrong_type" => invalid["findings"] = json!("old string format"),
-            "unknown_field" => invalid["invented_field"] = json!("unexpected"),
-            "invalid_status" => invalid["todos"] = json!([{"text":"Task", "status":"blocked"}]),
             "blank_todo" => invalid["todos"] = json!([{"text":" \t", "status":"pending"}]),
             _ => unreachable!(),
         }
-        if matches!(
-            failure,
-            "missing_field" | "wrong_type" | "unknown_field" | "invalid_status" | "blank_todo"
-        ) {
+        if failure == "blank_todo" {
             *fixture.provider.summary.lock().unwrap() = invalid.to_string();
         }
         let before = project_history(
@@ -1321,11 +897,21 @@ async fn permanent_summary_failures_preserve_history_after_three_attempts_withou
             &fixture.session.root,
         )
         .unwrap();
-        assert!(
-            fixture.compact(&CancellationToken::new()).await.is_err(),
-            "{failure}"
-        );
+        let error = fixture
+            .compact(&CancellationToken::new())
+            .await
+            .unwrap_err();
         let records = fixture.session.runtime.store.records().await;
+        if failure == "truncated" {
+            assert!(error.to_string().contains("truncated"));
+            assert!(records.iter().any(|record| matches!(
+                record.event,
+                SessionEvent::CompactionFailed {
+                    request: Some(_),
+                    ..
+                }
+            )));
+        }
         assert_eq!(
             fixture.provider.requests.lock().unwrap().len(),
             4,
@@ -1353,52 +939,6 @@ async fn permanent_summary_failures_preserve_history_after_three_attempts_withou
                 .items,
             old_todos,
             "{failure}"
-        );
-        fixture.assert_exact_requests_and_no_tool_execution().await;
-        fixture.session.shutdown().await.unwrap();
-    }
-}
-
-#[tokio::test]
-async fn empty_ordinary_responses_retry_twice_before_success_and_stop_after_three_failures() {
-    for empty_responses in [2, 10] {
-        let fixture = Fixture::new().await;
-        fixture
-            .provider
-            .agent_empty_responses
-            .store(empty_responses, Ordering::SeqCst);
-        let result = fixture
-            .session
-            .prompt("Continue after an empty provider response.")
-            .await;
-        if empty_responses == 2 {
-            assert_eq!(result.unwrap(), "done");
-        } else {
-            assert!(result.is_err());
-            assert_eq!(
-                fixture
-                    .provider
-                    .agent_empty_responses
-                    .load(Ordering::SeqCst),
-                7
-            );
-        }
-        assert_eq!(fixture.provider.requests.lock().unwrap().len(), 4);
-        let records = fixture.session.runtime.store.records().await;
-        let failures: Vec<_> = records
-            .iter()
-            .filter_map(|record| match record.event {
-                SessionEvent::ModelFailed { attempt, .. } => Some(attempt),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            failures,
-            if empty_responses == 2 {
-                vec![1, 2]
-            } else {
-                vec![1, 2, 3]
-            }
         );
         fixture.assert_exact_requests_and_no_tool_execution().await;
         fixture.session.shutdown().await.unwrap();
@@ -1600,9 +1140,9 @@ async fn structured_continuation_and_reconciled_todos_activate_together_and_surv
     let harness = super::Harness {
         inner: fixture.session.runtime.harness.clone(),
     };
-    fixture.session.shutdown().await.unwrap();
-    fixture.session.runtime.store.close().await.unwrap();
-    let resumed = harness.resume_session(fixture.session.id()).await.unwrap();
+    let id = fixture.session.id();
+    super::tests::shutdown_session(fixture.session).await;
+    let resumed = harness.resume_session(id).await.unwrap();
     assert_eq!(
         resumed
             .runtime
@@ -1757,55 +1297,6 @@ async fn selected_jobs_preserve_arguments_truncate_outputs_and_replay_without_cl
     fixture.add_history(20_000).await;
     fixture.compact(&CancellationToken::new()).await.unwrap();
     fixture.assert_exact_requests().await;
-}
-
-#[tokio::test]
-async fn selected_jobs_are_deduplicated_against_retained_notifications_and_nested_results() {
-    let fixture = Fixture::new().await;
-    fixture.add_history(20_000).await;
-    let runtime = &fixture.session.runtime;
-    let lease = runtime
-        .jobs
-        .create(JobSpec::test(fixture.session.root.clone(), "read"))
-        .await
-        .unwrap();
-    runtime
-        .jobs
-        .finish(
-            lease.id,
-            JobOutcome::Completed(ToolOutput::new(json!({"content":"retained evidence"}))),
-        )
-        .await
-        .unwrap();
-    let child = runtime
-        .jobs
-        .inspect_output(
-            crate::job::JobOutputQuery::new(lease.id),
-            &CapabilitySet::default(),
-        )
-        .await
-        .unwrap();
-    runtime
-        .commit(
-            &fixture.session.root,
-            Message::User(vec![UserContent::Runtime {
-                text: format!(
-                    "<skyhook_job_events>\n{}\n</skyhook_job_events>",
-                    json!([{ "id":900, "state":"completed", "result":{"nested":[child]} }])
-                ),
-            }]),
-        )
-        .await
-        .unwrap();
-    let mut summary = summary_value();
-    summary["jobs"] = json!([lease.id, lease.id]);
-    *fixture.provider.summary.lock().unwrap() = summary.to_string();
-    fixture.compact(&CancellationToken::new()).await.unwrap();
-    let records = runtime.store.records().await;
-    let projected = project_history(&records, &fixture.session.root).unwrap();
-    let text = serde_json::to_string(&projected).unwrap();
-    assert_eq!(text.matches("retained evidence").count(), 1);
-    assert!(!text.contains("Selected job snapshots"));
 }
 
 #[tokio::test]

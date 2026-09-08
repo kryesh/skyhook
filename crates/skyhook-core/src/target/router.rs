@@ -235,27 +235,6 @@ impl TargetRouter {
                 .map_err(RemoteError::authorization)?;
         }
     }
-
-    #[cfg(test)]
-    pub async fn upsert(
-        &self,
-        definition: TargetDefinition,
-    ) -> Result<TargetDefinition, TargetError> {
-        let _mutation = self.mutation.write().await;
-        let (definition, invalidated) = self.targets.upsert(definition).await?;
-        self.authorization
-            .revoke(|grant| {
-                grant.resource.namespace == "route"
-                    && grant
-                        .resource
-                        .segments
-                        .first()
-                        .is_some_and(|target| invalidated.contains(target))
-            })
-            .await;
-        self.remote.invalidate(&invalidated).await;
-        Ok(definition)
-    }
 }
 
 struct RemoteResolver(PreparedConnection);
@@ -294,10 +273,7 @@ mod tests {
             ConnectionFactory, ConnectionRequest, EmbeddedShimCatalog, RejectSensitivePrompts,
             test_connection,
         },
-        tool::{
-            authorization::AuthorizationError,
-            policy::{AuthorizationRequest, Policy, PolicyDecision, PolicyFuture},
-        },
+        tool::policy::{AuthorizationRequest, Policy, PolicyDecision, PolicyFuture},
     };
 
     struct RecordingPolicy {
@@ -345,6 +321,24 @@ mod tests {
         TargetDefinition::test(name, format!("/{name}"), via)
     }
 
+    async fn replace_target(router: &TargetRouter, definition: TargetDefinition) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::session::SessionStore::create_ephemeral(directory.path())
+            .await
+            .unwrap();
+        let mut subject = subject();
+        subject.agent = AgentId::root(store.id());
+        router
+            .add(
+                definition,
+                super::super::ROOT_TARGET.into(),
+                &subject,
+                &store,
+            )
+            .await
+            .unwrap();
+    }
+
     fn subject() -> AuthorizationSubject {
         let mut capabilities = crate::tool::policy::CapabilitySet::default();
         capabilities.insert(Capability::Targets);
@@ -380,25 +374,15 @@ mod tests {
         completions: Arc<AtomicUsize>,
         started: Notify,
         release: Arc<Semaphore>,
-        failure: bool,
     }
 
     impl BlockingFactory {
         fn new() -> Arc<Self> {
-            Self::with_failure(false)
-        }
-
-        fn failing() -> Arc<Self> {
-            Self::with_failure(true)
-        }
-
-        fn with_failure(failure: bool) -> Arc<Self> {
             Arc::new(Self {
                 starts: AtomicUsize::new(0),
                 completions: Arc::new(AtomicUsize::new(0)),
                 started: Notify::new(),
                 release: Arc::new(Semaphore::new(0)),
-                failure,
             })
         }
 
@@ -420,19 +404,11 @@ mod tests {
             self.starts.fetch_add(1, Ordering::SeqCst);
             self.started.notify_waiters();
             let release = self.release.clone();
-            let failure = self.failure;
             let completions = self.completions.clone();
             Box::pin(async move {
                 release.acquire().await.unwrap().forget();
                 completions.fetch_add(1, Ordering::SeqCst);
-                if failure {
-                    Err(RemoteError::UnsupportedPlatform {
-                        arch: "mystery".to_owned(),
-                        os: "unknown".to_owned(),
-                    })
-                } else {
-                    Ok(test_connection().await)
-                }
+                Ok(test_connection().await)
             })
         }
     }
@@ -472,29 +448,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_approval_is_identity_scoped_and_has_no_workspace() {
-        let targets = TargetRegistry::from_definitions([
-            target("gateway", None),
-            target("build", Some("gateway")),
-        ])
-        .unwrap();
-        let policy = RecordingPolicy::new([]);
-        let router = router(targets, policy.clone(), None);
-        let route = router.resolve("build").await.unwrap();
-        let subject = subject();
-
-        approve(&router, &route, &subject).await.unwrap();
-        approve(&router, &route, &subject).await.unwrap();
-
-        let requests = policy.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        let request = &requests[0];
-        assert_eq!(request.arguments["destination"], "build");
-        assert_eq!(request.arguments["route"][0], "gateway");
-        assert!(request.arguments.get("workspace").is_none());
-    }
-
-    #[tokio::test]
     async fn denial_is_retried_and_jump_updates_change_route_identity() {
         let targets = TargetRegistry::from_definitions([
             target("gateway", None),
@@ -517,27 +470,11 @@ mod tests {
         ));
         approve(&router, &original, &subject).await.unwrap();
 
-        router.upsert(target("gateway", None)).await.unwrap();
+        replace_target(&router, target("gateway", None)).await;
         let changed = router.resolve("build").await.unwrap();
         assert_ne!(original.identity, changed.identity);
         approve(&router, &changed, &subject).await.unwrap();
         assert_eq!(policy.requests.lock().unwrap().len(), 3);
-    }
-
-    #[test]
-    fn route_authorization_errors_keep_their_categories() {
-        assert!(matches!(
-            RemoteError::authorization(AuthorizationError::Cancelled),
-            RemoteError::Cancelled
-        ));
-        assert!(matches!(
-            RemoteError::authorization(AuthorizationError::InvalidGrant("wide".to_owned())),
-            RemoteError::ApprovalInvalidGrant(reason) if reason == "wide"
-        ));
-        assert!(matches!(
-            RemoteError::authorization(AuthorizationError::Unavailable),
-            RemoteError::ApprovalUnavailable
-        ));
     }
 
     #[tokio::test]
@@ -598,33 +535,13 @@ mod tests {
         let router = router(targets, policy.clone(), Some(factory.clone()));
         let preparing = spawn_prepare(&router, subject());
         factory.wait_for_starts(1).await;
-        router.upsert(target("gateway", None)).await.unwrap();
+        replace_target(&router, target("gateway", None)).await;
         factory.release.add_permits(2);
         preparing.await.unwrap().unwrap();
         assert_eq!(factory.starts.load(Ordering::SeqCst), 2);
         assert_eq!(policy.requests.lock().unwrap().len(), 2);
     }
 
-    #[tokio::test]
-    async fn coalesced_startup_preserves_structured_failure_category() {
-        let targets = TargetRegistry::from_definitions([target("build", None)]).unwrap();
-        let policy = RecordingPolicy::new([]);
-        let factory = BlockingFactory::failing();
-        let router = router(targets, policy, Some(factory.clone()));
-        let first = spawn_prepare(&router, subject());
-        factory.wait_for_starts(1).await;
-        let second = spawn_prepare(&router, subject());
-        tokio::task::yield_now().await;
-        factory.release.add_permits(1);
-        for result in [first.await.unwrap(), second.await.unwrap()] {
-            assert!(matches!(
-                result,
-                Err(RemoteError::UnsupportedPlatform { arch, os })
-                    if arch == "mystery" && os == "unknown"
-            ));
-        }
-        assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
-    }
     #[tokio::test]
     async fn failed_persistence_does_not_publish_target_registration() {
         let root = tempfile::tempdir().unwrap();

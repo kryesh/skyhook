@@ -62,28 +62,6 @@ fn script_error(error: crate::tool::javascript::JsError) -> ToolError {
             message,
             ToolOutput::new(serde_json::json!({"value": null, "console": "", "failure": details})),
         ),
-        JsError::WithConsole {
-            error,
-            console_output,
-        } => {
-            let error = script_error(*error);
-            match error {
-                ToolError::Cancelled => ToolError::Cancelled,
-                ToolError::FailedWithOutput {
-                    message,
-                    mut output,
-                } => {
-                    output.value["console"] = serde_json::Value::String(console_output);
-                    ToolError::with_output(message, *output)
-                }
-                error => {
-                    let mut output =
-                        ToolOutput::new(serde_json::json!({"value": null, "console": ""}));
-                    output.value["console"] = serde_json::Value::String(console_output);
-                    ToolError::with_output(error.concise_message(), output)
-                }
-            }
-        }
         error => ToolError::with_output(
             error.to_string(),
             ToolOutput::new(serde_json::json!({"value": null, "console": ""})),

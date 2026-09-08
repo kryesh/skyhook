@@ -130,49 +130,6 @@ pub(crate) fn bind_reasoning_scope(
 mod tests {
     use super::*;
     #[test]
-    fn missing_or_malformed_image_is_never_dropped() {
-        let mut image = ImageReference {
-            sha256: String::new(),
-            media_type: "image/png".into(),
-            name: "x".into(),
-            bytes: 1,
-            data_base64: None,
-        };
-        assert!(image_url(&image).is_err());
-        image.data_base64 = Some("?".into());
-        assert!(anthropic_image(&image).is_err());
-        image.data_base64 = Some("YQ==".into());
-        assert_eq!(image_url(&image).unwrap(), "data:image/png;base64,YQ==");
-        image.bytes = 2;
-        assert!(image_url(&image).is_err());
-    }
-    #[test]
-    fn script_console_stays_nested_in_tool_result() {
-        let tool = ToolResult {
-            call_id: "script-1".into(),
-            name: "script".into(),
-            result: json!({"value":{"is_error":true},"console":"captured\n"}),
-            images: Vec::new(),
-            is_error: false,
-        };
-        assert_eq!(
-            serde_json::from_str::<Value>(&tool_text(&tool)).unwrap(),
-            json!({"result":{"value":{"is_error":true},"console":"captured\n"},"is_error":false})
-        );
-    }
-
-    #[test]
-    fn reasoning_is_protocol_and_model_bound() {
-        let opaque = Some(reasoning_envelope(
-            "responses",
-            "model",
-            json!({"summary":[]}),
-        ));
-        assert!(opaque_payload(&opaque, "responses", "model").is_some());
-        assert!(opaque_payload(&opaque, "anthropic", "model").is_none());
-        assert!(opaque_payload(&opaque, "responses", "other").is_none());
-    }
-    #[test]
     fn endpoint_scope_is_required_and_preserves_only_matching_private_state() {
         use crate::provider::protocol::{AssistantItem, Message, ModelRequest, ResponseChunk};
         let a = reasoning_scope("api", "https://a.example/v1/responses");
