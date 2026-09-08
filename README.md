@@ -690,13 +690,18 @@ Every agent has an ordered advisory todo list. `todo()` reads the caller's list;
 progress. Unfinished items do not prevent an agent from finishing.
 
 Any agent allowed to delegate can seed a child with `agent.todos`. The task `prompt` remains
-required; seed strings become pending items before the child's first model request:
+required; seed items use the same `{text, status}` format as `todo.items` and appear in the
+child's runtime state before its first model request:
 
 ```js
 const child = await tool.agent({
   prompt: "Implement the requested change and report the validation results.",
   name: "implement-change",
-  todos: ["Inspect the implementation", "Make the change", "Run relevant checks"],
+  todos: [
+    {text: "Inspect the implementation", status: "in_progress"},
+    {text: "Make the change", status: "pending"},
+    {text: "Run relevant checks", status: "pending"}
+  ],
   bg: true
 });
 // Yield for an event, then inspect the child; an event need not mean completion.

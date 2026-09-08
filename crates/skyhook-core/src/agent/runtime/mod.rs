@@ -2817,6 +2817,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn child_first_request_includes_parent_supplied_todos() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let todos = json!([
+            {"text": "Inspect the implementation", "status": "completed"},
+            {"text": "Make the change", "status": "in_progress"},
+            {"text": "Run relevant checks", "status": "pending"}
+        ]);
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            scripted_provider(
+                &requests,
+                [
+                    response(vec![AssistantContent::tool_call(
+                        "tool-0",
+                        0,
+                        ToolCall {
+                            id: "delegate".to_owned(),
+                            name: "agent".to_owned(),
+                            arguments: json!({"prompt": "work", "todos": todos}),
+                        },
+                    )]),
+                    response(vec![AssistantContent::text(
+                        "answer",
+                        0,
+                        "child done".to_owned(),
+                    )]),
+                    response(vec![AssistantContent::text(
+                        "answer",
+                        0,
+                        "root done".to_owned(),
+                    )]),
+                ],
+            ),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
+        assert_request_journal(&session.runtime.store, &requests).await;
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let child_request = &requests[1];
+        assert!(
+            child_request.system[0]
+                .text
+                .starts_with(prompt::CHILD_PROMPT)
+        );
+        assert_eq!(runtime_state_count(&child_request.messages), 1);
+        let Some(Message::User(content)) = child_request.messages.last() else {
+            panic!("expected transient runtime state at the end of the first child request");
+        };
+        let state = content
+            .iter()
+            .find_map(|content| match content {
+                UserContent::Runtime { text } => text
+                    .strip_prefix("<skyhook_state>\n")
+                    .and_then(|text| text.strip_suffix("\n</skyhook_state>")),
+                _ => None,
+            })
+            .expect("first child request has a runtime state block");
+        let state: serde_json::Value = serde_json::from_str(state).unwrap();
+        assert_eq!(state["todos"], todos);
+    }
+
+    #[tokio::test]
     async fn child_completion_waits_for_background_work_and_returns_its_updated_answer() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();

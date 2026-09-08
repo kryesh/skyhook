@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use crate::{
-    agent::{Question, TodoItem, TodoStatus, todo::TodoStore},
+    agent::{Question, TodoItem, todo::TodoStore},
     provider::protocol::UserContent,
     session::SessionEvent,
     tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::Capability},
@@ -24,8 +24,8 @@ use super::{AgentCommand, AgentLaunch, QueuedPromptToken, SessionRuntime, queue:
 pub(super) struct AgentArgs {
     /// Task and context for the child.
     pub(super) prompt: String,
-    /// Initial todo items.
-    pub(super) todos: Option<Vec<String>>,
+    /// Initial todo items, using the same format as todo.items.
+    pub(super) todos: Option<Vec<TodoItem>>,
     /// Delegation depth available to the child; must be less than your available_depth.
     #[serde(default)]
     pub(super) depth: usize,
@@ -183,7 +183,7 @@ fn register_child_agent(
             async move {
                 let runtime = runtime.ok_or_else(runtime_unavailable)?;
                 let available_depth = runtime.available_depth(&context.agent);
-                let todos = input.todos.map(|items| items.into_iter().map(|text| TodoItem { text, status: TodoStatus::Pending }).collect::<Vec<_>>());
+                let todos = input.todos;
                 if let Some(items) = &todos {
                     TodoStore::validate(items)?;
                 }
