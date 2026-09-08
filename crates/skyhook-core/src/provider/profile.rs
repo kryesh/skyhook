@@ -23,9 +23,6 @@ impl ModelProfile {
         if self.max_output >= self.max_context {
             return Err("max_output must be smaller than max_context");
         }
-        if self.max_output > u64::from(u32::MAX) {
-            return Err("max_output exceeds the provider u32 request limit");
-        }
         Ok(())
     }
 }

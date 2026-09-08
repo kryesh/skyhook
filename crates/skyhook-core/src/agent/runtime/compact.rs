@@ -9,7 +9,9 @@ use crate::{
     identity::{AgentId, JobId},
     provider::{
         ProviderContext,
-        protocol::{AssistantContent, Message, ModelRequest, ResponseChunk, ResponseSchema, Usage},
+        protocol::{
+            BlockContent, Message, ModelRequest, ResponseChunk, ResponseSchema, StopReason, Usage,
+        },
     },
     session::{
         CompactionCheckpoint, ContextMessage, EventRecord, ModelCallOrigin, ModelPurpose,
@@ -155,8 +157,8 @@ fn retained_sources(
                 "active job creator is not an assistant message".into(),
             ));
         };
-        if !blocks.iter().any(
-            |block| matches!(block, AssistantContent::ToolCall(call) if call.id == origin.call_id),
+        if !blocks.iter().flat_map(|item| &item.blocks).any(
+            |block| matches!(&block.content, BlockContent::ToolCall(call) if call.id == origin.call_id),
         ) {
             return Err(HarnessError::Compaction(
                 "active job creator call is missing".into(),
@@ -167,10 +169,14 @@ fn retained_sources(
                 "active job creator has no complete result exchange".into(),
             ));
         };
-        for call in blocks.iter().filter_map(|block| match block {
-            AssistantContent::ToolCall(call) => Some(call),
-            _ => None,
-        }) {
+        for call in blocks
+            .iter()
+            .flat_map(|item| &item.blocks)
+            .filter_map(|block| match &block.content {
+                BlockContent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+        {
             if !results.iter().any(|result| result.call_id == call.id) {
                 return Err(HarnessError::Compaction(
                     "active job exchange has an unmatched tool call".into(),
@@ -398,10 +404,8 @@ impl SessionRuntime {
             result = provider.invoke(summary_request) => result?,
             () = turn.cancellation.cancelled() => return Err(HarnessError::Interrupted),
         };
-        let mut blocks = Vec::new();
-        let mut streamed = String::new();
+        let mut assembler = crate::provider::protocol::ResponseAssembler::default();
         let mut usage = Usage::default();
-        let mut truncated = false;
         loop {
             let chunk = tokio::select! {
                 chunk = stream.next() => chunk,
@@ -410,7 +414,10 @@ impl SessionRuntime {
             let Some(chunk) = chunk else {
                 break;
             };
-            let chunk = match chunk {
+            let chunk = match chunk.and_then(|chunk| {
+                assembler.push(&chunk)?;
+                Ok(chunk)
+            }) {
                 Ok(chunk) => chunk,
                 Err(error) => {
                     if usage != Usage::default() {
@@ -420,24 +427,23 @@ impl SessionRuntime {
                     return Err(error.into());
                 }
             };
-            match chunk {
-                ResponseChunk::TextDelta { text } => streamed.push_str(&text),
-                ResponseChunk::Block { block } => blocks.push(block),
-                ResponseChunk::Usage { usage: value } => usage = value,
-                ResponseChunk::Finished { truncated: value } => truncated |= value,
-                ResponseChunk::ReasoningDelta { .. } => {}
+            if let ResponseChunk::UsageUpdated { usage: value } = chunk {
+                usage = value;
             }
         }
+
         self.record_model_usage(agent, requested.sequence, usage)
             .await?;
-        if truncated {
+        let (blocks, _, reason) = assembler.finish()?;
+        if matches!(reason, StopReason::MaxTokens | StopReason::ContentFilter) {
             return Err(HarnessError::Compaction(
                 "summarization was truncated; original history is retained".into(),
             ));
         }
         if blocks
             .iter()
-            .any(|block| matches!(block, AssistantContent::ToolCall(_)))
+            .flat_map(|item| &item.blocks)
+            .any(|block| matches!(&block.content, BlockContent::ToolCall(_)))
         {
             return Err(HarnessError::Compaction(
                 "summarizer returned a tool call; no tools were executed".into(),
@@ -445,12 +451,12 @@ impl SessionRuntime {
         }
         let text: String = blocks
             .iter()
-            .filter_map(|block| match block {
-                AssistantContent::Text { text } => Some(text.as_str()),
+            .flat_map(|item| &item.blocks)
+            .filter_map(|block| match &block.content {
+                BlockContent::Text { text } => Some(text.as_str()),
                 _ => None,
             })
             .collect();
-        let text = if text.is_empty() { streamed } else { text };
         let continuation = compaction::continuation(&text).map_err(HarnessError::Compaction)?;
         let mut message = continuation.message;
         for launch in self.jobs.active_launches(agent).await {
@@ -615,7 +621,6 @@ mod tests {
                 "status":{"id":3,"state":"running"},
                 "arguments":{"id":4,"state":"completed","result":"literal"}
             }}),
-            console_output: String::new(),
             images: vec![],
             is_error: false,
         }]);

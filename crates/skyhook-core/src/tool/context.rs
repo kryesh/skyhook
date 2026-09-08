@@ -101,8 +101,6 @@ impl ToolContext {
 pub struct ToolOutput {
     pub value: Value,
     pub images: Vec<ImageReference>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub console_output: String,
 }
 
 impl ToolOutput {
@@ -111,7 +109,6 @@ impl ToolOutput {
         Self {
             value,
             images: Vec::new(),
-            console_output: String::new(),
         }
     }
 

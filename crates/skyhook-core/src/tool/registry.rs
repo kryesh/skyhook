@@ -156,9 +156,19 @@ struct ToolExecution {
     permission_resource: Option<ResourceId>,
     path_arguments: Vec<PathArgument>,
     capability_resolver: Option<CapabilityResolver>,
+    read_error_output: Option<fn(&str, &ToolError) -> Option<ToolOutput>>,
 }
 
 impl ToolOptions {
+    /// Built-in read only: expected OS read failures are successful structured results.
+    pub(crate) fn read_error_output(
+        mut self,
+        convert: fn(&str, &ToolError) -> Option<ToolOutput>,
+    ) -> Self {
+        self.execution.read_error_output = Some(convert);
+        self
+    }
+
     #[must_use]
     pub const fn placement(mut self, placement: ToolPlacement) -> Self {
         self.execution.placement = placement;
@@ -345,7 +355,19 @@ impl RegisteredTool {
         context: ToolContext,
         arguments: Value,
     ) -> Result<ToolOutput, ToolError> {
-        (self.handler)(context, arguments).await
+        let read_path = self.execution.read_error_output.and_then(|_| {
+            arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        match (self.handler)(context, arguments).await {
+            Err(error) => match read_path.and_then(|path| self.read_error_output(&path, &error)) {
+                Some(output) => Ok(output),
+                None => Err(error),
+            },
+            result => result,
+        }
     }
 
     pub fn capabilities_for(&self, arguments: &Value) -> Result<Vec<Capability>, ToolError> {
@@ -363,6 +385,12 @@ impl RegisteredTool {
     #[must_use]
     pub(crate) const fn placement(&self) -> ToolPlacement {
         self.execution.placement
+    }
+
+    pub(crate) fn read_error_output(&self, path: &str, error: &ToolError) -> Option<ToolOutput> {
+        self.execution
+            .read_error_output
+            .and_then(|convert| convert(path, error))
     }
 
     pub(crate) fn path_arguments(&self) -> &[PathArgument] {
@@ -1435,14 +1463,39 @@ mod tests {
             let output_args = &surface.get("job_output").unwrap().input_schema["properties"];
             assert_eq!(output_args["limit"]["default"], 100);
             assert_eq!(output_args["limit"]["maximum"], 1000);
-            assert_eq!(output_args["wait"]["default"], 0);
-            assert_eq!(output_args["wait"]["maximum"], 3600);
+            assert!(output_args.get("wait").is_none());
             assert_eq!(output_args["context"]["maximum"], 20);
             let script = definitions
                 .iter()
                 .find(|tool| tool.name == "script")
                 .unwrap();
-            assert!(script.description.ends_with("\n\nScript return: `JSON`."));
+            let script_schema = surface
+                .get("script")
+                .unwrap()
+                .result_schema
+                .as_ref()
+                .unwrap();
+            assert_eq!(script_schema["properties"]["console"]["type"], "string");
+            assert!(
+                script_schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("value"))
+            );
+            assert!(
+                script_schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("console"))
+            );
+            let result_type = schema_type(script_schema, script_schema);
+            assert!(
+                script
+                    .description
+                    .ends_with(&format!("\n\nScript return: `{result_type}`.")),
+                "{}",
+                script.description
+            );
             assert!(script.description.contains("tool.job(id).output("));
             assert!(!script.description.contains("tool.job(id).wait("));
             for name in ["exec", "shell", "jobs"] {

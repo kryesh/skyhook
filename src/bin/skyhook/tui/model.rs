@@ -7,7 +7,7 @@ use skyhook::{
     agent::{AgentActivity, LiveResponse, ObservationSnapshot},
     identity::{AgentId, JobId},
     job::JobState,
-    provider::protocol::{AssistantContent, Message, Usage, UserContent},
+    provider::protocol::{BlockContent, BlockKind, Message, Usage, UserContent},
     session::SessionEvent,
 };
 use std::{
@@ -158,7 +158,9 @@ impl Projection {
     }
 
     fn live_response(&self, request: u64, response: &LiveResponse) -> bool {
-        !response.settled && !self.response_committed(request)
+        // Settlement can announce a journal sequence before its record arrives.
+        // Keep that snapshot visible until the projection has consumed the commit.
+        (!response.settled || response.message.is_some()) && !self.response_committed(request)
     }
 
     pub fn rebuild(&mut self, snapshot: &ObservationSnapshot) {
@@ -512,8 +514,8 @@ pub struct ContentChanges {
 }
 
 /// Retains rendered journal content across streaming events. The caller bumps
-/// `revision` for every content mutation other than append-only TextDelta and
-/// ReasoningDelta events (including output downloads and presentation changes).
+/// `revision` for history and presentation changes. ResponseEvent mutations use
+/// `observe_response` so authoritative replacements rebuild only the live tail.
 /// Journal progress, selected agent, tab and defaults are also checked here.
 ///
 /// Entries remain caller-owned: neither historical strings nor tool documents
@@ -522,10 +524,10 @@ pub struct ContentChanges {
 pub struct ContentCache {
     identity: Option<(AgentId, Tab, bool, bool, u64, u64)>,
     history_len: usize,
-    observed_responses: HashMap<AgentId, HashSet<u64>>,
     history_running: bool,
     live: Vec<LiveContent>,
-    request: Option<LiveRequestContent>,
+    dirty_responses: HashMap<AgentId, HashSet<u64>>,
+    request_suffixes: HashMap<u64, (usize, usize)>,
     job_indices: HashMap<JobId, usize>,
     invalid_jobs: HashSet<JobId>,
     #[cfg(test)]
@@ -534,19 +536,10 @@ pub struct ContentCache {
     historical_entries: usize,
 }
 
-struct LiveRequestContent {
-    request: u64,
-    index: usize,
-    response_lengths: Option<(usize, usize)>,
-}
-
 struct LiveContent {
     request: u64,
     start: usize,
     count: usize,
-    text_len: usize,
-    reasoning_len: usize,
-    reasoning_end: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -558,10 +551,10 @@ pub struct EntryView<'a> {
 }
 
 impl ContentCache {
-    /// Deltas may precede a journal request record (including restored streams).
-    /// Keep discovery indexed instead of scanning all retained failed responses.
+    /// Response events can replace content, reorder blocks, or end a block
+    /// without changing its text. Never infer cache validity from string lengths.
     pub fn observe_response(&mut self, agent: &AgentId, request: u64) {
-        self.observed_responses
+        self.dirty_responses
             .entry(agent.clone())
             .or_default()
             .insert(request);
@@ -586,8 +579,8 @@ impl ContentCache {
         }
         self.invalid_jobs.clear();
         // Preserve warm layout for journal/output changes that leave ordering
-        // intact. Byte comparisons occur only on explicit invalidation, never
-        // on the streaming path. Reuse equal allocations, too.
+        // intact, including response snapshot replacements. Reuse equal
+        // allocations and retain layout for unchanged entries.
         changes.reset =
             old.is_empty() || old.iter().zip(entries.iter()).any(|(a, b)| a.key != b.key);
         changes.dirty.clear();
@@ -629,6 +622,7 @@ impl ContentCache {
             projection.through,
         );
         let reset = self.identity.as_ref() != Some(&identity);
+        let dirty_responses = self.dirty_responses.remove(agent).unwrap_or_default();
         let mut changes = ContentChanges {
             reset,
             ..ContentChanges::default()
@@ -644,35 +638,36 @@ impl ContentCache {
             .find(|a| &a.id == agent)
             .map_or("Agent", |a| a.name.as_str());
         if reset {
-            self.observed_responses.remove(agent);
             self.identity = Some(identity);
             *entries = entries_inner(snapshot, projection, presentation, outputs, false);
             self.history_len = entries.len();
             self.history_running = entries.iter().any(|entry| entry.running);
             self.live.clear();
-            self.request = None;
+            self.request_suffixes.clear();
+            if view.tab == Tab::Requests {
+                for (index, entry) in entries.iter().enumerate() {
+                    if view.expanded.contains(&entry.key)
+                        && let Some(request) = entry
+                            .key
+                            .strip_prefix('r')
+                            .and_then(|id| id.parse::<u64>().ok())
+                    {
+                        let suffix_len = snapshot.responses.get(&(agent.clone(), request)).map_or(
+                            0,
+                            |response| {
+                                format!("\nResponse\n{}\n{}", response.reasoning(), response.text())
+                                    .len()
+                            },
+                        );
+                        self.request_suffixes
+                            .insert(request, (index, entry.text.len() - suffix_len));
+                    }
+                }
+            }
             #[cfg(test)]
             {
                 self.historical_rebuilds += 1;
                 self.historical_entries += entries.len();
-            }
-            if view.tab == Tab::Requests
-                && let Some(request) = projection.active_request.get(agent)
-            {
-                let key = format!("r{request}");
-                if let Some(index) = entries
-                    .iter()
-                    .position(|e| e.key == key && view.expanded.contains(&key))
-                {
-                    self.request = Some(LiveRequestContent {
-                        request: *request,
-                        index,
-                        response_lengths: snapshot
-                            .responses
-                            .get(&(agent.clone(), *request))
-                            .map(|r| (r.reasoning.len(), r.text.len())),
-                    });
-                }
             }
         }
         if !reset {
@@ -687,41 +682,20 @@ impl ContentCache {
                 }
             }
         }
-        if view.tab == Tab::Requests
-            && !reset
-            && let Some(live) = &mut self.request
-            && let Some(response) = snapshot.responses.get(&(agent.clone(), live.request))
-        {
-            // Preserve the recorded input; only change its response suffix.
-            let index = live.index;
-            let entry = &mut entries[index];
-            if let Some((reasoning_len, text_len)) = live.response_lengths {
-                if response.reasoning.len() > reasoning_len {
-                    let at = entry.text.len() - text_len - 1;
-                    entry
-                        .text
-                        .insert_str(at, &response.reasoning[reasoning_len..]);
-                    changes.dirty.push(index);
-                }
-                if response.text.len() > text_len {
-                    let previous_len = entry.text.len();
-                    entry.text.push_str(&response.text[text_len..]);
-                    if !changes.dirty.contains(&index) {
+        if view.tab == Tab::Requests && !reset {
+            for request in &dirty_responses {
+                if let Some(&(index, start)) = self.request_suffixes.get(request)
+                    && let Some(response) = snapshot.responses.get(&(agent.clone(), *request))
+                {
+                    let suffix =
+                        format!("\nResponse\n{}\n{}", response.reasoning(), response.text());
+                    if entries[index].text[start..] != suffix {
+                        entries[index].text.truncate(start);
+                        entries[index].text.push_str(&suffix);
                         changes.dirty.push(index);
-                        changes.appends.insert(index, previous_len);
                     }
                 }
-            } else {
-                changes.appends.insert(index, entry.text.len());
-                entry.text.push_str("\nResponse\n");
-                entry.text.push_str(&response.reasoning);
-                entry.text.push('\n');
-                entry.text.push_str(&response.text);
-                changes.dirty.push(index);
             }
-            live.response_lengths = Some((response.reasoning.len(), response.text.len()));
-        }
-        if view.tab == Tab::Requests && !reset {
             // Refresh only the active request's summary; do not reconstruct its
             // recorded input or rebuild the history on each elapsed-time tick.
             if let Some(&request) = projection.active_request.get(agent)
@@ -738,6 +712,9 @@ impl ContentCache {
                         .find('\n')
                         .map_or(entry.text.len(), |offset| start + offset);
                     if entry.text[start..end] != stats || entry.running != running {
+                        if let Some((_, response_start)) = self.request_suffixes.get_mut(&request) {
+                            *response_start = *response_start - (end - start) + stats.len();
+                        }
                         entry.text.replace_range(start..end, &stats);
                         entry.running = running;
                         changes.appends.remove(&index);
@@ -772,118 +749,58 @@ impl ContentCache {
                     request: *request,
                     start,
                     count: entries.len() - start,
-                    text_len: response.text.len(),
-                    reasoning_len: response.reasoning.len(),
-                    reasoning_end: response.reasoning.trim_end_matches(['\r', '\n']).len(),
                 });
             }
-        } else {
-            // A request first acquires a response on its first delta. Locate it
-            // using the projection index, not by scanning settled responses.
-            let mut observed = self.observed_responses.remove(agent).unwrap_or_default();
-            if let Some(request) = projection.active_request.get(agent) {
-                observed.insert(*request);
-            }
-            let mut observed: Vec<_> = observed.into_iter().collect();
-            observed.sort_unstable();
-            for request in &observed {
-                if !self.live.iter().any(|live| live.request == *request)
-                    && let Some(response) = snapshot.responses.get(&(agent.clone(), *request))
-                    && projection.live_response(*request, response)
+        }
+        if !reset && !dirty_responses.is_empty() {
+            // Native events can replace equal-length text, reorder items, or end
+            // blocks. Rebuild only the live suffix, never clone journal entries.
+            let previous = entries.split_off(self.history_len);
+            let mut requests: Vec<_> = self
+                .live
+                .iter()
+                .map(|live| live.request)
+                .chain(dirty_responses.iter().copied())
+                .collect();
+            requests.sort_unstable();
+            requests.dedup();
+            self.live.clear();
+            for request in requests {
+                if let Some(response) = snapshot.responses.get(&(agent.clone(), request))
+                    && projection.live_response(request, response)
                 {
-                    let start = self
-                        .live
-                        .last()
-                        .map_or(self.history_len, |l| l.start + l.count);
-                    let replacement =
-                        response_entries(*request, response, view, thinking, agent_name);
-                    let count = replacement.len();
-                    entries.splice(start..start, replacement);
-                    changes.dirty.extend(start..entries.len());
+                    let start = entries.len();
+                    entries.extend(response_entries(
+                        request, response, view, thinking, agent_name,
+                    ));
                     self.live.push(LiveContent {
-                        request: *request,
+                        request,
                         start,
-                        count,
-                        text_len: response.text.len(),
-                        reasoning_len: response.reasoning.len(),
-                        reasoning_end: response.reasoning.trim_end_matches(['\r', '\n']).len(),
+                        count: entries.len() - start,
                     });
                 }
             }
-            // Only inspect lengths and newly appended suffixes.
-            let mut shift = 0isize;
-            for live in &mut self.live {
-                live.start = live
-                    .start
-                    .checked_add_signed(shift)
-                    .expect("live entry offset");
-                let Some(response) = snapshot.responses.get(&(agent.clone(), live.request)) else {
-                    continue;
-                };
-                if response.text.len() == live.text_len
-                    && response.reasoning.len() == live.reasoning_len
-                {
-                    continue;
-                }
-                let new_reasoning = &response.reasoning[live.reasoning_len..];
-                let trimmed_delta = new_reasoning.trim_end_matches(['\r', '\n']);
-                let end = if trimmed_delta.is_empty() {
-                    live.reasoning_end
-                } else {
-                    live.reasoning_len + trimmed_delta.len()
-                };
-                let reasoning_index = (live.count > 0
-                    && entries[live.start].surface == Surface::Reasoning)
-                    .then_some(live.start);
-                // Rebuild just this live response on a structural transition:
-                // first answer, first reasoning, or single-line -> disclosure.
-                let shape_change = (live.text_len == 0 && !response.text.is_empty())
-                    || (reasoning_index.is_none()
-                        && new_reasoning.chars().any(|c| !c.is_whitespace()))
-                    || reasoning_index.is_some_and(|i| {
-                        !entries[i].expandable
-                            && response.reasoning[live.reasoning_end..end].contains('\n')
-                    });
-                if shape_change {
-                    let replacement =
-                        response_entries(live.request, response, view, thinking, agent_name);
-                    let count = replacement.len();
-                    entries.splice(live.start..live.start + live.count, replacement);
-                    shift += count as isize - live.count as isize;
-                    live.count = count;
-                    // A structural insertion shifts any later live/status rows.
-                    changes.dirty.extend(live.start..entries.len());
-                } else {
-                    if let Some(index) = reasoning_index
-                        && end > live.reasoning_end
-                        && (!entries[index].expandable
-                            || view.is_expanded(&entries[index].key, entries[index].default_open))
-                    {
-                        let previous_len = entries[index].text.len();
-                        entries[index]
-                            .text
-                            .push_str(&response.reasoning[live.reasoning_end..end]);
+            // Keep unchanged live allocations, too. The old working indicator
+            // is regenerated below; entry removal is conveyed by vector length.
+            let reordered = previous
+                .iter()
+                .zip(&entries[self.history_len..])
+                .any(|(old, new)| old.key != new.key);
+            changes.reset |= reordered;
+            let previous_len = previous.len();
+            for (offset, old) in previous.into_iter().enumerate() {
+                let index = self.history_len + offset;
+                if let Some(entry) = entries.get_mut(index) {
+                    if *entry == old {
+                        *entry = old;
+                    } else {
                         changes.dirty.push(index);
-                        if shift == 0 {
-                            changes.appends.insert(index, previous_len);
-                        }
-                    }
-                    if response.text.len() > live.text_len {
-                        let index = live.start + live.count - 1;
-                        let previous_len = entries[index].text.len();
-                        entries[index]
-                            .text
-                            .push_str(&response.text[live.text_len..]);
-                        changes.dirty.push(index);
-                        if shift == 0 {
-                            changes.appends.insert(index, previous_len);
-                        }
                     }
                 }
-                live.text_len = response.text.len();
-                live.reasoning_len = response.reasoning.len();
-                live.reasoning_end = end;
             }
+            changes
+                .dirty
+                .extend(self.history_len + previous_len..entries.len());
         }
         // The working indicator is a synthetic tail, never part of history.
         let end = self
@@ -1033,7 +950,8 @@ fn entries_inner(
                         {
                             text.push_str(&format!(
                                 "\nResponse\n{}\n{}",
-                                response.reasoning, response.text
+                                response.reasoning(),
+                                response.text()
                             ));
                         } else if let Some(record) = info
                             .response
@@ -1075,6 +993,7 @@ fn entries_inner(
                         if let Some(response) =
                             snapshot.responses.get(&(agent.clone(), record.sequence))
                             && response.settled
+                            && !projection.live_response(record.sequence, response)
                             && !projection.response_committed(record.sequence)
                         {
                             entries.extend(response_entries(
@@ -1138,21 +1057,31 @@ fn entries_inner(
                                 entries.push(Entry::new(format!("{key}/{i}"), text, surface));
                             }
                         }
-                        Message::Assistant(blocks) => {
-                            let first_reasoning = blocks.iter().position(|block| matches!(block, AssistantContent::Reasoning { text, .. } if !text.is_empty()));
-                            let final_text = if blocks
+                        Message::Assistant(items) => {
+                            let request = projection
+                                .response_requests
+                                .get(&record.sequence)
+                                .copied()
+                                .unwrap_or(record.sequence);
+                            let blocks: Vec<_> = items
                                 .iter()
-                                .any(|block| matches!(block, AssistantContent::ToolCall(_)))
-                            {
+                                .flat_map(|item| item.blocks.iter().map(move |block| (item, block)))
+                                .collect();
+                            let final_text = if blocks.iter().any(|(_, block)| {
+                                matches!(&block.content, BlockContent::ToolCall(_))
+                            }) {
                                 None
                             } else {
-                                blocks.iter().rposition(|block| matches!(block, AssistantContent::Text { text } if !text.is_empty()))
+                                blocks.iter().rposition(|(_, block)| {
+                                    matches!(&block.content, BlockContent::Text { text } if !text.is_empty())
+                                })
                             };
-                            for (i, block) in blocks.iter().enumerate() {
-                                match block {
-                                    AssistantContent::Text { text } if !text.is_empty() => {
+                            for (i, (item, block)) in blocks.iter().enumerate() {
+                                let block_key = response_block_key(request, &item.id, &block.id);
+                                match &block.content {
+                                    BlockContent::Text { text } if !text.is_empty() => {
                                         let mut entry = Entry::new(
-                                            format!("{key}/{i}"),
+                                            block_key.clone(),
                                             format!("{agent_name}\n{text}"),
                                             Surface::Agent,
                                         );
@@ -1167,32 +1096,23 @@ fn entries_inner(
                                         }
                                         entries.push(entry);
                                     }
-                                    AssistantContent::Reasoning { text, .. }
+                                    BlockContent::Reasoning { text, .. }
                                         if !text.trim().is_empty() =>
                                     {
                                         entries.push(reasoning_entry(
-                                            // Preserve clicks made during the live-to-journal handoff.
-                                            if Some(i) == first_reasoning
-                                                && let Some(request) = projection
-                                                    .response_requests
-                                                    .get(&record.sequence)
-                                            {
-                                                format!("reasoning-done{request}")
-                                            } else {
-                                                format!("{key}/{i}")
-                                            },
+                                            reasoning_key(request, &item.id, &block.id),
                                             text,
                                             view,
                                             thinking,
                                             "Reasoning",
                                         ));
                                     }
-                                    AssistantContent::ToolCall(call) => {
+                                    BlockContent::ToolCall(call) => {
                                         let exists = projection
                                             .tool_origins
                                             .contains(&(record.sequence, call.id.clone()));
                                         if !exists {
-                                            let key = format!("{key}/{i}");
+                                            let key = block_key.clone();
                                             let open = view.is_expanded(&key, all_details);
                                             let header = format!(
                                                 "{} {}{}",
@@ -1402,7 +1322,9 @@ fn reasoning_entry(key: String, text: &str, view: &View, default_open: bool, tit
     // Source lines determine collapsibility; terminal wrapping must not change interaction.
     let text = text.trim_matches(['\r', '\n']);
     if text.lines().count() <= 1 {
-        return Entry::new(key, text.to_owned(), Surface::Reasoning);
+        let mut entry = Entry::new(key, text.to_owned(), Surface::Reasoning);
+        entry.default_open = default_open;
+        return entry;
     }
     let open = view.is_expanded(&key, default_open);
     let mut entry = Entry::new(
@@ -1419,6 +1341,19 @@ fn reasoning_entry(key: String, text: &str, view: &View, default_open: bool, tit
     entry
 }
 
+/// Length-prefixed native IDs avoid collisions even when IDs contain separators.
+fn response_block_key(request: u64, item: &str, block: &str) -> String {
+    format!(
+        "response{request}/{}:{item}/{}:{block}",
+        item.len(),
+        block.len()
+    )
+}
+
+fn reasoning_key(request: u64, item: &str, block: &str) -> String {
+    format!("reasoning-{}", response_block_key(request, item, block))
+}
+
 fn response_entries(
     request: u64,
     response: &LiveResponse,
@@ -1427,45 +1362,51 @@ fn response_entries(
     agent_name: &str,
 ) -> Vec<Entry> {
     let mut entries = Vec::new();
-    if !response.reasoning.trim().is_empty() {
-        // Answer text ends the reasoning phase, even while the response is still live.
-        // A separate key prevents a live expansion from overriding auto-collapse.
-        let running = !response.settled && response.text.is_empty();
-        let phase = if running { "live" } else { "done" };
-        let mut entry = reasoning_entry(
-            format!("reasoning-{phase}{request}"),
-            &response.reasoning,
-            view,
-            running || thinking,
-            if running {
-                "  Reasoning"
-            } else if response.error.is_some() {
-                "Reasoning · incomplete"
-            } else {
-                "Reasoning"
-            },
-        );
-        entry.running = running;
-        entries.push(entry);
-    }
-    if !response.text.is_empty() {
-        entries.push(Entry::new(
-            format!("live{request}"),
-            format!(
-                "{}\n{}",
-                if response.error.is_some() {
-                    "Incomplete response"
-                } else {
-                    agent_name
-                },
-                response.text,
-            ),
-            if response.error.is_some() {
-                Surface::Error
-            } else {
-                Surface::Agent
-            },
-        ));
+    for item in response.snapshot().items {
+        for block in item.blocks {
+            match block.kind {
+                BlockKind::Reasoning if !block.text.trim().is_empty() => {
+                    // A block ends independently of its item and of answer text.
+                    let running = !response.settled && !block.ended;
+                    let mut entry = reasoning_entry(
+                        reasoning_key(request, &item.id, &block.id),
+                        &block.text,
+                        view,
+                        running || thinking,
+                        if running {
+                            "  Reasoning"
+                        } else if response.error.is_some() {
+                            "Reasoning · incomplete"
+                        } else {
+                            "Reasoning"
+                        },
+                    );
+                    entry.running = running;
+                    entry.default_open = running || thinking;
+                    entries.push(entry);
+                }
+                BlockKind::Text if !block.text.is_empty() => {
+                    entries.push(Entry::new(
+                        response_block_key(request, &item.id, &block.id),
+                        format!(
+                            "{}\n{}",
+                            if response.error.is_some() {
+                                "Incomplete response"
+                            } else {
+                                agent_name
+                            },
+                            block.text,
+                        ),
+                        if response.error.is_some() {
+                            Surface::Error
+                        } else {
+                            Surface::Agent
+                        },
+                    ));
+                }
+                _ => {}
+            }
+        }
     }
     entries
 }
@@ -1684,24 +1625,272 @@ mod tests {
     use skyhook::{
         agent::{ObservedEvent, RuntimeEvent},
         identity::SessionId,
-        provider::protocol::ModelRequest,
+        provider::protocol::{
+            AssistantBlock, AssistantItem, BlockContent, BlockKind, ContentDelta, ItemKind,
+            ModelRequest, ReplayEnvelope, ResponseEvent, events_for_content,
+        },
         session::{ContextMessage, EventRecord, ModelPurpose},
     };
+    #[test]
+    fn native_live_display_preserves_interleaved_reasoning_and_text() {
+        let agent = AgentId::root(SessionId::from_bytes([91; 16]));
+        let mut snapshot = ObservationSnapshot::default();
+        for (id, position, kind, block_kind, text) in [
+            (
+                "second",
+                2,
+                ItemKind::Reasoning,
+                BlockKind::Reasoning,
+                "second",
+            ),
+            (
+                "first",
+                0,
+                ItemKind::Reasoning,
+                BlockKind::Reasoning,
+                "first",
+            ),
+            ("answer", 1, ItemKind::Text, BlockKind::Text, "answer"),
+        ] {
+            response_event(
+                &mut snapshot,
+                &agent,
+                7,
+                ResponseEvent::ItemStarted {
+                    id: id.into(),
+                    position,
+                    kind,
+                },
+            );
+            response_event(
+                &mut snapshot,
+                &agent,
+                7,
+                ResponseEvent::BlockStarted {
+                    item: id.into(),
+                    id: format!("{id}:0"),
+                    position: 0,
+                    kind: block_kind,
+                },
+            );
+            response_event(
+                &mut snapshot,
+                &agent,
+                7,
+                ResponseEvent::BlockDelta {
+                    item: id.into(),
+                    block: format!("{id}:0"),
+                    delta: ContentDelta::Text(text.into()),
+                },
+            );
+        }
+        response_event(
+            &mut snapshot,
+            &agent,
+            7,
+            ResponseEvent::BlockEnded {
+                item: "first".into(),
+                block: "first:0".into(),
+                content: BlockContent::Reasoning {
+                    text: "first complete".into(),
+                },
+            },
+        );
+        let entries = response_entries(
+            7,
+            &snapshot.responses[&(agent, 7)],
+            &View::default(),
+            true,
+            "Agent",
+        );
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].surface, Surface::Reasoning);
+        assert!(entries[0].text.contains("first complete"));
+        assert!(!entries[0].running);
+        assert_eq!(entries[1].text, "Agent\nanswer");
+        assert_eq!(entries[2].surface, Surface::Reasoning);
+        assert!(entries[2].text.contains("second"));
+        assert!(entries[2].running);
+    }
+
+    #[test]
+    fn consecutive_reasoning_blocks_end_independently_and_keep_identity_on_replay() {
+        let agent = AgentId::root(SessionId::from_bytes([92; 16]));
+        let mut snapshot = ObservationSnapshot::default();
+        let context = context(&mut snapshot, &agent);
+        let request = request(&mut snapshot, &agent, context);
+        let mut view = View::default();
+        let summaries = [
+            "First\nSecond\nThird",
+            "Fourth\nFifth\nSixth",
+            "Seventh\nEighth",
+        ];
+        let mut blocks = Vec::new();
+        let mut keys = Vec::new();
+        response_event(
+            &mut snapshot,
+            &agent,
+            request,
+            ResponseEvent::ItemStarted {
+                id: "native-reasoning".into(),
+                position: 0,
+                kind: ItemKind::Reasoning,
+            },
+        );
+        for (position, text) in summaries.into_iter().enumerate() {
+            let id = format!("summary-{position}");
+            response_event(
+                &mut snapshot,
+                &agent,
+                request,
+                ResponseEvent::BlockStarted {
+                    item: "native-reasoning".into(),
+                    id: id.clone(),
+                    position,
+                    kind: BlockKind::Reasoning,
+                },
+            );
+            response_event(
+                &mut snapshot,
+                &agent,
+                request,
+                ResponseEvent::BlockDelta {
+                    item: "native-reasoning".into(),
+                    block: id.clone(),
+                    delta: ContentDelta::Text(format!("provisional\n{text}")),
+                },
+            );
+            let live = &snapshot.responses[&(agent.clone(), request)];
+            let rows = response_entries(request, live, &view, false, "Agent");
+            assert_eq!(rows.len(), position + 1);
+            assert_eq!(rows.iter().filter(|entry| entry.running).count(), 1);
+            assert!(rows[position].running && rows[position].default_open);
+            assert!(rows[position].text.contains("provisional"));
+            keys.push(rows[position].key.clone());
+            response_event(
+                &mut snapshot,
+                &agent,
+                request,
+                ResponseEvent::BlockEnded {
+                    item: "native-reasoning".into(),
+                    block: id.clone(),
+                    content: BlockContent::Reasoning { text: text.into() },
+                },
+            );
+            let live = &snapshot.responses[&(agent.clone(), request)];
+            assert!(!live.settled);
+            assert!(!live.snapshot().items[0].ended, "item replay arrives later");
+            assert!(
+                live.text().is_empty(),
+                "block closure does not need an answer"
+            );
+            let closed = response_entries(request, live, &view, false, "Agent");
+            assert!(closed.iter().all(|entry| !entry.running));
+            assert_eq!(closed[position].text, "▸ Reasoning");
+            view.expanded.insert(keys[position].clone());
+            let expanded = response_entries(request, live, &view, false, "Agent");
+            assert!(expanded[position].text.ends_with(text));
+            assert!(
+                !expanded[position].text.contains("provisional"),
+                "authoritative end replaces deltas"
+            );
+            blocks.push(AssistantBlock {
+                id,
+                position,
+                content: BlockContent::Reasoning { text: text.into() },
+            });
+        }
+        response_event(
+            &mut snapshot,
+            &agent,
+            request,
+            ResponseEvent::ItemEnded {
+                id: "native-reasoning".into(),
+                replay: Some(replay()),
+            },
+        );
+        let live = &snapshot.responses[&(agent.clone(), request)];
+        assert_eq!(live.snapshot().items[0].replay, Some(replay()));
+        assert_eq!(
+            response_entries(request, live, &view, false, "Agent")
+                .iter()
+                .map(|entry| entry.key.clone())
+                .collect::<Vec<_>>(),
+            keys
+        );
+        let answer = AssistantItem::text("answer", 1, "Answer");
+        for event in events_for_content(std::slice::from_ref(&answer)) {
+            response_event(&mut snapshot, &agent, request, event);
+        }
+        record(
+            &mut snapshot,
+            &agent,
+            SessionEvent::MessageCommitted {
+                message: Message::Assistant(vec![
+                    AssistantItem {
+                        id: "native-reasoning".into(),
+                        position: 0,
+                        kind: ItemKind::Reasoning,
+                        blocks,
+                        replay: Some(replay()),
+                    },
+                    answer,
+                ]),
+            },
+        );
+        let records: Vec<EventRecord> = serde_json::from_slice(
+            &serde_json::to_vec(&snapshot.records.values().collect::<Vec<_>>()).unwrap(),
+        )
+        .unwrap();
+        let mut persisted = ObservationSnapshot::default();
+        for record in records {
+            update(&mut persisted, RuntimeEvent::Record(Box::new(record)));
+        }
+        for snapshot in [&snapshot, &persisted] {
+            let mut projection = Projection::default();
+            projection.rebuild(snapshot);
+            let rows = entries(
+                snapshot,
+                &projection,
+                &agent,
+                &view,
+                &HashMap::new(),
+                false,
+                false,
+            );
+            let reasoning = rows
+                .iter()
+                .filter(|entry| entry.surface == Surface::Reasoning)
+                .collect::<Vec<_>>();
+            assert_eq!(reasoning.len(), 3, "live and committed must not duplicate");
+            assert_eq!(
+                reasoning
+                    .iter()
+                    .map(|entry| entry.key.clone())
+                    .collect::<Vec<_>>(),
+                keys
+            );
+            for (entry, text) in reasoning.into_iter().zip(summaries) {
+                assert!(!entry.running);
+                assert!(
+                    entry.text.ends_with(text),
+                    "expanded identity survives handoff"
+                );
+            }
+        }
+    }
+
     #[test]
     fn job_notifications_are_historical_tool_cards_between_assistant_responses() {
         let agent = AgentId::root(SessionId::from_bytes([48; 16]));
         let payload = "<skyhook_job_events>\n[{\"id\":7,\"tool\":\"exec\",\"state\":\"completed\",\"result\":{\"stdout\":\"historical output\"}},{\"id\":8,\"state\":\"failed\",\"error\":\"historical failure\"}]\n</skyhook_job_events>";
         let mut snapshot = ObservationSnapshot::default();
         for message in [
-            Message::Assistant(vec![AssistantContent::Text {
-                text: "First answer".into(),
-            }]),
+            Message::Assistant(vec![AssistantItem::text("text-1", 1, "First answer")]),
             Message::User(vec![UserContent::Runtime {
                 text: payload.into(),
             }]),
-            Message::Assistant(vec![AssistantContent::Text {
-                text: "Follow-up answer".into(),
-            }]),
+            Message::Assistant(vec![AssistantItem::text("text-2", 2, "Follow-up answer")]),
         ] {
             record(
                 &mut snapshot,
@@ -1759,24 +1948,23 @@ mod tests {
         let agent = AgentId::root(SessionId::from_bytes([44; 16]));
         let mut snapshot = ObservationSnapshot::default();
         let call = |id: &str| {
-            AssistantContent::ToolCall(skyhook::provider::protocol::ToolCall {
-                id: id.into(),
-                name: "exec".into(),
-                arguments: serde_json::json!({"argv": ["true"]}),
-            })
+            AssistantItem::tool_call(
+                id,
+                0,
+                skyhook::provider::protocol::ToolCall {
+                    id: id.into(),
+                    name: "exec".into(),
+                    arguments: serde_json::json!({"argv": ["true"]}),
+                },
+            )
         };
         for blocks in [
             vec![
                 call("a"),
                 call("b"),
-                AssistantContent::Text {
-                    text: "Next".into(),
-                },
+                AssistantItem::text("text-3", 3, "Next"),
                 call("c"),
-                AssistantContent::Reasoning {
-                    text: "Keep this reasoning padded".into(),
-                    opaque: None,
-                },
+                AssistantItem::reasoning("reasoning-11", 11, "Keep this reasoning padded", None),
                 call("f"),
             ],
             vec![call("d"), call("e")],
@@ -1785,7 +1973,16 @@ mod tests {
                 &mut snapshot,
                 &agent,
                 SessionEvent::MessageCommitted {
-                    message: Message::Assistant(blocks),
+                    message: Message::Assistant(
+                        blocks
+                            .into_iter()
+                            .enumerate()
+                            .map(|(position, mut item)| {
+                                item.position = position;
+                                item
+                            })
+                            .collect(),
+                    ),
                 },
             );
         }
@@ -2090,7 +2287,7 @@ mod tests {
     }
 
     #[test]
-    fn content_cache_streams_without_rebuilding_or_cloning_history() {
+    fn content_cache_streams_without_replacing_unchanged_history_allocations() {
         let agent = AgentId::root(SessionId::from_bytes([31; 16]));
         let mut snapshot = ObservationSnapshot::default();
         for _ in 0..100 {
@@ -2133,12 +2330,9 @@ mod tests {
         for n in 0..50 {
             update(
                 &mut snapshot,
-                RuntimeEvent::TextDelta {
-                    agent: agent.clone(),
-                    request,
-                    text: "chunk".into(),
-                },
+                delta_event(agent.clone(), request, BlockKind::Text, "chunk".into()),
             );
+            cache.observe_response(&agent, request);
             let changes = cache.update(
                 &mut rows,
                 &snapshot,
@@ -2157,12 +2351,10 @@ mod tests {
             assert_eq!(cache.historical_rebuilds, 1);
             assert_eq!(cache.historical_entries, 100);
             assert!(changes.dirty.iter().all(|i| *i >= 100));
-            if n > 0 {
-                assert_eq!(changes.appends.get(&100), Some(&("Agent\n".len() + n * 5)));
-            }
             assert_eq!(rows[100].text, format!("Agent\n{}", "chunk".repeat(n + 1)));
         }
         // Presentation/output invalidation is explicit and conservative.
+        cache.observe_response(&agent, request);
         let changes = cache.update(
             &mut rows,
             &snapshot,
@@ -2193,6 +2385,7 @@ mod tests {
         let outputs = HashMap::new();
         let mut cache = ContentCache::default();
         let mut rows = Vec::new();
+        cache.observe_response(&agent, request);
         cache.update(
             &mut rows,
             &snapshot,
@@ -2209,12 +2402,9 @@ mod tests {
         for text in ["\n", "first", "\n", "second", "\r\n", "third", "\n\n"] {
             update(
                 &mut snapshot,
-                RuntimeEvent::ReasoningDelta {
-                    agent: agent.clone(),
-                    request,
-                    text: text.into(),
-                },
+                delta_event(agent.clone(), request, BlockKind::Reasoning, text.into()),
             );
+            cache.observe_response(&agent, request);
             cache.update(
                 &mut rows,
                 &snapshot,
@@ -2249,12 +2439,9 @@ mod tests {
         }
         update(
             &mut snapshot,
-            RuntimeEvent::TextDelta {
-                agent: agent.clone(),
-                request,
-                text: "answer".into(),
-            },
+            delta_event(agent.clone(), request, BlockKind::Text, "answer".into()),
         );
+        cache.observe_response(&agent, request);
         cache.update(
             &mut rows,
             &snapshot,
@@ -2286,11 +2473,63 @@ mod tests {
                 .map(|r| (&r.key, &r.text, r.expandable, r.running))
                 .collect::<Vec<_>>()
         );
+        // Equal-length authoritative replacement and block-only closure must invalidate cards.
+        let provisional = snapshot.responses[&(agent.clone(), request)].reasoning();
+        let replacement = provisional.replace("first", "FIRST");
+        assert_eq!(replacement.len(), provisional.len());
+        response_event(
+            &mut snapshot,
+            &agent,
+            request,
+            ResponseEvent::BlockEnded {
+                item: "reasoning".into(),
+                block: "reasoning:0".into(),
+                content: BlockContent::Reasoning { text: replacement },
+            },
+        );
+        response_event(
+            &mut snapshot,
+            &agent,
+            request,
+            ResponseEvent::ItemEnded {
+                id: "reasoning".into(),
+                replay: Some(replay()),
+            },
+        );
+        cache.observe_response(&agent, request);
+        cache.update(
+            &mut rows,
+            &snapshot,
+            &projection,
+            EntryView {
+                agent: &agent,
+                view: &view,
+                thinking: false,
+                all_details: false,
+            },
+            &outputs,
+            0,
+        );
+        let expected = entries(
+            &snapshot,
+            &projection,
+            &agent,
+            &view,
+            &outputs,
+            false,
+            false,
+        );
+        assert!(rows == expected);
+        assert!(
+            rows.iter()
+                .filter(|entry| entry.surface == Surface::Reasoning)
+                .all(|entry| !entry.running)
+        );
         assert_eq!(cache.historical_rebuilds, 1);
     }
 
     #[test]
-    fn content_cache_expanded_request_appends_without_reconstructing_input() {
+    fn content_cache_expanded_request_updates_without_reconstructing_input() {
         let agent = AgentId::root(SessionId::from_bytes([33; 16]));
         let mut snapshot = ObservationSnapshot::default();
         let context = context(&mut snapshot, &agent);
@@ -2305,6 +2544,7 @@ mod tests {
         let outputs = HashMap::new();
         let mut cache = ContentCache::default();
         let mut rows = Vec::new();
+        cache.observe_response(&agent, request);
         cache.update(
             &mut rows,
             &snapshot,
@@ -2325,19 +2565,12 @@ mod tests {
             (false, " more"),
         ] {
             let event = if reasoning {
-                RuntimeEvent::ReasoningDelta {
-                    agent: agent.clone(),
-                    request,
-                    text: text.into(),
-                }
+                delta_event(agent.clone(), request, BlockKind::Reasoning, text.into())
             } else {
-                RuntimeEvent::TextDelta {
-                    agent: agent.clone(),
-                    request,
-                    text: text.into(),
-                }
+                delta_event(agent.clone(), request, BlockKind::Text, text.into())
             };
             update(&mut snapshot, event);
+            cache.observe_response(&agent, request);
             cache.update(
                 &mut rows,
                 &snapshot,
@@ -2387,7 +2620,90 @@ mod tests {
         assert_eq!(empty.plain_text(), "Arguments\n  No arguments");
     }
 
+    fn replay() -> ReplayEnvelope {
+        ReplayEnvelope {
+            version: 1,
+            protocol: "fixture".into(),
+            model: "fixture".into(),
+            scope: "reasoning".into(),
+            payload: serde_json::json!({"signature": "opaque"}),
+        }
+    }
+
+    fn delta_event(agent: AgentId, request: u64, kind: BlockKind, text: String) -> RuntimeEvent {
+        let item = match kind {
+            BlockKind::Text => "text",
+            BlockKind::Reasoning => "reasoning",
+            _ => unreachable!(),
+        };
+        RuntimeEvent::ResponseEvent {
+            agent,
+            request,
+            event: ResponseEvent::BlockDelta {
+                item: item.into(),
+                block: format!("{item}:0"),
+                delta: ContentDelta::Text(text),
+            },
+        }
+    }
+
+    fn response_event(
+        snapshot: &mut ObservationSnapshot,
+        agent: &AgentId,
+        request: u64,
+        event: ResponseEvent,
+    ) {
+        update(
+            snapshot,
+            RuntimeEvent::ResponseEvent {
+                agent: agent.clone(),
+                request,
+                event,
+            },
+        );
+    }
+
     fn update(snapshot: &mut ObservationSnapshot, event: RuntimeEvent) {
+        // Delta fixtures start their native item/block once; production receives only full protocol events.
+        if let RuntimeEvent::ResponseEvent {
+            agent,
+            request,
+            event: ResponseEvent::BlockDelta { item, block, .. },
+        } = &event
+        {
+            let exists = snapshot
+                .responses
+                .get(&(agent.clone(), *request))
+                .is_some_and(|live| live.snapshot().items.iter().any(|entry| entry.id == *item));
+            if !exists {
+                let (position, kind, block_kind) = if item == "reasoning" {
+                    (0, ItemKind::Reasoning, BlockKind::Reasoning)
+                } else {
+                    (1, ItemKind::Text, BlockKind::Text)
+                };
+                response_event(
+                    snapshot,
+                    agent,
+                    *request,
+                    ResponseEvent::ItemStarted {
+                        id: item.clone(),
+                        position,
+                        kind,
+                    },
+                );
+                response_event(
+                    snapshot,
+                    agent,
+                    *request,
+                    ResponseEvent::BlockStarted {
+                        item: item.clone(),
+                        id: block.clone(),
+                        position: 0,
+                        kind: block_kind,
+                    },
+                );
+            }
+        }
         snapshot.apply(ObservedEvent {
             revision: snapshot.revision + 1,
             event,
@@ -2469,11 +2785,7 @@ mod tests {
             for text in ["First step", "\nSecond step"] {
                 update(
                     &mut snapshot,
-                    RuntimeEvent::ReasoningDelta {
-                        agent: agent.clone(),
-                        request,
-                        text: text.into(),
-                    },
+                    delta_event(agent.clone(), request, BlockKind::Reasoning, text.into()),
                 );
             }
             let live = rows(&snapshot, &view);
@@ -2483,22 +2795,40 @@ mod tests {
             view.collapsed.insert(live[0].key.clone());
             update(
                 &mut snapshot,
-                RuntimeEvent::ReasoningDelta {
-                    agent: agent.clone(),
+                delta_event(
+                    agent.clone(),
                     request,
-                    text: "\nThird step".into(),
-                },
+                    BlockKind::Reasoning,
+                    "\nThird step".into(),
+                ),
             );
             assert_eq!(rows(&snapshot, &view)[0].text, "▸   Reasoning");
             view.collapsed.clear();
-            view.expanded.insert(live[0].key.clone());
+            response_event(
+                &mut snapshot,
+                &agent,
+                request,
+                ResponseEvent::BlockEnded {
+                    item: "reasoning".into(),
+                    block: "reasoning:0".into(),
+                    content: BlockContent::Reasoning {
+                        text: "First step\nSecond step\nThird step".into(),
+                    },
+                },
+            );
+            assert!(!rows(&snapshot, &view)[0].running);
+            response_event(
+                &mut snapshot,
+                &agent,
+                request,
+                ResponseEvent::ItemEnded {
+                    id: "reasoning".into(),
+                    replay: Some(replay()),
+                },
+            );
             update(
                 &mut snapshot,
-                RuntimeEvent::TextDelta {
-                    agent: agent.clone(),
-                    request,
-                    text: "Answer".into(),
-                },
+                delta_event(agent.clone(), request, BlockKind::Text, "Answer".into()),
             );
             let live = rows(&snapshot, &view);
             assert_eq!(live.len(), 2);
@@ -2523,17 +2853,13 @@ mod tests {
                 &agent,
                 SessionEvent::MessageCommitted {
                     message: Message::Assistant(vec![
-                        AssistantContent::Reasoning {
-                            text: "First step\nSecond step\nThird step".into(),
-                            opaque: None,
-                        },
-                        AssistantContent::Reasoning {
-                            text: String::new(),
-                            opaque: Some(serde_json::json!({"signature": "opaque"})),
-                        },
-                        AssistantContent::Text {
-                            text: "Answer".into(),
-                        },
+                        AssistantItem::reasoning(
+                            "reasoning",
+                            0,
+                            "First step\nSecond step\nThird step",
+                            Some(replay()),
+                        ),
+                        AssistantItem::text("text", 1, "Answer"),
                     ]),
                 },
             );
@@ -2569,16 +2895,17 @@ mod tests {
         for owner in [agent.clone(), agent.child(1)] {
             update(
                 &mut snapshot,
-                RuntimeEvent::ReasoningDelta {
-                    text: if owner == agent {
+                delta_event(
+                    owner.clone(),
+                    request,
+                    BlockKind::Reasoning,
+                    if owner == agent {
                         "Partial reasoning"
                     } else {
                         "Child reasoning"
                     }
                     .into(),
-                    agent: owner,
-                    request,
-                },
+                ),
             );
         }
         update(
@@ -2707,31 +3034,29 @@ mod tests {
         assert_eq!(waiting[0].text, "  Working");
         update(
             &mut snapshot,
-            RuntimeEvent::ReasoningDelta {
-                agent: agent.child(1),
+            delta_event(
+                agent.child(1),
                 request,
-                text: "Child only".into(),
-            },
+                BlockKind::Reasoning,
+                "Child only".into(),
+            ),
         );
         assert_eq!(rows(&snapshot)[0].text, "  Working");
         update(
             &mut snapshot,
-            RuntimeEvent::ReasoningDelta {
-                agent: agent.clone(),
+            delta_event(
+                agent.clone(),
                 request,
-                text: "One step".into(),
-            },
+                BlockKind::Reasoning,
+                "One step".into(),
+            ),
         );
         let reasoning = rows(&snapshot);
         assert_eq!(reasoning.len(), 1, "reasoning replaces the generic spinner");
         assert!(reasoning[0].running && !reasoning[0].expandable);
         update(
             &mut snapshot,
-            RuntimeEvent::TextDelta {
-                agent: agent.clone(),
-                request,
-                text: "Answer".into(),
-            },
+            delta_event(agent.clone(), request, BlockKind::Text, "Answer".into()),
         );
         assert_eq!(rows(&snapshot).iter().filter(|e| e.running).count(), 1);
         update(
@@ -2754,13 +3079,8 @@ mod tests {
             &agent,
             SessionEvent::MessageCommitted {
                 message: Message::Assistant(vec![
-                    AssistantContent::Reasoning {
-                        text: "One step".into(),
-                        opaque: None,
-                    },
-                    AssistantContent::Text {
-                        text: "Answer".into(),
-                    },
+                    AssistantItem::reasoning("reasoning", 0, "One step", None),
+                    AssistantItem::text("text", 1, "Answer"),
                 ]),
             },
         );
@@ -2787,14 +3107,16 @@ mod tests {
                 &agent,
                 SessionEvent::MessageCommitted {
                     message: Message::Assistant(vec![
-                        AssistantContent::Text {
-                            text: "Checking a file".into(),
-                        },
-                        AssistantContent::ToolCall(skyhook::provider::protocol::ToolCall {
-                            id: format!("call-{name}"),
-                            name: "read".into(),
-                            arguments: serde_json::json!({"path":"file"}),
-                        }),
+                        AssistantItem::text("text-6", 6, "Checking a file"),
+                        AssistantItem::tool_call(
+                            "tool",
+                            10,
+                            skyhook::provider::protocol::ToolCall {
+                                id: format!("call-{name}"),
+                                name: "read".into(),
+                                arguments: serde_json::json!({"path":"file"}),
+                            },
+                        ),
                     ]),
                 },
             );
@@ -2804,12 +3126,8 @@ mod tests {
                 &agent,
                 SessionEvent::MessageCommitted {
                     message: Message::Assistant(vec![
-                        AssistantContent::Text {
-                            text: "Answer part one".into(),
-                        },
-                        AssistantContent::Text {
-                            text: "Answer part two".into(),
-                        },
+                        AssistantItem::text("text-7", 7, "Answer part one"),
+                        AssistantItem::text("text-8", 8, "Answer part two"),
                     ]),
                 },
             );
@@ -3004,7 +3322,9 @@ mod tests {
                 &mut snapshot,
                 &caller,
                 SessionEvent::MessageCommitted {
-                    message: Message::Assistant(vec![AssistantContent::ToolCall(
+                    message: Message::Assistant(vec![AssistantItem::tool_call(
+                        "tool",
+                        10,
                         skyhook::provider::protocol::ToolCall {
                             id: "delegate".into(),
                             name: "agent".into(),
@@ -3216,11 +3536,12 @@ mod tests {
         let failed = request(&mut snapshot, &root, context);
         update(
             &mut snapshot,
-            RuntimeEvent::TextDelta {
-                agent: root.clone(),
-                request: failed,
-                text: "failed partial".into(),
-            },
+            delta_event(
+                root.clone(),
+                failed,
+                BlockKind::Text,
+                "failed partial".into(),
+            ),
         );
         record(
             &mut snapshot,
@@ -3236,9 +3557,11 @@ mod tests {
             &mut snapshot,
             &root,
             SessionEvent::MessageCommitted {
-                message: Message::Assistant(vec![AssistantContent::Text {
-                    text: "successful retry".into(),
-                }]),
+                message: Message::Assistant(vec![AssistantItem::text(
+                    "text",
+                    1,
+                    "successful retry",
+                )]),
             },
         );
         record(
@@ -3253,11 +3576,12 @@ mod tests {
         let interrupted = request(&mut snapshot, &root, context);
         update(
             &mut snapshot,
-            RuntimeEvent::TextDelta {
-                agent: root.clone(),
-                request: interrupted,
-                text: "interrupted partial".into(),
-            },
+            delta_event(
+                root.clone(),
+                interrupted,
+                BlockKind::Text,
+                "interrupted partial".into(),
+            ),
         );
         update(
             &mut snapshot,
@@ -3269,19 +3593,16 @@ mod tests {
         let current = request(&mut snapshot, &root, context);
         update(
             &mut snapshot,
-            RuntimeEvent::TextDelta {
-                agent: root.clone(),
-                request: current,
-                text: "current stream".into(),
-            },
+            delta_event(
+                root.clone(),
+                current,
+                BlockKind::Text,
+                "current stream".into(),
+            ),
         );
         update(
             &mut snapshot,
-            RuntimeEvent::TextDelta {
-                agent: child,
-                request: retry,
-                text: "child only".into(),
-            },
+            delta_event(child, retry, BlockKind::Text, "child only".into()),
         );
         let mut projection = Projection::default();
         projection.rebuild(&snapshot);
@@ -3326,9 +3647,7 @@ mod tests {
             &mut snapshot,
             &agent,
             SessionEvent::MessageCommitted {
-                message: Message::Assistant(vec![AssistantContent::Text {
-                    text: "done".into(),
-                }]),
+                message: Message::Assistant(vec![AssistantItem::text("text", 1, "done")]),
             },
         );
         snapshot
@@ -3475,11 +3794,7 @@ mod tests {
         for _ in 0..3 {
             update(
                 &mut snapshot,
-                RuntimeEvent::TextDelta {
-                    agent: agent.clone(),
-                    request: first,
-                    text: "chunk".into(),
-                },
+                delta_event(agent.clone(), first, BlockKind::Text, "chunk".into()),
             );
             projection.rebuild(&snapshot);
             let entries = entries(

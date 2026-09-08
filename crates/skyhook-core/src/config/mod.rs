@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     agent::{AgentProfile, HarnessBuilder},
-    provider::backends::flux::OpenAiApi,
+    provider::backends::OpenAiApi,
     provider::profile::ModelProfile,
     target::TargetsConfig,
 };
@@ -52,31 +52,18 @@ const fn default_child_depth() -> usize {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderConfig {
+    /// Standard OpenAI wire protocols, without endpoint or model presets.
     Openai {
-        #[serde(default)]
-        api: OpenAiApi,
-        #[serde(default = "openai_key_env")]
-        api_key_env: String,
-    },
-    Anthropic {
-        #[serde(default = "anthropic_key_env")]
-        api_key_env: String,
-    },
-    Codex,
-    Claude,
-    OpenaiCompatible {
         base_url: String,
-        #[serde(default)]
         api: OpenAiApi,
         api_key_env: Option<String>,
     },
-}
-
-fn openai_key_env() -> String {
-    "OPENAI_API_KEY".to_owned()
-}
-fn anthropic_key_env() -> String {
-    "ANTHROPIC_API_KEY".to_owned()
+    Anthropic {
+        base_url: String,
+        api_key_env: Option<String>,
+    },
+    /// ChatGPT subscription using Skyhook-owned OAuth credentials.
+    Codex,
 }
 
 impl Config {
@@ -114,10 +101,7 @@ impl Config {
             builder = builder.provider(name.clone(), providers::build(name, config)?);
         }
         for (name, profile) in &self.models {
-            let mut profile = profile.clone();
-            let provider = self.providers.get(&profile.provider);
-            providers::resolve_model(&mut profile, provider);
-            builder = builder.model_profile(name.clone(), profile);
+            builder = builder.model_profile(name.clone(), profile.clone());
         }
         for (name, profile) in &self.agents {
             builder = builder.agent_profile(name.clone(), profile.clone());
@@ -166,10 +150,17 @@ mod tests {
 
     #[test]
     fn every_provider_requires_both_model_limits() {
-        for kind in ["openai", "anthropic", "claude", "codex"] {
+        for (kind, endpoint) in [
+            (
+                "openai",
+                "base_url = 'https://example.com/v1'\napi = 'responses'\n",
+            ),
+            ("anthropic", "base_url = 'https://example.com/v1'\n"),
+            ("codex", ""),
+        ] {
             for limits in ["", "max_context = 128000\n", "max_output = 16384\n"] {
                 let text = format!(
-                    "default_model_profile = 'test'\n[providers.test]\nkind = '{kind}'\n[models.test]\nprovider = 'test'\nmodel = 'test'\n{limits}"
+                    "default_model_profile = 'test'\n[providers.test]\nkind = '{kind}'\n{endpoint}[models.test]\nprovider = 'test'\nmodel = 'test'\n{limits}"
                 );
                 assert!(toml::from_str::<Config>(&text).is_err(), "{text}");
             }
@@ -183,14 +174,9 @@ mod tests {
             (128000, 0, "max_output must be positive"),
             (128000, 128000, "max_output must be smaller"),
             (128000, 128001, "max_output must be smaller"),
-            (
-                u64::from(u32::MAX) + 2,
-                u64::from(u32::MAX) + 1,
-                "provider u32",
-            ),
         ] {
             let config: Config = toml::from_str(&format!(
-                "default_model_profile = 'test'\n[providers.test]\nkind = 'anthropic'\n[models.test]\nprovider = 'test'\nmodel = 'test'\nmax_context = {max_context}\nmax_output = {max_output}\n"
+                "default_model_profile = 'test'\n[providers.test]\nkind = 'anthropic'\nbase_url = 'https://api.anthropic.com/v1'\napi_key_env = 'SKYHOOK_TEST_MISSING_API_KEY'\n[models.test]\nprovider = 'test'\nmodel = 'test'\nmax_context = {max_context}\nmax_output = {max_output}\n"
             )).unwrap();
             let Err(ConfigError::Model(name, message)) = config.harness_builder(".", "test") else {
                 panic!("expected limit validation before credential loading");
@@ -217,6 +203,38 @@ mod tests {
             toml::from_str(include_str!("../../../../skyhook.example.toml")).unwrap();
         assert!(config.providers.contains_key("codex"));
         assert!(!config.models.is_empty());
+    }
+
+    #[test]
+    fn native_protocols_require_explicit_configuration_without_presets() {
+        for text in [
+            "kind = 'openai'\napi = 'responses'",
+            "kind = 'openai'\nbase_url = 'https://example.com/v1'",
+            "kind = 'anthropic'",
+            "kind = 'claude'",
+            "kind = 'openai_compatible'\nbase_url = 'https://example.com/v1'\napi = 'responses'",
+        ] {
+            assert!(toml::from_str::<ProviderConfig>(text).is_err(), "{text}");
+        }
+        for text in [
+            "kind = 'openai'\nbase_url = 'https://example.com/custom/v1'\napi = 'responses'",
+            "kind = 'openai'\nbase_url = 'http://localhost:8080/v1'\napi = 'chat_completions'",
+            "kind = 'anthropic'\nbase_url = 'https://example.com/v1'",
+            "kind = 'codex'",
+        ] {
+            assert!(toml::from_str::<ProviderConfig>(text).is_ok(), "{text}");
+        }
+    }
+
+    #[test]
+    fn native_configuration_passes_model_identifiers_through() {
+        let config: Config = toml::from_str(
+            "[providers.local]\nkind = 'openai'\nbase_url = 'http://localhost:8080/v1'\napi = 'responses'\n\
+             [models.local]\nprovider = 'local'\nmodel = 'exact-model-id'\nmax_context = 128000\nmax_output = 16384\n",
+        ).unwrap();
+        assert_eq!(config.models["local"].model, "exact-model-id");
+        // Provider construction must not connect to an endpoint or require a key.
+        assert!(config.harness_builder(".", "local").is_ok());
     }
 
     #[test]

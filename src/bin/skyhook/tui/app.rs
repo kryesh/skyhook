@@ -497,8 +497,7 @@ impl App {
         }
         let (records, repaint, content) = match &event.event {
             RuntimeEvent::Record(_) => (true, true, true),
-            RuntimeEvent::TextDelta { agent, .. }
-            | RuntimeEvent::ReasoningDelta { agent, .. }
+            RuntimeEvent::ResponseEvent { agent, .. }
             | RuntimeEvent::ResponseSettled { agent, .. } => {
                 (false, agent == &self.selected, agent == &self.selected)
             }
@@ -506,15 +505,13 @@ impl App {
             RuntimeEvent::Context { agent, .. } => (false, agent == &self.selected, false),
             RuntimeEvent::TurnCompleted { .. } => (false, true, false),
         };
-        // Only deltas guarantee an unchanged prefix. All other content changes may
-        // replace entries or alter their presentation and advance the cache revision.
-        let append_only = match &event.event {
-            RuntimeEvent::TextDelta { agent, request, .. }
-            | RuntimeEvent::ReasoningDelta { agent, request, .. } => {
-                self.content_cache.observe_response(agent, *request);
-                true
-            }
-            _ => false,
+        // Lifecycle updates can replace the live response, but do not change
+        // recorded history. Invalidate that response without rebuilding history.
+        let append_only = if let RuntimeEvent::ResponseEvent { agent, request, .. } = &event.event {
+            self.content_cache.observe_response(agent, *request);
+            true
+        } else {
+            false
         };
         self.snapshot.apply(event);
         self.deliver_queue();
@@ -2819,7 +2816,8 @@ impl App {
                 vec![
                     Item::new("field:/result/stdout", "stdout", ""),
                     Item::new("field:/result/stderr", "stderr", ""),
-                    Item::new("field:/console", "console", ""),
+                    Item::new("field:/result/console", "script console", ""),
+                    Item::new("field:/result/value", "script return value", ""),
                     Item::new("field:/result/content", "file content", ""),
                     Item::new("field:", "complete result", ""),
                     Item::new("search", "Search this field", "regex"),
@@ -2929,14 +2927,145 @@ mod tests {
     use crate::interaction::UiInteraction;
     use skyhook::{
         agent::{Question, QuestionOption},
+        provider::protocol::{
+            AssistantItem, BlockContent, BlockKind, ContentDelta, ItemKind, ResponseEvent,
+            StopReason,
+        },
         remote::EmbeddedShimCatalog,
     };
     use std::sync::Arc;
     use tokio::sync::oneshot;
 
+    fn response_event(app: &mut App, agent: &AgentId, request: u64, event: ResponseEvent) -> bool {
+        app.observe(ObservedEvent {
+            revision: app.snapshot.revision + 1,
+            event: RuntimeEvent::ResponseEvent {
+                agent: agent.clone(),
+                request,
+                event,
+            },
+        })
+    }
+
+    fn requested(app: &mut App, agent: &AgentId, request: u64) {
+        app.observe(ObservedEvent {
+            revision: app.snapshot.revision + 1,
+            event: RuntimeEvent::Record(Box::new(skyhook::session::EventRecord {
+                version: 1,
+                sequence: request,
+                timestamp_millis: 0,
+                agent: agent.clone(),
+                event: SessionEvent::ModelRequested {
+                    context: 0,
+                    messages: vec![],
+                    purpose: skyhook::session::ModelPurpose::Agent,
+                },
+            })),
+        });
+        app.refresh();
+    }
+
+    /// One explicitly started provider item/block; appends never synthesize lifecycle events.
+    struct TestBlock {
+        agent: AgentId,
+        request: u64,
+        item: String,
+        block: String,
+        kind: BlockKind,
+    }
+
+    impl TestBlock {
+        fn start(
+            app: &mut App,
+            agent: &AgentId,
+            request: u64,
+            item: &str,
+            position: usize,
+            kind: BlockKind,
+        ) -> Self {
+            let item_kind = match kind {
+                BlockKind::Text => ItemKind::Text,
+                BlockKind::Reasoning => ItemKind::Reasoning,
+                BlockKind::ToolCallArguments => ItemKind::ToolCall,
+            };
+            response_event(
+                app,
+                agent,
+                request,
+                ResponseEvent::ItemStarted {
+                    id: item.into(),
+                    position,
+                    kind: item_kind,
+                },
+            );
+            let block = format!("{item}:0");
+            response_event(
+                app,
+                agent,
+                request,
+                ResponseEvent::BlockStarted {
+                    item: item.into(),
+                    id: block.clone(),
+                    position: 0,
+                    kind,
+                },
+            );
+            Self {
+                agent: agent.clone(),
+                request,
+                item: item.into(),
+                block,
+                kind,
+            }
+        }
+
+        fn delta(&self, app: &mut App, text: &str) -> bool {
+            response_event(
+                app,
+                &self.agent,
+                self.request,
+                ResponseEvent::BlockDelta {
+                    item: self.item.clone(),
+                    block: self.block.clone(),
+                    delta: ContentDelta::Text(text.into()),
+                },
+            )
+        }
+
+        fn end(&self, app: &mut App, text: &str) {
+            let content = match self.kind {
+                BlockKind::Text => BlockContent::Text { text: text.into() },
+                BlockKind::Reasoning => BlockContent::Reasoning { text: text.into() },
+                BlockKind::ToolCallArguments => panic!("text fixture does not end tool arguments"),
+            };
+            response_event(
+                app,
+                &self.agent,
+                self.request,
+                ResponseEvent::BlockEnded {
+                    item: self.item.clone(),
+                    block: self.block.clone(),
+                    content,
+                },
+            );
+        }
+
+        fn end_item(&self, app: &mut App) {
+            response_event(
+                app,
+                &self.agent,
+                self.request,
+                ResponseEvent::ItemEnded {
+                    id: self.item.clone(),
+                    replay: None,
+                },
+            );
+        }
+    }
+
     async fn draft_fixture() -> (tempfile::TempDir, App) {
         let root = tempfile::tempdir().unwrap();
-        let config = toml::from_str("[providers.test]\nkind='openai_compatible'\napi='chat_completions'\nbase_url='http://127.0.0.1:1'\n[models.first]\nprovider='test'\nmodel='fixture'\nmax_context=128000\nmax_output=4096\n").unwrap();
+        let config = toml::from_str("[providers.test]\nkind='openai'\napi='chat_completions'\nbase_url='http://127.0.0.1:1'\n[models.first]\nprovider='test'\nmodel='fixture'\nmax_context=128000\nmax_output=4096\n").unwrap();
         let (interaction, _) = UiInteraction::new();
         let launch = Launch {
             config: Arc::new(config),
@@ -3316,14 +3445,9 @@ mod tests {
         let current = app.render.rows.line_identities();
         assert_eq!(cached.len(), current.len());
         assert!(cached.iter().zip(&current).all(|(a, b)| Arc::ptr_eq(a, b)));
-        app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event: RuntimeEvent::ReasoningDelta {
-                agent: agent.clone(),
-                request: 42,
-                text: "**Check** `file.rs`".into(),
-            },
-        });
+        let reasoning =
+            TestBlock::start(&mut app, &agent, 42, "reasoning", 0, BlockKind::Reasoning);
+        reasoning.delta(&mut app, "**Check** `file.rs`");
         let inline = draw(&mut app);
         assert!(inline.contains("⠙ Check file.rs"), "{inline}");
         assert!(!inline.contains("Reasoning"));
@@ -3351,14 +3475,7 @@ mod tests {
         key(&mut app, KeyCode::Enter, M::NONE);
         assert!(draw(&mut app).contains("⠙ Check file.rs"));
         assert!(!app.entries[0].expandable);
-        app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event: RuntimeEvent::ReasoningDelta {
-                agent: agent.clone(),
-                request: 42,
-                text: "\nThen **continue**.".into(),
-            },
-        });
+        reasoning.delta(&mut app, "\nThen **continue**.");
         let multi = draw(&mut app);
         assert!(app.entries[0].expandable);
         assert!(multi.contains("Then continue."));
@@ -3371,14 +3488,13 @@ mod tests {
             .selection
             .expect("expandable reasoning is text selectable");
         assert!(!super::super::render::selected_text(&app.render.rows, selection).is_empty());
-        app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event: RuntimeEvent::TextDelta {
-                agent: agent.clone(),
-                request: 42,
-                text: "Answer".into(),
-            },
-        });
+        reasoning.end(&mut app, "**Check** `file.rs`\nThen **continue**.");
+        let closed = draw(&mut app);
+        assert!(closed.contains("▸ Reasoning"), "{closed}");
+        assert!(!closed.contains("Then continue."));
+        reasoning.end_item(&mut app);
+        let answer = TestBlock::start(&mut app, &agent, 42, "answer", 1, BlockKind::Text);
+        answer.delta(&mut app, "Answer");
         let answering = draw(&mut app);
         assert!(answering.contains("▸ Reasoning"));
         assert!(answering.contains("Working"));
@@ -3448,15 +3564,10 @@ mod tests {
     async fn live_reasoning_can_be_collapsed_by_body_click_and_reopened_with_enter() {
         let (_root, mut app) = fixture().await;
         let agent = app.selected.clone();
-        let delta = |text: &str| RuntimeEvent::ReasoningDelta {
-            agent: agent.clone(),
-            request: 42,
-            text: text.into(),
-        };
-        app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event: delta("First step\nMore detail"),
-        });
+        requested(&mut app, &agent, 42);
+        let reasoning =
+            TestBlock::start(&mut app, &agent, 42, "reasoning", 0, BlockKind::Reasoning);
+        reasoning.delta(&mut app, "First step\nMore detail");
         let first = draw(&mut app);
         assert!(first.contains("First step"));
         assert!(first.contains("⠋ Reasoning"));
@@ -3470,28 +3581,55 @@ mod tests {
         let body = *tool_hits(&app).last().unwrap();
         click(&mut app, body);
         assert!(!draw(&mut app).contains("First step"));
-        app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event: delta("\nSecond step"),
-        });
+        reasoning.delta(&mut app, "\nSecond step");
         assert!(!draw(&mut app).contains("Second step"));
         key(&mut app, KeyCode::Enter, M::NONE);
         assert!(draw(&mut app).contains("Second step"));
 
-        app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event: RuntimeEvent::TextDelta {
-                agent: agent.clone(),
-                request: 42,
-                text: "Answer starts".into(),
-            },
-        });
+        let reasoning_key = app
+            .entries
+            .iter()
+            .find(|entry| entry.surface == model::Surface::Reasoning)
+            .unwrap()
+            .key
+            .clone();
+        reasoning.end(&mut app, "First step\nMore detail\nSecond step");
+        let closed = draw(&mut app);
+        // Stable item/block identity preserves an explicit user-open choice.
+        // Completion still ends the spinner immediately, before ItemEnded/answer.
+        assert!(closed.contains("▾ Reasoning"), "{closed}");
+        assert!(closed.contains("Second step"));
+        assert!(
+            !app.entries
+                .iter()
+                .find(|entry| entry.key == reasoning_key)
+                .unwrap()
+                .running
+        );
+        // Block closure, not a later item end or answer, controls the live-to-done transition.
+        app.tick();
+        assert!(draw(&mut app).contains("Second step"));
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert!(!draw(&mut app).contains("Second step"));
+        reasoning.end_item(&mut app);
+        let answer = TestBlock::start(&mut app, &agent, 42, "answer", 1, BlockKind::Text);
+        answer.delta(&mut app, "Answer starts");
         let answering = draw(&mut app);
         assert!(answering.contains("▸ Reasoning"));
         assert!(answering.contains("Answer starts"));
         assert!(!answering.contains("Second step"));
         assert!(!app.animating);
 
+        answer.end(&mut app, "Answer starts");
+        answer.end_item(&mut app);
+        response_event(
+            &mut app,
+            &agent,
+            42,
+            ResponseEvent::ResponseEnded {
+                stop_reason: StopReason::EndTurn,
+            },
+        );
         // Commit the same reasoning as the runtime does at successful completion.
         let sequence = app.snapshot.records.last_key_value().unwrap().0 + 1;
         app.observe(ObservedEvent {
@@ -3512,10 +3650,13 @@ mod tests {
                 agent,
                 event: SessionEvent::MessageCommitted {
                     message: skyhook::provider::protocol::Message::Assistant(vec![
-                        skyhook::provider::protocol::AssistantContent::Reasoning {
-                            text: "First step\nSecond step".into(),
-                            opaque: None,
-                        },
+                        AssistantItem::reasoning(
+                            "reasoning",
+                            0,
+                            "First step\nMore detail\nSecond step",
+                            None,
+                        ),
+                        AssistantItem::text("answer", 1, "Answer starts"),
                     ]),
                 },
             })),
@@ -3531,9 +3672,152 @@ mod tests {
         app.view().collapsed.clear();
         app.command("thinking");
         assert!(draw(&mut app).contains("Second step"));
-        let body = *tool_hits(&app).last().unwrap();
+        let body = app
+            .hits
+            .iter()
+            .rev()
+            .find_map(|(rect, hit)| match hit {
+                Hit::Entry(index, true)
+                    if app.entries[*index].surface == model::Surface::Reasoning =>
+                {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .unwrap();
         click(&mut app, body);
         assert!(!draw(&mut app).contains("Second step"));
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn consecutive_reasoning_parts_close_independently_and_preserve_toggles_on_handoff() {
+        let (_root, mut app) = fixture().await;
+        let agent = app.selected.clone();
+        requested(&mut app, &agent, 42);
+        let first = TestBlock::start(&mut app, &agent, 42, "first", 0, BlockKind::Reasoning);
+        first.delta(&mut app, "First thought\nFirst detail");
+        draw(&mut app);
+        let first_key = app
+            .entries
+            .iter()
+            .find(|entry| entry.surface == model::Surface::Reasoning)
+            .unwrap()
+            .key
+            .clone();
+        first.end(&mut app, "First thought\nFirst detail");
+        let closed = draw(&mut app);
+        assert!(closed.contains("▸ Reasoning"), "{closed}");
+        assert!(!closed.contains("First detail"));
+        assert!(
+            !app.entries
+                .iter()
+                .find(|entry| entry.key == first_key)
+                .unwrap()
+                .running
+        );
+
+        // Starting another reasoning item must not reopen or merge the closed part,
+        // even when the first ItemEnded has not yet arrived.
+        let second = TestBlock::start(&mut app, &agent, 42, "second", 1, BlockKind::Reasoning);
+        second.delta(&mut app, "Second thought\nSecond detail");
+        let screen = draw(&mut app);
+        assert!(!screen.contains("First detail"));
+        assert!(screen.contains("Second detail"), "{screen}");
+        let reasoning: Vec<_> = app
+            .entries
+            .iter()
+            .filter(|entry| entry.surface == model::Surface::Reasoning)
+            .collect();
+        assert_eq!(reasoning.len(), 2);
+        assert_eq!(reasoning[0].key, first_key);
+        assert!(!reasoning[0].running);
+        assert!(reasoning[1].running);
+        let second_key = reasoning[1].key.clone();
+        assert_ne!(first_key, second_key);
+        first.end_item(&mut app);
+        second.end(&mut app, "Second thought\nSecond detail");
+        let closed = draw(&mut app);
+        assert!(!closed.contains("First detail"));
+        assert!(!closed.contains("Second detail"));
+        assert!(
+            app.entries
+                .iter()
+                .filter(|entry| entry.surface == model::Surface::Reasoning)
+                .all(|entry| !entry.running)
+        );
+
+        // A deliberate toggle after block completion survives delayed item closure,
+        // response settlement and the committed-message replacement.
+        app.focus = Focus::Content;
+        app.view().row = app
+            .entries
+            .iter()
+            .position(|entry| entry.key == second_key)
+            .unwrap();
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert!(draw(&mut app).contains("Second detail"));
+        second.end_item(&mut app);
+        response_event(
+            &mut app,
+            &agent,
+            42,
+            ResponseEvent::ResponseEnded {
+                stop_reason: StopReason::EndTurn,
+            },
+        );
+        assert!(draw(&mut app).contains("Second detail"));
+        let sequence = app.snapshot.records.last_key_value().unwrap().0 + 1;
+        app.observe(ObservedEvent {
+            revision: app.snapshot.revision + 1,
+            event: RuntimeEvent::ResponseSettled {
+                agent: agent.clone(),
+                request: 42,
+                message: Some(sequence),
+                error: None,
+            },
+        });
+        assert!(draw(&mut app).contains("Second detail"));
+        app.observe(ObservedEvent {
+            revision: app.snapshot.revision + 1,
+            event: RuntimeEvent::Record(Box::new(skyhook::session::EventRecord {
+                version: 1,
+                sequence,
+                timestamp_millis: 0,
+                agent,
+                event: SessionEvent::MessageCommitted {
+                    message: skyhook::provider::protocol::Message::Assistant(vec![
+                        AssistantItem::reasoning("first", 0, "First thought\nFirst detail", None),
+                        AssistantItem::reasoning(
+                            "second",
+                            1,
+                            "Second thought\nSecond detail",
+                            None,
+                        ),
+                    ]),
+                },
+            })),
+        });
+        app.refresh();
+        let committed = draw(&mut app);
+        assert!(!committed.contains("First detail"));
+        assert!(
+            committed.contains("Second detail"),
+            "{committed} entries={:?}",
+            app.entries
+                .iter()
+                .map(|e| (&e.key, &e.text))
+                .collect::<Vec<_>>()
+        );
+        let keys: Vec<_> = app
+            .entries
+            .iter()
+            .filter(|entry| entry.surface == model::Surface::Reasoning)
+            .map(|entry| entry.key.clone())
+            .collect();
+        assert_eq!(keys, vec![first_key, second_key]);
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert!(!draw(&mut app).contains("Second detail"));
         app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
@@ -3706,27 +3990,14 @@ mod tests {
         mouse(&mut app, Rect::new(0, 2, 1, 1), MouseEventKind::Moved);
         assert!(!app.dirty);
         let child = app.selected.child(1);
-        let event = RuntimeEvent::TextDelta {
-            agent: child.clone(),
-            request: 42,
-            text: "child stream".into(),
-        };
-        assert!(!app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event
-        }));
-        assert_eq!(app.snapshot.responses[&(child, 42)].text, "child stream");
+        let hidden = TestBlock::start(&mut app, &child, 42, "child-text", 0, BlockKind::Text);
+        assert!(!hidden.delta(&mut app, "child stream"));
+        assert_eq!(app.snapshot.responses[&(child, 42)].text(), "child stream");
         assert!(!app.dirty);
         assert!(!app.content_dirty);
-        let event = RuntimeEvent::TextDelta {
-            agent: app.selected.clone(),
-            request: 43,
-            text: "visible stream".into(),
-        };
-        app.observe(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event,
-        });
+        let agent = app.selected.clone();
+        let visible = TestBlock::start(&mut app, &agent, 43, "visible-text", 0, BlockKind::Text);
+        visible.delta(&mut app, "visible stream");
         assert!(app.dirty);
         assert!(app.content_dirty);
         app.session.as_ref().unwrap().shutdown().await.unwrap();
@@ -3738,7 +4009,7 @@ mod tests {
     #[ignore = "manual optimized UI latency benchmark"]
     async fn incremental_rendering_benchmark() {
         use skyhook::{
-            provider::protocol::{AssistantContent, Message},
+            provider::protocol::{AssistantItem, Message},
             session::EventRecord,
         };
         for count in [100, 10_000] {
@@ -3748,9 +4019,8 @@ mod tests {
                 let sequence = first + offset;
                 app.snapshot.records.insert(sequence, EventRecord {
                     version: 1, sequence, timestamp_millis: 0, agent: app.selected.clone(),
-                    event: SessionEvent::MessageCommitted { message: Message::Assistant(vec![AssistantContent::Text {
-                        text: format!("Message {offset}: **important** detail with `code` and ordinary text."),
-                    }]) },
+                    event: SessionEvent::MessageCommitted { message: Message::Assistant(vec![AssistantItem::text(format!("message-{offset}"), 0,
+                        format!("Message {offset}: **important** detail with `code` and ordinary text."))]) },
                 });
             }
             app.refresh();
@@ -3775,54 +4045,39 @@ mod tests {
                     elapsed[50], elapsed[95]
                 );
                 for (reasoning, markdown) in [(false, false), (true, false), (true, true)] {
-                    let request = first + count + u64::from(reasoning) + u64::from(markdown);
+                    let request = first
+                        + count
+                        + u64::from(width) * 10
+                        + u64::from(reasoning)
+                        + u64::from(markdown);
                     let body = if markdown {
                         "# Heading\n\nA **stable** reasoning paragraph with `code`.\n\n```rust\nlet n = 1;\n```\n\n".repeat(14_000)
                     } else {
                         "A stable reasoning paragraph with ordinary text.\n\n".repeat(22_000)
                     };
-                    let event = if reasoning {
-                        RuntimeEvent::ReasoningDelta {
-                            agent: app.selected.clone(),
-                            request,
-                            text: body,
-                        }
-                    } else {
-                        RuntimeEvent::TextDelta {
-                            agent: app.selected.clone(),
-                            request,
-                            text: body,
-                        }
-                    };
+                    let agent = app.selected.clone();
+                    let stream = TestBlock::start(
+                        &mut app,
+                        &agent,
+                        request,
+                        "benchmark",
+                        0,
+                        if reasoning {
+                            BlockKind::Reasoning
+                        } else {
+                            BlockKind::Text
+                        },
+                    );
                     app.thinking = true;
                     app.invalidate_content();
-                    app.observe(ObservedEvent {
-                        revision: app.snapshot.revision + 1,
-                        event,
-                    });
+                    stream.delta(&mut app, &body);
                     terminal
                         .draw(|frame| super::super::render::draw(frame, &mut app))
                         .unwrap();
                     let mut elapsed = Vec::new();
                     for _ in 0..100 {
                         let start = Instant::now();
-                        let event = if reasoning {
-                            RuntimeEvent::ReasoningDelta {
-                                agent: app.selected.clone(),
-                                request,
-                                text: "next word ".into(),
-                            }
-                        } else {
-                            RuntimeEvent::TextDelta {
-                                agent: app.selected.clone(),
-                                request,
-                                text: "next word ".into(),
-                            }
-                        };
-                        app.observe(ObservedEvent {
-                            revision: app.snapshot.revision + 1,
-                            event,
-                        });
+                        stream.delta(&mut app, "next word ");
                         terminal
                             .draw(|frame| super::super::render::draw(frame, &mut app))
                             .unwrap();
@@ -4163,7 +4418,7 @@ mod tests {
     #[tokio::test]
     async fn tool_body_collapses_on_click_preserves_drag_and_never_highlights_spacer() {
         use skyhook::{
-            provider::protocol::{AssistantContent, Message, ToolCall},
+            provider::protocol::{AssistantItem, Message, ToolCall},
             session::{EventRecord, SessionEvent},
         };
         let (_root, mut app) = fixture().await;
@@ -4180,11 +4435,15 @@ mod tests {
                 timestamp_millis: 0,
                 agent: app.selected.clone(),
                 event: SessionEvent::MessageCommitted {
-                    message: Message::Assistant(vec![AssistantContent::ToolCall(ToolCall {
-                        id: "fixture".into(),
-                        name: "exec".into(),
-                        arguments: serde_json::json!({"argv": ["echo", "hello"]}),
-                    })]),
+                    message: Message::Assistant(vec![AssistantItem::tool_call(
+                        "fixture",
+                        0,
+                        ToolCall {
+                            id: "fixture".into(),
+                            name: "exec".into(),
+                            arguments: serde_json::json!({"argv": ["echo", "hello"]}),
+                        },
+                    )]),
                 },
             },
         );
@@ -5291,7 +5550,7 @@ mod tests {
     async fn resize_preserves_semantic_entries_and_reflows_rows() {
         let (_root, mut app) = fixture().await;
         use skyhook::{
-            provider::protocol::{AssistantContent, Message},
+            provider::protocol::{AssistantItem, Message},
             session::EventRecord,
         };
         let sequence = app.snapshot.records.last_key_value().unwrap().0 + 1;
@@ -5303,9 +5562,11 @@ mod tests {
                 timestamp_millis: 0,
                 agent: app.selected.clone(),
                 event: SessionEvent::MessageCommitted {
-                    message: Message::Assistant(vec![AssistantContent::Text {
-                        text: "A visible message wrapping differently at narrow widths. ".repeat(8),
-                    }]),
+                    message: Message::Assistant(vec![AssistantItem::text(
+                        "resize",
+                        0,
+                        "A visible message wrapping differently at narrow widths. ".repeat(8),
+                    )]),
                 },
             },
         );

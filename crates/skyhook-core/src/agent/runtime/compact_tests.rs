@@ -22,7 +22,10 @@ use crate::{
         Provider, ProviderContext, ProviderError, ProviderErrorKind, ProviderFuture,
         ResponseStream,
         profile::ModelProfile,
-        protocol::{AssistantContent, Message, ModelRequest, ResponseChunk, Usage, UserContent},
+        protocol::{
+            AssistantContent, BlockContent, Message, ModelRequest, ResponseChunk, StopReason,
+            Usage, UserContent, events_for_content,
+        },
     },
     session::{ModelPurpose, SessionEvent, project_history, reconstruct_model_request},
     tool::{ToolOutput, policy::CapabilitySet},
@@ -107,16 +110,17 @@ impl ProviderContext for Arc<ControlledProvider> {
             if consume_failure(streaming) {
                 let mut chunks = Vec::new();
                 if let Some(usage) = *provider.observed_failure_usage.lock().unwrap() {
-                    chunks.push(Ok(ResponseChunk::Usage { usage }));
+                    chunks.push(Ok(ResponseChunk::UsageUpdated { usage }));
                 }
                 if !summary && provider.agent_failure_tool_blocks.load(Ordering::SeqCst) {
-                    chunks.push(Ok(ResponseChunk::Block {
-                        block: AssistantContent::ToolCall(crate::provider::protocol::ToolCall {
+                    chunks.extend(events_for_content(&[AssistantContent::tool_call(
+                        "failed-attempt-tool", 0,
+                        crate::provider::protocol::ToolCall {
                             id: "failed-attempt-tool".into(),
                             name: "write".into(),
                             arguments: json!({"path":"must-not-exist", "content":"side effect"}),
-                        }),
-                    }));
+                        },
+                    )]).into_iter().map(Ok));
                 }
                 chunks.push(Err(error()));
                 return Ok(Box::pin(stream::iter(chunks)) as ResponseStream);
@@ -126,7 +130,7 @@ impl ProviderContext for Arc<ControlledProvider> {
                     .observed_failure_usage
                     .lock()
                     .unwrap()
-                    .map(|usage| Ok(ResponseChunk::Usage { usage }))
+                    .map(|usage| Ok(ResponseChunk::UsageUpdated { usage }))
                     .into_iter()
                     .collect();
                 return Ok(Box::pin(stream::iter(chunks)) as ResponseStream);
@@ -137,25 +141,39 @@ impl ProviderContext for Arc<ControlledProvider> {
                     provider.release.acquire().await.unwrap().forget();
                 }
                 if provider.summary_tools.load(Ordering::SeqCst) {
-                    vec![Ok(ResponseChunk::Block {
-                        block: AssistantContent::ToolCall(crate::provider::protocol::ToolCall {
-                            id: "never-execute".into(),
-                            name: "write".into(),
-                            arguments: json!({"path":"must-not-exist", "content":"side effect"}),
-                        }),
-                    })]
+                    response_chunks(
+                        vec![AssistantContent::tool_call(
+                            "never-execute",
+                            0,
+                            crate::provider::protocol::ToolCall {
+                                id: "never-execute".into(),
+                                name: "write".into(),
+                                arguments: json!({"path":"must-not-exist", "content":"side effect"}),
+                            },
+                        )],
+                        StopReason::ToolUse,
+                    )
                 } else {
-                    vec![
-                        Ok(ResponseChunk::ReasoningDelta {
-                            text: "Reasoning before the answer is not JSON and must not enter the continuation.".into(),
-                        }),
-                        Ok(ResponseChunk::TextDelta {
-                            text: provider.summary.lock().unwrap().clone(),
-                        }),
-                        Ok(ResponseChunk::Finished {
-                            truncated: provider.truncate.load(Ordering::SeqCst),
-                        }),
-                    ]
+                    response_chunks(
+                        vec![
+                            AssistantContent::reasoning(
+                                "reasoning/0",
+                                0,
+                                "Reasoning before the answer is not JSON and must not enter the continuation.",
+                                None,
+                            ),
+                            AssistantContent::text(
+                                "text/1",
+                                1,
+                                provider.summary.lock().unwrap().clone(),
+                            ),
+                        ],
+                        if provider.truncate.load(Ordering::SeqCst) {
+                            StopReason::MaxTokens
+                        } else {
+                            StopReason::EndTurn
+                        },
+                    )
                 }
             } else if provider.overflow.swap(false, Ordering::SeqCst) {
                 vec![Err(ProviderError {
@@ -163,13 +181,23 @@ impl ProviderContext for Arc<ControlledProvider> {
                     message: "prompt is too long".into(),
                 })]
             } else {
-                vec![Ok(ResponseChunk::TextDelta {
-                    text: "done".into(),
-                })]
+                response_chunks(
+                    vec![AssistantContent::text("text/0", 0, "done")],
+                    StopReason::EndTurn,
+                )
             };
             Ok(Box::pin(stream::iter(chunks)) as ResponseStream)
         })
     }
+}
+
+fn response_chunks(
+    items: Vec<AssistantContent>,
+    stop_reason: StopReason,
+) -> Vec<Result<ResponseChunk, ProviderError>> {
+    let mut events = events_for_content(&items);
+    events.push(ResponseChunk::ResponseEnded { stop_reason });
+    events.into_iter().map(Ok).collect()
 }
 
 fn consume_failure(counter: &AtomicUsize) -> bool {
@@ -253,9 +281,11 @@ async fn switched_model_controls_compaction_and_retries_for_the_whole_turn() {
         .runtime
         .commit(
             &session.root,
-            Message::Assistant(vec![AssistantContent::Text {
-                text: "research ".repeat(12_000),
-            }]),
+            Message::Assistant(vec![AssistantContent::text(
+                "text/0",
+                0,
+                "research ".repeat(12_000),
+            )]),
         )
         .await
         .unwrap();
@@ -345,9 +375,11 @@ impl Fixture {
             .runtime
             .commit(
                 &self.session.root,
-                Message::Assistant(vec![AssistantContent::Text {
-                    text: "research ".repeat(tokens * 4 / 9),
-                }]),
+                Message::Assistant(vec![AssistantContent::text(
+                    "text/0",
+                    0,
+                    "research ".repeat(tokens * 4 / 9),
+                )]),
             )
             .await
             .unwrap();
@@ -454,6 +486,89 @@ impl Fixture {
             )
             .await
     }
+}
+
+#[tokio::test]
+async fn compaction_hydrates_both_user_and_tool_image_blobs() {
+    let fixture = Fixture::new().await;
+    let runtime = &fixture.session.runtime;
+    let agent = &fixture.session.root;
+    let user_image = runtime
+        .store
+        .import_blob(b"user-image", "user.png".into(), "image/png".into())
+        .await
+        .unwrap();
+    let tool_image = runtime
+        .store
+        .import_blob(b"tool-image", "tool.png".into(), "image/png".into())
+        .await
+        .unwrap();
+    assert!(user_image.data_base64.is_none());
+    assert!(tool_image.data_base64.is_none());
+    runtime
+        .commit(
+            agent,
+            Message::User(vec![UserContent::Image {
+                image: user_image.clone(),
+            }]),
+        )
+        .await
+        .unwrap();
+    runtime
+        .commit(
+            agent,
+            Message::Assistant(vec![AssistantContent::tool_call(
+                "image-call",
+                0,
+                crate::provider::protocol::ToolCall {
+                    id: "image-call".into(),
+                    name: "read".into(),
+                    arguments: json!({"path":"tool.png"}),
+                },
+            )]),
+        )
+        .await
+        .unwrap();
+    runtime
+        .commit(
+            agent,
+            Message::Tool(vec![crate::provider::protocol::ToolResult {
+                call_id: "image-call".into(),
+                name: "read".into(),
+                result: json!({}),
+                images: vec![tool_image.clone()],
+                is_error: false,
+            }]),
+        )
+        .await
+        .unwrap();
+    fixture.compact(&CancellationToken::new()).await.unwrap();
+    {
+        let requests = fixture.provider.requests.lock().unwrap();
+        let request = requests
+            .iter()
+            .find(|request| request.response_schema.is_some())
+            .unwrap();
+        let mut images = Vec::new();
+        for message in &request.messages {
+            match message {
+                Message::User(parts) => images.extend(parts.iter().filter_map(|part| match part {
+                    UserContent::Image { image } => Some(image),
+                    _ => None,
+                })),
+                Message::Tool(results) => {
+                    images.extend(results.iter().flat_map(|result| &result.images))
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].sha256, user_image.sha256);
+        assert_eq!(images[0].data_base64.as_deref(), Some("dXNlci1pbWFnZQ=="));
+        assert_eq!(images[1].sha256, tool_image.sha256);
+        assert_eq!(images[1].data_base64.as_deref(), Some("dG9vbC1pbWFnZQ=="));
+    }
+    fixture.session.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -858,7 +973,7 @@ async fn large_plan_in_continuation_is_kept_without_a_post_compaction_token_cap(
         .runtime
         .commit(
             &fixture.session.root,
-            Message::Assistant(vec![AssistantContent::Text { text: plan.clone() }]),
+            Message::Assistant(vec![AssistantContent::text("text/0", 0, plan.clone())]),
         )
         .await
         .unwrap();
@@ -975,7 +1090,7 @@ async fn oversized_protected_content_still_reaches_the_working_provider() {
         .runtime
         .commit(
             &fixture.session.root,
-            Message::Assistant(vec![AssistantContent::Text { text: plan.clone() }]),
+            Message::Assistant(vec![AssistantContent::text("text/0", 0, plan.clone())]),
         )
         .await
         .unwrap();
@@ -995,9 +1110,9 @@ async fn oversized_protected_content_still_reaches_the_working_provider() {
     assert!(compaction::estimate_request(working) > profile().max_context);
     assert!(working.messages.iter().any(|message| {
         match message {
-            Message::Assistant(blocks) => blocks
-                .iter()
-                .any(|block| matches!(block, AssistantContent::Text { text } if text == &plan)),
+            Message::Assistant(blocks) => blocks.iter().flat_map(|item| &item.blocks).any(
+                |block| matches!(&block.content, BlockContent::Text { text } if text == &plan),
+            ),
             Message::User(blocks) => blocks.iter().any(
                 |block| matches!(block, UserContent::Compaction { text } if text.contains(&plan)),
             ),

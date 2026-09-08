@@ -31,7 +31,9 @@ pub use event::{
 };
 pub use request::{project_history, reconstruct_model_request, reconstruct_model_request_indexed};
 
-pub const SESSION_FORMAT_VERSION: u16 = 1;
+// Version 2 preserves assistant item/block identities and item-scoped replay.
+// The former flat assistant content format is intentionally not migrated.
+pub const SESSION_FORMAT_VERSION: u16 = 2;
 
 /// Restore applied model and instructions, including sessions predating per-turn selection.
 pub fn agent_selection(
@@ -352,16 +354,27 @@ impl SessionStore {
     }
 }
 
-fn parse_lines<T>(bytes: &[u8]) -> Result<Vec<T>, SessionError>
-where
-    T: for<'de> Deserialize<'de>,
-{
+fn parse_lines(bytes: &[u8]) -> Result<Vec<EventRecord>, SessionError> {
+    #[derive(Deserialize)]
+    struct Header {
+        version: u16,
+    }
+
     bytes
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
-        .map(serde_json::from_slice)
-        .collect::<Result<_, _>>()
-        .map_err(SessionError::from)
+        .map(|line| {
+            // Check the header before deserializing the version-specific event
+            // body. An old assistant enum must report a version mismatch, not
+            // a misleading missing item/block field error, regardless of JSON
+            // object field order.
+            let header: Header = serde_json::from_slice(line)?;
+            if header.version != SESSION_FORMAT_VERSION {
+                return Err(SessionError::UnsupportedVersion(header.version));
+            }
+            Ok(serde_json::from_slice(line)?)
+        })
+        .collect()
 }
 
 async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
@@ -482,12 +495,36 @@ mod tests {
             .unwrap();
         store.close().await.unwrap();
         let mut record = serde_json::to_value(record).unwrap();
-        record["version"] = 2.into();
-        fs::write(path, format!("{record}\n")).await.unwrap();
-        assert!(matches!(
-            SessionStore::open(root.path(), id).await,
-            Err(SessionError::UnsupportedVersion(2))
-        ));
+        for version in [1, SESSION_FORMAT_VERSION + 1] {
+            record["version"] = version.into();
+            // The old flat enum cannot deserialize as an item. Put the body
+            // before the version to ensure field ordering cannot obscure the
+            // actionable format-version error.
+            record["event"] = serde_json::json!({
+                "type": "message_committed",
+                "message": {"role": "assistant", "content": [
+                    {"type": "reasoning", "text": "old", "opaque": {"signature": "old"}}
+                ]}
+            });
+            let mut ordered = serde_json::Map::new();
+            ordered.insert("event".into(), record["event"].clone());
+            for (key, value) in record.as_object().unwrap() {
+                if key != "event" && key != "version" {
+                    ordered.insert(key.clone(), value.clone());
+                }
+            }
+            ordered.insert("version".into(), version.into());
+            let serialized = serde_json::to_string(&ordered).unwrap();
+            fs::write(&path, format!("{serialized}\n")).await.unwrap();
+            assert!(matches!(
+                SessionStore::open(root.path(), id).await,
+                Err(SessionError::UnsupportedVersion(found)) if found == version
+            ));
+            assert!(matches!(
+                SessionStore::read_records(root.path(), id).await,
+                Err(SessionError::UnsupportedVersion(found)) if found == version
+            ));
+        }
     }
 
     #[tokio::test]

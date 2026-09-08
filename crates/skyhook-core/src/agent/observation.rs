@@ -2,6 +2,7 @@
 use super::RuntimeEvent;
 use crate::{
     identity::AgentId,
+    provider::protocol::{BlockKind, ResponseAssembler, ResponseSnapshot},
     session::{EventRecord, SessionEvent},
 };
 use std::{
@@ -29,11 +30,37 @@ pub struct ContextUsage {
 
 #[derive(Clone, Debug, Default)]
 pub struct LiveResponse {
-    pub text: String,
-    pub reasoning: String,
+    /// The sole source of truth for provider-native response state.
+    assembler: ResponseAssembler,
     pub message: Option<u64>,
     pub settled: bool,
     pub error: Option<String>,
+}
+
+impl LiveResponse {
+    pub fn snapshot(&self) -> ResponseSnapshot {
+        self.assembler.snapshot()
+    }
+
+    /// Derived aggregate for compact previews; live views should use snapshot items.
+    pub fn text(&self) -> String {
+        self.preview(BlockKind::Text)
+    }
+
+    /// Derived aggregate for compact previews; live views should use snapshot items.
+    pub fn reasoning(&self) -> String {
+        self.preview(BlockKind::Reasoning)
+    }
+
+    fn preview(&self, kind: BlockKind) -> String {
+        self.snapshot()
+            .items
+            .into_iter()
+            .flat_map(|item| item.blocks)
+            .filter(|block| block.kind == kind)
+            .map(|block| block.text)
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -78,27 +105,15 @@ impl ObservationSnapshot {
                 }
                 self.records.insert(record.sequence, *record);
             }
-            RuntimeEvent::TextDelta {
+            RuntimeEvent::ResponseEvent {
                 agent,
                 request,
-                text,
+                event,
             } => {
-                self.responses
-                    .entry((agent, request))
-                    .or_default()
-                    .text
-                    .push_str(&text);
-            }
-            RuntimeEvent::ReasoningDelta {
-                agent,
-                request,
-                text,
-            } => {
-                self.responses
-                    .entry((agent, request))
-                    .or_default()
-                    .reasoning
-                    .push_str(&text);
+                let response = self.responses.entry((agent, request)).or_default();
+                if let Err(error) = response.assembler.push(&event) {
+                    response.error = Some(error.to_string());
+                }
             }
             RuntimeEvent::ResponseSettled {
                 agent,
@@ -113,7 +128,10 @@ impl ObservationSnapshot {
                     let response = self.responses.entry(key).or_default();
                     response.message = message;
                     response.settled = true;
-                    response.error = error;
+                    // Do not erase a protocol validation failure on successful settlement.
+                    if error.is_some() {
+                        response.error = error;
+                    }
                 }
             }
             RuntimeEvent::Activity { agent, activity } => {
@@ -187,6 +205,9 @@ impl RuntimeEvents {
         }
     }
 
+    // Keep the broadcast API's ownership-preserving error contract; callers can
+    // recover the original event when there are no subscribers.
+    #[allow(clippy::result_large_err)]
     pub fn send(
         &self,
         event: RuntimeEvent,
@@ -210,20 +231,242 @@ impl RuntimeEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{identity::SessionId, provider::protocol::Message};
+    use crate::{
+        identity::SessionId,
+        provider::protocol::{BlockContent, ContentDelta, ItemKind, Message, ResponseEvent, Usage},
+    };
+
+    fn emit(hub: &RuntimeEvents, agent: &AgentId, event: ResponseEvent) {
+        let _ = hub.send(RuntimeEvent::ResponseEvent {
+            agent: agent.clone(),
+            request: 7,
+            event,
+        });
+    }
+
+    fn start_block(
+        hub: &RuntimeEvents,
+        agent: &AgentId,
+        item: &str,
+        block: &str,
+        position: usize,
+        kind: BlockKind,
+    ) {
+        emit(
+            hub,
+            agent,
+            ResponseEvent::BlockStarted {
+                item: item.into(),
+                id: block.into(),
+                position,
+                kind,
+            },
+        );
+    }
+
+    #[test]
+    fn ended_reasoning_blocks_remain_ended_while_item_is_open() {
+        let hub = RuntimeEvents::new(&[]);
+        let agent = AgentId::root(SessionId::from_bytes([2; 16]));
+        emit(
+            &hub,
+            &agent,
+            ResponseEvent::ItemStarted {
+                id: "reasoning".into(),
+                position: 0,
+                kind: ItemKind::Reasoning,
+            },
+        );
+        start_block(&hub, &agent, "reasoning", "first", 0, BlockKind::Reasoning);
+        emit(
+            &hub,
+            &agent,
+            ResponseEvent::BlockDelta {
+                item: "reasoning".into(),
+                block: "first".into(),
+                delta: ContentDelta::Text("partial".into()),
+            },
+        );
+        emit(
+            &hub,
+            &agent,
+            ResponseEvent::BlockEnded {
+                item: "reasoning".into(),
+                block: "first".into(),
+                content: BlockContent::Reasoning {
+                    text: "first".into(),
+                },
+            },
+        );
+        let boundary = hub.observe().snapshot.responses[&(agent.clone(), 7)].snapshot();
+        assert!(!boundary.items[0].ended);
+        assert!(boundary.items[0].blocks[0].ended);
+        assert_eq!(boundary.items[0].blocks[0].text, "first");
+
+        start_block(&hub, &agent, "reasoning", "second", 1, BlockKind::Reasoning);
+        emit(
+            &hub,
+            &agent,
+            ResponseEvent::BlockEnded {
+                item: "reasoning".into(),
+                block: "second".into(),
+                content: BlockContent::Reasoning {
+                    text: "second".into(),
+                },
+            },
+        );
+        emit(
+            &hub,
+            &agent,
+            ResponseEvent::ItemStarted {
+                id: "answer".into(),
+                position: 1,
+                kind: ItemKind::Text,
+            },
+        );
+        start_block(&hub, &agent, "answer", "text", 0, BlockKind::Text);
+        emit(
+            &hub,
+            &agent,
+            ResponseEvent::BlockDelta {
+                item: "answer".into(),
+                block: "text".into(),
+                delta: ContentDelta::Text("answer".into()),
+            },
+        );
+        let observation = hub.observe();
+        let response = &observation.snapshot.responses[&(agent, 7)];
+        let snapshot = response.snapshot();
+        assert_eq!(snapshot.items.len(), 2);
+        assert!(!snapshot.items[0].ended);
+        assert_eq!(snapshot.items[0].blocks.len(), 2);
+        assert!(
+            snapshot.items[0]
+                .blocks
+                .iter()
+                .all(|block| block.ended && block.content.is_some())
+        );
+        assert!(!snapshot.items[1].blocks[0].ended);
+        assert_eq!(response.reasoning(), "firstsecond");
+        assert_eq!(response.text(), "answer");
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn usage_updates_are_cumulative_snapshots_not_increments() {
+        let hub = RuntimeEvents::new(&[]);
+        let agent = AgentId::root(SessionId::from_bytes([3; 16]));
+        let usage = Usage {
+            input_tokens: 10,
+            cached_input_tokens: 5,
+            output_tokens: 2,
+        };
+        emit(&hub, &agent, ResponseEvent::UsageUpdated { usage });
+        let final_usage = Usage {
+            output_tokens: 7,
+            ..usage
+        };
+        emit(
+            &hub,
+            &agent,
+            ResponseEvent::UsageUpdated { usage: final_usage },
+        );
+        emit(
+            &hub,
+            &agent,
+            ResponseEvent::UsageUpdated { usage: final_usage },
+        );
+        assert_eq!(
+            hub.observe().snapshot.responses[&(agent, 7)]
+                .snapshot()
+                .usage,
+            final_usage
+        );
+    }
+
+    #[test]
+    fn invalid_event_records_error_without_mutation_or_panic() {
+        let hub = RuntimeEvents::new(&[]);
+        let agent = AgentId::root(SessionId::from_bytes([4; 16]));
+        emit(
+            &hub,
+            &agent,
+            ResponseEvent::ItemStarted {
+                id: "text".into(),
+                position: 0,
+                kind: ItemKind::Text,
+            },
+        );
+        let before = hub.observe().snapshot.responses[&(agent.clone(), 7)].snapshot();
+        emit(
+            &hub,
+            &agent,
+            ResponseEvent::BlockDelta {
+                item: "text".into(),
+                block: "missing".into(),
+                delta: ContentDelta::Text("invalid".into()),
+            },
+        );
+        let _ = hub.send(RuntimeEvent::ResponseSettled {
+            agent: agent.clone(),
+            request: 7,
+            message: None,
+            error: None,
+        });
+        let observation = hub.observe();
+        let response = &observation.snapshot.responses[&(agent, 7)];
+        assert_eq!(response.snapshot(), before);
+        assert!(response.error.is_some());
+        assert!(response.settled);
+    }
+
     #[test]
     fn snapshot_handoff_and_commit_do_not_duplicate_streams() {
         let hub = RuntimeEvents::new(&[]);
         let agent = AgentId::root(SessionId::from_bytes([1; 16]));
-        let _ = hub.send(RuntimeEvent::TextDelta {
-            agent: agent.clone(),
-            request: 2,
-            text: "hello".into(),
-        });
+        emit(
+            &hub,
+            &agent,
+            ResponseEvent::ItemStarted {
+                id: "text".into(),
+                position: 0,
+                kind: ItemKind::Text,
+            },
+        );
+        start_block(&hub, &agent, "text", "text", 0, BlockKind::Text);
+        emit(
+            &hub,
+            &agent,
+            ResponseEvent::BlockDelta {
+                item: "text".into(),
+                block: "text".into(),
+                delta: ContentDelta::Text("hello".into()),
+            },
+        );
         let mut observation = hub.observe();
+        assert_eq!(
+            observation.snapshot.responses[&(agent.clone(), 7)].text(),
+            "hello"
+        );
+        emit(
+            &hub,
+            &agent,
+            ResponseEvent::BlockDelta {
+                item: "text".into(),
+                block: "text".into(),
+                delta: ContentDelta::Text("!".into()),
+            },
+        );
+        let update = observation.updates.try_recv().unwrap();
+        observation.snapshot.apply(update.clone());
+        observation.snapshot.apply(update);
+        assert_eq!(
+            observation.snapshot.responses[&(agent.clone(), 7)].text(),
+            "hello!"
+        );
         let _ = hub.send(RuntimeEvent::ResponseSettled {
             agent: agent.clone(),
-            request: 2,
+            request: 7,
             message: Some(3),
             error: None,
         });
@@ -242,6 +485,6 @@ mod tests {
         }
         assert!(observation.snapshot.responses.is_empty());
         assert_eq!(observation.snapshot.records.len(), 1);
-        assert_eq!(observation.snapshot.revision, 3);
+        assert_eq!(observation.snapshot.revision, 6);
     }
 }

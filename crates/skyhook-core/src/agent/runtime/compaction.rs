@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     agent::todo::TodoItem,
-    provider::protocol::{AssistantContent, Message, ModelRequest, UserContent},
+    provider::protocol::{BlockContent, Message, ModelRequest, UserContent},
 };
 
 /// Required continuation sections, shared by the response schema and strict parser.
@@ -152,21 +152,26 @@ pub(crate) fn estimate_message(message: &Message) -> u64 {
                 UserContent::Image { .. } => 2_048,
             })
             .sum::<u64>(),
-        Message::Assistant(blocks) => blocks
+        Message::Assistant(items) => items
             .iter()
-            .map(|block| match block {
-                AssistantContent::Text { text } => 4 + estimate_text(text),
-                AssistantContent::Reasoning { text, opaque } => {
-                    4 + estimate_text(text)
-                        + opaque
-                            .as_ref()
-                            .map_or(0, |opaque| estimate_text(&opaque.to_string()))
-                }
-                AssistantContent::ToolCall(call) => {
-                    12 + estimate_text(&call.id)
-                        + estimate_text(&call.name)
-                        + estimate_text(&call.arguments.to_string())
-                }
+            .map(|item| {
+                item.blocks
+                    .iter()
+                    .map(|block| match &block.content {
+                        BlockContent::Text { text } | BlockContent::Reasoning { text } => {
+                            4 + estimate_text(text)
+                        }
+                        BlockContent::ToolCall(call) => {
+                            12 + estimate_text(&call.id)
+                                + estimate_text(&call.name)
+                                + estimate_text(&call.arguments.to_string())
+                        }
+                    })
+                    .sum::<u64>()
+                    // Opaque replay belongs to the item, not each visible block.
+                    + item.replay.as_ref().map_or(0, |replay| {
+                        estimate_text(&replay.payload.to_string())
+                    })
             })
             .sum::<u64>(),
         Message::Tool(results) => results
@@ -175,7 +180,6 @@ pub(crate) fn estimate_message(message: &Message) -> u64 {
                 12 + estimate_text(&result.call_id)
                     + estimate_text(&result.name)
                     + estimate_text(&result.result.to_string())
-                    + estimate_text(&result.console_output)
                     + result.images.len() as u64 * 2_048
             })
             .sum::<u64>(),
@@ -456,6 +460,83 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("conversation evidence")
+        );
+    }
+
+    #[test]
+    fn estimate_counts_all_visible_blocks_and_opaque_replay_once_per_item() {
+        use crate::provider::protocol::{
+            AssistantBlock, AssistantItem, ItemKind, ReplayEnvelope, ToolCall,
+        };
+        let payload = serde_json::json!({"encrypted_content": "opaque".repeat(100)});
+        let mut items: Vec<_> = [3, 3, 2]
+            .into_iter()
+            .enumerate()
+            .map(|(position, count)| AssistantItem {
+                id: format!("item-{position}"),
+                position,
+                kind: ItemKind::Reasoning,
+                blocks: (0..count)
+                    .map(|part| AssistantBlock {
+                        id: format!("block-{position}-{part}"),
+                        position: part,
+                        content: BlockContent::Reasoning {
+                            text: "visible summary".into(),
+                        },
+                    })
+                    .collect(),
+                replay: Some(ReplayEnvelope {
+                    version: 1,
+                    protocol: "responses".into(),
+                    model: "model".into(),
+                    scope: "reasoning".into(),
+                    payload: payload.clone(),
+                }),
+            })
+            .collect();
+        let reasoning_cost =
+            8 * (4 + estimate_text("visible summary")) + 3 * estimate_text(&payload.to_string());
+        assert_eq!(
+            estimate_message(&Message::Assistant(items.clone())),
+            8 + reasoning_cost
+        );
+        items.push(AssistantItem::text("answer", 3, "visible answer"));
+        let call = ToolCall {
+            id: "call".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path":"file"}),
+        };
+        let call_cost = 12
+            + estimate_text(&call.id)
+            + estimate_text(&call.name)
+            + estimate_text(&call.arguments.to_string());
+        items.push(AssistantItem::tool_call("tool", 4, call));
+        assert_eq!(
+            estimate_message(&Message::Assistant(items)),
+            8 + reasoning_cost + 4 + estimate_text("visible answer") + call_cost
+        );
+    }
+
+    #[test]
+    fn estimate_counts_replay_even_without_visible_blocks() {
+        use crate::provider::protocol::{AssistantItem, ItemKind, ReplayEnvelope};
+        let payload = serde_json::json!({"encrypted_content": "hidden reasoning"});
+        let item = AssistantItem {
+            id: "hidden".into(),
+            position: 0,
+            kind: ItemKind::Reasoning,
+            blocks: vec![],
+            replay: Some(ReplayEnvelope {
+                version: 1,
+                protocol: "responses".into(),
+                model: "model".into(),
+                scope: "reasoning".into(),
+                payload: payload.clone(),
+            }),
+        };
+        assert_eq!(
+            estimate_message(&Message::Assistant(vec![item])),
+            8 + estimate_text(&payload.to_string())
         );
     }
 

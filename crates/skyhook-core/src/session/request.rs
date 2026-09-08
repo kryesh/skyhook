@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     identity::AgentId,
-    provider::protocol::{AssistantContent, Message, ModelRequest},
+    provider::protocol::{BlockContent, Message, ModelRequest},
 };
 
 use super::{ContextMessage, EventRecord, ModelPurpose, SessionError, SessionEvent};
@@ -164,7 +164,8 @@ pub(super) fn validate_compaction(
             Message::Assistant(content)
                 if content
                     .iter()
-                    .any(|block| matches!(block, AssistantContent::ToolCall(_))) =>
+                    .flat_map(|item| &item.blocks)
+                    .any(|block| matches!(&block.content, BlockContent::ToolCall(_))) =>
             {
                 index.checked_add(1)
             }
@@ -203,8 +204,9 @@ fn valid_tool_pair(assistant: &Message, tool: &Message) -> bool {
     };
     let calls: Vec<_> = content
         .iter()
-        .filter_map(|block| match block {
-            AssistantContent::ToolCall(call) => Some((&call.id, &call.name)),
+        .flat_map(|item| &item.blocks)
+        .filter_map(|block| match &block.content {
+            BlockContent::ToolCall(call) => Some((&call.id, &call.name)),
             _ => None,
         })
         .collect();
@@ -340,11 +342,126 @@ mod tests {
     use crate::{
         identity::AgentId,
         provider::protocol::{
-            AssistantContent, SystemSegment, ToolDefinition, ToolResult, UserContent,
+            AssistantBlock, AssistantItem, ItemKind, ReplayEnvelope, SystemSegment, ToolDefinition,
+            ToolResult, UserContent,
         },
         session::SessionStore,
     };
     use serde_json::json;
+
+    #[tokio::test]
+    async fn persisted_three_three_two_summary_blocks_keep_item_replay_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(directory.path()).await.unwrap();
+        let agent = AgentId::root(store.id());
+        let message = Message::Assistant(
+            [3, 3, 2].into_iter().enumerate().map(|(position, count)| {
+                AssistantItem {
+                    id: format!("reasoning-{position}"),
+                    position,
+                    kind: ItemKind::Reasoning,
+                    blocks: (0..count).map(|part| AssistantBlock {
+                        id: format!("summary-{position}-{part}"),
+                        position: part,
+                        content: BlockContent::Reasoning {
+                            text: format!("summary {position}/{part}"),
+                        },
+                    }).collect(),
+                    replay: Some(ReplayEnvelope {
+                        version: 1,
+                        protocol: "responses".into(),
+                        model: "reasoning-model".into(),
+                        scope: "reasoning".into(),
+                        payload: json!({"encrypted_content": format!("opaque-{position}"), "unknown": {"keep": [1, true, null]}}),
+                    }),
+                }
+            }).collect(),
+        );
+        let source = store
+            .append(
+                agent.clone(),
+                SessionEvent::MessageCommitted {
+                    message: message.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let template = ModelRequest {
+            model: "reasoning-model".into(),
+            reasoning: None,
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            response_schema: None,
+            max_output_tokens: None,
+            correlation: None,
+        };
+        let context = store
+            .append(
+                agent.clone(),
+                SessionEvent::ModelContext {
+                    provider: "responses".into(),
+                    template: template.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let request = store
+            .append(
+                agent.clone(),
+                SessionEvent::ModelRequested {
+                    context: context.sequence,
+                    purpose: ModelPurpose::Agent,
+                    messages: vec![
+                        ContextMessage::Source {
+                            sequence: source.sequence,
+                        },
+                        ContextMessage::Inline {
+                            message: message.clone(),
+                        },
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+        let id = store.id();
+        let journal = store.directory().join("events.jsonl");
+        let before = store.records().await;
+        store.close().await.unwrap();
+
+        let archived = SessionStore::read_records(directory.path(), id)
+            .await
+            .unwrap();
+        let (reopened, restored) = SessionStore::open(directory.path(), id).await.unwrap();
+        assert_eq!(archived, before);
+        assert_eq!(restored, before);
+        assert_eq!(
+            project_history(&restored, &agent).unwrap(),
+            vec![(source.sequence, message.clone())]
+        );
+        let (_, replayed) = reconstruct_model_request(&restored, request.sequence).unwrap();
+        let mut expected = template;
+        expected.messages = vec![message.clone(), message];
+        assert_eq!(replayed, expected);
+        assert_indexed_equivalent(&restored, request.sequence);
+        // One envelope per item per persisted message (source and inline),
+        // never one envelope per summary block.
+        let journal = tokio::fs::read_to_string(journal).await.unwrap();
+        for position in 0..3 {
+            assert_eq!(journal.matches(&format!("opaque-{position}")).count(), 2);
+        }
+        let Message::Assistant(items) = &replayed.messages[0] else {
+            panic!("assistant")
+        };
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.blocks.len())
+                .collect::<Vec<_>>(),
+            vec![3, 3, 2]
+        );
+        reopened.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn replay_preserves_context_boundaries_and_image_payloads() {
@@ -364,15 +481,22 @@ mod tests {
                 image: image.clone(),
             },
         ]);
-        let assistant = Message::Assistant(vec![AssistantContent::Reasoning {
-            text: "reasoning".into(),
-            opaque: Some(json!({"signature":"preserve"})),
-        }]);
+        let assistant = Message::Assistant(vec![AssistantItem::reasoning(
+            "reasoning-item",
+            0,
+            "reasoning",
+            Some(ReplayEnvelope {
+                version: 1,
+                protocol: "test".into(),
+                model: "original-model".into(),
+                scope: "reasoning".into(),
+                payload: json!({"signature":"preserve"}),
+            }),
+        )]);
         let tool = Message::Tool(vec![ToolResult {
             call_id: "read-1".into(),
             name: "read".into(),
             result: json!({"ok":true}),
-            console_output: "console output".into(),
             images: vec![image],
             is_error: false,
         }]);
@@ -861,6 +985,46 @@ mod tests {
     }
 
     #[test]
+    fn tool_pair_matches_calls_in_all_nested_blocks() {
+        let calls = ["first", "second"].map(|id| crate::provider::protocol::ToolCall {
+            id: id.into(),
+            name: "shell".into(),
+            arguments: json!({}),
+        });
+        let assistant = Message::Assistant(vec![AssistantItem {
+            id: "nested-calls".into(),
+            position: 0,
+            kind: ItemKind::ToolCall,
+            blocks: calls
+                .iter()
+                .enumerate()
+                .map(|(position, call)| AssistantBlock {
+                    id: format!("call-block-{position}"),
+                    position,
+                    content: BlockContent::ToolCall(call.clone()),
+                })
+                .collect(),
+            replay: None,
+        }]);
+        let results: Vec<_> = calls
+            .iter()
+            .rev()
+            .map(|call| ToolResult {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                result: json!({}),
+                images: vec![],
+                is_error: false,
+            })
+            .collect();
+        assert!(valid_tool_pair(&assistant, &Message::Tool(results.clone())));
+        assert!(!valid_tool_pair(
+            &assistant,
+            &Message::Tool(results[..1].to_vec())
+        ));
+    }
+
+    #[test]
     fn checkpoint_cannot_cut_or_mismatch_parallel_tool_exchanges() {
         let (agent, mut records) = projection_fixture();
         let calls = ["a", "b"];
@@ -868,12 +1032,17 @@ mod tests {
             message: Message::Assistant(
                 calls
                     .iter()
-                    .map(|id| {
-                        AssistantContent::ToolCall(crate::provider::protocol::ToolCall {
-                            id: (*id).into(),
-                            name: "shell".into(),
-                            arguments: json!({}),
-                        })
+                    .enumerate()
+                    .map(|(position, id)| {
+                        AssistantItem::tool_call(
+                            format!("item-{id}"),
+                            position,
+                            crate::provider::protocol::ToolCall {
+                                id: (*id).into(),
+                                name: "shell".into(),
+                                arguments: json!({}),
+                            },
+                        )
                     })
                     .collect(),
             ),
@@ -887,7 +1056,6 @@ mod tests {
                         call_id: (*id).into(),
                         name: "shell".into(),
                         result: json!({}),
-                        console_output: String::new(),
                         images: vec![],
                         is_error: false,
                     })

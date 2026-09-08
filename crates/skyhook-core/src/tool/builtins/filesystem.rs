@@ -34,9 +34,10 @@ fn register_read(
         .map_err(|error| RegistryError::Schema(error.to_string()))?;
     builder.register_dynamic(
         "read",
-        "Capture a complete UTF-8 file or directory listing, or attach a supported image. Use job_output to page or search the saved snapshot.",
+        "Capture a complete UTF-8 file or directory listing, or attach a supported image. Use job_output to page or search the saved snapshot. Missing or OS-inaccessible paths return {kind:\"error\",path,error:{code:\"not_found\"|\"permission_denied\",message}} as a completed result; policy/approval denials remain denials.",
         schema,
         ToolOptions::new(vec![Capability::Read])
+            .read_error_output(read_error_output)
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .output_schema(output_schema)
             .path_argument("path", PathAccess::Read, PathKind::Existing),
@@ -322,8 +323,47 @@ struct ReadArgs {
 }
 
 #[derive(Serialize, JsonSchema)]
+struct ReadError {
+    code: ReadErrorCode,
+    message: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ReadErrorCode {
+    NotFound,
+    PermissionDenied,
+}
+
+fn read_error_output(path: &str, error: &ToolError) -> Option<ToolOutput> {
+    let ToolError::Io(error) = error else {
+        return None;
+    };
+    let code = match error.kind() {
+        std::io::ErrorKind::NotFound => ReadErrorCode::NotFound,
+        std::io::ErrorKind::PermissionDenied => ReadErrorCode::PermissionDenied,
+        _ => return None,
+    };
+    Some(ToolOutput::new(
+        serde_json::to_value(ReadOutput::Error {
+            path: path.to_owned(),
+            error: ReadError {
+                code,
+                message: error.to_string(),
+            },
+        })
+        .expect("read errors serialize"),
+    ))
+}
+
+#[derive(Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ReadOutput {
+    /// Expected filesystem failures, not policy or approval denials.
+    Error {
+        path: String,
+        error: ReadError,
+    },
     File {
         path: String,
         #[schemars(extend("x-skyhook-truncatable" = true))]
@@ -474,6 +514,156 @@ mod tests {
         },
     };
     use tokio::sync::Mutex;
+
+    fn read_executor(
+        runtime: &crate::test_support::TestRuntime,
+    ) -> (ToolExecutor, Arc<std::sync::OnceLock<ToolExecutor>>) {
+        let mut builder = ToolRegistryBuilder::default();
+        register(&mut builder, runtime.store.clone()).unwrap();
+        let slot = Arc::new(std::sync::OnceLock::new());
+        crate::tool::builtins::install_script_tool(&mut builder, Arc::downgrade(&slot)).unwrap();
+        let executor = runtime.executor(builder);
+        assert!(slot.set(executor.clone()).is_ok());
+        (executor, slot)
+    }
+
+    #[tokio::test]
+    async fn missing_reads_complete_direct_model_and_script_jobs() {
+        use serde_json::json;
+        let runtime = crate::test_support::TestRuntime::new().await;
+        let (executor, _slot) = read_executor(&runtime);
+        for path in ["missing", "missing/nested/file.txt"] {
+            let direct = executor
+                .execute(runtime.agent.clone(), "read", json!({"path":path}), None)
+                .await
+                .unwrap();
+            assert_eq!(direct.output.value["kind"], "error");
+            assert_eq!(direct.output.value["path"], path);
+            assert_eq!(direct.output.value["error"]["code"], "not_found");
+            assert!(
+                direct.output.value["error"]["message"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+            );
+            assert_eq!(
+                runtime.jobs.snapshot(direct.job).await.unwrap().state,
+                crate::job::JobState::Completed
+            );
+            let model = executor
+                .execute_model(runtime.agent.clone(), "read", json!({"path":path}), None)
+                .await
+                .unwrap();
+            assert_eq!(model.output.value["state"], "completed");
+            assert_eq!(model.output.value["result"]["error"]["code"], "not_found");
+            let script = executor.execute(runtime.agent.clone(), "script", json!({"source": format!("const result = await tool.read({{path:{}}}); return {{resolved:true, result}};", serde_json::to_string(path).unwrap())}), None).await.unwrap();
+            assert_eq!(script.output.value["value"]["resolved"], true);
+            assert_eq!(
+                script.output.value["value"]["result"]["error"]["code"],
+                "not_found"
+            );
+            assert_eq!(
+                runtime.jobs.snapshot(script.job).await.unwrap().state,
+                crate::job::JobState::Completed
+            );
+        }
+    }
+
+    #[test]
+    fn only_expected_os_errors_become_read_results() {
+        for (kind, code) in [
+            (std::io::ErrorKind::NotFound, "not_found"),
+            (std::io::ErrorKind::PermissionDenied, "permission_denied"),
+        ] {
+            let output =
+                read_error_output("path", &ToolError::Io(std::io::Error::from(kind))).unwrap();
+            assert_eq!(output.value["error"]["code"], code);
+        }
+        for error in [
+            ToolError::Denied("permission denied".into()),
+            ToolError::Failed("No such file or directory".into()),
+            ToolError::Io(std::io::Error::from(std::io::ErrorKind::InvalidData)),
+            ToolError::Cancelled,
+        ] {
+            assert!(read_error_output("path", &error).is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chmod_read_errors_complete_including_unsearchable_parent() {
+        use serde_json::json;
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        let runtime = crate::test_support::TestRuntime::new().await;
+        let file = runtime.root.path().join("locked.txt");
+        let directory = runtime.root.path().join("locked");
+        fs::write(&file, "secret").await.unwrap();
+        fs::create_dir(&directory).await.unwrap();
+        fs::write(directory.join("child"), "secret").await.unwrap();
+        fs::set_permissions(&file, std::fs::Permissions::from_mode(0o0))
+            .await
+            .unwrap();
+        fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o0))
+            .await
+            .unwrap();
+        if fs::read(&file).await.is_ok() {
+            // Root/CAP_DAC_OVERRIDE bypasses chmod. Re-run the actual runtime test
+            // under an unprivileged UID rather than silently skipping coverage.
+            fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+                .await
+                .unwrap();
+            fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .await
+                .unwrap();
+            assert!(std::env::var_os("SKYHOOK_UNPRIVILEGED_READ_TEST").is_none());
+            // The checkout itself may be under /root, inaccessible to this UID.
+            let child_root = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(child_root.path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            let child_binary = child_root.path().join("read-permission-test");
+            std::fs::copy(std::env::current_exe().unwrap(), &child_binary).unwrap();
+            std::fs::set_permissions(&child_binary, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            let output = std::process::Command::new(child_binary)
+                .args(["--exact", "tool::builtins::filesystem::tests::chmod_read_errors_complete_including_unsearchable_parent", "--nocapture"])
+                .env("SKYHOOK_UNPRIVILEGED_READ_TEST", "1")
+                .uid(65534).gid(65534).output().unwrap();
+            assert!(
+                output.status.success(),
+                "unprivileged test failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (executor, _slot) = read_executor(&runtime);
+        for path in [
+            "locked.txt",
+            "locked",
+            "locked/child",
+            "locked/missing/nested",
+        ] {
+            let direct = executor
+                .execute_model(runtime.agent.clone(), "read", json!({"path":path}), None)
+                .await
+                .unwrap();
+            assert_eq!(direct.output.value["state"], "completed");
+            assert_eq!(
+                direct.output.value["result"]["error"]["code"],
+                "permission_denied"
+            );
+            let script = executor.execute(runtime.agent.clone(), "script", json!({"source":format!("return await tool.read({{path:{}}});", serde_json::to_string(path).unwrap())}), None).await.unwrap();
+            assert_eq!(
+                script.output.value["value"]["error"]["code"],
+                "permission_denied"
+            );
+        }
+        fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+        fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn grouped_directories_keep_sizes_and_recover_truncated_entries() {

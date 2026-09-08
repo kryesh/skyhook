@@ -12,7 +12,7 @@ use crate::{
     tool::{
         ToolPlacement,
         authorization::{AuthorizationCoordinator, AuthorizationError, AuthorizationSubject},
-        builtins::workspace::resolve_for_authorization,
+        builtins::workspace::{lexical_path, resolve_for_authorization},
         policy::{ApprovalGrant, Capability, CapabilitySet, PermissionUse, Policy, ResourceId},
     },
 };
@@ -54,6 +54,7 @@ struct InvocationPlan {
 
 enum InvocationDispatch {
     Local,
+    ReadError(ToolOutput),
     Remote(ResolvedRoute),
 }
 
@@ -394,7 +395,7 @@ impl ToolExecutor {
                 .ok_or(ToolError::ArgumentsMustBeObject)?
                 .remove("target");
         }
-        let path_permissions = if selected.route.is_none() {
+        let (path_permissions, read_error) = if selected.route.is_none() {
             preflight_path_arguments(
                 &tool,
                 &selected.location.target,
@@ -404,11 +405,15 @@ impl ToolExecutor {
             )
             .await?
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         let mut capabilities = tool.capabilities_for(&arguments)?;
-        for permission in &path_permissions {
-            capabilities.retain(|candidate| *candidate != permission.capability);
+        // An unresolved read still requires the ordinary workspace authorization,
+        // as well as approval for the unresolved path below.
+        if read_error.is_none() {
+            for permission in &path_permissions {
+                capabilities.retain(|candidate| *candidate != permission.capability);
+            }
         }
         let mut permissions =
             scope_capabilities(capabilities, &selected.location, tool.permission_resource());
@@ -440,9 +445,14 @@ impl ToolExecutor {
             authorization_scope,
             background,
             job_name,
-            dispatch: selected
-                .route
-                .map_or(InvocationDispatch::Local, InvocationDispatch::Remote),
+            dispatch: read_error.map_or_else(
+                || {
+                    selected
+                        .route
+                        .map_or(InvocationDispatch::Local, InvocationDispatch::Remote)
+                },
+                InvocationDispatch::ReadError,
+            ),
         })
     }
 
@@ -591,6 +601,7 @@ impl ToolExecutor {
             let cancellation = context.authorization.cancellation.clone();
             let result = match plan.dispatch {
                 InvocationDispatch::Local => plan.tool.call(context, plan.handler_arguments).await,
+                InvocationDispatch::ReadError(output) => Ok(output),
                 InvocationDispatch::Remote(_) => {
                     let result = prepared
                         .expect("remote plans have prepared connections")
@@ -687,7 +698,6 @@ impl ToolExecutor {
                 output: ToolOutput {
                     value: envelope.output.unwrap_or(Value::Null),
                     images,
-                    console_output: envelope.console_output,
                 },
             })
         } else if envelope.denial.is_some() {
@@ -703,11 +713,7 @@ impl ToolExecutor {
                     .unwrap_or_else(|| format!("job ended as {:?}", envelope.state)),
                 output: envelope
                     .output
-                    .map(|value| ToolOutput {
-                        value,
-                        images,
-                        console_output: envelope.console_output,
-                    })
+                    .map(|value| ToolOutput { value, images })
                     .map(Box::new),
             })
         }
@@ -808,11 +814,12 @@ async fn preflight_path_arguments(
     workspace: &std::path::Path,
     authorization_root: &std::path::Path,
     arguments: &mut Value,
-) -> Result<Vec<PermissionUse>, ToolError> {
+) -> Result<(Vec<PermissionUse>, Option<ToolOutput>), ToolError> {
     let object = arguments
         .as_object_mut()
         .ok_or(ToolError::ArgumentsMustBeObject)?;
     let mut permissions = Vec::new();
+    let mut read_error = None;
     for spec in tool.path_arguments() {
         let input = match object.get(&spec.name) {
             Some(Value::String(path)) => path.clone(),
@@ -827,7 +834,27 @@ async fn preflight_path_arguments(
                 None => continue,
             },
         };
-        let resolved = resolve_for_authorization(workspace, &input, spec.kind).await?;
+        let resolved = match resolve_for_authorization(workspace, &input, spec.kind).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let Some(output) = tool.read_error_output(&input, &error) else {
+                    return Err(error);
+                };
+                // Canonicalization failed, so this path is not proven to be within
+                // the authorization root. Require exact path authorization even for
+                // apparently local paths, then return the captured failure without
+                // retrying the handler (which could now access a changed target).
+                let path = lexical_path(workspace, &input)?;
+                let capability = spec.access.capability();
+                let resource = ResourceId::path(target, &path);
+                permissions.push(
+                    PermissionUse::new(capability, resource.clone())
+                        .with_grant(ApprovalGrant::exact(capability, resource)),
+                );
+                read_error = Some(output);
+                continue;
+            }
+        };
         object.insert(
             spec.name.clone(),
             Value::String(resolved.path.to_string_lossy().into_owned()),
@@ -843,7 +870,7 @@ async fn preflight_path_arguments(
             permissions.push(PermissionUse::new(capability, resource).with_grant(grant));
         }
     }
-    Ok(permissions)
+    Ok((permissions, read_error))
 }
 
 fn scope_capabilities(
@@ -988,6 +1015,92 @@ mod tests {
             authorization.clone(),
         );
         TargetRouter::new(targets, remote, authorization)
+    }
+
+    #[tokio::test]
+    async fn missing_builtin_reads_still_require_policy_approval() {
+        struct DenyReads;
+        impl Policy for DenyReads {
+            fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
+                assert!(
+                    request
+                        .permissions
+                        .iter()
+                        .any(|permission| permission.capability == Capability::Read)
+                );
+                Box::pin(async {
+                    PolicyDecision::Deny {
+                        reason: "read forbidden".into(),
+                    }
+                })
+            }
+        }
+        let runtime = crate::test_support::TestRuntime::new().await;
+        let mut builder = ToolRegistryBuilder::default();
+        crate::tool::builtins::register_worker_tools(&mut builder, runtime.store.clone()).unwrap();
+        let executor = ToolExecutor::new(
+            builder.build(),
+            Arc::new(DenyReads),
+            runtime.jobs.clone(),
+            runtime.root.path().to_owned(),
+        );
+        for path in ["missing/nested/file", "../outside/missing"] {
+            let error = executor
+                .execute_model(
+                    runtime.agent.clone(),
+                    "read",
+                    serde_json::json!({"path":path}),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ExecutionError::Denied(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registered_name_read_does_not_opt_into_io_recovery() {
+        let runtime = crate::test_support::TestRuntime::new().await;
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register::<PathArgs, String, _, _>(
+                "read",
+                "custom read",
+                ToolOptions::new(vec![Capability::Read]).path_argument(
+                    "path",
+                    crate::tool::policy::PathAccess::Read,
+                    crate::tool::PathKind::Existing,
+                ),
+                |_context, _arguments| async {
+                    Err(ToolError::Io(std::io::Error::from(
+                        std::io::ErrorKind::PermissionDenied,
+                    )))
+                },
+            )
+            .unwrap();
+        let executor = runtime.executor(builder);
+        let error = executor
+            .execute(
+                runtime.agent.clone(),
+                "read",
+                serde_json::json!({"path":"missing/nested"}),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ExecutionError::Tool(ToolError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound)
+        );
+        let error = executor
+            .execute(
+                runtime.agent.clone(),
+                "read",
+                serde_json::json!({"path":"."}),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ExecutionError::Failed { .. }));
     }
 
     #[tokio::test]

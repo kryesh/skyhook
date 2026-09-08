@@ -22,18 +22,18 @@ use super::{AgentCommand, AgentLaunch, QueuedPromptToken, SessionRuntime, queue:
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AgentArgs {
-    /// Complete child task.
+    /// Task and context for the child.
     pub(super) prompt: String,
-    /// Initial pending instructions.
+    /// Initial todo items.
     pub(super) todos: Option<Vec<String>>,
-    /// Further child generations.
+    /// Delegation depth available to the child; must be less than your available_depth.
     #[serde(default)]
     pub(super) depth: usize,
     /// Model profile override; omitted/null inherits the parent's active model unless an explicit profile selects one.
     pub(super) model: Option<String>,
     /// Agent profile override; its model is used unless model is explicitly supplied.
     pub(super) profile: Option<String>,
-    /// Child target; omitted inherits.
+    /// Execution target; defaults to the parent's.
     #[schemars(skip)]
     pub(super) target: Option<String>,
     /// Child workspace override: absolute, or relative to the workspace selected by target.
@@ -51,6 +51,7 @@ pub(super) fn register(
     builder: &mut ToolRegistryBuilder,
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
 ) -> Result<(), RegistryError> {
+    register_wait(builder, runtime_slot.clone())?;
     register_ask(builder, runtime_slot.clone())?;
     register_todo(builder, runtime_slot.clone())?;
     register_child_agent(builder, runtime_slot)
@@ -87,6 +88,24 @@ fn register_todo(
                 } else {
                     Ok(TodoOutput::Items { items: runtime.todos.inspect(&context.agent, input.job).await?.items })
                 }
+            }
+        },
+    )?;
+    Ok(())
+}
+
+fn register_wait(
+    builder: &mut ToolRegistryBuilder,
+    runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
+) -> Result<(), RegistryError> {
+    builder.register::<super::wait::WaitArgs, super::wait::WaitOutput, _, _>(
+        "wait",
+        "Wait for any notification or input relevant to this agent. Optional timeout is a positive integer number of seconds; omitted/null waits indefinitely. Returns {reason: event|timeout}. Does not consume notifications or retrieve output; use job_output to inspect saved output. Cancellation interrupts the wait.",
+        ToolOptions::default(),
+        move |context, args| {
+            let runtime = runtime_slot.get().and_then(Weak::upgrade);
+            async move {
+                runtime.ok_or_else(runtime_unavailable)?.wait_for_event(&context, args).await
             }
         },
     )?;
@@ -145,7 +164,7 @@ fn register_child_agent(
 ) -> Result<(), RegistryError> {
     builder.register::<AgentArgs, String, _, _>(
         "agent",
-        "Start a child agent with fresh history; questions suspend it. Send follow-up instructions with tool.job(id).send({value: instructions}); completed children resume with retained history under the same job ID.",
+        "Start a child agent; questions suspend it. Send follow-ups with tool.job(id).send({value: instructions}), or answers if a question is pending. Running children receive input at the next model-request boundary without receive(); completed children resume with retained history under the same job ID.",
         ToolOptions::default()
             .named()
             .requires(Capability::Agents)
@@ -257,7 +276,7 @@ async fn run_child_request(
     runtime: &Arc<SessionRuntime>,
     context: &crate::tool::ToolContext,
     child: &crate::identity::AgentId,
-    sender: &tokio::sync::mpsc::Sender<AgentCommand>,
+    sender: &super::AgentSender,
     content: Vec<UserContent>,
 ) -> Result<String, ToolError> {
     let completion_gate = runtime

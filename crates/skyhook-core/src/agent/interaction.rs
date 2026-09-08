@@ -61,15 +61,11 @@ pub enum QuestionError {
 #[derive(Clone, Debug)]
 pub enum RuntimeEvent {
     Record(Box<EventRecord>),
-    TextDelta {
+    /// Provider-native item/block lifecycle, validated by the observation reducer.
+    ResponseEvent {
         agent: AgentId,
         request: u64,
-        text: String,
-    },
-    ReasoningDelta {
-        agent: AgentId,
-        request: u64,
-        text: String,
+        event: crate::provider::protocol::ResponseEvent,
     },
     ResponseSettled {
         agent: AgentId,

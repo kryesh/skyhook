@@ -222,7 +222,18 @@ class WorkPool {
     __workPoolIterators.add(iterator);
     return iterator;
   }
-  run(tasks) { return this.map(tasks, task => task()); }
+  run(tasks) {
+    if (arguments.length !== 1 || !Array.isArray(tasks)) {
+      throw new TypeError("WorkPool.run expects one array of functions: run([f1, f2])");
+    }
+    const values = Array.from(tasks);
+    for (let index = 0; index < values.length; index++) {
+      if (typeof values[index] !== "function") {
+        throw new TypeError(`WorkPool.run task at index ${index} must be a function`);
+      }
+    }
+    return this.map(values, task => task());
+  }
 }
 
 const receive = async () => __request({type:"receive"});

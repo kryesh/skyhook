@@ -111,8 +111,6 @@ pub(crate) enum Response {
 pub(crate) struct RemoteToolOutput {
     pub value: Value,
     pub images: Vec<RemoteImage>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub console_output: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -142,7 +140,6 @@ impl From<RemoteToolOutput> for ToolOutput {
             .collect();
         Self {
             value: value.value,
-            console_output: value.console_output,
             images,
         }
     }
@@ -272,6 +269,23 @@ pub(crate) async fn write_artifact<W: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn remote_output_keeps_console_only_inside_script_result() {
+        let output: RemoteToolOutput = serde_json::from_value(serde_json::json!({
+            "value":{"value":42,"console":"captured\n"},
+            "images":[]
+        }))
+        .unwrap();
+        let serialized = serde_json::to_value(&output).unwrap();
+        assert!(serialized.get("console_output").is_none());
+        assert!(serialized.get("console").is_none());
+        let native: ToolOutput = output.into();
+        assert_eq!(
+            native.value,
+            serde_json::json!({"value":42,"console":"captured\n"})
+        );
+    }
+
     #[tokio::test]
     async fn frames_round_trip() {
         let (mut left, mut right) = tokio::io::duplex(4096);
@@ -289,7 +303,6 @@ mod tests {
                 denial: None,
                 output: Some(Box::new(RemoteToolOutput {
                     value: serde_json::json!({"stdout":"partial"}),
-                    console_output: String::new(),
                     images: Vec::new(),
                 })),
             }),

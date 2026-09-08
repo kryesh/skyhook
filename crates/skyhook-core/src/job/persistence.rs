@@ -59,7 +59,6 @@ pub(super) async fn restore(
                     {
                         entry.output = None;
                         entry.images.clear();
-                        entry.console_output.clear();
                         entry.error = None;
                         entry.denial = None;
                         entry.delivery = DeliveryState::Pending;
@@ -74,7 +73,6 @@ pub(super) async fn restore(
                 output_path,
                 error,
                 images,
-                console_output,
                 denial,
             } => {
                 if let Some(entry) = jobs.get_mut(job) {
@@ -82,7 +80,6 @@ pub(super) async fn restore(
                     entry.error.clone_from(error);
                     entry.denial.clone_from(denial);
                     entry.images.clone_from(images);
-                    entry.console_output.clone_from(console_output);
                     if let Some(relative) = output_path {
                         if !is_safe_artifact_path(relative) {
                             return Err(SessionError::UnsafeArtifactPath.into());
@@ -115,6 +112,7 @@ pub(super) async fn restore(
         .filter_map(|(job, entry)| (!entry.state.is_terminal()).then_some(*job))
         .collect::<Vec<_>>();
     let manager = JobManager::with_jobs(store, jobs, maximum.saturating_add(1).max(1));
+    manager.inner.progress.lock().await.project(records);
     for job in active {
         manager.finish(job, JobOutcome::Interrupted).await?;
     }

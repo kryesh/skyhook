@@ -10,7 +10,10 @@ use std::{
 use tokio::sync::{Notify, Semaphore};
 
 use super::*;
-use crate::provider::{ProviderContext, ProviderError, ProviderFuture, ResponseStream};
+use crate::provider::{
+    ProviderContext, ProviderError, ProviderFuture, ResponseStream,
+    protocol::{BlockContent, StopReason, events_for_content},
+};
 
 struct Tracking {
     requests: StdMutex<Vec<ModelRequest>>,
@@ -70,20 +73,29 @@ impl ProviderContext for Context {
             if let Some(gate) = tracking.gates.get(index) {
                 gate.acquire().await.unwrap().forget();
             }
-            let chunk = if index == 0 && tracking.first_calls_tool {
-                ResponseChunk::Block {
-                    block: AssistantContent::ToolCall(ToolCall {
+            let tool = index == 0 && tracking.first_calls_tool;
+            let item = if tool {
+                AssistantContent::tool_call(
+                    "queue-todo",
+                    0,
+                    ToolCall {
                         id: "queue-todo".into(),
                         name: "todo".into(),
                         arguments: json!({"items": []}),
-                    }),
-                }
+                    },
+                )
             } else {
-                ResponseChunk::TextDelta {
-                    text: format!("answer-{index}"),
-                }
+                AssistantContent::text("text/0", 0, format!("answer-{index}"))
             };
-            Ok(Box::pin(futures_util::stream::iter([Ok(chunk)])) as ResponseStream)
+            let mut events = events_for_content(&[item]);
+            events.push(ResponseChunk::ResponseEnded {
+                stop_reason: if tool {
+                    StopReason::ToolUse
+                } else {
+                    StopReason::EndTurn
+                },
+            });
+            Ok(Box::pin(futures_util::stream::iter(events.into_iter().map(Ok))) as ResponseStream)
         })
     }
 }
@@ -210,7 +222,7 @@ async fn running_child_receives_parent_inputs(first_calls_tool: bool) {
     )
     .await
     .unwrap();
-    let job: JobId = serde_json::from_value(launched.value["id"].clone()).unwrap();
+    let job: JobId = serde_json::from_value(launched.value["value"]["id"].clone()).unwrap();
     let initial = tracking.request(0).await;
     assert_eq!(texts(&initial.messages), ["test:child-initial"]);
     assert!(parent_inputs(&initial.messages).is_empty());
@@ -234,7 +246,7 @@ async fn running_child_receives_parent_inputs(first_calls_tool: bool) {
     )))
     .await
     .unwrap();
-    assert_eq!(accepted.value, json!({"accepted": true}));
+    assert_eq!(accepted.value["value"], json!({"accepted": true}));
     bounded(async {
         while sender.capacity() != AGENT_CHANNEL_CAPACITY - 1 {
             tokio::task::yield_now().await;
@@ -272,9 +284,10 @@ async fn running_child_receives_parent_inputs(first_calls_tool: bool) {
                 _ => None,
             })
             .flatten()
+            .flat_map(|item| &item.blocks)
             .filter(|block| {
-                matches!(block,
-                AssistantContent::ToolCall(call) if call.id == "queue-todo")
+                matches!(&block.content,
+                BlockContent::ToolCall(call) if call.id == "queue-todo")
             })
             .count();
         let results = next
@@ -293,9 +306,7 @@ async fn running_child_receives_parent_inputs(first_calls_tool: bool) {
         assert_eq!(results[0].name, "todo");
     } else {
         assert!(next.messages.iter().any(|message| matches!(message,
-        Message::Assistant(blocks) if blocks == &vec![AssistantContent::Text {
-            text: "answer-0".into(),
-        }])));
+        Message::Assistant(items) if items == &vec![AssistantContent::text("text/0", 0, "answer-0")])));
     }
     assert!(
         !session
@@ -309,12 +320,37 @@ async fn running_child_receives_parent_inputs(first_calls_tool: bool) {
         "the child job must not complete before answering the parent updates"
     );
 
+    // This test drives the parent through scripts and explicitly claims the
+    // child's result. Keep completion wakeups out of the autonomous parent loop:
+    // otherwise it can consume the result before jobs.wait claims it and make an
+    // unrelated third provider request. The child's real mailbox remains active.
+    let (quiet_sender, _quiet_receiver) = mpsc::channel(AGENT_CHANNEL_CAPACITY);
+    let root_sender = std::mem::replace(
+        &mut session
+            .runtime
+            .agents
+            .write()
+            .unwrap()
+            .get_mut(&session.root)
+            .unwrap()
+            .sender,
+        AgentSender::new(quiet_sender),
+    );
+
     tracking.release(1);
     let completed = bounded(session.runtime.jobs.wait(job, None, true))
         .await
         .unwrap();
     assert_eq!(completed.state, crate::job::JobState::Completed);
     assert_eq!(completed.output, Some(json!("answer-1")));
+    session
+        .runtime
+        .agents
+        .write()
+        .unwrap()
+        .get_mut(&session.root)
+        .unwrap()
+        .sender = root_sender;
     stop(&session).await;
     assert_eq!(tracking.requests.lock().unwrap().len(), 2);
     let messages = session

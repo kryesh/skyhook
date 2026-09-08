@@ -4,6 +4,12 @@ mod message;
 mod request;
 mod response;
 
-pub use message::{AssistantContent, Message, ToolCall, ToolResult, UserContent};
+pub use message::{
+    AssistantBlock, AssistantContent, AssistantItem, BlockContent, BlockKind, ItemKind, Message,
+    ReplayEnvelope, ToolCall, ToolResult, UserContent,
+};
 pub use request::{ModelRequest, ResponseSchema, SystemSegment, ToolDefinition};
-pub use response::{ResponseChunk, Usage};
+pub use response::{
+    BlockSnapshot, ContentDelta, ItemSnapshot, ResponseAssembler, ResponseChunk, ResponseEvent,
+    ResponseSnapshot, StopReason, Usage, events_for_content,
+};

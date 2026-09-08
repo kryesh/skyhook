@@ -354,7 +354,6 @@ async fn externalize_images(
     }
     Ok(crate::remote::protocol::RemoteToolOutput {
         value: output.value,
-        console_output: output.console_output,
         images,
     })
 }
@@ -374,6 +373,77 @@ mod tests {
 
     use super::*;
     use crate::remote::protocol::RemoteToolOutput;
+
+    #[tokio::test]
+    async fn missing_read_is_an_ok_remote_result_after_authorization() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("missing/nested/file");
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut input, mut output) = tokio::io::split(client);
+        let (server_input, server_output) = tokio::io::split(server);
+        let worker = tokio::spawn(async move {
+            serve_io(server_input, server_output)
+                .await
+                .map_err(|e| e.to_string())
+        });
+        write_frame(&mut output, &Request::Hello).await.unwrap();
+        assert!(matches!(
+            read_frame::<_, Response>(&mut input).await.unwrap(),
+            Some(Response::Ready)
+        ));
+        write_frame(
+            &mut output,
+            &Request::Tool {
+                request_id: 1,
+                name: "read".into(),
+                arguments: serde_json::json!({"path":path}),
+            },
+        )
+        .await
+        .unwrap();
+        let mut authorized = false;
+        loop {
+            match read_frame::<_, Response>(&mut input)
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                Response::Authorization {
+                    authorization_id, ..
+                } => {
+                    authorized = true;
+                    write_frame(
+                        &mut output,
+                        &Request::AuthorizationDecision {
+                            request_id: 1,
+                            authorization_id,
+                            allowed: true,
+                            reason: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                Response::Tool {
+                    result: Ok(result), ..
+                } => {
+                    assert!(authorized);
+                    assert_eq!(result.value["kind"], "error");
+                    assert_eq!(result.value["error"]["code"], "not_found");
+                    assert_eq!(result.value["path"], path.to_string_lossy().as_ref());
+                    break;
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+        drop(output);
+        drop(input);
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn large_file_results_transfer_after_capture_in_bounded_artifact_frames() {

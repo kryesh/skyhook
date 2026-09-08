@@ -9,7 +9,10 @@ use std::time::Duration;
 use tokio::sync::{Notify, Semaphore};
 
 use super::*;
-use crate::provider::{ProviderContext, ProviderError, ProviderFuture, ResponseStream};
+use crate::provider::{
+    ProviderContext, ProviderError, ProviderFuture, ResponseStream,
+    protocol::{StopReason, events_for_content},
+};
 
 struct Tracking {
     next: AtomicUsize,
@@ -110,20 +113,28 @@ impl ProviderContext for Context {
                 tracking.entered.notify_one();
                 tracking.gate.acquire().await.unwrap().forget();
             }
-            let response = if tool {
-                ResponseChunk::Block {
-                    block: AssistantContent::ToolCall(ToolCall {
+            let item = if tool {
+                AssistantContent::tool_call(
+                    "todo-call",
+                    0,
+                    ToolCall {
                         id: "todo-call".into(),
                         name: "todo".into(),
                         arguments: json!({"items": []}),
-                    }),
-                }
+                    },
+                )
             } else {
-                ResponseChunk::TextDelta {
-                    text: "done".into(),
-                }
+                AssistantContent::text("text/0", 0, "done")
             };
-            Ok(Box::pin(futures_util::stream::iter([Ok(response)])) as ResponseStream)
+            let mut events = events_for_content(&[item]);
+            events.push(ResponseChunk::ResponseEnded {
+                stop_reason: if tool {
+                    StopReason::ToolUse
+                } else {
+                    StopReason::EndTurn
+                },
+            });
+            Ok(Box::pin(futures_util::stream::iter(events.into_iter().map(Ok))) as ResponseStream)
         })
     }
 }

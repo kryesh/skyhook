@@ -199,7 +199,7 @@ impl Drop for Terminal {
 }
 
 fn config(root: &std::path::Path, url: &str) {
-    std::fs::write(root.join("config.toml"),format!("default_model_profile='obsolete'\n[providers.test]\nkind='openai_compatible'\napi='chat_completions'\nbase_url='{url}'\n[models.first]\nprovider='test'\nmodel='fixture'\nmax_context=128000\nmax_output=4096\n")).unwrap();
+    std::fs::write(root.join("config.toml"),format!("default_model_profile='obsolete'\n[providers.test]\nkind='openai'\napi='chat_completions'\nbase_url='{url}'\n[models.first]\nprovider='test'\nmodel='fixture'\nmax_context=128000\nmax_output=4096\n")).unwrap();
 }
 // Own the listener and worker so failed tests cannot leave a server behind.
 struct Provider {
@@ -738,32 +738,61 @@ fn queued_input_reaches_next_tool_continuation_request_in_fifo_order() {
 #[test]
 fn reasoning_collapses_when_answer_starts_and_survives_completion_and_resume() {
     let (advance, gates) = mpsc::channel();
-    let mut chunks = [
-        serde_json::json!({"reasoning_content":"Reasoning retained from deltas\nMore detail"}),
-        serde_json::json!({"content":"The real answer"}),
-    ]
-    .into_iter()
-    .map(|delta| {
-        let chunk = serde_json::json!({
-            "id":"fixture", "object":"chat.completion.chunk", "created":0,
-            "model":"fixture", "choices":[{"index":0,"delta":delta,"finish_reason":null}],
-        });
-        format!("data: {chunk}\n\n")
-    })
-    .collect::<Vec<_>>();
-    chunks.push("data: [DONE]\n\n".into());
+    // Exercise standard Responses reasoning rather than Chat's nonstandard
+    // reasoning_content extension (deliberately unsupported by native Chat).
+    let reasoning = serde_json::json!({"id":"rs_1","type":"reasoning",
+        "summary":[{"type":"summary_text","text":"Reasoning retained from deltas\nMore detail"}],
+        "encrypted_content":"fixture-opaque"});
+    let answer = serde_json::json!({"id":"msg_1","type":"message","role":"assistant",
+        "status":"completed","content":[{"type":"output_text","text":"The real answer","annotations":[]}]});
+    let event = |value: serde_json::Value| format!("data: {value}\n\n");
+    let chunks = vec![
+        event(
+            serde_json::json!({"type":"response.output_item.added","output_index":0,
+            "item":{"id":"rs_1","type":"reasoning","summary":[]}}),
+        ) + &event(
+            serde_json::json!({"type":"response.reasoning_summary_text.delta","output_index":0,
+            "item_id":"rs_1","summary_index":0,"delta":"Reasoning retained from deltas\nMore detail"}),
+        ),
+        event(
+            serde_json::json!({"type":"response.output_item.done","output_index":0,"item":reasoning}),
+        ) + &event(
+            serde_json::json!({"type":"response.output_item.added","output_index":1,
+            "item":{"id":"msg_1","type":"message","role":"assistant","status":"in_progress","content":[]}}),
+        ) + &event(
+            serde_json::json!({"type":"response.output_text.delta","output_index":1,
+            "item_id":"msg_1","content_index":0,"delta":"The real answer"}),
+        ),
+        event(
+            serde_json::json!({"type":"response.output_item.done","output_index":1,"item":answer}),
+        ) + &event(
+            serde_json::json!({"type":"response.completed","response":{"id":"resp_1","status":"completed",
+            "output":[reasoning,answer],"usage":{"input_tokens":10,"output_tokens":5}}}),
+        ),
+    ];
     let provider = Provider::streaming(Duration::ZERO, Some(gates), chunks);
     advance.send(()).unwrap();
     let root = tempfile::tempdir().unwrap();
     config(root.path(), &provider.url);
+    let config_path = root.path().join("config.toml");
+    let text = std::fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("api='chat_completions'", "api='responses'");
+    std::fs::write(config_path, text).unwrap();
     let mut terminal = Terminal::launch(root.path(), &["--prompt", "Reasoning question"]);
     terminal.wait("Reasoning retained from deltas");
+    terminal.wait_for("expanded live reasoning header", |screen| {
+        screen
+            .contents()
+            .lines()
+            .any(|line| line.contains("Reasoning") && line.contains('▾'))
+    });
     let screen = terminal.parser.screen().contents();
     assert!(!screen.contains("streaming"));
     let symbol = screen
         .lines()
         .find(|line| line.contains("Reasoning") && line.contains('▾'))
-        .unwrap()
+        .unwrap_or_else(|| panic!("missing expanded reasoning header: {screen}"))
         .trim()
         .chars()
         .nth(2)

@@ -7,24 +7,24 @@ targets_enabled = false
 
 [providers.openai]
 kind = "openai"
+base_url = "https://api.openai.com/v1"
 api = "responses"
 api_key_env = "OPENAI_API_KEY"
 
 [providers.anthropic]
 kind = "anthropic"
+base_url = "https://api.anthropic.com/v1"
 api_key_env = "ANTHROPIC_API_KEY"
 
-# Subscription providers import credentials from the official CLIs (or Flux's credential store).
+# Run `skyhook auth login` (or `skyhook auth login --headless`) first.
+# Credentials belong to Skyhook; official Codex client credentials are never accessed.
 [providers.codex]
 kind = "codex"
 
-[providers.claude]
-kind = "claude"
-
 # Keyless local endpoint example:
 [providers.local]
-kind = "openai_compatible"
-base_url = "http://127.0.0.1:11434"
+kind = "openai"
+base_url = "http://127.0.0.1:11434/v1"
 api = "chat_completions"
 
 [models.openai]
@@ -37,7 +37,7 @@ supports_images = true
 
 [models.sonnet]
 provider = "anthropic"
-model = "sonnet"
+model = "claude-sonnet-4-6"
 reasoning = "high"
 max_context = 128000
 max_output = 16384
@@ -46,14 +46,6 @@ supports_images = true
 [models.codex]
 provider = "codex"
 model = "gpt-5.6-sol"
-reasoning = "high"
-max_context = 128000
-max_output = 16384
-supports_images = true
-
-[models.claude]
-provider = "claude"
-model = "sonnet"
 reasoning = "high"
 max_context = 128000
 max_output = 16384

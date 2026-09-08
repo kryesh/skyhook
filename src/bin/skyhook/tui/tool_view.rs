@@ -297,7 +297,7 @@ impl Document {
                 ("/result/content", "File content"),
                 ("/result/stdout", "stdout"),
                 ("/result/stderr", "stderr"),
-                ("/console", "Console"),
+                ("/result/console", "Console"),
             ] {
                 if let Some(text) = output.pointer(pointer).and_then(Value::as_str) {
                     let (parent, key) = pointer.rsplit_once('/').unwrap();
@@ -1045,7 +1045,8 @@ mod tests {
     #[test]
     fn structured_and_paged_outputs_preserve_original_text() {
         let args = json!({"path": "example.rs"});
-        let output = json!({"result": {"path": "example.rs", "content": "fn main() {\n    // hi\n}\n"}, "console": "literal \\\"text\\\"\nline 2  "});
+        let output =
+            json!({"result": {"path": "example.rs", "content": "fn main() {\n    // hi\n}\n"}});
         let before = serde_json::to_vec(&output).unwrap();
         let mut document = Document::default();
         document.output("read", &args, &output);
@@ -1055,7 +1056,6 @@ mod tests {
         );
         assert!(source(&document, "json").contains("\n  \"result\": {"));
         assert_eq!(document.plain_text().matches("fn main()").count(), 1);
-        assert!(document.plain_text().contains("line 2  "));
         assert_eq!(serde_json::to_vec(&output).unwrap(), before);
         let page = json!({"preview": {"field": "/result/content", "lines": ["    return 7;  ", "}"], "total_lines": 100, "next_start": 44, "next_offset": 0}});
         let mut document = Document::default();
@@ -1071,6 +1071,21 @@ mod tests {
         let mut document = Document::default();
         document.output("custom", &json!({}), &fragment);
         assert_eq!(&*source(&document, "json"), "  \"key\": [");
+    }
+
+    #[test]
+    fn script_console_is_displayed_from_nested_result_without_mutating_it() {
+        let output = json!({"result":{"value":{"answer":42},"console":"literal text\nline 2  "}});
+        let before = output.clone();
+        let mut document = Document::default();
+        document.output("script", &json!({}), &output);
+        assert!(document.plain_text().contains("Console"));
+        assert!(document.plain_text().contains("line 2  "));
+        assert_eq!(document.plain_text().matches("literal text").count(), 1);
+        let metadata: Value = serde_json::from_str(&source(&document, "json")).unwrap();
+        assert_eq!(metadata["result"]["value"]["answer"], 42);
+        assert!(metadata["result"].get("console").is_none());
+        assert_eq!(output, before);
     }
 
     #[test]

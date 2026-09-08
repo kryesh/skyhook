@@ -21,8 +21,8 @@ use crate::{
     provider::Provider,
     provider::profile::ModelProfile,
     provider::protocol::{
-        AssistantContent, Message, ModelRequest, ResponseChunk, SystemSegment, ToolCall,
-        ToolResult, Usage, UserContent,
+        AssistantContent, BlockContent, Message, ModelRequest, ResponseAssembler, ResponseChunk,
+        SystemSegment, ToolCall, ToolResult, Usage, UserContent,
     },
     remote::{EmbeddedShimCatalog, RejectSensitivePrompts, RemoteManager, SensitivePromptHandler},
     session::{EventRecord, SessionError, SessionEvent, SessionStore},
@@ -55,6 +55,10 @@ pub use queue::{QueuedPrompt, QueuedPromptToken};
 #[cfg(test)]
 mod queue_tests;
 mod tools;
+mod wait;
+#[cfg(test)]
+mod wait_tests;
+use wait::AgentSender;
 
 const AGENT_CHANNEL_CAPACITY: usize = 64;
 
@@ -306,7 +310,7 @@ impl Harness {
 pub struct SessionHandle {
     runtime: Arc<SessionRuntime>,
     root: AgentId,
-    root_tx: mpsc::Sender<AgentCommand>,
+    root_tx: AgentSender,
     enqueue_preparation: Arc<Mutex<()>>,
 }
 
@@ -364,9 +368,8 @@ impl SessionHandle {
 
     pub async fn inspect_output(
         &self,
-        mut query: crate::job::JobOutputQuery,
+        query: crate::job::JobOutputQuery,
     ) -> Result<serde_json::Value, crate::tool::ToolError> {
-        query.wait = Some(0);
         self.runtime
             .jobs
             .inspect_output(query, &self.runtime.harness.capabilities)
@@ -650,7 +653,7 @@ struct SessionRuntime {
 
 struct LiveAgent {
     model_profile: String,
-    sender: mpsc::Sender<AgentCommand>,
+    sender: AgentSender,
     cancellation: CancellationToken,
     available_depth: usize,
     completion_gate: Arc<Mutex<bool>>,
@@ -880,14 +883,31 @@ impl SessionRuntime {
             loop {
                 let completion = match completions.recv().await {
                     Ok(completion) => completion,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let Some(runtime) = runtime.upgrade() else {
+                            break;
+                        };
+                        let agents = runtime
+                            .agents
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .iter()
+                            .map(|(id, agent)| (id.clone(), agent.sender.clone()))
+                            .collect::<Vec<_>>();
+                        for (id, sender) in agents {
+                            if runtime.jobs.has_pending(&id).await {
+                                sender.jobs_ready();
+                            }
+                        }
+                        continue;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
                 let Some(runtime) = runtime.upgrade() else {
                     break;
                 };
                 if let Some(sender) = runtime.agent_sender(&completion.agent) {
-                    let _ = sender.send(AgentCommand::JobsReady).await;
+                    sender.jobs_ready();
                 }
             }
         });
@@ -916,7 +936,7 @@ impl SessionRuntime {
     async fn spawn_agent(
         self: &Arc<Self>,
         launch: AgentLaunch,
-    ) -> Result<mpsc::Sender<AgentCommand>, HarnessError> {
+    ) -> Result<AgentSender, HarnessError> {
         let AgentLaunch {
             id,
             parent,
@@ -967,6 +987,7 @@ impl SessionRuntime {
         }
         self.todos.register(id.clone(), owner_job, todos).await?;
         let (tx, rx) = mpsc::channel(AGENT_CHANNEL_CAPACITY);
+        let tx = AgentSender::new(tx);
         self.agents
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1035,7 +1056,6 @@ impl SessionRuntime {
                     call_id: call.id,
                     name: call.name,
                     result: result.output.value,
-                    console_output: result.output.console_output,
                     images: result.output.images,
                     is_error,
                 }
@@ -1047,9 +1067,7 @@ impl SessionRuntime {
                     result["code"] = json!(denial.code);
                     result["executed"] = json!(denial.executed);
                 }
-                let mut console_output = String::new();
                 let images = if let Some(output) = failure.output {
-                    console_output = output.console_output;
                     result["output"] = output.value;
                     output.images
                 } else {
@@ -1061,7 +1079,6 @@ impl SessionRuntime {
                     result,
                     images,
                     is_error: true,
-                    console_output,
                 }
             }
         }
@@ -1199,6 +1216,10 @@ impl SessionRuntime {
             // Register before claiming/persisting a queued message: interrupt must
             // not be lost while a commit is in flight.
             let cancellation = self.begin_turn(&id);
+            if let Some(sender) = self.agent_sender(&id) {
+                // Every input/notification path shares the same delivery gate.
+                let _ = sender.flush_events(&cancellation).await;
+            }
             let (content, done, selected_model) = match command {
                 AgentCommand::QueuedInputs(inputs) => {
                     if !self
@@ -1262,30 +1283,9 @@ impl SessionRuntime {
                         }
                         _ => continue,
                     };
-                    let mut presented = Vec::new();
-                    for job in &pending {
-                        match self
-                            .jobs
-                            .present_output_for(
-                                crate::job::output::OutputArgs::new(job.id),
-                                &capabilities,
-                                &location,
-                                true,
-                            )
-                            .await
-                        {
-                            Ok(view) => presented.push(view),
-                            Err(error) => presented.push(
-                                json!({"id":job.id,"state":job.state,"error":error.to_string()}),
-                            ),
-                        }
-                    }
-                    let content = vec![UserContent::Runtime {
-                        text: format!(
-                            "<skyhook_job_events>\n{}\n</skyhook_job_events>",
-                            serde_json::to_string(&presented).unwrap_or_else(|_| "[]".to_owned())
-                        ),
-                    }];
+                    let content = self
+                        .job_event_content(&pending, &capabilities, &location)
+                        .await;
                     (content, None, None)
                 }
             };
@@ -1455,6 +1455,10 @@ impl SessionRuntime {
         let mut provider_attempt = 0u8;
         let mut compaction_checked = false;
         'requests: loop {
+            if let Some(sender) = self.agent_sender(agent) {
+                sender.flush_events(cancellation).await?;
+                sender.begin_request();
+            }
             if cancellation.is_cancelled() {
                 return Err(HarnessError::Interrupted);
             }
@@ -1469,6 +1473,13 @@ impl SessionRuntime {
             }
             if cancellation.is_cancelled() {
                 return Err(HarnessError::Interrupted);
+            }
+            let pending = self.jobs.take_pending(agent).await?;
+            if !pending.is_empty() {
+                let content = self
+                    .job_event_content(&pending, capabilities, location)
+                    .await;
+                self.commit(agent, Message::User(content)).await?;
             }
             let profile = agent_context.profile.clone();
             if !profile.supports_images && agent_context.contains_images() {
@@ -1566,9 +1577,7 @@ impl SessionRuntime {
                     return Err(error.into());
                 }
             };
-            let mut blocks = Vec::new();
-            let mut streamed_text = String::new();
-            let mut streamed_reasoning = String::new();
+            let mut assembler = ResponseAssembler::default();
             let mut usage = Usage::default();
             loop {
                 let chunk = tokio::select! {
@@ -1578,7 +1587,10 @@ impl SessionRuntime {
                 let Some(chunk) = chunk else {
                     break;
                 };
-                let chunk = match chunk {
+                let chunk = match chunk.and_then(|chunk| {
+                    assembler.push(&chunk)?;
+                    Ok(chunk)
+                }) {
                     Ok(chunk) => chunk,
                     Err(error) => {
                         if usage != Usage::default() {
@@ -1604,29 +1616,16 @@ impl SessionRuntime {
                         return Err(error.into());
                     }
                 };
-                match chunk {
-                    ResponseChunk::TextDelta { text } => {
-                        let _ = self.events.send(RuntimeEvent::TextDelta {
-                            agent: agent.clone(),
-                            request: requested.sequence,
-                            text: text.clone(),
-                        });
-                        streamed_text.push_str(&text);
-                    }
-                    ResponseChunk::ReasoningDelta { text } => {
-                        streamed_reasoning.push_str(&text);
-                        let _ = self.events.send(RuntimeEvent::ReasoningDelta {
-                            agent: agent.clone(),
-                            request: requested.sequence,
-                            text,
-                        });
-                    }
-                    ResponseChunk::Block { block } => blocks.push(block),
-                    ResponseChunk::Usage { usage: value } => usage = value,
-                    ResponseChunk::Finished { .. } => {}
+                if let ResponseChunk::UsageUpdated { usage: value } = &chunk {
+                    usage = *value;
                 }
+                let _ = self.events.send(RuntimeEvent::ResponseEvent {
+                    agent: agent.clone(),
+                    request: requested.sequence,
+                    event: chunk,
+                });
             }
-            let response = match finish_response(blocks, streamed_text, streamed_reasoning, usage) {
+            let response = match finish_response(assembler, usage) {
                 Ok(response) => response,
                 Err(error) => {
                     if usage != Usage::default() {
@@ -1747,7 +1746,7 @@ impl SessionRuntime {
             .map_or(0, |agent| agent.available_depth)
     }
 
-    fn agent_sender(&self, id: &AgentId) -> Option<mpsc::Sender<AgentCommand>> {
+    fn agent_sender(&self, id: &AgentId) -> Option<AgentSender> {
         self.agents
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1775,54 +1774,25 @@ struct FoldedResponse {
 }
 
 fn finish_response(
-    mut blocks: Vec<AssistantContent>,
-    streamed_text: String,
-    streamed_reasoning: String,
+    assembler: ResponseAssembler,
     usage: Usage,
 ) -> Result<FoldedResponse, HarnessError> {
-    if !streamed_text.is_empty()
-        && !blocks
-            .iter()
-            .any(|block| matches!(block, AssistantContent::Text { .. }))
-    {
-        blocks.insert(
-            0,
-            AssistantContent::Text {
-                text: streamed_text,
-            },
-        );
-    }
-    // Some providers emit reasoning deltas without a completed reasoning block.
-    // Preserve those deltas in the journal, but prefer complete provider blocks
-    // (including their signatures) whenever they contain visible reasoning.
-    if !streamed_reasoning.is_empty()
-        && !blocks.iter().any(
-            |block| matches!(block, AssistantContent::Reasoning { text, .. } if !text.is_empty()),
-        )
-    {
-        blocks.insert(
-            0,
-            AssistantContent::Reasoning {
-                text: streamed_reasoning,
-                opaque: None,
-            },
-        );
-    }
-    if blocks.is_empty() {
-        return Err(HarnessError::EmptyResponse);
-    }
+    let (blocks, final_usage, _stop_reason) = assembler.finish()?;
+    debug_assert_eq!(usage, final_usage);
     let text = blocks
         .iter()
-        .filter_map(|block| match block {
-            AssistantContent::Text { text } => Some(text.as_str()),
-            AssistantContent::Reasoning { .. } | AssistantContent::ToolCall(_) => None,
+        .flat_map(|item| &item.blocks)
+        .filter_map(|block| match &block.content {
+            BlockContent::Text { text } => Some(text.as_str()),
+            _ => None,
         })
         .collect::<String>();
     let calls = blocks
         .iter()
-        .filter_map(|block| match block {
-            AssistantContent::ToolCall(call) => Some(call.clone()),
-            AssistantContent::Text { .. } | AssistantContent::Reasoning { .. } => None,
+        .flat_map(|item| &item.blocks)
+        .filter_map(|block| match &block.content {
+            BlockContent::ToolCall(call) => Some(call.clone()),
+            _ => None,
         })
         .collect();
     Ok(FoldedResponse {
@@ -1939,7 +1909,10 @@ mod tests {
     use super::*;
     use crate::{
         agent::Question,
-        provider::protocol::ToolCall,
+        provider::protocol::{
+            BlockContent, ContentDelta, ItemKind, ReplayEnvelope, StopReason, ToolCall,
+            events_for_content,
+        },
         provider::{ProviderContext, ProviderError, ProviderFuture, ResponseStream},
     };
 
@@ -1978,7 +1951,8 @@ mod tests {
 
     struct GatedResponse {
         release: Pin<Box<dyn Future<Output = ()> + Send>>,
-        emitted: bool,
+        released: bool,
+        events: VecDeque<ResponseChunk>,
     }
 
     impl futures_util::Stream for GatedResponse {
@@ -1988,16 +1962,16 @@ mod tests {
             mut self: Pin<&mut Self>,
             context: &mut std::task::Context<'_>,
         ) -> Poll<Option<Result<ResponseChunk, crate::provider::ProviderError>>> {
-            if self.emitted {
+            if self.events.is_empty() {
                 return Poll::Ready(None);
             }
-            if self.release.as_mut().poll(context).is_pending() {
-                return Poll::Pending;
+            if !self.released {
+                if self.release.as_mut().poll(context).is_pending() {
+                    return Poll::Pending;
+                }
+                self.released = true;
             }
-            self.emitted = true;
-            Poll::Ready(Some(Ok(ResponseChunk::TextDelta {
-                text: "initial".to_owned(),
-            })))
+            Poll::Ready(self.events.pop_front().map(Ok))
         }
     }
 
@@ -2064,12 +2038,11 @@ mod tests {
                             let permit = release.acquire_owned().await.unwrap();
                             permit.forget();
                         }),
-                        emitted: false,
+                        released: false,
+                        events: answer("initial").into(),
                     })
                 } else {
-                    Box::pin(stream::iter(vec![Ok(ResponseChunk::TextDelta {
-                        text: "jobs handled".to_owned(),
-                    })]))
+                    Box::pin(stream::iter(answer("jobs handled").into_iter().map(Ok)))
                 };
                 Ok(response)
             })
@@ -2355,6 +2328,48 @@ mod tests {
             .unwrap()
     }
 
+    fn response(items: Vec<AssistantContent>) -> Vec<ResponseChunk> {
+        let stop_reason = if items.iter().any(|item| item.kind == ItemKind::ToolCall) {
+            StopReason::ToolUse
+        } else {
+            StopReason::EndTurn
+        };
+        let mut events = events_for_content(&items);
+        events.push(ResponseChunk::ResponseEnded { stop_reason });
+        events
+    }
+
+    fn answer(text: impl Into<String>) -> Vec<ResponseChunk> {
+        response(vec![AssistantContent::text("answer", 0, text)])
+    }
+
+    fn response_with_usage(items: Vec<AssistantContent>, usage: Usage) -> Vec<ResponseChunk> {
+        let mut events = response(items);
+        events.insert(events.len() - 1, ResponseChunk::UsageUpdated { usage });
+        events
+    }
+
+    fn replay(payload: serde_json::Value) -> ReplayEnvelope {
+        ReplayEnvelope {
+            version: 1,
+            protocol: "responses".into(),
+            model: "native".into(),
+            scope: "reasoning".into(),
+            payload,
+        }
+    }
+
+    fn test_fold_response(
+        items: Vec<AssistantContent>,
+        usage: Usage,
+    ) -> Result<FoldedResponse, HarnessError> {
+        let mut assembler = ResponseAssembler::default();
+        for event in response_with_usage(items, usage) {
+            assembler.push(&event)?;
+        }
+        finish_response(assembler, usage)
+    }
+
     #[test]
     fn response_folding_keeps_only_the_current_assistant_turn() {
         let call = ToolCall {
@@ -2362,10 +2377,11 @@ mod tests {
             name: "read".to_owned(),
             arguments: json!({"path":"README.md"}),
         };
-        let response = finish_response(
-            vec![AssistantContent::ToolCall(call.clone())],
-            "working".to_owned(),
-            String::new(),
+        let response = test_fold_response(
+            vec![
+                AssistantContent::text("working", 0, "working"),
+                AssistantContent::tool_call("call-1", 1, call.clone()),
+            ],
             Usage {
                 input_tokens: 10,
                 output_tokens: 2,
@@ -2376,6 +2392,10 @@ mod tests {
         assert_eq!(response.text, "working");
         assert_eq!(response.calls, vec![call]);
         assert_eq!(response.blocks.len(), 2);
+        assert_eq!(response.blocks[0].id, "working");
+        assert_eq!(response.blocks[0].blocks[0].id, "working:0");
+        assert_eq!(response.blocks[1].id, "call-1");
+        assert_eq!(response.blocks[1].blocks[0].id, "call-1:0");
         assert_eq!(response.usage.input_tokens, 10);
     }
 
@@ -2387,17 +2407,19 @@ mod tests {
             .await
             .unwrap();
         let requests = Arc::new(StdMutex::new(Vec::new()));
-        let answer = |text: &str| vec![ResponseChunk::TextDelta { text: text.into() }];
+        let answer = |text: &str| response(vec![AssistantContent::text("answer", 0, text)]);
         let original = scripted_provider(
             &requests,
             [
-                vec![ResponseChunk::Block {
-                    block: AssistantContent::ToolCall(ToolCall {
+                response(vec![AssistantContent::tool_call(
+                    "tool-0",
+                    0,
+                    ToolCall {
                         id: "read-1".into(),
                         name: "read".into(),
                         arguments: json!({"path":"input.txt"}),
-                    }),
-                }],
+                    },
+                )]),
                 answer("First answer"),
             ],
         );
@@ -2539,22 +2561,20 @@ mod tests {
             let workspace = tempfile::tempdir().unwrap();
             let sessions = tempfile::tempdir().unwrap();
             let requests = Arc::new(StdMutex::new(Vec::new()));
-            let answer = || {
-                vec![ResponseChunk::TextDelta {
-                    text: "done".into(),
-                }]
-            };
+            let answer = || response(vec![AssistantContent::text("answer", 0, "done")]);
             let provider = scripted_provider(
                 &requests,
                 [
                     answer(),
-                    vec![ResponseChunk::Block {
-                        block: AssistantContent::ToolCall(ToolCall {
+                    response(vec![AssistantContent::tool_call(
+                        "tool-0",
+                        0,
+                        ToolCall {
                             id: "grandchild".into(),
                             name: "agent".into(),
                             arguments: json!({"prompt":"leaf"}),
-                        }),
-                    }],
+                        },
+                    )]),
                     answer(),
                     answer(),
                     answer(),
@@ -2681,7 +2701,7 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                let job = JobId::new(launched.value["id"].as_u64().unwrap()).unwrap();
+                let job = JobId::new(launched.value["value"]["id"].as_u64().unwrap()).unwrap();
                 resumed
                     .runtime
                     .jobs
@@ -2717,12 +2737,12 @@ mod tests {
         let provider = scripted_provider(
             &requests,
             [
-                vec![ResponseChunk::TextDelta {
-                    text: "Image received".into(),
-                }],
-                vec![ResponseChunk::TextDelta {
-                    text: "Image still present".into(),
-                }],
+                response(vec![AssistantContent::text("answer", 0, "Image received")]),
+                response(vec![AssistantContent::text(
+                    "answer",
+                    0,
+                    "Image still present",
+                )]),
             ],
         );
         let harness = test_builder(workspace.path(), sessions.path(), provider)
@@ -2798,7 +2818,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streamed_reasoning_is_journaled_even_without_a_final_provider_block() {
+    async fn incomplete_native_response_is_retried_without_committing_deltas() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
         let harness = test_harness(
@@ -2806,17 +2826,172 @@ mod tests {
             sessions.path(),
             Arc::new(ScriptedProvider {
                 requests: Arc::new(StdMutex::new(Vec::new())),
-                responses: StdMutex::new(VecDeque::from([vec![
-                    ResponseChunk::ReasoningDelta {
-                        text: "First step. ".into(),
-                    },
-                    ResponseChunk::ReasoningDelta {
-                        text: "Second step.".into(),
-                    },
-                    ResponseChunk::TextDelta {
-                        text: "Answer".into(),
-                    },
-                ]]))
+                responses: StdMutex::new(VecDeque::from([
+                    vec![
+                        ResponseChunk::ItemStarted {
+                            id: "answer".into(),
+                            position: 0,
+                            kind: ItemKind::Text,
+                        },
+                        ResponseChunk::BlockStarted {
+                            item: "answer".into(),
+                            id: "answer:0".into(),
+                            position: 0,
+                            kind: crate::provider::protocol::BlockKind::Text,
+                        },
+                        ResponseChunk::BlockDelta {
+                            item: "answer".into(),
+                            block: "answer:0".into(),
+                            delta: ContentDelta::Text("must not persist".into()),
+                        },
+                    ],
+                    answer("Recovered"),
+                ]))
+                .into(),
+            }),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(session.prompt("Question").await.unwrap(), "Recovered");
+        session.shutdown().await.unwrap();
+        let records = SessionStore::read_records(sessions.path(), session.id())
+            .await
+            .unwrap();
+        assert!(records.iter().any(|record| matches!(&record.event,
+            SessionEvent::ModelFailed { error, .. } if error.contains("response ended before all items ended"))));
+        let assistants: Vec<_> = records
+            .iter()
+            .filter_map(|record| match &record.event {
+                SessionEvent::MessageCommitted {
+                    message: Message::Assistant(blocks),
+                } => Some(blocks),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            assistants,
+            vec![&vec![AssistantContent::text("answer", 0, "Recovered")]]
+        );
+    }
+
+    #[tokio::test]
+    async fn native_blocks_keep_order_and_opaque_state_after_journal_reload() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        // Adjacent reasoning items retain separate native identities and replay envelopes.
+        let blocks = vec![
+            AssistantContent::reasoning(
+                "one",
+                0,
+                "First",
+                Some(replay(json!({
+                    "type":"reasoning","id":"one","encrypted_content":"secret-one"
+                }))),
+            ),
+            AssistantContent::reasoning(
+                "two",
+                1,
+                "Second",
+                Some(replay(json!({
+                    "type":"reasoning","id":"two","encrypted_content":"secret-two"
+                }))),
+            ),
+            AssistantContent::text("answer", 2, "Answer"),
+            AssistantContent::text("punctuation", 3, "!"),
+        ];
+        let mut chunks = Vec::new();
+        // Arrival order is deliberately different from provider item order.
+        for index in [1, 0, 2, 3] {
+            let item = &blocks[index];
+            let block = &item.blocks[0];
+            chunks.push(ResponseChunk::ItemStarted {
+                id: item.id.clone(),
+                position: item.position,
+                kind: item.kind,
+            });
+            chunks.push(ResponseChunk::BlockStarted {
+                item: item.id.clone(),
+                id: block.id.clone(),
+                position: block.position,
+                kind: block.content.kind(),
+            });
+            if index != 3 {
+                chunks.push(ResponseChunk::BlockDelta {
+                    item: item.id.clone(),
+                    block: block.id.clone(),
+                    delta: ContentDelta::Text("provisional content".into()),
+                });
+            }
+        }
+        for index in [1, 2, 3, 0] {
+            let item = &blocks[index];
+            let block = &item.blocks[0];
+            chunks.push(ResponseChunk::BlockEnded {
+                item: item.id.clone(),
+                block: block.id.clone(),
+                content: block.content.clone(),
+            });
+            chunks.push(ResponseChunk::ItemEnded {
+                id: item.id.clone(),
+                replay: item.replay.clone(),
+            });
+        }
+        chunks.push(ResponseChunk::ResponseEnded {
+            stop_reason: StopReason::EndTurn,
+        });
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(ScriptedProvider {
+                requests: requests.clone(),
+                responses: StdMutex::new(VecDeque::from([
+                    chunks,
+                    answer("Next"),
+                    answer("Resumed"),
+                ]))
+                .into(),
+            }),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(session.prompt("Question").await.unwrap(), "Answer!");
+        session.prompt("Follow up").await.unwrap();
+        assert!(
+            requests.lock().unwrap()[1]
+                .messages
+                .contains(&Message::Assistant(blocks.clone()))
+        );
+        session.shutdown().await.unwrap();
+        let records = SessionStore::read_records(sessions.path(), session.id())
+            .await
+            .unwrap();
+        assert!(records.iter().any(|record| matches!(&record.event,
+            SessionEvent::MessageCommitted { message: Message::Assistant(actual) } if actual == &blocks)));
+        session.runtime.store.close().await.unwrap();
+        let resumed = harness.resume_session(session.id()).await.unwrap();
+        assert_eq!(resumed.prompt("After reload").await.unwrap(), "Resumed");
+        assert!(
+            requests.lock().unwrap()[2]
+                .messages
+                .contains(&Message::Assistant(blocks))
+        );
+        resumed.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn final_only_reasoning_is_journaled_without_provisional_deltas() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(ScriptedProvider {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+                responses: StdMutex::new(VecDeque::from([response(vec![
+                    AssistantContent::reasoning("reasoning", 0, "First step. Second step.", None),
+                    AssistantContent::text("answer", 1, "Answer"),
+                ])]))
                 .into(),
             }),
         )
@@ -2838,29 +3013,52 @@ mod tests {
             .unwrap();
         assert_eq!(blocks.len(), 2);
         assert!(
-            matches!(&blocks[0], AssistantContent::Reasoning { text, opaque: None } if text == "First step. Second step.")
+            matches!(&blocks[0].blocks[0].content, BlockContent::Reasoning { text } if text == "First step. Second step.")
         );
-        assert!(matches!(&blocks[1], AssistantContent::Text { text } if text == "Answer"));
+        assert!(blocks[0].replay.is_none());
+        assert_eq!(blocks[0].id, "reasoning");
+        assert_eq!(blocks[0].blocks[0].id, "reasoning:0");
+        assert!(
+            matches!(&blocks[1].blocks[0].content, BlockContent::Text { text } if text == "Answer")
+        );
     }
 
     #[test]
-    fn reasoning_fallback_preserves_complete_blocks_and_signatures_without_duplication() {
+    fn authoritative_reasoning_preserves_complete_blocks_and_signatures_without_duplication() {
         let blocks = vec![
-            AssistantContent::Reasoning {
-                text: "Complete reasoning".into(),
-                opaque: Some(json!({"signature":"signed"})),
-            },
-            AssistantContent::Text {
-                text: "Answer".into(),
-            },
+            AssistantContent::reasoning(
+                "reasoning",
+                0,
+                "Complete reasoning",
+                Some(replay(json!({"signature":"signed"}))),
+            ),
+            AssistantContent::text("answer", 1, "Answer"),
         ];
-        let response = finish_response(
-            blocks.clone(),
-            "Answer".into(),
-            "Partial reasoning".into(),
-            Usage::default(),
-        )
-        .unwrap();
+        let mut assembler = ResponseAssembler::default();
+        for event in response(blocks.clone()) {
+            if let ResponseChunk::BlockEnded {
+                item,
+                block,
+                content,
+            } = &event
+            {
+                let partial = match content {
+                    BlockContent::Reasoning { .. } => "Partial reasoning",
+                    BlockContent::Text { .. } => "Partial answer",
+                    BlockContent::ToolCall(_) => unreachable!(),
+                };
+                assembler
+                    .push(&ResponseChunk::BlockDelta {
+                        item: item.clone(),
+                        block: block.clone(),
+                        delta: ContentDelta::Text(partial.into()),
+                    })
+                    .unwrap();
+            }
+            assembler.push(&event).unwrap();
+        }
+        let response = finish_response(assembler, Usage::default()).unwrap();
+        assert_eq!(response.text, "Answer");
         assert_eq!(response.blocks, blocks);
     }
 
@@ -2918,13 +3116,15 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let call = |id: &str, name: &str, arguments| {
-            vec![ResponseChunk::Block {
-                block: AssistantContent::ToolCall(ToolCall {
+            response(vec![AssistantContent::tool_call(
+                "tool-0",
+                0,
+                ToolCall {
                     id: id.into(),
                     name: name.into(),
                     arguments,
-                }),
-            }]
+                },
+            )])
         };
         tokio::fs::write(workspace.path().join("large.txt"), "x".repeat(92_000))
             .await
@@ -2942,9 +3142,7 @@ mod tests {
                 json!({"source":"return 1;"}),
             ));
         }
-        responses.push(vec![ResponseChunk::TextDelta {
-            text: "done".into(),
-        }]);
+        responses.push(response(vec![AssistantContent::text("answer", 0, "done")]));
         let harness = test_harness(
             workspace.path(),
             sessions.path(),
@@ -2990,16 +3188,16 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let responses = vec![
-            vec![ResponseChunk::Block {
-                block: AssistantContent::ToolCall(ToolCall {
+            response(vec![AssistantContent::tool_call(
+                "tool-0",
+                0,
+                ToolCall {
                     id: "full".into(),
                     name: "script".into(),
                     arguments: json!({"source":"return {text:'x'.repeat(92000),ok:true};"}),
-                }),
-            }],
-            vec![ResponseChunk::TextDelta {
-                text: "done".into(),
-            }],
+                },
+            )]),
+            response(vec![AssistantContent::text("answer", 0, "done")]),
         ];
         let harness = test_harness(
             workspace.path(),
@@ -3022,8 +3220,8 @@ mod tests {
                 }
             })
             .unwrap();
-        assert_eq!(result.result["result"]["text"], "x".repeat(92_000));
-        assert_eq!(result.result["result"]["ok"], true);
+        assert_eq!(result.result["result"]["value"]["text"], "x".repeat(92_000));
+        assert_eq!(result.result["result"]["value"]["ok"], true);
         assert!(result.result.get("truncated").is_none());
         assert!(result.result.get("preview").is_none());
     }
@@ -3097,25 +3295,31 @@ mod tests {
             scripted_provider(
                 &requests,
                 [
-                    vec![
-                        ResponseChunk::Block {
-                            block: AssistantContent::ToolCall(ToolCall {
+                    response(vec![
+                        AssistantContent::tool_call(
+                            "tool-0",
+                            0,
+                            ToolCall {
                                 id: "read-1".to_owned(),
                                 name: "read".to_owned(),
                                 arguments: json!({"path": "note.txt"}),
-                            }),
-                        },
-                        ResponseChunk::Block {
-                            block: AssistantContent::ToolCall(ToolCall {
+                            },
+                        ),
+                        AssistantContent::tool_call(
+                            "tool-1",
+                            1,
+                            ToolCall {
                                 id: "read-2".to_owned(),
                                 name: "read".to_owned(),
                                 arguments: json!({"path": "note.txt"}),
-                            }),
-                        },
-                    ],
-                    vec![ResponseChunk::TextDelta {
-                        text: "finished".to_owned(),
-                    }],
+                            },
+                        ),
+                    ]),
+                    response(vec![AssistantContent::text(
+                        "answer",
+                        0,
+                        "finished".to_owned(),
+                    )]),
                 ],
             ),
         )
@@ -3126,7 +3330,7 @@ mod tests {
             .run_script(r#"return tool.read().path("note.txt");"#)
             .await
             .unwrap();
-        assert_eq!(script_output.value["content"], "hello");
+        assert_eq!(script_output.value["value"]["content"], "hello");
         let background = session
             .runtime
             .executor
@@ -3197,19 +3401,25 @@ mod tests {
         let provider = scripted_provider(
             &requests,
             [
-                vec![ResponseChunk::Block {
-                    block: AssistantContent::ToolCall(ToolCall {
+                response(vec![AssistantContent::tool_call(
+                    "tool-0",
+                    0,
+                    ToolCall {
                         id: "agent-1".to_owned(),
                         name: "agent".to_owned(),
                         arguments: json!({"prompt":"inspect", "target":"build", "workspace":"child"}),
-                    }),
-                }],
-                vec![ResponseChunk::TextDelta {
-                    text: "child done".to_owned(),
-                }],
-                vec![ResponseChunk::TextDelta {
-                    text: "root done".to_owned(),
-                }],
+                    },
+                )]),
+                response(vec![AssistantContent::text(
+                    "answer",
+                    0,
+                    "child done".to_owned(),
+                )]),
+                response(vec![AssistantContent::text(
+                    "answer",
+                    0,
+                    "root done".to_owned(),
+                )]),
             ],
         );
         let mut targets = TargetsConfig::default();
@@ -3256,7 +3466,7 @@ mod tests {
             )
             .await
             .unwrap()
-            .value;
+            .value["value"].clone();
         let detailed = targets["detailed"]
             .as_array()
             .unwrap()
@@ -3397,19 +3607,18 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let call = |name: &str, arguments| {
-            vec![ResponseChunk::Block {
-                block: AssistantContent::ToolCall(ToolCall {
+            response(vec![AssistantContent::tool_call(
+                "tool-0",
+                0,
+                ToolCall {
                     id: name.to_owned(),
                     name: name.to_owned(),
                     arguments,
-                }),
-            }]
+                },
+            )])
         };
-        let text = |text: &str| {
-            vec![ResponseChunk::TextDelta {
-                text: text.to_owned(),
-            }]
-        };
+        let text =
+            |text: &str| response(vec![AssistantContent::text("answer", 0, text.to_owned())]);
         let answer = "child work completed\n".repeat(500);
         let harness = test_harness(
             workspace.path(),
@@ -3482,9 +3691,7 @@ mod tests {
         for request in requests.iter() {
             let system = &request.system[0].text;
             assert!(!system.contains("compaction"));
-            assert!(system.contains(
-                "Some result fields may be truncated. Use job_output to interact with the results."
-            ));
+            assert!(system.contains("Use job_output to retrieve truncated results."));
             assert!(!system.contains("Continue with the returned"));
         }
     }
@@ -3500,15 +3707,9 @@ mod tests {
             scripted_provider(
                 &requests,
                 [
-                    vec![ResponseChunk::TextDelta {
-                        text: "first answer".into(),
-                    }],
-                    vec![ResponseChunk::TextDelta {
-                        text: "second answer".into(),
-                    }],
-                    vec![ResponseChunk::TextDelta {
-                        text: "third answer".into(),
-                    }],
+                    response(vec![AssistantContent::text("answer", 0, "first answer")]),
+                    response(vec![AssistantContent::text("answer", 0, "second answer")]),
+                    response(vec![AssistantContent::text("answer", 0, "third answer")]),
                 ],
             ),
         )
@@ -3523,7 +3724,7 @@ mod tests {
             .unwrap()
             .get_mut(&session.root)
             .unwrap()
-            .sender = quiet_sender;
+            .sender = AgentSender::new(quiet_sender);
         let first = session
             .runtime
             .executor
@@ -3543,10 +3744,21 @@ mod tests {
             ("follow-up one", "second answer"),
             ("follow-up two", "third answer"),
         ] {
-            let sent = session.run_script(format!("await tool.job({job}).send({{value:{}}}); return await tool.job({job}).output({{wait:5}});", json!(instruction))).await.unwrap();
-            assert_eq!(sent.value["id"], job.get());
-            assert_eq!(sent.value["state"], "completed");
-            assert_eq!(sent.value["result"], answer);
+            session
+                .run_script(format!(
+                    "return tool.job({job}).send({{value:{}}});",
+                    json!(instruction)
+                ))
+                .await
+                .unwrap();
+            session.runtime.jobs.wait(job, None, true).await.unwrap();
+            let sent = session
+                .run_script(format!("return tool.job({job}).output();"))
+                .await
+                .unwrap();
+            assert_eq!(sent.value["value"]["id"], job.get());
+            assert_eq!(sent.value["value"]["state"], "completed");
+            assert_eq!(sent.value["value"]["result"], answer);
             assert_eq!(
                 session.runtime.jobs.metadata(job).await.unwrap().state,
                 crate::job::JobState::Completed
@@ -3678,19 +3890,17 @@ mod tests {
             let sessions = tempfile::tempdir().unwrap();
             let requests = Arc::new(StdMutex::new(Vec::new()));
             let call = |arguments| {
-                vec![ResponseChunk::Block {
-                    block: AssistantContent::ToolCall(ToolCall {
+                response(vec![AssistantContent::tool_call(
+                    "tool-0",
+                    0,
+                    ToolCall {
                         id: "agent".to_owned(),
                         name: "agent".to_owned(),
                         arguments,
-                    }),
-                }]
+                    },
+                )])
             };
-            let text = || {
-                vec![ResponseChunk::TextDelta {
-                    text: "done".to_owned(),
-                }]
-            };
+            let text = || response(vec![AssistantContent::text("answer", 0, "done".to_owned())]);
             let harness = test_builder(
                 workspace.path(),
                 sessions.path(),
@@ -3741,26 +3951,34 @@ mod tests {
         let provider = scripted_provider(
             &requests,
             [
-                vec![ResponseChunk::Block {
-                    block: AssistantContent::ToolCall(ToolCall {
+                response(vec![AssistantContent::tool_call(
+                    "tool-0",
+                    0,
+                    ToolCall {
                         id: "agent-local".to_owned(),
                         name: "agent".to_owned(),
                         arguments: json!({"prompt":"inspect", "workspace": child_path}),
-                    }),
-                }],
-                vec![ResponseChunk::Block {
-                    block: AssistantContent::ToolCall(ToolCall {
+                    },
+                )]),
+                response(vec![AssistantContent::tool_call(
+                    "tool-0",
+                    0,
+                    ToolCall {
                         id: "read-child".to_owned(),
                         name: "read".to_owned(),
                         arguments: json!({"path":"note.txt"}),
-                    }),
-                }],
-                vec![ResponseChunk::TextDelta {
-                    text: "child done".to_owned(),
-                }],
-                vec![ResponseChunk::TextDelta {
-                    text: "root done".to_owned(),
-                }],
+                    },
+                )]),
+                response(vec![AssistantContent::text(
+                    "answer",
+                    0,
+                    "child done".to_owned(),
+                )]),
+                response(vec![AssistantContent::text(
+                    "answer",
+                    0,
+                    "root done".to_owned(),
+                )]),
             ],
         );
         let harness = test_harness(workspace.path(), sessions.path(), provider).await;
@@ -3792,29 +4010,19 @@ mod tests {
             workspace.path(),
             sessions.path(),
             scripted_provider(&requests, [
-                    vec![ResponseChunk::Block {
-                        block: AssistantContent::ToolCall(ToolCall {
+                    response(vec![AssistantContent::tool_call("tool-0", 0, ToolCall {
                             id: "root-agent".to_owned(),
                             name: "agent".to_owned(),
                             arguments: json!({"prompt":"delegate once", "depth":1}),
-                        }),
-                    }],
-                    vec![ResponseChunk::Block {
-                        block: AssistantContent::ToolCall(ToolCall {
+                        })]),
+                    response(vec![AssistantContent::tool_call("tool-0", 0, ToolCall {
                             id: "child-agent".to_owned(),
                             name: "agent".to_owned(),
                             arguments: json!({"prompt":"inspect directly", "todos":["Inspect directly"]}),
-                        }),
-                    }],
-                    vec![ResponseChunk::TextDelta {
-                        text: "leaf done".to_owned(),
-                    }],
-                    vec![ResponseChunk::TextDelta {
-                        text: "child done".to_owned(),
-                    }],
-                    vec![ResponseChunk::TextDelta {
-                        text: "root done".to_owned(),
-                    }],
+                        })]),
+                    response(vec![AssistantContent::text("answer", 0, "leaf done".to_owned())]),
+                    response(vec![AssistantContent::text("answer", 0, "child done".to_owned())]),
+                    response(vec![AssistantContent::text("answer", 0, "root done".to_owned())]),
                 ]),
         )
         .await;
@@ -3851,16 +4059,20 @@ mod tests {
             scripted_provider(
                 &requests,
                 [
-                    vec![ResponseChunk::Block {
-                        block: AssistantContent::ToolCall(ToolCall {
+                    response(vec![AssistantContent::tool_call(
+                        "tool-0",
+                        0,
+                        ToolCall {
                             id: "agent-too-deep".to_owned(),
                             name: "agent".to_owned(),
                             arguments: json!({"prompt":"too deep", "depth":4}),
-                        }),
-                    }],
-                    vec![ResponseChunk::TextDelta {
-                        text: "root done".to_owned(),
-                    }],
+                        },
+                    )]),
+                    response(vec![AssistantContent::text(
+                        "answer",
+                        0,
+                        "root done".to_owned(),
+                    )]),
                 ],
             ),
         )
@@ -3893,37 +4105,47 @@ mod tests {
             scripted_provider(
                 &requests,
                 [
-                    vec![ResponseChunk::Block {
-                        block: AssistantContent::ToolCall(ToolCall {
+                    response(vec![AssistantContent::tool_call(
+                        "tool-0",
+                        0,
+                        ToolCall {
                             id: "root-agent".to_owned(),
                             name: "agent".to_owned(),
                             arguments: json!({"prompt":"try hidden delegation"}),
-                        }),
-                    }],
-                    vec![
-                        ResponseChunk::Block {
-                            block: AssistantContent::ToolCall(ToolCall {
+                        },
+                    )]),
+                    response(vec![
+                        AssistantContent::tool_call(
+                            "tool-0",
+                            0,
+                            ToolCall {
                                 id: "hidden-agent".to_owned(),
                                 name: "agent".to_owned(),
                                 arguments: json!({"prompt":"escape"}),
-                            }),
-                        },
-                        ResponseChunk::Block {
-                            block: AssistantContent::ToolCall(ToolCall {
+                            },
+                        ),
+                        AssistantContent::tool_call(
+                            "tool-1",
+                            1,
+                            ToolCall {
                                 id: "script-agent".to_owned(),
                                 name: "script".to_owned(),
                                 arguments: json!({
                                     "source":"return tool.agent({prompt: 'escape'});"
                                 }),
-                            }),
-                        },
-                    ],
-                    vec![ResponseChunk::TextDelta {
-                        text: "child done".to_owned(),
-                    }],
-                    vec![ResponseChunk::TextDelta {
-                        text: "root done".to_owned(),
-                    }],
+                            },
+                        ),
+                    ]),
+                    response(vec![AssistantContent::text(
+                        "answer",
+                        0,
+                        "child done".to_owned(),
+                    )]),
+                    response(vec![AssistantContent::text(
+                        "answer",
+                        0,
+                        "root done".to_owned(),
+                    )]),
                 ],
             ),
         )
@@ -3958,25 +4180,27 @@ mod tests {
             scripted_provider(
                 &requests,
                 [
-                    vec![
-                        ResponseChunk::Block {
-                            block: AssistantContent::ToolCall(ToolCall {
+                    response(vec![
+                        AssistantContent::tool_call(
+                            "tool-0",
+                            0,
+                            ToolCall {
                                 id: "ask-1".to_owned(),
                                 name: "ask".to_owned(),
                                 arguments: json!({"id":"first", "prompt":"First?", "options":[]}),
-                            }),
-                        },
-                        ResponseChunk::Block {
-                            block: AssistantContent::ToolCall(ToolCall {
+                            },
+                        ),
+                        AssistantContent::tool_call(
+                            "tool-1",
+                            1,
+                            ToolCall {
                                 id: "ask-2".to_owned(),
                                 name: "ask".to_owned(),
                                 arguments: json!({"id":"second", "prompt":"Second?", "options":[]}),
-                            }),
-                        },
-                    ],
-                    vec![ResponseChunk::TextDelta {
-                        text: "done".to_owned(),
-                    }],
+                            },
+                        ),
+                    ]),
+                    response(vec![AssistantContent::text("answer", 0, "done".to_owned())]),
                 ],
             ),
             Arc::new(RecordingQuestions {
@@ -4117,6 +4341,10 @@ mod tests {
             );
         }
         assert!(!description.contains("$schema"));
+        assert!(description.contains("this script's own job ID"));
+        assert!(description.contains("requires `script` with `bg:true`"));
+        assert!(description.contains("Child-agent input is delivered automatically"));
+        assert!(description.contains("next model-request boundary"));
         assert!(description.contains("Sending to a completed agent"));
         assert!(description.contains("same job ID"));
         let agent_description = &definitions
@@ -4146,14 +4374,20 @@ mod tests {
             )
             .await
             .unwrap();
+        session
+            .runtime
+            .jobs
+            .wait(running.job, None, true)
+            .await
+            .unwrap();
         let inspected = session
             .run_script(format!(
-                "await tool.job({}).output({{wait:2}}); return tool.job({}).output();",
+                "await tool.job({}).output(); return tool.job({}).output();",
                 running.job, running.job
             ))
             .await
             .unwrap();
-        assert_eq!(inspected.value["id"], running.job.get());
+        assert_eq!(inspected.value["value"]["id"], running.job.get());
     }
 
     #[tokio::test]
@@ -4167,30 +4401,22 @@ mod tests {
             scripted_provider(
                 &requests,
                 [
-                    vec![
-                        ResponseChunk::TextDelta {
-                            text: "done".to_owned(),
+                    response_with_usage(
+                        vec![AssistantContent::text("answer", 0, "done".to_owned())],
+                        Usage {
+                            input_tokens: 10,
+                            cached_input_tokens: 2,
+                            output_tokens: 3,
                         },
-                        ResponseChunk::Usage {
-                            usage: Usage {
-                                input_tokens: 10,
-                                cached_input_tokens: 2,
-                                output_tokens: 3,
-                            },
+                    ),
+                    response_with_usage(
+                        vec![AssistantContent::text("answer", 0, "done".to_owned())],
+                        Usage {
+                            input_tokens: 20,
+                            cached_input_tokens: 4,
+                            output_tokens: 5,
                         },
-                    ],
-                    vec![
-                        ResponseChunk::TextDelta {
-                            text: "done".to_owned(),
-                        },
-                        ResponseChunk::Usage {
-                            usage: Usage {
-                                input_tokens: 20,
-                                cached_input_tokens: 4,
-                                output_tokens: 5,
-                            },
-                        },
-                    ],
+                    ),
                 ],
             ),
         )
@@ -4417,7 +4643,7 @@ mod tests {
             "choose-color"
         );
         assert_eq!(
-            session.run_script("return 6 * 7;").await.unwrap().value,
+            session.run_script("return 6 * 7;").await.unwrap().value["value"],
             json!(42)
         );
         session
@@ -4427,27 +4653,24 @@ mod tests {
             ))
             .await
             .unwrap();
-        let completed = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let result = session
-                    .runtime
-                    .executor
-                    .execute_model(
-                        session.root.clone(),
-                        "job_output",
-                        json!({"job":ask.job, "wait":1}),
-                        None,
-                    )
-                    .await
-                    .unwrap();
-                if result.output.value["state"] == "completed" {
-                    break result;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            session.runtime.jobs.wait(ask.job, None, true),
+        )
         .await
+        .unwrap()
         .unwrap();
+        let completed = session
+            .runtime
+            .executor
+            .execute_model(
+                session.root.clone(),
+                "job_output",
+                json!({"job":ask.job}),
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(completed.output.value["result"], "blue");
         let events = session.runtime.store.records().await;
         assert!(events.iter().any(|record| matches!(&record.event,
@@ -4872,7 +5095,10 @@ mod tests {
             .wait(running.job, Some(Duration::from_secs(2)), true)
             .await
             .unwrap();
-        assert_eq!(completed.output, Some(json!("hello")));
+        assert_eq!(
+            completed.output,
+            Some(json!({"value":"hello", "console":""}))
+        );
     }
 
     #[tokio::test]
@@ -4897,7 +5123,8 @@ mod tests {
             ),
             (
                 "pool",
-                "const inputs=['missing-a','note.txt','missing-b','note.txt']; const results=[]; for await(const {index,value} of new WorkPool(2).map(inputs, path=>tool.read({path}))) results.push({index,content:value.content}); return results.sort((a,b)=>a.index-b.index);",
+                // Invalid path types still throw; missing files now resolve with structured read errors.
+                "const inputs=[17,'note.txt',false,'note.txt']; const results=[]; for await(const {index,value} of new WorkPool(2).map(inputs, path=>tool.read({path}))) results.push({index,content:value.content}); return results.sort((a,b)=>a.index-b.index);",
             ),
         ];
         let harness = test_harness(
@@ -4906,19 +5133,24 @@ mod tests {
             scripted_provider(
                 &requests,
                 [
-                    scripts
-                        .into_iter()
-                        .map(|(id, source)| ResponseChunk::Block {
-                            block: AssistantContent::ToolCall(ToolCall {
-                                id: id.to_owned(),
-                                name: "script".to_owned(),
-                                arguments: json!({"source": source}),
-                            }),
-                        })
-                        .collect(),
-                    vec![ResponseChunk::TextDelta {
-                        text: "done".to_owned(),
-                    }],
+                    response(
+                        scripts
+                            .into_iter()
+                            .enumerate()
+                            .map(|(position, (id, source))| {
+                                AssistantContent::tool_call(
+                                    id,
+                                    position,
+                                    ToolCall {
+                                        id: id.to_owned(),
+                                        name: "script".to_owned(),
+                                        arguments: json!({"source": source}),
+                                    },
+                                )
+                            })
+                            .collect(),
+                    ),
+                    response(vec![AssistantContent::text("answer", 0, "done".to_owned())]),
                 ],
             ),
         )
@@ -4939,20 +5171,27 @@ mod tests {
             .flatten()
             .collect::<Vec<_>>();
         let result = |id: &str| *results.iter().find(|result| result.call_id == id).unwrap();
-        assert_eq!(result("success").result["result"], json!({"changed":3}));
         assert_eq!(
-            result("success").result["console"],
+            result("success").result["result"]["value"],
+            json!({"changed":3})
+        );
+        assert_eq!(
+            result("success").result["result"]["console"],
             "Processed 12 {\"files\":true}\n"
         );
         assert!(!result("success").is_error);
         assert!(result("failure").is_error);
-        assert_eq!(result("failure").result["console"], "before failure\n");
+        assert_eq!(result("failure").result["result"]["value"], json!(null));
+        assert_eq!(
+            result("failure").result["result"]["console"],
+            "before failure\n"
+        );
         assert_eq!(
             result("failure").result["result"]["failure"]["message"],
             "boom"
         );
-        assert_eq!(result("silent").result["result"], json!(42));
-        assert!(result("silent").result.get("console").is_none());
+        assert_eq!(result("silent").result["result"]["value"], json!(42));
+        assert_eq!(result("silent").result["result"]["console"], "");
         assert!(
             serde_json::to_value(result("silent"))
                 .unwrap()
@@ -4961,24 +5200,24 @@ mod tests {
         );
         assert!(result("serialization").is_error);
         assert_eq!(
-            result("serialization").result["console"],
+            result("serialization").result["result"]["console"],
             "before serialization\n"
         );
-        assert!(!result("pool").is_error);
+        assert!(!result("pool").is_error, "{:?}", result("pool"));
         assert_eq!(
-            result("pool").result["result"],
+            result("pool").result["result"]["value"],
             json!([
                 {"index":1,"content":"hello"}, {"index":3,"content":"hello"}
             ])
         );
         assert!(
-            result("pool").result["console"]
+            result("pool").result["result"]["console"]
                 .as_str()
                 .unwrap()
                 .contains("WorkPool item 0 failed:")
         );
         assert!(
-            result("pool").result["console"]
+            result("pool").result["result"]["console"]
                 .as_str()
                 .unwrap()
                 .contains("WorkPool item 2 failed:")
@@ -5011,18 +5250,47 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let completed = session
-                .run_script(format!(
-                    "return tool.job({}).output({{wait:5}});",
-                    running.job.get()
-                ))
+            session
+                .runtime
+                .jobs
+                .wait(running.job, None, true)
                 .await
                 .unwrap();
-            assert_eq!(completed.value["console"], "background\n");
+            let completed = session
+                .run_script(format!("return tool.job({}).output();", running.job.get()))
+                .await
+                .unwrap();
+            assert_eq!(
+                completed.value["value"]["result"]["console"],
+                "background\n"
+            );
+            assert_eq!(completed.value["console"], "");
+            assert!(completed.value["value"].get("console").is_none());
+            let page_source = format!(
+                "return tool.job({}).output({{field:'/result/console',limit:1}});",
+                running.job.get()
+            );
+            let page = session.run_script(&page_source).await.unwrap();
+            let replay = session.run_script(&page_source).await.unwrap();
+            assert_eq!(page.value, replay.value);
+            assert_eq!(page.value["value"]["preview"]["field"], "/result/console");
+            assert_eq!(
+                page.value["value"]["preview"]["lines"],
+                json!(["background"])
+            );
             if source.contains("return") {
-                assert_eq!(completed.value["result"], 7);
+                assert_eq!(completed.value["value"]["result"]["value"], 7);
+                let returned = session
+                    .run_script(format!(
+                        "return tool.job({}).output({{field:'/result/value'}});",
+                        running.job.get()
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(returned.value["value"]["preview"]["field"], "/result/value");
+                assert_eq!(returned.value["value"]["preview"]["lines"], json!(["7"]));
             } else {
-                assert_eq!(completed.value["state"], "failed");
+                assert_eq!(completed.value["value"]["state"], "failed");
             }
         }
         let store = &session.runtime.store;
@@ -5034,7 +5302,11 @@ mod tests {
         let mut scripts = Vec::new();
         for job in restored.list(&session.root).await {
             let job = restored.snapshot(job.id).await.unwrap();
-            if job.console_output == "background\n" {
+            if job
+                .output
+                .as_ref()
+                .is_some_and(|output| output["console"] == "background\n")
+            {
                 scripts.push(job);
             }
         }
@@ -5065,29 +5337,34 @@ const accepted = [];
 for (const value of [{{text:"hello 🌏", nested:[1,true]}}, null, false]) {{
   accepted.push(await tool.job({id}).send({{value}}));
 }}
-const pending = await tool.job({id}).output({{wait:1}});
+const pending = await tool.job({id}).output();
 return {{accepted, state:pending.state}};
 "#
             ))
             .await
             .unwrap();
         assert_eq!(
-            queued.value["accepted"],
+            queued.value["value"]["accepted"],
             json!(vec![json!({"accepted":true}); 3])
         );
-        assert_eq!(queued.value["state"], "running");
-        let completed = session
-            .run_script(format!(
-                r#"
-await tool.job({id}).send({{value:"last"}});
-return tool.job({id}).output({{wait:5}});
-"#
-            ))
+        assert_eq!(queued.value["value"]["state"], "running");
+        session
+            .run_script(format!("return tool.job({id}).send({{value:\"last\"}});"))
             .await
             .unwrap();
-        assert_eq!(completed.value["state"], "completed");
+        session
+            .runtime
+            .jobs
+            .wait(running.job, None, true)
+            .await
+            .unwrap();
+        let completed = session
+            .run_script(format!("return tool.job({id}).output();"))
+            .await
+            .unwrap();
+        assert_eq!(completed.value["value"]["state"], "completed");
         assert_eq!(
-            completed.value["result"],
+            completed.value["value"]["result"]["value"],
             json!({
                 "messages":[{"text":"hello 🌏", "nested":[1,true]}, null, false, "last"],
                 "notifyType":"undefined",
@@ -5106,17 +5383,23 @@ return tool.job({id}).output({{wait:5}});
             .await
             .unwrap();
         let id = waiting.job.get();
-        let cancelled = session
+        session
             .run_script(format!(
-                r#"
-await tool.job({id}).output({{wait:1}});
-await tool.job({id}).cancel();
-return tool.job({id}).output({{wait:5}});
-"#
+                "await tool.job({id}).output(); return tool.job({id}).cancel();"
             ))
             .await
             .unwrap();
-        assert_eq!(cancelled.value["state"], "cancelled");
+        session
+            .runtime
+            .jobs
+            .wait(waiting.job, None, true)
+            .await
+            .unwrap();
+        let cancelled = session
+            .run_script(format!("return tool.job({id}).output();"))
+            .await
+            .unwrap();
+        assert_eq!(cancelled.value["value"]["state"], "cancelled");
     }
 
     #[cfg(unix)]
@@ -5133,15 +5416,25 @@ return tool.job({id}).output({{wait:5}});
         let session = harness.new_session().await.unwrap();
         let output = tokio::time::timeout(Duration::from_secs(15), session.run_script(r#"
 const job = await tool.shell({command:"printf 'before\\n'; while [ ! -f release ]; do sleep 0.01; done; printf 'after\\n'",timeout:10,bg:true});
-const live = await tool.job(job.id).output({field:"/result/stdout",wait:5});
+let live;
+while (true) {
+  live = await tool.job(job.id).output({field:"/result/stdout"});
+  if (live.preview.lines.length > 0) break;
+  await tool.wait({timeout:1});
+}
 await tool.write({path:"release",content:"go"});
-const completed = await tool.job(job.id).output({wait:10});
+let completed;
+while (true) {
+  completed = await tool.job(job.id).output();
+  if (["completed", "failed", "cancelled", "interrupted"].includes(completed.state)) break;
+  await tool.wait({timeout:1});
+}
 const first = await tool.job(job.id).output({field:"/result/stdout",limit:1});
 const replay = await tool.job(job.id).output({field:"/result/stdout",limit:1});
 const second = await tool.job(job.id).output({field:first.preview.field, start:first.preview.next_start, offset:first.preview.next_offset});
 return {live,completed,first,replay,second};
 "#)).await.unwrap().unwrap();
-        let value = output.value;
+        let value = output.value["value"].clone();
         assert_eq!(value["live"]["state"], "running");
         assert_eq!(value["first"], value["replay"]);
         assert_eq!(value["completed"]["state"], "completed");
@@ -5170,9 +5463,11 @@ return {live,completed,first,replay,second};
             .runtime
             .commit(
                 &session.root,
-                Message::Assistant(vec![AssistantContent::Text {
-                    text: "r".repeat(padding as usize),
-                }]),
+                Message::Assistant(vec![AssistantContent::text(
+                    "research",
+                    0,
+                    "r".repeat(padding as usize),
+                )]),
             )
             .await
             .unwrap();
@@ -5186,7 +5481,7 @@ return {live,completed,first,replay,second};
         let plan = "## Implementation plan\n1. Preserve the full original plan.\n2. Run the migration only after approval.\n";
         let provider = scripted_provider(
             &requests,
-            [vec![ResponseChunk::TextDelta { text: plan.into() }]],
+            [response(vec![AssistantContent::text("answer", 0, plan)])],
         );
         let harness = test_harness(workspace.path(), sessions.path(), provider.clone()).await;
         let session = harness.new_session().await.unwrap();
@@ -5205,11 +5500,15 @@ return {live,completed,first,replay,second};
             .replace(&session.root, todos.clone())
             .await
             .unwrap();
-        let creator = Message::Assistant(vec![AssistantContent::ToolCall(ToolCall {
-            id: "launch-once".into(),
-            name: "shell".into(),
-            arguments: json!({"command":"long-running research", "bg":true}),
-        })]);
+        let creator = Message::Assistant(vec![AssistantContent::tool_call(
+            "launch-once",
+            0,
+            ToolCall {
+                id: "launch-once".into(),
+                name: "shell".into(),
+                arguments: json!({"command":"long-running research", "bg":true}),
+            },
+        )]);
         let origin = session
             .runtime
             .commit(&session.root, creator.clone())
@@ -5238,7 +5537,6 @@ return {live,completed,first,replay,second};
             call_id: "launch-once".into(),
             name: "shell".into(),
             result: json!({"id":lease.id,"state":"running"}),
-            console_output: String::new(),
             images: vec![],
             is_error: false,
         }]);
@@ -5268,20 +5566,19 @@ return {live,completed,first,replay,second};
             }).to_string();
             add_research_for_compaction(&session, &template, 114_000).await;
             provider.responses.lock().unwrap().extend([
-                vec![
-                    ResponseChunk::TextDelta { text: summary },
-                    ResponseChunk::Usage {
-                        usage: Usage {
-                            input_tokens: 10,
-                            output_tokens: 3,
-                            cached_input_tokens: 0,
-                        },
+                response_with_usage(
+                    vec![AssistantContent::text("answer", 0, summary)],
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 3,
+                        cached_input_tokens: 0,
                     },
-                    ResponseChunk::Finished { truncated: false },
-                ],
-                vec![ResponseChunk::TextDelta {
-                    text: "Continuing the original plan.".into(),
-                }],
+                ),
+                response(vec![AssistantContent::text(
+                    "answer",
+                    0,
+                    "Continuing the original plan.",
+                )]),
             ]);
             session.prompt("Continue.").await.unwrap();
             let captured = requests.lock().unwrap();
@@ -5366,9 +5663,11 @@ return {live,completed,first,replay,second};
             .responses
             .lock()
             .unwrap()
-            .push_back(vec![ResponseChunk::TextDelta {
-                text: "Resumed safely.".into(),
-            }]);
+            .push_back(response(vec![AssistantContent::text(
+                "answer",
+                0,
+                "Resumed safely.",
+            )]));
         resumed.prompt("Resume.").await.unwrap();
         let last = requests.lock().unwrap().last().unwrap().clone();
         assert!(
@@ -5396,9 +5695,11 @@ return {live,completed,first,replay,second};
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let provider = scripted_provider(
             &requests,
-            [vec![ResponseChunk::TextDelta {
-                text: "## Plan\nKeep this original plan.".into(),
-            }]],
+            [response(vec![AssistantContent::text(
+                "answer",
+                0,
+                "## Plan\nKeep this original plan.",
+            )])],
         );
         let harness = test_harness(workspace.path(), sessions.path(), provider.clone()).await;
         let session = harness.new_session().await.unwrap();
@@ -5413,13 +5714,15 @@ return {live,completed,first,replay,second};
             .lock()
             .unwrap()
             .extend(std::iter::repeat_n(
-                vec![ResponseChunk::Block {
-                    block: AssistantContent::ToolCall(ToolCall {
+                response(vec![AssistantContent::tool_call(
+                    "tool-0",
+                    0,
+                    ToolCall {
                         id: "must-not-run".into(),
                         name: "shell".into(),
                         arguments: json!({"command":"touch should-not-exist"}),
-                    }),
-                }],
+                    },
+                )]),
                 super::compact::MAX_PROVIDER_ATTEMPTS as usize,
             ));
         assert!(session.prompt("Continue.").await.is_err());

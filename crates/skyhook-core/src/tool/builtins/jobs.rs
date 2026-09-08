@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::{
     identity::JobId,
     job::{JobManager, presented_job_schema},
-    tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder},
+    tool::{RegistryError, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder},
 };
 
 pub(crate) fn register(
@@ -52,20 +52,45 @@ pub(crate) fn register(
         },
     )?;
     let output = jobs.clone();
-    builder.register::<crate::job::output::OutputArgs, Value, _, _>(
+    builder.register_dynamic(
         "job_output",
-        "Read or search saved job output and status. Reads are repeatable. Use wait to await output, a question, or completion; timeout does not stop work. Select a field with start/limit; total_lines reports its size. Continue using next_start/next_offset as start/offset, repeating field and any pattern/context. Answer questions with tool.job(id).send({value:answer}).",
+        "Read or search saved job output and status on job completion. Whole-output reads attach saved images; filtered or paginated reads return text in preview.lines without images.",
+        serde_json::to_value(schemars::schema_for!(crate::job::output::OutputArgs))
+            .map_err(|error| RegistryError::Schema(error.to_string()))?,
         ToolOptions::default().generated_output_schema(crate::job::output::view_schema).job_method("output", "job"),
-        move |context, mut args| {
+        move |context, arguments| {
             let jobs = output.clone();
-            args.cancellation = Some(context.cancellation_token());
-            async move { jobs.present_output_for(args, &context.capabilities, &context.caller_location, false).await }
+            async move {
+                let mut args: crate::job::output::OutputArgs = serde_json::from_value(arguments)
+                    .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+                // Any explicit text selection, even its default value, opts out
+                // of potentially large image payloads.
+                let attach_images = args.field.is_none()
+                    && args.start.is_none()
+                    && args.limit.is_none()
+                    && args.pattern.is_none()
+                    && args.context.is_none()
+                    && args.offset.is_none();
+                let job = args.job;
+                args.cancellation = Some(context.cancellation_token());
+                // Preserve validation, cancellation, capability projection, and
+                // acknowledgment before retrieving any attachment side channel.
+                let value = jobs.present_output_for(
+                    args, &context.capabilities, &context.caller_location, false,
+                ).await?;
+                let images = if attach_images {
+                    jobs.images(job).await.map_err(|error| job_error(&error))?
+                } else {
+                    Vec::new()
+                };
+                Ok(ToolOutput::new(value).with_images(images))
+            }
         },
     )?;
     let send = jobs.clone();
     builder.register::<JobSendArgs, Value, _, _>(
         "job_send",
-        "Send JSON input. For an agent, answer pending questions or queue follow-up instructions for its next request. Sending to a completed agent appends to its retained conversation and resumes it under the same job ID.",
+        "Send JSON input to a job. For child agents, answer pending questions or deliver follow-up instructions automatically at the next model-request boundary. Sending to a completed agent appends to its retained conversation and resumes it under the same job ID. Background scripts read input with await receive().",
         ToolOptions::default()
             .script_only()
             .job_method("send", "job"),
@@ -128,11 +153,15 @@ struct JobArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct JobSendArgs {
-    /// Stable job identifier. Use the agent job, not its internal ask job.
+    /// Destination job ID. For child updates or answers, use the agent job; for receive(), use the background script job.
     job: JobId,
     /// JSON input. For merged child questions, pass an object keyed directly by question ID.
     value: Value,
 }
+
+#[cfg(test)]
+#[path = "job_image_tests.rs"]
+mod image_tests;
 
 #[cfg(test)]
 mod tests {
@@ -167,7 +196,6 @@ mod tests {
         for (tool, args) in [
             ("jobs", serde_json::json!({})),
             ("job_output", serde_json::json!({"job":pending})),
-            ("job_output", serde_json::json!({"job":pending,"wait":1})),
         ] {
             let result = executor
                 .execute(agent.clone(), tool, args, None)

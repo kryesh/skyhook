@@ -531,10 +531,7 @@ async fn route_responses<R>(
                     .await;
                     return;
                 };
-                if !(field == "/console"
-                    || field == "/error"
-                    || field == "/result"
-                    || field.starts_with("/result/"))
+                if !(field == "/error" || field == "/result" || field.starts_with("/result/"))
                     || data.len() > 64 * 1024
                     || (finished && !data.is_empty())
                 {
@@ -1044,7 +1041,6 @@ mod tests {
     fn output(value: &str) -> RemoteToolResult {
         Ok(RemoteToolOutput {
             value: serde_json::json!(value),
-            console_output: String::new(),
             images: Vec::new(),
         })
     }
@@ -1069,7 +1065,7 @@ mod tests {
                         let peer = Mutex::new(peer);
                         if complete {
                             super::super::protocol::write_artifact(&peer,1,"/result/stdout".into(),&source).await.unwrap();
-                            write_frame(&mut *peer.lock().await,&Response::Tool {request_id:1,result:Ok(RemoteToolOutput {value:serde_json::json!({"stdout":"","exit_code":0}),images:Vec::new(),console_output:String::new()})}).await.unwrap();
+                            write_frame(&mut *peer.lock().await,&Response::Tool {request_id:1,result:Ok(RemoteToolOutput {value:serde_json::json!({"stdout":"","exit_code":0}),images:Vec::new()})}).await.unwrap();
                         } else {
                             write_frame(&mut *peer.lock().await,&Response::ToolArtifact {request_id:1,field:"/result/stdout".into(),offset:0,data:b"retained prefix\n".to_vec(),finished:false}).await.unwrap();
                         }
@@ -1110,7 +1106,7 @@ mod tests {
                 let script = executor.execute_model(runtime.agent.clone(), "script", serde_json::json!({
                     "source":"const remote = await tool.remote_fixture({}); if (remote.stdout.length !== 1250000) throw new Error('truncated inside script'); return {remote};"
                 }), None).await.unwrap();
-                let child = &script.output.value["result"]["remote"];
+                let child = &script.output.value["result"]["value"]["remote"];
                 assert_eq!(child["tool"], "remote_fixture");
                 assert_eq!(child["result"]["stdout"], "line\n".repeat(100));
                 let mut query = crate::job::output::OutputArgs::new(

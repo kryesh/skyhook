@@ -67,7 +67,7 @@ pub(crate) async fn resolve_writable(
     Ok(parent.join(name))
 }
 
-fn lexical_path(workspace: &Path, relative: &str) -> Result<PathBuf, ToolError> {
+pub(crate) fn lexical_path(workspace: &Path, relative: &str) -> Result<PathBuf, ToolError> {
     let path = Path::new(relative);
     if path.as_os_str().is_empty() {
         return Err(ToolError::Failed("path cannot be empty".to_owned()));

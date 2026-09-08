@@ -544,7 +544,9 @@ mod tests {
 │   ├── diagram.svg
 │   ├── nul.dat
 │   ├── payload.bin
-│   └── pixel.png
+│   ├── pixel.png
+│   ├── vision-other.png
+│   └── vision.png
 ├── references/
 │   ├── config.json
 │   ├── data.csv
@@ -636,7 +638,7 @@ mod tests {
                 }
                 "scripts" => "└── example.py".to_owned(),
                 "assets" => {
-                    "├── diagram.svg\n├── nul.dat\n├── payload.bin\n└── pixel.png".to_owned()
+                    "├── diagram.svg\n├── nul.dat\n├── payload.bin\n├── pixel.png\n├── vision-other.png\n└── vision.png".to_owned()
                 }
                 _ => unreachable!(),
             };

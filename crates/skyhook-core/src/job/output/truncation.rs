@@ -24,25 +24,9 @@ pub(super) fn project(
         replacements,
     };
     projection.visit(&mut document["result"], "/result", &[schema], schema)?;
-    // Console is a shared output field with the same explicit annotation as tool fields.
-    let console_schema = json!({"type":"string", ANNOTATION:true});
-    projection.visit(
-        &mut document["console"],
-        "/console",
-        &[&console_schema],
-        &console_schema,
-    )?;
     let mut output = serde_json::Map::new();
     output.insert("result".into(), document["result"].take());
     capture_notice(&mut output, document["capture_complete"].as_bool());
-    if document["console"].as_str().is_some_and(|s| !s.is_empty())
-        || projection
-            .truncated
-            .iter()
-            .any(|t| t["field"] == "/console")
-    {
-        output.insert("console".into(), document["console"].take());
-    }
     if !projection.truncated.is_empty() {
         output.insert("truncated".into(), Value::Array(projection.truncated));
     }
@@ -552,8 +536,7 @@ mod tests {
         let mut spec = JobSpec::test(AgentId::root(store.id()), "annotated");
         spec.output_schema = Some(schema);
         let id = manager.create(spec).await.unwrap().id;
-        let mut output = ToolOutput::new(value);
-        output.console_output = "console\n".repeat(150);
+        let output = ToolOutput::new(value);
         let outcome = if let Some(message) = error {
             JobOutcome::Failed {
                 message,
@@ -597,8 +580,8 @@ mod tests {
             manager.metadata(id).await.unwrap().error.as_deref(),
             Some(error.as_str())
         );
-        assert_eq!(view["console"], "console\n".repeat(100));
-        assert_eq!(view["truncated"].as_array().unwrap().len(), 4);
+        assert!(view.get("console").is_none());
+        assert_eq!(view["truncated"].as_array().unwrap().len(), 3);
         assert!(view.get("preview").is_none());
         assert_eq!(manager.snapshot(id).await.unwrap().output.unwrap(), value);
         let session = manager.store().id();

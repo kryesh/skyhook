@@ -6,8 +6,8 @@ lazy builder inside `script`.
 
 The workspace contains the source-only `skyhook-agent-core` library package (whose Rust crate is
 named `skyhook`) and the installable `skyhook-agent` CLI package. The core does not depend on a
-provider-specific response type; Flux adapters supply OpenAI, Anthropic, Codex/ChatGPT subscription,
-Claude subscription, and OpenAI-compatible backends.
+provider-specific response type; native backends implement OpenAI Chat Completions and Responses,
+Anthropic Messages, and Codex/ChatGPT subscription behind a common provider API.
 
 ## Install
 
@@ -277,11 +277,11 @@ If todos change during summarization, a fresh attempt uses current history and s
 request still ends with a fresh state block containing current todos and active jobs.
 
 `ModelRequest.response_schema` optionally supplies a named JSON Schema for final answer text,
-independently of reasoning settings. Built-in Flux adapters transmit it through OpenAI Chat
-Completions, Responses, and Anthropic Messages formats. Codex OAuth schema calls use HTTP while
-ordinary calls retain Flux's WebSocket transport. Models/endpoints must support structured output;
-an opaque backend factory wrapped with `FluxProvider::new` rejects schemas explicitly instead of ignoring
-them. Ordinary agent requests have no response schema.
+independently of reasoning settings. Native backends transmit it through OpenAI Chat Completions,
+Responses, and Anthropic Messages formats. Codex uses the same Responses codec for WebSocket and
+HTTP/SSE, including structured output. Models/endpoints must support the requested features; providers
+must reject unsupported constraints instead of silently ignoring them or substituting a prompt.
+Ordinary agent requests have no response schema.
 
 Compaction includes a required `jobs` array of job IDs selected by the compactor, or `[]`.
 Skyhook supplies those jobs' original parameters and normally truncated outputs in the continuation.
@@ -409,16 +409,20 @@ a platform without a supplied shim returns an unsupported-platform error.
 ## Configuration
 
 Providers and models are separate named profiles. API secrets are read from environment variables;
-they are not stored in the TOML file. `openai_compatible` accepts an optional `api_key_env`, so a
-local endpoint can be keyless. Its `api` is either `chat_completions` or `responses`.
+they are not stored in the TOML file. `openai` requires an explicit `base_url` and `api`
+(`chat_completions` or `responses`); `anthropic` requires an explicit `base_url`. Both accept an
+optional `api_key_env`, so a local endpoint can be keyless. URLs name the API root: Skyhook appends
+`/chat/completions`, `/responses`, or `/messages`. For the official services use
+`https://api.openai.com/v1` or `https://api.anthropic.com/v1`. There are no vendor presets, model
+aliases, or automatic endpoint quirks. Use full model identifiers and standard protocol fields.
 
 ```toml
 approve_all = false
 targets_enabled = false
 
 [providers.local]
-kind = "openai_compatible"
-base_url = "http://127.0.0.1:11434"
+kind = "openai"
+base_url = "http://127.0.0.1:11434/v1"
 api = "chat_completions"
 
 [models.local]
@@ -431,12 +435,40 @@ supports_images = false
 
 Every model profile requires `max_context` and `max_output`. Set them to the context capacity and
 output limit you want Skyhook to use for that model; the example values are conservative starting
-points. Both must be positive, `max_output` must be smaller than `max_context`, and the output limit
-must fit the provider's 32-bit token field. Skyhook sends the configured output limit on every call.
+points. Both must be positive and `max_output` must be smaller than `max_context`. Protocol-specific
+limits are validated by the backend or service. Codex subscription does not accept an output-token
+limit on the wire; its configured limit remains available to local context budgeting.
 
-The `codex` and `claude` provider kinds import and refresh credentials through Flux, including
-credentials from the official Codex and Claude CLIs. Instructions in `AGENTS.md` files are loaded
-from outermost ancestor to workspace, followed by instructions configured through the library.
+The `codex` provider uses **Skyhook-owned** OAuth credentials. Run `skyhook auth login` for browser
+authorization or `skyhook auth login --headless` for device authorization. `skyhook auth status`
+reports local login status and `skyhook auth logout` removes Skyhook's credentials. Login does not
+require a model configuration. Skyhook never imports, reads, or modifies the official Codex client's
+credential files. Secure Codex credential storage currently requires Unix; other platforms fail
+explicitly rather than writing tokens without private ACL guarantees. Claude subscription support
+has been removed.
+
+Migration from Flux is a breaking configuration change: replace `openai_compatible` with `openai`,
+add explicit API-root URLs and OpenAI API choices, replace model aliases with full identifiers, and
+log in separately for Codex.
+
+Instructions in `AGENTS.md` files are loaded from outermost ancestor to workspace, followed by
+instructions configured through the library.
+
+### Native provider smoke tests
+
+Ordinary tests use local mock HTTP/WebSocket servers; they never require provider credentials.
+Live tests are ignored by default and make billable requests when explicitly selected:
+
+```sh
+cargo test -p skyhook-agent-core provider::backends::live_tests::openai_chat -- --ignored --exact
+cargo test -p skyhook-agent-core provider::backends::live_tests::openai_responses -- --ignored --exact
+cargo test -p skyhook-agent-core provider::backends::live_tests::anthropic_messages -- --ignored --exact
+```
+
+Supply `SKYHOOK_LIVE_OPENAI_BASE_URL`, `SKYHOOK_LIVE_OPENAI_MODEL`, and
+`SKYHOOK_LIVE_OPENAI_API_KEY` for OpenAI tests, or the corresponding
+`SKYHOOK_LIVE_ANTHROPIC_*` variables for Anthropic. Choose endpoints/models that support the requested
+standard protocol. Codex has a separate ignored smoke test using an existing Skyhook-owned login.
 
 ## Embedded JavaScript
 
@@ -449,14 +481,14 @@ const packageFile = tool.read({ path: "Cargo.toml" });
 const matches = tool.search({ pattern: "TODO", path: "src" });
 
 // The same schema also generates an immutable fluent builder.
-const firstLines = tool.read().path("README.md").start(1).limit(40);
+const readme = tool.read().path("README.md");
 
 // A skill loads its complete SKILL.md and a recursive asset tree.
 const instructions = tool.skill({ name: "release" });
 const template = tool.skill({ name: "release", path: "references/template.md" });
 
 // Builders nested in the returned value are resolved concurrently.
-return { packageFile, matches, firstLines, instructions, template };
+return { packageFile, matches, readme, instructions, template };
 ```
 
 The runtime also exposes:
@@ -468,23 +500,49 @@ The runtime also exposes:
 - `await sleep(ms)` for asynchronous waits, resolving to `undefined`. The delay must be a finite,
   nonnegative number of milliseconds within the host timer range; fractional values are accepted.
   Sleeps stop when the script is cancelled, and unawaited sleeps do not keep it alive;
-- `new WorkPool(concurrency).map(items, worker)` and `.run(tasks)` as async iterables yielding
-  successful `{index, value}` results in completion order. Failed items are logged and skipped;
+- `new WorkPool(concurrency).map(items, worker)` and `.run([fn1, fn2, ...])` as async iterables
+  yielding successful `{index, value}` results in completion order. `run` requires exactly one
+  array of functions, each called with no arguments—not variadic arguments. Invalid `run`
+  arguments throw before any task starts. Failures thrown by valid tasks are logged and skipped;
   remaining items continue. Early iterator closure stops scheduling and drains running work;
-- `await receive()` for the next JSON input sent to the owning job with
-  `tool.job(id).send({value})` (background scripts only).
+- `await receive()` waits for the next JSON value sent to the script's own job ID with
+  `tool.job(scriptJobId).send({value})`; the script must be launched with `bg: true`.
+  This is script input, not child-agent input: agents receive owner updates automatically.
+
+For example, pass the task functions to `run` in one array:
+
+```js
+const results = [];
+for await (const {index, value} of new WorkPool(2).run([
+  async () => 1,
+  async () => 2,
+  async () => 3,
+])) {
+  results.push({index, value});
+}
+return results;
+```
 
 Read or search saved command output with `tool.job(commandJobId).output({field:"/result/stdout"})`.
+Field-selected output is a job view, not a raw string: available text is in `preview.lines`,
+with pagination metadata alongside it. Field, pagination, and search selections omit image
+attachments; whole-output reads can attach saved images.
 
 Before returning results, convert `BigInt` values to strings, dates with `.toISOString()`, and
 typed arrays with `Array.from(bytes)`, `.toBase64()`, or `.toHex()`. The runtime does not provide
 Node.js APIs, `fetch`, `URL`, `TextEncoder`/`TextDecoder`, or `setTimeout`/`setInterval`.
 
-`console.log(...values)` captures space-separated text, formatting objects as JSON. The agent
-receives it in a separate text block alongside the unchanged JSON return value, on success or
-failure. Logs are delivered at completion, not streamed, and are capped at 16 MiB per script with
-an explicit truncation marker. Background job envelopes retain them in `console_output` when
-nonempty. Scripts without logs keep their existing output format.
+Every script result is `{value: <JavaScript return>, console: <captured text>}`, including
+silent scripts (`console: ""`) and scripts without a return (`value: null`). This wrapper applies
+to both public job views and native/programmatic script results; only script results need this
+extra `.value` unwrapping. Ordinary tool results inside JavaScript remain unchanged. In a script
+job view, the return is at `/result/value` and logs are at `/result/console`.
+
+`console.log(...values)` captures space-separated text, formatting objects as JSON. Logs are
+delivered at completion, not streamed, and are capped at 16 MiB per script with an explicit
+truncation marker. On failure, the result is `{value: null, console: <captured text>, failure:
+<details>}` alongside the job error. Console text belongs to the script result, not generic job
+metadata or a separate tool-result text block.
 
 Builder setters and object arguments come from the same strict JSON schema; omitted values receive
 the handler's normal defaults. Awaiting a builder executes it immediately. Returning builders recursively executes independent
@@ -501,11 +559,32 @@ errors include it in an `output` field; JavaScript callers can catch the error a
 - `provider::Provider` is a shared factory: `open_context(correlation)` creates an owned
   `ProviderContext`, whose `invoke(&mut self, request)` returns an asynchronous response stream.
   Adapters live under `provider::backends` and wire types under `provider::protocol`.
-  Custom providers implement both traits; `FluxProvider::new` takes a closure that creates a
-  fresh backend per context. A request's correlation must match its context's identity.
+  Custom providers implement both traits. A request's correlation must match its context's identity.
+  The common `ResponseEvent` contract separates output items from independently streamed blocks:
+  `ItemStarted`, `BlockStarted`, typed `BlockDelta`, `BlockEnded`, `ItemEnded`, `UsageUpdated`, and
+  `ResponseEnded`. Item/block IDs identify content; explicit positions determine its order.
+  Start events declare kinds, block ends contain authoritative final content, and item ends attach
+  replay metadata once. Each reasoning summary part is a separate visible block with its own end;
+  encrypted-only reasoning items need not create an empty visible section.
+  `ResponseAssembler` validates lifecycles and supplies ordered snapshots to both the runtime and
+  observation/UI layers. Cumulative usage snapshots replace earlier values, and response termination
+  carries a stop reason rather than a truncation boolean. Legacy unindexed delta events are removed.
+  Completed assistant messages persist nested items/blocks with their IDs and positions. Session
+  journals now use format version 2; version-1 journals are rejected with an explicit unsupported-version
+  error rather than guessing the missing block boundaries. Start a new session after this upgrade.
+  Reasoning
+  replay payloads retain provider/endpoint/protocol/model provenance: incompatible private reasoning
+  is omitted from outgoing requests, not deleted from the stored transcript.
+  Input images are encoded or rejected explicitly, never silently dropped. Protocols without
+  image-bearing tool results adapt images into adjacent user content associated with the tool call.
+  Chat Completions also accepts the common `reasoning_content` / `reasoning` streaming fields used
+  by local Qwen servers, preserving separate visible reasoning blocks without replaying private
+  reasoning in subsequent Chat requests. Null optional extension fields are tolerated; unsupported
+  nonempty semantic fields fail explicitly. Generated image outputs are not supported.
 - Each agent loop owns an `AgentContext`: projected journal history, model profile and request
   template, token accounting, and its provider handle. Codex contexts have separate WebSocket
-  connection slots and ordinary/schema HTTP routing state, with shared authentication tokens.
+  connection and continuation state, with shared authentication tokens. Connection setup failures
+  may fall back to HTTP; requests are not replayed automatically after a WebSocket send is attempted.
   Handles survive turns, retries, questions, and compaction, and are released when the agent exits.
   Model-profile changes prepare a replacement before committing, preserve history, and reset token
   calibration. Equivalent profiles retain their handle. Resuming opens a fresh handle with the
@@ -518,8 +597,10 @@ errors include it in an `output` field; JavaScript callers can catch the error a
 - `agent::Harness` owns profiles and policy; each `agent::SessionHandle` owns an isolated agent tree
   and registry.
 - Child agents are profile-selectable and retain their conversation for follow-up work.
-  `tool.job(id).send({value: instructions})` queues unsolicited input for a running child's next
-  model request. Sending to a completed child appends the instructions after its existing
+  `tool.job(id).send({value: instructions})` delivers unsolicited input automatically at a running
+  child's next model-request boundary, without interrupting the current request or tools.
+  Children do not need `receive()` to read these updates. Sending to a completed child appends
+  the instructions after its existing
   conversation and starts a new request under the same agent and job ID; it does not start
   over with fresh history. This resumption applies to successfully completed agent jobs retained
   in the live runtime, not arbitrary completed tools or jobs restored after a process restart.
@@ -621,11 +702,14 @@ required; seed strings become pending items before the child's first model reque
 ```js
 const child = await tool.agent({
   prompt: "Implement the requested change and report the validation results.",
-  name: "implement_change",
+  name: "implement-change",
   todos: ["Inspect the implementation", "Make the change", "Run relevant checks"],
   bg: true
 });
-await tool.job(child.id).output({wait:60});
+// Yield for an event, then inspect the child; an event need not mean completion.
+await tool.wait({timeout:60});
+const childStatus = await tool.job(child.id).output();
+if (childStatus.state === "queued") return childStatus;
 return tool.todo({job: child.id});
 ```
 
@@ -657,6 +741,15 @@ moves before the creation timestamp. Child-agent jobs report the child's selecte
 workspace once initialized. Location includes `target` when target capabilities are enabled;
 otherwise it contains only `workspace`.
 
+Active agent jobs also include exclusive `turns` and `tool_calls` counters. A turn is a
+complete, committed assistant response (including responses containing tool calls); failed
+attempts, incomplete responses, retries, and compaction requests do not add turns. Tool calls
+count jobs launched by that child, including calls inside its scripts, but not work owned by
+its descendants. Counters remain cumulative across retained-child follow-ups and session resume.
+An optional `children` array recursively shows that agent's active child-agent jobs using the
+same fields. Ordinary tool jobs are not included in `children`; the field is omitted entirely
+when there are no active child agents. Counters are per-agent, not subtree totals.
+
 ```json
 {
   "date": "2026-09-05",
@@ -680,12 +773,20 @@ unchanged; transient history does not guarantee exclusion from provider KV cache
 ## Built-in tools
 
 `read`, `search`, `glob`, `exec`, `shell`, `write`, `replace`, `patch`, `remove`, `script`, `targets`,
-`target_add`, `jobs`, `job_output`, `ask`, `todo`, and `agent`. `jobs()` lists the current agent's
+`target_add`, `jobs`, `job_output`, `wait`, `ask`, `todo`, and `agent`. `jobs()` lists the current agent's
 active jobs, excluding the listing call and its containing script. `jobs({all:true})` includes
 completed history; listings contain status and references, never saved results.
 
-`job_output` reads saved output and status, optionally waiting for output, a question, or completion.
+`job_output` reads saved output and status immediately; it never waits for new output or completion.
 Scripts use `tool.job(id).output(...)`, `.send({value})`, and `.cancel()`.
+
+Use `wait({timeout?: seconds})` (or `await tool.wait(...)` in scripts) to yield until an agent
+event or a timeout, then inspect the relevant jobs. Omitted or null `timeout` waits indefinitely;
+a supplied timeout must be a positive integer number of seconds.
+The result is `{reason:"event"}` or `{reason:"timeout"}`. An event does not guarantee a particular
+job has completed; inspect its current status. Waiting does not stop background work.
+Do independent work first rather than polling output in a tight loop. Output reads reject the old
+`wait` argument.
 
 ### Saved job output
 
@@ -703,6 +804,9 @@ Directory reads return grouped entries with file sizes, for example:
 `{kind:"directory",path:"src",entries:{files:[{name:"main.rs",bytes:4096}],directories:["lib"]}}`.
 Groups are `files`, `directories`, `symlinks`, and `other`, with sorted names and empty groups omitted.
 `read({path:"src",details:true})` returns flat `{name,kind,bytes?}` entries; regular files include sizes in both forms.
+Missing paths and operating-system access denials from `read` are successful tool results with
+`{kind:"error", path, error:{code:"not_found"|"permission_denied", message}}`, so workflows can inspect the
+error without catching an exception. Tool-policy permission denials remain tool errors.
 Search returns `{matches:{"src/main.rs":["12: matching text"]}}`, preserving source whitespace.
 `search({pattern:"...",details:true})` returns structured `{path,line,column,text}` matches instead.
 Empty compact directory/search maps are `{}`. Grouped maps share a single normal preview budget.
@@ -722,9 +826,9 @@ retain only complete items. Grouped maps share one budget across all groups. All
 aggregate response-size limit or whole-result fallback.
 
 Annotations cover file `content`, directory `entries`, process `stdout` and `stderr`, search
-`matches`, glob `paths`, skill asset `content` and `assets` trees, and shared `console` text. Skill instructions
-remain complete. Empty console fields are omitted from public job views and whole-document pages;
-explicit `/console` reads still work for silent jobs. Shortened fields keep their original types;
+`matches`, glob `paths`, skill asset `content` and `assets` trees, and script result `console` text. Skill instructions
+remain complete. Script results retain `console: ""` even for silent scripts; ordinary tools have
+no console field. Shortened fields keep their original types;
 `truncated: [{field, total_lines, next_start, next_offset?}]` identifies each one, reports its
 total source lines, and supplies the exact first unread position. Finished jobs with an incomplete capture include an `Output incomplete.` notice. Errors
 and questions are returned in full. Schemas are persisted with jobs so these rules also apply
@@ -732,7 +836,7 @@ after session resume and to completed remote jobs.
 
 Full JavaScript tool results remain available for programmatic transformations. When a script
 returns an unchanged tool-result object or array, it is presented as that child's native job view,
-wherever it appears in the return structure. The view replaces the raw tool result and carries
+wherever it appears within the script result's `value` structure. The view replaces the raw tool result and carries
 the child job ID, bounded annotated fields, and child read positions. A script still produces
 one tool response; custom objects and array ordering are preserved.
 
@@ -753,11 +857,13 @@ job_output({job:42, field:"/result/stdout", start:300, limit:80})
 // Search stored text, with surrounding context.
 job_output({job:42, field:"/result/stderr", pattern:"(?i)error|warning", context:2})
 // Continue at the returned source line and UTF-8 byte offset.
-job_output({job:42, field:"/result/stdout", start:22, offset:54, limit:100, wait:30})
+job_output({job:42, field:"/result/stdout", start:22, offset:54, limit:100})
 ```
 
 `field` is a JSON Pointer: `/result/content` selects a file snapshot, `/result/stdout` and
-`/result/stderr` select process streams, and `/console` selects script console text. Objects and
+`/result/stderr` select process streams. For scripts, `/result/console` selects captured console
+text and `/result/value` selects the JavaScript return (append pointer segments for nested data,
+for example `/result/value/items`). Objects and
 arrays have deterministic JSON text views. Long lines are split into UTF-8-safe fragments;
 the next position identifies where to continue. Regex matching is case-sensitive unless inline
 flags override it. Matching supports lines up to 4 MiB and reports an explicit resource error
@@ -765,8 +871,8 @@ for larger lines; ordinary paging can still read those lines.
 
 `start` is one-based (default 1); `offset` is a zero-based UTF-8 byte offset within that
 starting line (default 0). `limit` is 1–1000 returned source lines (default 100), including
-match context. `context` is 0–20 surrounding lines (default 0); positive context requires `pattern`; `wait` is 0–3600
-seconds (default 0). Every argument with a default is optional in the tool schema.
+match context. `context` is 0–20 surrounding lines (default 0); positive context requires `pattern`.
+Every argument with a default is optional in the tool schema. Output inspection has no wait argument.
 
 Explicit read pages contain `field` and `lines`, plus `total_lines` when known and a next position when more content may be available.
 `lines` is an array of strings, one per returned line (or fragment of an oversized line),

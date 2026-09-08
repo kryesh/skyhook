@@ -33,6 +33,9 @@ use crate::{
 pub(crate) mod output;
 pub use output::OutputArgs as JobOutputQuery;
 mod persistence;
+mod progress;
+#[cfg(test)]
+mod progress_tests;
 
 const JOB_INPUT_CAPACITY: usize = 32;
 const CANCELLATION_GRACE: Duration = Duration::from_millis(250);
@@ -79,8 +82,6 @@ pub struct JobEnvelope<L = ExecutionLocation, T = String, V = Value> {
     pub name: Option<T>,
     pub state: JobState,
     pub output: Option<V>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub console_output: String,
     pub error: Option<T>,
     pub location: L,
     #[serde(flatten)]
@@ -103,8 +104,6 @@ struct PresentedJob<'a> {
     workspace: Option<&'a std::path::Path>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<&'a Value>,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    console_output: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a str>,
     #[serde(flatten)]
@@ -121,6 +120,10 @@ pub(crate) struct ActiveJob {
     state: JobState,
     location: ActiveJobLocation,
     age_seconds: u64,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    progress: Option<progress::AgentProgress>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    children: Vec<ActiveJob>,
 }
 
 #[derive(Serialize)]
@@ -161,7 +164,6 @@ impl JobEnvelope {
                 .is_none_or(|location| location.workspace != self.location.workspace)
                 .then_some(self.location.workspace.as_path()),
             output: self.output.as_ref(),
-            console_output: self.console_output.clone(),
             error: self.error.as_deref(),
             denial: self.denial.clone(),
         })
@@ -263,7 +265,6 @@ struct JobEntry {
     state: JobState,
     output: Option<Value>,
     images: Vec<ImageReference>,
-    console_output: String,
     error: Option<String>,
     denial: Option<crate::tool::Denial>,
     accepts_input: bool,
@@ -295,7 +296,6 @@ impl JobEntry {
                 state: JobState::Queued,
                 output: None,
                 images: Vec::new(),
-                console_output: String::new(),
                 error: None,
                 denial: None,
                 accepts_input: spec.accepts_input,
@@ -335,7 +335,6 @@ impl JobEntry {
             name: self.name.clone(),
             state: self.state,
             output: None,
-            console_output: String::new(),
             error: self.error.clone(),
             location: self.location.clone(),
             denial: self.denial.clone(),
@@ -350,7 +349,6 @@ impl JobEntry {
             name: self.name.clone(),
             state: self.state,
             output: self.output.clone(),
-            console_output: self.console_output.clone(),
             error: self.error.clone(),
             location: self.location.clone(),
             denial: self.denial.clone(),
@@ -384,6 +382,7 @@ impl DeliveryState {
 struct JobManagerInner {
     store: SessionStore,
     jobs: Mutex<HashMap<JobId, JobEntry>>,
+    progress: Mutex<progress::Progress>,
     delivery_operation: Mutex<()>,
     next_id: AtomicU64,
     completions: broadcast::Sender<JobCompletion>,
@@ -446,6 +445,7 @@ impl JobManager {
             inner: Arc::new(JobManagerInner {
                 store,
                 jobs: Mutex::new(jobs),
+                progress: Mutex::new(progress::Progress::default()),
                 delivery_operation: Mutex::new(()),
                 next_id: AtomicU64::new(next_id),
                 completions,
@@ -597,13 +597,13 @@ impl JobManager {
     pub(crate) async fn finish(&self, id: JobId, outcome: JobOutcome) -> Result<(), JobError> {
         let operation = self.operation(id).await?;
         let _operation = operation.lock().await;
-        let agent = {
+        let (agent, script) = {
             let jobs = self.inner.jobs.lock().await;
             let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
             if entry.state.is_terminal() {
                 return Err(JobError::AlreadyTerminal(id));
             }
-            entry.agent.clone()
+            (entry.agent.clone(), entry.tool == "script")
         };
         let (state, output, error, denial) = match outcome {
             JobOutcome::Completed(output) => (JobState::Completed, Some(output), None, None),
@@ -625,14 +625,16 @@ impl JobManager {
                 None,
             ),
         };
-        let (mut output, images, console_output) = output
-            .map_or((None, Vec::new(), String::new()), |output| {
-                (Some(output.value), output.images, output.console_output)
-            });
+        let (mut output, images) = output.map_or((None, Vec::new()), |output| {
+            (Some(output.value), output.images)
+        });
         let directory = self.output_directory(id);
         let capture_complete = output
             .as_ref()
             .is_some_and(|value| value.get("timed_out") != Some(&Value::Bool(true)));
+        if output.is_none() && script {
+            output = Some(serde_json::json!({"value":null,"console":""}));
+        }
         if output.is_none() {
             let mut partial = serde_json::Map::new();
             for field in ["stdout", "stderr"] {
@@ -644,7 +646,7 @@ impl JobManager {
                 output = Some(Value::Object(partial));
             }
         }
-        let document = serde_json::json!({"capture_complete":capture_complete, "result":output, "console":console_output, "error":error});
+        let document = serde_json::json!({"capture_complete":capture_complete, "result":output, "error":error});
         tokio::task::spawn_blocking(move || output::save(&directory, &document))
             .await
             .map_err(|e| JobError::Internal(e.to_string()))?
@@ -664,7 +666,6 @@ impl JobManager {
                     output_path,
                     error: error.clone(),
                     images: images.clone(),
-                    console_output: String::new(),
                     denial: denial.clone(),
                 },
             )
@@ -681,7 +682,6 @@ impl JobManager {
             }
             entry.output = None;
             entry.images = images;
-            entry.console_output.clear();
             entry.error = error;
             entry.denial = denial;
             (entry.notify.clone(), entry.background)
@@ -734,7 +734,6 @@ impl JobManager {
             entry.state = JobState::Failed;
             entry.output = None;
             entry.images.clear();
-            entry.console_output.clear();
             entry.error = Some(error);
             Some((entry.agent.clone(), entry.notify.clone(), entry.background))
         };
@@ -797,35 +796,43 @@ impl JobManager {
         output
     }
 
-    /// Lightweight current state for request-time context; never clones job output artifacts.
+    /// Current request-time state; progress consumes each committed journal event once.
     pub(crate) async fn active_states(
         &self,
         owner: &AgentId,
         capabilities: &CapabilitySet,
         now_millis: i64,
     ) -> Vec<ActiveJob> {
+        let mut progress = self.inner.progress.lock().await;
+        let records = self.inner.store.records_after(progress.sequence).await;
+        progress.project(&records);
         let jobs = self.inner.jobs.lock().await;
         let mut states = jobs
             .iter()
             .filter(|(_, entry)| &entry.agent == owner && !entry.state.is_terminal())
-            .map(|(id, entry)| ActiveJob {
-                job: *id,
-                tool: entry.tool.clone(),
-                name: entry.name.clone(),
-                state: entry.state.presented(),
-                location: ActiveJobLocation {
-                    target: capabilities
-                        .contains(Capability::Targets)
-                        .then(|| entry.location.target.clone()),
-                    workspace: entry.location.workspace.clone(),
-                },
-                age_seconds: u64::try_from(now_millis.saturating_sub(entry.created_at_millis))
-                    .unwrap_or(0)
-                    / 1_000,
+            .map(|(id, _)| {
+                progress::active_job(
+                    *id,
+                    &jobs,
+                    &progress,
+                    capabilities,
+                    now_millis,
+                    &mut std::collections::HashSet::new(),
+                )
             })
             .collect::<Vec<_>>();
         states.sort_by_key(|job| job.job);
         states
+    }
+
+    /// Whether a completion/question is ready for delivery, without reserving it.
+    pub(crate) async fn has_pending(&self, owner: &AgentId) -> bool {
+        self.inner.jobs.lock().await.values().any(|entry| {
+            &entry.agent == owner
+                && entry.background
+                && entry.deliverable()
+                && entry.delivery == DeliveryState::Pending
+        })
     }
 
     /// Associate an agent job with the child's actual workspace and target.
@@ -1042,7 +1049,6 @@ impl JobManager {
                     entry.input = input;
                     entry.output = None;
                     entry.images.clear();
-                    entry.console_output.clear();
                     entry.error = None;
                     entry.denial = None;
                     entry.delivery = DeliveryState::Pending;
@@ -1805,7 +1811,6 @@ mod tests {
             name: None,
             state: JobState::Completed,
             output: Some(serde_json::json!({"target": "application-value"})),
-            console_output: String::new(),
             error: None,
             location: ExecutionLocation::named("build", "/srv/project".into()),
             denial: None,
