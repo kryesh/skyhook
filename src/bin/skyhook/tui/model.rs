@@ -62,13 +62,47 @@ pub struct Entry {
     pub default_open: bool,
     pub running: bool,
     pub footer: Option<String>,
-    /// Metadata-only request row; its token summary stays beside the label.
-    pub request_summary: Option<String>,
+    /// Metadata-only request row, laid out with shared columns.
+    pub request: Option<RequestRow>,
     pub indent: u16,
     pub job: Option<JobId>,
     pub document: Option<Document>,
     /// Omit the separator before a related sibling tool or this script's first child.
     pub compact_after: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RequestRow {
+    pub sequence: u64,
+    pub purpose: ModelPurpose,
+    pub model: String,
+    pub status: &'static str,
+    pub usage: Option<Usage>,
+    pub elapsed_tenths: Option<u64>,
+}
+
+impl RequestRow {
+    pub fn metadata(&self) -> [String; 4] {
+        [
+            format!("Request #{}", self.sequence),
+            format!("{:?}", self.purpose),
+            self.model.clone(),
+            self.status.into(),
+        ]
+    }
+
+    pub fn statistics(&self) -> [String; 4] {
+        let tokens = |value: fn(Usage) -> String| self.usage.map_or_else(|| "—".into(), value);
+        [
+            tokens(|usage| number(usage.output_tokens)),
+            tokens(|usage| number(usage.input_tokens)),
+            tokens(|usage| number(usage.cached_input_tokens)),
+            self.elapsed_tenths.map_or_else(
+                || "—".into(),
+                |tenths| format!("{}.{}s", tenths / 10, tenths % 10),
+            ),
+        ]
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -88,7 +122,7 @@ impl Entry {
             default_open: false,
             running: false,
             footer: None,
-            request_summary: None,
+            request: None,
             indent: 0,
             job: None,
             document: None,
@@ -634,7 +668,7 @@ impl ContentCache {
             {
                 let running = request_running(info, snapshot, projection, agent, request);
                 let entry = &mut entries[index];
-                let stats = request_stats(info, running);
+                let elapsed_tenths = request_elapsed(info, running);
                 if entry.running != running {
                     if let Some(record) = snapshot.records.get(&request)
                         && let SessionEvent::ModelRequested { purpose, .. } = &record.event
@@ -642,8 +676,10 @@ impl ContentCache {
                         *entry = request_entry(request, purpose, info, running);
                         changes.dirty.push(index);
                     }
-                } else if entry.request_summary.as_ref() != Some(&stats) {
-                    entry.request_summary = Some(stats);
+                } else if let Some(row) = &mut entry.request
+                    && row.elapsed_tenths != elapsed_tenths
+                {
+                    row.elapsed_tenths = elapsed_tenths;
                     changes.dirty.push(index);
                 }
             }
@@ -1273,18 +1309,20 @@ fn request_entry(
     } else {
         "Interrupted"
     };
-    let text = format!(
-        "Request #{} · {:?} · {} · {status}",
+    let row = RequestRow {
         sequence,
-        purpose,
-        info.model.as_deref().unwrap_or("Unknown model"),
-    );
+        purpose: *purpose,
+        model: clean(info.model.as_deref().unwrap_or("Unknown model")).replace('\n', " "),
+        status,
+        usage: info.usage,
+        elapsed_tenths: request_elapsed(info, running),
+    };
     let mut e = Entry::new(
         format!("r{sequence}"),
-        clean(&text).replace('\n', " "),
+        row.metadata().join(" · "),
         Surface::Tool,
     );
-    e.request_summary = Some(request_stats(info, running));
+    e.request = Some(row);
     e.running = running;
     e
 }
@@ -1305,36 +1343,18 @@ fn request_running(
         && matches!(snapshot.activity.get(agent), Some(AgentActivity::Working))
 }
 
-fn request_stats(info: &RequestInfo, running: bool) -> String {
-    let usage = info.usage.map_or_else(
-        || "Out — · In — · Cached —".into(),
-        |usage| {
-            format!(
-                "Out {} · In {} · Cached {}",
-                number(usage.output_tokens),
-                number(usage.input_tokens),
-                number(usage.cached_input_tokens)
-            )
-        },
-    );
-    let timing = match (info.started_millis, info.finished_millis) {
-        (Some(start), Some(end)) => {
-            format!("{:.1}s", end.saturating_sub(start).max(0) as f64 / 1000.0)
-        }
-        (Some(start), None) if running => {
-            let now = std::time::SystemTime::now()
+fn request_elapsed(info: &RequestInfo, running: bool) -> Option<u64> {
+    let start = info.started_millis?;
+    let end = info.finished_millis.or_else(|| {
+        running.then(|| {
+            std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(start, |duration| {
                     duration.as_millis().min(i64::MAX as u128) as i64
-                });
-            format!(
-                "{:.1}s elapsed",
-                now.saturating_sub(start).max(0) as f64 / 1000.0
-            )
-        }
-        _ => "Time —".into(),
-    };
-    format!("{usage} · {timing}")
+                })
+        })
+    })?;
+    Some(end.saturating_sub(start).max(0) as u64 / 100)
 }
 
 /// Show the event where the model received it, using its historical payload
@@ -1800,7 +1820,7 @@ mod tests {
             assert!(!rows[0].text.contains("original request"));
             assert!(!rows[0].text.contains("answer"));
             assert!(!rows[0].text.contains("reason"));
-            assert!(rows[0].request_summary.as_ref().unwrap().contains("Out —"));
+            assert!(rows[0].request.as_ref().unwrap().usage.is_none());
         }
         record(
             &mut snapshot,
@@ -1854,12 +1874,13 @@ mod tests {
         assert!(rows.iter().all(|row| !row.expandable
             && !row.text.contains('\n')
             && !row.text.contains("saved response")));
-        assert!(
-            rows[0]
-                .request_summary
-                .as_ref()
-                .unwrap()
-                .contains("Out 20 · In 100 · Cached 80")
+        assert_eq!(
+            rows[0].request.as_ref().unwrap().usage,
+            Some(Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+                cached_input_tokens: 80,
+            })
         );
     }
 

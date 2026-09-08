@@ -100,7 +100,7 @@ fn register_wait(
 ) -> Result<(), RegistryError> {
     builder.register::<super::wait::WaitArgs, super::wait::WaitOutput, _, _>(
         "wait",
-        "Wait for any notification or input relevant to this agent. Optional timeout is a positive integer number of seconds; omitted/null waits indefinitely. Returns {reason: event|timeout}. Does not consume notifications or retrieve output; use job_output to inspect saved output. Cancellation interrupts the wait.",
+        "Wait for any notification or input relevant to this agent. Optional timeout is a positive integer number of seconds; omitted/null waits indefinitely. Returns {reason: event|timeout}. Does not consume notifications or retrieve output; use job_output to inspect saved output. Cancellation interrupts the wait. A timeout ends this wait, not background work; wait again if still dependent on it.",
         ToolOptions::default(),
         move |context, args| {
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
@@ -164,7 +164,7 @@ fn register_child_agent(
 ) -> Result<(), RegistryError> {
     builder.register::<AgentArgs, String, _, _>(
         "agent",
-        "Start a child agent; questions suspend it. Send follow-ups with tool.job(id).send({value: instructions}), or answers if a question is pending. Running children receive input at the next model-request boundary without receive(); completed children resume with retained history under the same job ID.",
+        "Start a child agent; questions suspend it. Send follow-ups with tool.job(id).send({value: instructions}), or answers if a question is pending. Running children receive input at the next model-request boundary without receive(); their intermediate replies are injected into the parent while they continue working. Completed children resume with retained history under the same job ID.",
         ToolOptions::default()
             .named()
             .requires(Capability::Agents)

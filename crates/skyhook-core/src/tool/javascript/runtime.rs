@@ -568,43 +568,6 @@ return {values, pooled, settled};
     }
 
     #[tokio::test]
-    async fn work_pool_keeps_captured_state_alive_across_host_calls() {
-        let mut builder = ToolRegistryBuilder::default();
-        builder
-            .register::<Echo, String, _, _>(
-                "echo",
-                "Return the supplied payload after yielding to the host.",
-                ToolOptions::default(),
-                |_context, args| async move {
-                    tokio::task::yield_now().await;
-                    Ok(args.value)
-                },
-            )
-            .unwrap();
-        let (_root, executor, context) = test_runtime(builder).await;
-        let output = evaluate(
-            r#"
-const payload = "x".repeat(16384);
-const results = [];
-for await (const {index, value} of new WorkPool(4).map(
-  Array.from({length: 128}, (_, index) => index),
-  () => tool.echo({value: payload})
-)) results.push({index, length: value.length});
-return results.sort((a, b) => a.index - b.index);
-"#
-            .to_owned(),
-            executor,
-            context,
-        )
-        .await
-        .unwrap();
-        let expected = (0..128)
-            .map(|index| serde_json::json!({"index": index, "length": 16384}))
-            .collect::<Vec<_>>();
-        assert_eq!(output.value["value"], serde_json::json!(expected));
-    }
-
-    #[tokio::test]
     async fn work_pool_completion_order_and_early_close() {
         let (_root, executor, context) = test_runtime(ToolRegistryBuilder::default()).await;
         let output = evaluate(

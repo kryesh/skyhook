@@ -23,9 +23,19 @@ pub(super) struct AgentSender {
 struct AgentWake {
     revision: watch::Sender<u64>,
     batch: std::sync::Mutex<EventBatch>,
+    child_messages: std::sync::Mutex<Vec<ChildMessage>>,
     ready_input_revision: AtomicU64,
     observed_input: AtomicU64,
     observed: AtomicU64,
+}
+
+#[derive(Serialize)]
+pub(super) struct ChildMessage {
+    pub id: crate::identity::JobId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub message: u64,
+    pub text: String,
 }
 
 #[derive(Default)]
@@ -42,6 +52,7 @@ impl AgentSender {
             wake: Arc::new(AgentWake {
                 revision: watch::channel(0).0,
                 batch: std::sync::Mutex::new(EventBatch::default()),
+                child_messages: std::sync::Mutex::new(Vec::new()),
                 ready_input_revision: AtomicU64::new(0),
                 observed_input: AtomicU64::new(0),
                 observed: AtomicU64::new(0),
@@ -81,6 +92,36 @@ impl AgentSender {
         // A full mailbox already guarantees another request boundary. Never
         // stall notification of other agents behind this one's mailbox.
         let _ = self.sender.try_send(AgentCommand::JobsReady);
+    }
+
+    pub(super) fn child_message(&self, message: ChildMessage) {
+        // Keep payloads outside the bounded command mailbox. A foreground child
+        // must not block on its parent draining progress while awaiting that child.
+        self.wake
+            .child_messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(message);
+        self.jobs_ready();
+    }
+
+    pub(super) fn has_child_messages(&self) -> bool {
+        !self
+            .wake
+            .child_messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    fn take_child_messages(&self) -> Vec<ChildMessage> {
+        std::mem::take(
+            &mut *self
+                .wake
+                .child_messages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// One bounded coalescing window per agent, shared by every delivery path.
@@ -207,7 +248,7 @@ impl SessionRuntime {
             if sender.wake.ready_input_revision.load(Ordering::Acquire)
                 != sender.wake.observed_input.load(Ordering::Acquire)
                 || (released != sender.wake.observed.load(Ordering::Acquire)
-                    && self.jobs.has_pending(&context.agent).await)
+                    && (sender.has_child_messages() || self.jobs.has_pending(&context.agent).await))
             {
                 return Ok(WaitOutput {
                     reason: WakeReason::Event,
@@ -229,7 +270,45 @@ impl SessionRuntime {
         }
     }
 
-    pub(super) async fn job_event_content(
+    pub(super) async fn pending_event_content(
+        &self,
+        agent: &crate::identity::AgentId,
+        capabilities: &crate::tool::policy::CapabilitySet,
+        location: &crate::execution::ExecutionLocation,
+    ) -> Result<Vec<UserContent>, super::HarnessError> {
+        let pending = self.jobs.take_pending(agent).await?;
+        // Reserve completions before draining messages: every intermediate reply
+        // from a completed child was queued before its completion was published.
+        let mut content = self.child_message_content(agent);
+        if !pending.is_empty() {
+            content.extend(
+                self.job_event_content(&pending, capabilities, location)
+                    .await,
+            );
+        }
+        Ok(content)
+    }
+
+    pub(super) fn child_message_content(
+        &self,
+        agent: &crate::identity::AgentId,
+    ) -> Vec<UserContent> {
+        let messages = self
+            .agent_sender(agent)
+            .map(|sender| sender.take_child_messages())
+            .unwrap_or_default();
+        if messages.is_empty() {
+            return Vec::new();
+        }
+        vec![UserContent::Runtime {
+            text: format!(
+                "<skyhook_agent_messages>\n{}\n</skyhook_agent_messages>",
+                serde_json::to_string(&messages).expect("child messages serialize")
+            ),
+        }]
+    }
+
+    async fn job_event_content(
         &self,
         pending: &[crate::job::JobEnvelope],
         capabilities: &crate::tool::policy::CapabilitySet,

@@ -26,9 +26,12 @@ grep-matcher = "0.1.8"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
 ignore = "0.4.31"
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream"] }
-rquickjs = { version = "=0.12.2", features = ["futures", "parallel"] }
-# Keep schema property order through generation, provider serialization, and replay.
+reqwest = { version = "0.13.4", default-features = false, features = [
+    "rustls",
+    "json",
+    "stream",
+] }
+rquickjs = { version = "0.13", features = ["futures", "parallel"] }
 schemars = { version = "1.2.2", features = ["preserve_order"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -49,7 +52,7 @@ tokio = { version = "1.53.1", features = [
     "time",
 ] }
 tokio-util = "0.7.17"
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 toml = { version = "1.1.4", features = ["preserve_order"] }
 indexmap = { version = "2", features = ["serde"] }
 zeroize = "1.8.2"

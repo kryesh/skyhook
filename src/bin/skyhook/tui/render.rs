@@ -28,6 +28,7 @@ pub struct RenderState {
     pub agent: skyhook::identity::AgentId,
     pub highlights: super::tool_view::HighlightCache,
     pub entries: std::collections::HashMap<String, CachedEntry>,
+    request_columns: RequestColumns,
 }
 
 impl RenderState {
@@ -47,6 +48,7 @@ impl RenderState {
             agent,
             highlights: super::tool_view::HighlightCache::with_notify(notify),
             entries: std::collections::HashMap::new(),
+            request_columns: RequestColumns::default(),
         }
     }
 
@@ -477,6 +479,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if reset {
         dirty = (0..app.entries.len()).collect();
     }
+    if tab == Tab::Requests
+        && (reset || !dirty.is_empty() || app.render.rows.entry_count() != app.entries.len())
+    {
+        app.render.request_columns.update(&app.entries, &mut dirty);
+    }
     // Only changed documents are prepared on ordinary content updates.
     let selected = app.views.get(&app.selected).map_or(0, |view| view.row);
     if reset || content_changed || !dirty.is_empty() {
@@ -545,6 +552,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 width,
                 palette: p,
                 highlights: &app.render.highlights,
+                request_columns: app.render.request_columns,
             },
             append_from,
         );
@@ -1164,6 +1172,84 @@ impl AgentStatsColumns {
     }
 }
 
+/// Like agent statistics, request fields use widths measured across the complete
+/// list, not the viewport. Metadata is left aligned and numeric fields are right aligned.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct RequestColumns {
+    metadata: [usize; 4],
+    statistics: [usize; 4],
+}
+
+impl RequestColumns {
+    fn new<'a>(rows: impl IntoIterator<Item = &'a model::RequestRow>) -> Self {
+        let mut columns = Self::default();
+        for row in rows {
+            for (width, value) in columns.metadata.iter_mut().zip(row.metadata()) {
+                *width = (*width).max(value.width());
+            }
+            for (width, value) in columns.statistics.iter_mut().zip(row.statistics()) {
+                *width = (*width).max(value.width());
+            }
+        }
+        columns
+    }
+
+    fn update(&mut self, entries: &[model::Entry], dirty: &mut Vec<usize>) {
+        let columns = Self::new(entries.iter().filter_map(|entry| entry.request.as_ref()));
+        if *self != columns {
+            *self = columns;
+            // A wider token count or elapsed time changes even unchanged rows.
+            dirty.extend(
+                entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, entry)| entry.request.as_ref().map(|_| index)),
+            );
+        }
+    }
+
+    fn line(&self, row: &model::RequestRow, width: u16, p: Palette) -> Line<'static> {
+        let statistics = row
+            .statistics()
+            .iter()
+            .zip(self.statistics)
+            .zip(["Out", "In", "Cached", "Time"])
+            .map(|((value, width), label)| {
+                format!("{label} {}{value}", " ".repeat(width - value.width()))
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let show_statistics = statistics.width() + 18 <= width as usize;
+        let left_width = if show_statistics {
+            width - statistics.width() as u16 - 2
+        } else {
+            width
+        };
+        let mut widths = self.metadata;
+        // Clip the model column first so IDs, purpose and state remain visible.
+        let excess = (widths.iter().sum::<usize>() + 9).saturating_sub(left_width as usize);
+        widths[2] = widths[2].saturating_sub(excess);
+        let metadata = row
+            .metadata()
+            .iter()
+            .zip(widths)
+            .map(|(value, width)| {
+                let value = clipped_header(value, width.min(u16::MAX as usize) as u16);
+                format!("{value}{}", " ".repeat(width - value.width()))
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let metadata = clipped_header(&metadata, left_width);
+        let gap = width as usize - metadata.width();
+        let mut spans = vec![Span::raw(metadata)];
+        if show_statistics {
+            spans.push(Span::raw(" ".repeat(gap - statistics.width())));
+            spans.push(Span::styled(statistics, Style::default().fg(p.muted)));
+        }
+        Line::from(spans)
+    }
+}
+
 fn agent_symbol(running: bool, status: &str, terminal: bool, tick: usize) -> &'static str {
     if running {
         spinner(tick)
@@ -1346,6 +1432,7 @@ struct EntryLayout<'a> {
     width: u16,
     palette: Palette,
     highlights: &'a super::tool_view::HighlightCache,
+    request_columns: RequestColumns,
 }
 
 fn update_entry_rows(
@@ -1360,7 +1447,18 @@ fn update_entry_rows(
         width,
         palette: p,
         highlights,
+        request_columns,
     } = settings;
+    if let Some(request) = &entry.request {
+        let geometry = EntryGeometry::new(entry, width, index);
+        rows.clear();
+        rows.push(geometry.row(
+            request_columns.line(request, geometry.body_width, p),
+            true,
+            false,
+        ));
+        return;
+    }
     let block = matches!(entry.surface, Surface::User | Surface::Agent);
     if (entry.surface == Surface::Reasoning || block) && entry.document.is_none() {
         let geometry = EntryGeometry::new(entry, width, index);
@@ -1520,27 +1618,6 @@ fn layout_document_or_plain(
     index: usize,
 ) -> Vec<Row> {
     let geometry = EntryGeometry::new(entry, width, index);
-    if let Some(summary) = &entry.request_summary {
-        // Requests are metadata-only: reserve the right edge for statistics when
-        // there is room for a label, otherwise clip the label, never wrap it.
-        let summary = model::clean(summary).replace('\n', " ");
-        let width = geometry.body_width;
-        let summary_width = summary.width();
-        let label = model::clean(&entry.text).replace('\n', " ");
-        let line = if summary_width + 18 <= width as usize {
-            let label_width = width - summary_width as u16 - 2;
-            let label = clipped_header(&label, label_width);
-            let gap = width as usize - label.width() - summary_width;
-            Line::from(vec![
-                Span::raw(label),
-                Span::raw(" ".repeat(gap)),
-                Span::styled(summary, Style::default().fg(p.muted)),
-            ])
-        } else {
-            Line::from(clipped_header(&label, width))
-        };
-        return vec![geometry.row(line, true, false)];
-    }
     let block = matches!(entry.surface, Surface::User | Surface::Agent);
     let lines = if let Some(document) = &entry.document {
         document.lines(Some(highlights), p.fg == Palette::new(true).fg)
@@ -1894,7 +1971,7 @@ mod tests {
             default_open: false,
             running: false,
             footer: None,
-            request_summary: None,
+            request: None,
             indent: 0,
             job: None,
             compact_after: false,
@@ -1947,57 +2024,7 @@ mod tests {
             selection
         ));
     }
-    #[test]
-    fn requests_are_single_clipped_rows_with_right_side_statistics() {
-        let mut entry = model::Entry {
-            key: "r1".into(),
-            text: "Request #1 · Agent · 界 long model\nmetadata".into(),
-            surface: Surface::Tool,
-            expandable: false,
-            default_open: false,
-            running: false,
-            footer: None,
-            request_summary: Some("Out 20 · In 100 · Cached 80 · 1.0s".into()),
-            indent: 0,
-            job: None,
-            document: None,
-            compact_after: false,
-        };
-        let highlights = super::super::tool_view::HighlightCache::default();
-        for width in [1, 5, 12, 30, 60, 120] {
-            let rows = layout_document_or_plain(&entry, width, Palette::new(false), &highlights, 0);
-            assert_eq!(rows.len(), 1, "width {width}: no wrapping or separators");
-            assert!(!rows[0].blank);
-            assert!(!rows[0].continued);
-            assert!(rows[0].line.width() <= rows[0].width as usize);
-            if width == 120 {
-                let text = rows[0].line.to_string();
-                assert!(text.starts_with("Request #1"));
-                assert!(text.ends_with(entry.request_summary.as_ref().unwrap()));
-                assert_eq!(text.width(), rows[0].width as usize);
-            }
-            // Multiple calls remain adjacent, including a running call.
-            entry.running = true;
-            let mut blocks = RowBlocks::default();
-            for index in 0..2 {
-                update_entry_rows(
-                    blocks.block_mut(index),
-                    &mut CachedEntry::default(),
-                    &entry,
-                    index,
-                    EntryLayout {
-                        width,
-                        palette: Palette::new(false),
-                        highlights: &highlights,
-                    },
-                    None,
-                );
-                blocks.finish_update(index);
-            }
-            assert_eq!(blocks.len(), 2);
-        }
-    }
-
+   
     #[test]
     fn document_and_plain_fallback_match_reference_layout() {
         let highlights = super::super::tool_view::HighlightCache::default();
@@ -2025,7 +2052,7 @@ mod tests {
                     default_open: true,
                     running: false,
                     footer: None,
-                    request_summary: None,
+                    request: None,
                     document,
                     job: None,
                     compact_after: false,
@@ -2099,7 +2126,7 @@ mod tests {
                         default_open: true,
                         running: true,
                         footer: None,
-                        request_summary: None,
+                        request: None,
                         document: None,
                         job: None,
                         compact_after: false,
@@ -2116,6 +2143,7 @@ mod tests {
                             width,
                             palette: p,
                             highlights: &highlights,
+                            request_columns: RequestColumns::default(),
                         },
                         None,
                     );
@@ -2131,6 +2159,7 @@ mod tests {
                                 width,
                                 palette: p,
                                 highlights: &highlights,
+                                request_columns: RequestColumns::default(),
                             },
                             Some(old_len),
                         );

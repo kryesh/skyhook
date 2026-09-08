@@ -2,7 +2,7 @@ use chrono::{DateTime, Local};
 use serde::Serialize;
 
 use crate::{
-    agent::{TodoItem, todo::TodoStore},
+    agent::{todo::TodoStore, TodoItem},
     execution::ExecutionLocation,
     identity::AgentId,
     job::{ActiveJob, JobManager},
@@ -10,8 +10,8 @@ use crate::{
     tool::policy::{Capability, CapabilitySet},
 };
 
-pub(super) const ROOT_PROMPT: &str = "You are an agent running in Skyhook. Prefer direct tools for simple operations and batch independent calls; use script for JavaScript control flow, transformation or bounded concurrency. When blocked on background work, use wait rather than polling. Before finishing, resolve pending child questions and finish, cancel, or explicitly leave active jobs running.";
-pub(super) const CHILD_PROMPT: &str = "You are an agent running in Skyhook. Complete your parent's task and return the result. Prefer direct tools for simple operations and batch independent calls; use script for JavaScript control flow, transformation or bounded concurrency. When blocked on background work, use wait rather than polling. Before finishing, resolve pending child questions and finish or cancel all owned jobs and descendants. Your job cannot complete while owned work is active; only the root may leave background work running.";
+pub(super) const ROOT_PROMPT: &str = "You are an agent running in Skyhook. Prefer direct tools for simple operations and batch independent calls; use script for JavaScript control flow, transformation or bounded concurrency. Before finishing, wait for needed work, cancel unnecessary work, or explicitly identify jobs left running.";
+pub(super) const CHILD_PROMPT: &str = "You are an agent running in Skyhook. Complete your parent's task and return the result. Prefer direct tools for simple operations and batch independent calls; use script for JavaScript control flow, transformation or bounded concurrency. Before finishing, wait for needed work, cancel unnecessary work. You cannot complete while owned work is active.";
 pub(super) const TARGET_PROMPT: &str = r#"Tools default to the target and workspace in skyhook_context. A tool's target selects the execution machine; write commands as if already on that machine. If the task's machine is unclear, use targets to discover available machines. Findings apply only to the target inspected.
 
 "root" selects the session host running Skyhook and its configured workspace; "local" identifies that host's target type. Selecting another target uses its configured workspace; selecting the current remote target preserves your workspace override.
@@ -20,7 +20,7 @@ Remote commands receive Skyhook's SSH_AUTH_SOCK; Skyhook handles SSH authenticat
 
 const WORKSPACE_PROMPT: &str = "Workspaces set the base directory; they do not isolate files. Agents on the same target share its filesystem. Paths/cwd may be absolute or relative (including `..`) on the selected machine. Relative child workspace overrides resolve against the selected base.";
 const LIFECYCLE_PROMPT: &str = "Direct tool calls return JobView; Result in tool descriptions refers to its result field. JavaScript calls return native results; background launches return job metadata. Use job_output to retrieve truncated results.\n\nCommand timeouts terminate execution; omitted timeouts have no deadline. Nonzero exit_code is a normal result. Script failures throw with partial error.output. Never circumvent a declined operation; use permitted alternatives or explain the limitation.";
-const AGENT_PROMPT: &str = "Children start without your conversation history. Supply their task, relevant context, and scope, and give each child a distinct responsibility.";
+const AGENT_PROMPT: &str = "Children start without your conversation history. Supply their task, relevant context, and scope, and give each child a distinct responsibility.\n\nLet children continue working autonomously. Use the appended runtime state and child messages to decide whether intervention is needed. Elapsed time, a wait timeout, or unchanged turn/tool-call counts alone do not establish that a child is stalled; it may be processing a request or awaiting a tool. When dependent on unfinished work, wait again. Send follow-ups to answer questions, resolve concrete blockers, correct a demonstrated misunderstanding, or communicate changed requirements. Resolve questions from children you supervise. Progress updates do not require a reply.";
 
 const TODO_PROMPT: &str = "Use todo for multi-step work and account for unfinished items.";
 

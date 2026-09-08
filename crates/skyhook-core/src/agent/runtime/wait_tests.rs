@@ -22,7 +22,7 @@ use crate::{
 
 struct Step {
     model: &'static str,
-    content: AssistantContent,
+    content: Vec<AssistantContent>,
     gate: Semaphore,
 }
 
@@ -34,6 +34,15 @@ struct Tracking {
 
 impl Tracking {
     fn new(steps: Vec<(&'static str, AssistantContent)>) -> Arc<Self> {
+        Self::responses(
+            steps
+                .into_iter()
+                .map(|(model, content)| (model, vec![content]))
+                .collect(),
+        )
+    }
+
+    fn responses(steps: Vec<(&'static str, Vec<AssistantContent>)>) -> Arc<Self> {
         Arc::new(Self {
             steps: steps
                 .into_iter()
@@ -101,12 +110,12 @@ impl ProviderContext for Context {
         Box::pin(async move {
             tracking.steps[step].gate.acquire().await.unwrap().forget();
             let content = tracking.steps[step].content.clone();
-            let stop_reason = if content.kind == ItemKind::ToolCall {
+            let stop_reason = if content.iter().any(|item| item.kind == ItemKind::ToolCall) {
                 StopReason::ToolUse
             } else {
                 StopReason::EndTurn
             };
-            let mut events = events_for_content(&[content]);
+            let mut events = events_for_content(&content);
             events.push(ResponseChunk::ResponseEnded { stop_reason });
             Ok(Box::pin(futures_util::stream::iter(events.into_iter().map(Ok))) as ResponseStream)
         })
@@ -208,6 +217,16 @@ async fn complete_background(session: &SessionHandle, value: &str) -> JobId {
 }
 
 fn events(request: &ModelRequest) -> Vec<Value> {
+    runtime_entries(request, "skyhook_job_events")
+}
+
+fn agent_messages(request: &ModelRequest) -> Vec<Value> {
+    runtime_entries(request, "skyhook_agent_messages")
+}
+
+fn runtime_entries(request: &ModelRequest, tag: &str) -> Vec<Value> {
+    let prefix = format!("<{tag}>\n");
+    let suffix = format!("\n</{tag}>");
     request
         .messages
         .iter()
@@ -216,8 +235,8 @@ fn events(request: &ModelRequest) -> Vec<Value> {
                 .iter()
                 .filter_map(|block| match block {
                     UserContent::Runtime { text } => text
-                        .strip_prefix("<skyhook_job_events>\n")
-                        .and_then(|text| text.strip_suffix("\n</skyhook_job_events>"))
+                        .strip_prefix(&prefix)
+                        .and_then(|text| text.strip_suffix(&suffix))
                         .map(|text| serde_json::from_str::<Vec<Value>>(text).unwrap()),
                     _ => None,
                 })
@@ -605,6 +624,382 @@ async fn child_completion_wakes_parent_and_injects_output_once() {
     tracking.release(4);
     bounded(turn).await.unwrap().unwrap();
     session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn intermediate_child_reply_wakes_parent_and_is_injected_once() {
+    intermediate_child_reply(true).await;
+}
+
+#[tokio::test]
+async fn intermediate_child_reply_before_wait_is_delivered_at_request_boundary() {
+    intermediate_child_reply(false).await;
+}
+
+async fn intermediate_child_reply(parent_already_waiting: bool) {
+    const REPLY: &str = "intermediate-child-reply-marker";
+    const FINAL: &str = "final-child-output-marker";
+    let workspace = tempfile::tempdir().unwrap();
+    let mut child_tool = call("continue-child", "script", json!({"source":"return 42;"}));
+    child_tool.position = 1;
+    let reply = vec![AssistantContent::text("child-reply", 0, REPLY), child_tool];
+    let tracking = Tracking::responses(vec![
+        (
+            "root",
+            vec![call(
+                "child",
+                "agent",
+                json!({"prompt":"child task", "model":"child", "name":"child-replier", "bg":true}),
+            )],
+        ),
+        ("child", vec![call("child-wait", "wait", json!({}))]),
+        ("root", vec![call("waiting", "wait", json!({}))]),
+        ("child", reply.clone()),
+        (
+            "child",
+            vec![AssistantContent::text("child-final", 0, FINAL)],
+        ),
+        ("root", vec![call("again", "wait", json!({"timeout":1}))]),
+        ("root", vec![call("finish-wait", "wait", json!({}))]),
+        (
+            "root",
+            vec![call("after-final", "wait", json!({"timeout":1}))],
+        ),
+        ("root", vec![answer()]),
+    ]);
+    let harness = harness(workspace.path(), tracking.clone()).await;
+    let session = Arc::new(harness.new_session().await.unwrap());
+    let turn = prompt(&session);
+    tracking.request(0).await;
+    tracking.release(0);
+    tracking.request(1).await;
+    let in_flight = tracking.request(2).await;
+    assert!(agent_messages(&in_flight).is_empty());
+    let child_job = running_job(&session, "agent").await;
+    let child = session
+        .runtime
+        .agents
+        .read()
+        .unwrap()
+        .keys()
+        .find(|agent| **agent != session.root)
+        .unwrap()
+        .clone();
+    tracking.release(1);
+    bounded(async {
+        loop {
+            if session
+                .runtime
+                .jobs
+                .list(&child)
+                .await
+                .iter()
+                .any(|job| job.tool == "wait" && job.state == JobState::Running)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if parent_already_waiting {
+        tracking.release(2);
+        running_job(&session, "wait").await;
+    }
+
+    // Send through the public job API, not directly into the agent's queue.
+    // The child's next request proves that the input actually reached it.
+    let sent = bounded(session.run_script(format!(
+        "return await tool.job({}).send({{value:\"parent-reply-request-marker\"}});",
+        child_job.get()
+    )))
+    .await
+    .unwrap();
+    assert_eq!(sent.value["value"], json!({"accepted":true}));
+    let child_request = tracking.request(3).await;
+    assert_reason(&child_request, "child-wait", "event");
+    assert_eq!(
+        serde_json::to_string(&child_request.messages)
+            .unwrap()
+            .matches("parent-reply-request-marker")
+            .count(),
+        1
+    );
+    tracking.release(3);
+    // The child has committed text WITH a tool call and reached another invoke.
+    // Keep that final response gated until after the parent has read the reply.
+    tracking.request(4).await;
+    assert_eq!(
+        session
+            .runtime
+            .jobs
+            .snapshot(child_job)
+            .await
+            .unwrap()
+            .state,
+        JobState::Running
+    );
+    if !parent_already_waiting {
+        // No new parent request may start while its current invoke is gated.
+        assert!(
+            tracking
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(step, _)| *step < 5)
+        );
+        tracking.release(2);
+    }
+    let next = tracking.request(5).await;
+    assert_reason(&next, "waiting", "event");
+    assert_eq!(
+        session
+            .runtime
+            .jobs
+            .snapshot(child_job)
+            .await
+            .unwrap()
+            .state,
+        JobState::Running,
+        "the reply must not depend on child completion"
+    );
+    assert!(events(&next).is_empty(), "a reply is not a job completion");
+    let records = session.runtime.store.records().await;
+    let committed = records
+        .iter()
+        .filter(|record| {
+            record.agent == child
+                && matches!(&record.event,
+                    SessionEvent::MessageCommitted { message: Message::Assistant(content) }
+                        if content == &reply)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(committed.len(), 1);
+    let replies = agent_messages(&next);
+    assert_eq!(
+        replies,
+        vec![json!({
+            "id":child_job.get(),
+            "name":"child-replier",
+            "message":committed[0].sequence,
+            "text":REPLY,
+        })]
+    );
+    assert_eq!(
+        serde_json::to_string(&next.messages)
+            .unwrap()
+            .matches(REPLY)
+            .count(),
+        1,
+        "only the runtime envelope should contain the reply"
+    );
+
+    tracking.release(5);
+    let again = tracking.request(6).await;
+    assert_reason(&again, "again", "timeout");
+    assert_eq!(
+        agent_messages(&again),
+        replies,
+        "do not inject another copy"
+    );
+    assert!(events(&again).is_empty());
+    tracking.release(6);
+    running_job(&session, "wait").await;
+    tracking.release(4);
+    let completed = tracking.request(7).await;
+    assert_reason(&completed, "finish-wait", "event");
+    assert_eq!(agent_messages(&completed), replies);
+    let notifications = events(&completed);
+    assert_eq!(notifications.len(), 1);
+    assert_eq!(notifications[0]["id"], child_job.get());
+    let notification = serde_json::to_string(&notifications[0]).unwrap();
+    assert!(notification.contains(FINAL));
+    assert!(
+        !notification.contains(REPLY),
+        "final notification repeated the reply"
+    );
+    let snapshot = session.runtime.jobs.snapshot(child_job).await.unwrap();
+    assert_eq!(snapshot.state, JobState::Completed);
+    let output = serde_json::to_string(&snapshot.output).unwrap();
+    assert!(output.contains(FINAL));
+    assert!(
+        !output.contains(REPLY),
+        "saved final output repeated the reply"
+    );
+
+    tracking.release(7);
+    let last = tracking.request(8).await;
+    assert_reason(&last, "after-final", "timeout");
+    assert_eq!(agent_messages(&last), replies);
+    assert_eq!(events(&last), notifications);
+    tracking.release(8);
+    bounded(turn).await.unwrap().unwrap();
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn intermediate_child_reply_crosses_parent_no_tool_boundary() {
+    child_replies_at_no_tool_boundary(1, false).await;
+}
+
+#[tokio::test]
+async fn intermediate_child_replies_outlive_a_full_parent_mailbox() {
+    child_replies_at_no_tool_boundary(AGENT_CHANNEL_CAPACITY + 1, true).await;
+}
+
+async fn child_replies_at_no_tool_boundary(reply_count: usize, fill_mailbox: bool) {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut steps = vec![
+        (
+            "root",
+            vec![call(
+                "child",
+                "agent",
+                json!({"prompt":"child task", "model":"child", "bg":true}),
+            )],
+        ),
+        // Unlike wait, this response has no tool call and can end the parent turn.
+        ("root", vec![answer()]),
+    ];
+    for index in 0..reply_count {
+        let mut tool = call(
+            &format!("child-tool-{index}"),
+            "script",
+            json!({"source":"return 42;"}),
+        );
+        tool.position = 1;
+        steps.push((
+            "child",
+            vec![
+                AssistantContent::text(
+                    format!("child-reply-{index}"),
+                    0,
+                    format!("mailbox-child-reply-{index}"),
+                ),
+                tool,
+            ],
+        ));
+    }
+    let child_final = steps.len();
+    steps.push((
+        "child",
+        vec![AssistantContent::text(
+            "child-final",
+            0,
+            "mailbox-child-final",
+        )],
+    ));
+    let parent_reply = steps.len();
+    steps.push(("root", vec![call("finish-wait", "wait", json!({}))]));
+    let parent_completed = steps.len();
+    steps.push(("root", vec![answer()]));
+    let tracking = Tracking::responses(steps);
+    let harness = harness(workspace.path(), tracking.clone()).await;
+    let session = Arc::new(harness.new_session().await.unwrap());
+    let turn = prompt(&session);
+    tracking.request(0).await;
+    tracking.release(0);
+    tracking.request(1).await;
+    let child_job = running_job(&session, "agent").await;
+    if fill_mailbox {
+        // Fill the command channel while the parent is inside invoke. Replies
+        // must use the separate payload queue even when JobsReady cannot fit.
+        while session.root_tx.capacity() > 0 {
+            bounded(session.root_tx.send(AgentCommand::JobsReady))
+                .await
+                .unwrap();
+        }
+        assert_eq!(session.root_tx.capacity(), 0);
+    }
+    for step in 2..child_final {
+        tracking.request(step).await;
+        tracking.release(step);
+    }
+    // More replies than the entire channel capacity have been published without
+    // allowing the parent to drain anything. The child must not deadlock here.
+    tracking.request(child_final).await;
+    assert_eq!(
+        session
+            .runtime
+            .jobs
+            .snapshot(child_job)
+            .await
+            .unwrap()
+            .state,
+        JobState::Running
+    );
+    assert!(
+        tracking
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(step, _)| *step < parent_reply)
+    );
+    if fill_mailbox {
+        assert_eq!(session.root_tx.capacity(), 0);
+    }
+    tracking.release(1);
+    let next = tracking.request(parent_reply).await;
+    assert_eq!(
+        session
+            .runtime
+            .jobs
+            .snapshot(child_job)
+            .await
+            .unwrap()
+            .state,
+        JobState::Running,
+        "a no-tool parent response must not strand replies until child completion"
+    );
+    assert!(events(&next).is_empty());
+    let replies = agent_messages(&next);
+    assert_eq!(
+        replies.len(),
+        reply_count,
+        "a full mailbox must not drop payloads"
+    );
+    let records = session.runtime.store.records().await;
+    for (index, reply) in replies.iter().enumerate() {
+        let content = &tracking.steps[index + 2].content;
+        let committed = records
+            .iter()
+            .find(|record| {
+                record.agent != session.root
+                    && matches!(&record.event,
+                    SessionEvent::MessageCommitted { message: Message::Assistant(actual) }
+                        if actual == content)
+            })
+            .unwrap();
+        assert_eq!(reply["id"], child_job.get());
+        assert_eq!(reply["message"], committed.sequence);
+        assert_eq!(reply["text"], format!("mailbox-child-reply-{index}"));
+        assert!(
+            reply.get("name").is_none(),
+            "unnamed child should omit name"
+        );
+    }
+    tracking.release(parent_reply);
+    running_job(&session, "wait").await;
+    tracking.release(child_final);
+    let completed = tracking.request(parent_completed).await;
+    assert_reason(&completed, "finish-wait", "event");
+    assert_eq!(
+        agent_messages(&completed),
+        replies,
+        "retained replies are exactly once"
+    );
+    let notifications = events(&completed);
+    assert_eq!(notifications.len(), 1);
+    assert_eq!(notifications[0]["id"], child_job.get());
+    let output = serde_json::to_string(&notifications[0]).unwrap();
+    assert!(output.contains("mailbox-child-final"));
+    assert!(!output.contains("mailbox-child-reply-"));
+    tracking.release(parent_completed);
+    bounded(turn).await.unwrap().unwrap();
+    bounded(session.shutdown()).await.unwrap();
+    bounded(session.root_tx.closed()).await;
 }
 
 #[tokio::test]

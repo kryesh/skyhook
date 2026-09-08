@@ -587,7 +587,12 @@ errors include it in an `output` field; JavaScript callers can catch the error a
 - Child agents are profile-selectable and retain their conversation for follow-up work.
   `tool.job(id).send({value: instructions})` delivers unsolicited input automatically at a running
   child's next model-request boundary, without interrupting the current request or tools.
-  Children do not need `receive()` to read these updates. Sending to a completed child appends
+  Children do not need `receive()` to read these updates. Intermediate text replies accompanying
+  child tool calls are injected into the parent's next model request and wake `wait`, without
+  waiting for the child job to finish. These attributed replies are separate from the final
+  job result, so progress text is not concatenated into the final answer. A foreground call
+  still needs to return before its parent can make another model request.
+  Sending to a completed child appends
   the instructions after its existing
   conversation and starts a new request under the same agent and job ID; it does not start
   over with fresh history. This resumption applies to successfully completed agent jobs retained
@@ -695,7 +700,7 @@ const child = await tool.agent({
   bg: true
 });
 // Yield for an event, then inspect the child; an event need not mean completion.
-await tool.wait({timeout:60});
+await tool.wait({timeout:300});
 const childStatus = await tool.job(child.id).output();
 if (childStatus.state === "queued") return childStatus;
 return tool.todo({job: child.id});

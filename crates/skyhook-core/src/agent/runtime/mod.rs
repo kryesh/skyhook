@@ -1246,8 +1246,11 @@ impl SessionRuntime {
                     model,
                 } => (content, done, model),
                 AgentCommand::JobsReady => {
-                    let pending = match self.jobs.take_pending(&id).await {
-                        Ok(pending) if !pending.is_empty() => pending,
+                    let content = match self
+                        .pending_event_content(&id, &capabilities, &location)
+                        .await
+                    {
+                        Ok(content) if !content.is_empty() => content,
                         Ok(_)
                             if is_child
                                 && child_answer.is_some()
@@ -1260,6 +1263,9 @@ impl SessionRuntime {
                             if deferred
                                 .iter()
                                 .any(|command| matches!(command, AgentCommand::QueuedInputs(_)))
+                                || self
+                                    .agent_sender(&id)
+                                    .is_some_and(|sender| sender.has_child_messages())
                             {
                                 continue;
                             }
@@ -1276,9 +1282,6 @@ impl SessionRuntime {
                         }
                         _ => continue,
                     };
-                    let content = self
-                        .job_event_content(&pending, &capabilities, &location)
-                        .await;
                     (content, None, None)
                 }
             };
@@ -1350,6 +1353,9 @@ impl SessionRuntime {
                 if deferred
                     .iter()
                     .any(|command| matches!(command, AgentCommand::QueuedInputs(_)))
+                    || self
+                        .agent_sender(&id)
+                        .is_some_and(|sender| sender.has_child_messages())
                 {
                     continue;
                 }
@@ -1394,6 +1400,14 @@ impl SessionRuntime {
                 child_answer = result.as_ref().ok().cloned();
             }
             if is_child && !self.jobs.has_running(&id).await {
+                // A descendant may have published a reply and then finished
+                // during the awaits above. Check after observing no live jobs.
+                if self
+                    .agent_sender(&id)
+                    .is_some_and(|sender| sender.has_child_messages())
+                {
+                    continue;
+                }
                 *completing = false;
                 if let Some(done) = child_done.take() {
                     let _ = done.send(
@@ -1462,11 +1476,10 @@ impl SessionRuntime {
             if cancellation.is_cancelled() {
                 return Err(HarnessError::Interrupted);
             }
-            let pending = self.jobs.take_pending(agent).await?;
-            if !pending.is_empty() {
-                let content = self
-                    .job_event_content(&pending, capabilities, location)
-                    .await;
+            let content = self
+                .pending_event_content(agent, capabilities, location)
+                .await?;
+            if !content.is_empty() {
                 self.commit(agent, Message::User(content)).await?;
             }
             let profile = agent_context.profile.clone();
@@ -1623,10 +1636,26 @@ impl SessionRuntime {
                     return Err(error);
                 }
             };
-            final_text.push_str(&response.text);
             let assistant = Message::Assistant(response.blocks);
             let origin = self.commit(agent, assistant.clone()).await?;
             agent_context.projected.push((origin, assistant));
+            if let Some(job) = owner_job
+                && !response.calls.is_empty()
+                && !response.text.trim().is_empty()
+                && let Some(parent) = agent.parent().and_then(|parent| self.agent_sender(&parent))
+            {
+                let metadata = self.jobs.metadata(job).await?;
+                parent.child_message(wait::ChildMessage {
+                    id: job,
+                    name: metadata.name,
+                    message: origin,
+                    text: response.text.clone(),
+                });
+            } else {
+                // Child progress is delivered separately, not concatenated into
+                // the eventual final result (nor repeated at completion).
+                final_text.push_str(&response.text);
+            }
             self.events.send(RuntimeEvent::ResponseSettled {
                 agent: agent.clone(),
                 request: requested.sequence,
@@ -1647,6 +1676,14 @@ impl SessionRuntime {
             provider_attempt = 0;
             compaction_checked = false;
             if response.calls.is_empty() {
+                // Replies arriving during this provider request must be processed
+                // before returning an answer based on the earlier context.
+                let content = self.child_message_content(agent);
+                if !content.is_empty() {
+                    self.commit(agent, Message::User(content)).await?;
+                    final_text.clear();
+                    continue 'requests;
+                }
                 // A response without tools is still a request boundary. Consume
                 // prompts received in flight before completing a one-shot child
                 // (or returning a stale final answer to the root caller).

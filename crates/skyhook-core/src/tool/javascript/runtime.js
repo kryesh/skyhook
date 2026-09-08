@@ -177,50 +177,42 @@ function __execute(operation) {
   return execution;
 }
 
-// Root WorkPool iterators for this script runtime's lifetime as a workaround for
-// QuickJS fix 7955cfd49e669f00d37aaf8cf37f868132f5a58d (closure-to-coroutine GC edges).
-const __workPoolIterators = new Set();
-
 class WorkPool {
   constructor(concurrency) {
     if (!Number.isInteger(concurrency) || concurrency < 1) throw new RangeError("concurrency must be positive");
     if (arguments.length !== 1) throw new TypeError("WorkPool accepts only a concurrency limit");
     this.concurrency = concurrency;
   }
-  map(items, worker) {
-    const iterator = (async function* () {
-      const values = Array.from(items), completed = [], running = new Set();
-      let next = 0, stopped = false, wake;
-      const signal = () => { if (wake) { const resolve = wake; wake = undefined; resolve(); } };
-      const schedule = () => {
-        while (!stopped && next < values.length && running.size < this.concurrency) {
-          const index = next++;
-          const task = Promise.resolve().then(() => worker(values[index], index)).then(
-            value => { completed.push({index, value}); },
-            error => { console.log(`WorkPool item ${index} failed:`, error?.message ?? error); },
-          ).finally(() => { running.delete(task); signal(); });
-          running.add(task);
-        }
-      };
-      try {
-        schedule();
-        while (next < values.length || running.size || completed.length) {
-          if (completed.length) {
-            yield completed.shift();
-            schedule();
-          } else {
-            schedule();
-            if (running.size) await new Promise(resolve => { wake = resolve; });
-          }
-        }
-      } finally {
-        stopped = true;
-        await Promise.all(running);
-        completed.length = 0;
+  async *map(items, worker) {
+    const values = Array.from(items), completed = [], running = new Set();
+    let next = 0, stopped = false, wake;
+    const signal = () => { if (wake) { const resolve = wake; wake = undefined; resolve(); } };
+    const schedule = () => {
+      while (!stopped && next < values.length && running.size < this.concurrency) {
+        const index = next++;
+        const task = Promise.resolve().then(() => worker(values[index], index)).then(
+          value => { completed.push({index, value}); },
+          error => { console.log(`WorkPool item ${index} failed:`, error?.message ?? error); },
+        ).finally(() => { running.delete(task); signal(); });
+        running.add(task);
       }
-    }).call(this);
-    __workPoolIterators.add(iterator);
-    return iterator;
+    };
+    try {
+      schedule();
+      while (next < values.length || running.size || completed.length) {
+        if (completed.length) {
+          yield completed.shift();
+          schedule();
+        } else {
+          schedule();
+          if (running.size) await new Promise(resolve => { wake = resolve; });
+        }
+      }
+    } finally {
+      stopped = true;
+      await Promise.all(running);
+      completed.length = 0;
+    }
   }
   run(tasks) {
     if (arguments.length !== 1 || !Array.isArray(tasks)) {
