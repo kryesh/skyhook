@@ -634,10 +634,24 @@ fn ensure_field_file(
         }
         if field.is_empty() {
             // Whole-output pages contain the public document, not internal capture metadata.
-            document
-                .as_object_mut()
-                .expect("saved output document")
-                .remove("capture_complete");
+            let output = document.as_object_mut().expect("saved output document");
+            output.remove("capture_complete");
+            if output
+                .get("console")
+                .is_some_and(|value| value.is_null() || value.as_str() == Some(""))
+            {
+                // Empty strings can be placeholders for file-backed console logs.
+                // Keep the canonical saved field for explicit /console reads, but
+                // omit genuinely empty logs from the public whole-output document.
+                let has_logs = match std::fs::metadata(field_file(directory, "/console")) {
+                    Ok(metadata) => metadata.len() > 0,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => return Err(error.into()),
+                };
+                if !has_logs {
+                    output.remove("console");
+                }
+            }
         }
         let value = document.pointer(field).ok_or_else(|| {
             ToolError::InvalidArguments("field does not exist in this result".into())
@@ -735,6 +749,10 @@ mod tests {
     };
 
     async fn fixture(value: Value) -> (tempfile::TempDir, JobManager, JobId) {
+        fixture_output(ToolOutput::new(value)).await
+    }
+
+    async fn fixture_output(output: ToolOutput) -> (tempfile::TempDir, JobManager, JobId) {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::create(root.path()).await.unwrap();
         let manager = JobManager::new(store.clone());
@@ -747,10 +765,68 @@ mod tests {
             .await
             .unwrap();
         manager
-            .finish(lease.id, JobOutcome::Completed(ToolOutput::new(value)))
+            .finish(lease.id, JobOutcome::Completed(output))
             .await
             .unwrap();
         (root, manager, lease.id)
+    }
+
+    #[tokio::test]
+    async fn console_is_optional_in_public_views_but_empty_logs_remain_readable() {
+        let schema = view_schema(&Default::default());
+        assert_eq!(schema["properties"]["console"], json!({"type":"string"}));
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("console"))
+        );
+
+        // Include file-backed logs: their saved-document placeholder is also "".
+        for console in [String::new(), "hello\n".to_owned(), "x".repeat(5000)] {
+            let mut output = ToolOutput::new(json!({"ok":true}));
+            output.console_output.clone_from(&console);
+            let (_root, manager, job) = fixture_output(output).await;
+            let view = manager
+                .present_output(OutputArgs::new(job), &Default::default())
+                .await
+                .unwrap();
+            assert_eq!(view.get("console").is_some(), !console.is_empty());
+            if !console.is_empty() {
+                assert!(console.starts_with(view["console"].as_str().unwrap()));
+            }
+
+            let mut query = OutputArgs::new(job);
+            query.field = Some(String::new());
+            let whole = manager
+                .present_output(query, &Default::default())
+                .await
+                .unwrap();
+            let text = whole["preview"]["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|line| line.as_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let document: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(document.get("console").is_some(), !console.is_empty());
+            if !console.is_empty() {
+                assert_eq!(document["console"], console);
+            }
+
+            let mut query = OutputArgs::new(job);
+            query.field = Some("/console".to_owned());
+            let logs = manager
+                .present_output(query, &Default::default())
+                .await
+                .unwrap();
+            assert_eq!(logs["preview"]["field"], "/console");
+            assert_eq!(
+                logs["preview"]["lines"],
+                serde_json::to_value(console.lines().collect::<Vec<_>>()).unwrap()
+            );
+        }
     }
 
     #[tokio::test]

@@ -866,7 +866,7 @@ pub(crate) struct StartedExecution {
     background: bool,
 }
 
-async fn persist_completion(jobs: &JobManager, job: JobId, completion: JobOutcome) {
+pub(crate) async fn persist_completion(jobs: &JobManager, job: JobId, completion: JobOutcome) {
     let result = jobs.finish(job, completion).await;
     if let Err(error) = result
         && !matches!(error, JobError::AlreadyTerminal(_))

@@ -171,6 +171,7 @@ enum InputTarget {
     Search,
     Prompt,
     Composer,
+    None,
 }
 
 pub struct QueuedInput {
@@ -1565,6 +1566,7 @@ impl App {
                     }
                     InputTarget::Composer if text.lines().count() > 12 => self.pastes.push(text),
                     InputTarget::Composer => self.editor.insert(&text),
+                    InputTarget::None => {}
                 }
             }
             Event::Mouse(mouse) => {
@@ -1742,12 +1744,17 @@ impl App {
             InputTarget::Search
         } else if self.prompt_active && !self.prompts.is_empty() {
             InputTarget::Prompt
+        } else if !self.selected.path().is_empty() {
+            InputTarget::None
         } else {
             InputTarget::Composer
         }
     }
     fn key(&mut self, key: KeyEvent) {
         let target = self.input_target();
+        if matches!(target, InputTarget::None) && self.focus == Focus::Composer {
+            self.focus = Focus::Content;
+        }
         if matches!(target, InputTarget::Menu) {
             self.menu_key(key);
             return;
@@ -1845,6 +1852,13 @@ impl App {
                         Focus::Content
                     };
                 }
+                if !self.selected.path().is_empty() && self.focus == Focus::Composer {
+                    self.focus = if reverse && self.tree_rect.height > 0 {
+                        Focus::Tree
+                    } else {
+                        Focus::Content
+                    };
+                }
                 if self.focus == Focus::Content {
                     let current = self.view().row;
                     let visible: Vec<_> = self
@@ -1888,8 +1902,12 @@ impl App {
             KeyCode::Esc => {
                 if self.busy() {
                     self.interrupt();
-                } else if self.focus != Focus::Composer {
-                    self.focus = Focus::Composer;
+                } else {
+                    self.focus = if self.selected.path().is_empty() {
+                        Focus::Composer
+                    } else {
+                        Focus::Content
+                    };
                 }
                 return;
             }
@@ -4432,7 +4450,7 @@ mod tests {
         };
         let mut status_columns = Vec::new();
         for (agent, expected, status) in [
-            (&root, "1k · 5k(2k) · 10% (10k/100k)", "Working"),
+            (&root, "1k ·  5k(2k) · 10% (10k/100k)", "Working"),
             (
                 &child_id,
                 "4k · 11k(5k) · 20% (40k/200k)",
@@ -4473,6 +4491,246 @@ mod tests {
         assert_eq!(
             model::agent_footer(&app.snapshot, &app.projection, &root.child(2)),
             "0 · 0(0) · —"
+        );
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_token_columns_align_each_stat_at_mixed_and_narrow_widths() {
+        use skyhook::{agent::ContextUsage, provider::protocol::Usage};
+        use unicode_width::UnicodeWidthStr;
+
+        let (_temp, mut app) = fixture().await;
+        let root = app.selected.clone();
+        let ids = [root.clone(), root.child(1), root.child(1).child(1)];
+        app.projection.agents[0].name = "root agent".into();
+        for (id, name) in ids[1..].iter().zip(["child agent", "grandchild agent"]) {
+            let mut agent = app.projection.agents[0].clone();
+            agent.id = id.clone();
+            agent.name = name.into();
+            agent.terminal = false;
+            app.projection.agents.push(agent);
+        }
+        for (id, output_tokens, input_tokens) in [
+            (&ids[0], 12000, 3),
+            (&ids[1], 2, 120000),
+            (&ids[2], 300, 42),
+        ] {
+            app.projection.agent_usage.insert(
+                id.clone(),
+                Usage {
+                    output_tokens,
+                    input_tokens,
+                    cached_input_tokens: 0,
+                },
+            );
+        }
+        app.snapshot.context.clear();
+        app.snapshot.context.insert(
+            ids[0].clone(),
+            ContextUsage {
+                tokens: 9,
+                capacity: 100,
+            },
+        );
+        app.snapshot.context.insert(
+            ids[1].clone(),
+            ContextUsage {
+                tokens: 100000,
+                capacity: 100000,
+            },
+        );
+        let expected = [
+            "12k ·       3(3) ·       9% (9/100)",
+            "  2 · 120k(120k) · 100% (100k/100k)",
+            "300 ·     42(42) ·                —",
+        ];
+        // The maximum of each field comes from a different row. Neither tree
+        // depth nor missing context may shift the individual numeric columns.
+        for picker in [false, true] {
+            if picker {
+                key(&mut app, KeyCode::Char('x'), M::CONTROL);
+                key(&mut app, KeyCode::Char('a'), M::NONE);
+            }
+            for width in [120, 90, 66, 40, 20] {
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 50)).unwrap();
+                terminal
+                    .draw(|frame| super::super::render::draw(frame, &mut app))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let mut columns = Vec::new();
+                for (index, id) in ids.iter().enumerate() {
+                    let rect = app
+                        .hits
+                        .iter()
+                        .find_map(|(rect, hit)| {
+                            let matches = if picker {
+                                matches!(hit, Hit::Menu(i) if *i == index)
+                            } else {
+                                matches!(hit, Hit::Agent(agent) if agent == id)
+                            };
+                            matches.then_some(*rect)
+                        })
+                        .unwrap();
+                    let rows = (rect.y..rect.bottom())
+                        .map(|y| {
+                            (rect.x..rect.right())
+                                .map(|x| buffer[(x, y)].symbol())
+                                .collect::<String>()
+                        })
+                        .collect::<Vec<_>>();
+                    let stats_row = rows.iter().find(|row| row.contains('('));
+                    if width >= 60 {
+                        let row = stats_row
+                            .unwrap_or_else(|| panic!("width={width}, picker={picker}: {rows:?}"));
+                        assert!(
+                            row.contains(expected[index]),
+                            "width={width}, picker={picker}: {row:?}"
+                        );
+                        columns.push(
+                            row.rmatch_indices('·')
+                                .take(2)
+                                .map(|(byte, _)| row[..byte].width())
+                                .collect::<Vec<_>>(),
+                        );
+                        if picker {
+                            assert_eq!(
+                                rect.height,
+                                match width {
+                                    120 => 1,
+                                    90 => 2,
+                                    _ => 3,
+                                }
+                            );
+                        }
+                    } else {
+                        // Hide the entire shared set, rather than showing only
+                        // shorter rows or clipping a numeric field on tiny screens.
+                        assert!(
+                            stats_row.is_none(),
+                            "width={width}, picker={picker}: {rows:?}"
+                        );
+                        assert!(
+                            rows[0].contains(["root", "child", "grand"][index]),
+                            "{rows:?}"
+                        );
+                    }
+                }
+                assert!(
+                    columns.windows(2).all(|pair| pair[0] == pair[1]),
+                    "{columns:?}"
+                );
+            }
+        }
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn child_view_hides_composer_and_gives_its_rows_to_the_tree() {
+        let (_temp, mut app) = fixture().await;
+        let root = app.selected.clone();
+        for index in 1..=12 {
+            let mut child = app.projection.agents[0].clone();
+            child.id = root.child(index);
+            child.name = format!("worker {index}");
+            child.terminal = false;
+            app.projection.agents.push(child);
+        }
+        app.editor.set("preserved root draft".into());
+        draw(&mut app);
+        let root_tree_height = app.tree_rect.height;
+        let composer_height = app.composer_rect.height;
+        let root_content_height = app.content_rect.height;
+        assert!(composer_height > 0);
+        app.select(root.child(1));
+        let screen = draw(&mut app);
+        assert_eq!(app.composer_rect.height, 0);
+        assert_eq!(app.tree_rect.height, root_tree_height + composer_height);
+        assert_eq!(app.content_rect.height, root_content_height);
+        assert!(!screen.contains("preserved root draft"));
+        assert!(
+            !app.hits
+                .iter()
+                .any(|(_, hit)| matches!(hit, Hit::Composer | Hit::Attachments))
+        );
+        for _ in 0..4 {
+            key(&mut app, KeyCode::Tab, M::NONE);
+            assert!(app.focus != Focus::Composer);
+            key(&mut app, KeyCode::BackTab, M::NONE);
+            assert!(app.focus != Focus::Composer);
+        }
+        key(&mut app, KeyCode::Esc, M::NONE);
+        app.event(Event::Paste("hidden edit".into()));
+        assert_eq!(app.editor.text, "preserved root draft");
+        app.select(root);
+        assert!(draw(&mut app).contains("preserved root draft"));
+        assert_eq!(app.composer_rect.height, composer_height);
+        assert_eq!(app.tree_rect.height, root_tree_height);
+    }
+
+    #[tokio::test]
+    async fn resumed_child_reopens_agent_pane_without_stealing_focus() {
+        let (_temp, mut app) = fixture().await;
+        let root = app.selected.clone();
+        let job = JobId::new(900).unwrap();
+        let mut child = app.projection.agents[0].clone();
+        child.id = root.child(1);
+        child.owner = Some(job);
+        child.name = "retained worker".into();
+        child.terminal = true;
+        let child_id = child.id.clone();
+        app.projection.agents.push(child);
+        app.projection
+            .completed
+            .insert(child_id.clone(), Instant::now() - Duration::from_secs(3));
+        app.editor.set("unfinished draft".into());
+        draw(&mut app);
+        assert_eq!(app.tree_rect.height, 0);
+        app.command("agents");
+        key(&mut app, KeyCode::Esc, M::NONE);
+        assert!(app.menu.is_none());
+        let focus = app.focus;
+        let sequence = app
+            .snapshot
+            .records
+            .last_key_value()
+            .map_or(1, |(seq, _)| seq + 1);
+        assert!(app.observe(ObservedEvent {
+            revision: app.snapshot.revision + 1,
+            event: RuntimeEvent::Record(Box::new(skyhook::session::EventRecord {
+                version: 1,
+                sequence,
+                timestamp_millis: 0,
+                agent: root.clone(),
+                event: SessionEvent::JobStateChanged {
+                    job,
+                    state: skyhook::job::JobState::Running
+                },
+            })),
+        }));
+        app.refresh();
+        app.observe(ObservedEvent {
+            revision: app.snapshot.revision + 1,
+            event: RuntimeEvent::Activity {
+                agent: child_id.clone(),
+                activity: AgentActivity::Working,
+            },
+        });
+        let rendered = draw(&mut app);
+        assert_eq!(app.tree_rect.height, 4);
+        assert!(rendered.contains("retained worker"));
+        assert!(
+            app.hits
+                .iter()
+                .any(|(_, hit)| matches!(hit, Hit::Agent(id) if id == &child_id))
+        );
+        assert_eq!(app.selected, root);
+        assert!(app.focus == focus);
+        assert_eq!(app.editor.text, "unfinished draft");
+        assert!(
+            app.menu.is_none(),
+            "a dismissed Agents menu must stay dismissed"
         );
         app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
@@ -4526,7 +4784,9 @@ mod tests {
         app.focus = Focus::Tree;
         draw(&mut app);
         assert_eq!(app.tree_rect.height, 4);
-        assert_eq!(app.content_rect.height, full_content_height - 4);
+        assert_eq!(app.composer_rect.height, 0);
+        // With only two tree rows, unused reclaimed space goes to history.
+        assert_eq!(app.content_rect.height, full_content_height - 4 + 3);
         assert!(app.focus == Focus::Tree);
         assert!(
             app.hits

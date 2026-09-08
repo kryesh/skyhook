@@ -54,6 +54,17 @@ pub(super) async fn restore(
             }
             SessionEvent::JobStateChanged { job, state } => {
                 if let Some(entry) = jobs.get_mut(job) {
+                    if entry.state == super::JobState::Completed
+                        && *state == super::JobState::Running
+                    {
+                        entry.output = None;
+                        entry.images.clear();
+                        entry.console_output.clear();
+                        entry.error = None;
+                        entry.denial = None;
+                        entry.delivery = DeliveryState::Pending;
+                        entry.background = true;
+                    }
                     entry.state = *state;
                 }
             }

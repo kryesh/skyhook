@@ -451,9 +451,9 @@ const matches = tool.search({ pattern: "TODO", path: "src" });
 // The same schema also generates an immutable fluent builder.
 const firstLines = tool.read().path("README.md").start(1).limit(40);
 
-// Selecting a skill loads its SKILL.md; selecting an asset changes the operation.
+// A skill loads its complete SKILL.md and a recursive asset tree.
 const instructions = tool.skill({ name: "release" });
-const template = tool.skill({ name: "release", path: "template.md" });
+const template = tool.skill({ name: "release", path: "references/template.md" });
 
 // Builders nested in the returned value are resolved concurrently.
 return { packageFile, matches, firstLines, instructions, template };
@@ -517,7 +517,14 @@ errors include it in an `output` field; JavaScript callers can catch the error a
   outputs, and line-addressable job output.
 - `agent::Harness` owns profiles and policy; each `agent::SessionHandle` owns an isolated agent tree
   and registry.
-- Child agents are one-shot, profile-selectable agents. Each model-facing `ask` contains one
+- Child agents are profile-selectable and retain their conversation for follow-up work.
+  `tool.job(id).send({value: instructions})` queues unsolicited input for a running child's next
+  model request. Sending to a completed child appends the instructions after its existing
+  conversation and starts a new request under the same agent and job ID; it does not start
+  over with fresh history. This resumption applies to successfully completed agent jobs retained
+  in the live runtime, not arbitrary completed tools or jobs restored after a process restart.
+  Failed, cancelled, and interrupted agents are not resumed by `send`.
+  Each model-facing `ask` contains one
   `{id, prompt, options}` question; independent concurrent calls are merged by the runtime. A child
   question batch changes its stable agent job to `waiting_input`; answer that job with
   `tool.job(id).send({value: answer})` in a script. For a merged batch, use
@@ -527,6 +534,14 @@ errors include it in an `output` field; JavaScript callers can catch the error a
   suggestion with a non-whitespace comment. A single question returns that value directly;
   a merged batch keeps each value under its question ID.
   Root-agent questions still go directly to the host question handler.
+  `ask` also accepts optional `bg` (boolean, default `false`). With `bg: true`, the call returns
+  job metadata immediately so the agent can continue independent work. Use `job_output` or
+  `tool.job(id).output()` to inspect the pending question and eventual answer; the ask job also
+  accepts `tool.job(id).send({value: answer})`. Omitting `bg` or passing `false` keeps the usual
+  foreground wait. Multiple outstanding child question batches are combined on the stable agent
+  job; parents may answer a subset keyed by question ID, and unanswered questions remain pending.
+  IDs must be unique across that child's outstanding questions. Background questions are still
+  owned jobs: children must await or cancel them before finishing.
 
 `agent` accepts an optional `depth` delegation budget. It defaults to zero, making the launched
 child a leaf. A caller may grant less than its own available depth; once no depth remains, `agent`
@@ -707,8 +722,9 @@ retain only complete items. Grouped maps share one budget across all groups. All
 aggregate response-size limit or whole-result fallback.
 
 Annotations cover file `content`, directory `entries`, process `stdout` and `stderr`, search
-`matches`, glob `paths`, skill asset `content`, and shared `console` text. Skill instructions
-remain complete. Shortened fields keep their original types;
+`matches`, glob `paths`, skill asset `content` and `assets` trees, and shared `console` text. Skill instructions
+remain complete. Empty console fields are omitted from public job views and whole-document pages;
+explicit `/console` reads still work for silent jobs. Shortened fields keep their original types;
 `truncated: [{field, total_lines, next_start, next_offset?}]` identifies each one, reports its
 total source lines, and supplies the exact first unread position. Finished jobs with an incomplete capture include an `Output incomplete.` notice. Errors
 and questions are returned in full. Schemas are persisted with jobs so these rules also apply
@@ -780,8 +796,48 @@ The journal stores the exact model-visible previews, pages, and notifications. F
 are separate; provider-neutral request reconstruction reuses committed content rather than
 regenerating it from current files or settings. Session format 1 has no migration layer.
 
-Host-owned skills are exposed through `skills` and `skill`; they are discovered from the user
-configuration directory and `.agents/skills` directories along the workspace ancestry.
+Host-owned skills are exposed through `skills` and `skill`. Discovery reads `~/.agents/skills`
+and `.agents/skills` directories along the workspace ancestry, with the nearest workspace
+definition winning when names collide. Discovery happens when the harness starts; restart it
+to discover newly added skills. A skill directory contains `SKILL.md` and optional supporting
+files, conventionally grouped in `scripts/`, `references/`, and `assets/`:
+
+```text
+.agents/skills/release/
+├── SKILL.md
+├── assets/
+│   └── logo.png
+├── references/
+│   └── template.md
+└── scripts/
+    └── release.py
+```
+
+Only `name` is required by the `skill` input schema. `path` and `to` are optional and nullable;
+native calls supplying `null` behave like calls omitting those fields.
+
+```js
+await tool.skill({ name: "release" }); // Complete SKILL.md plus recursive assets tree
+await tool.skill({ name: "release", path: "references" }); // Directory subtree
+await tool.skill({ name: "release", path: "references/template.md" }); // Original text
+await tool.skill({ name: "release", path: "assets/logo.png" }); // Attached image
+await tool.skill({ name: "release", path: "assets/logo.png", to: "tmp/logo.png" }); // Copy
+```
+
+Results have a `kind` discriminator: `skill`, `directory`, `text`, `image`, `binary`, or `copied`.
+Base skill results contain `name`, `description`, complete `content`, and an `assets` text tree
+that includes nested files but excludes the already-loaded root `SKILL.md`. Directory results
+use the same tree format, rooted at the selected path. Trees mark symlinks without descending
+through them. Long trees and asset text are saved in full and can be paged using `job_output`.
+
+Text assets (including JSON, YAML, source code, and SVG) are returned unchanged, never executed.
+Supported raster images are attached with metadata. Other binary files return metadata and
+a suggestion to supply `to`, rather than raw binary or base64 content. Copies return destination,
+byte count, and SHA-256, and require write authorization. `to` is resolved in the **calling agent's\ntarget and workspace**: a remote agent receives host-owned asset bytes on its remote target,\nnot in a similarly named directory on the host. Skill discovery, instructions, and asset reads\nremain host-owned. Remote copies require route and destination write authorization, including\npath approval when the destination is outside the authorized workspace. `to` requires a file\n`path`; paths inside a skill must be relative and cannot escape its root. Use `path: "."` to\nbrowse the root.
+
+A mixed-file test workspace lives at `tests/fixtures/skill-workspace/`, including its hidden
+`.agents/skills/mixed-assets/` directory. Its tests exercise native calls, explicit nulls,
+asset discovery, UTF-8 and binary files, image attachments, copying, and path containment.
 
 ## Development
 

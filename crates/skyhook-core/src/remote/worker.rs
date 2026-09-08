@@ -72,6 +72,7 @@ where
     let jobs = JobManager::new(store.clone());
     let mut builder = ToolRegistryBuilder::default();
     register_worker_tools(&mut builder, store.clone())?;
+    crate::tool::builtins::skill_transfer::register_worker(&mut builder)?;
     let executor = ToolExecutor::new(
         builder.build(),
         Arc::new(ForwardPolicy {

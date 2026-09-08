@@ -277,6 +277,16 @@ impl ToolOptions {
         self
     }
 
+    /// Resolve invocation capabilities from validated arguments before authorization.
+    #[must_use]
+    pub fn capability_resolver(
+        mut self,
+        resolver: impl Fn(&Value) -> Result<Vec<Capability>, ToolError> + Send + Sync + 'static,
+    ) -> Self {
+        self.execution.capability_resolver = Some(Arc::new(resolver));
+        self
+    }
+
     #[must_use]
     pub fn output_schema(mut self, schema: Value) -> Self {
         self.output_schema = Some(Arc::new(move |_| schema.clone()));

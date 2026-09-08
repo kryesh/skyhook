@@ -609,8 +609,18 @@ impl SessionHandle {
             .store(true, std::sync::atomic::Ordering::Release);
         self.runtime.interrupt_tree(&self.root).await;
         self.runtime.router.shutdown().await;
-        // A closed command channel means the root already stopped. Shutdown is idempotent.
-        let _ = self.root_tx.send(AgentCommand::Shutdown).await;
+        // Completed children retain idle loops for resumption, and must also stop.
+        let senders = self
+            .runtime
+            .agents
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(|agent| agent.sender.clone())
+            .collect::<Vec<_>>();
+        for sender in senders {
+            let _ = sender.send(AgentCommand::Shutdown).await;
+        }
         Ok(())
     }
 
@@ -643,6 +653,7 @@ struct LiveAgent {
     sender: mpsc::Sender<AgentCommand>,
     cancellation: CancellationToken,
     available_depth: usize,
+    completion_gate: Arc<Mutex<bool>>,
 }
 
 enum AgentCommand {
@@ -966,6 +977,7 @@ impl SessionRuntime {
                     sender: tx.clone(),
                     cancellation: CancellationToken::new(),
                     available_depth,
+                    completion_gate: Arc::new(Mutex::new(true)),
                 },
             );
         self.activity(&id, AgentActivity::Idle);
@@ -1159,6 +1171,14 @@ impl SessionRuntime {
             },
             None => CancellationToken::new(),
         };
+        let completion_gate = self
+            .agents
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+            .expect("registered live agent")
+            .completion_gate
+            .clone();
         let mut child_done: Option<oneshot::Sender<Result<String, String>>> = None;
         let mut child_answer = None;
         let mut deferred = VecDeque::new();
@@ -1216,6 +1236,17 @@ impl SessionRuntime {
                                 && child_answer.is_some()
                                 && !self.jobs.has_running(&id).await =>
                         {
+                            let mut completing = completion_gate.lock().await;
+                            while let Ok(command) = rx.try_recv() {
+                                deferred.push_back(command);
+                            }
+                            if deferred
+                                .iter()
+                                .any(|command| matches!(command, AgentCommand::QueuedInputs(_)))
+                            {
+                                continue;
+                            }
+                            *completing = false;
                             if let Some(done) = child_done.take() {
                                 let _ =
                                     done.send(Ok(child_answer.take().expect("child has answered")));
@@ -1224,7 +1255,10 @@ impl SessionRuntime {
                                 .store
                                 .append(id.clone(), SessionEvent::AgentCompleted)
                                 .await;
-                            break;
+                            if owner_job.is_none() {
+                                break;
+                            }
+                            continue;
                         }
                         _ => continue,
                     };
@@ -1313,6 +1347,20 @@ impl SessionRuntime {
                 // do not silently start a new turn for them.
                 queue::reject_pending(&mut rx, &mut deferred);
             }
+            // Serialize the final mailbox check with owner forwarding. An accepted
+            // update either joins this request cycle or starts a new retained turn.
+            let mut completing = completion_gate.lock().await;
+            if one_shot && result.is_ok() {
+                while let Ok(command) = rx.try_recv() {
+                    deferred.push_back(command);
+                }
+                if deferred
+                    .iter()
+                    .any(|command| matches!(command, AgentCommand::QueuedInputs(_)))
+                {
+                    continue;
+                }
+            }
             self.activity(
                 &id,
                 match &result {
@@ -1353,6 +1401,7 @@ impl SessionRuntime {
                 child_answer = result.as_ref().ok().cloned();
             }
             if one_shot && !self.jobs.has_running(&id).await {
+                *completing = false;
                 if let Some(done) = child_done.take() {
                     let _ = done.send(
                         result
@@ -1367,8 +1416,17 @@ impl SessionRuntime {
                     SessionEvent::AgentInterrupted
                 };
                 let _ = self.store.append(id.clone(), terminal).await;
-                break;
+                // Retain the provider session and full projected history while idle.
+                // A fresh owner request resumes this same child, never a new agent.
+                child_answer = None;
+                if owner_job.is_none() {
+                    break;
+                }
+                continue;
             }
+        }
+        if let Some(job) = owner_job {
+            self.jobs.clear_resume_handler(job).await;
         }
         self.agents
             .write()
@@ -1616,6 +1674,17 @@ impl SessionRuntime {
             provider_attempt = 0;
             compaction_checked = false;
             if response.calls.is_empty() {
+                // A response without tools is still a request boundary. Consume
+                // prompts received in flight before completing a one-shot child
+                // (or returning a stale final answer to the root caller).
+                if self
+                    .consume_queued_inputs(&turn, agent_context, model_profile, rx, deferred)
+                    .await
+                {
+                    context_sequence = None;
+                    final_text.clear();
+                    continue 'requests;
+                }
                 let _ = self.events.send(RuntimeEvent::TurnCompleted {
                     agent: agent.clone(),
                     text: final_text.clone(),
@@ -3421,6 +3490,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_child_resumes_same_history_and_job_repeatedly() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            scripted_provider(
+                &requests,
+                [
+                    vec![ResponseChunk::TextDelta {
+                        text: "first answer".into(),
+                    }],
+                    vec![ResponseChunk::TextDelta {
+                        text: "second answer".into(),
+                    }],
+                    vec![ResponseChunk::TextDelta {
+                        text: "third answer".into(),
+                    }],
+                ],
+            ),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        // This test drives tools directly; suppress autonomous parent wakeups.
+        let (quiet_sender, _quiet_receiver) = mpsc::channel(AGENT_CHANNEL_CAPACITY);
+        session
+            .runtime
+            .agents
+            .write()
+            .unwrap()
+            .get_mut(&session.root)
+            .unwrap()
+            .sender = quiet_sender;
+        let first = session
+            .runtime
+            .executor
+            .execute(
+                session.root.clone(),
+                "agent",
+                json!({"prompt":"remember the initial task", "depth":0}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.output.value, "first answer");
+        let job = first.job;
+        let child = session.root.child(1);
+        assert_eq!(session.runtime.jobs.prune_claimed().await.unwrap(), 0);
+        for (instruction, answer) in [
+            ("follow-up one", "second answer"),
+            ("follow-up two", "third answer"),
+        ] {
+            let sent = session.run_script(format!("await tool.job({job}).send({{value:{}}}); return await tool.job({job}).output({{wait:5}});", json!(instruction))).await.unwrap();
+            assert_eq!(sent.value["id"], job.get());
+            assert_eq!(sent.value["state"], "completed");
+            assert_eq!(sent.value["result"], answer);
+            assert_eq!(
+                session.runtime.jobs.metadata(job).await.unwrap().state,
+                crate::job::JobState::Completed
+            );
+        }
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.correlation.as_deref()
+                        == Some(child.to_string().as_str()))
+            );
+            let history = request_history(&requests[2]);
+            let text = serde_json::to_string(history).unwrap();
+            for expected in [
+                "remember the initial task",
+                "first answer",
+                "follow-up one",
+                "second answer",
+                "follow-up two",
+            ] {
+                assert!(text.contains(expected), "missing {expected}: {text}");
+            }
+            assert!(
+                matches!(history.last(), Some(Message::User(content)) if matches!(&content[0], UserContent::ParentInput {text} if text.contains("follow-up two")))
+            );
+        }
+        assert_eq!(session.runtime.store.records().await.iter().filter(|record| matches!(&record.event, SessionEvent::AgentStarted {owner_job:Some(id), ..} if *id == job)).count(), 1);
+        let restored = JobManager::restore(
+            session.runtime.store.clone(),
+            &session.runtime.store.records().await,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            restored.snapshot(job).await.unwrap().output,
+            Some(json!("third answer"))
+        );
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn child_finishes_when_another_waiter_claims_its_last_background_result() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
@@ -3827,6 +3997,15 @@ mod tests {
         assert!(ask.input_schema["properties"]["prompt"].is_object());
         assert!(ask.input_schema["properties"]["options"].is_object());
         assert!(ask.input_schema["properties"].get("questions").is_none());
+        assert_eq!(ask.input_schema["properties"]["bg"]["default"], false);
+        assert_eq!(ask.input_schema["properties"]["bg"]["type"], "boolean");
+        assert!(
+            !ask.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("bg"))
+        );
+        assert!(ask.input_schema["properties"].get("background").is_none());
 
         assert_eq!(session.prompt("ask twice").await.unwrap(), "done");
         let batches = batches.lock().unwrap();
@@ -3938,6 +4117,14 @@ mod tests {
             );
         }
         assert!(!description.contains("$schema"));
+        assert!(description.contains("Sending to a completed agent"));
+        assert!(description.contains("same job ID"));
+        let agent_description = &definitions
+            .iter()
+            .find(|definition| definition.name == "agent")
+            .unwrap()
+            .description;
+        assert!(agent_description.contains("completed children resume with retained history"));
 
         let direct = session
             .runtime
@@ -4160,6 +4347,354 @@ mod tests {
         assert_eq!(runtime_state_count(&requests[2].messages), 1);
     }
 
+    struct GatedQuestions {
+        opened: Arc<tokio::sync::Semaphore>,
+        answer: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl QuestionHandler for GatedQuestions {
+        fn ask(&self, _agent: AgentId, _questions: Vec<Question>) -> crate::agent::QuestionFuture {
+            let opened = self.opened.clone();
+            let answer = self.answer.clone();
+            Box::pin(async move {
+                opened.add_permits(1);
+                answer.acquire_owned().await.unwrap().forget();
+                Ok(json!("host answer"))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn background_ask_returns_and_accepts_job_input_while_independent_work_progresses() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let opened = Arc::new(tokio::sync::Semaphore::new(0));
+        let answer = Arc::new(tokio::sync::Semaphore::new(0));
+        let harness = question_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(HangingProvider::default()),
+            Arc::new(GatedQuestions {
+                opened: opened.clone(),
+                answer,
+            }),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        let ask = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.runtime.executor.execute_model(
+                session.root.clone(),
+                "ask",
+                json!({"id":"choose-color", "prompt":"Which color?", "bg":true}),
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(ask.background);
+        assert_eq!(ask.output.value["id"], ask.job.get());
+        tokio::time::timeout(Duration::from_secs(2), opened.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let output = session
+            .runtime
+            .executor
+            .execute_model(
+                session.root.clone(),
+                "job_output",
+                json!({"job":ask.job}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.output.value["state"], "waiting_input");
+        assert_eq!(
+            output.output.value["question"]["questions"][0]["id"],
+            "choose-color"
+        );
+        assert_eq!(
+            session.run_script("return 6 * 7;").await.unwrap().value,
+            json!(42)
+        );
+        session
+            .run_script(format!(
+                "return tool.job({}).send({{value:'blue'}});",
+                ask.job
+            ))
+            .await
+            .unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let result = session
+                    .runtime
+                    .executor
+                    .execute_model(
+                        session.root.clone(),
+                        "job_output",
+                        json!({"job":ask.job, "wait":1}),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                if result.output.value["state"] == "completed" {
+                    break result;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(completed.output.value["result"], "blue");
+        let events = session.runtime.store.records().await;
+        assert!(events.iter().any(|record| matches!(&record.event,
+            SessionEvent::QuestionResolved { job, answers, .. } if *job == ask.job && answers == &json!("blue")
+        )));
+    }
+
+    #[tokio::test]
+    async fn foreground_ask_omitted_or_false_waits_for_the_host_answer() {
+        for bg in [None, Some(false)] {
+            let workspace = tempfile::tempdir().unwrap();
+            let sessions = tempfile::tempdir().unwrap();
+            let opened = Arc::new(tokio::sync::Semaphore::new(0));
+            let answer = Arc::new(tokio::sync::Semaphore::new(0));
+            let harness = question_harness(
+                workspace.path(),
+                sessions.path(),
+                Arc::new(HangingProvider::default()),
+                Arc::new(GatedQuestions {
+                    opened: opened.clone(),
+                    answer: answer.clone(),
+                }),
+            )
+            .await;
+            let session = harness.new_session().await.unwrap();
+            let mut input = json!({"id":"foreground", "prompt":"Continue?"});
+            if let Some(bg) = bg {
+                input["bg"] = json!(bg);
+            }
+            let ask =
+                session
+                    .runtime
+                    .executor
+                    .execute_model(session.root.clone(), "ask", input, None);
+            tokio::pin!(ask);
+            tokio::select! {
+                result = &mut ask => panic!("foreground returned before answer: {result:?}"),
+                permit = opened.acquire() => permit.unwrap().forget(),
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut ask)
+                    .await
+                    .is_err()
+            );
+            answer.add_permits(1);
+            let result = tokio::time::timeout(Duration::from_secs(2), ask)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!result.background);
+            assert_eq!(result.output.value["result"], "host answer");
+        }
+    }
+
+    #[tokio::test]
+    async fn background_child_asks_merge_across_turns_and_resolve_independently() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(HangingProvider::default()),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        let child = session.root.child(1);
+        let owner = session
+            .runtime
+            .jobs
+            .create(crate::job::JobSpec {
+                accepts_input: true,
+                ..crate::job::JobSpec::test(session.root.clone(), "agent")
+            })
+            .await
+            .unwrap();
+        session
+            .runtime
+            .jobs
+            .transition(owner.id, crate::job::JobState::Running)
+            .await
+            .unwrap();
+        let first = session
+            .runtime
+            .executor
+            .execute_model(
+                child.clone(),
+                "ask",
+                json!({"id":"first", "prompt":"First?", "bg":true}),
+                Some(owner.id),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.runtime.jobs.snapshot(owner.id).await.unwrap().state
+                != crate::job::JobState::WaitingInput
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let second = session
+            .runtime
+            .executor
+            .execute_model(
+                child.clone(),
+                "ask",
+                json!({"id":"second", "prompt":"Second?", "bg":true}),
+                Some(owner.id),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let output = session
+                    .runtime
+                    .jobs
+                    .snapshot(owner.id)
+                    .await
+                    .unwrap()
+                    .output
+                    .unwrap();
+                if output["questions"].as_array().unwrap().len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(first.background && second.background);
+        // A repeated stable ID must not replace an outstanding question.
+        let duplicate = session
+            .runtime
+            .executor
+            .execute_model(
+                child,
+                "ask",
+                json!({"id":"second", "prompt":"Duplicate?", "bg":true}),
+                Some(owner.id),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !session
+                .runtime
+                .jobs
+                .snapshot(duplicate.job)
+                .await
+                .unwrap()
+                .state
+                .is_terminal()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            session
+                .runtime
+                .jobs
+                .snapshot(duplicate.job)
+                .await
+                .unwrap()
+                .state,
+            crate::job::JobState::Failed
+        );
+        // Parents can answer a subset keyed by stable question ID, even when
+        // a new background batch arrived after the question was presented.
+        assert!(
+            session
+                .runtime
+                .questions
+                .answer_child_question(owner.id, json!({"first":"one"}))
+                .await
+                .unwrap()
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !session
+                .runtime
+                .jobs
+                .snapshot(first.job)
+                .await
+                .unwrap()
+                .state
+                .is_terminal()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let remaining = session.runtime.jobs.snapshot(owner.id).await.unwrap();
+        assert_eq!(remaining.state, crate::job::JobState::WaitingInput);
+        assert_eq!(remaining.output.unwrap()["questions"][0]["id"], "second");
+        assert_eq!(
+            session
+                .runtime
+                .jobs
+                .wait(first.job, None, true)
+                .await
+                .unwrap()
+                .output,
+            Some(json!("one"))
+        );
+        // Keyed semantics survive shrinking a merged set to one question.
+        assert!(
+            session
+                .runtime
+                .questions
+                .answer_child_question(owner.id, json!({"second":"two"}))
+                .await
+                .unwrap()
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !session
+                .runtime
+                .jobs
+                .snapshot(second.job)
+                .await
+                .unwrap()
+                .state
+                .is_terminal()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            session
+                .runtime
+                .jobs
+                .wait(second.job, None, true)
+                .await
+                .unwrap()
+                .output,
+            Some(json!("two"))
+        );
+        assert_eq!(
+            session.runtime.jobs.snapshot(owner.id).await.unwrap().state,
+            crate::job::JobState::Running
+        );
+        session.runtime.jobs.cancel(owner.id).await.unwrap();
+    }
+
     #[tokio::test]
     async fn child_questions_route_through_the_stable_agent_job() {
         let workspace = tempfile::tempdir().unwrap();
@@ -4245,18 +4780,56 @@ mod tests {
                 .await
                 .unwrap()
         );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..100 {
+                assert!(
+                    session
+                        .runtime
+                        .questions
+                        .answer_child_question(
+                            owner,
+                            json!({"first":"duplicate", "second":"duplicate"})
+                        )
+                        .await
+                        .unwrap()
+                );
+            }
+        })
+        .await
+        .expect("duplicate answers must not block on a full input channel");
         assert_eq!(ask.input.recv().await.unwrap(), json!("yes"));
         assert_eq!(ask_two.input.recv().await.unwrap(), json!(2));
         session
             .runtime
             .questions
-            .resolve_child_question(owner)
+            .resolve_child_question(owner, &[ask.id, ask_two.id])
             .await
             .unwrap();
         assert_eq!(
             session.runtime.jobs.snapshot(owner).await.unwrap().state,
             crate::job::JobState::Running
         );
+        // Cancellation remains responsive after a burst of duplicate replies.
+        session
+            .runtime
+            .questions
+            .open_child_questions(vec![("cancel".to_owned(), ask.id)], json!({"questions":[]}))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..100 {
+                session
+                    .runtime
+                    .questions
+                    .answer_child_question(owner, json!("cancel me"))
+                    .await
+                    .unwrap();
+            }
+            session.runtime.questions.cancel_child_question(owner).await;
+        })
+        .await
+        .expect("reply bursts must not block coordinator cancellation");
+        assert!(ask.cancellation.is_cancelled());
     }
 
     #[tokio::test]
@@ -4379,6 +4952,7 @@ mod tests {
             "boom"
         );
         assert_eq!(result("silent").result["result"], json!(42));
+        assert!(result("silent").result.get("console").is_none());
         assert!(
             serde_json::to_value(result("silent"))
                 .unwrap()

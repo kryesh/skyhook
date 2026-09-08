@@ -55,6 +55,25 @@ impl ToolContext {
         self.authorization.cancellation.cancelled().await;
     }
 
+    pub(crate) async fn drain_input_or_close(&self) -> Vec<Value> {
+        let mut input = self.input.lock().await;
+        let operation = self.jobs.operation(self.job).await.expect("live tool job");
+        let _operation = operation.lock().await;
+        let mut pending = Vec::new();
+        while let Ok(value) = input.try_recv() {
+            pending.push(value);
+        }
+        if pending.is_empty() {
+            input.close();
+            // A sender on another thread may enqueue between try_recv and
+            // close. Closing rejects future sends, but preserves accepted ones.
+            while let Ok(value) = input.try_recv() {
+                pending.push(value);
+            }
+        }
+        pending
+    }
+
     pub async fn receive(&self) -> Result<Value, ToolError> {
         let mut input = self.input.lock().await;
         tokio::select! {

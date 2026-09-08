@@ -58,6 +58,37 @@ pub(crate) struct TargetRouter {
 }
 
 impl TargetRouter {
+    pub(crate) async fn authorize_transfer(
+        &self,
+        context: &crate::tool::ToolContext,
+        tool: &str,
+        permissions: Vec<PermissionUse>,
+        arguments: serde_json::Value,
+    ) -> Result<(), crate::tool::ToolError> {
+        self.authorization
+            .authorize(
+                &context.authorization,
+                tool.to_owned(),
+                permissions,
+                arguments,
+            )
+            .await
+            .map_err(|error| match error {
+                crate::tool::authorization::AuthorizationError::Cancelled => {
+                    crate::tool::ToolError::Cancelled
+                }
+                crate::tool::authorization::AuthorizationError::Denied(reason) => {
+                    crate::tool::ToolError::Denied(reason)
+                }
+                crate::tool::authorization::AuthorizationError::Unavailable => {
+                    crate::tool::ToolError::Denied("required capability is unavailable".into())
+                }
+                error => {
+                    crate::tool::ToolError::Failed(RemoteError::authorization(error).to_string())
+                }
+            })
+    }
+
     pub fn new(
         targets: TargetRegistry,
         remote: RemoteManager,

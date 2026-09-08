@@ -17,7 +17,7 @@ use crate::{
     tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::Capability},
 };
 
-use super::{AgentCommand, AgentLaunch, SessionRuntime};
+use super::{AgentCommand, AgentLaunch, QueuedPromptToken, SessionRuntime, queue::QueuedInput};
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -99,8 +99,8 @@ fn register_ask(
 ) -> Result<(), RegistryError> {
     builder.register::<Question, Value, _, _>(
         "ask",
-        "Ask one structured question. Issue independent questions concurrently; the runtime merges calls that become ready together.",
-        ToolOptions::default().input(),
+        "Ask one structured question. Issue independent questions concurrently; the runtime merges calls that become ready together. Use bg:true to continue independent work while awaiting an answer; inspect the returned job with job_output.",
+        ToolOptions::default().background().input(),
         move |context, input| {
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
             async move {
@@ -145,7 +145,7 @@ fn register_child_agent(
 ) -> Result<(), RegistryError> {
     builder.register::<AgentArgs, String, _, _>(
         "agent",
-        "Run a one-shot child agent with fresh history; questions suspend it.",
+        "Start a child agent with fresh history; questions suspend it. Send follow-up instructions with tool.job(id).send({value: instructions}); completed children resume with retained history under the same job ID.",
         ToolOptions::default()
             .named()
             .requires(Capability::Agents)
@@ -213,45 +213,125 @@ fn register_child_agent(
                     available_depth: input.depth,
                     location,
                 }).await.map_err(|error| tool_error(&error))?;
-                let (done_tx, mut done_rx) = oneshot::channel();
-                sender.send(AgentCommand::Input {
-                    model: None,
-                    content: vec![UserContent::Text { text: input.prompt }],
-                    done: Some(done_tx),
-                }).await.map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?;
-                loop {
-                    tokio::select! {
-                        result = &mut done_rx => {
-                            let text = result
-                                .map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?
-                                .map_err(ToolError::Failed)?;
-                            return Ok(text);
+                // Only this live child session may opt its completed job into resumption.
+                // Keep a weak runtime reference: jobs must not retain their own manager.
+                let resume_runtime = Arc::downgrade(&runtime);
+                let resume_child = child.clone();
+                let resume_sender = sender.clone();
+                let authorization = context.authorization.clone();
+                let execution_location = context.execution_location.clone();
+                let caller_location = context.caller_location.clone();
+                runtime.jobs.set_resume_handler(context.job, Arc::new(move |value, input| {
+                    let runtime = resume_runtime.upgrade();
+                    let child = resume_child.clone();
+                    let sender = resume_sender.clone();
+                    let authorization = authorization.clone();
+                    let execution_location = execution_location.clone();
+                    let caller_location = caller_location.clone();
+                    Box::pin(async move {
+                        let runtime = runtime.ok_or_else(runtime_unavailable)?;
+                        if runtime.shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+                            return Err(ToolError::Cancelled);
                         }
-                        value = context.receive() => {
-                            let value = match value {
-                                Ok(value) => value,
-                                Err(error) => {
-                                    runtime.questions.cancel_child_question(context.job).await;
-                                    runtime.interrupt_tree(&child).await;
-                                    return Err(error);
-                                }
-                            };
-                            if !runtime.questions.answer_child_question(context.job, value.clone()).await
-                                .map_err(|error| tool_error(&error))?
-                            {
-                                sender.send(AgentCommand::Input {
-                                    model: None,
-                                    content: vec![UserContent::ParentInput { text: format!("Owner input: {value}") }],
-                                    done: None,
-                                }).await.map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?;
-                            }
-                        }
-                    }
-                }
+                        let context = crate::tool::ToolContext::new(
+                            authorization, execution_location, caller_location, input, runtime.jobs.clone(),
+                        );
+                        let text = run_child_request(
+                            &runtime, &context, &child, &sender,
+                            vec![UserContent::ParentInput { text: format!("Owner input: {value}") }],
+                        ).await?;
+                        Ok(crate::tool::ToolOutput::new(json!(text)))
+                    })
+                })).await.map_err(|error| tool_error(&error))?;
+                run_child_request(
+                    &runtime, &context, &child, &sender,
+                    vec![UserContent::Text { text: input.prompt }],
+                ).await
             }
         },
     )?;
     Ok(())
+}
+
+async fn run_child_request(
+    runtime: &Arc<SessionRuntime>,
+    context: &crate::tool::ToolContext,
+    child: &crate::identity::AgentId,
+    sender: &tokio::sync::mpsc::Sender<AgentCommand>,
+    content: Vec<UserContent>,
+) -> Result<String, ToolError> {
+    let completion_gate = runtime
+        .agents
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(child)
+        .ok_or_else(|| ToolError::Failed("child agent stopped".into()))?
+        .completion_gate
+        .clone();
+    *completion_gate.lock().await = true;
+    let (done_tx, mut done_rx) = oneshot::channel();
+    sender
+        .send(AgentCommand::Input {
+            model: None,
+            content,
+            done: Some(done_tx),
+        })
+        .await
+        .map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?;
+    loop {
+        tokio::select! {
+            result = &mut done_rx => {
+                let text = result
+                    .map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?
+                    .map_err(ToolError::Failed)?;
+                let mut content = Vec::new();
+                for value in context.drain_input_or_close().await {
+                    content.push(UserContent::ParentInput { text: format!("Owner input: {value}") });
+                }
+                if content.is_empty() { return Ok(text); }
+                let (done, next) = oneshot::channel();
+                done_rx = next;
+                *completion_gate.lock().await = true;
+                sender.send(AgentCommand::Input { model: None, content, done: Some(done) }).await
+                    .map_err(|_| ToolError::Failed("child agent stopped".into()))?;
+            }
+            value = context.receive() => {
+                let value = match value {
+                    Ok(value) => value,
+                    Err(error) => {
+                        runtime.questions.cancel_child_question(context.job).await;
+                        runtime.interrupt_tree(child).await;
+                        return Err(error);
+                    }
+                };
+                if !runtime.questions.answer_child_question(context.job, value.clone()).await
+                    .map_err(|error| tool_error(&error))?
+                {
+                    let mut active = completion_gate.lock().await;
+                    if !*active {
+                        let (done, next) = oneshot::channel();
+                        done_rx = next;
+                        *active = true;
+                        sender.send(AgentCommand::Input {
+                            model: None,
+                            content: vec![UserContent::ParentInput { text: format!("Owner input: {value}") }],
+                            done: Some(done),
+                        }).await.map_err(|_| ToolError::Failed("child agent stopped".into()))?;
+                        continue;
+                    }
+                    // Owner updates use the same request-boundary mailbox as
+                    // queued root prompts, rather than waiting for a new turn.
+                    let (committed, _receipt) = oneshot::channel();
+                    sender.send(AgentCommand::QueuedInputs(vec![QueuedInput {
+                        model: None,
+                        content: vec![UserContent::ParentInput { text: format!("Owner input: {value}") }],
+                        token: QueuedPromptToken::new(),
+                        committed,
+                    }])).await.map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?;
+                }
+            }
+        }
+    }
 }
 
 fn runtime_unavailable() -> ToolError {

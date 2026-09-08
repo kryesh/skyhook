@@ -317,16 +317,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     let prompt_active = app.prompt_active && !app.prompts.is_empty();
     let editor_lines = draft_lines(&app.editor, width.saturating_sub(4).max(1) as usize, p);
+    let viewing_child = !app.selected.path().is_empty();
+    let editor_height = (editor_lines.len() as u16
+        + 2
+        + u16::from(!app.images.is_empty() || !app.pastes.is_empty()))
+    .clamp(3, 7)
+    .min(height.saturating_sub(footer_height + 3).max(3));
     let composer_height = if prompt_active {
         (app.prompt_options().len() as u16 + 6)
             .clamp(7, 12)
             .min(height / 2)
+    } else if viewing_child {
+        0
     } else {
-        (editor_lines.len() as u16
-            + 2
-            + u16::from(!app.images.is_empty() || !app.pastes.is_empty()))
-        .clamp(3, 7)
-        .min(height.saturating_sub(footer_height + 3).max(3))
+        editor_height
     };
     let tree_agents = app.projection.visible(&app.selected);
     let notice_height = u16::from(
@@ -335,9 +339,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             || app.leader.is_some(),
     );
     let composer_y = height.saturating_sub(footer_height + composer_height);
-    let tree_capacity = composer_y
-        .saturating_sub(3 + notice_height)
-        .min((height / 4).clamp(4, 10));
+    let tree_capacity = composer_y.saturating_sub(3 + notice_height).min(
+        (height / 4).clamp(4, 10)
+            + if viewing_child && !prompt_active {
+                editor_height
+            } else {
+                0
+            },
+    );
     let show_tree = !app.selected.path().is_empty() || app.projection.has_active_children();
     let tree_rows = if show_tree && tree_capacity >= 3 {
         (tree_agents.len() as u16).min(tree_capacity - 2)
@@ -346,7 +355,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     let tree_height = if tree_rows > 0 { tree_rows + 2 } else { 0 };
     if tree_height == 0 && app.focus == Focus::Tree {
-        app.focus = Focus::Composer;
+        app.focus = if viewing_child {
+            Focus::Content
+        } else {
+            Focus::Composer
+        };
+    }
+    if viewing_child && !prompt_active && app.focus == Focus::Composer {
+        app.focus = Focus::Content;
     }
     let tree_y = composer_y.saturating_sub(tree_height);
     app.composer_rect = r(0, composer_y, width, composer_height);
@@ -767,13 +783,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .min(tree_agents.len().saturating_sub(tree_rows as usize));
     let agent_stats = tree_agents
         .iter()
-        .map(|agent| model::agent_footer(&app.snapshot, &app.projection, &agent.id))
+        .map(|agent| model::agent_footer_stats(&app.snapshot, &app.projection, &agent.id))
         .collect::<Vec<_>>();
-    let stats_column_width = agent_stats
-        .iter()
-        .map(|stats| stats.width() as u16)
-        .max()
-        .unwrap_or(0);
+    let stats_columns = AgentStatsColumns::new(agent_stats.iter());
+    let stats_column_width = stats_columns.width();
     let minimum_name_width = tree_agents
         .iter()
         .map(|agent| {
@@ -823,8 +836,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let symbol = agent_symbol(running, &status, agent.terminal, app.tick_count);
         let indent = (agent.id.depth() as u16 * 4).min(width / 3);
         let target = model::target_suffix(&agent.target);
-        let stats = agent_stats[index].clone();
-        let stats_width = stats.width() as u16;
+        let stats = stats_columns.format(&agent_stats[index]);
         let available = width.saturating_sub(indent + 4);
         let name_width = available.saturating_sub(status_reserved + stats_reserved);
         let name = format!(
@@ -867,7 +879,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         if stats_reserved > 0 {
             text(
                 frame,
-                r(width - stats_width - 2, y, stats_width, 1),
+                r(width - stats_column_width - 2, y, stats_column_width, 1),
                 stats,
                 p.muted,
                 bg,
@@ -878,7 +890,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     fill(frame, app.composer_rect, p.input);
     if prompt_active {
         draw_prompt(frame, app, p);
-    } else {
+    } else if !viewing_child {
         let cursor_prefix = &app.editor.text[..app.editor.cursor];
         let prefix_lines = wrap_plain(cursor_prefix, width.saturating_sub(4) as usize);
         let cursor_line = prefix_lines.len().saturating_sub(1);
@@ -1139,6 +1151,34 @@ fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette) {
         p.input,
     );
 }
+/// Numeric fields share their own right edge, not just the footer's right edge.
+/// Measure all agents, including off-screen rows, to keep columns stable on scroll.
+struct AgentStatsColumns([usize; 3]);
+
+impl AgentStatsColumns {
+    fn new<'a>(rows: impl IntoIterator<Item = &'a [String; 3]>) -> Self {
+        let mut widths = [0; 3];
+        for row in rows {
+            for (width, value) in widths.iter_mut().zip(row) {
+                *width = (*width).max(value.width());
+            }
+        }
+        Self(widths)
+    }
+
+    fn width(&self) -> u16 {
+        (self.0.iter().sum::<usize>() + 6) as u16
+    }
+
+    fn format(&self, row: &[String; 3]) -> String {
+        row.iter()
+            .zip(self.0)
+            .map(|(value, width)| format!("{}{value}", " ".repeat(width - value.width())))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+}
+
 fn agent_symbol(running: bool, status: &str, terminal: bool, tick: usize) -> &'static str {
     if running {
         spinner(tick)
@@ -1178,18 +1218,17 @@ fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
     );
     let items = menu.filtered();
     let agent_menu = matches!(menu.kind, MenuKind::Agents);
-    let stats_width = if agent_menu {
+    let agent_stats = if agent_menu {
         app.projection
             .agents
             .iter()
-            .map(|agent| {
-                model::agent_footer(&app.snapshot, &app.projection, &agent.id).width() as u16
-            })
-            .max()
-            .unwrap_or(0)
+            .map(|agent| model::agent_footer_stats(&app.snapshot, &app.projection, &agent.id))
+            .collect::<Vec<_>>()
     } else {
-        0
+        Vec::new()
     };
+    let stats_columns = AgentStatsColumns::new(agent_stats.iter());
+    let stats_width = stats_columns.width();
     // Match the inline tree's aligned status/token columns. On narrow screens,
     // use a second line so the picker still exposes both status and token usage.
     let compact_agents = agent_menu && width.saturating_sub(2) < stats_width + 50;
@@ -1218,7 +1257,11 @@ fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
                 let (running, status) = app.agent_status(agent);
                 app.animating |= running;
                 let symbol = agent_symbol(running, &status, agent.terminal, app.tick_count);
-                let stats = model::agent_footer(&app.snapshot, &app.projection, &agent.id);
+                let stats = stats_columns.format(&model::agent_footer_stats(
+                    &app.snapshot,
+                    &app.projection,
+                    &agent.id,
+                ));
                 let target = model::target_suffix(&agent.target);
                 let indent = (agent.id.depth() as u16 * 4).min(row.width / 3);
                 let name_width = if compact_agents {
@@ -1261,7 +1304,6 @@ fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
                     },
                     bg,
                 );
-                let stats_width = stats.width() as u16;
                 if stats_width <= row.width {
                     text(
                         frame,
@@ -1430,15 +1472,19 @@ impl EntryGeometry {
     fn new(entry: &model::Entry, width: u16, index: usize) -> Self {
         let block = matches!(entry.surface, Surface::User | Surface::Agent);
         let available = width.saturating_sub(5).max(1);
-        let block_width = if block && width >= 70 {
-            (available as u32 * 75 / 100) as u16
+        // Message boxes keep one column on the sender's side and three on the
+        // opposite side, leaving all remaining width available for content.
+        let block_width = if block {
+            width.saturating_sub(4).max(1)
         } else {
             available
         };
         let indent = entry.indent.min(available / 3);
         Self {
             x: if entry.surface == Surface::User {
-                width.saturating_sub(block_width + 2)
+                width.saturating_sub(block_width + 1)
+            } else if block {
+                1
             } else {
                 2 + indent
             },
@@ -2183,6 +2229,108 @@ mod tests {
             }
         }
     }
+    fn message_entry(surface: Surface, text: String) -> model::Entry {
+        model::Entry {
+            key: "message".into(),
+            text,
+            surface,
+            expandable: false,
+            default_open: false,
+            running: false,
+            footer: None,
+            indent: 0,
+            job: None,
+            compact_after: false,
+            document: None,
+        }
+    }
+
+    #[test]
+    fn message_boxes_have_one_sender_margin_and_three_opposite_columns() {
+        for width in [20, 30, 69, 70, 80, 120, 240] {
+            for (surface, left, right) in [(Surface::Agent, 1, 3), (Surface::User, 3, 1)] {
+                let entry = message_entry(surface, "Sender\nBody".into());
+                let geometry = EntryGeometry::new(&entry, width, 0);
+                assert_eq!(geometry.x, left);
+                assert_eq!(geometry.block_width, width - 4);
+                assert_eq!(geometry.row_width, width - 4);
+                assert_eq!(width - geometry.x - geometry.block_width, right);
+                assert_eq!(geometry.body_width, width - 8);
+                let row = geometry.row(Line::from("Body"), false, false);
+                assert_eq!(row.text_x(), left + 2);
+                assert_eq!(row.x + row.width - (row.text_x() + geometry.body_width), 2);
+            }
+            // Non-message rows retain their existing margins and indentation.
+            for surface in [Surface::Tool, Surface::Reasoning, Surface::Muted] {
+                let mut entry = message_entry(surface, "Body".into());
+                entry.indent = 2;
+                let geometry = EntryGeometry::new(&entry, width, 0);
+                assert_eq!(geometry.x, 4);
+                assert_eq!(geometry.row_width, width - 7);
+                assert_eq!(geometry.body_width, width - 7);
+            }
+        }
+        for width in 0..9 {
+            for surface in [Surface::Agent, Surface::User] {
+                let entry = message_entry(surface, "Sender\nBody".into());
+                let geometry = EntryGeometry::new(&entry, width, 0);
+                assert!(geometry.block_width >= 1);
+                assert!(geometry.body_width >= 1);
+            }
+        }
+    }
+
+    #[test]
+    fn message_boxes_use_full_content_width_for_titles_streams_and_footers() {
+        let highlights = super::super::tool_view::HighlightCache::default();
+        for width in [30, 69, 70, 80, 120] {
+            for surface in [Surface::Agent, Surface::User] {
+                let content_width = usize::from(width - 8);
+                let title = "T".repeat(content_width);
+                let body = "b".repeat(content_width);
+                let footer = "F".repeat(content_width);
+                let mut entry = message_entry(surface, format!("{title}\n{body}"));
+                entry.footer = Some(footer.clone());
+                let mut rows = Vec::new();
+                let mut cached = CachedEntry::default();
+                let settings = EntryLayout {
+                    width,
+                    palette: Palette::new(false),
+                    highlights: &highlights,
+                };
+                update_entry_rows(&mut rows, &mut cached, &entry, 0, settings, None);
+                let content = |rows: &[Row]| {
+                    rows.iter()
+                        .filter(|row| !row.blank && row.line.width() > 0)
+                        .map(Row::text)
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    content(&rows),
+                    [title.clone(), body.clone(), footer.clone()]
+                );
+                assert!(rows.iter().filter(|row| row.surface == surface).all(|row| {
+                    row.x == (if surface == Surface::Agent { 1 } else { 3 })
+                        && row.width == width - 4
+                }));
+
+                let append_from = entry.text.len();
+                entry.text.push('b');
+                update_entry_rows(
+                    &mut rows,
+                    &mut cached,
+                    &entry,
+                    0,
+                    settings,
+                    Some(append_from),
+                );
+                assert_eq!(content(&rows), [title, body, "b".into(), footer]);
+                let continuation = rows.iter().find(|row| row.text() == "b").unwrap();
+                assert!(continuation.continued);
+            }
+        }
+    }
+
     #[test]
     fn message_wrap_preserves_words_styles_and_source_whitespace() {
         let wrap = |text: &str, width| {
@@ -2295,7 +2443,7 @@ mod tests {
                     .iter()
                     .find(|row| row.line.to_string() == "recorded-model-id")
                     .unwrap();
-                assert_eq!(footer.x, 2);
+                assert_eq!(footer.x, 1);
                 assert_eq!(footer.surface, Surface::Agent);
                 assert_eq!(footer.line.spans[0].style.fg, Some(palette.muted));
                 assert!(!footer.header);

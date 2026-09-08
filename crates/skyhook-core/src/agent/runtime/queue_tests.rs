@@ -185,6 +185,164 @@ async fn stop(session: &SessionHandle) {
     bounded(session.root_tx.closed()).await;
 }
 
+fn parent_inputs(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(blocks) => Some(blocks),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|block| match block {
+            UserContent::ParentInput { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn running_child_receives_parent_inputs(first_calls_tool: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let tracking = Tracking::new(first_calls_tool);
+    let harness = harness(root.path(), tracking.clone()).await;
+    let session = Arc::new(harness.new_session().await.unwrap());
+    let launched = bounded(
+        session.run_script("return await tool.agent({prompt:'test:child-initial',bg:true});"),
+    )
+    .await
+    .unwrap();
+    let job: JobId = serde_json::from_value(launched.value["id"].clone()).unwrap();
+    let initial = tracking.request(0).await;
+    assert_eq!(texts(&initial.messages), ["test:child-initial"]);
+    assert!(parent_inputs(&initial.messages).is_empty());
+    let (child, sender) = {
+        let agents = session.runtime.agents.read().unwrap();
+        let children = agents
+            .iter()
+            .filter(|(id, _)| *id != &session.root)
+            .collect::<Vec<_>>();
+        assert_eq!(children.len(), 1);
+        (children[0].0.clone(), children[0].1.sender.clone())
+    };
+
+    // Exercise the public script send as well as the underlying job mailbox.
+    // Neither input answers a question: the child is inside its gated invoke.
+    let first = json!({"instruction": "test:parent-one", "nested": [1, true]});
+    let second = json!("test:parent-two");
+    let accepted = bounded(session.run_script(format!(
+        "return await tool.job({}).send({{value:{first}}});",
+        job.get()
+    )))
+    .await
+    .unwrap();
+    assert_eq!(accepted.value, json!({"accepted": true}));
+    bounded(async {
+        while sender.capacity() != AGENT_CHANNEL_CAPACITY - 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    bounded(session.runtime.jobs.send(job, second.clone()))
+        .await
+        .unwrap();
+    // A job send acknowledgement alone does not establish that tools.rs has
+    // forwarded the value. Observe the child's actual command mailbox before
+    // allowing either a tool response or a final response to finish.
+    bounded(async {
+        while sender.capacity() != AGENT_CHANNEL_CAPACITY - 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert_eq!(tracking.requests.lock().unwrap().len(), 1);
+
+    tracking.release(0);
+    let next = tracking.request(1).await;
+    let expected = [
+        format!("Owner input: {first}"),
+        format!("Owner input: {second}"),
+    ];
+    assert_eq!(parent_inputs(&next.messages), expected);
+    assert_eq!(texts(&next.messages), ["test:child-initial"]);
+    if first_calls_tool {
+        let calls = next
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant(blocks) => Some(blocks),
+                _ => None,
+            })
+            .flatten()
+            .filter(|block| {
+                matches!(block,
+                AssistantContent::ToolCall(call) if call.id == "queue-todo")
+            })
+            .count();
+        let results = next
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool(results) => Some(results),
+                _ => None,
+            })
+            .flatten()
+            .filter(|result| result.call_id == "queue-todo")
+            .collect::<Vec<_>>();
+        assert_eq!(calls, 1, "the initial tool call must be retained once");
+        assert_eq!(results.len(), 1, "the tool must finish exactly once");
+        assert!(!results[0].is_error);
+        assert_eq!(results[0].name, "todo");
+    } else {
+        assert!(next.messages.iter().any(|message| matches!(message,
+        Message::Assistant(blocks) if blocks == &vec![AssistantContent::Text {
+            text: "answer-0".into(),
+        }])));
+    }
+    assert!(
+        !session
+            .runtime
+            .jobs
+            .snapshot(job)
+            .await
+            .unwrap()
+            .state
+            .is_terminal(),
+        "the child job must not complete before answering the parent updates"
+    );
+
+    tracking.release(1);
+    let completed = bounded(session.runtime.jobs.wait(job, None, true))
+        .await
+        .unwrap();
+    assert_eq!(completed.state, crate::job::JobState::Completed);
+    assert_eq!(completed.output, Some(json!("answer-1")));
+    stop(&session).await;
+    assert_eq!(tracking.requests.lock().unwrap().len(), 2);
+    let messages = session
+        .runtime
+        .store
+        .records()
+        .await
+        .into_iter()
+        .filter(|record| record.agent == child)
+        .filter_map(|record| match record.event {
+            SessionEvent::MessageCommitted { message } => Some(message),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(texts(&messages), ["test:child-initial"]);
+    assert_eq!(parent_inputs(&messages), expected);
+}
+
+#[tokio::test]
+async fn running_child_parent_inputs_are_fifo_once_and_preserve_tool_results() {
+    running_child_receives_parent_inputs(true).await;
+}
+
+#[tokio::test]
+async fn running_child_parent_inputs_continue_after_final_response() {
+    running_child_receives_parent_inputs(false).await;
+}
+
 #[test]
 fn queued_token_cancellation_is_shared_and_idempotent() {
     for token in [QueuedPromptToken::new(), QueuedPromptToken::default()] {

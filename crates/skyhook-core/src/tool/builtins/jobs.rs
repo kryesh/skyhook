@@ -65,7 +65,7 @@ pub(crate) fn register(
     let send = jobs.clone();
     builder.register::<JobSendArgs, Value, _, _>(
         "job_send",
-        "Send JSON input; agent answers use its stable agent job ID.",
+        "Send JSON input. For an agent, answer pending questions or queue follow-up instructions for its next request. Sending to a completed agent appends to its retained conversation and resumes it under the same job ID.",
         ToolOptions::default()
             .script_only()
             .job_method("send", "job"),

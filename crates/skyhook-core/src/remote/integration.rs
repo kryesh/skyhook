@@ -304,3 +304,329 @@ async fn exercise_connections() {
     manager.shutdown().await;
     assert!(!std::path::Path::new(&socket).exists());
 }
+
+#[tokio::test]
+#[ignore = "requires a built shim, sshd and loopback sockets; set SKYHOOK_TEST_SHIM"]
+async fn host_skills_from_remote_caller_copy_into_workspace_override() {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        exercise_remote_skills(),
+    )
+    .await
+    .expect("remote skills integration timed out");
+}
+
+async fn exercise_remote_skills() {
+    use crate::{
+        execution::ExecutionLocation,
+        identity::AgentId,
+        job::JobManager,
+        session::SessionStore,
+        target::{TargetRegistry, TargetRouter},
+        tool::{
+            ToolRegistryBuilder,
+            builtins::{HostSkills, register_coding_tools},
+            executor::ToolExecutor,
+            policy::{
+                AuthorizationRequest, Capability, Policy, PolicyDecision, PolicyFuture, ResourceId,
+            },
+        },
+    };
+    use serde_json::json;
+    use std::path::Path;
+
+    // Allow SSH setup and ordinary tool use, but require worker-side path authorization
+    // to reject writes outside the remote caller's override, including symlink escapes.
+    struct RemoteWorkspaceOnly {
+        allowed: ResourceId,
+        denied: AtomicUsize,
+    }
+    impl Policy for RemoteWorkspaceOnly {
+        fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
+            let outside = request.permissions.iter().any(|permission| {
+                permission.capability == Capability::Write
+                    && permission.resource.namespace == "path"
+                    && permission.resource.segments.first().map(String::as_str) == Some("first")
+                    && !permission
+                        .resource
+                        .segments
+                        .starts_with(&self.allowed.segments)
+            });
+            if outside {
+                self.denied.fetch_add(1, Ordering::SeqCst);
+            }
+            Box::pin(async move {
+                if outside {
+                    PolicyDecision::Deny {
+                        reason: "fixture denies writes outside remote override".into(),
+                    }
+                } else {
+                    PolicyDecision::allow()
+                }
+            })
+        }
+    }
+
+    fn copy_fixture(source: &Path, destination: &Path) {
+        std::fs::create_dir_all(destination).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let to = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_fixture(&entry.path(), &to);
+            } else {
+                std::fs::copy(entry.path(), to).unwrap();
+            }
+        }
+    }
+
+    let server = Server::start().await;
+    let host = tempfile::tempdir().unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let host_workspace = std::fs::canonicalize(host.path()).unwrap();
+    let remote_override = std::fs::canonicalize(remote.path()).unwrap();
+    let outside_workspace = std::fs::canonicalize(outside.path()).unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/skill-workspace/.agents/skills/mixed-assets");
+    let host_skill = host_workspace.join(".agents/skills/mixed-assets");
+    copy_fixture(&fixture, &host_skill);
+
+    let shim = std::fs::read(std::env::var_os("SKYHOOK_TEST_SHIM").expect("set SKYHOOK_TEST_SHIM"))
+        .unwrap();
+    let assets = Box::leak(
+        vec![(
+            "skyhook-shim-x86_64-linux",
+            Box::leak(shim.into_boxed_slice()) as &'static [u8],
+        )]
+        .into_boxed_slice(),
+    );
+    let policy = Arc::new(RemoteWorkspaceOnly {
+        allowed: ResourceId::path("first", &remote_override),
+        denied: AtomicUsize::new(0),
+    });
+    let authorization = AuthorizationCoordinator::new(policy.clone());
+    let manager = RemoteManager::new(
+        EmbeddedShimCatalog::from_assets(assets).unwrap(),
+        Arc::new(crate::remote::RejectSensitivePrompts),
+        authorization.clone(),
+    );
+    let first = server.target("first", "first").await;
+    let configured_workspace = first.workspace.clone();
+    assert_ne!(configured_workspace, remote_override);
+    assert_ne!(host_workspace, remote_override);
+    let router = TargetRouter::new(
+        TargetRegistry::from_definitions([first]).unwrap(),
+        manager.clone(),
+        authorization.clone(),
+    );
+    let store = SessionStore::create_ephemeral(&host_workspace)
+        .await
+        .unwrap();
+    let jobs = JobManager::new(store.clone());
+    let agent = AgentId::root(store.id());
+    let mut builder = ToolRegistryBuilder::default();
+    register_coding_tools(
+        &mut builder,
+        store.clone(),
+        jobs.clone(),
+        HostSkills::discover(&host_workspace).await,
+        router.clone(),
+    )
+    .unwrap();
+    let registry = builder.build();
+    assert!(registry.get("__skill_copy").is_none());
+    let surface = registry.surface(&Default::default());
+    assert!(surface.get("__skill_copy").is_none());
+    assert!(
+        surface
+            .definitions()
+            .iter()
+            .all(|tool| tool.name != "__skill_copy")
+    );
+    let script_surface = serde_json::to_value(surface.script_manifests()).unwrap();
+    assert!(
+        script_surface
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tool| tool["name"] != "__skill_copy")
+    );
+    assert!(
+        surface.get("skill").unwrap().input_schema["properties"]
+            .get("target")
+            .is_none()
+    );
+    let mut capabilities = crate::tool::policy::CapabilitySet::default();
+    capabilities.insert(Capability::Targets);
+    let executor = ToolExecutor::with_authorization(
+        registry,
+        authorization,
+        jobs.clone(),
+        host_workspace.clone(),
+    )
+    .with_capabilities(capabilities)
+    .with_location(ExecutionLocation::named("first", remote_override.clone()))
+    .with_target_router(router);
+
+    let listed = executor
+        .execute_model(agent.clone(), "skills", json!({}), None)
+        .await
+        .unwrap();
+    assert!(
+        listed.output.value["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|skill| skill["name"] == "mixed-assets")
+    );
+    let loaded = executor
+        .execute_model(
+            agent.clone(),
+            "skill",
+            json!({"name":"mixed-assets", "path":null, "to":null}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(loaded.output.value["result"]["kind"], "skill");
+    assert_eq!(
+        loaded.output.value["result"]["content"],
+        std::fs::read_to_string(host_skill.join("SKILL.md")).unwrap()
+    );
+    assert!(
+        loaded.output.value["result"]["assets"]
+            .as_str()
+            .unwrap()
+            .contains("payload.bin")
+    );
+    let text = executor
+        .execute_model(
+            agent.clone(),
+            "skill",
+            json!({"name":"mixed-assets", "path":"references/note.txt", "to":null}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(text.output.value["result"]["kind"], "text");
+    assert_eq!(
+        text.output.value["result"]["content"],
+        std::fs::read_to_string(host_skill.join("references/note.txt")).unwrap()
+    );
+    let image = executor
+        .execute_model(
+            agent.clone(),
+            "skill",
+            json!({"name":"mixed-assets", "path":"assets/pixel.png"}),
+            None,
+        )
+        .await
+        .unwrap();
+    let image_bytes = std::fs::read(host_skill.join("assets/pixel.png")).unwrap();
+    assert_eq!(image.output.value["result"]["kind"], "image");
+    assert_eq!(
+        image.output.value["result"]["image"]["sha256"],
+        crate::sha256_hex(&image_bytes)
+    );
+    assert_eq!(
+        image.output.value["result"]["image"]["media_type"],
+        "image/png"
+    );
+    assert_eq!(image.output.images.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&image.output.images[0]).unwrap(),
+        image.output.value["result"]["image"]
+    );
+    assert_eq!(
+        store.read_blob(&image.output.images[0]).await.unwrap(),
+        image_bytes
+    );
+    assert_eq!(jobs.images(image.job).await.unwrap(), image.output.images);
+
+    // Loopback shares a filesystem, so use disjoint layouts: this relative parent
+    // exists ONLY below the remote override, not below either other workspace.
+    let relative = "remote-only/nested/copied.bin";
+    std::fs::create_dir_all(remote_override.join("remote-only/nested")).unwrap();
+    assert!(!host_workspace.join("remote-only").exists());
+    assert!(!configured_workspace.join("remote-only").exists());
+    assert!(!remote_override.join(".agents").exists());
+    assert!(!configured_workspace.join(".agents").exists());
+    let destination = remote_override.join(relative);
+    std::fs::write(&destination, b"existing destination must be replaced").unwrap();
+    // Both invalid UTF-8 and NUL-containing bytes must survive the worker transfer;
+    // the second copy also proves that an already copied destination is overwritten.
+    for asset in ["assets/payload.bin", "assets/nul.dat"] {
+        let expected = std::fs::read(host_skill.join(asset)).unwrap();
+        let copied = executor
+            .execute_model(
+                agent.clone(),
+                "skill",
+                json!({"name":"mixed-assets", "path":asset, "to":relative}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            copied.output.value["state"], "completed",
+            "copy failed: {}",
+            copied.output.value
+        );
+        assert_eq!(copied.output.value["result"]["kind"], "copied");
+        assert_eq!(
+            copied.output.value["result"]["to"],
+            destination.to_string_lossy().as_ref()
+        );
+        assert_eq!(copied.output.value["result"]["bytes"], expected.len());
+        assert_eq!(
+            copied.output.value["result"]["sha256"],
+            crate::sha256_hex(&expected)
+        );
+        let actual = std::fs::read(&destination).unwrap();
+        assert_eq!(crate::sha256_hex(&actual), crate::sha256_hex(&expected));
+        assert_eq!(actual, expected);
+        assert_eq!(std::fs::read(host_skill.join(asset)).unwrap(), expected);
+        assert!(!host_workspace.join("remote-only").exists());
+        assert!(!configured_workspace.join("remote-only").exists());
+    }
+
+    let protected = outside_workspace.join("protected.bin");
+    std::fs::write(&protected, b"outside sentinel").unwrap();
+    std::os::unix::fs::symlink(&outside_workspace, remote_override.join("escape")).unwrap();
+    for to in [
+        protected.to_string_lossy().into_owned(),
+        "escape/new.bin".into(),
+    ] {
+        let denied_before = policy.denied.load(Ordering::SeqCst);
+        let result = executor
+            .execute_model(
+                agent.clone(),
+                "skill",
+                json!({"name":"mixed-assets", "path":"assets/payload.bin", "to":to}),
+                None,
+            )
+            .await;
+        let view = result.unwrap().output.value;
+        assert_eq!(
+            view["state"], "failed",
+            "outside copy unexpectedly succeeded: {view}"
+        );
+        assert!(view["error"].as_str().is_some());
+        assert!(
+            policy.denied.load(Ordering::SeqCst) > denied_before,
+            "copy must reach worker-side path authorization"
+        );
+        assert_eq!(std::fs::read(&protected).unwrap(), b"outside sentinel");
+        assert!(!outside_workspace.join("new.bin").exists());
+        assert_eq!(
+            std::fs::read_dir(&outside_workspace).unwrap().count(),
+            1,
+            "denial must not leave temporary files"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        std::fs::read(host_skill.join("assets/nul.dat")).unwrap()
+    );
+    manager.shutdown().await;
+}

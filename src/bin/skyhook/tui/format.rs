@@ -54,6 +54,10 @@ pub fn number(n: u64) -> String {
     }
 }
 pub fn footer(usage: Usage, context: Option<(u64, u64)>) -> String {
+    footer_stats(usage, context).join(" · ")
+}
+
+pub fn footer_stats(usage: Usage, context: Option<(u64, u64)>) -> [String; 3] {
     let context =
         context
             .filter(|(_, capacity)| *capacity > 0)
@@ -65,12 +69,15 @@ pub fn footer(usage: Usage, context: Option<(u64, u64)>) -> String {
                     number(total)
                 )
             });
-    format!(
-        "{} · {}({}) · {context}",
+    [
         number(usage.output_tokens),
-        number(usage.input_tokens.saturating_add(usage.cached_input_tokens)),
-        number(usage.input_tokens)
-    )
+        format!(
+            "{}({})",
+            number(usage.input_tokens.saturating_add(usage.cached_input_tokens)),
+            number(usage.input_tokens)
+        ),
+        context,
+    ]
 }
 
 /// Remove terminal controls while preserving line boundaries and expanding tabs.

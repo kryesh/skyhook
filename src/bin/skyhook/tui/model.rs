@@ -67,9 +67,17 @@ pub struct Entry {
     pub indent: u16,
     pub job: Option<JobId>,
     pub document: Option<Document>,
-    /// Omit the separator only before another tool from this response.
+    /// Omit the separator before a related sibling tool or this script's first child.
     pub compact_after: bool,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolGroup {
+    Response(u64),
+    Script(JobId),
+    Notification(u64, usize),
+}
+
 impl Entry {
     fn new(key: String, text: String, surface: Surface) -> Self {
         Self {
@@ -115,6 +123,9 @@ pub struct JobInfo {
 
 #[derive(Default)]
 struct RequestInfo {
+    started_millis: Option<i64>,
+    finished_millis: Option<i64>,
+    usage: Option<Usage>,
     model: Option<String>,
     failed: Option<String>,
     details: String,
@@ -216,6 +227,17 @@ impl Projection {
                     if let Some(info) = self.jobs.get_mut(job) {
                         info.state = *state;
                     }
+                    // Resuming a retained child reuses its owner job and does not
+                    // emit AgentStarted again. Reopen its tree row on that job's
+                    // Running event, not on ordinary model/tool activity updates.
+                    if *state == JobState::Running {
+                        for agent in &mut self.agents {
+                            if agent.owner == Some(*job) && agent.terminal {
+                                agent.terminal = false;
+                                self.completed.remove(&agent.id);
+                            }
+                        }
+                    }
                 }
                 SessionEvent::JobFinished {
                     job, state, error, ..
@@ -259,21 +281,32 @@ impl Projection {
                                 }
                                 _ => None,
                             });
-                    self.requests.entry(record.sequence).or_default().model = model;
+                    let info = self.requests.entry(record.sequence).or_default();
+                    info.model = model;
+                    info.started_millis = Some(record.timestamp_millis);
                     self.active_request
                         .insert(record.agent.clone(), record.sequence);
                 }
+                SessionEvent::AgentInterrupted => {
+                    if let Some(request) = self.active_request.get(&record.agent)
+                        && let Some(info) = self.requests.get_mut(request)
+                    {
+                        info.finished_millis.get_or_insert(record.timestamp_millis);
+                    }
+                }
                 SessionEvent::ModelFailed { request, error, .. } => {
-                    self.requests.entry(*request).or_default().failed = Some(error.clone());
+                    let info = self.requests.entry(*request).or_default();
+                    info.failed = Some(error.clone());
+                    info.finished_millis.get_or_insert(record.timestamp_millis);
                 }
                 SessionEvent::Usage {
                     request: Some(request),
                     usage,
                 } => {
-                    self.requests
-                        .entry(*request)
-                        .or_default()
-                        .details
+                    let info = self.requests.entry(*request).or_default();
+                    add_usage(info.usage.get_or_insert_with(Usage::default), *usage);
+                    info.finished_millis.get_or_insert(record.timestamp_millis);
+                    info.details
                         .push_str(&format!("\nUsage\n{}", pretty(usage)));
                 }
                 SessionEvent::Compaction { checkpoint } => {
@@ -301,6 +334,9 @@ impl Projection {
                         if request.response.is_none() {
                             self.response_requests.insert(record.sequence, request_id);
                             request.response = Some(record.sequence);
+                            request
+                                .finished_millis
+                                .get_or_insert(record.timestamp_millis);
                         }
                     }
                 }
@@ -445,7 +481,14 @@ pub fn agent_footer(
     projection: &Projection,
     agent: &AgentId,
 ) -> String {
-    footer(
+    agent_footer_stats(snapshot, projection, agent).join(" · ")
+}
+pub fn agent_footer_stats(
+    snapshot: &ObservationSnapshot,
+    projection: &Projection,
+    agent: &AgentId,
+) -> [String; 3] {
+    super::format::footer_stats(
         projection
             .agent_usage
             .get(agent)
@@ -677,6 +720,33 @@ impl ContentCache {
                 changes.dirty.push(index);
             }
             live.response_lengths = Some((response.reasoning.len(), response.text.len()));
+        }
+        if view.tab == Tab::Requests && !reset {
+            // Refresh only the active request's summary; do not reconstruct its
+            // recorded input or rebuild the history on each elapsed-time tick.
+            if let Some(&request) = projection.active_request.get(agent)
+                && let Some(info) = projection.requests.get(&request)
+                && let Some(index) = entries
+                    .iter()
+                    .position(|entry| entry.key == format!("r{request}"))
+            {
+                let running = request_running(info, snapshot, projection, agent, request);
+                let entry = &mut entries[index];
+                let stats = request_stats(info, running);
+                if let Some(start) = entry.text.find('\n').map(|offset| offset + 1) {
+                    let end = entry.text[start..]
+                        .find('\n')
+                        .map_or(entry.text.len(), |offset| start + offset);
+                    if entry.text[start..end] != stats || entry.running != running {
+                        entry.text.replace_range(start..end, &stats);
+                        entry.running = running;
+                        changes.appends.remove(&index);
+                        if !changes.dirty.contains(&index) {
+                            changes.dirty.push(index);
+                        }
+                    }
+                }
+            }
         }
         if view.tab != Tab::Conversation {
             if let Some(old) = old {
@@ -938,6 +1008,9 @@ fn entries_inner(
                         purpose,
                         failed.map_or(String::new(), |e| format!(" · Failed: {e}"))
                     );
+                    let running = request_running(info, snapshot, projection, agent, r.sequence);
+                    text.push('\n');
+                    text.push_str(&request_stats(info, running));
                     if open {
                         text.push_str(info.input.get_or_init(|| {
                             #[cfg(test)]
@@ -974,6 +1047,7 @@ fn entries_inner(
                     }
                     let mut e = Entry::new(key, text, Surface::Tool);
                     e.expandable = true;
+                    e.running = running;
                     Some(e)
                 } else {
                     None
@@ -988,7 +1062,7 @@ fn entries_inner(
             .collect(),
         Tab::Conversation => {
             let mut entries = Vec::new();
-            let mut tool_responses = HashMap::new();
+            let mut tool_groups = HashMap::new();
             let agent_name = projection
                 .agents
                 .iter()
@@ -1034,6 +1108,26 @@ fn entries_inner(
                                         format!("Image attachment\n{}", pretty(image)),
                                         Surface::User,
                                     ),
+                                    UserContent::Runtime { text }
+                                        if text
+                                            .trim_start()
+                                            .starts_with("<skyhook_job_events>") =>
+                                    {
+                                        for entry in job_event_entries(
+                                            &format!("{key}/{i}"),
+                                            text,
+                                            projection,
+                                            view,
+                                            all_details,
+                                        ) {
+                                            tool_groups.insert(
+                                                entry.key.clone(),
+                                                ToolGroup::Notification(record.sequence, i),
+                                            );
+                                            entries.push(entry);
+                                        }
+                                        continue;
+                                    }
                                     UserContent::Runtime { text } => {
                                         (format!("Harness notification\n{text}"), Surface::Muted)
                                     }
@@ -1123,7 +1217,10 @@ fn entries_inner(
                                                 e.document = Some(document);
                                             }
                                             e.expandable = true;
-                                            tool_responses.insert(e.key.clone(), record.sequence);
+                                            tool_groups.insert(
+                                                e.key.clone(),
+                                                ToolGroup::Response(record.sequence),
+                                            );
                                             entries.push(e);
                                         }
                                     }
@@ -1157,8 +1254,20 @@ fn entries_inner(
                     SessionEvent::JobCreated { job, origin, .. } => {
                         if let Some(job) = projection.jobs.get(job) {
                             let entry = job_entry(job, projection, view, outputs, all_details);
-                            if let Some(origin) = origin {
-                                tool_responses.insert(entry.key.clone(), origin.message);
+                            // Script children belong to their immediate script,
+                            // not to the model response that launched the script.
+                            let group = job
+                                .parent
+                                .and_then(|parent| projection.jobs.get(&parent))
+                                .filter(|parent| parent.tool == "script")
+                                .map(|parent| ToolGroup::Script(parent.id))
+                                .or_else(|| {
+                                    origin
+                                        .as_ref()
+                                        .map(|origin| ToolGroup::Response(origin.message))
+                                });
+                            if let Some(group) = group {
+                                tool_groups.insert(entry.key.clone(), group);
                             }
                             entries.push(entry);
                         }
@@ -1219,12 +1328,14 @@ fn entries_inner(
             // Store adjacency on the preceding entry so equality-based cache
             // invalidation also relayouts it when a sibling arrives or disappears.
             for index in 0..entries.len().saturating_sub(1) {
-                entries[index].compact_after =
-                    tool_responses
+                let next_group = tool_groups.get(&entries[index + 1].key);
+                let script_child = entries[index]
+                    .job
+                    .is_some_and(|job| next_group == Some(&ToolGroup::Script(job)));
+                entries[index].compact_after = script_child
+                    || tool_groups
                         .get(&entries[index].key)
-                        .is_some_and(|response| {
-                            tool_responses.get(&entries[index + 1].key) == Some(response)
-                        });
+                        .is_some_and(|group| next_group == Some(group));
             }
             if !include_live {
                 return entries;
@@ -1367,6 +1478,119 @@ pub fn target_suffix(target: &str) -> String {
     }
 }
 
+fn request_running(
+    info: &RequestInfo,
+    snapshot: &ObservationSnapshot,
+    projection: &Projection,
+    agent: &AgentId,
+    request: u64,
+) -> bool {
+    info.finished_millis.is_none()
+        && projection.active_request.get(agent) == Some(&request)
+        && snapshot
+            .responses
+            .get(&(agent.clone(), request))
+            .is_none_or(|response| !response.settled)
+        && matches!(snapshot.activity.get(agent), Some(AgentActivity::Working))
+}
+
+fn request_stats(info: &RequestInfo, running: bool) -> String {
+    let usage = info.usage.map_or_else(
+        || "Out — · In — · Cached —".into(),
+        |usage| {
+            format!(
+                "Out {} · In {} · Cached {}",
+                number(usage.output_tokens),
+                number(usage.input_tokens),
+                number(usage.cached_input_tokens)
+            )
+        },
+    );
+    let timing = match (info.started_millis, info.finished_millis) {
+        (Some(start), Some(end)) => {
+            format!("{:.1}s", end.saturating_sub(start).max(0) as f64 / 1000.0)
+        }
+        (Some(start), None) if running => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(start, |duration| {
+                    duration.as_millis().min(i64::MAX as u128) as i64
+                });
+            format!(
+                "{:.1}s elapsed",
+                now.saturating_sub(start).max(0) as f64 / 1000.0
+            )
+        }
+        _ => "Time —".into(),
+    };
+    format!("{usage} · {timing}")
+}
+
+/// Show the event where the model received it, using its historical payload
+/// rather than the job's latest output (the same job may have since resumed).
+fn job_event_entries(
+    key: &str,
+    text: &str,
+    projection: &Projection,
+    view: &View,
+    all: bool,
+) -> Vec<Entry> {
+    let events = text
+        .trim()
+        .strip_prefix("<skyhook_job_events>")
+        .and_then(|text| text.strip_suffix("</skyhook_job_events>"))
+        .and_then(|json| serde_json::from_str::<Vec<Value>>(json).ok());
+    let Some(events) = events.filter(|events| !events.is_empty()) else {
+        return vec![Entry::new(
+            format!("{key}/events"),
+            "Job event · notification received by model · details unavailable".into(),
+            Surface::Tool,
+        )];
+    };
+    events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let key = format!("{key}/event{index}");
+            let open = view.is_expanded(&key, all);
+            let id = event
+                .get("id")
+                .and_then(Value::as_u64)
+                .and_then(|id| JobId::new(id).ok());
+            let job = id.and_then(|id| projection.jobs.get(&id));
+            let tool = event
+                .get("tool")
+                .and_then(Value::as_str)
+                .or_else(|| job.map(|job| job.tool.as_str()))
+                .unwrap_or("job");
+            let state = event
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("updated");
+            let heading = format!(
+                "{} Job event · {}{} · {}",
+                if open { "▾" } else { "▸" },
+                tool,
+                id.map_or(String::new(), |id| format!(" #{id}")),
+                state
+            );
+            let mut entry = Entry::new(key, heading.clone(), Surface::Tool);
+            entry.expandable = true;
+            // Deliberately not Entry.job: output refresh must not replace this
+            // historical notification with a live job card or discard its key.
+            if open {
+                let mut body = Document::default();
+                body.line(heading, Role::Heading);
+                body.line("Notification received by model", Role::Muted);
+                body.output(tool, job.map_or(&Value::Null, |job| &job.args), event);
+                entry.text = body.plain_text();
+                entry.document = Some(body);
+            }
+            entry
+        })
+        .collect()
+}
+
 fn job_entry(
     job: &JobInfo,
     projection: &Projection,
@@ -1464,6 +1688,73 @@ mod tests {
         session::{ContextMessage, EventRecord, ModelPurpose},
     };
     #[test]
+    fn job_notifications_are_historical_tool_cards_between_assistant_responses() {
+        let agent = AgentId::root(SessionId::from_bytes([48; 16]));
+        let payload = "<skyhook_job_events>\n[{\"id\":7,\"tool\":\"exec\",\"state\":\"completed\",\"result\":{\"stdout\":\"historical output\"}},{\"id\":8,\"state\":\"failed\",\"error\":\"historical failure\"}]\n</skyhook_job_events>";
+        let mut snapshot = ObservationSnapshot::default();
+        for message in [
+            Message::Assistant(vec![AssistantContent::Text {
+                text: "First answer".into(),
+            }]),
+            Message::User(vec![UserContent::Runtime {
+                text: payload.into(),
+            }]),
+            Message::Assistant(vec![AssistantContent::Text {
+                text: "Follow-up answer".into(),
+            }]),
+        ] {
+            record(
+                &mut snapshot,
+                &agent,
+                SessionEvent::MessageCommitted { message },
+            );
+        }
+        let mut projection = Projection::default();
+        projection.rebuild(&snapshot);
+        for open in [false, true] {
+            let rows = entries(
+                &snapshot,
+                &projection,
+                &agent,
+                &View::default(),
+                &HashMap::new(),
+                true,
+                open,
+            );
+            assert_eq!(rows.len(), 4);
+            assert!(rows[0].text.contains("First answer"));
+            assert!(rows[3].text.contains("Follow-up answer"));
+            assert!(rows[1].text.contains("Job event · exec #7 · completed"));
+            assert!(rows[2].text.contains("Job event · job #8 · failed"));
+            assert!(rows[1].compact_after);
+            assert!(!rows[2].compact_after);
+            for row in &rows[1..3] {
+                assert!(row.surface == Surface::Tool);
+                assert!(row.expandable);
+                assert!(row.job.is_none());
+                assert!(!row.text.contains("skyhook_job_events"));
+                assert!(!row.text.contains("Harness notification"));
+            }
+            assert_eq!(rows[1].text.contains("historical output"), open);
+            assert_eq!(rows[2].text.contains("historical failure"), open);
+        }
+        // Presentation does not rewrite the actual model input.
+        assert!(snapshot.records.values().any(|r| matches!(&r.event,
+            SessionEvent::MessageCommitted { message: Message::User(blocks) }
+                if blocks.iter().any(|b| matches!(b, UserContent::Runtime { text } if text == payload))
+        )));
+        for text in [
+            "<skyhook_job_events>bad json</skyhook_job_events>",
+            "<skyhook_job_events>[]</skyhook_job_events>",
+        ] {
+            let rows = job_event_entries("test", text, &projection, &View::default(), true);
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].text.contains("details unavailable"));
+            assert!(!rows[0].text.contains("skyhook_job_events"));
+        }
+    }
+
+    #[test]
     fn conversation_compacts_only_adjacent_calls_from_the_same_response() {
         let agent = AgentId::root(SessionId::from_bytes([44; 16]));
         let mut snapshot = ObservationSnapshot::default();
@@ -1515,6 +1806,141 @@ mod tests {
                 [true, false, false, false, false, false, true, false]
             );
         }
+    }
+
+    #[test]
+    fn conversation_compacts_script_siblings_without_crossing_group_boundaries() {
+        let agent = AgentId::root(SessionId::from_bytes([46; 16]));
+        let mut snapshot = ObservationSnapshot::default();
+        // Script IDs deliberately overlap response IDs: the two identity
+        // namespaces must never group together. Both scripts share a response.
+        for (id, tool, parent, response) in [
+            (100, "script", None, Some(100)),
+            (200, "script", None, Some(100)),
+            (1, "exec", Some(100), None),
+            (2, "read", Some(100), None),
+            (3, "exec", Some(200), None),
+            (4, "read", Some(200), None),
+            (5, "exec", None, Some(200)),
+            (6, "read", None, Some(300)),
+            (300, "agent", None, None),
+            (7, "exec", Some(300), None),
+            (8, "read", Some(300), None),
+            (400, "script", Some(100), None),
+            (9, "exec", Some(400), None),
+            (10, "read", Some(400), None),
+            (11, "exec", Some(100), None),
+        ] {
+            record(
+                &mut snapshot,
+                &agent,
+                SessionEvent::JobCreated {
+                    job: JobId::new(id).unwrap(),
+                    parent: parent.map(|id| JobId::new(id).unwrap()),
+                    origin: response.map(|message| skyhook::session::ModelCallOrigin {
+                        message,
+                        call_id: format!("call{id}"),
+                    }),
+                    tool: tool.into(),
+                    name: None,
+                    arguments: serde_json::json!({}),
+                    output_schema: None,
+                    accepts_input: false,
+                    background: false,
+                    location: skyhook::execution::ExecutionLocation::root("/tmp".into()),
+                },
+            );
+        }
+        let mut projection = Projection::default();
+        projection.rebuild(&snapshot);
+        for open in [false, true] {
+            let rows = entries(
+                &snapshot,
+                &projection,
+                &agent,
+                &View::default(),
+                &HashMap::new(),
+                true,
+                open,
+            );
+            assert_eq!(rows.len(), 15);
+            assert_eq!(
+                rows.iter()
+                    .filter(|entry| entry.compact_after)
+                    .map(|entry| entry.key.as_str())
+                    .collect::<Vec<_>>(),
+                ["j100", "j1", "j3", "j400", "j9"],
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_script_sibling_spacing_updates_cached_rows() {
+        let agent = AgentId::root(SessionId::from_bytes([47; 16]));
+        let mut snapshot = ObservationSnapshot::default();
+        let mut projection = Projection::default();
+        let mut cache = ContentCache::default();
+        let mut rows = Vec::new();
+        let view = View::default();
+        let presentation = EntryView {
+            agent: &agent,
+            view: &view,
+            thinking: true,
+            all_details: true,
+        };
+        let outputs = HashMap::new();
+        for id in 1..=4 {
+            if id == 4 {
+                record(
+                    &mut snapshot,
+                    &agent,
+                    SessionEvent::Status {
+                        message: "Separate script siblings around non-tool content".into(),
+                    },
+                );
+            }
+            record(
+                &mut snapshot,
+                &agent,
+                SessionEvent::JobCreated {
+                    job: JobId::new(id).unwrap(),
+                    parent: (id != 1).then(|| JobId::new(1).unwrap()),
+                    origin: None,
+                    tool: if id == 1 { "script" } else { "exec" }.into(),
+                    name: None,
+                    arguments: serde_json::json!({}),
+                    output_schema: None,
+                    accepts_input: false,
+                    background: false,
+                    location: skyhook::execution::ExecutionLocation::root("/tmp".into()),
+                },
+            );
+            projection.rebuild(&snapshot);
+            let changes =
+                cache.update(&mut rows, &snapshot, &projection, presentation, &outputs, 0);
+            if id == 2 {
+                // The first child removes the script parent's trailing gap and
+                // invalidates its already-rendered row, even without an origin.
+                assert!(!changes.reset);
+                assert_eq!(changes.dirty, [0, 1]);
+                assert!(rows[0].compact_after);
+            }
+            if id == 3 {
+                assert!(!changes.reset);
+                assert_eq!(changes.dirty, [1, 2]);
+                assert!(rows[1].compact_after);
+            }
+        }
+        assert_eq!(
+            rows.iter()
+                .map(|entry| entry.compact_after)
+                .collect::<Vec<_>>(),
+            [true, true, false, false, false],
+        );
+        cache.invalidate_job(JobId::new(2).unwrap());
+        let changes = cache.update(&mut rows, &snapshot, &projection, presentation, &outputs, 0);
+        assert_eq!(changes.dirty, [1]);
+        assert!(rows[1].compact_after);
     }
 
     #[test]
@@ -2410,6 +2836,144 @@ mod tests {
     }
 
     #[test]
+    fn resumed_child_reopens_on_owner_running_without_another_agent_started() {
+        let root = AgentId::root(SessionId::from_bytes([2; 16]));
+        let child = root.child(1);
+        let job = JobId::new(1).unwrap();
+        for interrupted in [false, true] {
+            let mut snapshot = ObservationSnapshot::default();
+            let mut projection = Projection::default();
+            record(
+                &mut snapshot,
+                &root,
+                SessionEvent::JobCreated {
+                    job,
+                    parent: None,
+                    origin: None,
+                    tool: "agent".into(),
+                    name: Some("worker".into()),
+                    arguments: serde_json::json!({"prompt": "inspect"}),
+                    output_schema: None,
+                    accepts_input: true,
+                    background: true,
+                    location: skyhook::execution::ExecutionLocation::root("/host".into()),
+                },
+            );
+            record(
+                &mut snapshot,
+                &child,
+                SessionEvent::AgentStarted {
+                    parent: Some(root.clone()),
+                    owner_job: Some(job),
+                    model_profile: "fixture".into(),
+                    max_context: None,
+                    agent_profile: None,
+                    location: skyhook::execution::ExecutionLocation::root("/child".into()),
+                },
+            );
+            record(
+                &mut snapshot,
+                &root,
+                SessionEvent::JobStateChanged {
+                    job,
+                    state: JobState::Running,
+                },
+            );
+            projection.rebuild(&snapshot);
+            assert!(projection.has_active_children());
+
+            // Exercise more than one resume of the same child identity.
+            for _ in 0..2 {
+                record(
+                    &mut snapshot,
+                    &child,
+                    if interrupted {
+                        SessionEvent::AgentInterrupted
+                    } else {
+                        SessionEvent::AgentCompleted
+                    },
+                );
+                record(
+                    &mut snapshot,
+                    &root,
+                    SessionEvent::JobStateChanged {
+                        job,
+                        state: JobState::Completed,
+                    },
+                );
+                projection.rebuild(&snapshot);
+                assert!(!projection.has_active_children());
+                projection.completed.clear(); // completion grace period has expired
+                assert!(projection.visible(&root).is_empty());
+
+                // Activity and unrelated tools must not revive a completed child.
+                for activity in [AgentActivity::Working, AgentActivity::Tools] {
+                    update(
+                        &mut snapshot,
+                        RuntimeEvent::Activity {
+                            agent: child.clone(),
+                            activity,
+                        },
+                    );
+                    record(
+                        &mut snapshot,
+                        &child,
+                        SessionEvent::JobStateChanged {
+                            job: JobId::new(2).unwrap(),
+                            state: JobState::Running,
+                        },
+                    );
+                    projection.rebuild(&snapshot);
+                    assert!(!projection.has_active_children());
+                }
+
+                // The owner event is recorded on the parent, not the child.
+                record(
+                    &mut snapshot,
+                    &root,
+                    SessionEvent::JobStateChanged {
+                        job,
+                        state: JobState::Running,
+                    },
+                );
+                update(
+                    &mut snapshot,
+                    RuntimeEvent::Activity {
+                        agent: child.clone(),
+                        activity: AgentActivity::Working,
+                    },
+                );
+                projection.rebuild(&snapshot);
+                assert!(projection.has_active_children());
+                assert_eq!(projection.visible(&root).len(), 1);
+                assert!(!projection.completed.contains_key(&child));
+                assert_eq!(
+                    projection.status(&projection.agents[0], &snapshot),
+                    (true, "Working".into())
+                );
+                // Rebuilds and replay must not retain an old terminal marker.
+                projection.rebuild(&snapshot);
+                let mut replay = Projection::default();
+                replay.rebuild(&snapshot);
+                assert!(replay.has_active_children());
+                assert!(!replay.completed.contains_key(&child));
+                assert_eq!(replay.agents.len(), 1);
+                assert_eq!(replay.agents[0].owner, Some(job));
+            }
+
+            // A completion later in the same snapshot still wins over Running.
+            record(&mut snapshot, &child, SessionEvent::AgentCompleted);
+            projection.rebuild(&snapshot);
+            assert!(!projection.has_active_children());
+            projection.rebuild(&snapshot);
+            assert!(!projection.has_active_children());
+            let mut replay = Projection::default();
+            replay.rebuild(&snapshot);
+            assert!(!replay.has_active_children());
+        }
+    }
+
+    #[test]
     fn agent_calls_show_child_targets_before_start_while_running_and_after_replay() {
         for (caller_target, requested, child_target) in [
             ("root", Some("lab-monitoring"), "lab-monitoring"),
@@ -2749,6 +3313,132 @@ mod tests {
         assert_eq!(text.matches("failed partial").count(), 1);
         assert!(!text.contains("child only"));
         assert!(entries.last().unwrap().text.contains("current stream"));
+    }
+
+    #[test]
+    fn request_summaries_show_per_request_tokens_and_recorded_duration() {
+        let mut snapshot = ObservationSnapshot::default();
+        let agent = AgentId::root(SessionId::from_bytes([49; 16]));
+        let context = context(&mut snapshot, &agent);
+        let first = request(&mut snapshot, &agent, context);
+        snapshot.records.get_mut(&first).unwrap().timestamp_millis = 1_000;
+        let response = record(
+            &mut snapshot,
+            &agent,
+            SessionEvent::MessageCommitted {
+                message: Message::Assistant(vec![AssistantContent::Text {
+                    text: "done".into(),
+                }]),
+            },
+        );
+        snapshot
+            .records
+            .get_mut(&response)
+            .unwrap()
+            .timestamp_millis = 3_500;
+        let usage = record(
+            &mut snapshot,
+            &agent,
+            SessionEvent::Usage {
+                request: Some(first),
+                usage: Usage {
+                    input_tokens: 120,
+                    cached_input_tokens: 300,
+                    output_tokens: 45,
+                },
+            },
+        );
+        snapshot.records.get_mut(&usage).unwrap().timestamp_millis = 9_000;
+        let second = request(&mut snapshot, &agent, context);
+        snapshot.records.get_mut(&second).unwrap().timestamp_millis = 10_000;
+        let failure = record(
+            &mut snapshot,
+            &agent,
+            SessionEvent::ModelFailed {
+                request: second,
+                attempt: 1,
+                error: "provider failure".into(),
+            },
+        );
+        snapshot.records.get_mut(&failure).unwrap().timestamp_millis = 11_250;
+        let mut projection = Projection::default();
+        projection.rebuild(&snapshot);
+        let mut view = View {
+            tab: Tab::Requests,
+            ..View::default()
+        };
+        for expanded in [false, true] {
+            if expanded {
+                view.expanded
+                    .extend([format!("r{first}"), format!("r{second}")]);
+            }
+            let rows = entries(
+                &snapshot,
+                &projection,
+                &agent,
+                &view,
+                &HashMap::new(),
+                false,
+                false,
+            );
+            assert!(rows[0].text.contains("Out 45 · In 120 · Cached 300 · 2.5s"));
+            assert!(rows[1].text.contains("Out — · In — · Cached — · 1.2s"));
+            assert!(rows.iter().all(|row| !row.running));
+        }
+        assert_eq!(
+            request_stats(&RequestInfo::default(), false),
+            "Out — · In — · Cached — · Time —"
+        );
+        let backwards = RequestInfo {
+            started_millis: Some(100),
+            finished_millis: Some(50),
+            ..RequestInfo::default()
+        };
+        assert!(request_stats(&backwards, false).ends_with("0.0s"));
+    }
+
+    #[test]
+    fn active_request_elapsed_summary_updates_without_rebuilding_history() {
+        let mut snapshot = ObservationSnapshot::default();
+        let agent = AgentId::root(SessionId::from_bytes([50; 16]));
+        let context = context(&mut snapshot, &agent);
+        let id = request(&mut snapshot, &agent, context);
+        snapshot
+            .activity
+            .insert(agent.clone(), AgentActivity::Working);
+        let mut projection = Projection::default();
+        projection.rebuild(&snapshot);
+        let view = View {
+            tab: Tab::Requests,
+            ..View::default()
+        };
+        let presentation = EntryView {
+            agent: &agent,
+            view: &view,
+            thinking: false,
+            all_details: false,
+        };
+        let mut cache = ContentCache::default();
+        let mut rows = Vec::new();
+        let outputs = HashMap::new();
+        cache.update(&mut rows, &snapshot, &projection, presentation, &outputs, 0);
+        assert!(rows[0].running);
+        assert!(rows[0].text.contains("elapsed"));
+        // Advance the effective start deterministically rather than sleeping.
+        projection.requests.get_mut(&id).unwrap().started_millis = Some(5_000);
+        let changes = cache.update(&mut rows, &snapshot, &projection, presentation, &outputs, 0);
+        assert!(!changes.reset);
+        assert_eq!(changes.dirty, [0]);
+        assert!(changes.appends.is_empty());
+        assert_eq!(cache.historical_rebuilds, 1);
+        assert_eq!(projection.request_reconstructions.get(), 0);
+        snapshot
+            .activity
+            .insert(agent.clone(), AgentActivity::Interrupted);
+        let changes = cache.update(&mut rows, &snapshot, &projection, presentation, &outputs, 0);
+        assert_eq!(changes.dirty, [0]);
+        assert!(!rows[0].running);
+        assert!(rows[0].text.contains("Time —"));
     }
 
     #[test]
