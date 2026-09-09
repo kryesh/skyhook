@@ -15,6 +15,7 @@ use tokio::sync::broadcast;
 pub enum AgentActivity {
     Idle,
     Working,
+    Reconnecting { attempt: u8, max_attempts: u8 },
     Tools,
     WaitingChildren,
     Compacting,
@@ -69,6 +70,39 @@ impl ObservationSnapshot {
                     return;
                 }
                 match &record.event {
+                    SessionEvent::ModelRecoveryScheduled {
+                        attempt,
+                        max_attempts,
+                        ..
+                    } => {
+                        // ModelFailed settles only its response. Recovery keeps the
+                        // agent active without turning a transport failure into a
+                        // terminal agent/job failure.
+                        self.activity.insert(
+                            record.agent.clone(),
+                            AgentActivity::Reconnecting {
+                                attempt: *attempt,
+                                max_attempts: *max_attempts,
+                            },
+                        );
+                    }
+                    SessionEvent::ModelRequested { .. }
+                        if matches!(
+                            self.activity.get(&record.agent),
+                            Some(AgentActivity::Reconnecting { .. })
+                        ) =>
+                    {
+                        self.activity
+                            .insert(record.agent.clone(), AgentActivity::Working);
+                    }
+                    SessionEvent::AgentCompleted => {
+                        self.activity
+                            .insert(record.agent.clone(), AgentActivity::Idle);
+                    }
+                    SessionEvent::AgentInterrupted => {
+                        self.activity
+                            .insert(record.agent.clone(), AgentActivity::Interrupted);
+                    }
                     SessionEvent::ModelFailed { request, error, .. } => {
                         let response = self
                             .responses
@@ -312,5 +346,133 @@ mod tests {
         assert!(observation.snapshot.responses.is_empty());
         assert_eq!(observation.snapshot.records.len(), 1);
         assert_eq!(observation.snapshot.revision, 6);
+    }
+    fn record(hub: &RuntimeEvents, agent: &AgentId, sequence: u64, event: SessionEvent) {
+        hub.send(RuntimeEvent::Record(Box::new(EventRecord {
+            version: crate::session::SESSION_FORMAT_VERSION,
+            sequence,
+            timestamp_millis: 0,
+            agent: agent.clone(),
+            event,
+        })));
+    }
+
+    #[test]
+    fn recovery_is_active_replayable_and_preserves_failed_partial_output() {
+        let hub = RuntimeEvents::new(&[]);
+        let agent = AgentId::root(SessionId::from_bytes([2; 16]));
+        emit(
+            &hub,
+            &agent,
+            ResponseEvent::ItemStarted {
+                id: "text".into(),
+                position: 0,
+                kind: ItemKind::Text,
+            },
+        );
+        start_block(&hub, &agent, "text", "text", 0, BlockKind::Text);
+        emit(
+            &hub,
+            &agent,
+            ResponseEvent::BlockDelta {
+                item: "text".into(),
+                block: "text".into(),
+                delta: ContentDelta::Text("partial answer".into()),
+            },
+        );
+        hub.send(RuntimeEvent::Activity {
+            agent: agent.clone(),
+            activity: AgentActivity::Working,
+        });
+        record(
+            &hub,
+            &agent,
+            8,
+            SessionEvent::ModelFailed {
+                request: 7,
+                attempt: 1,
+                error: "connection lost".into(),
+            },
+        );
+        assert_eq!(
+            hub.observe().snapshot.activity[&agent],
+            AgentActivity::Working
+        );
+        record(
+            &hub,
+            &agent,
+            9,
+            SessionEvent::ModelRecoveryScheduled {
+                request: 7,
+                attempt: 2,
+                max_attempts: 3,
+                delay_millis: 1000,
+                error: "connection lost".into(),
+            },
+        );
+        let snapshot = hub.observe().snapshot;
+        assert_eq!(
+            snapshot.activity[&agent],
+            AgentActivity::Reconnecting {
+                attempt: 2,
+                max_attempts: 3
+            }
+        );
+        let response = &snapshot.responses[&(agent.clone(), 7)];
+        assert!(response.settled);
+        assert_eq!(response.error.as_deref(), Some("connection lost"));
+        assert_eq!(
+            response.snapshot().items[0].blocks[0].text,
+            "partial answer"
+        );
+        let records: Vec<_> = snapshot.records.values().cloned().collect();
+        let replayed = RuntimeEvents::new(&records).observe().snapshot;
+        assert_eq!(replayed.activity[&agent], snapshot.activity[&agent]);
+        // Duplicate journal delivery cannot roll a newer activity back.
+        record(
+            &hub,
+            &agent,
+            10,
+            SessionEvent::ModelRequested {
+                context: 1,
+                messages: Vec::new(),
+                purpose: crate::session::ModelPurpose::Agent,
+            },
+        );
+        hub.send(RuntimeEvent::Record(Box::new(records[1].clone())));
+        assert_eq!(
+            hub.observe().snapshot.activity[&agent],
+            AgentActivity::Working
+        );
+        record(&hub, &agent, 11, SessionEvent::AgentCompleted);
+        assert_eq!(hub.observe().snapshot.activity[&agent], AgentActivity::Idle);
+        let records: Vec<_> = hub.observe().snapshot.records.values().cloned().collect();
+        assert_eq!(
+            RuntimeEvents::new(&records).observe().snapshot.activity[&agent],
+            AgentActivity::Idle
+        );
+    }
+
+    #[test]
+    fn interruption_replaces_pending_recovery() {
+        let hub = RuntimeEvents::new(&[]);
+        let agent = AgentId::root(SessionId::from_bytes([3; 16]));
+        record(
+            &hub,
+            &agent,
+            1,
+            SessionEvent::ModelRecoveryScheduled {
+                request: 7,
+                attempt: 3,
+                max_attempts: 3,
+                delay_millis: 1000,
+                error: "connection lost".into(),
+            },
+        );
+        record(&hub, &agent, 2, SessionEvent::AgentInterrupted);
+        assert_eq!(
+            hub.observe().snapshot.activity[&agent],
+            AgentActivity::Interrupted
+        );
     }
 }

@@ -438,6 +438,13 @@ impl Projection {
         }
         match snapshot.activity.get(&agent.id) {
             Some(AgentActivity::Working) => (true, "Working".into()),
+            Some(AgentActivity::Reconnecting {
+                attempt,
+                max_attempts,
+            }) => (
+                true,
+                format!("Reconnecting · attempt {attempt} of {max_attempts}"),
+            ),
             Some(AgentActivity::Compacting) => (true, "Compacting".into()),
             Some(AgentActivity::Interrupted) => (false, "Interrupted".into()),
             Some(AgentActivity::Failed(_)) => (false, "Failed".into()),
@@ -773,9 +780,13 @@ impl ContentCache {
                 .any(|entry| entry.running);
         let has_working = entries.get(end).is_some_and(|e| e.key == working_key);
         if let Some(label) = working_label(snapshot, projection, agent, running) {
+            let entry = working_entry(agent, &label);
             if !has_working {
-                entries.insert(end, working_entry(agent, label));
+                entries.insert(end, entry);
                 changes.dirty.extend(end..entries.len());
+            } else if entries[end] != entry {
+                entries[end] = entry;
+                changes.dirty.push(end);
             }
         } else if has_working {
             entries.remove(end);
@@ -854,6 +865,13 @@ fn entries_inner(
             .map(|job| job_entry(job, projection, view, outputs, all_details))
             .collect(),
         Tab::Conversation => {
+            let recoveries: HashSet<_> = records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    SessionEvent::ModelRecoveryScheduled { request, .. } => Some(*request),
+                    _ => None,
+                })
+                .collect();
             let mut entries = Vec::new();
             let mut tool_groups = HashMap::new();
             let agent_name = projection
@@ -1099,6 +1117,11 @@ fn entries_inner(
                         error,
                         request,
                     } => {
+                        if recoveries.contains(request) {
+                            // The recovery status below represents this failure;
+                            // keep partial output, but do not imply a terminal turn.
+                            continue;
+                        }
                         // This is the logical invocation count, not the provider's
                         // internal HTTP retry count. Do not promise a fixed /3 here.
                         // Exhausted HTTP retries report their count in the error.
@@ -1113,6 +1136,19 @@ fn entries_inner(
                             Surface::Error,
                         ));
                     }
+                    SessionEvent::ModelRecoveryScheduled {
+                        attempt,
+                        max_attempts,
+                        delay_millis,
+                        error,
+                        ..
+                    } => entries.push(Entry::new(
+                        key,
+                        format!(
+                            "Reconnecting · attempt {attempt} of {max_attempts} · retry delay {delay_millis} ms\n{error}"
+                        ),
+                        Surface::Status,
+                    )),
                     SessionEvent::CompactionFailed { error, .. } => entries.push(Entry::new(
                         key,
                         format!("Compaction failed; previous context retained\n{error}"),
@@ -1158,7 +1194,7 @@ fn entries_inner(
                 agent,
                 entries.iter().any(|entry| entry.running),
             ) {
-                entries.push(working_entry(agent, label));
+                entries.push(working_entry(agent, &label));
             }
             entries
         }
@@ -1170,7 +1206,7 @@ fn working_label(
     projection: &Projection,
     agent: &AgentId,
     running: bool,
-) -> Option<&'static str> {
+) -> Option<String> {
     if running {
         return None;
     }
@@ -1181,9 +1217,13 @@ fn working_label(
                 .get(agent)
                 .is_some_and(|request| projection.response_committed(*request)) =>
         {
-            "Working"
+            "Working".into()
         }
-        Some(AgentActivity::Compacting) => "Compacting",
+        Some(AgentActivity::Reconnecting {
+            attempt,
+            max_attempts,
+        }) => format!("Reconnecting · attempt {attempt} of {max_attempts}"),
+        Some(AgentActivity::Compacting) => "Compacting".into(),
         _ => return None,
     };
     Some(label)
@@ -2603,6 +2643,139 @@ mod tests {
             assert_eq!(failure.text, format!("{label}{error}"));
             assert!(!failure.text.contains("/3"));
         }
+    }
+
+    #[test]
+    fn recovery_status_is_nonterminal_and_keeps_partial_output() {
+        let mut snapshot = ObservationSnapshot::default();
+        let root = AgentId::root(SessionId::from_bytes([1; 16]));
+        let context = context(&mut snapshot, &root);
+        let failed = request(&mut snapshot, &root, context);
+        update(
+            &mut snapshot,
+            delta_event(
+                root.clone(),
+                failed,
+                BlockKind::Text,
+                "partial answer".into(),
+            ),
+        );
+        record(
+            &mut snapshot,
+            &root,
+            SessionEvent::ModelFailed {
+                request: failed,
+                attempt: 1,
+                error: "stream lost".into(),
+            },
+        );
+        record(
+            &mut snapshot,
+            &root,
+            SessionEvent::ModelRecoveryScheduled {
+                request: failed,
+                attempt: 2,
+                max_attempts: 3,
+                delay_millis: 1000,
+                error: "stream lost".into(),
+            },
+        );
+        let mut projection = Projection::default();
+        projection.rebuild(&snapshot);
+        let info = AgentInfo {
+            id: root.clone(),
+            name: "skyhook".into(),
+            model: "test".into(),
+            target: "root".into(),
+            owner: None,
+            terminal: false,
+        };
+        assert_eq!(
+            projection.status(&info, &snapshot),
+            (true, "Reconnecting · attempt 2 of 3".into())
+        );
+        assert!(projection.jobs.is_empty());
+        let rendered = entries(
+            &snapshot,
+            &projection,
+            &root,
+            &View::default(),
+            &HashMap::new(),
+            false,
+            false,
+        );
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|entry| entry.text.contains("partial answer"))
+                .count(),
+            1
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|entry| entry.key == format!("failed{failed}"))
+        );
+        assert!(rendered.iter().any(|entry| entry.surface == Surface::Status
+            && entry.text.contains("Reconnecting · attempt 2 of 3")
+            && entry.text.contains("1000 ms")
+            && entry.text.contains("stream lost")));
+        // A retry keeps its predecessor's failed partial response distinct.
+        let retry = request(&mut snapshot, &root, context);
+        projection.rebuild(&snapshot);
+        assert_eq!(
+            projection.status(&info, &snapshot),
+            (true, "Working".into())
+        );
+        assert!(snapshot.responses[&(root.clone(), failed)].settled);
+        assert!(!snapshot.responses.contains_key(&(root, retry)));
+    }
+
+    #[test]
+    fn cached_reconnecting_indicator_tracks_activity_changes() {
+        let root = AgentId::root(SessionId::from_bytes([1; 16]));
+        let mut snapshot = ObservationSnapshot::default();
+        let projection = Projection::default();
+        let view = View::default();
+        let outputs = HashMap::new();
+        let mut cache = ContentCache::default();
+        let mut rows = Vec::new();
+        for activity in [
+            AgentActivity::Working,
+            AgentActivity::Reconnecting {
+                attempt: 2,
+                max_attempts: 3,
+            },
+            AgentActivity::Reconnecting {
+                attempt: 3,
+                max_attempts: 3,
+            },
+            AgentActivity::Interrupted,
+        ] {
+            update(
+                &mut snapshot,
+                RuntimeEvent::Activity {
+                    agent: root.clone(),
+                    activity,
+                },
+            );
+            cache.update(
+                &mut rows,
+                &snapshot,
+                &projection,
+                EntryView {
+                    agent: &root,
+                    view: &view,
+                    thinking: false,
+                    all_details: false,
+                },
+                &outputs,
+                0,
+            );
+            let expected = entries(&snapshot, &projection, &root, &view, &outputs, false, false);
+            assert!(rows == expected);
+        }
+        assert!(rows.is_empty());
     }
 
     #[test]

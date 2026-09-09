@@ -607,6 +607,7 @@ impl App {
                 self.snapshot.activity.get(self.root_agent()),
                 Some(
                     AgentActivity::Working
+                        | AgentActivity::Reconnecting { .. }
                         | AgentActivity::Tools
                         | AgentActivity::Compacting
                         | AgentActivity::WaitingChildren
@@ -3064,6 +3065,24 @@ mod tests {
         .await
         .expect("lifecycle task completed")
     }
+    #[tokio::test]
+    async fn reconnecting_keeps_input_delivery_busy_until_interrupted() {
+        let (_root, mut app) = draft_fixture().await;
+        let agent = app.root_agent().clone();
+        app.snapshot.activity.insert(
+            agent.clone(),
+            AgentActivity::Reconnecting {
+                attempt: 2,
+                max_attempts: 3,
+            },
+        );
+        assert!(app.busy());
+        app.snapshot
+            .activity
+            .insert(agent, AgentActivity::Interrupted);
+        assert!(!app.busy());
+    }
+
     #[tokio::test]
     async fn menu_loads_only_fill_the_originating_open_menu() {
         let (_root, mut app) = draft_fixture().await;

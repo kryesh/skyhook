@@ -27,6 +27,32 @@ pub trait ProviderContext: Send {
     /// is supplied, transmit it as a structured-output constraint or return
     /// `InvalidRequest`; do not silently ignore it or replace it with a prompt.
     fn invoke(&mut self, request: ModelRequest) -> ProviderFuture;
+
+    /// Retire connection/continuation state before a runtime-owned retry. The
+    /// previous invocation and stream must have been dropped. Stateless providers
+    /// need no reset; stateful providers must replay the next request in full.
+    fn reset(&mut self) {}
+}
+
+/// Recovery is permission to retry an *uncommitted* local-tool response, not a
+/// claim of general request idempotency. The runtime owns the retry budget and
+/// must not replay committed responses or externally executed tool effects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderRecovery {
+    ResetContext,
+}
+
+/// Sanitized categories for transient Codex WebSocket failures. Native errors,
+/// close reasons, URLs, credentials, and response content are never retained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodexWebSocketError {
+    EndOfStream,
+    Closed,
+    Read,
+    ReadTimeout,
+    Ping,
+    Write,
+    WriteTimeout,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +65,7 @@ pub enum ProviderErrorKind {
     InvalidRequest,
     ContextWindowExceeded,
     Response,
+    CodexWebSocket(CodexWebSocketError),
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -49,6 +76,14 @@ pub struct ProviderError {
 }
 
 impl ProviderError {
+    #[must_use]
+    pub fn recovery(&self) -> Option<ProviderRecovery> {
+        match self.kind {
+            ProviderErrorKind::CodexWebSocket(_) => Some(ProviderRecovery::ResetContext),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub fn protocol(message: impl Into<String>) -> Self {
         Self {

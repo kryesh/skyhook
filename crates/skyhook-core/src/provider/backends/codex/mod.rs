@@ -1,15 +1,20 @@
 //! Skyhook-owned ChatGPT subscription provider. Authentication never imports the
 //! official client's credentials. Both transports share the Responses codec.
 //! Connection, routing affinity and continuation belong to one context. Only a
-//! failed handshake may fall back: after a write attempt nothing is replayed.
+//! failed handshake may fall back: the provider never replays after a write attempt.
+//! The runtime may explicitly reset/reinvoke an eligible uncommitted response.
 pub mod auth;
+
+#[cfg(test)]
+mod recovery_tests;
 
 use super::{
     common::{bind_reasoning_scope, filter_reasoning_scope, reasoning_scope},
     responses, transport,
 };
 use crate::provider::{
-    Provider, ProviderContext, ProviderError, ProviderErrorKind, ProviderFuture, ResponseStream,
+    CodexWebSocketError, Provider, ProviderContext, ProviderError, ProviderErrorKind,
+    ProviderFuture, ResponseStream,
     protocol::{Message as ProtocolMessage, ModelRequest, ResponseAssembler, ResponseChunk},
 };
 use futures_util::{SinkExt, StreamExt, stream};
@@ -23,7 +28,7 @@ use tokio::{
 };
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
-    tungstenite::{Message, client::IntoClientRequest},
+    tungstenite::{self, Message, client::IntoClientRequest, protocol::frame::coding::CloseCode},
 };
 
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -91,6 +96,7 @@ async fn prepare_reuse(session: &mut Session) {
     let Some(mut socket) = session.socket.take() else {
         session.reusable_since = None;
         session.continuation = None;
+        session.affinity = None;
         return;
     };
     let since = session.reusable_since.take();
@@ -159,6 +165,12 @@ struct Context {
     session: Arc<Mutex<Session>>,
 }
 impl ProviderContext for Context {
+    fn reset(&mut self) {
+        // Do not wait on a stream-owned lock. A retired stream can only return
+        // its socket to the detached session, never to the new conversation state.
+        self.session = Arc::new(Mutex::new(Session::default()));
+    }
+
     fn invoke(&mut self, mut request: ModelRequest) -> ProviderFuture {
         let provider = self.provider.clone();
         let correlation = self.correlation.clone();
@@ -213,6 +225,10 @@ impl ProviderContext for Context {
                 }
             }
             if let Some(mut socket) = session.socket.take() {
+                // Keep affinity out of the shared session while a request is in
+                // flight. Failed writes and cancellation drop all routing state.
+                session.reusable_since = None;
+                let affinity = session.affinity.take();
                 let (wire, settings, input) =
                     websocket_request(&body, session.continuation.take().as_ref());
                 // Removing continuation before writing invalidates it on cancellation.
@@ -221,18 +237,9 @@ impl ProviderContext for Context {
                     socket.send(Message::Text(wire.to_string().into())),
                 )
                 .await
-                .map_err(|_| {
-                    error(
-                        ProviderErrorKind::Timeout,
-                        "Codex WebSocket write timed out; request was not replayed",
-                    )
-                })?
-                .map_err(|_| {
-                    error(
-                        ProviderErrorKind::Transport,
-                        "Codex WebSocket write failed; request was not replayed",
-                    )
-                })?;
+                .map_err(|_| websocket_error(CodexWebSocketError::WriteTimeout))?
+                .map_err(|error| socket_error(error, CodexWebSocketError::Write))?;
+                session.affinity = affinity;
                 return Ok(ws_stream(
                     socket,
                     session,
@@ -365,17 +372,21 @@ struct WsState {
     settings: Value,
     input: Vec<Value>,
     completed: Option<Continuation>,
+    affinity: Option<HeaderValue>,
     assembler: ResponseAssembler,
     scope: String,
 }
 fn ws_stream(
     socket: Socket,
-    session: OwnedMutexGuard<Session>,
+    mut session: OwnedMutexGuard<Session>,
     decoder: responses::Decoder,
     settings: Value,
     input: Vec<Value>,
     scope: String,
 ) -> ResponseStream {
+    let affinity = session.affinity.take();
+    session.reusable_since = None;
+    session.continuation = None;
     Box::pin(stream::unfold(
         WsState {
             socket: Some(socket),
@@ -387,6 +398,7 @@ fn ws_stream(
             settings,
             input,
             completed: None,
+            affinity,
             assembler: ResponseAssembler::default(),
             scope,
         },
@@ -400,6 +412,7 @@ fn ws_stream(
                         state.session.socket = state.socket.take();
                         state.session.reusable_since = Some(Instant::now());
                         state.session.continuation = state.completed.take();
+                        state.session.affinity = state.affinity.take();
                     }
                     return None;
                 }
@@ -498,33 +511,31 @@ fn ws_stream(
                         )),
                     },
                     Ok(Some(Ok(Message::Ping(payload)))) => {
-                        if tokio::time::timeout(
+                        match tokio::time::timeout(
                             DEADLINE,
                             state.socket.as_mut().unwrap().send(Message::Pong(payload)),
                         )
                         .await
-                        .is_ok_and(|result| result.is_ok())
                         {
-                            continue;
+                            Ok(Ok(())) => continue,
+                            Ok(Err(error)) => Err(socket_error(error, CodexWebSocketError::Ping)),
+                            Err(_) => Err(websocket_error(CodexWebSocketError::Ping)),
                         }
-                        Err(error(
-                            ProviderErrorKind::Transport,
-                            "Codex WebSocket ping failed; request was not replayed",
-                        ))
                     }
                     Ok(Some(Ok(Message::Pong(_)))) => continue,
                     Ok(Some(Ok(Message::Binary(_)))) => Err(error(
                         ProviderErrorKind::Protocol,
                         "unexpected Codex binary frame",
                     )),
-                    Err(_) => Err(error(
-                        ProviderErrorKind::Timeout,
-                        "Codex WebSocket read timed out; request was not replayed",
-                    )),
-                    _ => Err(error(
-                        ProviderErrorKind::Transport,
-                        "Codex WebSocket ended before completion; request was not replayed",
-                    )),
+                    Err(_) => Err(websocket_error(CodexWebSocketError::ReadTimeout)),
+                    Ok(None) => Err(websocket_error(CodexWebSocketError::EndOfStream)),
+                    Ok(Some(Err(error))) => Err(socket_error(error, CodexWebSocketError::Read)),
+                    Ok(Some(Ok(Message::Close(frame)))) => {
+                        Err(close_error(frame.map(|frame| frame.code)))
+                    }
+                    Ok(Some(Ok(Message::Frame(_)))) => {
+                        Err(ProviderError::protocol("unexpected Codex WebSocket frame"))
+                    }
                 };
                 match decoded {
                     Ok(chunks) => state.pending.extend(chunks.into_iter().map(Ok)),
@@ -538,6 +549,67 @@ fn ws_stream(
         },
     ))
 }
+fn websocket_error(category: CodexWebSocketError) -> ProviderError {
+    let message = match category {
+        CodexWebSocketError::EndOfStream => "Codex WebSocket EOF before completion",
+        CodexWebSocketError::Closed => "Codex WebSocket closed before completion",
+        CodexWebSocketError::Read => "Codex WebSocket read failed",
+        CodexWebSocketError::ReadTimeout => "Codex WebSocket read timed out",
+        CodexWebSocketError::Ping => "Codex WebSocket ping response failed",
+        CodexWebSocketError::Write => "Codex WebSocket write failed",
+        CodexWebSocketError::WriteTimeout => "Codex WebSocket write timed out",
+    };
+    error(ProviderErrorKind::CodexWebSocket(category), message)
+}
+
+fn socket_error(native: tungstenite::Error, operation: CodexWebSocketError) -> ProviderError {
+    use tungstenite::{Error, error::ProtocolError};
+    match native {
+        Error::ConnectionClosed | Error::AlreadyClosed => {
+            websocket_error(CodexWebSocketError::Closed)
+        }
+        Error::Protocol(ProtocolError::ResetWithoutClosingHandshake) => {
+            websocket_error(CodexWebSocketError::EndOfStream)
+        }
+        Error::Io(_) | Error::Tls(_) => websocket_error(operation),
+        // Do not turn malformed frames, payloads, or local request errors into
+        // replay eligibility. In particular, never include native error text.
+        _ => ProviderError::protocol("Codex WebSocket protocol failure"),
+    }
+}
+
+fn close_error(code: Option<CloseCode>) -> ProviderError {
+    match code {
+        Some(
+            CloseCode::Protocol
+            | CloseCode::Unsupported
+            | CloseCode::Invalid
+            | CloseCode::Size
+            | CloseCode::Extension,
+        ) => ProviderError::protocol("Codex WebSocket rejected protocol or payload"),
+        Some(CloseCode::Policy) => error(
+            ProviderErrorKind::Authentication,
+            "Codex WebSocket policy rejection",
+        ),
+        None
+        | Some(
+            CloseCode::Normal
+            | CloseCode::Away
+            | CloseCode::Status
+            | CloseCode::Abnormal
+            | CloseCode::Restart
+            | CloseCode::Again
+            | CloseCode::Error,
+        ) => websocket_error(CodexWebSocketError::Closed),
+        // Unknown application codes can represent permanent authentication or
+        // request rejection. Only allowlisted connection-loss codes are eligible.
+        _ => error(
+            ProviderErrorKind::Response,
+            "Codex WebSocket application rejection",
+        ),
+    }
+}
+
 // Subscription quota notifications are transport metadata, not Responses output.
 // Recognize only the documented/observed type; unknown semantic events still fail.
 pub(super) fn is_transport_metadata(event: &Value) -> bool {
@@ -940,7 +1012,16 @@ mod tests {
     #[tokio::test]
     async fn dropping_response_clears_socket_and_continuation() {
         let (socket, server) = mock_socket(vec![]).await;
-        let session = Arc::new(Mutex::new(Session::default()));
+        let session = Arc::new(Mutex::new(Session {
+            affinity: Some(HeaderValue::from_static("cancelled-affinity")),
+            continuation: Some(Continuation {
+                id: "cancelled".into(),
+                input: vec![],
+                settings: json!({}),
+            }),
+            reusable_since: Some(Instant::now()),
+            ..Session::default()
+        }));
         let events = ws_stream(
             socket,
             session.clone().lock_owned().await,
@@ -953,6 +1034,8 @@ mod tests {
         let session = session.lock().await;
         assert!(session.socket.is_none());
         assert!(session.continuation.is_none());
+        assert!(session.affinity.is_none());
+        assert!(session.reusable_since.is_none());
         server.await.unwrap();
     }
     #[tokio::test]

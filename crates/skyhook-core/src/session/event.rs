@@ -110,6 +110,20 @@ pub enum SessionEvent {
         attempt: u8,
         error: String,
     },
+    /// A failed model request will be retried after a bounded recovery delay.
+    /// This is host-facing status, not model-visible conversation history.
+    ModelRecoveryScheduled {
+        /// Sequence of the failed `ModelRequested` event.
+        request: u64,
+        /// The next logical invocation (not an HTTP transport retry).
+        attempt: u8,
+        /// Total invocation limit, including the original attempt.
+        max_attempts: u8,
+        /// Backoff scheduled before the next invocation.
+        delay_millis: u64,
+        /// The connection failure that triggered this recovery.
+        error: String,
+    },
     CompactionSkipped {
         request: u64,
         reason: String,
@@ -242,4 +256,60 @@ pub(crate) fn is_safe_artifact_path(path: &Path) -> bool {
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_event_round_trips_without_changing_existing_log_format() {
+        let id = SessionId::from_bytes([42; 16]);
+        let agent = AgentId::root(id);
+        // A failure from existing version-2 logs requires no new fields.
+        let failure: SessionEvent = serde_json::from_str(
+            r#"{"type":"model_failed","request":7,"attempt":1,"error":"connection lost"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            failure,
+            SessionEvent::ModelFailed {
+                request: 7,
+                attempt: 1,
+                error: "connection lost".into(),
+            }
+        );
+        let events = [
+            failure,
+            SessionEvent::ModelRecoveryScheduled {
+                request: 7,
+                attempt: 2,
+                max_attempts: 3,
+                delay_millis: 1000,
+                error: "connection lost".into(),
+            },
+        ];
+        let records: Vec<_> = events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| EventRecord {
+                version: SESSION_FORMAT_VERSION,
+                sequence: index as u64 + 1,
+                timestamp_millis: 0,
+                agent: agent.clone(),
+                event,
+            })
+            .collect();
+        let encoded = serde_json::to_string(&records).unwrap();
+        assert!(encoded.contains("model_recovery_scheduled"));
+        let decoded: Vec<EventRecord> = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, records);
+        validate_records(&decoded, id).unwrap();
+        // Recovery status and its error are host-only, never prompt content.
+        assert!(
+            crate::session::project_history(&decoded, &agent)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }

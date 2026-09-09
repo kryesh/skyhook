@@ -54,6 +54,8 @@ mod queue;
 pub use queue::{QueuedPrompt, QueuedPromptToken};
 #[cfg(test)]
 mod queue_tests;
+#[cfg(test)]
+mod recovery_tests;
 mod tools;
 mod wait;
 #[cfg(test)]
@@ -61,6 +63,9 @@ mod wait_tests;
 use wait::AgentSender;
 
 const AGENT_CHANNEL_CAPACITY: usize = 64;
+/// Initial generation plus two reconnects. Compaction has its own additive budget.
+const MAX_CONNECTION_ATTEMPTS: u8 = 3;
+const MAX_MODEL_ATTEMPTS: u8 = MAX_CONNECTION_ATTEMPTS + compact::MAX_PROVIDER_ATTEMPTS - 1;
 
 pub struct HarnessBuilder {
     workspace: PathBuf,
@@ -1458,6 +1463,8 @@ impl SessionRuntime {
         let mut final_text = String::new();
         let mut force_compaction = false;
         let mut provider_attempt = 0u8;
+        let mut connection_attempt = 1u8;
+        let mut compaction_attempt = 1u8;
         let mut compaction_checked = false;
         'requests: loop {
             if let Some(sender) = self.agent_sender(agent) {
@@ -1475,6 +1482,8 @@ impl SessionRuntime {
                 context_sequence = None;
                 compaction_checked = false;
                 provider_attempt = 0;
+                connection_attempt = 1;
+                compaction_attempt = 1;
             }
             if cancellation.is_cancelled() {
                 return Err(HarnessError::Interrupted);
@@ -1535,71 +1544,147 @@ impl SessionRuntime {
                     .expect("runtime state is present")
                     .clone(),
             });
-            let requested = self
-                .store
-                .append(
-                    agent.clone(),
-                    SessionEvent::ModelRequested {
-                        context,
-                        messages,
-                        purpose: crate::session::ModelPurpose::Agent,
-                    },
-                )
-                .await?;
-            self.activity(agent, AgentActivity::Working);
-            self.events.send(RuntimeEvent::Context {
-                agent: agent.clone(),
-                tokens: agent_context.meter.estimate(&request),
-                capacity: profile.max_context,
-            });
+            // Freeze the request across connection recovery. Input/notifications and
+            // model changes remain queued until the next normal request boundary.
+            // Partial streamed output is display-only: only a fully assembled response
+            // below is committed and allowed to execute Skyhook tools.
             let input_estimate = compaction::estimate_request(&request);
+            let context_tokens = agent_context.meter.estimate(&request);
             self.store.hydrate_model_request(&mut request).await?;
-            provider_attempt += 1;
-            let invoked = tokio::select! {
-                response = agent_context.provider.invoke(request) => response,
-                () = cancellation.cancelled() => return Err(HarnessError::Interrupted),
-            };
-            let mut response = match invoked {
-                Ok(response) => response,
-                Err(error) => {
-                    self.record_model_failure(
-                        agent,
-                        requested.sequence,
-                        provider_attempt,
-                        Usage::default(),
-                        error.to_string(),
+            let (requested, response) = 'attempts: loop {
+                if cancellation.is_cancelled() {
+                    return Err(HarnessError::Interrupted);
+                }
+                let requested = self
+                    .store
+                    .append(
+                        agent.clone(),
+                        SessionEvent::ModelRequested {
+                            context,
+                            messages: messages.clone(),
+                            purpose: crate::session::ModelPurpose::Agent,
+                        },
                     )
                     .await?;
-                    // Transport owns retries. A context rejection may recover only by
-                    // changing the request through bounded compaction, never blind replay.
-                    if provider_attempt < compact::MAX_PROVIDER_ATTEMPTS
-                        && error.kind == crate::provider::ProviderErrorKind::ContextWindowExceeded
-                    {
-                        force_compaction = true;
-                        continue;
+                self.activity(agent, AgentActivity::Working);
+                self.events.send(RuntimeEvent::Context {
+                    agent: agent.clone(),
+                    tokens: context_tokens,
+                    capacity: profile.max_context,
+                });
+                provider_attempt += 1;
+                let invoked = tokio::select! {
+                    response = agent_context.provider.invoke(request.clone()) => response,
+                    () = cancellation.cancelled() => return Err(HarnessError::Interrupted),
+                };
+                let mut response = match invoked {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.record_model_failure(
+                            agent,
+                            requested.sequence,
+                            provider_attempt,
+                            Usage::default(),
+                            error.to_string(),
+                        )
+                        .await?;
+                        // Only explicitly eligible connection failures may replay an
+                        // uncommitted response. Native HTTP startup retries stay transport-owned.
+                        if error.recovery().is_some() {
+                            self.schedule_model_recovery(
+                                &turn,
+                                requested.sequence,
+                                provider_attempt,
+                                connection_attempt,
+                                &error,
+                                agent_context.provider.as_mut(),
+                            )
+                            .await?;
+                            connection_attempt += 1;
+                            continue 'attempts;
+                        }
+                        if provider_attempt < MAX_MODEL_ATTEMPTS
+                            && compaction_attempt < compact::MAX_PROVIDER_ATTEMPTS
+                            && error.kind
+                                == crate::provider::ProviderErrorKind::ContextWindowExceeded
+                        {
+                            force_compaction = true;
+                            compaction_attempt += 1;
+                            continue 'requests;
+                        }
+                        return Err(error.into());
                     }
-                    return Err(error.into());
+                };
+                let mut assembler = ResponseAssembler::default();
+                let mut usage = Usage::default();
+                let mut saw_content = false;
+                loop {
+                    let chunk = tokio::select! {
+                        chunk = response.next() => chunk,
+                        () = cancellation.cancelled() => {
+                            self.record_model_usage(agent, requested.sequence, usage).await?;
+                            return Err(HarnessError::Interrupted);
+                        },
+                    };
+                    let Some(chunk) = chunk else {
+                        break;
+                    };
+                    let chunk = match chunk.and_then(|chunk| {
+                        assembler.push(&chunk)?;
+                        Ok(chunk)
+                    }) {
+                        Ok(chunk) => chunk,
+                        Err(error) => {
+                            self.record_model_failure(
+                                agent,
+                                requested.sequence,
+                                provider_attempt,
+                                usage,
+                                error.to_string(),
+                            )
+                            .await?;
+                            if error.recovery().is_some() {
+                                // The failed stream may own the connection mutex. Drop it
+                                // before resetting or waiting. No assistant message or tools
+                                // from this attempt have been committed/executed.
+                                drop(response);
+                                self.schedule_model_recovery(
+                                    &turn,
+                                    requested.sequence,
+                                    provider_attempt,
+                                    connection_attempt,
+                                    &error,
+                                    agent_context.provider.as_mut(),
+                                )
+                                .await?;
+                                connection_attempt += 1;
+                                continue 'attempts;
+                            }
+                            if !saw_content
+                                && provider_attempt < MAX_MODEL_ATTEMPTS
+                                && compaction_attempt < compact::MAX_PROVIDER_ATTEMPTS
+                                && error.kind
+                                    == crate::provider::ProviderErrorKind::ContextWindowExceeded
+                            {
+                                force_compaction = true;
+                                compaction_attempt += 1;
+                                continue 'requests;
+                            }
+                            return Err(error.into());
+                        }
+                    };
+                    saw_content |= !matches!(&chunk, ResponseChunk::UsageUpdated { .. });
+                    if let ResponseChunk::UsageUpdated { usage: value } = &chunk {
+                        usage = *value;
+                    }
+                    self.events.send(RuntimeEvent::ResponseEvent {
+                        agent: agent.clone(),
+                        request: requested.sequence,
+                        event: chunk,
+                    });
                 }
-            };
-            let mut assembler = ResponseAssembler::default();
-            let mut usage = Usage::default();
-            let mut saw_content = false;
-            loop {
-                let chunk = tokio::select! {
-                    chunk = response.next() => chunk,
-                    () = cancellation.cancelled() => {
-                        self.record_model_usage(agent, requested.sequence, usage).await?;
-                        return Err(HarnessError::Interrupted);
-                    },
-                };
-                let Some(chunk) = chunk else {
-                    break;
-                };
-                let chunk = match chunk.and_then(|chunk| {
-                    assembler.push(&chunk)?;
-                    Ok(chunk)
-                }) {
-                    Ok(chunk) => chunk,
+                let response = match finish_response(assembler, usage) {
+                    Ok(response) => response,
                     Err(error) => {
                         self.record_model_failure(
                             agent,
@@ -1609,40 +1694,10 @@ impl SessionRuntime {
                             error.to_string(),
                         )
                         .await?;
-                        if !saw_content
-                            && provider_attempt < compact::MAX_PROVIDER_ATTEMPTS
-                            && error.kind
-                                == crate::provider::ProviderErrorKind::ContextWindowExceeded
-                        {
-                            force_compaction = true;
-                            continue 'requests;
-                        }
-                        return Err(error.into());
+                        return Err(error);
                     }
                 };
-                saw_content |= !matches!(&chunk, ResponseChunk::UsageUpdated { .. });
-                if let ResponseChunk::UsageUpdated { usage: value } = &chunk {
-                    usage = *value;
-                }
-                self.events.send(RuntimeEvent::ResponseEvent {
-                    agent: agent.clone(),
-                    request: requested.sequence,
-                    event: chunk,
-                });
-            }
-            let response = match finish_response(assembler, usage) {
-                Ok(response) => response,
-                Err(error) => {
-                    self.record_model_failure(
-                        agent,
-                        requested.sequence,
-                        provider_attempt,
-                        usage,
-                        error.to_string(),
-                    )
-                    .await?;
-                    return Err(error);
-                }
+                break (requested, response);
             };
             let assistant = Message::Assistant(response.blocks);
             let origin = if let Some(job) = owner_job {
@@ -1698,6 +1753,8 @@ impl SessionRuntime {
                 capacity: profile.max_context,
             });
             provider_attempt = 0;
+            connection_attempt = 1;
+            compaction_attempt = 1;
             compaction_checked = false;
             if response.calls.is_empty() {
                 // Notifications arriving during this provider request must be
@@ -1740,6 +1797,54 @@ impl SessionRuntime {
             let tools = Message::Tool(results);
             let sequence = self.commit(agent, tools.clone()).await?;
             agent_context.projected.push((sequence, tools));
+        }
+    }
+
+    /// Recovery is bounded per logical response and never restarts a child or
+    /// re-executes committed tools. The caller has recorded the failed attempt and
+    /// dropped the provider's failed stream before entering this wait.
+    async fn schedule_model_recovery(
+        &self,
+        turn: &TurnContext<'_>,
+        request: u64,
+        model_attempt: u8,
+        connection_attempt: u8,
+        error: &crate::provider::ProviderError,
+        provider: &mut dyn crate::provider::ProviderContext,
+    ) -> Result<(), HarnessError> {
+        if turn.cancellation.is_cancelled() {
+            return Err(HarnessError::Interrupted);
+        }
+        if connection_attempt >= MAX_CONNECTION_ATTEMPTS || model_attempt >= MAX_MODEL_ATTEMPTS {
+            let mut exhausted = error.clone();
+            exhausted.message = format!(
+                "{}; connection recovery exhausted after {} attempts ({} total model attempts); completed tool results were preserved",
+                error.message, connection_attempt, model_attempt,
+            );
+            return Err(exhausted.into());
+        }
+        provider.reset();
+        // Bounded positive jitter avoids synchronized reconnects without making
+        // randomness a prerequisite for recovery.
+        let mut jitter = [0u8; 1];
+        let _ = getrandom::fill(&mut jitter);
+        let delay_millis =
+            if connection_attempt == 1 { 500 } else { 1500 } + u64::from(jitter[0] % 101);
+        self.store
+            .append(
+                turn.agent.clone(),
+                SessionEvent::ModelRecoveryScheduled {
+                    request,
+                    attempt: connection_attempt + 1,
+                    max_attempts: MAX_CONNECTION_ATTEMPTS,
+                    delay_millis,
+                    error: error.to_string(),
+                },
+            )
+            .await?;
+        tokio::select! {
+            () = turn.cancellation.cancelled() => Err(HarnessError::Interrupted),
+            () = tokio::time::sleep(std::time::Duration::from_millis(delay_millis)) => Ok(()),
         }
     }
 
