@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex, Notify, broadcast, mpsc},
+    sync::{Mutex, Notify, OwnedMutexGuard, broadcast, mpsc},
     task::AbortHandle,
 };
 pub(crate) use tokio_util::sync::CancellationToken;
@@ -23,6 +23,7 @@ use crate::{
     execution::ExecutionLocation,
     identity::{AgentId, JobId},
     media::ImageReference,
+    provider::protocol::Message,
     session::{EventRecord, SessionError, SessionEvent, SessionStore},
     tool::{
         ToolOutput,
@@ -32,6 +33,8 @@ use crate::{
 
 pub(crate) mod output;
 pub use output::OutputArgs as JobOutputQuery;
+#[cfg(test)]
+mod delivery_tests;
 mod persistence;
 mod progress;
 #[cfg(test)]
@@ -383,7 +386,7 @@ struct JobManagerInner {
     store: SessionStore,
     jobs: Mutex<HashMap<JobId, JobEntry>>,
     progress: Mutex<progress::Progress>,
-    delivery_operation: Mutex<()>,
+    delivery_operation: Arc<Mutex<()>>,
     next_id: AtomicU64,
     completions: broadcast::Sender<JobCompletion>,
 }
@@ -391,6 +394,47 @@ struct JobManagerInner {
 #[derive(Clone)]
 pub struct JobManager {
     inner: Arc<JobManagerInner>,
+}
+
+/// A non-destructive snapshot serialized against explicit claims and resumption.
+/// Dropping a receipt before committing leaves its jobs pending. Presentation must
+/// not claim jobs while this receipt holds the delivery gate.
+pub(crate) struct PendingDelivery {
+    manager: JobManager,
+    owner: AgentId,
+    envelopes: Vec<JobEnvelope>,
+    _delivery: OwnedMutexGuard<()>,
+}
+
+impl PendingDelivery {
+    pub(crate) fn envelopes(&self) -> &[JobEnvelope] {
+        &self.envelopes
+    }
+
+    /// Commit the parent notification before acknowledging the selected jobs.
+    ///
+    /// The caller must shield this operation, together with any other notification
+    /// acknowledgements, from cancellation: SessionStore::append performs async I/O.
+    /// Replay recognizes the committed runtime envelopes, closing the crash window
+    /// between this append and the in-memory acknowledgement without a second event.
+    /// The receipt retains the delivery gate after commit; drop it only after all
+    /// other notification acknowledgements belonging to this message are complete.
+    pub(crate) async fn commit(&self, message: Message) -> Result<u64, JobError> {
+        let record = self
+            .manager
+            .inner
+            .store
+            .append(
+                self.owner.clone(),
+                SessionEvent::MessageCommitted { message },
+            )
+            .await?;
+        let mut jobs = self.manager.inner.jobs.lock().await;
+        if let SessionEvent::MessageCommitted { message } = &record.event {
+            persistence::acknowledge_message(&mut jobs, &self.owner, message);
+        }
+        Ok(record.sequence)
+    }
 }
 
 pub struct JobLease {
@@ -446,7 +490,7 @@ impl JobManager {
                 store,
                 jobs: Mutex::new(jobs),
                 progress: Mutex::new(progress::Progress::default()),
-                delivery_operation: Mutex::new(()),
+                delivery_operation: Arc::new(Mutex::new(())),
                 next_id: AtomicU64::new(next_id),
                 completions,
             }),
@@ -581,6 +625,7 @@ impl JobManager {
     pub(crate) async fn finish(&self, id: JobId, outcome: JobOutcome) -> Result<(), JobError> {
         let operation = self.operation(id).await?;
         let _operation = operation.lock().await;
+        let _delivery = self.inner.delivery_operation.lock().await;
         let (agent, script) = {
             let jobs = self.inner.jobs.lock().await;
             let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
@@ -661,6 +706,9 @@ impl JobManager {
                 return Err(JobError::AlreadyTerminal(id));
             }
             entry.state = state;
+            // A terminal outcome is a new delivery even if an earlier question
+            // was claimed or injected without returning through resume_input.
+            entry.delivery = DeliveryState::Pending;
             if state != JobState::Completed {
                 entry.resume = None;
             }
@@ -707,6 +755,7 @@ impl JobManager {
 
     /// Preserve a live, observable terminal result when durable finalization is unavailable.
     pub(crate) async fn fail_volatile(&self, id: JobId, error: String) {
+        let _delivery = self.inner.delivery_operation.lock().await;
         let terminal = {
             let mut jobs = self.inner.jobs.lock().await;
             let Some(entry) = jobs.get_mut(&id) else {
@@ -716,6 +765,7 @@ impl JobManager {
                 return;
             }
             entry.state = JobState::Failed;
+            entry.delivery = DeliveryState::Pending;
             entry.output = None;
             entry.images.clear();
             entry.error = Some(error);
@@ -1197,6 +1247,7 @@ impl JobManager {
     pub async fn request_input(&self, id: JobId, output: Value) -> Result<(), JobError> {
         let operation = self.operation(id).await?;
         let _operation = operation.lock().await;
+        let _delivery = self.inner.delivery_operation.lock().await;
         let agent = {
             let jobs = self.inner.jobs.lock().await;
             let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
@@ -1236,6 +1287,7 @@ impl JobManager {
     pub async fn resume_input(&self, id: JobId) -> Result<(), JobError> {
         let operation = self.operation(id).await?;
         let _operation = operation.lock().await;
+        let _delivery = self.inner.delivery_operation.lock().await;
         let agent = {
             let jobs = self.inner.jobs.lock().await;
             let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
@@ -1266,47 +1318,73 @@ impl JobManager {
         Ok(())
     }
 
-    /// Atomically reserves every pending notification for an agent so queued
-    /// wake-up signals cannot inject an explicitly claimed result a second time.
+    /// Snapshot a bounded pending batch without acknowledging it. The receipt
+    /// holds the delivery gate through presentation and parent history commit.
+    pub(crate) async fn pending_delivery(
+        &self,
+        owner: &AgentId,
+    ) -> Result<PendingDelivery, JobError> {
+        let delivery = self.inner.delivery_operation.clone().lock_owned().await;
+        let jobs = self.inner.jobs.lock().await;
+        let envelopes = self
+            .pending_ids(&jobs, owner)
+            .into_iter()
+            .map(|id| jobs[&id].envelope(id))
+            .collect();
+        Ok(PendingDelivery {
+            manager: self.clone(),
+            owner: owner.clone(),
+            envelopes,
+            _delivery: delivery,
+        })
+    }
+
+    fn pending_ids(&self, jobs: &HashMap<JobId, JobEntry>, owner: &AgentId) -> Vec<JobId> {
+        let mut ids = jobs
+            .iter()
+            .filter(|(_, entry)| {
+                &entry.agent == owner
+                    && entry.background
+                    && entry.deliverable()
+                    && entry.delivery == DeliveryState::Pending
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        let mut pending = Vec::new();
+        let mut budget = 0;
+        for id in ids {
+            let entry = &jobs[&id];
+            let metadata =
+                serde_json::to_vec(&entry.metadata(id)).map_or(8192, |bytes| bytes.len());
+            let estimate = output::presentation_size(&self.output_directory(id));
+            let cost = if entry.state == JobState::Completed && estimate <= output::CONTENT_BYTES {
+                estimate
+                    .saturating_add(metadata)
+                    .saturating_add(128)
+                    .min(8192)
+            } else {
+                8192
+            };
+            if !pending.is_empty() && budget + cost > 8192 {
+                break;
+            }
+            pending.push(id);
+            budget += cost;
+        }
+        pending
+    }
+
+    /// Legacy eager reservation for callers that do not commit parent history.
     pub async fn take_pending(&self, owner: &AgentId) -> Result<Vec<JobEnvelope>, JobError> {
         let _delivery = self.inner.delivery_operation.lock().await;
         let pending = {
             let mut jobs = self.inner.jobs.lock().await;
-            let mut ids = jobs
-                .iter()
-                .filter(|(_, entry)| {
-                    &entry.agent == owner
-                        && entry.background
-                        && entry.deliverable()
-                        && entry.delivery == DeliveryState::Pending
-                })
-                .map(|(id, _)| *id)
-                .collect::<Vec<_>>();
-            ids.sort();
             let mut pending = Vec::new();
-            let mut budget = 0;
-            for id in ids {
-                let directory = self.output_directory(id);
-                let entry = jobs.get(&id).expect("selected job");
-                let metadata =
-                    serde_json::to_vec(&entry.metadata(id)).map_or(8192, |bytes| bytes.len());
-                let estimate = output::presentation_size(&directory);
-                let cost =
-                    if entry.state == JobState::Completed && estimate <= output::CONTENT_BYTES {
-                        estimate
-                            .saturating_add(metadata)
-                            .saturating_add(128)
-                            .min(8192)
-                    } else {
-                        8192
-                    };
-                if !pending.is_empty() && budget + cost > 8192 {
-                    break;
-                }
+            for id in self.pending_ids(&jobs, owner) {
                 let entry = jobs.get_mut(&id).expect("selected job");
                 if let Some(agent) = entry.reserve_delivery(DeliveryState::Injected) {
                     pending.push((id, agent, entry.envelope(id)));
-                    budget += cost;
                 }
             }
             pending

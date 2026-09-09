@@ -57,3 +57,21 @@ impl ProviderError {
         }
     }
 }
+
+/// HTTP startup is a per-attempt deadline; read-idle resets per body chunk.
+/// Native HTTP requests have at most three attempts, so startup can consume three
+/// times this duration plus bounded retry backoff. Codex HTTP remains single-attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderTimeouts {
+    pub startup: std::time::Duration,
+    pub read_idle: std::time::Duration,
+}
+
+impl Default for ProviderTimeouts {
+    fn default() -> Self {
+        Self {
+            startup: std::time::Duration::from_secs(600),
+            read_idle: std::time::Duration::from_secs(600),
+        }
+    }
+}

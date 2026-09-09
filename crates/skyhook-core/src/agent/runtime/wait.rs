@@ -29,13 +29,80 @@ struct AgentWake {
     observed: AtomicU64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(super) struct ChildMessage {
     pub id: crate::identity::JobId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub message: u64,
     pub text: String,
+}
+
+/// A non-destructive snapshot. Dropping it (including cancellation or a failed
+/// parent history commit) leaves progress available at the next boundary.
+/// Only acknowledge after the parent MessageCommitted append succeeds.
+pub(super) struct ChildMessageBatch {
+    sender: Option<AgentSender>,
+    messages: Vec<ChildMessage>,
+}
+
+/// Child progress and job outputs share one parent-history commit boundary.
+/// Preparing/presenting a batch is cancellable; once commit starts, its short
+/// journal transaction runs to completion even if the caller is interrupted.
+pub(super) struct PendingEventBatch {
+    child_messages: ChildMessageBatch,
+    jobs: Option<crate::job::PendingDelivery>,
+}
+
+impl PendingEventBatch {
+    pub(super) async fn commit(
+        self,
+        runtime: &SessionRuntime,
+        agent: &crate::identity::AgentId,
+        message: crate::provider::protocol::Message,
+    ) -> Result<u64, super::HarnessError> {
+        let store = runtime.store.clone();
+        let agent = agent.clone();
+        // Dropping a SessionStore::append future during disk I/O could leave a
+        // durable record without its in-memory acknowledgment. Own both here.
+        tokio::spawn(async move {
+            let sequence = match &self.jobs {
+                Some(jobs) => jobs.commit(message).await?,
+                None => {
+                    store
+                        .append(
+                            agent,
+                            crate::session::SessionEvent::MessageCommitted { message },
+                        )
+                        .await?
+                        .sequence
+                }
+            };
+            self.child_messages.acknowledge();
+            // Keep the delivery gate until BOTH kinds have been acknowledged.
+            drop(self.jobs);
+            Ok(sequence)
+        })
+        .await
+        .map_err(|error| crate::session::SessionError::Io(std::io::Error::other(error)))?
+    }
+}
+
+impl ChildMessageBatch {
+    fn acknowledge(self) {
+        let Some(sender) = self.sender else { return };
+        let delivered = self
+            .messages
+            .iter()
+            .map(|message| (message.id, message.message))
+            .collect::<std::collections::HashSet<_>>();
+        sender
+            .wake
+            .child_messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|message| !delivered.contains(&(message.id, message.message)));
+    }
 }
 
 #[derive(Default)]
@@ -114,14 +181,16 @@ impl AgentSender {
             .is_empty()
     }
 
-    fn take_child_messages(&self) -> Vec<ChildMessage> {
-        std::mem::take(
-            &mut *self
+    fn snapshot_child_messages(&self) -> ChildMessageBatch {
+        ChildMessageBatch {
+            sender: Some(self.clone()),
+            messages: self
                 .wake
                 .child_messages
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        }
     }
 
     /// One bounded coalescing window per agent, shared by every delivery path.
@@ -275,37 +344,59 @@ impl SessionRuntime {
         agent: &crate::identity::AgentId,
         capabilities: &crate::tool::policy::CapabilitySet,
         location: &crate::execution::ExecutionLocation,
-    ) -> Result<Vec<UserContent>, super::HarnessError> {
-        let pending = self.jobs.take_pending(agent).await?;
-        // Reserve completions before draining messages: every intermediate reply
+    ) -> Result<(Vec<UserContent>, PendingEventBatch), super::HarnessError> {
+        let pending = self.jobs.pending_delivery(agent).await?;
+        // Reserve completions before snapshotting messages: every intermediate reply
         // from a completed child was queued before its completion was published.
-        let mut content = self.child_message_content(agent);
-        if !pending.is_empty() {
+        let (mut content, mut batch) = self.child_message_content(agent);
+        if !pending.envelopes().is_empty() {
             content.extend(
-                self.job_event_content(&pending, capabilities, location)
+                self.job_event_content(pending.envelopes(), capabilities, location)
                     .await,
             );
         }
-        Ok(content)
+        if !content.is_empty() {
+            // Also serialize child-only commits with the next boundary after
+            // interruption: the owned commit task can outlive its original caller.
+            batch.jobs = Some(pending);
+        }
+        // Never retain an empty delivery gate across the ensuing model call.
+        Ok((content, batch))
     }
 
     pub(super) fn child_message_content(
         &self,
         agent: &crate::identity::AgentId,
-    ) -> Vec<UserContent> {
+    ) -> (Vec<UserContent>, PendingEventBatch) {
         let messages = self
             .agent_sender(agent)
-            .map(|sender| sender.take_child_messages())
-            .unwrap_or_default();
-        if messages.is_empty() {
-            return Vec::new();
+            .map(|sender| sender.snapshot_child_messages())
+            .unwrap_or(ChildMessageBatch {
+                sender: None,
+                messages: Vec::new(),
+            });
+        if messages.messages.is_empty() {
+            return (
+                Vec::new(),
+                PendingEventBatch {
+                    child_messages: messages,
+                    jobs: None,
+                },
+            );
         }
-        vec![UserContent::Runtime {
+        let content = vec![UserContent::Runtime {
             text: format!(
                 "<skyhook_agent_messages>\n{}\n</skyhook_agent_messages>",
-                serde_json::to_string(&messages).expect("child messages serialize")
+                serde_json::to_string(&messages.messages).expect("child messages serialize")
             ),
-        }]
+        }];
+        (
+            content,
+            PendingEventBatch {
+                child_messages: messages,
+                jobs: None,
+            },
+        )
     }
 
     async fn job_event_content(
@@ -318,11 +409,10 @@ impl SessionRuntime {
         for job in pending {
             match self
                 .jobs
-                .present_output_for(
+                .inspect_output_for(
                     crate::job::output::OutputArgs::new(job.id),
                     capabilities,
                     location,
-                    true,
                 )
                 .await
             {

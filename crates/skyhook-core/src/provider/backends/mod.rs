@@ -4,11 +4,12 @@ mod anthropic;
 mod chat;
 pub mod codex;
 mod common;
+mod errors;
 pub(crate) mod responses;
 pub(crate) mod transport;
 
 use crate::provider::{
-    Provider, ProviderContext, ProviderError, ProviderFuture, ResponseStream,
+    Provider, ProviderContext, ProviderError, ProviderFuture, ProviderTimeouts, ResponseStream,
     protocol::{ModelRequest, ResponseChunk},
 };
 use futures_util::{StreamExt, stream};
@@ -20,6 +21,18 @@ use std::collections::VecDeque;
 pub enum OpenAiApi {
     ChatCompletions,
     Responses,
+}
+
+/// Provider-wide reasoning replay serialization for Chat Completions endpoints.
+/// Defaults to the widely supported `reasoning_content` field; use `Unsupported`
+/// to omit reasoning from requests. Native protocols are unaffected.
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatReasoningReplay {
+    Unsupported,
+    #[default]
+    ReasoningContent,
+    Reasoning,
 }
 
 #[derive(Clone, Copy)]
@@ -36,6 +49,8 @@ pub struct NativeProvider {
     headers: HeaderMap,
     protocol: Protocol,
     scope: String,
+    timeouts: ProviderTimeouts,
+    chat_reasoning_replay: ChatReasoningReplay,
 }
 
 /// `base_url` is an explicit API root (for example `https://api.openai.com/v1`).
@@ -66,6 +81,8 @@ pub fn openai_compatible(
         headers,
         protocol,
         scope,
+        timeouts: ProviderTimeouts::default(),
+        chat_reasoning_replay: ChatReasoningReplay::default(),
     })
 }
 
@@ -92,6 +109,8 @@ pub fn anthropic_api(
         headers,
         protocol: Protocol::Anthropic,
         scope,
+        timeouts: ProviderTimeouts::default(),
+        chat_reasoning_replay: ChatReasoningReplay::default(),
     })
 }
 
@@ -112,6 +131,20 @@ fn endpoint(base: &str, suffix: &str) -> Result<String, ProviderError> {
     let path = format!("{}/{suffix}", url.path().trim_end_matches('/'));
     url.set_path(&path);
     Ok(url.into())
+}
+
+impl NativeProvider {
+    #[must_use]
+    pub fn with_chat_reasoning_replay(mut self, policy: ChatReasoningReplay) -> Self {
+        self.chat_reasoning_replay = policy;
+        self
+    }
+
+    #[must_use]
+    pub fn with_timeouts(mut self, timeouts: ProviderTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
 }
 
 impl Provider for NativeProvider {
@@ -147,7 +180,7 @@ impl ProviderContext for NativeContext {
             common::filter_reasoning_scope(&mut request, &provider.scope);
             let (body, decoder) = match provider.protocol {
                 Protocol::Chat => (
-                    chat::encode(&request)?,
+                    chat::encode(&request, provider.chat_reasoning_replay)?,
                     Decoder::Chat(chat::Decoder::new(request.model)),
                 ),
                 Protocol::Responses => (
@@ -159,11 +192,12 @@ impl ProviderContext for NativeContext {
                     Decoder::Anthropic(anthropic::Decoder::new(request.model)),
                 ),
             };
-            let events = transport::post_sse(
+            let events = transport::post_sse_with_timeouts(
                 &provider.client,
                 &provider.endpoint,
                 provider.headers,
                 &body,
+                provider.timeouts,
             )
             .await?;
             Ok(decode_stream(events, decoder, provider.scope, ()))

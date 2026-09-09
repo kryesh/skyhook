@@ -88,6 +88,11 @@ request bodies remain in the session journal for reconstruction but are not rend
 Startup warnings appear directly in the conversation log rather than a separate diagnostics page.
 Job output is paged and searchable without acknowledging the agent's pending notifications. Select a job
 and press `o` for output fields, regex search, and the next page; `c` requests cancellation.
+Intermediate child-agent messages and terminal job notifications appear as expandable **Job event**
+cards in the conversation. Agent-message cards show the job identity/name, source message sequence,
+and readable progress text when expanded, rather than raw runtime envelopes. They retain their
+historical payload when the job later completes or is resumed; ordinary user text is not reclassified.
+This presentation also applies when reopening older saved sessions.
 Remote output is available after transfer completes. Provider-supplied reasoning streams in a separate
 expanded block with an animated spinner and collapses as soon as answer text starts (or the response
 finishes). Single-line reasoning stays inline without an expand/collapse control and is not
@@ -418,7 +423,9 @@ they are not stored in the TOML file. `openai` requires an explicit `base_url` a
 optional `api_key_env`, so a local endpoint can be keyless. URLs name the API root: Skyhook appends
 `/chat/completions`, `/responses`, or `/messages`. For the official services use
 `https://api.openai.com/v1` or `https://api.anthropic.com/v1`. There are no vendor presets, model
-aliases, or automatic endpoint quirks. Use full model identifiers and standard protocol fields.
+aliases, or automatic vendor detection. Use full model identifiers. A shared Chat codec normalizes
+specific compatible streaming variations; backend wire types and replay policies stay behind the
+unified `Provider` / `ProviderContext` interface.
 
 ```toml
 approve_all = false
@@ -442,6 +449,76 @@ output limit you want Skyhook to use for that model; the example values are cons
 points. Both must be positive and `max_output` must be smaller than `max_context`. Protocol-specific
 limits are validated by the backend or service. Codex subscription does not accept an output-token
 limit on the wire; its configured limit remains available to local context budgeting.
+
+### Reasoning history and local-server compatibility
+
+All backends retain returned reasoning and replay state in the session journal. Responses and Codex
+replay native reasoning items (including encrypted state), and Anthropic replays signed thinking or
+redacted-thinking blocks. Native replay is automatic when provider, endpoint, protocol, and model
+provenance match. Visible summaries are not substituted for opaque or signed state. Switching to an
+incompatible provider/model filters replay from that request without deleting the original history.
+Reasoning that the service never returns cannot be reconstructed.
+
+Standard Chat Completions has no portable request-side reasoning field. Compatible Chat providers
+replay their returned, scoped reasoning using **`reasoning_content` by default**: this is consumed by
+llama.cpp and SGLang, and accepted as an alias by current vLLM. Ordinary Chat responses without
+reasoning do not acquire an invented reasoning field. Configure a different spelling or disable
+request replay on the **provider**, not individual model profiles:
+
+```toml
+[providers.local]
+kind = "openai"
+base_url = "http://127.0.0.1:11434/v1"
+api = "chat_completions"
+# Optional; this is the default:
+chat_reasoning_replay = "reasoning_content"
+# Alternatives: "reasoning", or "unsupported" to keep reasoning locally only.
+```
+
+This option belongs only to OpenAI-compatible Chat Completions. Anthropic and Codex reject it as an
+unknown setting; configuring it with `api = "responses"` is also rejected. Their native reasoning
+replay remains automatic and independent of this option. All models using a provider share its
+Chat wire convention; use separate provider entries if a proxy routes to incompatible conventions.
+The agent runtime and generic `ModelRequest` never interpret this setting.
+
+Reasoning is replayed with its owning assistant turn, including tool calls and reasoning-only turns;
+it is never merged into answer text or fabricated `<think>` tags. Old Chat transcripts that contain
+only display text without scoped replay provenance cannot safely be upgraded to native replay.
+Compaction retains complete selected assistant/tool exchanges; older exchanges may be summarized to
+keep active context bounded, while original journal events remain available.
+
+OpenAI-compatible and Anthropic providers also accept positive `startup_timeout_secs` and
+`read_idle_timeout_secs` settings (both default to 600 seconds). Startup is a deadline for each HTTP
+attempt, while read-idle resets after each response-body chunk. For example:
+
+```toml
+[providers.local]
+kind = "openai"
+base_url = "http://127.0.0.1:8080/v1"
+api = "chat_completions"
+startup_timeout_secs = 600
+read_idle_timeout_secs = 600
+```
+
+The Chat codec accepts llama-swap loading chunks with an absent singleton choice index, repeated
+same-tool updates within one chunk (such as vLLM Hermes), and late cache-usage attribution. It still
+rejects malformed/nonzero choice indexes, multiple answer choices, and unsupported semantic
+extensions. Server-side tool and reasoning parsers/templates must be configured appropriately;
+Skyhook does not infer them from model names. The current `max_completion_tokens` and usage-stream
+fields are shared by OpenAI, llama.cpp, vLLM, and SGLang; no automatic parameter renaming is applied.
+
+Transport owns retries, with **at most three HTTP attempts** for pre-response connection/send
+failures, startup/header timeouts, and transient HTTP 408/429/500/502/503/504 responses. Each attempt receives a fresh startup
+deadline; three startup timeouts can therefore take about 30 minutes at the defaults, plus bounded
+backoff. Exhausted transient failures include the HTTP attempt count. Short `Retry-After` delays are honored;
+long or unparseable delays are returned to the caller rather than retried early. Cancellation drops
+the pending request or retry wait. The server may continue work if it does not honor disconnects.
+
+After successful headers are accepted, malformed streams, read-idle timeouts, and partial output are
+not replayed. Deterministic protocol/configuration failures and refusals are not regenerated by the
+agent loop. Context-overflow recovery remains a separate compaction path. Codex retains single-attempt
+HTTP and its existing WebSocket limits/safety rules. Aborted or truncated tool generation never makes
+incomplete arguments executable.
 
 The `codex` provider uses **Skyhook-owned** OAuth credentials. Run `skyhook auth login` for browser
 authorization or `skyhook auth login --headless` for device authorization. `skyhook auth status`
@@ -566,8 +643,11 @@ errors include it in an `output` field; JavaScript callers can catch the error a
   Input images are encoded or rejected explicitly, never silently dropped. Protocols without
   image-bearing tool results adapt images into adjacent user content associated with the tool call.
   Chat Completions also accepts the common `reasoning_content` / `reasoning` streaming fields used
-  by local Qwen servers, preserving separate visible reasoning blocks without replaying private
-  reasoning in subsequent Chat requests. Null optional extension fields are tolerated; unsupported
+  by local Qwen servers, preserving separate visible reasoning blocks and scoped replay envelopes.
+  Chat request-side replay uses the provider's `chat_reasoning_replay` field selector (default
+  `reasoning_content`);
+  other APIs replay their compatible native reasoning state automatically. Null optional extension
+  fields are tolerated; unsupported
   nonempty semantic fields fail explicitly. Generated image outputs are not supported.
 - Each agent loop owns an `AgentContext`: projected journal history, model profile and request
   template, token accounting, and its provider handle. Codex contexts have separate WebSocket
@@ -592,10 +672,19 @@ errors include it in an `output` field; JavaScript callers can catch the error a
   waiting for the child job to finish. These attributed replies are separate from the final
   job result, so progress text is not concatenated into the final answer. A foreground call
   still needs to return before its parent can make another model request.
+  Progress and terminal/question notifications share a snapshot → parent-history commit →
+  acknowledgment boundary. Failed or abandoned preparation leaves notifications pending, and
+  caller cancellation cannot split a started append/acknowledgment operation. Job replay recognizes
+  already-committed runtime notifications to avoid duplicate terminal delivery after restart.
+  Uncommitted child progress is still an in-memory queue: a host crash can lose its pending delivery,
+  although the original child conversation may retain the response. Delivery means inclusion in
+  parent history at a request boundary, not interruption of an in-flight model request.
   Sending to a completed child appends
   the instructions after its existing
   conversation and starts a new request under the same agent and job ID; it does not start
-  over with fresh history. This resumption applies to successfully completed agent jobs retained
+  over with fresh history. `job_output(id)` then exposes the latest run's saved result, not an archive
+  of earlier results; already-committed parent notifications and the child conversation remain intact.
+  This resumption applies to successfully completed agent jobs retained
   in the live runtime, not arbitrary completed tools or jobs restored after a process restart.
   Failed, cancelled, and interrupted agents are not resumed by `send`.
   Each model-facing `ask` contains one

@@ -429,10 +429,19 @@ fn new_returns_to_draft_and_submission_creates_a_second_session() {
     terminal.send("/requests\r");
     terminal.wait_for("request metadata and tokens on one line", |screen| {
         screen.contents().lines().any(|line| {
+            let fields: Vec<_> = line
+                .split_whitespace()
+                .filter(|word| *word != "·")
+                .collect();
+            let stats = &fields[fields.len().saturating_sub(4)..];
             line.contains("Request #")
-                && line.contains("Out 84")
-                && line.contains("In 80")
-                && line.contains("Cached 20")
+                && stats.len() == 4
+                && stats[..3] == ["84", "80", "20"]
+                && stats[3].ends_with('s')
+                && !line.contains("Out ")
+                && !line.contains("In ")
+                && !line.contains("Cached ")
+                && !line.contains("Time ")
         })
     });
     terminal.send("\r"); // Requests cannot expand to expose provider input or responses.

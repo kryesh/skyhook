@@ -1216,6 +1216,7 @@ impl SessionRuntime {
                 // Every input/notification path shares the same delivery gate.
                 let _ = sender.flush_events(&cancellation).await;
             }
+            let mut pending_events = None;
             let (content, done, selected_model) = match command {
                 AgentCommand::QueuedInputs(inputs) => {
                     if !self
@@ -1250,7 +1251,10 @@ impl SessionRuntime {
                         .pending_event_content(&id, &capabilities, &location)
                         .await
                     {
-                        Ok(content) if !content.is_empty() => content,
+                        Ok((content, messages)) if !content.is_empty() => {
+                            pending_events = Some(messages);
+                            content
+                        }
                         Ok(_)
                             if is_child
                                 && child_answer.is_some()
@@ -1306,7 +1310,13 @@ impl SessionRuntime {
             self.activity(&id, AgentActivity::Working);
             if !content.is_empty() {
                 let message = Message::User(content);
-                let committed = self.commit(&id, message.clone()).await;
+                let committed = match pending_events {
+                    Some(messages) => messages.commit(&self, &id, message.clone()).await,
+                    None => self
+                        .commit(&id, message.clone())
+                        .await
+                        .map_err(HarnessError::from),
+                };
                 if let Err(error) = &committed {
                     if let Some(done) = done.or_else(|| child_done.take()) {
                         let _ = done.send(Err(error.to_string()));
@@ -1476,11 +1486,11 @@ impl SessionRuntime {
             if cancellation.is_cancelled() {
                 return Err(HarnessError::Interrupted);
             }
-            let content = self
+            let (content, messages) = self
                 .pending_event_content(agent, capabilities, location)
                 .await?;
             if !content.is_empty() {
-                self.commit(agent, Message::User(content)).await?;
+                messages.commit(self, agent, Message::User(content)).await?;
             }
             let profile = agent_context.profile.clone();
             if !profile.supports_images && agent_context.contains_images() {
@@ -1567,10 +1577,12 @@ impl SessionRuntime {
                         error.to_string(),
                     )
                     .await?;
-                    if provider_attempt < compact::MAX_PROVIDER_ATTEMPTS {
-                        force_compaction =
-                            error.kind == crate::provider::ProviderErrorKind::ContextWindowExceeded;
-                        compact::retry_delay(cancellation, provider_attempt).await?;
+                    // Transport owns retries. A context rejection may recover only by
+                    // changing the request through bounded compaction, never blind replay.
+                    if provider_attempt < compact::MAX_PROVIDER_ATTEMPTS
+                        && error.kind == crate::provider::ProviderErrorKind::ContextWindowExceeded
+                    {
+                        force_compaction = true;
                         continue;
                     }
                     return Err(error.into());
@@ -1578,10 +1590,14 @@ impl SessionRuntime {
             };
             let mut assembler = ResponseAssembler::default();
             let mut usage = Usage::default();
+            let mut saw_content = false;
             loop {
                 let chunk = tokio::select! {
                     chunk = response.next() => chunk,
-                    () = cancellation.cancelled() => return Err(HarnessError::Interrupted),
+                    () = cancellation.cancelled() => {
+                        self.record_model_usage(agent, requested.sequence, usage).await?;
+                        return Err(HarnessError::Interrupted);
+                    },
                 };
                 let Some(chunk) = chunk else {
                     break;
@@ -1600,15 +1616,18 @@ impl SessionRuntime {
                             error.to_string(),
                         )
                         .await?;
-                        if provider_attempt < compact::MAX_PROVIDER_ATTEMPTS {
-                            force_compaction = error.kind
-                                == crate::provider::ProviderErrorKind::ContextWindowExceeded;
-                            compact::retry_delay(cancellation, provider_attempt).await?;
+                        if !saw_content
+                            && provider_attempt < compact::MAX_PROVIDER_ATTEMPTS
+                            && error.kind
+                                == crate::provider::ProviderErrorKind::ContextWindowExceeded
+                        {
+                            force_compaction = true;
                             continue 'requests;
                         }
                         return Err(error.into());
                     }
                 };
+                saw_content |= !matches!(&chunk, ResponseChunk::UsageUpdated { .. });
                 if let ResponseChunk::UsageUpdated { usage: value } = &chunk {
                     usage = *value;
                 }
@@ -1629,16 +1648,33 @@ impl SessionRuntime {
                         error.to_string(),
                     )
                     .await?;
-                    if provider_attempt < compact::MAX_PROVIDER_ATTEMPTS {
-                        compact::retry_delay(cancellation, provider_attempt).await?;
-                        continue;
-                    }
                     return Err(error);
                 }
             };
             let assistant = Message::Assistant(response.blocks);
             let origin = self.commit(agent, assistant.clone()).await?;
             agent_context.projected.push((origin, assistant));
+            if response.stop_reason == crate::provider::protocol::StopReason::Aborted {
+                // Preserve completed visible/replay content, but never turn a
+                // provider cancellation into a successful agent turn. The failure
+                // helper records observed usage exactly once before returning.
+                let error = "provider aborted response".to_owned();
+                self.record_model_failure(
+                    agent,
+                    requested.sequence,
+                    provider_attempt,
+                    response.usage,
+                    error.clone(),
+                )
+                .await?;
+                self.events.send(RuntimeEvent::ResponseSettled {
+                    agent: agent.clone(),
+                    request: requested.sequence,
+                    message: Some(origin),
+                    error: Some(error),
+                });
+                return Err(HarnessError::Interrupted);
+            }
             if let Some(job) = owner_job
                 && !response.calls.is_empty()
                 && !response.text.trim().is_empty()
@@ -1676,11 +1712,15 @@ impl SessionRuntime {
             provider_attempt = 0;
             compaction_checked = false;
             if response.calls.is_empty() {
-                // Replies arriving during this provider request must be processed
-                // before returning an answer based on the earlier context.
-                let content = self.child_message_content(agent);
+                // Notifications arriving during this provider request must be
+                // processed before returning an answer based on earlier context.
+                // Use the same snapshot/commit/ack boundary for child progress
+                // and terminal/question events, including a shared completion batch.
+                let (content, messages) = self
+                    .pending_event_content(agent, capabilities, location)
+                    .await?;
                 if !content.is_empty() {
-                    self.commit(agent, Message::User(content)).await?;
+                    messages.commit(self, agent, Message::User(content)).await?;
                     final_text.clear();
                     continue 'requests;
                 }
@@ -1802,6 +1842,7 @@ impl SessionRuntime {
 }
 
 struct FoldedResponse {
+    stop_reason: crate::provider::protocol::StopReason,
     blocks: Vec<AssistantContent>,
     usage: Usage,
     calls: Vec<ToolCall>,
@@ -1812,7 +1853,22 @@ fn finish_response(
     assembler: ResponseAssembler,
     usage: Usage,
 ) -> Result<FoldedResponse, HarnessError> {
-    let (blocks, final_usage, _stop_reason) = assembler.finish()?;
+    let (mut blocks, final_usage, stop_reason) = assembler.finish()?;
+    // A terminal limit/filter/abort does not authorize execution, even if a
+    // backend completed valid arguments before learning the final stop reason.
+    if matches!(
+        stop_reason,
+        crate::provider::protocol::StopReason::MaxTokens
+            | crate::provider::protocol::StopReason::ContentFilter
+            | crate::provider::protocol::StopReason::Aborted
+    ) {
+        blocks.retain(|item| {
+            !item
+                .blocks
+                .iter()
+                .any(|block| matches!(block.content, BlockContent::ToolCall(_)))
+        });
+    }
     debug_assert_eq!(usage, final_usage);
     let text = blocks
         .iter()
@@ -1831,6 +1887,7 @@ fn finish_response(
         })
         .collect();
     Ok(FoldedResponse {
+        stop_reason,
         blocks,
         usage,
         calls,
@@ -2439,7 +2496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incomplete_native_response_is_retried_without_committing_deltas() {
+    async fn incomplete_native_response_is_not_retried_or_committed() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
         let harness = test_harness(
@@ -2473,7 +2530,7 @@ mod tests {
         )
         .await;
         let session = harness.new_session().await.unwrap();
-        assert_eq!(session.prompt("Question").await.unwrap(), "Recovered");
+        assert!(session.prompt("Question").await.is_err());
         session.shutdown().await.unwrap();
         let records = SessionStore::read_records(sessions.path(), session.id())
             .await
@@ -2489,10 +2546,138 @@ mod tests {
                 _ => None,
             })
             .collect();
+        assert!(assistants.is_empty());
         assert_eq!(
-            assistants,
-            vec![&vec![AssistantContent::text("answer", 0, "Recovered")]]
+            records
+                .iter()
+                .filter(|record| matches!(record.event, SessionEvent::ModelRequested { .. }))
+                .count(),
+            1
         );
+    }
+
+    #[test]
+    fn abnormal_termination_never_executes_even_completed_tool_calls() {
+        for reason in [
+            StopReason::MaxTokens,
+            StopReason::ContentFilter,
+            StopReason::Aborted,
+        ] {
+            let mut assembler = ResponseAssembler::default();
+            let items = vec![
+                AssistantContent::text("answer", 0, "Visible response"),
+                AssistantContent::tool_call(
+                    "tool",
+                    1,
+                    ToolCall {
+                        id: "call".into(),
+                        name: "shell".into(),
+                        arguments: json!({"command":"unsafe"}),
+                    },
+                ),
+            ];
+            for event in crate::provider::protocol::events_for_content(&items) {
+                assembler.push(&event).unwrap();
+            }
+            assembler
+                .push(&ResponseChunk::ResponseEnded {
+                    stop_reason: reason,
+                })
+                .unwrap();
+            let folded = finish_response(assembler, Usage::default()).unwrap();
+            assert_eq!(folded.text, "Visible response");
+            assert!(folded.calls.is_empty());
+            assert_eq!(folded.blocks.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_response_preserves_visible_content_and_usage_but_settles_as_interrupted() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let retained = vec![
+            AssistantContent::reasoning(
+                "reason",
+                0,
+                "completed reasoning",
+                Some(replay(json!({"encrypted_content":"retained"}))),
+            ),
+            AssistantContent::text("answer", 1, "partial visible answer"),
+        ];
+        let mut items = retained.clone();
+        items.push(AssistantContent::tool_call(
+            "tool",
+            2,
+            ToolCall {
+                id: "call".into(),
+                name: "write".into(),
+                arguments: json!({"path":"must-not-exist", "content":"unsafe"}),
+            },
+        ));
+        let observed = Usage {
+            input_tokens: 11,
+            cached_input_tokens: 7,
+            output_tokens: 3,
+        };
+        let mut chunks = events_for_content(&items);
+        chunks.push(ResponseChunk::UsageUpdated { usage: observed });
+        chunks.push(ResponseChunk::ResponseEnded {
+            stop_reason: StopReason::Aborted,
+        });
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            scripted_provider(&requests, [chunks]),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        let mut events = session.runtime.events.subscribe();
+        let error = session.prompt("Abort this turn.").await.unwrap_err();
+        assert!(error.to_string().contains("interrupted"));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(session.usage().await, observed);
+        let records = session.runtime.store.records().await;
+        let assistants: Vec<_> = records
+            .iter()
+            .filter_map(|record| match &record.event {
+                SessionEvent::MessageCommitted {
+                    message: Message::Assistant(items),
+                } => Some(items.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistants, vec![retained]);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.event, SessionEvent::Usage { .. }))
+                .count(),
+            1
+        );
+        assert!(records.iter().any(|record| matches!(&record.event, SessionEvent::ModelFailed { error, .. } if error == "provider aborted response")));
+        assert!(
+            !records
+                .iter()
+                .any(|record| matches!(record.event, SessionEvent::JobCreated { .. }))
+        );
+        assert!(!workspace.path().join("must-not-exist").exists());
+        let mut settled = false;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                RuntimeEvent::ResponseSettled { message, error, .. } => {
+                    assert!(message.is_some());
+                    assert_eq!(error.as_deref(), Some("provider aborted response"));
+                    settled = true;
+                }
+                RuntimeEvent::TurnCompleted { .. } => {
+                    panic!("aborted turn cannot complete successfully")
+                }
+                _ => {}
+            }
+        }
+        assert!(settled);
+        session.shutdown().await.unwrap();
     }
 
     #[tokio::test]

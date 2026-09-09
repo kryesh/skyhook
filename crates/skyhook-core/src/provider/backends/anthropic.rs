@@ -235,6 +235,7 @@ struct Block {
     has_json_delta: bool,
     ended: bool,
     completed: Option<(BlockContent, Option<ReplayEnvelope>)>,
+    tool_error: Option<ProviderError>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -444,6 +445,7 @@ impl Decoder {
                         has_json_delta: false,
                         ended: false,
                         completed: None,
+                        tool_error: None,
                     },
                 );
                 Ok(chunks)
@@ -536,50 +538,23 @@ impl Decoder {
                         }
                     }
                     "tool_use" => {
-                        let arguments = if block.has_json_delta {
-                            serde_json::from_str::<Value>(&block.partial_json)
-                                .map_err(|_| protocol("invalid tool input JSON"))?
-                        } else {
-                            block.native["input"].clone()
-                        };
-                        if !arguments.is_object() {
-                            return Err(protocol("tool input must be a JSON object"));
+                        // The terminal reason arrives after content_block_stop. An
+                        // incomplete input is truncation, not a protocol failure,
+                        // when that reason is max_tokens or refusal.
+                        match tool_content(block) {
+                            Ok(content) => content,
+                            Err(error) => {
+                                block.ended = true;
+                                block.tool_error = Some(error);
+                                return self.emit_completed_blocks(false);
+                            }
                         }
-                        BlockContent::ToolCall(ToolCall {
-                            id: string(&block.native, "id")?.into(),
-                            name: string(&block.native, "name")?.into(),
-                            arguments,
-                        })
                     }
                     _ => return Err(protocol("unsupported completed content block")),
                 };
                 block.ended = true;
                 block.completed = Some((completed, replay));
-                let mut chunks = Vec::new();
-                while let Some(block) = self
-                    .blocks
-                    .get_mut(&self.next_end)
-                    .filter(|block| block.ended)
-                {
-                    let (content, replay) = block
-                        .completed
-                        .take()
-                        .ok_or_else(|| protocol("block was already emitted"))?;
-                    chunks.push(ResponseChunk::BlockEnded {
-                        item: self.next_end.to_string(),
-                        block: "0".into(),
-                        content,
-                    });
-                    chunks.push(ResponseChunk::ItemEnded {
-                        id: self.next_end.to_string(),
-                        replay,
-                    });
-                    self.next_end = self
-                        .next_end
-                        .checked_add(1)
-                        .ok_or_else(|| protocol("block index overflow"))?;
-                }
-                Ok(chunks)
+                self.emit_completed_blocks(false)
             }
             "message_delta" => {
                 self.require_all_blocks_ended()?;
@@ -605,9 +580,32 @@ impl Decoder {
                         .ok_or_else(|| protocol("message_delta missing usage"))?,
                     false,
                 )?;
+                let discard_tools = matches!(
+                    stop_reason,
+                    StopReason::MaxTokens | StopReason::ContentFilter
+                );
+                let mut chunks = Vec::new();
+                if discard_tools {
+                    // Even syntactically complete inputs are unsafe on abnormal
+                    // stops. Retract tools already emitted, as well as pending
+                    // ones, before the response can be promoted for execution.
+                    for (id, block) in &self.blocks {
+                        if block.native["type"] == "tool_use" {
+                            chunks.push(ResponseChunk::ItemDiscarded { id: id.to_string() });
+                        }
+                    }
+                } else {
+                    for block in self.blocks.values_mut() {
+                        if let Some(error) = block.tool_error.take() {
+                            return Err(error);
+                        }
+                    }
+                }
+                chunks.extend(self.emit_completed_blocks(discard_tools)?);
                 self.stop_reason = Some(stop_reason);
                 self.message_delta = true;
-                Ok(vec![ResponseChunk::UsageUpdated { usage }])
+                chunks.push(ResponseChunk::UsageUpdated { usage });
+                Ok(chunks)
             }
             "message_stop" => {
                 self.require_all_blocks_ended()?;
@@ -626,6 +624,46 @@ impl Decoder {
         }
     }
 
+    fn emit_completed_blocks(
+        &mut self,
+        discard_tools: bool,
+    ) -> Result<Vec<ResponseChunk>, ProviderError> {
+        let mut chunks = Vec::new();
+        while let Some(block) = self
+            .blocks
+            .get_mut(&self.next_end)
+            .filter(|block| block.ended)
+        {
+            if discard_tools && block.native["type"] == "tool_use" {
+                block.completed = None;
+                block.tool_error = None;
+            } else {
+                if block.tool_error.is_some() {
+                    // Keep index ordering while awaiting the terminal reason.
+                    break;
+                }
+                let (content, replay) = block
+                    .completed
+                    .take()
+                    .ok_or_else(|| protocol("block was already emitted"))?;
+                chunks.push(ResponseChunk::BlockEnded {
+                    item: self.next_end.to_string(),
+                    block: "0".into(),
+                    content,
+                });
+                chunks.push(ResponseChunk::ItemEnded {
+                    id: self.next_end.to_string(),
+                    replay,
+                });
+            }
+            self.next_end = self
+                .next_end
+                .checked_add(1)
+                .ok_or_else(|| protocol("block index overflow"))?;
+        }
+        Ok(chunks)
+    }
+
     fn require_content_phase(&self) -> Result<(), ProviderError> {
         if self.message_delta {
             Err(protocol("content event after terminal message_delta"))
@@ -638,7 +676,7 @@ impl Decoder {
         if self.blocks.values().any(|block| !block.ended) {
             return Err(protocol("message ended with open content blocks"));
         }
-        if self.next_end != self.blocks.len() {
+        if self.blocks.keys().copied().ne(0..self.blocks.len()) {
             return Err(protocol(
                 "content block indices are not contiguous from zero",
             ));
@@ -685,6 +723,23 @@ impl Decoder {
         }
         Ok(Vec::new())
     }
+}
+
+fn tool_content(block: &Block) -> Result<BlockContent, ProviderError> {
+    let arguments = if block.has_json_delta {
+        serde_json::from_str::<Value>(&block.partial_json)
+            .map_err(|_| protocol("invalid tool input JSON"))?
+    } else {
+        block.native["input"].clone()
+    };
+    if !arguments.is_object() {
+        return Err(protocol("tool input must be a JSON object"));
+    }
+    Ok(BlockContent::ToolCall(ToolCall {
+        id: string(&block.native, "id")?.into(),
+        name: string(&block.native, "name")?.into(),
+        arguments,
+    }))
 }
 
 fn index(value: &Value) -> Result<usize, ProviderError> {
@@ -1027,6 +1082,108 @@ mod tests {
         assert_eq!(replay.payload, redacted);
     }
 
+    #[tokio::test]
+    async fn signed_and_redacted_reasoning_tool_roundtrip_survives_save_resume() {
+        use super::super::common::{
+            bind_reasoning_scope, filter_reasoning_scope, reasoning_scope, tests::resume_request,
+        };
+        let mut request = request();
+        let scope = reasoning_scope("anthropic", "https://api.example/v1/messages");
+        let native = json!({"type":"thinking", "thinking":"original private text", "signature":"sig+/=",
+            "future_field":{"opaque":"preserve"}});
+        let redacted =
+            json!({"type":"redacted_thinking", "data":"encrypted+/=", "future_field":42});
+        let tool =
+            json!({"type":"tool_use", "id":"call_1", "name":"inspect", "input":{"path":"test"}});
+        let mut decoder = Decoder::new(request.model.clone());
+        let mut assembler = crate::provider::protocol::ResponseAssembler::default();
+        for frame in [
+            start(),
+            block_start(
+                0,
+                json!({"type":"thinking", "thinking":"original ", "signature":"",
+                "future_field":{"opaque":"preserve"}}),
+            ),
+            delta(
+                0,
+                json!({"type":"thinking_delta", "thinking":"private text"}),
+            ),
+            delta(0, json!({"type":"signature_delta", "signature":"sig+"})),
+            delta(0, json!({"type":"signature_delta", "signature":"/="})),
+            stop(0),
+            block_start(1, redacted.clone()),
+            stop(1),
+            block_start(2, tool.clone()),
+            stop(2),
+            terminal("tool_use", 12),
+            json!({"type":"message_stop"}),
+        ] {
+            for mut chunk in decoder.decode(&event(frame)).unwrap() {
+                bind_reasoning_scope(&mut chunk, &scope);
+                assembler.push(&chunk).unwrap();
+            }
+        }
+        let (mut items, _, reason) = assembler.finish().unwrap();
+        assert_eq!(reason, StopReason::ToolUse);
+        assert_eq!(items[0].replay.as_ref().unwrap().payload, native);
+        assert_eq!(items[1].replay.as_ref().unwrap().payload, redacted);
+        // UI summaries are not authoritative signed thinking and must never be
+        // used to reconstruct the native payload, even after persistence.
+        items[0].blocks[0].content = BlockContent::Reasoning {
+            text: "display summary only".into(),
+        };
+        request.messages.push(Message::Assistant(items));
+        request.messages.push(Message::Tool(vec![ToolResult {
+            call_id: "call_1".into(),
+            name: "inspect".into(),
+            result: json!({"ok":true}),
+            images: vec![],
+            is_error: false,
+        }]));
+        let original = resume_request(&request).await;
+        let mut matching = original.clone();
+        filter_reasoning_scope(&mut matching, &scope);
+        let body = encode(&matching).unwrap();
+        assert_eq!(
+            body["messages"][1]["content"],
+            json!([native, redacted, tool])
+        );
+        assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "call_1");
+        assert!(body.get("thinking").is_none()); // replay does not require enabling new thinking
+        for foreign_scope in [
+            reasoning_scope("other-provider", "https://api.example/v1/messages"),
+            reasoning_scope("anthropic", "https://other.example/v1/messages"),
+        ] {
+            let mut foreign = original.clone();
+            filter_reasoning_scope(&mut foreign, &foreign_scope);
+            let Message::Assistant(items) = &foreign.messages[1] else {
+                unreachable!()
+            };
+            assert_eq!(items.len(), 3);
+            assert_eq!(
+                items[0].blocks[0].content,
+                BlockContent::Reasoning {
+                    text: "display summary only".into()
+                }
+            );
+            assert!(items[0].replay.is_none());
+            assert_eq!(
+                encode(&foreign).unwrap()["messages"][1]["content"],
+                json!([tool])
+            );
+        }
+        let mut foreign = original.clone();
+        foreign.model = "different-model".into();
+        assert_eq!(
+            encode(&foreign).unwrap()["messages"][1]["content"],
+            json!([tool])
+        );
+        assert_eq!(
+            encode(&original).unwrap()["messages"][1]["content"][0],
+            native
+        );
+    }
+
     #[test]
     fn interleaved_tools_are_finalized_in_native_index_order() {
         let mut decoder = started();
@@ -1054,6 +1211,123 @@ mod tests {
         assert!(
             matches!(&chunks[2],ResponseChunk::BlockEnded { item, content:BlockContent::ToolCall(call), .. } if item == "1" && call.arguments == json!({"x":1}))
         );
+    }
+
+    #[test]
+    fn abnormal_tool_stops_preserve_completed_reasoning_and_final_usage() {
+        use crate::provider::protocol::ResponseAssembler;
+
+        for (reason, expected) in [
+            ("max_tokens", StopReason::MaxTokens),
+            ("model_context_window_exceeded", StopReason::MaxTokens),
+            ("refusal", StopReason::ContentFilter),
+        ] {
+            // A valid object is also provisional until the terminal reason.
+            for input in [r#"{"path":"part"#, r#"{"path":"complete"}"#, "[]"] {
+                let mut decoder = Decoder::new("claude-test".into());
+                let mut assembler = ResponseAssembler::default();
+                let signed = json!({"type":"thinking", "thinking":"private text",
+                    "signature":"signed+/=", "future_field":{"opaque":true}});
+                let redacted = json!({"type":"redacted_thinking", "data":"encrypted+/=",
+                    "future_field":42});
+                let mut chunks = Vec::new();
+                for frame in [
+                    start(),
+                    block_start(0, signed.clone()),
+                    stop(0),
+                    block_start(1, redacted.clone()),
+                    stop(1),
+                    block_start(
+                        2,
+                        json!({"type":"tool_use", "id":"call_1",
+                        "name":"inspect", "input":{}}),
+                    ),
+                    delta(2, json!({"type":"input_json_delta", "partial_json":input})),
+                    stop(2),
+                    terminal(reason, 19),
+                    json!({"type":"message_stop"}),
+                ] {
+                    for chunk in decoder.decode(&event(frame)).unwrap() {
+                        assembler.push(&chunk).unwrap();
+                        chunks.push(chunk);
+                    }
+                }
+                decoder.finish().unwrap();
+                assert!(chunks.contains(&ResponseChunk::ItemDiscarded { id: "2".into() }));
+                let (items, usage, stop_reason) = assembler.finish().unwrap();
+                assert_eq!(stop_reason, expected);
+                assert_eq!(
+                    usage,
+                    Usage {
+                        input_tokens: 24,
+                        cached_input_tokens: 17,
+                        output_tokens: 19,
+                    }
+                );
+                assert_eq!(items.len(), 2);
+                assert!(items.iter().all(|item| item.kind == ItemKind::Reasoning));
+                assert_eq!(items[0].replay.as_ref().unwrap().payload, signed);
+                assert_eq!(items[1].replay.as_ref().unwrap().payload, redacted);
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_tool_does_not_block_later_completed_reasoning() {
+        use crate::provider::protocol::ResponseAssembler;
+
+        let mut decoder = Decoder::new("claude-test".into());
+        let mut assembler = ResponseAssembler::default();
+        let signed = json!({"type":"thinking", "thinking":"private", "signature":"signed"});
+        for frame in [
+            start(),
+            block_start(
+                0,
+                json!({"type":"tool_use", "id":"call_1",
+                "name":"inspect", "input":{}}),
+            ),
+            delta(0, json!({"type":"input_json_delta", "partial_json":"{"})),
+            stop(0),
+            block_start(1, signed.clone()),
+            stop(1),
+            terminal("max_tokens", 19),
+            json!({"type":"message_stop"}),
+        ] {
+            for chunk in decoder.decode(&event(frame)).unwrap() {
+                assembler.push(&chunk).unwrap();
+            }
+        }
+        let (items, usage, reason) = assembler.finish().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].replay.as_ref().unwrap().payload, signed);
+        assert_eq!(usage.output_tokens, 19);
+        assert_eq!(reason, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn malformed_tool_input_still_errors_on_normal_terminal_reason() {
+        for reason in ["tool_use", "end_turn", "stop_sequence", "pause_turn"] {
+            for input in ["{", "[]", ""] {
+                let mut decoder = started();
+                decoder
+                    .decode(&event(block_start(
+                        0,
+                        json!({"type":"tool_use",
+                    "id":"call_1", "name":"inspect", "input":{}}),
+                    )))
+                    .unwrap();
+                decoder
+                    .decode(&event(delta(
+                        0,
+                        json!({"type":"input_json_delta",
+                    "partial_json":input}),
+                    )))
+                    .unwrap();
+                assert!(decoder.decode(&event(stop(0))).unwrap().is_empty());
+                assert!(decoder.decode(&event(terminal(reason, 19))).is_err());
+                assert!(decoder.finish().is_err());
+            }
+        }
     }
 
     #[test]

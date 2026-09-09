@@ -139,7 +139,7 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
     if let Some(effort) = &request.reasoning {
         if !matches!(
             effort.as_str(),
-            "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
         ) {
             return Err(invalid(format!(
                 "Unsupported Responses reasoning effort: {effort}"
@@ -246,6 +246,26 @@ fn final_parts(item: &Value) -> Result<Vec<BlockContent>, ProviderError> {
     }
 }
 
+/// A completion snapshot may add native state, but must not erase or rewrite
+/// state already received. Arrays (including summaries) remain authoritative,
+/// indivisible values. This only validates; replay always uses the full snapshot.
+fn native_enrichment(previous: &Value, terminal: &Value) -> bool {
+    if previous == terminal || previous.is_null() {
+        return true;
+    }
+    match (previous.as_object(), terminal.as_object()) {
+        (Some(previous), Some(terminal)) => previous.iter().all(|(key, value)| {
+            terminal.get(key).is_some_and(|next| {
+                // Some streams use an empty ciphertext placeholder until the
+                // final response. Nonempty ciphertext must never be rewritten.
+                (key == "encrypted_content" && value.as_str() == Some("") && next.is_string())
+                    || native_enrichment(value, next)
+            })
+        }),
+        _ => false,
+    }
+}
+
 fn arguments(text: &str) -> Result<Value, ProviderError> {
     let value: Value =
         serde_json::from_str(text).map_err(|_| protocol("invalid function arguments JSON"))?;
@@ -292,9 +312,37 @@ struct Item {
     kind: Kind,
     ended: Option<Value>,
     parts: BTreeMap<usize, Part>,
+    // Native reasoning text uses content_index, independently of summary_index.
+    // It is replay state, not a replacement for the user-visible summary.
+    native_reasoning: BTreeMap<usize, Part>,
     call_id: Option<String>,
     name: Option<String>,
     final_arguments: Option<String>,
+}
+
+fn validate_native_reasoning(item: &Item, native: &Value) -> Result<(), ProviderError> {
+    for (position, streamed) in &item.native_reasoning {
+        let content = native
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|content| content.get(*position))
+            .ok_or_else(|| protocol("final reasoning item omitted streamed native text"))?;
+        if string(content, "type")? != "reasoning_text" {
+            return Err(protocol("unsupported native reasoning content"));
+        }
+        let text = string(content, "text")?;
+        if (!streamed.streamed.is_empty() && streamed.streamed != text)
+            || streamed
+                .ended
+                .as_ref()
+                .is_some_and(|done| done != &BlockContent::Reasoning { text: text.into() })
+        {
+            return Err(protocol(
+                "final native reasoning disagrees with streamed text",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) struct Decoder {
@@ -376,6 +424,7 @@ impl Decoder {
                 kind: item_kind,
                 ended: None,
                 parts: BTreeMap::new(),
+                native_reasoning: BTreeMap::new(),
                 call_id: item
                     .get("call_id")
                     .and_then(Value::as_str)
@@ -504,13 +553,43 @@ impl Decoder {
         if string(native, "id")? != item.native_id || kind(native)? != item.kind {
             return Err(protocol("final output item identity changed"));
         }
+        // A tool may end with partial JSON before the terminal max-token or
+        // filter reason arrives. Keep it provisional; an abnormal stop discards
+        // it, while a normal terminal response must still validate its JSON.
+        if !terminal
+            && item.kind == Kind::Function
+            && arguments(string(native, "arguments")?).is_err()
+        {
+            if item.ended.is_some() {
+                return Err(protocol("duplicate final output item"));
+            }
+            self.items.get_mut(&id).expect("checked item").ended = Some(native.clone());
+            return Ok(());
+        }
         let parts = final_parts(native)?;
+        if terminal
+            || native
+                .get("content")
+                .is_some_and(|content| !content.is_null())
+        {
+            validate_native_reasoning(item, native)?;
+        }
         if let Some(old) = &item.ended {
-            if !terminal
-                || final_parts(old)? != parts
-                || (item.kind == Kind::Reasoning && old != native)
-            {
+            if !terminal || final_parts(old)? != parts {
                 return Err(protocol("duplicate or conflicting final output item"));
+            }
+            if item.kind == Kind::Reasoning && old != native {
+                // The terminal snapshot can supply ciphertext or other native
+                // state absent from output_item.done. Keep that exact snapshot;
+                // never reconstruct signed/encrypted fields from display text.
+                if !native_enrichment(old, native) {
+                    return Err(protocol("conflicting terminal reasoning state"));
+                }
+                chunks.push(ResponseChunk::ItemReplayUpdated {
+                    id: item.native_id.clone(),
+                    replay: reasoning_envelope("responses", &self.model, native.clone()),
+                });
+                self.items.get_mut(&id).expect("checked item").ended = Some(native.clone());
             }
             return Ok(());
         }
@@ -609,6 +688,36 @@ impl Decoder {
                     &mut chunks,
                 )?;
             }
+            // OpenAI's ResponseReasoningText{Delta,Done}Event uses a separate
+            // content_index and is finalized in ResponseReasoningItem.content.
+            "response.reasoning_text.delta" | "response.reasoning_text.done" => {
+                let id = self.active(&event, Kind::Reasoning)?;
+                let position = index(&event, "content_index")?;
+                let part = self
+                    .items
+                    .get_mut(&id)
+                    .expect("checked item")
+                    .native_reasoning
+                    .entry(position)
+                    .or_default();
+                if string(&event, "type")?.ends_with(".delta") {
+                    if part.ended.is_some() {
+                        return Err(protocol("native reasoning delta after done"));
+                    }
+                    part.streamed.push_str(string(&event, "delta")?);
+                } else {
+                    let text = string(&event, "text")?;
+                    let final_content = BlockContent::Reasoning { text: text.into() };
+                    if (!part.streamed.is_empty() && part.streamed != text)
+                        || part.ended.as_ref().is_some_and(|old| old != &final_content)
+                    {
+                        return Err(protocol(
+                            "native reasoning done disagrees with streamed text",
+                        ));
+                    }
+                    part.ended = Some(final_content);
+                }
+            }
             "response.reasoning_summary_text.delta" => {
                 let id = self.active(&event, Kind::Reasoning)?;
                 self.delta(
@@ -628,6 +737,14 @@ impl Decoder {
             "response.function_call_arguments.done" => {
                 let id = self.active(&event, Kind::Function)?;
                 let text = string(&event, "arguments")?;
+                if arguments(text).is_err() {
+                    let item = self.items.get_mut(&id).expect("checked item");
+                    if item.final_arguments.is_some() {
+                        return Err(protocol("conflicting final function arguments"));
+                    }
+                    item.final_arguments = Some(text.into());
+                    return Ok(chunks);
+                }
                 self.validate_arguments(id, text)?;
                 let item = self.items.get_mut(&id).expect("checked item");
                 item.final_arguments = Some(text.into());
@@ -761,15 +878,56 @@ impl Decoder {
                     };
                 let omitted = self.allow_omitted_terminal_output
                     && output.is_empty()
-                    && self.items.values().all(|item| item.ended.is_some());
-                if !omitted && self.items.keys().any(|id| *id >= output.len()) {
+                    && self.items.values().all(|item| {
+                        item.ended.is_some() || (truncated && item.kind == Kind::Function)
+                    });
+                if !omitted
+                    && self.items.iter().any(|(id, item)| {
+                        *id >= output.len() && !(truncated && item.kind == Kind::Function)
+                    })
+                {
                     return Err(protocol("terminal response omitted a streamed output item"));
                 }
                 for (id, native) in output.iter().enumerate() {
                     if !self.items.contains_key(&id) {
                         self.start(id, native, &mut chunks)?;
                     }
+                    if truncated && self.items[&id].kind == Kind::Function {
+                        if string(native, "id")? != self.items[&id].native_id
+                            || kind(native)? != Kind::Function
+                        {
+                            return Err(protocol("final output item identity changed"));
+                        }
+                        continue;
+                    }
                     self.end(id, native, &mut chunks, true)?;
+                }
+                if truncated {
+                    // Even syntactically complete tools are unsafe on an
+                    // abnormal stop; never expose them as executable calls.
+                    for item in self
+                        .items
+                        .values()
+                        .filter(|item| item.kind == Kind::Function)
+                    {
+                        chunks.push(ResponseChunk::ItemDiscarded {
+                            id: item.native_id.clone(),
+                        });
+                    }
+                }
+                // Codex may omit the terminal output array; its completed item
+                // snapshots must still account for every native text delta.
+                if omitted {
+                    for item in self.items.values() {
+                        if truncated && item.kind == Kind::Function {
+                            continue;
+                        }
+                        let native = item.ended.as_ref().expect("checked ended");
+                        // Deferred malformed tools must fail on normal stops,
+                        // including Codex's no-output terminal dialect.
+                        final_parts(native)?;
+                        validate_native_reasoning(item, native)?;
+                    }
                 }
                 if let Some(usage) = response.get("usage").filter(|u| !u.is_null()) {
                     let count = |key: &str| {
@@ -1016,6 +1174,191 @@ mod tests {
         assert_eq!(encode(&req).unwrap()["input"], json!([]));
     }
 
+    #[tokio::test]
+    async fn encrypted_reasoning_and_tools_survive_save_resume_and_scope_changes() {
+        use super::super::common::{
+            bind_reasoning_scope, filter_reasoning_scope, reasoning_scope, tests::resume_request,
+        };
+        let mut req = request();
+        let scope = reasoning_scope("openai", "https://api.example/v1/responses");
+        // No display summary is required for native reasoning to be replayable.
+        let native = json!({"type":"reasoning", "id":"rs_opaque", "summary":[],
+            "encrypted_content":"opaque+/=", "future_state":{"signature":"unchanged"},
+            "content":[{"type":"reasoning_text", "text":"native reasoning text"}]});
+        let mut assembler = crate::provider::protocol::ResponseAssembler::default();
+        let mut decoder = Decoder::new(req.model.clone());
+        for frame in [
+            added(
+                0,
+                json!({"type":"reasoning", "id":"rs_opaque", "summary":[]}),
+            ),
+            json!({"type":"response.reasoning_text.delta", "output_index":0,
+                "item_id":"rs_opaque", "content_index":0, "delta":"native reasoning "}),
+            json!({"type":"response.reasoning_text.delta", "output_index":0,
+                "item_id":"rs_opaque", "content_index":0, "delta":"text"}),
+            json!({"type":"response.reasoning_text.done", "output_index":0,
+                "item_id":"rs_opaque", "content_index":0, "text":"native reasoning text"}),
+            // Ciphertext and future replay state arrive only at completion.
+            done(
+                0,
+                json!({"type":"reasoning", "id":"rs_opaque", "summary":[]}),
+            ),
+            added(1, call_item()),
+            done(1, call_item()),
+            completed(vec![native.clone(), call_item()]),
+        ] {
+            for mut chunk in decoder.feed(frame).unwrap() {
+                bind_reasoning_scope(&mut chunk, &scope);
+                assembler.push(&chunk).unwrap();
+            }
+        }
+        let (items, _, reason) = assembler.finish().unwrap();
+        assert_eq!(reason, StopReason::ToolUse);
+        assert!(items[0].blocks.is_empty());
+        req.messages = vec![
+            Message::Assistant(items),
+            Message::Tool(vec![ToolResult {
+                call_id: "call_1".into(),
+                name: "search".into(),
+                result: json!({"found":true}),
+                images: vec![],
+                is_error: false,
+            }]),
+        ];
+        let original = resume_request(&req).await;
+        let mut matching = original.clone();
+        filter_reasoning_scope(&mut matching, &scope);
+        let body = encode(&matching).unwrap();
+        assert_eq!(body["input"][0], native);
+        assert_eq!(body["input"][1]["type"], "function_call");
+        assert_eq!(body["input"][2]["type"], "function_call_output");
+        assert_eq!(body["input"][1]["call_id"], body["input"][2]["call_id"]);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+
+        for foreign_scope in [
+            reasoning_scope("other-provider", "https://api.example/v1/responses"),
+            reasoning_scope("openai", "https://other.example/v1/responses"),
+        ] {
+            let mut foreign = original.clone();
+            filter_reasoning_scope(&mut foreign, &foreign_scope);
+            let Message::Assistant(items) = &foreign.messages[0] else {
+                unreachable!()
+            };
+            assert_eq!(items.len(), 2);
+            assert!(items[0].blocks.is_empty());
+            assert!(items[0].replay.is_none());
+            assert_eq!(
+                encode(&foreign).unwrap()["input"],
+                json!([body["input"][1].clone(), body["input"][2].clone()])
+            );
+        }
+        let mut foreign = original.clone();
+        foreign.model = "different-model".into();
+        assert_eq!(
+            encode(&foreign).unwrap()["input"].as_array().unwrap().len(),
+            2
+        );
+        // Filtering a call-time clone must never destroy resumable journal state.
+        assert_eq!(encode(&original).unwrap()["input"][0], native);
+    }
+
+    #[test]
+    fn native_reasoning_text_requires_lossless_final_state_in_both_terminal_dialects() {
+        // Shapes follow openai-python's ResponseReasoningTextDeltaEvent,
+        // ResponseReasoningTextDoneEvent, and ResponseReasoningItem.content.
+        for codex in [false, true] {
+            for (content, valid) in [
+                (None, false),
+                (
+                    Some(json!([{"type":"reasoning_text", "text":"different"}])),
+                    false,
+                ),
+                (
+                    Some(json!([{"type":"reasoning_text", "text":"native"}])),
+                    true,
+                ),
+            ] {
+                let mut decoder = if codex {
+                    Decoder::codex("gpt-5".into())
+                } else {
+                    Decoder::new("gpt-5".into())
+                };
+                let mut native = json!({"type":"reasoning", "id":"rs_1", "summary":[]});
+                decoder.feed(added(0, native.clone())).unwrap();
+                assert!(
+                    decoder
+                        .feed(json!({"type":"response.reasoning_text.delta",
+                    "output_index":0, "item_id":"rs_1", "content_index":0, "delta":"native"}))
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    decoder
+                        .feed(json!({"type":"response.reasoning_text.done",
+                    "output_index":0, "item_id":"rs_1", "content_index":0, "text":"native"}))
+                        .unwrap()
+                        .is_empty()
+                );
+                if let Some(content) = content {
+                    native["content"] = content;
+                }
+                let result = decoder.feed(done(0, native.clone())).and_then(|_| {
+                    decoder.feed(completed(if codex { vec![] } else { vec![native] }))
+                });
+                assert_eq!(result.is_ok(), valid, "codex={codex}: {result:?}");
+            }
+        }
+        let mut decoder = Decoder::new("gpt-5".into());
+        decoder.feed(added(0, reasoning_item())).unwrap();
+        decoder
+            .feed(json!({"type":"response.reasoning_text.delta",
+            "output_index":0, "item_id":"rs_1", "content_index":0, "delta":"native"}))
+            .unwrap();
+        assert!(
+            decoder
+                .feed(json!({"type":"response.reasoning_text.done",
+            "output_index":0, "item_id":"rs_1", "content_index":0, "text":"changed"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn terminal_reasoning_may_enrich_but_not_replace_native_state() {
+        for placeholder in [Value::Null, json!("")] {
+            let old = json!({"type":"reasoning", "id":"rs_1", "summary":[], "encrypted_content":placeholder});
+            let terminal = json!({"type":"reasoning", "id":"rs_1", "summary":[], "encrypted_content":"ciphertext"});
+            let mut decoder = Decoder::new("gpt-5".into());
+            decoder.feed(added(0, old.clone())).unwrap();
+            decoder.feed(done(0, old)).unwrap();
+            let chunks = decoder.feed(completed(vec![terminal.clone()])).unwrap();
+            assert!(chunks.iter().any(|chunk| matches!(chunk,
+                ResponseChunk::ItemReplayUpdated { replay, .. } if replay.payload == terminal)));
+        }
+        let old = reasoning_item();
+        for terminal in [
+            {
+                let mut v = old.clone();
+                v["encrypted_content"] = json!("different");
+                v
+            },
+            {
+                let mut v = old.clone();
+                v.as_object_mut().unwrap().remove("encrypted_content");
+                v
+            },
+            {
+                let mut v = old.clone();
+                v["summary"][0]["text"] = json!("different");
+                v
+            },
+        ] {
+            let mut decoder = Decoder::new("gpt-5".into());
+            decoder.feed(added(0, old.clone())).unwrap();
+            decoder.feed(done(0, old.clone())).unwrap();
+            assert!(decoder.feed(completed(vec![terminal])).is_err());
+        }
+    }
+
     #[test]
     fn assistant_text_and_function_calls_encode_as_native_items() {
         let mut req = request();
@@ -1109,6 +1452,90 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn abnormal_terminal_discards_tools_but_preserves_reasoning_and_usage() {
+        for codex in [false, true] {
+            for output_done in [false, true] {
+                for (detail, reason) in [
+                    ("max_output_tokens", StopReason::MaxTokens),
+                    ("content_filter", StopReason::ContentFilter),
+                ] {
+                    for args in ["{\"query\":", "{\"query\":\"rust\"}"] {
+                        let mut decoder = if codex {
+                            Decoder::codex("gpt-5".into())
+                        } else {
+                            Decoder::new("gpt-5".into())
+                        };
+                        let native = reasoning_item();
+                        let mut call = call_item();
+                        call["arguments"] = json!(args);
+                        let mut initial_call = call.clone();
+                        initial_call["arguments"] = json!("");
+                        let mut frames = vec![
+                            added(0, native.clone()),
+                            done(0, native.clone()),
+                            added(1, initial_call),
+                            json!({"type":"response.function_call_arguments.delta", "output_index":1,
+                                "item_id":"fc_1", "delta":args}),
+                            json!({"type":"response.function_call_arguments.done", "output_index":1,
+                                "item_id":"fc_1", "arguments":args}),
+                        ];
+                        if output_done {
+                            frames.push(done(1, call.clone()));
+                        }
+                        frames.push(json!({"type":"response.incomplete", "response":{
+                            "status":"incomplete", "incomplete_details":{"reason":detail},
+                            "output":if codex { vec![] } else { vec![native.clone(), call] },
+                            "usage":{"input_tokens":20,"output_tokens":11}}}));
+                        let mut assembler = crate::provider::protocol::ResponseAssembler::default();
+                        for frame in frames {
+                            for chunk in decoder.feed(frame).unwrap() {
+                                assembler.push(&chunk).unwrap();
+                            }
+                        }
+                        decoder.finish().unwrap();
+                        let (items, usage, actual_reason) = assembler.finish().unwrap();
+                        assert_eq!(actual_reason, reason);
+                        assert_eq!(usage.output_tokens, 11);
+                        assert_eq!(usage.input_tokens, 20);
+                        assert_eq!(items.len(), 1);
+                        assert_eq!(items[0].replay.as_ref().unwrap().payload, native);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_malformed_tools_still_fail_on_normal_terminal() {
+        for codex in [false, true] {
+            let mut decoder = if codex {
+                Decoder::codex("gpt-5".into())
+            } else {
+                Decoder::new("gpt-5".into())
+            };
+            let mut call = call_item();
+            call["arguments"] = json!("{\"query\":");
+            decoder.feed(added(0, call.clone())).unwrap();
+            assert!(decoder.feed(done(0, call.clone())).unwrap().is_empty());
+            assert!(
+                decoder
+                    .feed(completed(if codex { vec![] } else { vec![call] }))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn max_reasoning_effort_is_encoded_without_restricting_model_capabilities() {
+        let mut request = request();
+        request.reasoning = Some("max".into());
+        assert_eq!(
+            encode(&request).unwrap()["reasoning"],
+            json!({"effort":"max", "summary":"auto"})
+        );
     }
 
     #[test]

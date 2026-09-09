@@ -1054,3 +1054,212 @@ async fn idle_agent_batches_background_notifications_without_a_wait_call() {
     bounded(barrier).await.unwrap().unwrap();
     session.shutdown().await.unwrap();
 }
+
+/// A parent can be cancelled while output presentation/commit is still pending.
+/// Snapshotting must not consume the only live copy of a child's progress.
+#[tokio::test]
+async fn child_progress_snapshot_survives_abandoned_and_failed_parent_commits() {
+    let workspace = tempfile::tempdir().unwrap();
+    let tracking = Tracking::new(vec![("root", answer()), ("root", answer())]);
+    let harness = harness(workspace.path(), tracking.clone()).await;
+    let session = Arc::new(harness.new_session().await.unwrap());
+    let turn = prompt(&session);
+    tracking.request(0).await;
+    let root = session.root_agent();
+    let reply = |sequence, text: &str| wait::ChildMessage {
+        id: JobId::new(123).unwrap(),
+        name: Some("snapshot-child".into()),
+        message: sequence,
+        text: text.into(),
+    };
+    session
+        .root_tx
+        .child_message(reply(10, "retained-progress"));
+    let (content, batch) = session.runtime.child_message_content(root);
+    assert_eq!(content.len(), 1);
+    // Dropping a prepared delivery, as cancellation does before its commit,
+    // must not empty the mailbox.
+    drop(batch);
+    assert!(session.root_tx.has_child_messages());
+
+    let (content, batch) = session.runtime.child_message_content(root);
+    let wrong_agent = AgentId::root(crate::identity::SessionId::from_bytes([99; 16]));
+    assert!(
+        batch
+            .commit(&session.runtime, &wrong_agent, Message::User(content))
+            .await
+            .is_err()
+    );
+    assert!(session.root_tx.has_child_messages());
+
+    let (content, batch) = session.runtime.child_message_content(root);
+    // Arrival after snapshot (even with the same text) belongs to the next batch.
+    session
+        .root_tx
+        .child_message(reply(11, "retained-progress"));
+    batch
+        .commit(&session.runtime, root, Message::User(content))
+        .await
+        .unwrap();
+    let (remaining, batch) = session.runtime.child_message_content(root);
+    let serialized = serde_json::to_string(&remaining).unwrap();
+    assert!(serialized.contains("retained-progress"));
+    assert!(serialized.contains("11"));
+    drop(batch);
+    tracking.release(0);
+    let next = tracking.request(1).await;
+    let delivered = agent_messages(&next);
+    assert_eq!(delivered.len(), 2);
+    assert_eq!(delivered[0]["message"], 10);
+    assert_eq!(delivered[1]["message"], 11);
+    assert!(!session.root_tx.has_child_messages());
+    tracking.release(1);
+    bounded(turn).await.unwrap().unwrap();
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_a_started_notification_commit_finishes_both_acknowledgments() {
+    cancelled_notification_commit(true).await;
+}
+
+#[tokio::test]
+async fn cancelling_a_started_child_only_commit_serializes_the_next_snapshot() {
+    cancelled_notification_commit(false).await;
+}
+
+async fn cancelled_notification_commit(with_completion: bool) {
+    let workspace = tempfile::tempdir().unwrap();
+    let tracking = Tracking::new(vec![("root", answer()), ("root", answer())]);
+    let harness = harness(workspace.path(), tracking.clone()).await;
+    let session = Arc::new(harness.new_session().await.unwrap());
+    let turn = prompt(&session);
+    tracking.request(0).await;
+    let job = if with_completion {
+        complete_background(&session, "committed-completion").await
+    } else {
+        JobId::new(123).unwrap()
+    };
+    session.root_tx.child_message(wait::ChildMessage {
+        id: job,
+        name: Some("committed-child".into()),
+        message: 42,
+        text: "committed-progress".into(),
+    });
+    let location = crate::execution::ExecutionLocation::root(workspace.path().to_path_buf());
+    let (content, batch) = session
+        .runtime
+        .pending_event_content(
+            session.root_agent(),
+            &session.runtime.harness.capabilities,
+            &location,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        content.len(),
+        if with_completion { 2 } else { 1 },
+        "progress and completion share the same batch"
+    );
+    assert!(session.root_tx.has_child_messages());
+    assert_eq!(
+        session.runtime.jobs.has_pending(session.root_agent()).await,
+        with_completion
+    );
+    let mut records = session.runtime.store.subscribe();
+    {
+        let commit = batch.commit(
+            &session.runtime,
+            session.root_agent(),
+            Message::User(content),
+        );
+        tokio::pin!(commit);
+        // This current-thread test has not yielded: the owned commit task has
+        // been scheduled but cannot have run yet. Dropping its caller models an
+        // interrupt exactly after this transaction's ownership boundary.
+        assert!(futures_util::poll!(commit.as_mut()).is_pending());
+    }
+    {
+        // An immediate resumed request cannot snapshot progress still owned by
+        // the interrupted caller's transaction, even without any terminal job.
+        let next_batch = session.runtime.pending_event_content(
+            session.root_agent(),
+            &session.runtime.harness.capabilities,
+            &location,
+        );
+        tokio::pin!(next_batch);
+        assert!(futures_util::poll!(next_batch.as_mut()).is_pending());
+    }
+    bounded(async {
+        loop {
+            let record = records.recv().await.unwrap();
+            if matches!(
+                record.event,
+                SessionEvent::MessageCommitted {
+                    message: Message::User(_)
+                }
+            ) {
+                break;
+            }
+        }
+        while session.root_tx.has_child_messages()
+            || session.runtime.jobs.has_pending(session.root_agent()).await
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    // Duplicate wake commands do not reconstruct already acknowledged output.
+    session.root_tx.jobs_ready();
+    session.root_tx.jobs_ready();
+    tracking.release(0);
+    bounded(turn).await.unwrap().unwrap();
+    let turn = prompt(&session);
+    let next = tracking.request(1).await;
+    assert_eq!(agent_messages(&next).len(), 1);
+    assert_eq!(events(&next).len(), usize::from(with_completion));
+    if with_completion {
+        assert_eq!(events(&next)[0]["id"], job.get());
+    }
+    tracking.release(1);
+    bounded(turn).await.unwrap().unwrap();
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn progress_and_completion_cross_the_same_no_tool_boundary_once() {
+    let workspace = tempfile::tempdir().unwrap();
+    let tracking = Tracking::new(vec![("root", answer()), ("root", answer())]);
+    let harness = harness(workspace.path(), tracking.clone()).await;
+    let session = Arc::new(harness.new_session().await.unwrap());
+    let turn = prompt(&session);
+    tracking.request(0).await;
+    let job = complete_background(&session, "no-tool-completion").await;
+    session.root_tx.child_message(wait::ChildMessage {
+        id: job,
+        name: Some("no-tool-child".into()),
+        message: 42,
+        text: "no-tool-progress".into(),
+    });
+    tracking.release(0);
+    let next = tracking.request(1).await;
+    assert_eq!(agent_messages(&next).len(), 1);
+    assert_eq!(events(&next).len(), 1);
+    // Both envelopes must be in a single persisted parent user message, not
+    // separate history/ack transactions or a follow-on idle turn.
+    let records = session.runtime.store.records().await;
+    assert!(records.iter().any(|record| {
+        record.agent == session.root && matches!(&record.event,
+            SessionEvent::MessageCommitted { message: Message::User(content) }
+                if content.len() == 2 && content.iter().all(|block| matches!(block, UserContent::Runtime { .. })))
+    }));
+    assert!(
+        !turn.is_finished(),
+        "the earlier answer must not finish the caller's turn"
+    );
+    assert!(!session.root_tx.has_child_messages());
+    assert!(!session.runtime.jobs.has_pending(session.root_agent()).await);
+    tracking.release(1);
+    bounded(turn).await.unwrap().unwrap();
+    session.shutdown().await.unwrap();
+}

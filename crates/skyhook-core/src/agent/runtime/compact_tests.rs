@@ -6,7 +6,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -44,6 +44,7 @@ struct ControlledProvider {
     summary_stream_failures: AtomicUsize,
     summary_tools: AtomicBool,
     observed_failure_usage: StdMutex<Option<Usage>>,
+    pause_stream_after_usage: AtomicBool,
     started: Notify,
     release: Semaphore,
 }
@@ -65,6 +66,7 @@ impl Default for ControlledProvider {
             summary_stream_failures: AtomicUsize::new(0),
             summary_tools: AtomicBool::new(false),
             observed_failure_usage: StdMutex::new(None),
+            pause_stream_after_usage: AtomicBool::new(false),
             started: Notify::new(),
             release: Semaphore::new(0),
         }
@@ -102,6 +104,28 @@ impl ProviderContext for Arc<ControlledProvider> {
                 kind: ProviderErrorKind::Transport,
                 message: "deterministic transient failure".into(),
             };
+            if provider.pause_stream_after_usage.load(Ordering::SeqCst) {
+                let usage = provider.observed_failure_usage.lock().unwrap().unwrap();
+                let mut chunks = vec![Ok(ResponseChunk::UsageUpdated { usage })];
+                chunks.extend(
+                    events_for_content(&[AssistantContent::tool_call(
+                        "interrupted-tool",
+                        0,
+                        crate::provider::protocol::ToolCall {
+                            id: "interrupted-tool".into(),
+                            name: "write".into(),
+                            arguments: json!({"path":"must-not-exist", "content":"side effect"}),
+                        },
+                    )])
+                    .into_iter()
+                    .map(Ok),
+                );
+                let tail = stream::once(async move {
+                    provider.started.notify_one();
+                    std::future::pending::<Result<ResponseChunk, ProviderError>>().await
+                });
+                return Ok(Box::pin(stream::iter(chunks).chain(tail)) as ResponseStream);
+            }
             if consume_failure(immediate) {
                 return Err(error());
             }
@@ -725,7 +749,7 @@ async fn fresh_state_reflects_concurrent_todo_updates_without_claiming_job_notif
 }
 
 #[tokio::test]
-async fn ordinary_requests_retry_immediate_and_stream_failures_then_succeed_on_attempt_three() {
+async fn ordinary_requests_do_not_replay_provider_failures() {
     let fixture = Fixture::new().await;
     fixture
         .provider
@@ -735,23 +759,27 @@ async fn ordinary_requests_retry_immediate_and_stream_failures_then_succeed_on_a
         .provider
         .agent_stream_failures
         .store(1, Ordering::SeqCst);
-    assert_eq!(
-        fixture.session.prompt("Retry this request.").await.unwrap(),
-        "done"
-    );
-    assert_eq!(fixture.provider.requests.lock().unwrap().len(), 4);
-    let records = fixture.session.runtime.store.records().await;
     assert!(
-        !records
-            .iter()
-            .any(|record| matches!(record.event, SessionEvent::Compaction { .. }))
+        fixture
+            .session
+            .prompt("Do not replay this request.")
+            .await
+            .is_err()
+    );
+    assert_eq!(fixture.provider.requests.lock().unwrap().len(), 2);
+    assert_eq!(
+        fixture
+            .provider
+            .agent_stream_failures
+            .load(Ordering::SeqCst),
+        1
     );
     fixture.assert_exact_requests_and_no_tool_execution().await;
     fixture.session.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn ordinary_provider_failures_stop_after_three_total_attempts() {
+async fn ordinary_provider_failures_stop_after_one_attempt() {
     for streaming in [false, true] {
         let fixture = Fixture::new().await;
         let counter = if streaming {
@@ -771,21 +799,17 @@ async fn ordinary_provider_failures_stop_after_three_total_attempts() {
                 .await
                 .is_err()
         );
-        assert_eq!(fixture.provider.requests.lock().unwrap().len(), 4);
-        assert_eq!(counter.load(Ordering::SeqCst), 7);
+        assert_eq!(fixture.provider.requests.lock().unwrap().len(), 2);
+        assert_eq!(counter.load(Ordering::SeqCst), 9);
         fixture.assert_exact_requests_and_no_tool_execution().await;
         fixture.session.shutdown().await.unwrap();
     }
 }
 
 #[tokio::test]
-async fn overflow_compaction_does_not_reset_the_ordinary_attempt_budget() {
+async fn overflow_compaction_recovers_by_changing_request() {
     let fixture = Fixture::new().await;
     fixture.add_history(20_000).await;
-    fixture
-        .provider
-        .agent_immediate_failures
-        .store(1, Ordering::SeqCst);
     fixture.provider.overflow.store(true, Ordering::SeqCst);
     assert_eq!(
         fixture
@@ -796,45 +820,6 @@ async fn overflow_compaction_does_not_reset_the_ordinary_attempt_budget() {
         "done"
     );
     let records = fixture.session.runtime.store.records().await;
-    assert_eq!(fixture.provider.requests.lock().unwrap().len(), 5);
-    assert_eq!(
-        records
-            .iter()
-            .filter(|record| matches!(
-                record.event,
-                SessionEvent::ModelRequested {
-                    purpose: ModelPurpose::Agent,
-                    ..
-                }
-            ))
-            .count(),
-        4
-    );
-    assert_eq!(
-        records
-            .iter()
-            .filter(|record| matches!(record.event, SessionEvent::Compaction { .. }))
-            .count(),
-        1
-    );
-    fixture.assert_exact_requests_and_no_tool_execution().await;
-    fixture.session.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn summarizer_retries_both_failure_paths_and_succeeds_on_attempt_three() {
-    let fixture = Fixture::new().await;
-    fixture.add_history(20_000).await;
-    fixture
-        .provider
-        .summary_immediate_failures
-        .store(1, Ordering::SeqCst);
-    fixture
-        .provider
-        .summary_stream_failures
-        .store(1, Ordering::SeqCst);
-    fixture.compact(&CancellationToken::new()).await.unwrap();
-    let records = fixture.session.runtime.store.records().await;
     assert_eq!(fixture.provider.requests.lock().unwrap().len(), 4);
     assert_eq!(
         records
@@ -842,7 +827,7 @@ async fn summarizer_retries_both_failure_paths_and_succeeds_on_attempt_three() {
             .filter(|record| matches!(
                 record.event,
                 SessionEvent::ModelRequested {
-                    purpose: ModelPurpose::Compaction,
+                    purpose: ModelPurpose::Agent,
                     ..
                 }
             ))
@@ -861,7 +846,32 @@ async fn summarizer_retries_both_failure_paths_and_succeeds_on_attempt_three() {
 }
 
 #[tokio::test]
-async fn permanent_summary_failures_preserve_history_after_three_attempts_without_tools() {
+async fn summarizer_does_not_replay_provider_failures() {
+    for streaming in [false, true] {
+        let fixture = Fixture::new().await;
+        fixture.add_history(20_000).await;
+        let counter = if streaming {
+            &fixture.provider.summary_stream_failures
+        } else {
+            &fixture.provider.summary_immediate_failures
+        };
+        counter.store(2, Ordering::SeqCst);
+        assert!(fixture.compact(&CancellationToken::new()).await.is_err());
+        assert_eq!(fixture.provider.requests.lock().unwrap().len(), 2);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        let records = fixture.session.runtime.store.records().await;
+        assert!(
+            !records
+                .iter()
+                .any(|record| matches!(record.event, SessionEvent::Compaction { .. }))
+        );
+        fixture.assert_exact_requests_and_no_tool_execution().await;
+        fixture.session.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn permanent_summary_failures_preserve_history_without_provider_replays_or_tools() {
     // Exhaustive malformed-field cases belong to the continuation parser tests.
     // Here retain provider, truncation, tool-execution and semantic rollback contracts.
     for failure in ["stream", "truncated", "tool_call", "blank_todo"] {
@@ -914,7 +924,7 @@ async fn permanent_summary_failures_preserve_history_after_three_attempts_withou
         }
         assert_eq!(
             fixture.provider.requests.lock().unwrap().len(),
-            4,
+            if failure == "stream" { 2 } else { 4 },
             "{failure}"
         );
         assert_eq!(
@@ -962,35 +972,27 @@ async fn observed_usage_is_counted_once_for_each_failed_agent_and_summary_reques
         .provider
         .agent_empty_responses
         .store(1, Ordering::SeqCst);
-    assert_eq!(
+    assert!(
         fixture
             .session
-            .prompt("Retry while preserving usage accounting.")
+            .prompt("Preserve failed usage.")
             .await
-            .unwrap(),
-        "done"
+            .is_err()
     );
-    assert_eq!(
-        fixture.session.usage().await,
-        Usage {
-            input_tokens: 22,
-            cached_input_tokens: 14,
-            output_tokens: 6
-        }
-    );
+    assert_eq!(fixture.session.usage().await, observed);
 
     fixture.add_history(20_000).await;
     fixture
         .provider
         .summary_stream_failures
         .store(2, Ordering::SeqCst);
-    fixture.compact(&CancellationToken::new()).await.unwrap();
+    assert!(fixture.compact(&CancellationToken::new()).await.is_err());
     assert_eq!(
         fixture.session.usage().await,
         Usage {
-            input_tokens: 44,
-            cached_input_tokens: 28,
-            output_tokens: 12
+            input_tokens: 22,
+            cached_input_tokens: 14,
+            output_tokens: 6
         }
     );
     let records = fixture.session.runtime.store.records().await;
@@ -1005,7 +1007,7 @@ async fn observed_usage_is_counted_once_for_each_failed_agent_and_summary_reques
             _ => None,
         })
         .collect();
-    assert_eq!(failed.len(), 4);
+    assert_eq!(failed.len(), 2);
     for request in failed {
         let recorded: Vec<_> = records
             .iter()
@@ -1320,4 +1322,160 @@ async fn invalid_selected_job_retries_without_installing_compaction() {
             .count(),
         3
     );
+}
+
+#[tokio::test]
+async fn cancellation_journals_observed_usage_once_without_committing_or_executing_tools() {
+    for summary in [false, true] {
+        let fixture = Fixture::new().await;
+        let observed = Usage {
+            input_tokens: 11,
+            cached_input_tokens: 7,
+            output_tokens: 3,
+        };
+        *fixture.provider.observed_failure_usage.lock().unwrap() = Some(observed);
+        fixture
+            .provider
+            .pause_stream_after_usage
+            .store(true, Ordering::SeqCst);
+        if summary {
+            fixture.add_history(20_000).await;
+            let cancellation = CancellationToken::new();
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(fixture.compact(&cancellation), async {
+                    fixture.provider.started.notified().await;
+                    cancellation.cancel();
+                })
+            })
+            .await
+            .unwrap();
+            assert!(matches!(result, Err(HarnessError::Interrupted)));
+        } else {
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(fixture.session.prompt("Interrupt this turn."), async {
+                    fixture.provider.started.notified().await;
+                    fixture.session.interrupt().await;
+                })
+            })
+            .await
+            .unwrap();
+            assert!(result.is_err());
+        }
+        let records = fixture.session.runtime.store.records().await;
+        let requested = records
+            .iter()
+            .rev()
+            .find(|r| matches!(r.event, SessionEvent::ModelRequested { .. }))
+            .unwrap()
+            .sequence;
+        let observed_events: Vec<_> = records
+            .iter()
+            .filter_map(|r| match r.event {
+                SessionEvent::Usage {
+                    request: Some(request),
+                    usage,
+                } if request == requested => Some(usage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(observed_events, vec![observed]);
+        assert_eq!(fixture.session.usage().await, observed);
+        assert!(!records.iter().any(|r| matches!(&r.event,
+            SessionEvent::MessageCommitted { message: Message::Assistant(items) }
+                if items.iter().any(|item| item.id == "interrupted-tool"))));
+        fixture.assert_exact_requests_and_no_tool_execution().await;
+        fixture.session.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn compaction_checkpoint_and_resumed_request_preserve_reasoning_tool_exchange() {
+    use crate::provider::protocol::{ReplayEnvelope, ToolCall, ToolResult};
+    for protocol in ["chat_completions", "responses", "anthropic"] {
+        let fixture = Fixture::new().await;
+        fixture.add_history(20_000).await;
+        let assistant = Message::Assistant(vec![
+            AssistantContent::reasoning(
+                "retained-reasoning",
+                0,
+                "original reasoning",
+                Some(ReplayEnvelope {
+                    version: 1,
+                    protocol: protocol.into(),
+                    model: "native".into(),
+                    scope: "original-scope".into(),
+                    payload: json!({"encrypted_content":"opaque state", "signature":"original signature"}),
+                }),
+            ),
+            AssistantContent::tool_call(
+                "retained-tool",
+                1,
+                ToolCall {
+                    id: "retained-call".into(),
+                    name: "read".into(),
+                    arguments: json!({"path":"evidence.txt"}),
+                },
+            ),
+        ]);
+        let result = Message::Tool(vec![ToolResult {
+            call_id: "retained-call".into(),
+            name: "read".into(),
+            result: json!({"content":"retained evidence"}),
+            images: vec![],
+            is_error: false,
+        }]);
+        let assistant_id = fixture
+            .session
+            .runtime
+            .commit(&fixture.session.root, assistant.clone())
+            .await
+            .unwrap();
+        let result_id = fixture
+            .session
+            .runtime
+            .commit(&fixture.session.root, result.clone())
+            .await
+            .unwrap();
+        fixture.compact(&CancellationToken::new()).await.unwrap();
+        let records = fixture.session.runtime.store.records().await;
+        let history = project_history(&records, &fixture.session.root).unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(&r.event, SessionEvent::Compaction { .. }))
+        );
+        assert!(history.contains(&(assistant_id, assistant.clone())));
+        assert!(history.contains(&(result_id, result.clone())));
+        fixture.assert_exact_requests_and_no_tool_execution().await;
+        let harness = super::Harness {
+            inner: fixture.session.runtime.harness.clone(),
+        };
+        let id = fixture.session.id();
+        super::tests::shutdown_session(fixture.session).await;
+        let resumed = harness.resume_session(id).await.unwrap();
+        let reloaded = resumed.runtime.store.records().await;
+        assert_eq!(project_history(&reloaded, &resumed.root).unwrap(), history);
+        resumed
+            .prompt("Continue from the preserved evidence.")
+            .await
+            .unwrap();
+        let requests = fixture.provider.requests.lock().unwrap().clone();
+        let request = requests.last().unwrap();
+        let position = request
+            .messages
+            .iter()
+            .position(|message| message == &assistant)
+            .expect("original opaque assistant item is replayed");
+        assert_eq!(request.messages.get(position + 1), Some(&result));
+        assert!(
+            !resumed
+                .runtime
+                .store
+                .records()
+                .await
+                .iter()
+                .any(|r| matches!(r.event, SessionEvent::JobCreated { .. }))
+        );
+        resumed.shutdown().await.unwrap();
+    }
 }

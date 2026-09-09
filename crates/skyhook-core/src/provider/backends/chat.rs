@@ -1,11 +1,16 @@
 //! Native OpenAI Chat Completions with compatible visible reasoning deltas.
 
+#[cfg(test)]
+mod compatibility_tests;
+mod wire;
+
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::provider::{
-    ProviderError, ProviderErrorKind,
+    ProviderError,
+    backends::ChatReasoningReplay,
     protocol::{
         BlockContent, BlockKind, ContentDelta, ItemKind, Message, ModelRequest, ResponseChunk,
         StopReason, ToolCall, Usage, UserContent,
@@ -13,11 +18,14 @@ use crate::provider::{
 };
 
 use super::{
-    common::{image_url, invalid, tool_text},
+    common::{image_url, invalid, opaque_payload, reasoning_envelope, tool_text},
     transport::SseEvent,
 };
 
-pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
+pub(crate) fn encode(
+    request: &ModelRequest,
+    replay: ChatReasoningReplay,
+) -> Result<Value, ProviderError> {
     if request.model.is_empty() {
         return Err(invalid("Chat Completions requires a model"));
     }
@@ -47,34 +55,52 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
             Message::Assistant(parts) => {
                 let mut text = String::new();
                 let mut calls = Vec::new();
-                for part in parts.iter().flat_map(|item| &item.blocks) {
-                    match &part.content {
-                        BlockContent::Text { text: fragment } => text.push_str(fragment),
-                        // Standard Chat defines no portable reasoning replay field.
-                        // Compatible visible reasoning is retained in history, but
-                        // never replayed; foreign opaque state must not reach this wire.
-                        BlockContent::Reasoning { .. } => {}
-                        BlockContent::ToolCall(call) => {
-                            if call.id.is_empty()
-                                || !valid_name(&call.name)
-                                || !call.arguments.is_object()
-                            {
-                                return Err(invalid(
-                                    "Chat tool calls require an ID, a valid function name, and object arguments",
-                                ));
-                            }
-                            calls.push(json!({
+                let mut reasoning = String::new();
+                for item in parts {
+                    if replay != ChatReasoningReplay::Unsupported
+                        && let Some(payload) =
+                            opaque_payload(&item.replay, "chat_completions", &request.model)
+                        && let Some(text) = payload.get("text").and_then(Value::as_str)
+                    {
+                        reasoning.push_str(text);
+                    }
+                    for part in &item.blocks {
+                        match &part.content {
+                            BlockContent::Text { text: fragment } => text.push_str(fragment),
+                            // Only the originating envelope is replayable. Visible
+                            // reasoning (including foreign summaries) is not provenance.
+                            BlockContent::Reasoning { .. } => {}
+                            BlockContent::ToolCall(call) => {
+                                if call.id.is_empty()
+                                    || !valid_name(&call.name)
+                                    || !call.arguments.is_object()
+                                {
+                                    return Err(invalid(
+                                        "Chat tool calls require an ID, a valid function name, and object arguments",
+                                    ));
+                                }
+                                calls.push(json!({
                                 "id": call.id, "type": "function",
                                 "function": {"name": call.name, "arguments": call.arguments.to_string()}
                             }));
+                            }
                         }
                     }
                 }
-                // A reasoning-only turn has no representable Chat content.
-                if !text.is_empty() || !calls.is_empty() {
+                // Preserve reasoning-only turns when the selected profile can
+                // replay their provider-bound state; never turn thoughts into content.
+                if !text.is_empty() || !calls.is_empty() || !reasoning.is_empty() {
                     let mut message = json!({"role": "assistant", "content": if text.is_empty() { Value::Null } else { Value::String(text) }});
                     if !calls.is_empty() {
                         message["tool_calls"] = Value::Array(calls);
+                    }
+                    if !reasoning.is_empty() {
+                        let field = match replay {
+                            ChatReasoningReplay::ReasoningContent => "reasoning_content",
+                            ChatReasoningReplay::Reasoning => "reasoning",
+                            ChatReasoningReplay::Unsupported => unreachable!(),
+                        };
+                        message[field] = Value::String(reasoning);
                     }
                     messages.push(message);
                 }
@@ -100,14 +126,20 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
             }
         }
     }
-    let mut body = json!({
-        "model": request.model, "messages": messages, "stream": true,
-        "stream_options": {"include_usage": true}
-    });
+    let mut body = serde_json::to_value(wire::Request {
+        model: &request.model,
+        messages,
+        n: 1,
+        stream: true,
+        stream_options: wire::StreamOptions {
+            include_usage: true,
+        },
+    })
+    .map_err(|_| invalid("Unable to serialize Chat request"))?;
     if let Some(effort) = &request.reasoning {
         if !matches!(
             effort.as_str(),
-            "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
         ) {
             return Err(invalid(format!(
                 "Unsupported standard Chat reasoning_effort: {effort}"
@@ -358,13 +390,14 @@ enum Block {
 /// One choice, one stream. IDs identify logical blocks rather than wire indexes.
 #[derive(Clone)]
 pub(crate) struct Decoder {
-    _model: String,
+    model: String,
     blocks: Vec<Block>,
     visible_id: Option<usize>,
     ended: BTreeSet<usize>,
     tool_ids: BTreeMap<u64, usize>,
     finish_reason: Option<StopReason>,
     usage: Usage,
+    raw_prompt_tokens: u64,
     done: bool,
     failed: bool,
 }
@@ -372,13 +405,14 @@ pub(crate) struct Decoder {
 impl Decoder {
     pub(crate) fn new(model: String) -> Self {
         Self {
-            _model: model,
+            model,
             blocks: Vec::new(),
             visible_id: None,
             ended: BTreeSet::new(),
             tool_ids: BTreeMap::new(),
             finish_reason: None,
             usage: Usage::default(),
+            raw_prompt_tokens: 0,
             done: false,
             failed: false,
         }
@@ -420,22 +454,23 @@ impl Decoder {
         }
         let value: Value = serde_json::from_str(&event.data)
             .map_err(|_| ProviderError::protocol("Invalid Chat SSE JSON"))?;
-        let object = object_ref(&value, "Chat chunk")?;
-        if object.get("error").is_some_and(|value| !value.is_null()) {
-            return Err(response_error("Chat API reported an error"));
+        if value.get("error").is_some_and(|value| !value.is_null())
+            || event.event.as_deref() == Some("error")
+        {
+            return Err(super::errors::classify_error(None, &value));
         }
-        if event.event.as_deref() == Some("error") {
-            return Err(response_error("Chat API reported an error"));
-        }
-        if let Some(kind) = object.get("object")
-            && kind.as_str() != Some("chat.completion.chunk")
+        let wire::Chunk {
+            object,
+            choices,
+            usage,
+        } = serde_json::from_value(value)
+            .map_err(|_| ProviderError::protocol("Invalid Chat chunk shape"))?;
+        if object
+            .as_deref()
+            .is_some_and(|kind| kind != "chat.completion.chunk")
         {
             return Err(ProviderError::protocol("Expected chat.completion.chunk"));
         }
-        let choices = object
-            .get("choices")
-            .and_then(Value::as_array)
-            .ok_or_else(|| ProviderError::protocol("Chat chunk requires a choices array"))?;
         if choices.len() > 1 {
             return Err(ProviderError::protocol(
                 "Chat codec supports exactly one choice",
@@ -448,21 +483,20 @@ impl Decoder {
                     "Chat choice received after finish_reason",
                 ));
             }
-            let choice = object_ref(choice, "Chat choice")?;
-            if choice.get("index").and_then(Value::as_u64) != Some(0) {
-                return Err(ProviderError::protocol("Chat choice index must be zero"));
+            if !matches!(
+                choice.index,
+                wire::ChoiceIndex::Missing | wire::ChoiceIndex::Number(0)
+            ) {
+                return Err(ProviderError::protocol(
+                    "Chat choice index must be zero or absent",
+                ));
             }
-            let delta = choice
-                .get("delta")
-                .ok_or_else(|| ProviderError::protocol("Chat choice requires delta"))?;
-            self.delta(object_ref(delta, "Chat delta")?, &mut chunks)?;
-            if let Some(reason) = choice.get("finish_reason").filter(|value| !value.is_null()) {
-                let reason = reason.as_str().ok_or_else(|| {
-                    ProviderError::protocol("Chat finish_reason must be a string")
-                })?;
+            self.delta(&choice.delta, &mut chunks)?;
+            if let Some(reason) = choice.finish_reason.as_deref() {
                 let stop_reason = match reason {
                     "stop" => StopReason::EndTurn,
                     "length" => StopReason::MaxTokens,
+                    "abort" => StopReason::Aborted,
                     "tool_calls" if !self.tool_ids.is_empty() => StopReason::ToolUse,
                     "tool_calls" => {
                         return Err(ProviderError::protocol(
@@ -474,18 +508,28 @@ impl Decoder {
                         return Err(ProviderError::protocol("Unsupported Chat finish_reason"));
                     }
                 };
-                self.end_blocks(&mut chunks)?;
+                self.end_blocks(
+                    &mut chunks,
+                    matches!(
+                        stop_reason,
+                        StopReason::MaxTokens | StopReason::Aborted | StopReason::ContentFilter
+                    ),
+                )?;
                 self.finish_reason = Some(stop_reason);
             }
         }
-        if let Some(usage) = object.get("usage").filter(|value| !value.is_null()) {
-            let usage = decode_usage(usage)?;
-            if usage.input_tokens < self.usage.input_tokens
+        if let Some(usage) = usage {
+            // Prompt totals are monotone, but uncached input may fall when a
+            // later packet refines the cached-token breakdown.
+            let prompt = usage.prompt_tokens;
+            let usage = decode_usage(usage, self.usage.cached_input_tokens)?;
+            if prompt < self.raw_prompt_tokens
                 || usage.cached_input_tokens < self.usage.cached_input_tokens
                 || usage.output_tokens < self.usage.output_tokens
             {
                 return Err(ProviderError::protocol("Chat usage counters regressed"));
             }
+            self.raw_prompt_tokens = prompt;
             self.usage = usage;
             chunks.push(ResponseChunk::UsageUpdated { usage });
         } else if choices.is_empty() {
@@ -496,57 +540,26 @@ impl Decoder {
 
     fn delta(
         &mut self,
-        delta: &Map<String, Value>,
+        delta: &wire::Delta,
         chunks: &mut Vec<ResponseChunk>,
     ) -> Result<(), ProviderError> {
-        for (key, value) in delta {
-            // Compatible servers include null placeholders for unsupported optional
-            // fields. They carry no content; non-null unknown fields must not be
-            // silently discarded (audio/function_call/etc. may be semantic).
-            if !value.is_null()
-                && !matches!(
-                    key.as_str(),
-                    "role"
-                        | "content"
-                        | "tool_calls"
-                        | "refusal"
-                        | "reasoning_content"
-                        | "reasoning"
-                )
-            {
-                return Err(ProviderError::protocol("Unsupported Chat delta field"));
-            }
+        // Null placeholders carry no semantics; reject non-null unknown fields
+        // rather than silently losing audio, legacy function_call, etc.
+        if delta.extra.values().any(|value| !value.is_null()) {
+            return Err(ProviderError::protocol("Unsupported Chat delta field"));
         }
-        if let Some(role) = delta.get("role").filter(|value| !value.is_null())
-            && role.as_str() != Some("assistant")
+        if delta
+            .role
+            .as_deref()
+            .is_some_and(|role| role != "assistant")
         {
             return Err(ProviderError::protocol("Chat delta role must be assistant"));
         }
-        if let Some(refusal) = delta.get("refusal").filter(|value| !value.is_null()) {
-            let refusal = refusal
-                .as_str()
-                .ok_or_else(|| ProviderError::protocol("Chat refusal must be a string"))?;
-            if !refusal.is_empty() {
-                return Err(response_error("Chat model refused the request"));
-            }
-        }
-        // Qwen/vLLM uses reasoning_content; some compatible endpoints use
-        // reasoning. Both are visible reasoning, never assistant answer text or
-        // opaque replay state. Validate aliases before emitting any fragments.
-        let reasoning = ["reasoning_content", "reasoning"].map(|key| {
-            delta
-                .get(key)
-                .filter(|value| !value.is_null())
-                .map(|value| {
-                    value.as_str().ok_or_else(|| {
-                        ProviderError::protocol("Chat reasoning delta must be a string")
-                    })
-                })
-                .transpose()
-        });
-        let [primary, alias] = reasoning;
-        let primary = primary?.filter(|text| !text.is_empty());
-        let alias = alias?.filter(|text| !text.is_empty());
+        let primary = delta
+            .reasoning_content
+            .as_deref()
+            .filter(|text| !text.is_empty());
+        let alias = delta.reasoning.as_deref().filter(|text| !text.is_empty());
         if let (Some(primary), Some(alias)) = (primary, alias)
             && primary != alias
         {
@@ -557,84 +570,57 @@ impl Decoder {
         if let Some(text) = primary.or(alias) {
             self.visible_delta(text, true, chunks)?;
         }
-        if let Some(text) = delta.get("content").filter(|value| !value.is_null()) {
-            let text = text
-                .as_str()
-                .ok_or_else(|| ProviderError::protocol("Chat content delta must be a string"))?;
+        for text in [delta.content.as_deref(), delta.refusal.as_deref()]
+            .into_iter()
+            .flatten()
+        {
             if !text.is_empty() {
                 self.visible_delta(text, false, chunks)?;
             }
         }
-        if let Some(calls) = delta.get("tool_calls").filter(|value| !value.is_null()) {
-            let calls = calls
-                .as_array()
-                .ok_or_else(|| ProviderError::protocol("Chat tool_calls delta must be an array"))?;
-            let mut seen = BTreeSet::new();
-            for call in calls {
-                let call = object_ref(call, "Chat tool call delta")?;
-                for key in call.keys() {
-                    if !matches!(key.as_str(), "index" | "id" | "type" | "function") {
-                        return Err(ProviderError::protocol("Unsupported Chat tool call field"));
-                    }
+        for call in delta.tool_calls.iter().flatten() {
+            if call.kind.as_deref().is_some_and(|kind| kind != "function") {
+                return Err(ProviderError::protocol(
+                    "Only Chat function tool calls are supported",
+                ));
+            }
+            // A Hermes delta may contain a header and argument fragments for
+            // the same index. Apply each entry in wire order, not as a map.
+            let id = if let Some(id) = self.tool_ids.get(&call.index) {
+                *id
+            } else {
+                let id = self.blocks.len();
+                self.blocks.push(Block::Tool {
+                    call_id: String::new(),
+                    name: String::new(),
+                    arguments: String::new(),
+                });
+                self.tool_ids.insert(call.index, id);
+                start_item(chunks, id, ItemKind::ToolCall, BlockKind::ToolCallArguments);
+                id
+            };
+            let Block::Tool {
+                call_id,
+                name,
+                arguments,
+            } = &mut self.blocks[id]
+            else {
+                unreachable!()
+            };
+            if let Some(fragment) = &call.id {
+                call_id.push_str(fragment);
+            }
+            if let Some(function) = &call.function {
+                if let Some(fragment) = &function.name {
+                    name.push_str(fragment);
                 }
-                let index = call.get("index").and_then(Value::as_u64).ok_or_else(|| {
-                    ProviderError::protocol(
-                        "Chat tool call delta requires a nonnegative integer index",
-                    )
-                })?;
-                if !seen.insert(index) {
-                    return Err(ProviderError::protocol(
-                        "Duplicate Chat tool index within a delta",
-                    ));
-                }
-                if let Some(kind) = call.get("type").filter(|value| !value.is_null())
-                    && kind.as_str() != Some("function")
-                {
-                    return Err(ProviderError::protocol(
-                        "Only Chat function tool calls are supported",
-                    ));
-                }
-                let id = if let Some(id) = self.tool_ids.get(&index) {
-                    *id
-                } else {
-                    let id = self.blocks.len();
-                    self.blocks.push(Block::Tool {
-                        call_id: String::new(),
-                        name: String::new(),
-                        arguments: String::new(),
-                    });
-                    self.tool_ids.insert(index, id);
-                    start_item(chunks, id, ItemKind::ToolCall, BlockKind::ToolCallArguments);
-                    id
-                };
-                let Block::Tool {
-                    call_id,
-                    name,
-                    arguments,
-                } = &mut self.blocks[id]
-                else {
-                    unreachable!()
-                };
-                append_string(call.get("id"), call_id, "Chat tool call ID")?;
-                if let Some(function) = call.get("function").filter(|value| !value.is_null()) {
-                    let function = object_ref(function, "Chat function delta")?;
-                    for key in function.keys() {
-                        if !matches!(key.as_str(), "name" | "arguments") {
-                            return Err(ProviderError::protocol("Unsupported Chat function field"));
-                        }
-                    }
-                    append_string(function.get("name"), name, "Chat function name")?;
-                    let previous_len = arguments.len();
-                    append_string(
-                        function.get("arguments"),
-                        arguments,
-                        "Chat function arguments",
-                    )?;
-                    if arguments.len() > previous_len {
+                if let Some(fragment) = &function.arguments {
+                    arguments.push_str(fragment);
+                    if !fragment.is_empty() {
                         chunks.push(ResponseChunk::BlockDelta {
                             item: id.to_string(),
                             block: "0".into(),
-                            delta: ContentDelta::JsonFragment(arguments[previous_len..].into()),
+                            delta: ContentDelta::JsonFragment(fragment.clone()),
                         });
                     }
                 }
@@ -664,7 +650,7 @@ impl Decoder {
                     Block::Reasoning(text) => BlockContent::Reasoning { text: text.clone() },
                     _ => unreachable!(),
                 };
-                end_item(chunks, id, content);
+                self.end_item(chunks, id, content);
                 self.ended.insert(id);
             }
             let id = self.blocks.len();
@@ -702,7 +688,11 @@ impl Decoder {
         Ok(())
     }
 
-    fn end_blocks(&self, chunks: &mut Vec<ResponseChunk>) -> Result<(), ProviderError> {
+    fn end_blocks(
+        &self,
+        chunks: &mut Vec<ResponseChunk>,
+        discard_tools: bool,
+    ) -> Result<(), ProviderError> {
         let mut call_ids = BTreeSet::new();
         for (id, block) in self.blocks.iter().enumerate() {
             if self.ended.contains(&id) {
@@ -710,14 +700,16 @@ impl Decoder {
             }
             let block = match block {
                 Block::Text(text) => BlockContent::Text { text: text.clone() },
-                // Chat has no portable reasoning replay contract. Keep this
-                // visible in history/UI without creating replayable private state.
                 Block::Reasoning(text) => BlockContent::Reasoning { text: text.clone() },
                 Block::Tool {
                     call_id,
                     name,
                     arguments,
                 } => {
+                    if discard_tools {
+                        chunks.push(ResponseChunk::ItemDiscarded { id: id.to_string() });
+                        continue;
+                    }
                     if call_id.is_empty() || !call_ids.insert(call_id) || !valid_name(name) {
                         return Err(ProviderError::protocol(
                             "Chat tool calls require distinct nonempty IDs and valid function names",
@@ -737,7 +729,7 @@ impl Decoder {
                     })
                 }
             };
-            end_item(chunks, id, block);
+            self.end_item(chunks, id, block);
         }
         Ok(())
     }
@@ -774,84 +766,56 @@ fn start_item(chunks: &mut Vec<ResponseChunk>, id: usize, kind: ItemKind, block_
     });
 }
 
-fn end_item(chunks: &mut Vec<ResponseChunk>, id: usize, content: BlockContent) {
-    chunks.push(ResponseChunk::BlockEnded {
-        item: id.to_string(),
-        block: "0".into(),
-        content,
-    });
-    chunks.push(ResponseChunk::ItemEnded {
-        id: id.to_string(),
-        replay: None,
-    });
-}
-
-fn object_ref<'a>(value: &'a Value, label: &str) -> Result<&'a Map<String, Value>, ProviderError> {
-    value
-        .as_object()
-        .ok_or_else(|| ProviderError::protocol(format!("{label} must be an object")))
-}
-
-fn append_string(
-    value: Option<&Value>,
-    destination: &mut String,
-    label: &str,
-) -> Result<(), ProviderError> {
-    if let Some(value) = value.filter(|value| !value.is_null()) {
-        destination.push_str(
-            value
-                .as_str()
-                .ok_or_else(|| ProviderError::protocol(format!("{label} must be a string")))?,
-        );
+impl Decoder {
+    fn end_item(&self, chunks: &mut Vec<ResponseChunk>, id: usize, content: BlockContent) {
+        // The transport wrapper binds the provider+endpoint scope. llama-swap
+        // injected reasoning is indistinguishable on this wire and receives
+        // the same origin scope, never a fabricated separate provenance.
+        let replay = match &content {
+            BlockContent::Reasoning { text } => Some(reasoning_envelope(
+                "chat_completions",
+                &self.model,
+                json!({"text": text}),
+            )),
+            _ => None,
+        };
+        chunks.push(ResponseChunk::BlockEnded {
+            item: id.to_string(),
+            block: "0".into(),
+            content,
+        });
+        chunks.push(ResponseChunk::ItemEnded {
+            id: id.to_string(),
+            replay,
+        });
     }
-    Ok(())
 }
 
-fn decode_usage(value: &Value) -> Result<Usage, ProviderError> {
-    let object = object_ref(value, "Chat usage")?;
-    let count = |value: Option<&Value>, label: &str| -> Result<u64, ProviderError> {
-        value.and_then(Value::as_u64).ok_or_else(|| {
-            ProviderError::protocol(format!("Chat usage {label} must be a nonnegative integer"))
-        })
-    };
-    let input_tokens = count(object.get("prompt_tokens"), "prompt_tokens")?;
-    let output_tokens = count(object.get("completion_tokens"), "completion_tokens")?;
-    if let Some(total) = object.get("total_tokens") {
-        let total = count(Some(total), "total_tokens")?;
-        if input_tokens.checked_add(output_tokens) != Some(total) {
-            return Err(ProviderError::protocol(
-                "Chat usage total_tokens does not match prompt + completion",
-            ));
-        }
-    }
-    let mut cached_input_tokens = 0;
-    if let Some(details) = object
-        .get("prompt_tokens_details")
-        .filter(|value| !value.is_null())
+fn decode_usage(value: wire::Usage, previous_cached: u64) -> Result<Usage, ProviderError> {
+    let input_tokens = value.prompt_tokens;
+    let output_tokens = value.completion_tokens;
+    if let Some(total) = value.total_tokens
+        && input_tokens.checked_add(output_tokens) != Some(total)
     {
-        let details = object_ref(details, "Chat prompt_tokens_details")?;
-        if let Some(cached) = details.get("cached_tokens") {
-            cached_input_tokens = count(Some(cached), "cached_tokens")?;
-        }
+        return Err(ProviderError::protocol(
+            "Chat usage total_tokens does not match prompt + completion",
+        ));
     }
+    // Missing/null cache details do not erase a previously reported breakdown.
+    let cached_input_tokens = value
+        .prompt_tokens_details
+        .and_then(|details| details.cached_tokens)
+        .unwrap_or(previous_cached);
     if cached_input_tokens > input_tokens {
         return Err(ProviderError::protocol(
             "Chat cached_tokens exceeds prompt_tokens",
         ));
     }
-    // Runtime accounts for cache reads separately from uncached input.
     Ok(Usage {
         input_tokens: input_tokens - cached_input_tokens,
         cached_input_tokens,
         output_tokens,
     })
-}
-
-fn response_error(message: impl Into<String>) -> ProviderError {
-    ProviderError {
-        kind: ProviderErrorKind::Response,
-        message: message.into(),
-    }
 }
 
 #[cfg(test)]
@@ -862,6 +826,10 @@ mod tests {
         media::ImageReference,
         provider::protocol::{SystemSegment, ToolDefinition, ToolResult},
     };
+
+    fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
+        super::encode(request, ChatReasoningReplay::Unsupported)
+    }
 
     fn request() -> ModelRequest {
         ModelRequest {
@@ -958,12 +926,9 @@ mod tests {
                 ItemKind::Text
             ]
         );
-        assert!(
-            items
-                .iter()
-                .enumerate()
-                .all(|(n, i)| i.position == n && i.blocks.len() == 1 && i.replay.is_none())
-        );
+        assert!(items.iter().enumerate().all(|(n, i)| i.position == n
+            && i.blocks.len() == 1
+            && i.replay.is_some() == (i.kind == ItemKind::Reasoning)));
         let mut request = request();
         request.messages = vec![Message::Assistant(items)];
         let wire = encode(&request).unwrap();

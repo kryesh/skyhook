@@ -76,15 +76,34 @@ async fn live_skill_tool_images() {
         profile.reasoning = Some("low".into());
     }
     let provider: Arc<dyn Provider> = match &config.providers[&profile.provider] {
-        ProviderConfig::Codex => Arc::new(CodexProvider::new().unwrap()),
+        ProviderConfig::Codex {} => {
+            Arc::new(CodexProvider::new().unwrap().with_name(&profile.provider))
+        }
         ProviderConfig::Openai {
             base_url,
             api,
             api_key_env,
+            chat_reasoning_replay,
+            startup_timeout_secs,
+            read_idle_timeout_secs,
         } => {
             assert_eq!(*api, OpenAiApi::ChatCompletions);
             let key = api_key_env.as_ref().map(|e| std::env::var(e).unwrap());
-            Arc::new(openai_compatible(&profile.provider, base_url, *api, key).unwrap())
+            let defaults = skyhook::provider::ProviderTimeouts::default();
+            let timeouts = skyhook::provider::ProviderTimeouts {
+                startup: startup_timeout_secs
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or(defaults.startup),
+                read_idle: read_idle_timeout_secs
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or(defaults.read_idle),
+            };
+            Arc::new(
+                openai_compatible(&profile.provider, base_url, *api, key)
+                    .unwrap()
+                    .with_timeouts(timeouts)
+                    .with_chat_reasoning_replay(chat_reasoning_replay.unwrap_or_default()),
+            )
         }
         _ => panic!("unexpected provider"),
     };

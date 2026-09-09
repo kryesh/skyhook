@@ -37,6 +37,7 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Clone)]
 pub struct CodexProvider {
+    name: String,
     auth: auth::AuthManager,
     client: reqwest::Client,
     endpoint: String,
@@ -46,11 +47,23 @@ impl CodexProvider {
     /// No credentials are read and no login is required until invocation.
     pub fn new() -> Result<Self, ProviderError> {
         Ok(Self {
+            name: "codex".into(),
             auth: auth::AuthManager::new().map_err(auth_error)?,
             client: transport::client()?,
             endpoint: ENDPOINT.into(),
             ws_endpoint: WS_ENDPOINT.into(),
         })
+    }
+
+    /// Bind private replay to a configured provider identity, including aliases
+    /// using the same Codex endpoint. The default embedding identity is `codex`.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    fn replay_scope(&self) -> String {
+        reasoning_scope(&self.name, &self.endpoint)
     }
 }
 impl Provider for CodexProvider {
@@ -151,7 +164,7 @@ impl ProviderContext for Context {
         let correlation = self.correlation.clone();
         let session = self.session.clone();
         Box::pin(async move {
-            let scope = reasoning_scope("codex", &provider.endpoint);
+            let scope = provider.replay_scope();
             filter_reasoning_scope(&mut request, &scope);
             let mut body = responses::encode(&request)?;
             // Subscription wire constraints; no second request/response codec.
@@ -710,6 +723,220 @@ mod tests {
         server.await.unwrap();
     }
 
+    fn reasoning_tool_output() -> Vec<Value> {
+        vec![
+            json!({"type":"reasoning", "id":"rs_private", "summary":[],
+                "encrypted_content":"opaque+/=", "future_native":{"state":"keep"}}),
+            json!({"type":"function_call", "id":"fc_1", "call_id":"call_1",
+                "name":"inspect", "arguments":"{\"path\":\"test\"}", "status":"completed"}),
+        ]
+    }
+
+    fn reasoning_tool_request(scope: &str) -> ModelRequest {
+        use crate::provider::protocol::{AssistantItem, ToolCall, ToolResult};
+        let mut replay = super::super::common::reasoning_envelope(
+            "responses",
+            "gpt-5",
+            reasoning_tool_output()[0].clone(),
+        );
+        replay.scope = scope.into();
+        let mut reasoning = AssistantItem::reasoning("rs_private", 0, "", Some(replay));
+        reasoning.blocks.clear();
+        ModelRequest {
+            model: "gpt-5".into(),
+            system: vec![],
+            tools: vec![],
+            messages: vec![
+                ProtocolMessage::Assistant(vec![
+                    reasoning,
+                    AssistantItem::tool_call(
+                        "fc_1",
+                        1,
+                        ToolCall {
+                            id: "call_1".into(),
+                            name: "inspect".into(),
+                            arguments: json!({"path":"test"}),
+                        },
+                    ),
+                ]),
+                ProtocolMessage::Tool(vec![ToolResult {
+                    call_id: "call_1".into(),
+                    name: "inspect".into(),
+                    result: json!({"ok":true}),
+                    images: vec![],
+                    is_error: false,
+                }]),
+            ],
+            response_schema: None,
+            reasoning: None,
+            max_output_tokens: None,
+            correlation: None,
+        }
+    }
+
+    #[test]
+    fn configured_provider_aliases_do_not_share_private_replay() {
+        let default = CodexProvider::new().unwrap();
+        assert_eq!(default.replay_scope(), reasoning_scope("codex", ENDPOINT));
+        let a = default.clone().with_name("alias-a");
+        let b = default.with_name("alias-b");
+        assert_eq!(a.endpoint, b.endpoint);
+        assert_ne!(a.replay_scope(), b.replay_scope());
+        let original = reasoning_tool_request(&a.replay_scope());
+        let mut same = original.clone();
+        filter_reasoning_scope(&mut same, &a.replay_scope());
+        assert_eq!(
+            responses::encode(&same).unwrap()["input"][0],
+            reasoning_tool_output()[0]
+        );
+        let mut foreign = original.clone();
+        filter_reasoning_scope(&mut foreign, &b.replay_scope());
+        let wire = responses::encode(&foreign).unwrap();
+        assert_eq!(wire["input"].as_array().unwrap().len(), 2);
+        assert_eq!(wire["input"][0]["type"], "function_call");
+        assert_eq!(wire["input"][1]["type"], "function_call_output");
+        assert_eq!(
+            responses::encode(&original).unwrap()["input"][0],
+            reasoning_tool_output()[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn native_reasoning_continuation_and_full_replay_survive_save_resume() {
+        use super::super::common::tests::resume_request;
+        let scope = reasoning_scope("codex", "https://codex.example/responses");
+        let output = reasoning_tool_output();
+        let (socket, server) = mock_socket(vec![
+            json!({"type":"response.output_item.added", "output_index":0,
+                "item":{"type":"reasoning", "id":"rs_private", "summary":[]}}),
+            json!({"type":"response.output_item.done", "output_index":0,
+                "item":{"type":"reasoning", "id":"rs_private", "summary":[]}}),
+            json!({"type":"response.completed", "response":{"id":"resp_native", "status":"completed", "output":output}}),
+        ]).await;
+        let mut request = reasoning_tool_request(&scope);
+        let mut initial = request.clone();
+        initial.messages.clear();
+        let (_, settings, input) = websocket_request(&responses::encode(&initial).unwrap(), None);
+        let session = Arc::new(Mutex::new(Session::default()));
+        let chunks = ws_stream(
+            socket,
+            session.clone().lock_owned().await,
+            responses::Decoder::codex(request.model.clone()),
+            settings,
+            input,
+            scope.clone(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        let mut assembler = ResponseAssembler::default();
+        for chunk in chunks {
+            assembler.push(&chunk.unwrap()).unwrap();
+        }
+        request.messages[0] = ProtocolMessage::Assistant(assembler.finish().unwrap().0);
+        let original = resume_request(&request).await;
+        let mut matching = original.clone();
+        filter_reasoning_scope(&mut matching, &scope);
+        let full = responses::encode(&matching).unwrap();
+        let session = session.lock().await;
+        let continuation = session.continuation.as_ref().unwrap();
+        assert_eq!(continuation.input, full["input"].as_array().unwrap()[..2]);
+        assert_eq!(continuation.input[0], output[0]);
+        let (wire, _, _) = websocket_request(&full, Some(continuation));
+        assert_eq!(wire["previous_response_id"], "resp_native");
+        assert_eq!(wire["input"], json!([full["input"][2].clone()]));
+        assert_eq!(wire["input"][0]["call_id"], "call_1");
+
+        // Reconnects and setting changes (including fallback compaction) must
+        // send complete compatible native state, never a continuation suffix.
+        let (reconnected, _, _) = websocket_request(&full, None);
+        assert!(reconnected.get("previous_response_id").is_none());
+        assert_eq!(reconnected["input"], full["input"]);
+        let mut changed_settings = full.clone();
+        changed_settings["text"] = json!({"format":{"type":"json_object"}});
+        let (fallback, _, _) = websocket_request(&changed_settings, Some(continuation));
+        assert!(fallback.get("previous_response_id").is_none());
+        assert_eq!(fallback["input"][0], output[0]);
+        let mut compacted = full.clone();
+        compacted["input"].as_array_mut().unwrap().insert(
+            0,
+            json!({"role":"user", "content":[{"type":"input_text", "text":"compacted history"}]}),
+        );
+        let (fallback, _, _) = websocket_request(&compacted, Some(continuation));
+        assert!(fallback.get("previous_response_id").is_none());
+        assert_eq!(fallback["input"][1], output[0]);
+
+        let mut foreign = original.clone();
+        filter_reasoning_scope(
+            &mut foreign,
+            &reasoning_scope("other", "https://codex.example/responses"),
+        );
+        let foreign_body = responses::encode(&foreign).unwrap();
+        let (foreign_wire, _, _) = websocket_request(&foreign_body, Some(continuation));
+        assert!(foreign_wire.get("previous_response_id").is_none());
+        assert_eq!(foreign_wire["input"].as_array().unwrap().len(), 2);
+        assert_eq!(responses::encode(&original).unwrap()["input"][0], output[0]);
+        drop(session);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_preserves_native_reasoning_and_usage_on_both_transports() {
+        use crate::provider::protocol::StopReason;
+        let native = reasoning_tool_output()[0].clone();
+        let mut call = reasoning_tool_output()[1].clone();
+        call["arguments"] = json!("{\"path\":");
+        let frames = vec![
+            json!({"type":"response.output_item.added", "output_index":0, "item":native}),
+            json!({"type":"response.output_item.done", "output_index":0, "item":native}),
+            json!({"type":"response.output_item.added", "output_index":1, "item":call}),
+            json!({"type":"response.output_item.done", "output_index":1, "item":call}),
+            json!({"type":"response.incomplete", "response":{"id":"truncated", "status":"incomplete",
+                "incomplete_details":{"reason":"max_output_tokens"}, "output":[],
+                "usage":{"input_tokens":8,"output_tokens":13}}}),
+        ];
+        let (socket, server) = mock_socket(frames.clone()).await;
+        let session = Arc::new(Mutex::new(Session::default()));
+        let ws = ws_stream(
+            socket,
+            session.clone().lock_owned().await,
+            responses::Decoder::codex("gpt-5".into()),
+            json!({"model":"gpt-5"}),
+            vec![],
+            "scope".into(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert!(session.lock().await.continuation.is_none());
+        server.await.unwrap();
+        let events = Box::pin(stream::iter(frames.into_iter().map(|frame| {
+            Ok(transport::SseEvent {
+                event: None,
+                data: frame.to_string(),
+            })
+        })));
+        let http = http_stream(
+            events,
+            responses::Decoder::codex("gpt-5".into()),
+            session.clone().lock_owned().await,
+            "scope".into(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        for chunks in [ws, http] {
+            let mut assembler = ResponseAssembler::default();
+            for chunk in chunks {
+                assembler.push(&chunk.unwrap()).unwrap();
+            }
+            let (items, usage, reason) = assembler.finish().unwrap();
+            assert_eq!(reason, StopReason::MaxTokens);
+            assert_eq!(usage.output_tokens, 13);
+            assert_eq!(items.len(), 1);
+            let replay = items[0].replay.as_ref().unwrap();
+            assert_eq!(replay.scope, "scope");
+            assert_eq!(replay.payload, native);
+        }
+    }
+
     #[tokio::test]
     async fn dropping_response_clears_socket_and_continuation() {
         let (socket, server) = mock_socket(vec![]).await;
@@ -780,22 +1007,19 @@ mod tests {
         });
         let directory = tempfile::tempdir().unwrap();
         let provider = CodexProvider {
+            name: "codex".into(),
             auth: auth::test_manager(directory.path().to_owned()),
             client: transport::client().unwrap(),
             endpoint: format!("http://{address}/responses"),
             ws_endpoint: format!("ws://{address}/responses"),
         };
         let mut context = provider.open_context("context".into()).unwrap();
-        let request = ModelRequest {
-            model: "gpt-5".into(),
-            system: vec![],
-            messages: vec![],
-            tools: vec![],
-            response_schema: None,
-            reasoning: None,
-            max_output_tokens: Some(100),
-            correlation: Some("context".into()),
-        };
+        let scope = provider.replay_scope();
+        let mut request = reasoning_tool_request(&scope);
+        request.max_output_tokens = Some(100);
+        request.correlation = Some("context".into());
+        let request = super::super::common::tests::resume_request(&request).await;
+        let expected_input = responses::encode(&request).unwrap()["input"].clone();
         let events = context
             .invoke(request)
             .await
@@ -811,7 +1035,9 @@ mod tests {
             serde_json::from_str(requests[1].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert!(body.get("previous_response_id").is_none());
         assert!(body.get("max_output_tokens").is_none());
-        assert_eq!(body["input"], json!([]));
+        assert_eq!(body["input"], expected_input);
+        assert_eq!(body["input"][0], reasoning_tool_output()[0]);
+        assert_eq!(body["input"][1]["call_id"], body["input"][2]["call_id"]);
     }
 
     fn retained_session(socket: Socket) -> Session {
@@ -848,6 +1074,7 @@ mod tests {
         let session = Arc::new(Mutex::new(retained_session(socket)));
         let mut context = Context {
             provider: CodexProvider {
+                name: "codex".into(),
                 auth: auth::test_manager(directory.path().to_owned()),
                 client: transport::client().unwrap(),
                 endpoint: format!("http://{address}/responses"),

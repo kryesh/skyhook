@@ -1,3 +1,8 @@
+use crate::{
+    identity::{AgentId, JobId},
+    provider::protocol::{Message, UserContent},
+};
+
 use crate::session::{
     EventRecord, SessionError, SessionEvent, SessionStore, is_safe_artifact_path,
 };
@@ -64,8 +69,19 @@ pub(super) async fn restore(
                         entry.delivery = DeliveryState::Pending;
                         entry.background = true;
                     }
+                    if *state == super::JobState::WaitingInput
+                        || (entry.state == super::JobState::WaitingInput
+                            && *state == super::JobState::Running)
+                    {
+                        entry.output = None;
+                        entry.delivery = DeliveryState::Pending;
+                        entry.background = true;
+                    }
                     entry.state = *state;
                 }
+            }
+            SessionEvent::MessageCommitted { message } => {
+                acknowledge_message(&mut jobs, &record.agent, message);
             }
             SessionEvent::JobFinished {
                 job,
@@ -77,6 +93,7 @@ pub(super) async fn restore(
             } => {
                 if let Some(entry) = jobs.get_mut(job) {
                     entry.state = *state;
+                    entry.delivery = DeliveryState::Pending;
                     entry.error.clone_from(error);
                     entry.denial.clone_from(denial);
                     entry.images.clone_from(images);
@@ -117,4 +134,55 @@ pub(super) async fn restore(
         manager.finish(job, JobOutcome::Interrupted).await?;
     }
     Ok(manager)
+}
+
+/// The committed host-generated notification is the delivery acknowledgement.
+/// Infer it in journal order, so a later retained resume resets delivery normally.
+/// User text/parent input is deliberately not parsed as a host notification.
+pub(super) fn acknowledge_message(
+    jobs: &mut std::collections::HashMap<JobId, JobEntry>,
+    owner: &AgentId,
+    message: &Message,
+) {
+    let Message::User(content) = message else {
+        return;
+    };
+    for block in content {
+        let UserContent::Runtime { text } = block else {
+            continue;
+        };
+        let Some(json) = text
+            .strip_prefix("<skyhook_job_events>\n")
+            .and_then(|text| text.strip_suffix("\n</skyhook_job_events>"))
+        else {
+            continue;
+        };
+        let Ok(envelopes) = serde_json::from_str::<Vec<serde_json::Value>>(json) else {
+            continue;
+        };
+        for envelope in envelopes {
+            let Some(id) = envelope.get("id") else {
+                continue;
+            };
+            let Some(state) = envelope.get("state") else {
+                continue;
+            };
+            let (Ok(id), Ok(state)) = (
+                serde_json::from_value::<JobId>(id.clone()),
+                serde_json::from_value::<super::JobState>(state.clone()),
+            ) else {
+                continue;
+            };
+            let Some(entry) = jobs.get_mut(&id) else {
+                continue;
+            };
+            if &entry.agent == owner
+                && entry.background
+                && entry.state.presented() == state
+                && entry.deliverable()
+            {
+                entry.reserve_delivery(DeliveryState::Injected);
+            }
+        }
+    }
 }

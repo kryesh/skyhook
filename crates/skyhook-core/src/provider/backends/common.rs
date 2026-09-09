@@ -117,18 +117,81 @@ pub(crate) fn bind_reasoning_scope(
     chunk: &mut crate::provider::protocol::ResponseChunk,
     scope: &str,
 ) {
-    if let crate::provider::protocol::ResponseChunk::ItemEnded {
-        replay: Some(replay),
-        ..
-    } = chunk
-    {
-        replay.scope = scope.into();
+    use crate::provider::protocol::ResponseChunk;
+    match chunk {
+        ResponseChunk::ItemEnded {
+            replay: Some(replay),
+            ..
+        }
+        | ResponseChunk::ItemReplayUpdated { replay, .. } => replay.scope = scope.into(),
+        _ => {}
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    /// Exercise the actual journal boundary, not just a serde round trip. Keep
+    /// this in backend tests so each codec verifies the resumed wire payload.
+    pub(crate) async fn resume_request(
+        request: &crate::provider::protocol::ModelRequest,
+    ) -> crate::provider::protocol::ModelRequest {
+        use crate::{
+            identity::AgentId,
+            session::{
+                ContextMessage, ModelPurpose, SessionEvent, SessionStore, reconstruct_model_request,
+            },
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(directory.path()).await.unwrap();
+        let agent = AgentId::root(store.id());
+        let mut template = request.clone();
+        template.messages.clear();
+        let context = store
+            .append(
+                agent.clone(),
+                SessionEvent::ModelContext {
+                    provider: "native-replay-test".into(),
+                    template,
+                },
+            )
+            .await
+            .unwrap();
+        let mut messages = Vec::new();
+        for message in &request.messages {
+            let record = store
+                .append(
+                    agent.clone(),
+                    SessionEvent::MessageCommitted {
+                        message: message.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            messages.push(ContextMessage::Source {
+                sequence: record.sequence,
+            });
+        }
+        let call = store
+            .append(
+                agent,
+                SessionEvent::ModelRequested {
+                    context: context.sequence,
+                    purpose: ModelPurpose::Agent,
+                    messages,
+                },
+            )
+            .await
+            .unwrap();
+        let id = store.id();
+        drop(store);
+        let (_store, records) = SessionStore::open(directory.path(), id).await.unwrap();
+        let (_, resumed) = reconstruct_model_request(&records, call.sequence).unwrap();
+        assert_eq!(&resumed, request);
+        resumed
+    }
+
     #[test]
     fn endpoint_scope_is_required_and_preserves_only_matching_private_state() {
         use crate::provider::protocol::{AssistantItem, Message, ModelRequest, ResponseChunk};

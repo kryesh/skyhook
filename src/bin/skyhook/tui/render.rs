@@ -1209,14 +1209,15 @@ impl RequestColumns {
     }
 
     fn line(&self, row: &model::RequestRow, width: u16, p: Palette) -> Line<'static> {
+        // The animation overlay paints at column zero. Reserve its cell and a
+        // separator on every row so running/completed requests stay aligned.
+        let gutter = width.min(2);
+        let width = width - gutter;
         let statistics = row
             .statistics()
             .iter()
             .zip(self.statistics)
-            .zip(["Out", "In", "Cached", "Time"])
-            .map(|((value, width), label)| {
-                format!("{label} {}{value}", " ".repeat(width - value.width()))
-            })
+            .map(|(value, width)| format!("{}{value}", " ".repeat(width - value.width())))
             .collect::<Vec<_>>()
             .join(" · ");
         let show_statistics = statistics.width() + 18 <= width as usize;
@@ -1241,7 +1242,7 @@ impl RequestColumns {
             .join(" · ");
         let metadata = clipped_header(&metadata, left_width);
         let gap = width as usize - metadata.width();
-        let mut spans = vec![Span::raw(metadata)];
+        let mut spans = vec![Span::raw(" ".repeat(gutter as usize)), Span::raw(metadata)];
         if show_statistics {
             spans.push(Span::raw(" ".repeat(gap - statistics.width())));
             spans.push(Span::styled(statistics, Style::default().fg(p.muted)));
@@ -1848,6 +1849,74 @@ fn clipped_header(value: &str, width: u16) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn request_rows_reserve_spinner_gutter_and_show_unlabelled_statistics() {
+        let running = model::RequestRow {
+            sequence: 7,
+            purpose: skyhook::session::ModelPurpose::Agent,
+            model: "qwen".into(),
+            status: "Running",
+            usage: Some(skyhook::provider::protocol::Usage {
+                input_tokens: 80,
+                cached_input_tokens: 20,
+                output_tokens: 84,
+            }),
+            elapsed_tenths: Some(12),
+        };
+        let mut completed = running.clone();
+        completed.sequence = 123;
+        completed.status = "Completed";
+        let columns = RequestColumns::new([&running, &completed]);
+        for row in [&running, &completed] {
+            let line = columns.line(row, 100, Palette::new(false));
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert!(text.starts_with(&format!("  Request #{}", row.sequence)));
+            assert!(text.ends_with("84 · 80 · 20 · 1.2s"));
+            for label in ["Out ", "In ", "Cached ", "Time "] {
+                assert!(!text.contains(label));
+            }
+            let area = Rect::new(0, 0, 100, 1);
+            let mut buffer = Buffer::empty(area);
+            Paragraph::new(line).render(area, &mut buffer);
+            // This is the same overlay column used by the animated requests view.
+            buffer[(0, 0)].set_symbol(spinner(0));
+            assert_eq!(buffer[(0, 0)].symbol(), spinner(0));
+            assert_eq!(buffer[(1, 0)].symbol(), " ");
+            assert_eq!(buffer[(2, 0)].symbol(), "R");
+            assert_eq!(buffer[(3, 0)].symbol(), "e");
+        }
+    }
+
+    #[test]
+    fn request_rows_keep_the_gutter_within_narrow_viewports() {
+        let row = model::RequestRow {
+            sequence: 12345,
+            purpose: skyhook::session::ModelPurpose::Compaction,
+            model: "long model 界界 😀".into(),
+            status: "Running",
+            usage: None,
+            elapsed_tenths: None,
+        };
+        let columns = RequestColumns::new([&row]);
+        for width in 0..100 {
+            let line = columns.line(&row, width, Palette::new(false));
+            assert!(line.width() <= width as usize, "overflow at width {width}");
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert!(text.starts_with(&" ".repeat(width.min(2) as usize)));
+            if width == 99 {
+                assert!(text.ends_with("— · — · — · —"));
+            }
+        }
+    }
+
     // Full-render oracle shares static geometry, but independently parses and wraps
     // the complete source instead of reusing any incremental streaming state.
     fn layout(
@@ -2024,7 +2093,7 @@ mod tests {
             selection
         ));
     }
-   
+
     #[test]
     fn document_and_plain_fallback_match_reference_layout() {
         let highlights = super::super::tool_view::HighlightCache::default();

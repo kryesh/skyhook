@@ -1,5 +1,6 @@
 //! Shared, cancellation-safe HTTP/SSE transport. A dropped stream drops its HTTP body.
-use crate::provider::{ProviderError, ProviderErrorKind};
+use super::errors::classify_error;
+use crate::provider::{ProviderError, ProviderErrorKind, ProviderTimeouts};
 use futures_util::stream::{self, BoxStream};
 use reqwest::{
     Client, Response,
@@ -8,8 +9,6 @@ use reqwest::{
 use serde_json::Value;
 use std::{collections::VecDeque, time::Duration};
 
-pub(crate) const START_TIMEOUT: Duration = Duration::from_secs(30);
-pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 16 * 1024;
 pub(crate) type SseStream = BoxStream<'static, Result<SseEvent, ProviderError>>;
@@ -24,6 +23,9 @@ pub(crate) fn client() -> Result<Client, ProviderError> {
     Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
+        // This transport owns the complete HTTP attempt budget, including Codex's
+        // one-attempt policy; disable reqwest's automatic protocol-nack retries.
+        .retry(reqwest::retry::never())
         .build()
         .map_err(http_error)
 }
@@ -47,16 +49,17 @@ fn timeout_error(phase: &str) -> ProviderError {
     }
 }
 
-/// Retry only explicit rate-limit rejections and connect failures,
-/// at most twice. Once response headers are accepted no request is ever replayed,
+/// Retry startup timeouts, pre-response send failures and transient HTTP rejections,
+/// at most twice. Once a successful response is accepted no request is ever replayed,
 /// including malformed streams, EOF, idle timeouts, or caller cancellation.
+#[cfg(test)]
 pub(crate) async fn post_sse(
     client: &Client,
     url: &str,
     headers: HeaderMap,
     body: &Value,
 ) -> Result<SseStream, ProviderError> {
-    post_sse_policy(client, url, headers, body, 3).await
+    post_sse_with_timeouts(client, url, headers, body, ProviderTimeouts::default()).await
 }
 
 /// Codex and other continuation protocols can disable even overload retries.
@@ -66,7 +69,17 @@ pub(crate) async fn post_sse_once(
     headers: HeaderMap,
     body: &Value,
 ) -> Result<SseStream, ProviderError> {
-    post_sse_policy(client, url, headers, body, 1).await
+    post_sse_policy(client, url, headers, body, 1, ProviderTimeouts::default()).await
+}
+
+pub(crate) async fn post_sse_with_timeouts(
+    client: &Client,
+    url: &str,
+    headers: HeaderMap,
+    body: &Value,
+    timeouts: ProviderTimeouts,
+) -> Result<SseStream, ProviderError> {
+    post_sse_policy(client, url, headers, body, 3, timeouts).await
 }
 
 async fn post_sse_policy(
@@ -75,48 +88,64 @@ async fn post_sse_policy(
     mut headers: HeaderMap,
     body: &Value,
     attempts: u32,
+    timeouts: ProviderTimeouts,
 ) -> Result<SseStream, ProviderError> {
     headers.insert(ACCEPT, "text/event-stream".parse().expect("static header"));
-    let deadline = tokio::time::Instant::now() + START_TIMEOUT;
     for attempt in 0..attempts {
+        // Startup is an HTTP-attempt budget, not a budget shared by retries or
+        // their backoff. Error diagnostics use this same remaining deadline.
+        let deadline = tokio::time::Instant::now() + timeouts.startup;
+        let backoff = Duration::from_millis(200 * (1 << attempt));
         let sent = tokio::time::timeout_at(
             deadline,
             client.post(url).headers(headers.clone()).json(body).send(),
         )
-        .await
-        .map_err(|_| timeout_error("startup"))?;
+        .await;
         let response = match sent {
-            Ok(response) => response,
-            Err(error) if error.is_connect() && attempt + 1 < attempts => {
-                tokio::time::sleep(Duration::from_millis(200 * (1 << attempt))).await;
-                continue;
+            Ok(Ok(response)) => response,
+            failure => {
+                let (error, retryable) = match failure {
+                    Err(_) => (timeout_error("startup"), true),
+                    Ok(Err(error)) => {
+                        // The fixed JSON request is replayable. A connection
+                        // closed/reset before headers has the same ambiguity as
+                        // a header timeout; builder errors are not transient.
+                        let retryable =
+                            error.is_connect() || error.is_timeout() || error.is_request();
+                        (http_error(error), retryable)
+                    }
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                if retryable && attempt + 1 < attempts {
+                    // No detached work: dropping this future cancels a pending
+                    // send or sleep and cannot launch a subsequent attempt.
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                return Err(if retryable {
+                    with_attempt_count(error, attempt + 1)
+                } else {
+                    error
+                });
             }
-            Err(error) => return Err(http_error(error)),
         };
         let status = response.status();
         if !status.is_success() {
-            if status.as_u16() == 429 && attempt + 1 < attempts {
-                let retry_after = response.headers().get("retry-after");
-                let delay = match retry_after {
-                    Some(value) => value
-                        .to_str()
-                        .ok()
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .filter(|s| *s <= 2)
-                        .map(Duration::from_secs),
-                    None => Some(Duration::from_millis(200 * (1 << attempt))),
-                };
-                // Never retry earlier than Retry-After. Long or HTTP-date values
-                // exceed our small retry policy and are returned to the caller.
-                if let Some(delay) =
-                    delay.filter(|delay| tokio::time::Instant::now() + *delay < deadline)
-                {
-                    drop(response);
-                    tokio::time::sleep(delay).await;
-                    continue;
-                }
+            let retryable = matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504);
+            if retryable
+                && attempt + 1 < attempts
+                && let Some(delay) = retry_delay(response.headers(), backoff)
+            {
+                drop(response);
+                tokio::time::sleep(delay).await;
+                continue;
             }
-            return Err(status_error(response).await);
+            let error = status_error(response, deadline, timeouts.read_idle).await;
+            return Err(if retryable {
+                with_attempt_count(error, attempt + 1)
+            } else {
+                error
+            });
         }
         let content_type = response
             .headers()
@@ -134,19 +163,50 @@ async fn post_sse_policy(
                 "provider returned a non-SSE content type",
             ));
         }
-        return Ok(response_stream(response));
+        return Ok(response_stream(response, timeouts.read_idle));
     }
     unreachable!("bounded retry loop always returns")
 }
 
-async fn status_error(mut response: Response) -> ProviderError {
+fn with_attempt_count(mut error: ProviderError, attempts: u32) -> ProviderError {
+    error
+        .message
+        .push_str(&format!(" (after {attempts} HTTP attempts)"));
+    error
+}
+
+fn retry_delay(headers: &HeaderMap, backoff: Duration) -> Option<Duration> {
+    let mut values = headers.get_all("retry-after").iter();
+    let Some(value) = values.next() else {
+        return Some(backoff);
+    };
+    // Never retry earlier than Retry-After. Decline long, HTTP-date, ambiguous
+    // or malformed values rather than exceeding this bounded short-delay policy.
+    if values.next().is_some() {
+        return None;
+    }
+    let value = value.to_str().ok()?.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let seconds = value.parse::<u64>().ok().filter(|seconds| *seconds <= 2)?;
+    Some(backoff.max(Duration::from_secs(seconds)))
+}
+
+async fn status_error(
+    mut response: Response,
+    startup_deadline: tokio::time::Instant,
+    read_idle: Duration,
+) -> ProviderError {
     let status = response.status().as_u16();
     let mut body = Vec::new();
-    // Bound the whole error-body read, not only individual chunks.
-    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+    // Error diagnostics must not extend the startup budget. Keep both a small
+    // total diagnostic cap and the configured per-read idle limit.
+    let deadline = startup_deadline.min(tokio::time::Instant::now() + Duration::from_secs(5));
+    let _ = tokio::time::timeout_at(deadline, async {
         while body.len() < MAX_ERROR_BYTES {
-            match response.chunk().await {
-                Ok(Some(chunk)) => {
+            match tokio::time::timeout(read_idle, response.chunk()).await {
+                Ok(Ok(Some(chunk))) => {
                     body.extend_from_slice(&chunk[..chunk.len().min(MAX_ERROR_BYTES - body.len())])
                 }
                 _ => break,
@@ -155,39 +215,16 @@ async fn status_error(mut response: Response) -> ProviderError {
     })
     .await;
     let native: Option<Value> = serde_json::from_slice(&body).ok();
-    let code = native
-        .as_ref()
-        .and_then(|v| {
-            v.pointer("/error/code")
-                .or_else(|| v.pointer("/error/type"))
-        })
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let kind = if matches!(code, "context_length_exceeded" | "context_window_exceeded") {
-        ProviderErrorKind::ContextWindowExceeded
-    } else {
-        match status {
-            401 | 403 => ProviderErrorKind::Authentication,
-            408 | 504 => ProviderErrorKind::Timeout,
-            429 => ProviderErrorKind::RateLimited,
-            400 | 404 | 413 | 422 => ProviderErrorKind::InvalidRequest,
-            _ => ProviderErrorKind::Response,
-        }
-    };
-    // Never echo service bodies: proxies and API errors can reflect credentials,
-    // request text, or image payloads. Only local classifications enter logs.
-    ProviderError {
-        kind,
-        message: format!("provider HTTP {status}"),
-    }
+    classify_error(Some(status), &native.unwrap_or(Value::Null))
 }
 
-fn response_stream(response: Response) -> SseStream {
+fn response_stream(response: Response, read_idle: Duration) -> SseStream {
     struct State {
         response: Response,
         parser: SseParser,
         pending: VecDeque<SseEvent>,
         done: bool,
+        read_idle: Duration,
     }
     Box::pin(stream::unfold(
         State {
@@ -195,6 +232,7 @@ fn response_stream(response: Response) -> SseStream {
             parser: SseParser::default(),
             pending: VecDeque::new(),
             done: false,
+            read_idle,
         },
         |mut state| async move {
             loop {
@@ -204,7 +242,7 @@ fn response_stream(response: Response) -> SseStream {
                 if state.done {
                     return None;
                 }
-                let read = tokio::time::timeout(READ_TIMEOUT, state.response.chunk()).await;
+                let read = tokio::time::timeout(state.read_idle, state.response.chunk()).await;
                 let parsed = match read {
                     Err(_) => Err(timeout_error("read")),
                     Ok(Err(error)) => Err(http_error(error)),

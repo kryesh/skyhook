@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +34,15 @@ pub enum ResponseEvent {
         id: String,
         replay: Option<ReplayEnvelope>,
     },
+    /// Enrich opaque replay after item completion, before response completion.
+    ItemReplayUpdated {
+        id: String,
+        replay: ReplayEnvelope,
+    },
+    /// Remove an unsafe/provisional item without promoting its partial content.
+    ItemDiscarded {
+        id: String,
+    },
     /// A cumulative snapshot, not an increment.
     UsageUpdated {
         usage: Usage,
@@ -59,6 +68,7 @@ pub enum StopReason {
     MaxTokens,
     StopSequence,
     ContentFilter,
+    Aborted,
     Other(String),
 }
 
@@ -116,6 +126,7 @@ pub struct BlockSnapshot {
 #[derive(Clone, Debug, Default)]
 pub struct ResponseAssembler {
     items: BTreeMap<usize, ItemSnapshot>,
+    discarded: BTreeSet<String>,
     usage: Usage,
     stop_reason: Option<StopReason>,
 }
@@ -143,7 +154,10 @@ impl ResponseAssembler {
         }
         match event {
             ResponseEvent::ItemStarted { id, position, kind } => {
-                if id.trim().is_empty() || self.items.values().any(|item| item.id == *id) {
+                if id.trim().is_empty()
+                    || self.discarded.contains(id)
+                    || self.items.values().any(|item| item.id == *id)
+                {
                     return Err(ProviderError::protocol("empty or duplicate item ID"));
                 }
                 if self.items.contains_key(position) {
@@ -274,6 +288,26 @@ impl ResponseAssembler {
                 item.replay = replay.clone();
                 item.ended = true;
             }
+            ResponseEvent::ItemReplayUpdated { id, replay } => {
+                let item = self
+                    .items
+                    .values_mut()
+                    .find(|item| item.id == *id)
+                    .filter(|item| item.ended)
+                    .ok_or_else(|| {
+                        ProviderError::protocol("replay update requires a completed item")
+                    })?;
+                item.replay = Some(replay.clone());
+            }
+            ResponseEvent::ItemDiscarded { id } => {
+                let position = self
+                    .items
+                    .iter()
+                    .find_map(|(position, item)| (item.id == *id).then_some(*position))
+                    .ok_or_else(|| ProviderError::protocol("discarded item has not started"))?;
+                self.items.remove(&position);
+                self.discarded.insert(id.clone());
+            }
             ResponseEvent::UsageUpdated { usage } => self.usage = *usage,
             ResponseEvent::ResponseEnded { stop_reason } => {
                 self.validate_closed()?;
@@ -392,6 +426,80 @@ mod tests {
     use super::super::ToolCall;
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn discarded_partial_tools_cannot_reappear_or_execute() {
+        let mut assembler = ResponseAssembler::default();
+        assembler
+            .push(&start("tool", 0, ItemKind::ToolCall))
+            .unwrap();
+        assembler
+            .push(&ResponseEvent::BlockStarted {
+                item: "tool".into(),
+                id: "args".into(),
+                position: 0,
+                kind: BlockKind::ToolCallArguments,
+            })
+            .unwrap();
+        assembler
+            .push(&ResponseEvent::BlockDelta {
+                item: "tool".into(),
+                block: "args".into(),
+                delta: ContentDelta::JsonFragment("{\"incomplete\":".into()),
+            })
+            .unwrap();
+        assembler
+            .push(&ResponseEvent::ItemDiscarded { id: "tool".into() })
+            .unwrap();
+        assert!(
+            assembler
+                .push(&start("tool", 0, ItemKind::ToolCall))
+                .is_err()
+        );
+        assembler
+            .push(&ResponseEvent::ResponseEnded {
+                stop_reason: StopReason::Aborted,
+            })
+            .unwrap();
+        let (items, _, reason) = assembler.finish().unwrap();
+        assert!(items.is_empty());
+        assert_eq!(reason, StopReason::Aborted);
+    }
+
+    #[test]
+    fn replay_enrichment_requires_completed_item_and_preserves_content() {
+        let mut assembler = ResponseAssembler::default();
+        let replay = ReplayEnvelope {
+            version: 1,
+            protocol: "responses".into(),
+            model: "m".into(),
+            scope: "s".into(),
+            payload: json!({"encrypted_content":"cipher"}),
+        };
+        assembler
+            .push(&start("reason", 0, ItemKind::Reasoning))
+            .unwrap();
+        let update = ResponseEvent::ItemReplayUpdated {
+            id: "reason".into(),
+            replay: replay.clone(),
+        };
+        assert!(assembler.push(&update).is_err());
+        assembler
+            .push(&ResponseEvent::ItemEnded {
+                id: "reason".into(),
+                replay: None,
+            })
+            .unwrap();
+        assembler.push(&update).unwrap();
+        assembler
+            .push(&ResponseEvent::ResponseEnded {
+                stop_reason: StopReason::EndTurn,
+            })
+            .unwrap();
+        assert!(assembler.push(&update).is_err());
+        let (items, _, _) = assembler.finish().unwrap();
+        assert_eq!(items[0].replay, Some(replay));
+    }
 
     fn start(id: &str, position: usize, kind: ItemKind) -> ResponseEvent {
         ResponseEvent::ItemStarted {

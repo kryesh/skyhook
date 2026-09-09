@@ -56,14 +56,24 @@ pub enum ProviderConfig {
     Openai {
         base_url: String,
         api: OpenAiApi,
+        /// Chat-only request field; absence uses the shared reasoning_content default.
+        chat_reasoning_replay: Option<crate::provider::backends::ChatReasoningReplay>,
         api_key_env: Option<String>,
+        /// Time to receive HTTP response headers per attempt (default: 600 seconds).
+        startup_timeout_secs: Option<u64>,
+        /// Maximum interval between HTTP response body reads (default: 600 seconds).
+        read_idle_timeout_secs: Option<u64>,
     },
     Anthropic {
         base_url: String,
         api_key_env: Option<String>,
+        /// Time to receive HTTP response headers per attempt (default: 600 seconds).
+        startup_timeout_secs: Option<u64>,
+        /// Maximum interval between HTTP response body reads (default: 600 seconds).
+        read_idle_timeout_secs: Option<u64>,
     },
     /// ChatGPT subscription using Skyhook-owned OAuth credentials.
-    Codex,
+    Codex {},
 }
 
 impl Config {

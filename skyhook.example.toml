@@ -26,6 +26,13 @@ kind = "codex"
 kind = "openai"
 base_url = "http://127.0.0.1:11434/v1"
 api = "chat_completions"
+# Chat-only, per-provider. Default "reasoning_content" replays returned reasoning.
+# Use "reasoning" for that wire convention, or "unsupported" to keep it local only.
+# Other protocols replay native reasoning automatically and do not accept this option.
+# chat_reasoning_replay = "reasoning_content"
+# Defaults allow long local-model prefills. Startup applies to EACH HTTP attempt.
+# startup_timeout_secs = 600
+# read_idle_timeout_secs = 600
 
 [models.openai]
 provider = "openai"

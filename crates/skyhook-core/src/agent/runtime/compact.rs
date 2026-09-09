@@ -288,11 +288,8 @@ impl SessionRuntime {
                             },
                         )
                         .await?;
-                    let retryable = request_sequence.is_some()
-                        && matches!(
-                            &error,
-                            HarnessError::Provider(_) | HarnessError::Compaction(_)
-                        );
+                    let retryable =
+                        request_sequence.is_some() && matches!(&error, HarnessError::Compaction(_));
                     if !retryable || attempt == MAX_PROVIDER_ATTEMPTS {
                         return Err(error);
                     }
@@ -422,7 +419,10 @@ impl SessionRuntime {
         loop {
             let chunk = tokio::select! {
                 chunk = stream.next() => chunk,
-                () = turn.cancellation.cancelled() => return Err(HarnessError::Interrupted),
+                () = turn.cancellation.cancelled() => {
+                    self.record_model_usage(agent, requested.sequence, usage).await?;
+                    return Err(HarnessError::Interrupted);
+                },
             };
             let Some(chunk) = chunk else {
                 break;
@@ -448,7 +448,10 @@ impl SessionRuntime {
         self.record_model_usage(agent, requested.sequence, usage)
             .await?;
         let (blocks, _, reason) = assembler.finish()?;
-        if matches!(reason, StopReason::MaxTokens | StopReason::ContentFilter) {
+        if matches!(
+            reason,
+            StopReason::MaxTokens | StopReason::ContentFilter | StopReason::Aborted
+        ) {
             return Err(HarnessError::Compaction(
                 "summarization was truncated; original history is retained".into(),
             ));
@@ -622,6 +625,83 @@ impl SessionRuntime {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn active_exchange_retains_complete_reasoning_bundle_outside_visible_tail() {
+        use crate::provider::protocol::{
+            AssistantContent, ReplayEnvelope, ToolCall, ToolResult, UserContent,
+        };
+        let agent = AgentId::root(crate::identity::SessionId::from_bytes([0; 16]));
+        for protocol in ["chat_completions", "responses", "anthropic"] {
+            let reasoning = AssistantContent::reasoning(
+                "reason",
+                0,
+                "visible reasoning",
+                Some(ReplayEnvelope {
+                    version: 1,
+                    protocol: protocol.into(),
+                    model: "model".into(),
+                    scope: "scope".into(),
+                    payload: json!({"opaque":"must survive", "signature":"signed"}),
+                }),
+            );
+            let call = AssistantContent::tool_call(
+                "tool",
+                1,
+                ToolCall {
+                    id: "call".into(),
+                    name: "agent".into(),
+                    arguments: json!({"prompt":"continue"}),
+                },
+            );
+            let exchange = Message::Assistant(vec![reasoning, call]);
+            let results = Message::Tool(vec![ToolResult {
+                call_id: "call".into(),
+                name: "agent".into(),
+                result: json!({"id":1}),
+                images: vec![],
+                is_error: false,
+            }]);
+            let tail = Message::User(vec![UserContent::Text {
+                text: "tail".repeat(10_000),
+            }]);
+            let records: Vec<_> = [exchange.clone(), results.clone(), tail.clone()]
+                .into_iter()
+                .enumerate()
+                .map(|(i, message)| EventRecord {
+                    version: 1,
+                    sequence: i as u64 + 1,
+                    timestamp_millis: 0,
+                    agent: agent.clone(),
+                    event: SessionEvent::MessageCommitted { message },
+                })
+                .collect();
+            // Active creator is no longer visible after an earlier compaction.
+            let projected = vec![(3, tail)];
+            let retained = retained_sources(
+                &records,
+                &agent,
+                &projected,
+                &[ModelCallOrigin {
+                    message: 1,
+                    call_id: "call".into(),
+                }],
+            )
+            .unwrap();
+            assert_eq!(retained, vec![1, 2, 3]);
+            // Original message identity is retained, not a visible-only reconstruction.
+            let persisted: Vec<EventRecord> =
+                serde_json::from_str(&serde_json::to_string(&records).unwrap()).unwrap();
+            assert_eq!(
+                persisted[0].event,
+                SessionEvent::MessageCommitted { message: exchange }
+            );
+            assert_eq!(
+                persisted[1].event,
+                SessionEvent::MessageCommitted { message: results }
+            );
+        }
+    }
 
     #[test]
     fn retained_tool_results_include_nested_jobs_and_null_results_but_not_status_or_arguments() {

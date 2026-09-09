@@ -903,9 +903,7 @@ fn entries_inner(
                                         Surface::User,
                                     ),
                                     UserContent::Runtime { text }
-                                        if text
-                                            .trim_start()
-                                            .starts_with("<skyhook_job_events>") =>
+                                        if job_notification_kind(text).is_some() =>
                                     {
                                         for entry in job_event_entries(
                                             &format!("{key}/{i}"),
@@ -948,13 +946,13 @@ fn entries_inner(
                                 None
                             } else {
                                 blocks.iter().rposition(|(_, block)| {
-                                    matches!(&block.content, BlockContent::Text { text } if !text.is_empty())
+                                    matches!(&block.content, BlockContent::Text { text } if !text.trim().is_empty())
                                 })
                             };
                             for (i, (item, block)) in blocks.iter().enumerate() {
                                 let block_key = response_block_key(request, &item.id, &block.id);
                                 match &block.content {
-                                    BlockContent::Text { text } if !text.is_empty() => {
+                                    BlockContent::Text { text } if !text.trim().is_empty() => {
                                         let mut entry = Entry::new(
                                             block_key.clone(),
                                             format!("{agent_name}\n{text}"),
@@ -1101,9 +1099,17 @@ fn entries_inner(
                         error,
                         request,
                     } => {
+                        // This is the logical invocation count, not the provider's
+                        // internal HTTP retry count. Do not promise a fixed /3 here.
+                        // Exhausted HTTP retries report their count in the error.
+                        let label = if *attempt == 1 {
+                            "Request failed".to_owned()
+                        } else {
+                            format!("Request failed · attempt {attempt}")
+                        };
                         entries.push(Entry::new(
                             format!("failed{request}"),
-                            format!("Request failed · attempt {attempt}/3\n{error}"),
+                            format!("{label}\n{error}"),
                             Surface::Error,
                         ));
                     }
@@ -1260,7 +1266,7 @@ fn response_entries(
                     entry.default_open = running || thinking;
                     entries.push(entry);
                 }
-                BlockKind::Text if !block.text.is_empty() => {
+                BlockKind::Text if !block.text.trim().is_empty() => {
                     entries.push(Entry::new(
                         response_block_key(request, &item.id, &block.id),
                         format!(
@@ -1359,6 +1365,32 @@ fn request_elapsed(info: &RequestInfo, running: bool) -> Option<u64> {
 
 /// Show the event where the model received it, using its historical payload
 /// rather than the job's latest output (the same job may have since resumed).
+/// Both runtime envelopes describe historical job notifications, not user text.
+/// Keep recognizing the original envelopes when projecting saved sessions.
+#[derive(Clone, Copy)]
+enum JobNotificationKind {
+    State,
+    AgentMessage,
+}
+
+impl JobNotificationKind {
+    fn tags(self) -> (&'static str, &'static str) {
+        match self {
+            Self::State => ("<skyhook_job_events>", "</skyhook_job_events>"),
+            Self::AgentMessage => ("<skyhook_agent_messages>", "</skyhook_agent_messages>"),
+        }
+    }
+}
+
+fn job_notification_kind(text: &str) -> Option<JobNotificationKind> {
+    [
+        JobNotificationKind::State,
+        JobNotificationKind::AgentMessage,
+    ]
+    .into_iter()
+    .find(|kind| text.trim_start().starts_with(kind.tags().0))
+}
+
 fn job_event_entries(
     key: &str,
     text: &str,
@@ -1366,11 +1398,15 @@ fn job_event_entries(
     view: &View,
     all: bool,
 ) -> Vec<Entry> {
-    let events = text
-        .trim()
-        .strip_prefix("<skyhook_job_events>")
-        .and_then(|text| text.strip_suffix("</skyhook_job_events>"))
-        .and_then(|json| serde_json::from_str::<Vec<Value>>(json).ok());
+    let kind = job_notification_kind(text);
+    let agent_message = matches!(kind, Some(JobNotificationKind::AgentMessage));
+    let events = kind.and_then(|kind| {
+        let (start, end) = kind.tags();
+        text.trim()
+            .strip_prefix(start)
+            .and_then(|text| text.strip_suffix(end))
+            .and_then(|json| serde_json::from_str::<Vec<Value>>(json).ok())
+    });
     let Some(events) = events.filter(|events| !events.is_empty()) else {
         return vec![Entry::new(
             format!("{key}/events"),
@@ -1393,16 +1429,35 @@ fn job_event_entries(
                 .get("tool")
                 .and_then(Value::as_str)
                 .or_else(|| job.map(|job| job.tool.as_str()))
-                .unwrap_or("job");
-            let state = event
-                .get("state")
-                .and_then(Value::as_str)
-                .unwrap_or("updated");
+                .unwrap_or(if agent_message { "agent" } else { "job" });
+            let state = if agent_message {
+                event
+                    .get("message")
+                    .and_then(Value::as_u64)
+                    .map_or_else(|| "message".into(), |message| format!("message #{message}"))
+            } else {
+                event
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("updated")
+                    .into()
+            };
+            let name = if agent_message {
+                event
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .or_else(|| job.and_then(|job| job.name.as_deref()))
+                    .map(|name| format!(" · {}", brief(&clean(name), 80)))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             let heading = format!(
-                "{} Job event · {}{} · {}",
+                "{} Job event · {}{}{} · {}",
                 if open { "▾" } else { "▸" },
                 tool,
                 id.map_or(String::new(), |id| format!(" #{id}")),
+                name,
                 state
             );
             let mut entry = Entry::new(key, heading.clone(), Surface::Tool);
@@ -1412,8 +1467,17 @@ fn job_event_entries(
             if open {
                 let mut body = Document::default();
                 body.line(heading, Role::Heading);
-                body.line("Notification received by model", Role::Muted);
-                body.output(tool, job.map_or(&Value::Null, |job| &job.args), event);
+                if agent_message {
+                    body.line("Agent message received by model", Role::Muted);
+                    if let Some(text) = event.get("text").and_then(Value::as_str) {
+                        body.line(clean(text), Role::Plain);
+                    } else {
+                        body.line("Message text unavailable", Role::Muted);
+                    }
+                } else {
+                    body.line("Notification received by model", Role::Muted);
+                    body.output(tool, job.map_or(&Value::Null, |job| &job.args), event);
+                }
                 entry.text = body.plain_text();
                 entry.document = Some(body);
             }
@@ -2147,6 +2211,334 @@ mod tests {
             }
             assert_eq!(rows(&replay, &View::default())[0].text, "▸ Reasoning");
             assert!(rows(&replay, &view)[0].text.contains("Third step"));
+        }
+    }
+
+    #[test]
+    fn whitespace_only_tool_turns_do_not_create_empty_agent_cards() {
+        for whitespace in ["\n\n", "\n\n\n", " \t\r\n", "\u{2003}"] {
+            let mut snapshot = ObservationSnapshot::default();
+            let root = AgentId::root(SessionId::from_bytes([3; 16]));
+            let context = context(&mut snapshot, &root);
+            request(&mut snapshot, &root, context);
+            let message = Message::Assistant(vec![
+                AssistantItem::reasoning("reasoning", 0, "Inspect the repository.", Some(replay())),
+                AssistantItem::text("separator", 1, whitespace),
+                AssistantItem::tool_call(
+                    "tool",
+                    2,
+                    skyhook::provider::protocol::ToolCall {
+                        id: "call_read".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path":"."}),
+                    },
+                ),
+            ]);
+            let original = serde_json::to_vec(&message).unwrap();
+            let sequence = record(
+                &mut snapshot,
+                &root,
+                SessionEvent::MessageCommitted { message },
+            );
+            let mut projection = Projection::default();
+            projection.rebuild(&snapshot);
+            let cards = entries(
+                &snapshot,
+                &projection,
+                &root,
+                &View::default(),
+                &HashMap::new(),
+                false,
+                true,
+            );
+            assert!(cards.iter().all(|card| card.surface != Surface::Agent));
+            assert!(cards.iter().any(|card| card.surface == Surface::Reasoning
+                && card.text.contains("Inspect the repository.")));
+            assert!(
+                cards
+                    .iter()
+                    .any(|card| card.surface == Surface::Tool && card.text.contains("read"))
+            );
+            let SessionEvent::MessageCommitted { message } = &snapshot.records[&sequence].event
+            else {
+                panic!("message history changed during rendering");
+            };
+            assert_eq!(serde_json::to_vec(message).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn live_text_waits_for_visible_content_without_trimming_the_response() {
+        let mut snapshot = ObservationSnapshot::default();
+        let root = AgentId::root(SessionId::from_bytes([4; 16]));
+        let context = context(&mut snapshot, &root);
+        let request = request(&mut snapshot, &root, context);
+        update(
+            &mut snapshot,
+            delta_event(root.clone(), request, BlockKind::Text, "\n\n".into()),
+        );
+        let cards = response_entries(
+            request,
+            &snapshot.responses[&(root.clone(), request)],
+            &View::default(),
+            false,
+            "Agent",
+        );
+        assert!(
+            cards.is_empty(),
+            "newline-only streaming deltas must not create a blank card"
+        );
+        update(
+            &mut snapshot,
+            delta_event(
+                root.clone(),
+                request,
+                BlockKind::Text,
+                "  Actual answer.\n".into(),
+            ),
+        );
+        let cards = response_entries(
+            request,
+            &snapshot.responses[&(root, request)],
+            &View::default(),
+            false,
+            "Agent",
+        );
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].surface, Surface::Agent);
+        assert_eq!(cards[0].text, "Agent\n\n\n  Actual answer.\n");
+    }
+
+    #[test]
+    fn trailing_whitespace_does_not_steal_the_final_answer_footer() {
+        let mut snapshot = ObservationSnapshot::default();
+        let root = AgentId::root(SessionId::from_bytes([5; 16]));
+        let context = context(&mut snapshot, &root);
+        request(&mut snapshot, &root, context);
+        let answer = "  Actual answer with spacing.\n";
+        record(
+            &mut snapshot,
+            &root,
+            SessionEvent::MessageCommitted {
+                message: Message::Assistant(vec![
+                    AssistantItem::text("answer", 0, answer),
+                    AssistantItem::text("separator", 1, "\n\n"),
+                ]),
+            },
+        );
+        let mut projection = Projection::default();
+        projection.rebuild(&snapshot);
+        let cards = entries(
+            &snapshot,
+            &projection,
+            &root,
+            &View::default(),
+            &HashMap::new(),
+            false,
+            false,
+        );
+        let answers: Vec<_> = cards
+            .iter()
+            .filter(|card| card.surface == Surface::Agent)
+            .collect();
+        assert_eq!(answers.len(), 1);
+        assert!(answers[0].text.ends_with(answer));
+        assert_eq!(answers[0].footer.as_deref(), Some("fixture-model"));
+    }
+
+    #[test]
+    fn intermediate_agent_messages_are_historical_expandable_job_events() {
+        let message = "Both reviewer gaps are fixed.\nChecking \"native\" replay — next.";
+        let text = format!(
+            " <skyhook_agent_messages>\n{}\n</skyhook_agent_messages> ",
+            serde_json::json!([{
+                "id":253, "name":"implement-native-replay", "message":6577, "text":message,
+            }]),
+        );
+        let mut projection = Projection::default();
+        let collapsed = job_event_entries("m42/0", &text, &projection, &View::default(), false);
+        assert_eq!(collapsed.len(), 1);
+        let card = &collapsed[0];
+        assert_eq!(card.surface, Surface::Tool);
+        assert!(card.expandable);
+        assert!(card.job.is_none());
+        assert_eq!(card.key, "m42/0/event0");
+        assert!(
+            card.text
+                .contains("Job event · agent #253 · implement-native-replay · message #6577")
+        );
+        assert!(!card.text.contains("skyhook_agent_messages"));
+        assert!(!card.text.contains(message));
+        let mut view = View::default();
+        view.expanded.insert(card.key.clone());
+        let expanded = job_event_entries("m42/0", &text, &projection, &view, false);
+        assert!(expanded[0].document.is_some());
+        assert!(expanded[0].text.contains(message));
+        assert!(!expanded[0].text.contains("<skyhook_"));
+        assert!(!expanded[0].text.contains("\\\"text\\\""));
+
+        // A later terminal job snapshot must not relabel or replace the historical message.
+        let id = JobId::new(253).unwrap();
+        projection.jobs.insert(
+            id,
+            JobInfo {
+                id,
+                agent: AgentId::root(SessionId::from_bytes([1; 16])),
+                name: Some("current name".into()),
+                tool: "agent".into(),
+                args: Value::Null,
+                parent: None,
+                state: JobState::Completed,
+                target: "host".into(),
+                location: ".".into(),
+                remote: false,
+                error: None,
+            },
+        );
+        let after_completion = job_event_entries("m42/0", &text, &projection, &view, false);
+        assert_eq!(after_completion[0].text, expanded[0].text);
+        assert!(after_completion[0].job.is_none());
+        view.collapsed.insert(card.key.clone());
+        assert!(
+            job_event_entries("m42/0", &text, &projection, &view, true)[0]
+                .document
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn conversation_projects_both_job_envelopes_without_reclassifying_user_text() {
+        let agent = AgentId::root(SessionId::from_bytes([2; 16]));
+        let messages = format!(
+            "<skyhook_agent_messages>\n{}\n</skyhook_agent_messages>",
+            serde_json::json!([
+                {"id":253,"message":6577,"text":"first progress"},
+                {"id":253,"message":6578,"text":"second progress"},
+            ]),
+        );
+        let jobs = format!(
+            "<skyhook_job_events>\n{}\n</skyhook_job_events>",
+            serde_json::json!([{"id":253,"tool":"agent","state":"completed","result":"final result"}]),
+        );
+        let message = Message::User(vec![
+            UserContent::Runtime {
+                text: messages.clone(),
+            },
+            UserContent::Runtime { text: jobs },
+            UserContent::Text {
+                text: messages.clone(),
+            },
+            UserContent::Runtime {
+                text: "ordinary scheduler note".into(),
+            },
+        ]);
+        // Saved histories retain the original runtime envelopes; rendering is presentation-only.
+        let saved = serde_json::to_vec(&message).unwrap();
+        let restored = serde_json::from_slice(&saved).unwrap();
+        let mut snapshot = ObservationSnapshot::default();
+        let sequence = record(
+            &mut snapshot,
+            &agent,
+            SessionEvent::MessageCommitted { message: restored },
+        );
+        let mut projection = Projection::default();
+        projection.rebuild(&snapshot);
+        let cards = entries(
+            &snapshot,
+            &projection,
+            &agent,
+            &View::default(),
+            &HashMap::new(),
+            false,
+            true,
+        );
+        let notifications: Vec<_> = cards
+            .iter()
+            .filter(|entry| entry.surface == Surface::Tool)
+            .collect();
+        assert_eq!(notifications.len(), 3);
+        assert_eq!(notifications[0].key, format!("m{sequence}/0/event0"));
+        assert_eq!(notifications[1].key, format!("m{sequence}/0/event1"));
+        assert_eq!(notifications[2].key, format!("m{sequence}/1/event0"));
+        assert!(notifications[0].text.contains("first progress"));
+        assert!(notifications[1].text.contains("second progress"));
+        assert!(notifications[2].text.contains("final result"));
+        assert!(notifications.iter().all(|entry| entry.expandable
+            && entry.job.is_none()
+            && !entry.text.contains("<skyhook_")
+            && !entry.text.contains("Harness notification")));
+        assert!(notifications[0].compact_after);
+        assert!(!notifications[1].compact_after);
+        assert!(cards.iter().any(
+            |entry| entry.surface == Surface::User && entry.text == format!("You\n{messages}")
+        ));
+        assert!(cards.iter().any(|entry| entry.surface == Surface::Muted
+            && entry.text == "Harness notification\nordinary scheduler note"));
+        let SessionEvent::MessageCommitted { message: stored } = &snapshot.records[&sequence].event
+        else {
+            panic!("message history changed during rendering");
+        };
+        assert_eq!(serde_json::to_vec(stored).unwrap(), saved);
+    }
+
+    #[test]
+    fn malformed_agent_notifications_use_job_event_fallback_without_panicking() {
+        for text in [
+            "<skyhook_agent_messages>bad json</skyhook_agent_messages>",
+            "<skyhook_agent_messages>[]</skyhook_agent_messages>",
+            "<skyhook_agent_messages>[{}]",
+        ] {
+            assert!(job_notification_kind(text).is_some());
+            let entries =
+                job_event_entries("m1/0", text, &Projection::default(), &View::default(), true);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].surface, Surface::Tool);
+            assert!(entries[0].text.contains("Job event"));
+            assert!(entries[0].text.contains("details unavailable"));
+            assert!(!entries[0].text.contains("<skyhook_"));
+        }
+    }
+
+    #[test]
+    fn failed_request_labels_do_not_confuse_http_retries_with_invocations() {
+        for (attempt, error, label) in [
+            (
+                1,
+                "Timeout: provider HTTP startup timeout (after 3 HTTP attempts)",
+                "Request failed\n",
+            ),
+            (2, "Protocol: rejected", "Request failed · attempt 2\n"),
+        ] {
+            let mut snapshot = ObservationSnapshot::default();
+            let root = AgentId::root(SessionId::from_bytes([1; 16]));
+            let context = context(&mut snapshot, &root);
+            let request = request(&mut snapshot, &root, context);
+            record(
+                &mut snapshot,
+                &root,
+                SessionEvent::ModelFailed {
+                    request,
+                    attempt,
+                    error: error.into(),
+                },
+            );
+            let mut projection = Projection::default();
+            projection.rebuild(&snapshot);
+            let entries = entries(
+                &snapshot,
+                &projection,
+                &root,
+                &View::default(),
+                &HashMap::new(),
+                false,
+                false,
+            );
+            let failure = entries
+                .iter()
+                .find(|entry| entry.key == format!("failed{request}"))
+                .unwrap();
+            assert_eq!(failure.text, format!("{label}{error}"));
+            assert!(!failure.text.contains("/3"));
         }
     }
 
