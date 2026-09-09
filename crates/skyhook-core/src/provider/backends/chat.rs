@@ -844,6 +844,74 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn fetch_json_body_schema_uses_provider_compatible_unrestricted_objects() {
+        use crate::{
+            test_support::TestRuntime,
+            tool::{
+                ToolRegistryBuilder,
+                builtins::register_worker_tools,
+                policy::{Capability, CapabilitySet},
+            },
+        };
+
+        let runtime = TestRuntime::new().await;
+        let mut builder = ToolRegistryBuilder::default();
+        register_worker_tools(&mut builder, runtime.store.clone()).unwrap();
+        let mut capabilities = CapabilitySet::default();
+        capabilities.insert(Capability::Network);
+        let fetch = builder
+            .build()
+            .surface(&capabilities)
+            .definitions()
+            .into_iter()
+            .find(|tool| tool.name == "fetch")
+            .expect("fetch is registered");
+        let mut request = request();
+        request.messages.push(Message::User(vec![UserContent::Text {
+            text: "Hello".into(),
+        }]));
+        request.tools.push(fetch);
+        let body = encode(&request).unwrap();
+        let schema = &body["tools"][0]["function"]["parameters"];
+        let json_variant = schema["$defs"]["RequestBody"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["const"] == "json")
+            .unwrap();
+        // A boolean true here caused llama.cpp to reject the entire first
+        // request with HTTP 400: "Unrecognized schema: true".
+        assert_eq!(json_variant["properties"]["value"], json!({}));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["insecure"]["default"], false);
+        let validator = jsonschema::validator_for(schema).unwrap();
+        for value in [
+            Value::Null,
+            json!(true),
+            json!(false),
+            json!(42),
+            json!("text"),
+            json!([1, true]),
+            json!({"enabled":true}),
+        ] {
+            assert!(validator.is_valid(
+                &json!({"url":"https://example.org", "body":{"kind":"json", "value":value}})
+            ));
+        }
+        assert!(validator.is_valid(
+            &json!({"url":"https://example.org", "query":[["key","value"],["key","second"]]})
+        ));
+        for query in [
+            json!([["key"]]),
+            json!([["key", "value", "extra"]]),
+            json!([[1, "value"]]),
+        ] {
+            assert!(!validator.is_valid(&json!({"url":"https://example.org", "query":query})));
+        }
+        assert!(!validator.is_valid(&json!({"url":"https://example.org", "unknown":true})));
+    }
+
     fn image() -> ImageReference {
         ImageReference {
             sha256: "digest".into(),

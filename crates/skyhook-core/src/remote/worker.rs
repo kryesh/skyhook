@@ -249,9 +249,19 @@ where
             });
         };
         if request.parent.is_none() {
-            request
-                .permissions
-                .retain(|permission| permission.resource.namespace == "path");
+            // Only the ordinary static workspace permissions were approved by
+            // the caller before dispatch. Preserve destination-derived resources
+            // (network origins, paths, and other namespaces), including redirects
+            // from a top-level worker invocation whose parent remains None.
+            request.permissions.retain(|permission| {
+                !(permission.resource.namespace == "workspace"
+                    && matches!(
+                        permission.capability,
+                        crate::tool::policy::Capability::Read
+                            | crate::tool::policy::Capability::Write
+                            | crate::tool::policy::Capability::Exec
+                    ))
+            });
             if request.permissions.is_empty() {
                 return Box::pin(async { PolicyDecision::allow() });
             }
@@ -375,6 +385,153 @@ mod tests {
 
     use super::*;
     use crate::remote::protocol::RemoteToolOutput;
+
+    #[tokio::test]
+    async fn top_level_network_authorizations_are_forwarded_with_scope() {
+        use crate::tool::policy::{Capability, PermissionUse, ResourceId};
+        let runtime = crate::test_support::TestRuntime::new().await;
+        let (mut client, server) = tokio::io::duplex(8192);
+        let authorizations = Arc::new(Mutex::new(HashMap::new()));
+        let policy = Arc::new(ForwardPolicy {
+            output: Arc::new(Mutex::new(server)),
+            authorizations: authorizations.clone(),
+            next_id: AtomicU64::new(0),
+        });
+        let job = runtime
+            .jobs
+            .create(crate::job::JobSpec::test(
+                runtime.agent.clone(),
+                "network_test",
+            ))
+            .await
+            .unwrap()
+            .id;
+        for origin in ["https://initial.test", "https://redirect.test"] {
+            let permission =
+                PermissionUse::new(Capability::Network, ResourceId::network("root", origin));
+            let request = AuthorizationRequest {
+                agent: runtime.agent.clone(),
+                job,
+                parent: None,
+                scope: Some(42),
+                tool: "network_test".to_owned(),
+                permissions: vec![permission.clone()],
+                arguments: serde_json::json!({"insecure":true}),
+            };
+            let policy = policy.clone();
+            let pending = tokio::spawn(async move { policy.authorize(request).await });
+            let response = tokio::time::timeout(
+                Duration::from_secs(2),
+                read_frame::<_, Response>(&mut client),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            let Response::Authorization {
+                request_id,
+                authorization_id,
+                permissions,
+                arguments,
+                ..
+            } = response
+            else {
+                panic!("expected authorization")
+            };
+            assert_eq!(request_id, 42);
+            assert_eq!(permissions, vec![permission]);
+            assert_eq!(arguments["insecure"], true);
+            authorizations
+                .lock()
+                .await
+                .remove(&(request_id, authorization_id))
+                .unwrap()
+                .send(PolicyDecision::Deny {
+                    reason: "blocked".to_owned(),
+                })
+                .unwrap();
+            assert!(matches!(
+                pending.await.unwrap(),
+                PolicyDecision::Deny { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn top_level_network_and_redirect_permissions_are_forwarded() {
+        use crate::{
+            identity::{JobId, SessionId},
+            tool::policy::{Capability, PermissionUse, ResourceId},
+        };
+        let (mut host, worker) = tokio::io::duplex(16 * 1024);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let policy = Arc::new(ForwardPolicy {
+            output: Arc::new(Mutex::new(worker)),
+            authorizations: pending.clone(),
+            next_id: AtomicU64::new(0),
+        });
+        for (origin, allow) in [
+            ("https://initial.test", true),
+            ("https://redirect.test:8443", false),
+        ] {
+            let network =
+                PermissionUse::new(Capability::Network, ResourceId::network("root", origin));
+            let arguments = serde_json::json!({"url":"https://initial.test", "network_origin":origin, "insecure":true});
+            let request = AuthorizationRequest {
+                agent: crate::identity::AgentId::root(SessionId::from_bytes([1; 16])),
+                job: JobId::new(1).unwrap(),
+                parent: None,
+                scope: Some(7),
+                tool: "fetch".to_owned(),
+                permissions: vec![
+                    PermissionUse::new(
+                        Capability::Exec,
+                        ResourceId::new("workspace", ["root", "/workspace"]),
+                    ),
+                    network.clone(),
+                ],
+                arguments: arguments.clone(),
+            };
+            let policy = policy.clone();
+            let decision = tokio::spawn(async move { policy.authorize(request).await });
+            let response =
+                tokio::time::timeout(Duration::from_secs(2), read_frame::<_, Response>(&mut host))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            let Response::Authorization {
+                request_id,
+                authorization_id,
+                tool,
+                permissions,
+                arguments: forwarded,
+            } = response
+            else {
+                panic!("expected network authorization");
+            };
+            assert_eq!(request_id, 7);
+            assert_eq!(tool, "fetch");
+            assert_eq!(permissions, vec![network]);
+            assert_eq!(forwarded, arguments);
+            let expected = if allow {
+                PolicyDecision::allow()
+            } else {
+                PolicyDecision::Deny {
+                    reason: "redirect denied".to_owned(),
+                }
+            };
+            pending
+                .lock()
+                .await
+                .remove(&(request_id, authorization_id))
+                .unwrap()
+                .send(expected.clone())
+                .unwrap();
+            assert_eq!(decision.await.unwrap(), expected);
+        }
+        assert!(pending.lock().await.is_empty());
+    }
 
     #[tokio::test]
     async fn tool_requests_execute_concurrently_and_reply_on_completion() {

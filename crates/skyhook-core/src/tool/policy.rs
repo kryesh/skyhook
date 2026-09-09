@@ -16,15 +16,17 @@ pub enum Capability {
     Read,
     Write,
     Exec,
+    Network,
     Targets,
     Agents,
 }
 
 impl Capability {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Read,
         Self::Write,
         Self::Exec,
+        Self::Network,
         Self::Targets,
         Self::Agents,
     ];
@@ -67,6 +69,7 @@ impl Default for CapabilitySet {
             Capability::Read,
             Capability::Write,
             Capability::Exec,
+            Capability::Network,
             Capability::Agents,
         ]))
     }
@@ -109,6 +112,15 @@ impl ResourceId {
             Component::Normal(value) => value.to_string_lossy().into_owned(),
         }));
         Self::new("path", segments)
+    }
+
+    /// A destination scoped to one execution target and normalized HTTP(S)
+    /// origin. Callers obtain the origin from a validated URL parser; omit path,
+    /// query, user information and default ports. A permission using this resource
+    /// should normally not propose a persistent grant.
+    #[must_use]
+    pub fn network(target: &str, normalized_origin: &str) -> Self {
+        Self::new("network", [target, normalized_origin])
     }
 
     #[must_use]
@@ -248,5 +260,39 @@ pub struct AllowAll;
 impl Policy for AllowAll {
     fn authorize(&self, _request: AuthorizationRequest) -> PolicyFuture<'_> {
         Box::pin(async { PolicyDecision::allow() })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_capability_serializes_and_is_enabled_by_default() {
+        assert!(CapabilitySet::default().contains(Capability::Network));
+        assert_eq!(
+            serde_json::to_value(Capability::Network).unwrap(),
+            "network"
+        );
+        assert_eq!(
+            serde_json::from_value::<Capability>(serde_json::json!("network")).unwrap(),
+            Capability::Network
+        );
+    }
+
+    #[test]
+    fn network_resources_are_scoped_by_target_and_origin() {
+        let resource = ResourceId::network("root", "https://example.test");
+        let grant = ApprovalGrant::exact(Capability::Network, resource.clone());
+        assert!(grant.covers(Capability::Network, &resource));
+        for other in [
+            ResourceId::network("build", "https://example.test"),
+            ResourceId::network("root", "http://example.test"),
+            ResourceId::network("root", "https://example.test:8443"),
+            ResourceId::network("root", "https://other.test"),
+        ] {
+            assert!(!grant.covers(Capability::Network, &other));
+        }
+        assert!(!grant.covers(Capability::Read, &resource));
     }
 }

@@ -19,8 +19,34 @@ fn discovered(server: &str, tool: &str) -> DiscoveredTool {
     }
 }
 
+fn tool_name(item: &DiscoveredTool) -> String {
+    tool_names(std::slice::from_ref(item), |_| false).remove(0)
+}
+
+#[test]
+fn ordinary_names_remain_readable_without_hashes() {
+    assert_eq!(
+        tool_name(&discovered("filesystem", "write_file")),
+        "mcp_filesystem_write_file"
+    );
+    assert_eq!(
+        tool_name(&discovered("filesystem", "read_text_file")),
+        "mcp_filesystem_read_text_file"
+    );
+    assert_eq!(
+        tool_name(&discovered("docs-v2", "Search")),
+        "mcp_docs-v2_Search"
+    );
+    let boundary = "x".repeat(57);
+    let name = tool_name(&discovered("s", &boundary));
+    assert_eq!(name, format!("mcp_s_{boundary}"));
+    assert_eq!(name.len(), 63);
+    assert_eq!(tool_name(&discovered("s", &"x".repeat(58))).len(), 64);
+}
+
 #[test]
 fn names_are_stable_safe_bounded_and_collision_resistant() {
+    let long = "x".repeat(500);
     let identities = [
         ("a-b", "c"),
         ("a_b", "c"),
@@ -29,25 +55,97 @@ fn names_are_stable_safe_bounded_and_collision_resistant() {
         ("👋", "工具"),
         ("", ""),
         ("server", "background"),
+        (long.as_str(), "first"),
+        (long.as_str(), "second"),
     ];
-    let mut names = BTreeSet::new();
-    for (server, tool) in identities {
-        let item = discovered(server, tool);
-        let name = tool_name(&item);
-        assert_eq!(name, tool_name(&item));
+    let mut catalog: Vec<_> = identities
+        .iter()
+        .map(|(server, tool)| discovered(server, tool))
+        .collect();
+    let names = tool_names(&catalog, |_| false);
+    assert_eq!(names, tool_names(&catalog, |_| false));
+    assert_eq!(names.iter().collect::<BTreeSet<_>>().len(), names.len());
+    for name in &names {
         assert!(name.starts_with("mcp_"));
         assert!(name.len() <= 64);
         assert!(
             name.bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
         );
-        assert!(names.insert(name));
     }
-    let long = "x".repeat(500);
-    let first = tool_name(&discovered(&long, "first"));
-    let second = tool_name(&discovered(&long, "second"));
-    assert_eq!(first.len(), 64);
-    assert_ne!(first, second);
+    // Both ambiguous identities receive suffixes, rather than first-one-wins.
+    assert!(names[1].starts_with("mcp_a_b_c_"));
+    assert!(names[2].starts_with("mcp_a_b_c_"));
+    assert_ne!(names[1], names[2]);
+    assert_eq!(names[7].len(), 64);
+    assert_eq!(names[8].len(), 64);
+    assert_eq!(names[7].rsplit('_').next().unwrap().len(), 8);
+    catalog.reverse();
+    let mut reversed = tool_names(&catalog, |_| false);
+    reversed.reverse();
+    assert_eq!(names, reversed);
+    // Adding unrelated names does not rename existing tools.
+    catalog.reverse();
+    catalog.push(discovered("unrelated", "new_tool"));
+    assert_eq!(&tool_names(&catalog, |_| false)[..names.len()], names);
+}
+
+#[test]
+fn sanitization_and_truncation_only_add_short_hashes_when_needed() {
+    for item in [
+        discovered("bad.server", "write"),
+        discovered("s", &"x".repeat(59)),
+    ] {
+        let name = tool_name(&item);
+        let suffix = name.rsplit('_').next().unwrap();
+        assert_eq!(suffix.len(), 8);
+        assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(name.len() <= 64);
+    }
+    assert_ne!(
+        tool_name(&discovered("bad.server", "write")),
+        tool_name(&discovered("bad/server", "write"))
+    );
+}
+
+#[test]
+fn natural_names_take_precedence_over_generated_suffixes() {
+    let invalid = discovered("bad.server", "write");
+    let generated = tool_name(&invalid);
+    let natural = discovered(
+        "bad_server",
+        generated.strip_prefix("mcp_bad_server_").unwrap(),
+    );
+    let names = tool_names(&[invalid.clone(), natural.clone()], |_| false);
+    assert_eq!(names[1], generated);
+    assert_ne!(names[0], names[1]);
+    assert_eq!(names[0], format!("{generated}_1"));
+    let reverse = tool_names(&[natural, invalid], |_| false);
+    assert_eq!(names, vec![reverse[1].clone(), reverse[0].clone()]);
+}
+
+#[test]
+fn registered_tool_names_are_never_taken_by_mcp() {
+    let item = discovered("filesystem", "write_file");
+    let raw = tool_name(&item);
+    let fallback = tool_names(std::slice::from_ref(&item), |name| name == raw).remove(0);
+    let mut builder = ToolRegistryBuilder::default();
+    for name in [&raw, &fallback] {
+        builder
+            .register_dynamic(
+                name.as_str(),
+                "host tool",
+                json!({"type":"object"}),
+                ToolOptions::default(),
+                |_, _| async { Ok(ToolOutput::new(Value::Null)) },
+            )
+            .unwrap();
+    }
+    let names = tool_names(&[item], |name| builder.contains_name(name));
+    assert_eq!(names[0], format!("{fallback}_1"));
+    assert!(builder.contains_name(&raw));
+    assert!(builder.contains_name(&fallback));
+    assert!(!builder.contains_name(&names[0]));
 }
 
 #[test]
@@ -369,6 +467,8 @@ async fn registration_dispatch_capabilities_permissions_and_preapproval_validati
     let registry = builder.build();
     let native = tool_name(&discovered("fixture", "native"));
     let open = tool_name(&discovered("fixture", "open"));
+    assert_eq!(native, "mcp_fixture_native");
+    assert_eq!(open, "mcp_fixture_open");
     for tool in registry.tools() {
         assert_eq!(tool.placement(), ToolPlacement::Host);
         assert_eq!(

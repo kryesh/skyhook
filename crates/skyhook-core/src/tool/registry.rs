@@ -11,8 +11,9 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::{
+    execution::ExecutionLocation,
     provider::protocol::ToolDefinition as ProviderToolDefinition,
-    tool::policy::{Capability, CapabilitySet, PathAccess, ResourceId},
+    tool::policy::{Capability, CapabilitySet, PathAccess, PermissionUse, ResourceId},
 };
 
 use super::{ToolContext, ToolError, ToolOutput};
@@ -27,6 +28,9 @@ pub struct RegisteredTool {
 type ToolHandler = Arc<
     dyn Fn(ToolContext, Value) -> BoxFuture<'static, Result<ToolOutput, ToolError>> + Send + Sync,
 >;
+type ArgumentPermissions =
+    Arc<dyn Fn(&ExecutionLocation, &Value) -> Result<Vec<PermissionUse>, ToolError> + Send + Sync>;
+type ArgumentPaths = Arc<dyn Fn(&Value) -> Result<Vec<PathArgument>, ToolError> + Send + Sync>;
 type ArgumentValidator = Arc<dyn Fn(&Value) -> Result<(), ToolError> + Send + Sync>;
 
 #[derive(Clone, Debug)]
@@ -160,18 +164,35 @@ pub enum ToolPlacement {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PathKind {
+pub enum PathKind {
     Existing,
     Writable,
     Removable,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PathArgument {
-    pub name: String,
-    pub access: PathAccess,
-    pub kind: PathKind,
-    pub default: Option<String>,
+pub struct PathArgument {
+    pub(crate) name: String,
+    pub(crate) access: PathAccess,
+    pub(crate) kind: PathKind,
+    pub(crate) default: Option<String>,
+    /// JSON pointer for nested paths; unlike legacy top-level paths these always
+    /// contribute a permission, even inside the authorization root.
+    pub(crate) pointer: Option<String>,
+}
+
+impl PathArgument {
+    #[must_use]
+    pub fn pointer(pointer: impl Into<String>, access: PathAccess, kind: PathKind) -> Self {
+        let pointer = pointer.into();
+        Self {
+            name: pointer.clone(),
+            access,
+            kind,
+            default: None,
+            pointer: Some(pointer),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -197,6 +218,8 @@ struct ToolExecution {
     permission_resource: Option<ResourceId>,
     path_arguments: Vec<PathArgument>,
     argument_validator: Option<ArgumentValidator>,
+    argument_permissions: Option<ArgumentPermissions>,
+    argument_paths: Option<ArgumentPaths>,
     read_error_output: Option<fn(&str, &ToolError) -> Option<ToolOutput>>,
 }
 
@@ -325,6 +348,7 @@ impl ToolOptions {
             access,
             kind,
             default: None,
+            pointer: None,
         });
         self
     }
@@ -342,13 +366,42 @@ impl ToolOptions {
             access,
             kind,
             default: Some(default.into()),
+            pointer: None,
         });
+        self
+    }
+
+    /// Extract invocation-specific permissions after tool argument validation.
+    /// These replace static permissions of the same capability. Remote path and
+    /// network permissions are forwarded from the destination for host approval;
+    /// other namespaces are authorized by the host before dispatch.
+    #[must_use]
+    pub fn argument_permissions(
+        mut self,
+        extract: impl Fn(&ExecutionLocation, &Value) -> Result<Vec<PermissionUse>, ToolError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.execution.argument_permissions = Some(Arc::new(extract));
+        self
+    }
+
+    /// Extract concrete JSON pointers (including array indices) to filesystem
+    /// inputs/outputs. Each path is resolved and rewritten before authorization.
+    /// Dynamic paths require their capability even when inside the workspace.
+    #[must_use]
+    pub fn argument_paths(
+        mut self,
+        extract: impl Fn(&Value) -> Result<Vec<PathArgument>, ToolError> + Send + Sync + 'static,
+    ) -> Self {
+        self.execution.argument_paths = Some(Arc::new(extract));
         self
     }
 
     /// Validate tool-specific arguments before requesting authorization.
     #[must_use]
-    pub(crate) fn argument_validator(
+    pub fn argument_validator(
         mut self,
         validate: impl Fn(&Value) -> Result<(), ToolError> + Send + Sync + 'static,
     ) -> Self {
@@ -460,8 +513,23 @@ impl RegisteredTool {
             .and_then(|convert| convert(path, error))
     }
 
-    pub(crate) fn path_arguments(&self) -> &[PathArgument] {
-        &self.execution.path_arguments
+    pub(crate) fn path_arguments(&self, arguments: &Value) -> Result<Vec<PathArgument>, ToolError> {
+        let mut paths = self.execution.path_arguments.clone();
+        if let Some(extract) = &self.execution.argument_paths {
+            paths.extend(extract(arguments)?);
+        }
+        Ok(paths)
+    }
+
+    pub(crate) fn argument_permissions(
+        &self,
+        location: &ExecutionLocation,
+        arguments: &Value,
+    ) -> Result<Vec<PermissionUse>, ToolError> {
+        self.execution
+            .argument_permissions
+            .as_ref()
+            .map_or_else(|| Ok(Vec::new()), |extract| extract(location, arguments))
     }
 
     pub(crate) const fn accepts_input(&self) -> bool {
@@ -623,6 +691,11 @@ pub struct ToolRegistryBuilder {
 }
 
 impl ToolRegistryBuilder {
+    /// Check names already claimed by builtin or host-supplied tools.
+    pub(crate) fn contains_name(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
     pub fn extend(&mut self, registry: &ToolRegistry) -> Result<&mut Self, RegistryError> {
         for (name, tool) in registry.tools.iter() {
             if self.tools.insert(name.clone(), tool.clone()).is_some() {
@@ -952,6 +1025,14 @@ fn sanitize_schema(value: &mut Value) {
 }
 
 fn sanitize_schema_inner(value: &mut Value, preserve_dialect: bool) {
+    // `true` and `{}` both accept any JSON value. Some provider-side tool
+    // schema converters (including llama.cpp) only accept the object form.
+    // This traversal visits schema nodes, never literal defaults or examples.
+    // Keep `false` intact: internal validation relies on closed-object flags.
+    if value.as_bool() == Some(true) {
+        *value = Value::Object(Map::new());
+        return;
+    }
     let Some(object) = value.as_object_mut() else {
         return;
     };
@@ -1351,6 +1432,107 @@ mod schema_normalization_tests {
         assert_eq!(schema["properties"]["value"]["examples"][0], literal);
         assert_eq!(schema["$defs"]["title"], json!({"type": "string"}));
         assert_eq!(schema["items"][0], json!({"type": "string"}));
+    }
+
+    #[test]
+    fn unrestricted_schemas_use_object_form_without_rewriting_boolean_data() {
+        let literal = json!({"properties":{"value":true}, "items":false, "$schema":true});
+        let original = json!({
+            "$schema":"https://json-schema.org/draft/2020-12/schema",
+            "type":"object", "additionalProperties":false, "readOnly":true,
+            "properties": {
+                "value":true, "forbidden":false,
+                "flag":{"type":"boolean", "default":true, "const":true, "enum":[true,false], "examples":[true,literal]},
+                "list":{"type":"array", "items":true},
+                "tuple":{"type":"array", "prefixItems":[true,false]},
+                "open":{"type":"object", "additionalProperties":true},
+                "union":{"anyOf":[true,false]}
+            },
+            "$defs":{"anything":true, "nothing":false},
+            "required":["value"]
+        });
+        for preserve_dialect in [false, true] {
+            let mut normalized = original.clone();
+            sanitize_schema_inner(&mut normalized, preserve_dialect);
+            for pointer in [
+                "/properties/value",
+                "/properties/list/items",
+                "/properties/tuple/prefixItems/0",
+                "/properties/open/additionalProperties",
+                "/properties/union/anyOf/0",
+                "/$defs/anything",
+            ] {
+                assert_eq!(
+                    normalized.pointer(pointer).unwrap(),
+                    &json!({}),
+                    "{pointer}"
+                );
+            }
+            for pointer in [
+                "/additionalProperties",
+                "/properties/forbidden",
+                "/properties/tuple/prefixItems/1",
+                "/properties/union/anyOf/1",
+                "/$defs/nothing",
+            ] {
+                assert_eq!(
+                    normalized.pointer(pointer),
+                    Some(&Value::Bool(false)),
+                    "{pointer}"
+                );
+            }
+            assert_eq!(
+                normalized["properties"]["flag"],
+                original["properties"]["flag"]
+            );
+            assert_eq!(normalized["readOnly"], true);
+            assert_eq!(normalized.get("$schema").is_some(), preserve_dialect);
+            let before = jsonschema::validator_for(&original).unwrap();
+            let after = jsonschema::validator_for(&normalized).unwrap();
+            for value in [
+                Value::Null,
+                json!(true),
+                json!(false),
+                json!(42),
+                json!("text"),
+                json!([1, false]),
+                json!({"enabled":true}),
+            ] {
+                let valid = json!({"value":value});
+                assert!(before.is_valid(&valid));
+                assert!(after.is_valid(&valid));
+                for invalid in [
+                    json!({"value":value,"forbidden":null}),
+                    json!({"value":value,"unknown":1}),
+                ] {
+                    assert!(!before.is_valid(&invalid));
+                    assert!(!after.is_valid(&invalid));
+                }
+            }
+            let once = normalized.clone();
+            sanitize_schema_inner(&mut normalized, preserve_dialect);
+            assert_eq!(normalized, once);
+        }
+    }
+
+    #[test]
+    fn unrestricted_output_schema_is_normalized_too() {
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register_dynamic(
+                "any_output",
+                "test",
+                json!({"type":"object"}),
+                ToolOptions::default().output_schema(Value::Bool(true)),
+                |_, _| async { Ok(ToolOutput::new(Value::Null)) },
+            )
+            .unwrap();
+        let registry = builder.build();
+        let surface = registry.surface(&CapabilitySet::default());
+        assert_eq!(
+            surface.get("any_output").unwrap().output_schema,
+            Some(json!({}))
+        );
     }
 
     #[test]

@@ -85,7 +85,7 @@ impl UiInteraction {
 fn requires_prompt(permission: &PermissionUse) -> bool {
     match permission.capability {
         Capability::Read | Capability::Agents => false,
-        Capability::Exec | Capability::Targets => true,
+        Capability::Exec | Capability::Targets | Capability::Network => true,
         Capability::Write => {
             permission.resource.namespace != "workspace"
                 || permission
@@ -156,6 +156,17 @@ impl SensitivePromptHandler for UiInteraction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_requests_require_user_approval_for_every_target() {
+        use skyhook::tool::policy::ResourceId;
+        for target in ["root", "build"] {
+            assert!(requires_prompt(&PermissionUse::new(
+                Capability::Network,
+                ResourceId::network(target, "https://example.test"),
+            )));
+        }
+    }
     #[tokio::test]
     async fn abandoned_prompt_is_cancelled_without_reading_stdin() {
         let (handler, mut rx) = UiInteraction::new();

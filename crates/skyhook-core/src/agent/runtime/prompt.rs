@@ -106,7 +106,7 @@ fn capability_prompt(capability: Capability, available_depth: usize) -> Option<S
         Capability::Agents => Some(format!(
             "{AGENT_PROMPT}\n\n<agent_context>\n{{\"available_depth\":{available_depth}}}\n</agent_context>"
         )),
-        Capability::Read | Capability::Write | Capability::Exec => None,
+        Capability::Read | Capability::Write | Capability::Exec | Capability::Network => None,
     }
 }
 

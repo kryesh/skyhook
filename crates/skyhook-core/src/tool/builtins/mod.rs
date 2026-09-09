@@ -1,5 +1,7 @@
 //! Built-in coding, helper, and job-control tools.
 
+mod fetch;
+mod fetch_text;
 mod filesystem;
 pub(crate) mod jobs;
 mod process;
@@ -43,5 +45,6 @@ pub(crate) fn register_worker_tools(
     filesystem::register(builder, store)?;
     search::register(builder)?;
     process::register(builder)?;
+    fetch::register(builder)?;
     Ok(())
 }

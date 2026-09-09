@@ -154,10 +154,10 @@ mod tests {
             "start_command = ['server']\ncwd = 'work'\nenv = { MODE = 'test' }\n",
         ] {
             let config: McpServerConfig = toml::from_str(&format!(
-                "transport = 'streamable_http'\nurl = 'http://localhost:8080/mcp'\n{command}headers_env = {{ Authorization = 'SKYHOOK_MCP_TEST_UNSET_SECRET' }}\ncapabilities = ['read', 'write', 'exec', 'targets', 'agents']"
+                "transport = 'streamable_http'\nurl = 'http://localhost:8080/mcp'\n{command}headers_env = {{ Authorization = 'SKYHOOK_MCP_TEST_UNSET_SECRET' }}\ncapabilities = ['read', 'write', 'exec', 'network', 'targets', 'agents']"
             )).unwrap();
             assert_eq!(config.transport, McpTransport::StreamableHttp);
-            assert_eq!(config.capabilities.len(), 5);
+            assert_eq!(config.capabilities.len(), 6);
             // Secret resolution belongs to connection startup, not config parsing.
             assert_eq!(
                 config.headers_env["Authorization"],
@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn unknown_fields_capabilities_and_invalid_timeouts_are_rejected() {
         for extra in [
-            "capabilities = ['network']",
+            "capabilities = ['unknown_capability']",
             "capabilities = ['Read']",
             "command = ['other']",
             "startup_timeout_secs = 0",

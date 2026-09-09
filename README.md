@@ -521,7 +521,7 @@ harness startup without a model tool-approval prompt, only on the local root/ses
 selected SSH targets. Only configure commands and endpoints you trust. MCP clients and launched
 processes are owned by the root session rather than independently restarted for each child agent.
 
-`capabilities` defaults to `[]`. Valid names are `read`, `write`, `exec`, `targets`, and `agents`.
+`capabilities` defaults to `[]`. Valid names are `read`, `write`, `exec`, `network`, `targets`, and `agents`.
 An agent must hold **all** listed capabilities to see or call a server's tools; otherwise those tools
 are hidden from both the model catalog and JavaScript access. Servers whose requirements exceed
 the session's capabilities are not contacted or launched at all. This is a host-configured gate, not
@@ -542,10 +542,12 @@ or conflicts with the common `bg` argument, its MCP input is nested under an `ar
 instead. Schemas with a root `$ref` or `patternProperties` are also conservatively wrapped. Input
 schema roots must declare `type = "object"`; tools with invalid or unsupported schemas are warned
 about and skipped individually. Use the advertised schema for either surface; the wrapper is
-removed before sending input to the MCP server. Generated names begin with `mcp_` and include a
-stable hash suffix to avoid collisions; use the exact advertised name with `tool[name](...)` or
-its fluent builder. Direct calls return normal job views, while foreground script calls return
-the MCP result envelope (`content`, plus optional `structuredContent` and `isError`). Images use the
+removed before sending input to the MCP server. Tools normally use readable names such as
+`mcp_filesystem_write_file`. A short, deterministic hash suffix is added only when a name needs
+sanitizing or shortening to the 64-character limit, or conflicts with another tool. Ambiguous
+names are resolved across the startup catalog independently of discovery order. Use the exact
+advertised name with `tool[name](...)` or its fluent builder. Direct calls return normal job views,
+while foreground script calls return the MCP result envelope (`content`, plus optional `structuredContent` and `isError`). Images use the
 usual saved-output image handling, and server-reported errors retain their output in failed jobs.
 
 Calls pass through the same cancellation and background-job machinery as builtins. Skyhook
@@ -896,7 +898,7 @@ unfinished jobs become interrupted and job identifiers continue monotonically; t
 service survival across harness restarts. `SessionHandle::interrupt` stops active provider streams
 and cancels jobs across the session's agent tree.
 
-`agent`, `exec`, and `shell` accept an optional `name` describing the work. Names must use
+`agent`, `exec`, `shell`, and `fetch` accept an optional `name` describing the work. Names must use
 lowercase kebab-case: start with a letter, then use lowercase ASCII letters, digits, and single
 hyphens between nonempty words. Examples include `inspect-config`, `run-tests`, and `build-v2`.
 Names are descriptive labels, do not need to be unique, and do not replace job IDs.
@@ -997,7 +999,7 @@ unchanged; transient history does not guarantee exclusion from provider KV cache
 
 ## Built-in tools
 
-`read`, `search`, `glob`, `exec`, `shell`, `write`, `replace`, `patch`, `remove`, `script`, `targets`,
+`read`, `search`, `glob`, `exec`, `shell`, `fetch`, `write`, `replace`, `patch`, `remove`, `script`, `targets`,
 `target_add`, `jobs`, `job_output`, `wait`, `ask`, `todo`, and `agent`. `jobs()` lists the current agent's
 active jobs, excluding the listing call and its containing script. `jobs({all:true})` includes
 completed history; listings contain status and references, never saved results.
@@ -1012,6 +1014,117 @@ The result is `{reason:"event"}` or `{reason:"timeout"}`. An event does not guar
 job has completed; inspect its current status. Waiting does not stop background work.
 Do independent work first rather than polling output in a tight loop. Output reads reject the old
 `wait` argument.
+
+### HTTP requests with `fetch`
+
+`fetch` is a reqwest-backed HTTP tool, available directly and as `tool.fetch(...)` in scripts.
+It runs on the selected execution target: DNS, TLS, proxy discovery, uploads, and downloads all
+happen there. Relative paths use that target's workspace; no files are implicitly copied between
+machines. Like `exec`, it supports `name`, `bg`, cancellation, and saved job output.
+
+```js
+// Read an article without sending HTML boilerplate to the model.
+const page = await tool.fetch({url: "https://example.com/article", text: true});
+
+// Send JSON to an API. HTTP 4xx/5xx are responses, not tool failures.
+const response = await tool.fetch({
+  url: "https://api.example.com/items",
+  method: "POST",
+  body: {kind: "json", value: {name: "example"}}
+});
+
+// Duplicate query parameters and request headers are supported.
+const search = await tool.fetch({
+  url: "https://api.example.com/search",
+  query: [["tag", "rust"], ["tag", "http"]],
+  headers: {Accept: "application/json"}
+});
+
+// Upload files without shelling out or base64-encoding them in model context.
+const upload = await tool.fetch({
+  url: "https://api.example.com/upload",
+  method: "POST",
+  body: {kind: "multipart", parts: [
+    {name: "description", text: "Build output"},
+    {name: "file", path: "dist/archive.tar.gz"}
+  ]}
+});
+
+// Save a download on the execution target. Existing files are preserved unless overwrite:true.
+const download = await tool.fetch({
+  url: "https://example.com/archive.tar.gz",
+  save_to: "archive.tar.gz",
+  max_bytes: 104857600,
+  timeout: 300
+});
+
+// Explicitly opt out of certificate validation for a development HTTPS server.
+// This permits untrusted certificates and enables interception; never use casually.
+const development = await tool.fetch({url: "https://localhost:8443/health", insecure: true});
+```
+
+Only `url` is required. `method` defaults to `GET` and accepts standard methods and valid custom
+HTTP method tokens. `query` is an ordered array of string pairs, appended to any existing URL query.
+The default `User-Agent` is `Skyhook/<version>`; an explicit `User-Agent` header overrides it.
+Header values can be strings or arrays of strings. `auth` accepts `{kind:"bearer",token:"..."}` or
+`{kind:"basic",username:"...",password:"..."}`; arbitrary authentication schemes can use headers.
+Do not combine `auth` with an `Authorization` header or embed credentials in URLs.
+
+`body` has exactly one tagged source:
+
+- `{kind:"text",value:"..."}` for UTF-8 text.
+- `{kind:"json",value:...}` for any JSON value, including `null`.
+- `{kind:"form",fields:[["key","value"],...]}` for URL-encoded forms with repeated keys.
+- `{kind:"base64",value:"..."}` for inline binary data.
+- `{kind:"file",path:"..."}` for a regular-file upload.
+- `{kind:"multipart",parts:[...]}` for text, file, or base64 parts. Each part has `name` and one of
+  `text`, `path`, or `base64`; binary/file parts can specify `filename` and `content_type`.
+
+Responses include final URL/method, status, `ok` (2xx), repeated headers, redirect history,
+received byte count, elapsed time, and a tagged `body`: `text`, `base64`, `file`, or `empty`.
+JSON responses remain decoded text; scripts can use `JSON.parse(response.body.text)`.
+`response_format` defaults to `auto` (text for textual content, base64 otherwise); `text` forces
+character decoding and `base64` preserves response entity bytes. HTTP decompression is automatic;
+these are not raw wire bytes. `save_to` streams to a temporary file and commits on success instead
+of embedding the payload. Errors or cancellation do not replace an existing destination.
+Automatic job presentation may shorten `body.text` and `body.data`, with continuation markers;
+retrieve the complete saved payload using `job_output` fields `/result/body/text` or
+`/result/body/data`. Status, headers, body kind, and other metadata remain intact. JavaScript
+calls still receive the complete payload for processing.
+
+`text:true` is separate from `response_format:"text"`: it extracts readable article content from
+HTML with **dom_smoothie**, returning plain text and available title/byline/site/language metadata.
+It does not execute JavaScript or fetch linked assets. Plain text, JSON, and other textual types
+pass through decoded; binary content is not converted. Extraction failures are explicit, never
+silently replaced with raw HTML. Fetch with `text:false` to inspect the original response. Empty
+responses remain empty. `text:true` cannot be combined with `save_to` or `response_format:"base64"`.
+Extraction accepts at most 10 MiB of decoded HTML and 50,000 DOM elements, with bounded parser
+concurrency. Character decoding honors BOMs, HTTP charsets, and HTML meta charsets where applicable.
+
+The default total `timeout` is 30 seconds, `connect_timeout` is 10 seconds, and `max_bytes` is
+10 MiB. The response limit can be raised to 100 MiB; total uploads are also capped at 100 MiB.
+Timeouts must be between 1 and 3600 seconds and `max_redirects` cannot exceed 20.
+Limits apply while streaming, including to decompressed data; exceeding a limit fails
+rather than reporting an incomplete body as successful. Model-visible preview truncation is
+independent: retrieve saved results with `job_output`. Cancellation and timeouts cannot undo
+server-side effects, and requests are not automatically retried.
+
+`redirects` is `safe` by default (follow GET/HEAD), `follow` to follow other methods too, or `manual`
+to return the redirect response. `max_redirects` defaults to 5. Changed origins require authorization;
+cross-origin requests do not inherit sensitive request headers, and HTTPS-to-HTTP redirects are
+rejected. Redirect method rewriting follows HTTP conventions; 307/308 preserve method and body.
+`proxy` selects an explicit HTTP proxy; otherwise reqwest uses the target's proxy environment.
+`insecure` defaults to **false**. Setting it to **true** disables HTTPS certificate validation for
+that invocation only; it does not disable authorization or permit HTTPS downgrade redirects.
+
+All requests require the `network` capability and approval, not just filesystem `read` permission.
+File uploads additionally require `read`, and downloads require `write`, including paths inside
+the workspace. Loopback and internal-service URLs are supported; this is a general-purpose network
+tool, not an isolated browser or a network sandbox. Returned content is untrusted data.
+There is no ambient shared cookie jar: set `Cookie` explicitly and inspect repeated `Set-Cookie`
+headers when needed. **Arguments, response bodies, and headers can contain secrets and are subject
+to the normal session/job persistence rules**; do not assume HTTP credentials are omitted from
+session records or that `insecure` makes authentication safer.
 
 ### Saved job output
 

@@ -416,6 +416,7 @@ impl ToolExecutor {
                 .ok_or(ToolError::ArgumentsMustBeObject)?
                 .remove("target");
         }
+        tool.validate_arguments(&arguments)?;
         let (path_permissions, read_error) = if selected.route.is_none() {
             preflight_path_arguments(
                 &tool,
@@ -428,8 +429,14 @@ impl ToolExecutor {
         } else {
             (Vec::new(), None)
         };
-        tool.validate_arguments(&arguments)?;
+        let argument_permissions = tool.argument_permissions(&selected.location, &arguments)?;
         let mut capabilities = tool.capabilities();
+        for permission in &argument_permissions {
+            if !self.capabilities.contains(permission.capability) {
+                return Err(ExecutionError::UnavailableTool(name.to_owned()));
+            }
+            capabilities.retain(|candidate| *candidate != permission.capability);
+        }
         // An unresolved read still requires the ordinary workspace authorization,
         // as well as approval for the unresolved path below.
         if read_error.is_none() {
@@ -440,6 +447,13 @@ impl ToolExecutor {
         let mut permissions =
             scope_capabilities(capabilities, &selected.location, tool.permission_resource());
         permissions.extend(path_permissions);
+        // Destination-derived permissions are approved once on the worker, which
+        // forwards them to the host with its actual target identity. This avoids
+        // duplicate network prompts while still authorizing before any request.
+        permissions.extend(argument_permissions.into_iter().filter(|permission| {
+            selected.route.is_none()
+                || !matches!(permission.resource.namespace.as_str(), "path" | "network")
+        }));
         let authorization_arguments = if let Some(route) = &selected.route {
             permissions.push(route.permission());
             serde_json::json!({
@@ -530,7 +544,7 @@ impl ToolExecutor {
                 &subject,
                 plan.tool.name().to_owned(),
                 plan.permissions,
-                plan.authorization_arguments,
+                plan.authorization_arguments.clone(),
             )
             .await
         {
@@ -599,6 +613,11 @@ impl ToolExecutor {
             self.shared.jobs.clone(),
         );
         context.process_environment = self.shared.process_environment.clone();
+        context.authorizer = Some((
+            self.shared.authorization.clone(),
+            plan.tool.name().to_owned(),
+            plan.authorization_arguments.clone(),
+        ));
         let authentication = if context.capabilities.contains(Capability::Targets)
             && context.execution_location.is_root()
             && matches!(plan.tool.name(), "exec" | "shell")
@@ -840,13 +859,17 @@ async fn preflight_path_arguments(
     authorization_root: &std::path::Path,
     arguments: &mut Value,
 ) -> Result<(Vec<PermissionUse>, Option<ToolOutput>), ToolError> {
-    let object = arguments
-        .as_object_mut()
-        .ok_or(ToolError::ArgumentsMustBeObject)?;
+    if !arguments.is_object() {
+        return Err(ToolError::ArgumentsMustBeObject);
+    }
     let mut permissions = Vec::new();
     let mut read_error = None;
-    for spec in tool.path_arguments() {
-        let input = match object.get(&spec.name) {
+    for spec in tool.path_arguments(arguments)? {
+        let value = match &spec.pointer {
+            Some(pointer) => arguments.pointer(pointer),
+            None => arguments.get(&spec.name),
+        };
+        let input = match value {
             Some(Value::String(path)) => path.clone(),
             Some(_) => {
                 return Err(ToolError::InvalidArguments(format!(
@@ -856,6 +879,12 @@ async fn preflight_path_arguments(
             }
             None => match &spec.default {
                 Some(default) => default.clone(),
+                None if spec.pointer.is_some() => {
+                    return Err(ToolError::InvalidArguments(format!(
+                        "path pointer `{}` does not identify an argument",
+                        spec.name
+                    )));
+                }
                 None => continue,
             },
         };
@@ -880,11 +909,20 @@ async fn preflight_path_arguments(
                 continue;
             }
         };
-        object.insert(
-            spec.name.clone(),
-            Value::String(resolved.path.to_string_lossy().into_owned()),
-        );
-        if !resolved.path.starts_with(authorization_root) {
+        let value = Value::String(resolved.path.to_string_lossy().into_owned());
+        if let Some(pointer) = &spec.pointer {
+            *arguments.pointer_mut(pointer).ok_or_else(|| {
+                ToolError::InvalidArguments(format!(
+                    "path pointer `{pointer}` does not identify an argument"
+                ))
+            })? = value;
+        } else {
+            arguments
+                .as_object_mut()
+                .expect("validated object")
+                .insert(spec.name.clone(), value);
+        }
+        if spec.pointer.is_some() || !resolved.path.starts_with(authorization_root) {
             let capability = spec.access.capability();
             let resource = ResourceId::path(target, &resolved.path);
             let grant = if resolved.directory {
@@ -1041,6 +1079,376 @@ mod tests {
             authorization.clone(),
         );
         TargetRouter::new(targets, remote, authorization)
+    }
+
+    #[derive(Default)]
+    struct NetworkPolicy {
+        requests: std::sync::Mutex<Vec<AuthorizationRequest>>,
+        deny_redirect: bool,
+    }
+
+    impl Policy for NetworkPolicy {
+        fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
+            let denied = self.deny_redirect
+                && request.permissions.iter().any(|permission| {
+                    permission
+                        .resource
+                        .segments
+                        .last()
+                        .is_some_and(|origin| origin == "https://redirect.test")
+                });
+            self.requests.lock().unwrap().push(request);
+            Box::pin(async move {
+                if denied {
+                    PolicyDecision::Deny {
+                        reason: "redirect denied".to_owned(),
+                    }
+                } else {
+                    PolicyDecision::allow()
+                }
+            })
+        }
+    }
+
+    fn network_builder() -> ToolRegistryBuilder {
+        use crate::tool::{PathArgument, PathKind, policy::PathAccess};
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register_dynamic(
+                "network_test",
+                "Exercise invocation-derived authorization",
+                serde_json::json!({"type":"object","properties":{
+                    "url":{"type":"string"}, "body":{}, "save_to":{}, "redirect":{}, "insecure":{}
+                }}),
+                ToolOptions::new(vec![Capability::Network])
+                    .placement(ToolPlacement::TargetedWorkspace)
+                    .background()
+                    .named()
+                    .argument_validator(|arguments| {
+                        if arguments["url"] != "https://initial.test" {
+                            return Err(ToolError::InvalidArguments("invalid test URL".to_owned()));
+                        }
+                        Ok(())
+                    })
+                    .argument_permissions(|location, _arguments| {
+                        Ok(vec![PermissionUse::new(
+                            Capability::Network,
+                            ResourceId::network(&location.target, "https://initial.test"),
+                        )])
+                    })
+                    .argument_paths(|arguments| {
+                        let mut paths = Vec::new();
+                        if arguments["body"]["kind"] == "file" {
+                            paths.push(PathArgument::pointer(
+                                "/body/path",
+                                PathAccess::Read,
+                                PathKind::Existing,
+                            ));
+                        }
+                        if let Some(parts) = arguments["body"]["parts"].as_array() {
+                            for (index, part) in parts.iter().enumerate() {
+                                if part.get("path").is_some() {
+                                    paths.push(PathArgument::pointer(
+                                        format!("/body/parts/{index}/path"),
+                                        PathAccess::Read,
+                                        PathKind::Existing,
+                                    ));
+                                }
+                            }
+                        }
+                        if arguments.get("save_to").is_some() {
+                            paths.push(PathArgument::pointer(
+                                "/save_to",
+                                PathAccess::Write,
+                                PathKind::Writable,
+                            ));
+                        }
+                        Ok(paths)
+                    }),
+                |context, arguments| async move {
+                    if arguments["redirect"] == true {
+                        context.authorize_network("https://redirect.test").await?;
+                    }
+                    Ok(ToolOutput::new(arguments))
+                },
+            )
+            .unwrap();
+        builder
+    }
+
+    #[tokio::test]
+    async fn network_only_invocations_have_exact_origin_permissions_each_time() {
+        let runtime = crate::test_support::TestRuntime::new().await;
+        let policy = Arc::new(NetworkPolicy::default());
+        let mut capabilities = CapabilitySet::default();
+        capabilities.remove(Capability::Read);
+        capabilities.remove(Capability::Write);
+        let executor = ToolExecutor::new(
+            network_builder().build(),
+            policy.clone(),
+            runtime.jobs.clone(),
+            runtime.root.path().to_path_buf(),
+        )
+        .with_capabilities(capabilities);
+        assert!(executor.surface().get("network_test").is_some());
+        for _ in 0..2 {
+            executor
+                .execute(
+                    runtime.agent.clone(),
+                    "network_test",
+                    serde_json::json!({"url":"https://initial.test"}),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let requests = policy.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert_eq!(
+                request.permissions,
+                vec![PermissionUse::new(
+                    Capability::Network,
+                    ResourceId::network("root", "https://initial.test")
+                )]
+            );
+            assert!(request.permissions[0].proposed_grant.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn network_paths_inside_and_outside_root_require_dynamic_capabilities() {
+        let runtime = crate::test_support::TestRuntime::new().await;
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(runtime.root.path().join("upload"), "data").unwrap();
+        std::fs::write(outside.path().join("upload"), "data").unwrap();
+        for (removed, extra) in [
+            (
+                Capability::Read,
+                serde_json::json!({"body":{"kind":"file","path":"upload"}}),
+            ),
+            (
+                Capability::Read,
+                serde_json::json!({"body":{"kind":"multipart","parts":[{"name":"upload","path":"upload"}]}}),
+            ),
+            (Capability::Write, serde_json::json!({"save_to":"download"})),
+            (
+                Capability::Read,
+                serde_json::json!({"body":{"kind":"file","path":outside.path().join("upload")}}),
+            ),
+            (
+                Capability::Read,
+                serde_json::json!({"body":{"kind":"multipart","parts":[{"name":"upload","path":outside.path().join("upload")}]}}),
+            ),
+            (
+                Capability::Write,
+                serde_json::json!({"save_to":outside.path().join("download")}),
+            ),
+        ] {
+            let policy = Arc::new(NetworkPolicy::default());
+            let mut capabilities = CapabilitySet::default();
+            capabilities.remove(removed);
+            let executor = ToolExecutor::new(
+                network_builder().build(),
+                policy.clone(),
+                runtime.jobs.clone(),
+                runtime.root.path().to_path_buf(),
+            )
+            .with_capabilities(capabilities);
+            // The network tool remains exposed without either file capability.
+            assert!(executor.surface().get("network_test").is_some());
+            let mut arguments = serde_json::json!({"url":"https://initial.test"});
+            arguments
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let error = executor
+                .execute(runtime.agent.clone(), "network_test", arguments, None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ExecutionError::UnavailableTool(_)),
+                "{error:?}"
+            );
+            assert!(policy.requests.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn network_nested_paths_are_rewritten_and_authorized_including_in_root() {
+        let runtime = crate::test_support::TestRuntime::new().await;
+        std::fs::write(runtime.root.path().join("upload"), "data").unwrap();
+        let policy = Arc::new(NetworkPolicy::default());
+        let executor = ToolExecutor::new(
+            network_builder().build(),
+            policy.clone(),
+            runtime.jobs.clone(),
+            runtime.root.path().to_path_buf(),
+        );
+        let plan = executor.plan_registered(InvocationKind::Host, runtime.agent.clone(), "network_test", serde_json::json!({
+            "url":"https://initial.test", "body":{"kind":"multipart","parts":[{"name":"upload","path":"upload"},{"name":"message","text":"not a file"}]}, "save_to":"download"
+        }), None, None).await.unwrap();
+        let upload = runtime.root.path().join("upload");
+        let download = runtime.root.path().join("download");
+        assert_eq!(
+            plan.handler_arguments
+                .pointer("/body/parts/0/path")
+                .unwrap(),
+            &serde_json::json!(upload)
+        );
+        assert_eq!(
+            plan.handler_arguments["save_to"],
+            serde_json::json!(download)
+        );
+        assert!(
+            plan.permissions
+                .iter()
+                .any(|p| p.capability == Capability::Read
+                    && p.resource == ResourceId::path("root", &upload))
+        );
+        assert!(
+            plan.permissions
+                .iter()
+                .any(|p| p.capability == Capability::Write
+                    && p.resource == ResourceId::path("root", &download))
+        );
+        assert_eq!(plan.permissions.len(), 3);
+        assert!(policy.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_network_permissions_are_deferred_but_other_dynamic_permissions_are_not() {
+        let runtime = crate::test_support::TestRuntime::new().await;
+        let policy = Arc::new(NetworkPolicy::default());
+        let mut builder = network_builder();
+        builder
+            .register_dynamic(
+                "dynamic_exec",
+                "test generic dynamic permissions",
+                serde_json::json!({"type":"object","properties":{}}),
+                ToolOptions::new(vec![Capability::Exec])
+                    .placement(ToolPlacement::TargetedWorkspace)
+                    .argument_permissions(|_, _| {
+                        Ok(vec![PermissionUse::new(
+                            Capability::Exec,
+                            ResourceId::session("dynamic-command"),
+                        )])
+                    }),
+                |_, _| async { Ok(ToolOutput::new(Value::Null)) },
+            )
+            .unwrap();
+        let targets = TargetRegistry::from_definitions([target("build", "/build", None)]).unwrap();
+        let mut capabilities = CapabilitySet::default();
+        capabilities.insert(Capability::Targets);
+        let executor = ToolExecutor::new(
+            builder.build(),
+            policy.clone(),
+            runtime.jobs.clone(),
+            runtime.root.path().to_path_buf(),
+        )
+        .with_target_router(router(targets, policy.clone()))
+        .with_capabilities(capabilities);
+        let network = executor
+            .plan_registered(
+                InvocationKind::Host,
+                runtime.agent.clone(),
+                "network_test",
+                serde_json::json!({"url":"https://initial.test", "target":"build"}),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(network.dispatch, InvocationDispatch::Remote(_)));
+        assert!(
+            !network
+                .permissions
+                .iter()
+                .any(|permission| permission.capability == Capability::Network)
+        );
+        let command = executor
+            .plan_registered(
+                InvocationKind::Host,
+                runtime.agent.clone(),
+                "dynamic_exec",
+                serde_json::json!({"target":"build"}),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(command.permissions.contains(&PermissionUse::new(
+            Capability::Exec,
+            ResourceId::session("dynamic-command")
+        )));
+        assert!(policy.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_network_arguments_fail_before_approval_or_path_resolution() {
+        let runtime = crate::test_support::TestRuntime::new().await;
+        let policy = Arc::new(NetworkPolicy::default());
+        let executor = ToolExecutor::new(
+            network_builder().build(),
+            policy.clone(),
+            runtime.jobs.clone(),
+            runtime.root.path().to_path_buf(),
+        );
+        let error = executor
+            .execute(
+                runtime.agent.clone(),
+                "network_test",
+                serde_json::json!({"url":"invalid", "body":{"kind":"file", "path":"missing"}}),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExecutionError::Tool(ToolError::InvalidArguments(_))
+        ));
+        assert!(policy.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_network_authorization_preserves_invocation_and_denies_redirect() {
+        let runtime = crate::test_support::TestRuntime::new().await;
+        let policy = Arc::new(NetworkPolicy {
+            deny_redirect: true,
+            ..NetworkPolicy::default()
+        });
+        let executor = ToolExecutor::new(
+            network_builder().build(),
+            policy.clone(),
+            runtime.jobs.clone(),
+            runtime.root.path().to_path_buf(),
+        );
+        let error = executor
+            .execute(
+                runtime.agent.clone(),
+                "network_test",
+                serde_json::json!({"url":"https://initial.test", "redirect":true,"insecure":true}),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ExecutionError::Denied(_)), "{error:?}");
+        let requests = policy.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].job, requests[1].job);
+        assert_eq!(requests[0].agent, requests[1].agent);
+        assert_eq!(requests[1].arguments["insecure"], true);
+        assert_eq!(
+            requests[1].arguments["network_origin"],
+            "https://redirect.test"
+        );
+        assert_eq!(
+            requests[1].permissions,
+            vec![PermissionUse::new(
+                Capability::Network,
+                ResourceId::network("root", "https://redirect.test")
+            )]
+        );
     }
 
     #[tokio::test]

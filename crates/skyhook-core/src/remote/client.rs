@@ -518,7 +518,7 @@ async fn route_responses<R>(
                             .await
                     } else {
                         Err(AuthorizationError::Denied(
-                            "remote path authorization requires a host tool context".into(),
+                            "remote authorization requires a host tool context".into(),
                         ))
                     };
                     let (allowed, reason) = match decision {
@@ -596,17 +596,20 @@ fn rebase_remote_permissions(
         target: &str,
         resource: &mut crate::tool::policy::ResourceId,
     ) -> Result<(), RemoteError> {
-        if resource.namespace != "path" {
+        if !matches!(
+            resource.namespace.as_str(),
+            "path" | "network" | "workspace"
+        ) {
             return Ok(());
         }
         let Some(origin) = resource.segments.first_mut() else {
             return Err(RemoteError::Protocol(
-                "remote path permission omitted its execution target".to_owned(),
+                "remote scoped permission omitted its execution target".to_owned(),
             ));
         };
         if origin != "root" {
             return Err(RemoteError::Protocol(format!(
-                "remote path permission used unexpected execution target `{origin}`"
+                "remote scoped permission used unexpected execution target `{origin}`"
             )));
         }
         target.clone_into(origin);
@@ -1164,11 +1167,74 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_network_permissions_preserve_origins_and_rebase_targets() {
+        let mut permissions = vec![PermissionUse::new(
+            Capability::Network,
+            ResourceId::network("root", "https://example.test:8443"),
+        )];
+        rebase_remote_permissions("build", &mut permissions).unwrap();
+        assert_eq!(
+            permissions[0].resource,
+            ResourceId::network("build", "https://example.test:8443")
+        );
+        assert!(permissions[0].proposed_grant.is_none());
+        let mut forged = vec![PermissionUse::new(
+            Capability::Network,
+            ResourceId::network("another-target", "https://example.test"),
+        )];
+        assert!(matches!(
+            rebase_remote_permissions("build", &mut forged),
+            Err(RemoteError::Protocol(_))
+        ));
+    }
+
+    #[test]
     fn forwarded_path_permissions_cannot_claim_another_target() {
         let mut permissions = vec![PermissionUse::new(
             Capability::Read,
             ResourceId::new("path", ["other", "/", "outside"]),
         )];
+        assert!(matches!(
+            rebase_remote_permissions("build", &mut permissions),
+            Err(RemoteError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn forwarded_network_permissions_and_grants_are_target_scoped() {
+        let resource = ResourceId::network("root", "https://example.test:8443");
+        let mut permissions = vec![
+            PermissionUse::new(Capability::Network, resource.clone())
+                .with_grant(ApprovalGrant::exact(Capability::Network, resource)),
+        ];
+        rebase_remote_permissions("build", &mut permissions).unwrap();
+        let expected = ResourceId::network("build", "https://example.test:8443");
+        assert_eq!(permissions[0].resource, expected);
+        assert_eq!(
+            permissions[0].proposed_grant.as_ref().unwrap().resource,
+            expected
+        );
+
+        for resource in [
+            ResourceId::network("other", "https://example.test"),
+            ResourceId::new("network", std::iter::empty::<String>()),
+        ] {
+            let mut permissions = vec![PermissionUse::new(Capability::Network, resource)];
+            assert!(matches!(
+                rebase_remote_permissions("build", &mut permissions),
+                Err(RemoteError::Protocol(_))
+            ));
+        }
+        let mut permissions = vec![
+            PermissionUse::new(
+                Capability::Network,
+                ResourceId::network("root", "https://example.test"),
+            )
+            .with_grant(ApprovalGrant::exact(
+                Capability::Network,
+                ResourceId::network("other", "https://example.test"),
+            )),
+        ];
         assert!(matches!(
             rebase_remote_permissions("build", &mut permissions),
             Err(RemoteError::Protocol(_))

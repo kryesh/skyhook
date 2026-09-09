@@ -8,7 +8,7 @@ use crate::{
     execution::ExecutionLocation,
     identity::{AgentId, JobId},
     media::ImageReference,
-    tool::policy::CapabilitySet,
+    tool::policy::{Capability, CapabilitySet, PermissionUse, ResourceId},
 };
 
 #[derive(Clone)]
@@ -20,6 +20,11 @@ pub struct ToolContext {
     pub capabilities: CapabilitySet,
     pub(crate) process_environment: crate::remote::backend::ProcessEnvironment,
     pub(crate) authorization: super::authorization::AuthorizationSubject,
+    pub(crate) authorizer: Option<(
+        super::authorization::AuthorizationCoordinator,
+        String,
+        Value,
+    )>,
     input: Arc<Mutex<mpsc::Receiver<Value>>>,
     jobs: crate::job::JobManager,
 }
@@ -40,9 +45,62 @@ impl ToolContext {
             capabilities: authorization.capabilities.clone(),
             process_environment: Default::default(),
             authorization,
+            authorizer: None,
             input: Arc::new(Mutex::new(input)),
             jobs,
         }
+    }
+
+    /// Authorize an additional operation using this invocation's identity,
+    /// capability ceiling, cancellation and (on workers) forwarding scope.
+    async fn authorize(
+        &self,
+        permissions: Vec<PermissionUse>,
+        arguments: Value,
+    ) -> Result<(), ToolError> {
+        let Some((coordinator, tool, _)) = &self.authorizer else {
+            return Err(ToolError::Denied(
+                "runtime authorization is unavailable".to_owned(),
+            ));
+        };
+        coordinator
+            .authorize(&self.authorization, tool.clone(), permissions, arguments)
+            .await
+            .map_err(|error| {
+                use super::authorization::AuthorizationError;
+                match error {
+                    AuthorizationError::Cancelled => ToolError::Cancelled,
+                    AuthorizationError::Denied(reason)
+                    | AuthorizationError::InvalidGrant(reason) => ToolError::Denied(reason),
+                    AuthorizationError::Unavailable => {
+                        ToolError::Denied("required capability is unavailable".to_owned())
+                    }
+                }
+            })
+    }
+
+    /// Approve a redirect destination before connecting to it. Callers must pass
+    /// the normalized HTTP(S) origin from their parsed URL, never a full URL.
+    /// No persistent grant is proposed; each invocation/destination is reviewed.
+    pub async fn authorize_network(&self, normalized_origin: &str) -> Result<(), ToolError> {
+        let mut arguments = self
+            .authorizer
+            .as_ref()
+            .map_or(Value::Null, |(_, _, arguments)| arguments.clone());
+        if let Some(object) = arguments.as_object_mut() {
+            object.insert(
+                "network_origin".to_owned(),
+                Value::String(normalized_origin.to_owned()),
+            );
+        }
+        self.authorize(
+            vec![PermissionUse::new(
+                Capability::Network,
+                ResourceId::network(&self.execution_location.target, normalized_origin),
+            )],
+            arguments,
+        )
+        .await
     }
 
     #[must_use]

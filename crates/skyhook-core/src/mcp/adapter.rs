@@ -32,8 +32,8 @@ pub fn register(
     store: SessionStore,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
-    let mut names = BTreeSet::new();
-    for discovered in manager.catalog() {
+    let generated_names = tool_names(manager.catalog(), |name| builder.contains_name(name));
+    for (discovered, name) in manager.catalog().iter().zip(generated_names) {
         let server = &discovered.server;
         let tool = &discovered.tool;
         let Some(config) = configs.get(server) else {
@@ -50,14 +50,6 @@ pub fn register(
                 continue;
             }
         };
-        let name = tool_name(discovered);
-        if !names.insert(name.clone()) {
-            warnings.push(format!(
-                "MCP tool {server}/{} skipped: duplicate generated name {name}",
-                tool.name
-            ));
-            continue;
-        }
         let validator = adapted.clone();
         let options = ToolOptions::new(config.capabilities.clone())
             .preserve_required()
@@ -117,25 +109,78 @@ pub fn register(
     warnings
 }
 
-/// Always include a hash of the *original*, length-delimited identity: names
-/// remain stable when other servers/tools are added, sanitized, or truncated.
-fn tool_name(discovered: &DiscoveredTool) -> String {
-    let server = &discovered.server;
-    let tool = discovered.tool.name.as_ref();
-    let identity = format!("{}:{server}{}:{tool}", server.len(), tool.len());
-    let hash = crate::sha256_hex(identity.as_bytes());
-    let readable: String = format!("mcp_{server}_{tool}")
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '_' {
-                character
-            } else {
-                '_'
-            }
-        })
-        .take(39)
+/// Prefer readable names. Allocate against the whole catalog before registration
+/// so ambiguous server/tool boundaries never depend on discovery order. Natural
+/// names take precedence over generated suffixes, even if discovered later.
+fn tool_names(catalog: &[DiscoveredTool], is_registered: impl Fn(&str) -> bool) -> Vec<String> {
+    let raw: Vec<_> = catalog
+        .iter()
+        .map(|item| format!("mcp_{}_{}", item.server, item.tool.name))
         .collect();
-    format!("{readable}_{}", &hash[..24])
+    let safe = |name: &str| {
+        name.len() <= 64
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    };
+    let mut counts = BTreeMap::new();
+    for name in &raw {
+        *counts.entry(name.as_str()).or_insert(0_usize) += 1;
+    }
+    let reserved: BTreeSet<_> = raw
+        .iter()
+        .filter(|name| safe(name))
+        .map(String::as_str)
+        .collect();
+    let mut order: Vec<_> = (0..catalog.len()).collect();
+    order.sort_by(|&left, &right| {
+        (&catalog[left].server, &catalog[left].tool.name)
+            .cmp(&(&catalog[right].server, &catalog[right].tool.name))
+    });
+    let mut names = vec![String::new(); catalog.len()];
+    let mut used = BTreeSet::new();
+    for index in order {
+        let name = &raw[index];
+        if safe(name) && counts[name.as_str()] == 1 && !is_registered(name) {
+            names[index] = name.clone();
+            used.insert(name.clone());
+            continue;
+        }
+        let item = &catalog[index];
+        let server = &item.server;
+        let tool = item.tool.name.as_ref();
+        // Length-delimited originals distinguish identities such as a_b/c and
+        // a/b_c, as well as names that normalize to the same ASCII spelling.
+        let hash = crate::sha256_hex(format!("{}:{server}{}:{tool}", server.len(), tool.len()));
+        let readable: String = name
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        for attempt in 0_usize.. {
+            let suffix = if attempt == 0 {
+                hash[..8].to_owned()
+            } else {
+                format!("{}_{attempt}", &hash[..8])
+            };
+            let prefix = &readable[..readable.len().min(64 - 1 - suffix.len())];
+            let candidate = format!("{prefix}_{suffix}");
+            if !reserved.contains(candidate.as_str())
+                && !used.contains(&candidate)
+                && !is_registered(&candidate)
+            {
+                used.insert(candidate.clone());
+                names[index] = candidate;
+                break;
+            }
+        }
+    }
+    names
 }
 
 struct NoExternalSchemas;
