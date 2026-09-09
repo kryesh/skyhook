@@ -1,9 +1,9 @@
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::{
     media::ImageReference,
-    tool::{policy::PermissionUse, ToolOutput},
+    tool::{ToolOutput, policy::PermissionUse},
 };
 use serde_json::Value;
 

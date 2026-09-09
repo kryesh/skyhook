@@ -1040,14 +1040,12 @@ const search = await tool.fetch({
   headers: {Accept: "application/json"}
 });
 
-// Upload files without shelling out or base64-encoding them in model context.
+// Send a file as the raw request body, without base64-encoding it in model context.
 const upload = await tool.fetch({
   url: "https://api.example.com/upload",
-  method: "POST",
-  body: {kind: "multipart", parts: [
-    {name: "description", text: "Build output"},
-    {name: "file", path: "dist/archive.tar.gz"}
-  ]}
+  method: "PUT",
+  headers: {"Content-Type": "application/gzip"},
+  body: {kind: "file", path: "dist/archive.tar.gz"}
 });
 
 // Save a download on the execution target. Existing files are preserved unless overwrite:true.
@@ -1076,9 +1074,10 @@ Do not combine `auth` with an `Authorization` header or embed credentials in URL
 - `{kind:"json",value:...}` for any JSON value, including `null`.
 - `{kind:"form",fields:[["key","value"],...]}` for URL-encoded forms with repeated keys.
 - `{kind:"base64",value:"..."}` for inline binary data.
-- `{kind:"file",path:"..."}` for a regular-file upload.
-- `{kind:"multipart",parts:[...]}` for text, file, or base64 parts. Each part has `name` and one of
-  `text`, `path`, or `base64`; binary/file parts can specify `filename` and `content_type`.
+- `{kind:"file",path:"..."}` for a regular-file upload as the raw request body.
+
+Multipart form-data encoding is not supported. File bodies can set their media type through the
+`Content-Type` request header; they are not interchangeable with multipart uploads.
 
 Responses include final URL/method, status, `ok` (2xx), repeated headers, redirect history,
 received byte count, elapsed time, and a tagged `body`: `text`, `base64`, `file`, or `empty`.
@@ -1108,6 +1107,53 @@ Limits apply while streaming, including to decompressed data; exceeding a limit 
 rather than reporting an incomplete body as successful. Model-visible preview truncation is
 independent: retrieve saved results with `job_output`. Cancellation and timeouts cannot undo
 server-side effects, and requests are not automatically retried.
+
+Transport and processing failures remain failed jobs (and rejected script calls), but include a
+structured failure result. It contains `method`, a safe `origin`, `elapsed_ms`, `received_bytes`,
+redirect history, and `diagnostic`: `phase`, `error_kind`, and a concise `message`. To keep tool
+definitions compact, diagnostic category fields use string schemas rather than exhaustive lists
+of labels; the typed runtime classifications and returned values are unchanged. When available,
+`diagnostic.os_error` supplies the executing platform, a numeric OS `code`, and a portable `kind`.
+Timeouts include `diagnostic.timeout.kind` (`total`, `connect`, or `unknown`) and a `limit_ms` only
+when the expiring limit is known. Timing starts inside fetch on the execution target; it does not
+include SSH startup or initial tool approval.
+
+Connection refusal, host/network unreachability, DNS failures, TLS failures, typed HTTP proxy
+CONNECT failures, and response-processing failures are distinguished when the underlying errors
+provide evidence. Otherwise fetch reports a generic transport category; it never infers that a
+firewall caused an error. Diagnostic messages do not copy arbitrary error strings, query strings,
+credentials, headers, or bodies. Failure URL/redirect context is reduced to origins. Received HTTP
+headers retain their normal response semantics and may still contain sensitive response data.
+`proxy_origin`, when present, describes an explicit proxy; omission does not rule out an environment
+proxy. Use the job's target for source attribution, and interpret OS codes using the reported platform.
+
+If headers arrived before a failure (including an outer timeout), the failure also retains the
+HTTP status, `ok`, headers, and byte count. Before any response, those HTTP fields are omitted,
+not fabricated. HTTP 4xx/5xx responses still complete normally: a 405 establishes HTTP connectivity,
+not successful ingestion. Permission denial and cancellation retain their separate semantics.
+
+In scripts, catch failures inside each worker and inspect `error.output.diagnostic`; merely
+logging an Error or allowing `WorkPool` to skip a failed worker loses the structured row:
+
+```js
+try {
+  const response = await tool.fetch({url, target});
+  return {target, http_reached: true, status: response.status};
+} catch (error) {
+  const failure = error.output ?? {};
+  return {
+    target,
+    http_reached: Number.isInteger(failure.status),
+    status: failure.status ?? null,
+    elapsed_ms: failure.elapsed_ms ?? null,
+    diagnostic: failure.diagnostic ?? null,
+    error: error.message,
+  };
+}
+```
+
+The same diagnostic is retrievable from a failed fetch job at `/result/diagnostic`. An uncaught
+script failure preserves it under `/result/failure/output/diagnostic` in the script job.
 
 `redirects` is `safe` by default (follow GET/HEAD), `follow` to follow other methods too, or `manual`
 to return the redirect response. `max_redirects` defaults to 5. Changed origins require authorization;

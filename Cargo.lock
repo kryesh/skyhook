@@ -2764,7 +2764,6 @@ dependencies = [
  "js-sys",
  "log",
  "mime",
- "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -3364,6 +3363,8 @@ dependencies = [
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
+ "http",
+ "hyper-util",
  "ignore",
  "indexmap",
  "jsonschema",
@@ -3372,6 +3373,7 @@ dependencies = [
  "reqwest",
  "rmcp",
  "rquickjs",
+ "rustls",
  "schemars",
  "serde",
  "serde_json",
@@ -3385,6 +3387,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "toml",
+ "tower-service",
  "zeroize",
 ]
 

@@ -14,7 +14,7 @@ static EXTRACTORS: Semaphore = Semaphore::const_new(2);
 const MAX_HTML_BYTES: usize = 10 * 1024 * 1024;
 const MAX_HTML_ELEMENTS: usize = 50_000;
 
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub(super) struct ExtractionMetadata {
     pub engine: String,
     pub title: String,

@@ -68,34 +68,29 @@ async fn methods_and_body_encodings_reach_the_server() {
     }
 }
 
-#[tokio::test]
-async fn multipart_upload_contains_text_file_and_binary_parts() {
-    let runtime = crate::test_support::TestRuntime::new().await;
-    tokio::fs::write(runtime.root.path().join("source.txt"), b"snapshot bytes")
-        .await
-        .unwrap();
-    let (url, task) = server(vec![response("200 OK", "", "")]).await;
-    executor(&runtime).execute(runtime.agent.clone(), "fetch", json!({
-        "url":url,"method":"POST","body":{"kind":"multipart","parts":[
-            {"name":"description","text":"some text"},
-            {"name":"file","path":"source.txt","filename":"chosen.txt","content_type":"text/plain"},
-            {"name":"binary","base64":"YmluYXJ5","filename":"data.bin","content_type":"application/octet-stream"}
-        ]}
-    }), None).await.unwrap();
-    let requests = task.await.unwrap();
-    let request = &requests[0];
-    assert!(request.contains("multipart/form-data; boundary="));
-    for expected in [
-        "name=\"description\"",
-        "some text",
-        "filename=\"chosen.txt\"",
-        "snapshot bytes",
-        "filename=\"data.bin\"",
-        "binary",
-        "application/octet-stream",
-    ] {
-        assert!(request.contains(expected), "missing {expected}: {request}");
-    }
+#[test]
+fn multipart_is_not_advertised_and_is_rejected() {
+    let mut builder = ToolRegistryBuilder::default();
+    register(&mut builder).unwrap();
+    let registry = builder.build();
+    let capabilities = crate::tool::policy::CapabilitySet::default();
+    let surface = registry.surface(&capabilities);
+    let spec = surface.get("fetch").unwrap();
+    assert!(spec.input_schema["$defs"].get("MultipartPart").is_none());
+    let body_kinds: Vec<_> = spec.input_schema["$defs"]["RequestBody"]["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|variant| variant["properties"]["kind"]["const"].as_str().unwrap())
+        .collect();
+    assert_eq!(body_kinds, ["text", "json", "form", "base64", "file"]);
+    let old_input = json!({"url":"https://example.org", "body":{"kind":"multipart", "parts":[]}});
+    assert!(serde_json::from_value::<FetchArgs>(old_input.clone()).is_err());
+    assert!(
+        !jsonschema::validator_for(&spec.input_schema)
+            .unwrap()
+            .is_valid(&old_input)
+    );
 }
 
 async fn raw_response_server(response: Vec<u8>) -> (String, JoinHandle<()>) {
@@ -162,7 +157,7 @@ async fn cancellation_preserves_destination_and_cleans_temporary_download() {
     let server_task = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut buffer = [0u8; 4096];
-        socket.read(&mut buffer).await.unwrap();
+        assert!(socket.read(&mut buffer).await.unwrap() > 0);
         socket
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\npartial")
             .await

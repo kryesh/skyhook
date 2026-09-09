@@ -213,6 +213,35 @@ fn defaults_validation_and_schemas() {
     .unwrap();
     let schema = serde_json::to_value(schema_for!(FetchArgs)).unwrap();
     assert_eq!(schema["properties"]["insecure"]["default"], false);
+    for field in ["timeout", "connect_timeout"] {
+        assert_eq!(schema["properties"][field]["minimum"], 1);
+        assert_eq!(schema["properties"][field]["maximum"], 3600);
+    }
+    assert_eq!(schema["properties"]["max_bytes"]["minimum"], 1);
+    assert_eq!(schema["properties"]["max_bytes"]["maximum"], MAX_BYTES);
+    assert_eq!(schema["properties"]["max_redirects"]["minimum"], 0);
+    assert_eq!(schema["properties"]["max_redirects"]["maximum"], 20);
+    let output_schema = serde_json::to_value(schema_for!(FetchResultSchema)).unwrap();
+    for name in ["FetchPhase", "FetchErrorKind", "FetchIoKind"] {
+        assert!(output_schema["$defs"].get(name).is_none());
+    }
+    for name in ["phase", "error_kind"] {
+        assert_eq!(
+            output_schema["$defs"]["FetchDiagnostic"]["properties"][name]["type"],
+            "string"
+        );
+    }
+    assert_eq!(
+        output_schema["$defs"]["FetchOsError"]["properties"]["kind"]["type"],
+        "string"
+    );
+    let diagnostic = serde_json::to_value(FetchDiagnostic::new(
+        FetchPhase::Connect,
+        FetchErrorKind::ConnectionRefused,
+    ))
+    .unwrap();
+    assert_eq!(diagnostic["phase"], "connect");
+    assert_eq!(diagnostic["error_kind"], "connection_refused");
 }
 
 #[test]
@@ -316,7 +345,7 @@ async fn safe_manual_follow_and_cross_origin_credentials() {
 }
 
 #[tokio::test]
-async fn follow_307_replays_file_and_multipart_uploads() {
+async fn follow_307_replays_file_uploads() {
     let runtime = crate::test_support::TestRuntime::new().await;
     tokio::fs::write(runtime.root.path().join("upload.txt"), b"file payload")
         .await
@@ -331,19 +360,6 @@ async fn follow_307_replays_file_and_multipart_uploads() {
     for request in task.await.unwrap() {
         assert!(request.starts_with("PUT "));
         assert!(request.ends_with("file payload"));
-    }
-    let (url, task) = server(vec![response("200 OK", "", "")]).await;
-    executor.execute(runtime.agent.clone(), "fetch", json!({"url":url,"method":"POST","body":{"kind":"multipart","parts":[{"name":"a","text":"hello"},{"name":"f","path":"upload.txt","filename":"custom.txt","content_type":"text/plain"},{"name":"b","base64":"d29ybGQ="}]}}), None).await.unwrap();
-    let request = &task.await.unwrap()[0];
-    for text in [
-        "multipart/form-data; boundary=",
-        "name=\"a\"",
-        "hello",
-        "filename=\"custom.txt\"",
-        "file payload",
-        "world",
-    ] {
-        assert!(request.contains(text), "missing {text}: {request}");
     }
 }
 
@@ -485,7 +501,7 @@ async fn extraction_failure_preserves_executed_response_metadata() {
         .into_failure()
         .output
         .expect("failed processing retains HTTP response");
-    assert_eq!(output.value["status"], 201);
+    assert_eq!(output.value["status"], 201, "{}", output.value);
     assert_eq!(output.value["method"], "POST");
     assert_eq!(output.value["headers"]["x-result"], json!(["created"]));
     assert_eq!(output.value["received_bytes"], 6);
@@ -503,9 +519,7 @@ async fn file_upload_snapshot_is_bounded_and_immutable() {
     tokio::fs::write(root.path().join("source"), b"changed")
         .await
         .unwrap();
-    let UploadData::File { snapshot, length } = data else {
-        panic!("file snapshot expected")
-    };
+    let FileUpload { snapshot, length } = data;
     assert_eq!(length, 8);
     assert_eq!(tokio::fs::read(snapshot.path()).await.unwrap(), b"original");
 }

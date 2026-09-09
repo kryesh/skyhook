@@ -67,7 +67,7 @@ impl Resources {
 }
 
 enum ResourceState {
-    Running(Resources),
+    Running(Box<Resources>),
     Closing(tokio::task::JoinHandle<()>),
     Closed,
 }
@@ -305,10 +305,10 @@ async fn connect_one(
                     Server {
                         peer,
                         timeout: Duration::from_secs(config.call_timeout_secs),
-                        resources: Mutex::new(ResourceState::Running(Resources {
+                        resources: Mutex::new(ResourceState::Running(Box::new(Resources {
                             client,
                             process,
-                        })),
+                        }))),
                         calls: Semaphore::new(16),
                     },
                 )),

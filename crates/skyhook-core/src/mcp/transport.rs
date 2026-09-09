@@ -512,9 +512,10 @@ impl StreamableHttpClient for BoundedHttpClient {
 async fn http_connect(
     client: BoundedHttpClient,
     config: StreamableHttpClientTransportConfig,
-) -> Result<Client, ClientInitializeError> {
+) -> Result<Client, Box<ClientInitializeError>> {
     ().serve(StreamableHttpClientTransport::with_client(client, config))
         .await
+        .map_err(Box::new)
 }
 
 /// The caller supplies an outer startup deadline and retains ownership outside
@@ -642,7 +643,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
+            assert!(socket.read(&mut request).await.unwrap() > 0);
             // Early rejection may close the connection while we're writing.
             if socket.write_all(headers.as_bytes()).await.is_ok()
                 && socket.write_all(&body).await.is_ok()

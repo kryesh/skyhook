@@ -10,7 +10,6 @@ use futures_util::StreamExt;
 use reqwest::{
     Client, Method, Url,
     header::{HeaderMap, HeaderName, HeaderValue},
-    multipart,
 };
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
@@ -26,6 +25,19 @@ use crate::tool::{
     ToolPlacement, ToolRegistryBuilder,
     policy::{Capability, PathAccess, PermissionUse, ResourceId},
 };
+
+mod diagnostics;
+mod progress;
+use diagnostics::{DnsFailure, FetchDiagnostic, FetchErrorKind, FetchPhase};
+use progress::{FetchFailureOutput, FetchProgress, classified_error, diagnostic_error};
+
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum FetchResultSchema {
+    Response(FetchOutput),
+    Failure(FetchFailureOutput),
+}
 
 const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_BYTES: u64 = 100 * 1024 * 1024;
@@ -49,18 +61,18 @@ const fn default_redirects() -> usize {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct FetchArgs {
-    /// Absolute HTTP or HTTPS URL. Embedded URL credentials are not accepted.
+    /// HTTP(S), without URL credentials.
     pub url: String,
     #[serde(default = "default_method")]
     pub method: String,
-    /// Ordered query pairs, preserving duplicate keys and appending to the URL query.
+    /// Appends to the URL query.
     #[serde(default)]
     pub query: Vec<(String, String)>,
     #[serde(default)]
     pub headers: BTreeMap<String, HeaderValues>,
     pub body: Option<RequestBody>,
     pub auth: Option<Auth>,
-    /// Extract readable HTML text. Plain text is decoded; binary formats are rejected.
+    /// Extract readable HTML text.
     #[serde(default)]
     pub text: bool,
     #[serde(default)]
@@ -68,22 +80,25 @@ pub(super) struct FetchArgs {
     pub save_to: Option<String>,
     #[serde(default)]
     pub overwrite: bool,
-    /// Total operation deadline in seconds (1..=3600).
+    /// Seconds.
     #[serde(default = "default_timeout")]
+    #[schemars(range(min = 1, max = 3600))]
     pub timeout: u64,
-    /// Connection deadline in seconds (1..=3600).
+    /// Seconds.
     #[serde(default = "default_connect_timeout")]
+    #[schemars(range(min = 1, max = 3600))]
     pub connect_timeout: u64,
-    /// Maximum decoded response bytes (1..=104857600). Exceeding it is an error.
+    /// Decoded response bytes; excess fails.
     #[serde(default = "default_max_bytes")]
+    #[schemars(range(min = 1, max = 104857600))]
     pub max_bytes: u64,
     #[serde(default)]
     pub redirects: RedirectPolicy,
-    /// Maximum followed redirects (0..=20).
     #[serde(default = "default_redirects")]
+    #[schemars(range(min = 0, max = 20))]
     pub max_redirects: usize,
     pub proxy: Option<String>,
-    /// Disable HTTPS certificate validation. Defaults to false; use only when necessary.
+    /// Skip TLS certificate verification.
     #[serde(default)]
     pub insecure: bool,
 }
@@ -103,30 +118,6 @@ pub(super) enum RequestBody {
     Form { fields: Vec<(String, String)> },
     Base64 { value: String },
     File { path: String },
-    Multipart { parts: Vec<MultipartPart> },
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(untagged, deny_unknown_fields)]
-pub(super) enum MultipartPart {
-    Text {
-        name: String,
-        text: String,
-        filename: Option<String>,
-        content_type: Option<String>,
-    },
-    File {
-        name: String,
-        path: String,
-        filename: Option<String>,
-        content_type: Option<String>,
-    },
-    Base64 {
-        name: String,
-        base64: String,
-        filename: Option<String>,
-        content_type: Option<String>,
-    },
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -179,7 +170,7 @@ struct Redirect {
     location: String,
     method: String,
 }
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ResponseBody {
     Text {
@@ -202,7 +193,7 @@ enum ResponseBody {
 pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
     builder.register_dynamic(
         "fetch",
-        "Make a bounded HTTP(S) request on the selected target. HTTP error statuses are normal results. Supports repeated query/headers, uploads, readable HTML text, and atomic downloads. Redirects default to GET/HEAD only; HTTPS downgrades are blocked. insecure disables HTTPS certificate validation (default false). No automatic retries.",
+        "HTTP(S) from the selected target. HTTP error statuses are normal results. Safe redirects follow GET/HEAD only; no HTTPS downgrade or retries.",
         serde_json::to_value(schema_for!(FetchArgs)).expect("fetch schema serializes"),
         ToolOptions::new(vec![Capability::Network])
             .argument_validator(|arguments| {
@@ -218,27 +209,27 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
                 let args: FetchArgs = serde_json::from_value(arguments.clone()).map_err(invalid)?;
                 let mut paths = Vec::new();
                 if args.save_to.is_some() { paths.push(PathArgument::pointer("/save_to", PathAccess::Write, PathKind::Writable)); }
-                match args.body {
-                    Some(RequestBody::File { .. }) => paths.push(PathArgument::pointer("/body/path", PathAccess::Read, PathKind::Existing)),
-                    Some(RequestBody::Multipart { parts }) => for (i, part) in parts.iter().enumerate() {
-                        if matches!(part, MultipartPart::File { .. }) { paths.push(PathArgument::pointer(format!("/body/parts/{i}/path"), PathAccess::Read, PathKind::Existing)); }
-                    },
-                    _ => {},
+                if matches!(args.body, Some(RequestBody::File { .. })) {
+                    paths.push(PathArgument::pointer("/body/path", PathAccess::Read, PathKind::Existing));
                 }
                 Ok(paths)
             })
             .placement(ToolPlacement::TargetedWorkspace).background().named()
-            .output_schema(serde_json::to_value(schema_for!(FetchOutput)).expect("fetch output schema serializes")),
+            .output_schema(serde_json::to_value(schema_for!(FetchResultSchema)).expect("fetch output schema serializes")),
         |context, arguments| async move {
             let args: FetchArgs = serde_json::from_value(arguments).map_err(invalid)?;
             validate(&args)?;
-            let result = tokio::select! {
+            let mut progress = FetchProgress::new(&args);
+            let outcome = tokio::select! {
                 biased;
                 () = context.cancelled() => return Err(ToolError::Cancelled),
-                result = tokio::time::timeout(Duration::from_secs(args.timeout), execute(&context, &args)) =>
-                    result.map_err(|_| ToolError::Failed("fetch operation timed out".into()))??,
+                result = tokio::time::timeout(Duration::from_secs(args.timeout), execute(&context, &args, &mut progress)) => result,
             };
-            Ok(ToolOutput::new(serde_json::to_value(result).map_err(failed)?))
+            match outcome {
+                Ok(Ok(result)) => Ok(ToolOutput::new(serde_json::to_value(result).map_err(failed)?)),
+                Ok(Err(error)) => Err(progress.failure(error)),
+                Err(_) => Err(progress.timeout(args.timeout)),
+            }
         },
     )?;
     Ok(())
@@ -250,19 +241,28 @@ fn invalid(error: impl std::fmt::Display) -> ToolError {
 fn failed(error: impl std::fmt::Display) -> ToolError {
     ToolError::Failed(error.to_string())
 }
-fn network(error: reqwest::Error) -> ToolError {
-    // Do not echo URLs (which may contain secret query parameters) or authorization values.
-    let category = if error.is_timeout() {
-        "timed out"
-    } else if error.is_connect() {
-        "connection failed"
-    } else if error.is_body() {
-        "body transfer failed"
-    } else {
-        "request failed"
-    };
-    failed(format!("HTTP {category}: {}", error.without_url()))
+fn network(error: reqwest::Error, phase: FetchPhase) -> ToolError {
+    diagnostic_error(FetchDiagnostic::from_reqwest(&error, phase))
 }
+
+/// Same system lookup as reqwest's default resolver, with a typed failure marker.
+/// There is no additional lookup or preflight connection.
+#[derive(Debug)]
+struct FetchResolver;
+impl reqwest::dns::Resolve for FetchResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let addresses = tokio::net::lookup_host((name.as_str(), 0))
+                .await
+                .map_err(|error| {
+                    Box::new(DnsFailure::new(error)) as Box<dyn std::error::Error + Send + Sync>
+                })?
+                .collect::<Vec<_>>();
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 fn parse_url(value: &str) -> Result<Url, ToolError> {
     let url = Url::parse(value).map_err(|_| invalid("invalid absolute URL"))?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
@@ -348,47 +348,31 @@ struct PreparedBody {
     bytes: Vec<u8>,
     content_type: Option<String>,
 }
-struct PreparedPart {
-    name: String,
-    data: UploadData,
-    filename: Option<String>,
-    content_type: Option<String>,
+struct FileUpload {
+    snapshot: tempfile::NamedTempFile,
+    length: u64,
 }
-enum UploadData {
-    Bytes(Vec<u8>),
-    File {
-        snapshot: tempfile::NamedTempFile,
-        length: u64,
-    },
-}
-impl UploadData {
+impl FileUpload {
     fn len(&self) -> u64 {
-        match self {
-            Self::Bytes(bytes) => bytes.len() as u64,
-            Self::File { length, .. } => *length,
-        }
+        self.length
     }
     async fn body(&self) -> Result<reqwest::Body, ToolError> {
-        Ok(match self {
-            Self::Bytes(bytes) => reqwest::Body::from(bytes.clone()),
-            Self::File { snapshot, .. } => {
-                let file = tokio::fs::File::open(snapshot.path()).await?;
-                reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file))
-            }
-        })
+        let file = tokio::fs::File::open(self.snapshot.path()).await?;
+        Ok(reqwest::Body::wrap_stream(
+            tokio_util::io::ReaderStream::new(file),
+        ))
     }
 }
 enum Upload {
     Bytes(PreparedBody),
-    File(UploadData),
-    Multipart(Vec<PreparedPart>),
+    File(FileUpload),
 }
 
 async fn upload_file(
     workspace: &Path,
     path: &str,
     remaining: u64,
-) -> Result<UploadData, ToolError> {
+) -> Result<FileUpload, ToolError> {
     let path = resolve_existing(workspace, path).await?;
     if !tokio::fs::metadata(&path).await?.is_file() {
         return Err(invalid("upload path must be a regular file"));
@@ -404,7 +388,7 @@ async fn upload_file(
         return Err(invalid("upload path must be a regular file"));
     }
     if metadata.len() > remaining {
-        return Err(invalid("aggregate upload exceeds 100 MiB limit"));
+        return Err(invalid("upload exceeds 100 MiB limit"));
     }
     // Snapshot once, with a bounded streaming copy. Redirect replays reopen this
     // immutable private snapshot, not a potentially changed source file.
@@ -413,9 +397,9 @@ async fn upload_file(
     let length = tokio::io::copy(&mut file.take(remaining + 1), &mut output).await?;
     output.flush().await?;
     if length > remaining {
-        return Err(invalid("aggregate upload exceeds 100 MiB limit"));
+        return Err(invalid("upload exceeds 100 MiB limit"));
     }
-    Ok(UploadData::File { snapshot, length })
+    Ok(FileUpload { snapshot, length })
 }
 fn check_upload_size(size: usize) -> Result<(), ToolError> {
     if size as u64 > MAX_UPLOAD_BYTES {
@@ -463,67 +447,6 @@ async fn prepare_body(
                 upload_file(workspace, path, MAX_UPLOAD_BYTES).await?,
             )));
         }
-        RequestBody::Multipart { parts } => {
-            let mut prepared = Vec::new();
-            let mut total = 0u64;
-            for part in parts {
-                let (name, data, filename, content_type) = match part {
-                    MultipartPart::Text {
-                        name,
-                        text,
-                        filename,
-                        content_type,
-                    } => (
-                        name,
-                        UploadData::Bytes(text.as_bytes().to_vec()),
-                        filename.clone(),
-                        content_type,
-                    ),
-                    MultipartPart::Base64 {
-                        name,
-                        base64,
-                        filename,
-                        content_type,
-                    } => (
-                        name,
-                        UploadData::Bytes(decode_base64(base64)?),
-                        filename.clone(),
-                        content_type,
-                    ),
-                    MultipartPart::File {
-                        name,
-                        path,
-                        filename,
-                        content_type,
-                    } => (
-                        name,
-                        upload_file(workspace, path, MAX_UPLOAD_BYTES - total).await?,
-                        filename.clone().or_else(|| {
-                            Path::new(path)
-                                .file_name()
-                                .map(|s| s.to_string_lossy().into_owned())
-                        }),
-                        content_type,
-                    ),
-                };
-                total = total
-                    .checked_add(data.len())
-                    .ok_or_else(|| invalid("upload too large"))?;
-                check_upload_size(total as usize)?;
-                if let Some(content_type) = content_type {
-                    multipart::Part::bytes(Vec::new())
-                        .mime_str(content_type)
-                        .map_err(invalid)?;
-                }
-                prepared.push(PreparedPart {
-                    name: name.clone(),
-                    data,
-                    filename,
-                    content_type: content_type.clone(),
-                });
-            }
-            return Ok(Some(Upload::Multipart(prepared)));
-        }
     };
     check_upload_size(bytes.len())?;
     Ok(Some(Upload::Bytes(PreparedBody {
@@ -551,26 +474,6 @@ async fn apply_body(
             request = request
                 .header("content-length", data.len())
                 .body(data.body().await?);
-        }
-        Some(Upload::Multipart(parts)) => {
-            if headers.contains_key("content-type") {
-                return Err(invalid(
-                    "multipart content-type (including boundary) is managed by fetch",
-                ));
-            }
-            let mut form = multipart::Form::new();
-            for part in parts {
-                let mut value =
-                    multipart::Part::stream_with_length(part.data.body().await?, part.data.len());
-                if let Some(filename) = &part.filename {
-                    value = value.file_name(filename.clone());
-                }
-                if let Some(content_type) = &part.content_type {
-                    value = value.mime_str(content_type).map_err(invalid)?;
-                }
-                form = form.part(part.name.clone(), value);
-            }
-            request = request.multipart(form);
         }
     }
     Ok(request)
@@ -625,17 +528,28 @@ fn client(args: &FetchArgs) -> Result<Client, ToolError> {
         .user_agent(concat!("Skyhook/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
+        .dns_resolver(std::sync::Arc::new(FetchResolver))
         .connect_timeout(Duration::from_secs(args.connect_timeout))
         .timeout(Duration::from_secs(args.timeout))
         .danger_accept_invalid_certs(args.insecure);
     if let Some(proxy) = &args.proxy {
-        builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(invalid)?);
+        builder = builder.proxy(
+            reqwest::Proxy::all(proxy)
+                .map_err(|error| network(error, FetchPhase::ClientPreparation))?,
+        );
     }
-    builder.build().map_err(network)
+    builder
+        .build()
+        .map_err(|error| network(error, FetchPhase::ClientPreparation))
 }
 
-async fn execute(context: &ToolContext, args: &FetchArgs) -> Result<FetchOutput, ToolError> {
-    let started = Instant::now();
+async fn execute(
+    context: &ToolContext,
+    args: &FetchArgs,
+    progress: &mut FetchProgress,
+) -> Result<FetchOutput, ToolError> {
+    let started = progress.started;
+    progress.phase = FetchPhase::LocalIo;
     let workspace = &context.execution_location.workspace;
     let destination = match &args.save_to {
         Some(path) => {
@@ -654,6 +568,7 @@ async fn execute(context: &ToolContext, args: &FetchArgs) -> Result<FetchOutput,
         }
         None => None,
     };
+    progress.phase = FetchPhase::ClientPreparation;
     let client = client(args)?;
     let mut url = parse_url(&args.url)?;
     if !args.query.is_empty() {
@@ -663,6 +578,7 @@ async fn execute(context: &ToolContext, args: &FetchArgs) -> Result<FetchOutput,
     url.set_fragment(None);
     let mut method = Method::from_bytes(args.method.as_bytes()).map_err(invalid)?;
     let mut headers = request_headers(args)?;
+    progress.phase = FetchPhase::LocalIo;
     let mut body = prepare_body(args.body.as_ref(), workspace).await?;
     let mut redirects = Vec::new();
     let mut authorized_origin = url.origin();
@@ -670,12 +586,15 @@ async fn execute(context: &ToolContext, args: &FetchArgs) -> Result<FetchOutput,
         if context.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
+        progress.begin_request(&url, &method);
         // The initial origin was authorized by argument_permissions. A changed origin
         // must be authorized before sending any headers or replaying any upload.
         if url.origin() != authorized_origin {
+            progress.phase = FetchPhase::Authorization;
             authorize_url(context, &url).await?;
             authorized_origin = url.origin();
         }
+        progress.phase = FetchPhase::Request;
         let request = client
             .request(method.clone(), url.clone())
             .headers(headers.clone());
@@ -683,7 +602,8 @@ async fn execute(context: &ToolContext, args: &FetchArgs) -> Result<FetchOutput,
             .await?
             .send()
             .await
-            .map_err(network)?;
+            .map_err(|error| network(error, FetchPhase::Request))?;
+        progress.response(&response);
         let status = response.status().as_u16();
         let follow = matches!(status, 301 | 302 | 303 | 307 | 308)
             && args.redirects != RedirectPolicy::Manual
@@ -693,6 +613,7 @@ async fn execute(context: &ToolContext, args: &FetchArgs) -> Result<FetchOutput,
         if !follow {
             break response;
         }
+        progress.phase = FetchPhase::Redirect;
         let Some(location) = response.headers().get("location") else {
             break response;
         };
@@ -753,6 +674,7 @@ async fn execute(context: &ToolContext, args: &FetchArgs) -> Result<FetchOutput,
             location: next.to_string(),
             method: method.to_string(),
         });
+        progress.redirects(&redirects);
         url = next;
         method = next_method;
     };
@@ -764,6 +686,7 @@ async fn execute(context: &ToolContext, args: &FetchArgs) -> Result<FetchOutput,
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     let mut received = 0u64;
+    progress.phase = FetchPhase::ResponseBody;
     let processed = async {
         // content_length is decoded length when known; the streamed count remains authoritative.
         if method != Method::HEAD
@@ -771,8 +694,13 @@ async fn execute(context: &ToolContext, args: &FetchArgs) -> Result<FetchOutput,
                 .content_length()
                 .is_some_and(|length| length > args.max_bytes)
         {
-            return Err(failed("response exceeds max_bytes"));
+            return Err(classified_error(
+                FetchPhase::ResponseBody,
+                FetchErrorKind::SizeLimit,
+                "response exceeds max_bytes",
+            ));
         }
+        progress.phase = FetchPhase::LocalIo;
         let mut temp = match &destination {
             Some(path) => Some(tempfile::NamedTempFile::new_in(
                 path.parent()
@@ -786,21 +714,32 @@ async fn execute(context: &ToolContext, args: &FetchArgs) -> Result<FetchOutput,
         };
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(network)?;
+        loop {
+            progress.phase = FetchPhase::ResponseBody;
+            let Some(chunk) = stream.next().await else {
+                break;
+            };
+            let chunk = chunk.map_err(|error| network(error, FetchPhase::ResponseBody))?;
             received = received
                 .checked_add(chunk.len() as u64)
                 .ok_or_else(|| failed("response too large"))?;
+            progress.received_bytes = received;
             if received > args.max_bytes {
-                return Err(failed("response exceeds max_bytes"));
+                return Err(classified_error(
+                    FetchPhase::ResponseBody,
+                    FetchErrorKind::SizeLimit,
+                    "response exceeds max_bytes",
+                ));
             }
             if let Some(file) = &mut file {
+                progress.phase = FetchPhase::LocalIo;
                 file.write_all(&chunk).await?;
             } else {
                 bytes.extend_from_slice(&chunk);
             }
         }
         let response_body = if let Some(mut file) = file {
+            progress.phase = FetchPhase::LocalIo;
             file.flush().await?;
             file.sync_all().await?;
             drop(file);
@@ -821,6 +760,11 @@ async fn execute(context: &ToolContext, args: &FetchArgs) -> Result<FetchOutput,
                 bytes: received,
             }
         } else {
+            progress.phase = if args.text {
+                FetchPhase::Extraction
+            } else {
+                FetchPhase::Decode
+            };
             response_body(bytes, content_type.as_deref(), url.as_str(), args).await?
         };
         Ok::<_, ToolError>(response_body)
@@ -842,15 +786,12 @@ async fn execute(context: &ToolContext, args: &FetchArgs) -> Result<FetchOutput,
             output.body = body;
             Ok(output)
         }
-        Err(error) => Err(ToolError::with_output(
-            format!("HTTP response received but processing failed: {error}"),
-            ToolOutput::new(serde_json::to_value(output).map_err(failed)?),
-        )),
+        Err(error) => Err(error),
     }
 }
 
 fn redirect_error(
-    message: &str,
+    message: &'static str,
     response: &reqwest::Response,
     method: &Method,
     redirects: &[Redirect],
@@ -867,10 +808,12 @@ fn redirect_error(
         received_bytes: 0,
         elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
     };
-    ToolError::with_output(
-        message,
-        ToolOutput::new(serde_json::to_value(output).expect("fetch output serializes")),
-    )
+    let mut value = serde_json::to_value(output).expect("fetch output serializes");
+    let mut diagnostic =
+        FetchDiagnostic::new(FetchPhase::Redirect, FetchErrorKind::RedirectFailure);
+    diagnostic.message = message.to_owned();
+    value["diagnostic"] = serde_json::to_value(diagnostic).expect("fetch diagnostic serializes");
+    ToolError::with_output(message, ToolOutput::new(value))
 }
 
 async fn authorize_url(context: &ToolContext, url: &Url) -> Result<(), ToolError> {
@@ -911,7 +854,9 @@ async fn response_body(
             });
         }
         if !fetch_text::is_textual(&bytes, content_type) {
-            return Err(invalid(
+            return Err(classified_error(
+                FetchPhase::Extraction,
+                FetchErrorKind::ExtractionFailure,
                 "text extraction is unsupported for this binary content type",
             ));
         }
