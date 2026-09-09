@@ -18,7 +18,7 @@ pub(crate) struct LocalResolver;
 #[async_trait::async_trait]
 impl ConfigResolver for LocalResolver {
     async fn resolve(&self, target: &TargetDefinition) -> Result<ResolvedSsh, TargetError> {
-        crate::remote::ssh::resolve_local(target)
+        crate::remote::backend::resolve_local(target)
             .await
             .map_err(|e| TargetError::Import(e.to_string()))
     }

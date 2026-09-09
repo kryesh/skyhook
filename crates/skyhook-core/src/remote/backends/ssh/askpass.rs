@@ -1,4 +1,6 @@
-use super::{SecretValue, SensitivePrompt, SensitivePromptHandler, SensitivePromptKind};
+use crate::remote::{
+    SecretValue, SensitivePrompt, SensitivePromptHandler, SensitivePromptKind, prompt::PromptAnswer,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     io::{Read as _, Write as _},
@@ -24,12 +26,6 @@ struct AskpassRequest {
     hint: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) enum PromptAnswer {
-    Accepted(SecretValue),
-    Rejected,
-}
-
 impl AskpassServer {
     pub fn start(handler: Arc<dyn SensitivePromptHandler>) -> Result<Self, std::io::Error> {
         use std::os::unix::fs::PermissionsExt as _;
@@ -43,7 +39,7 @@ impl AskpassServer {
             &executable,
             format!(
                 "#!/bin/sh\nexec {} --askpass \"$@\"\n",
-                super::ssh::shell_quote(&helper.to_string_lossy())
+                super::config::shell_quote(&helper.to_string_lossy())
             ),
         )?;
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
@@ -208,7 +204,7 @@ mod tests {
         let (mut client, server) = UnixStream::pair().unwrap();
         let task = tokio::spawn(serve_one(
             server,
-            Arc::new(super::super::RejectSensitivePrompts),
+            Arc::new(crate::remote::RejectSensitivePrompts),
         ));
         client
             .write_all(br#"{"prompt":"Password:","hint":null}"#)

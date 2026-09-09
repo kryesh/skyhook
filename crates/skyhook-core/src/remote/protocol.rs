@@ -1,9 +1,9 @@
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::{
     media::ImageReference,
-    tool::{ToolOutput, policy::PermissionUse},
+    tool::{policy::PermissionUse, ToolOutput},
 };
 use serde_json::Value;
 
@@ -36,7 +36,7 @@ pub(crate) enum Request {
     },
     SensitiveAnswer {
         prompt_id: u64,
-        answer: super::askpass::PromptAnswer,
+        answer: super::prompt::PromptAnswer,
     },
     Hello,
     Tool {

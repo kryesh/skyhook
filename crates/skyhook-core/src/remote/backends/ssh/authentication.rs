@@ -1,12 +1,12 @@
 //! Session-owned OpenSSH agent and per-process authentication environment.
-use super::{RemoteError, SensitivePromptHandler, askpass::AskpassServer};
-use std::{collections::BTreeMap, process::Stdio, sync::Arc};
+use super::askpass::AskpassServer;
+use crate::remote::backend::ProcessEnvironment;
+use crate::remote::{RemoteError, SensitivePromptHandler};
+use std::{process::Stdio, sync::Arc};
 use tokio::{
     process::{Child, Command},
     sync::Mutex,
 };
-
-pub(crate) type ProcessEnvironment = BTreeMap<String, String>;
 
 pub(crate) struct Authentication {
     prompts: Arc<dyn SensitivePromptHandler>,
@@ -92,5 +92,34 @@ impl Authentication {
             let _ = agent.child.kill().await;
             let _ = agent.child.wait().await;
         }
+    }
+}
+
+/// Worker-side OpenSSH authentication state, retaining the askpass server.
+pub(crate) struct WorkerAuthentication {
+    _askpass: AskpassServer,
+    environment: ProcessEnvironment,
+}
+
+impl WorkerAuthentication {
+    pub(crate) fn new(prompts: Arc<dyn SensitivePromptHandler>) -> Result<Self, std::io::Error> {
+        let askpass = AskpassServer::start(prompts)?;
+        let mut environment = askpass.environment();
+        // OpenSSH already owns a private forwarded socket for this connection.
+        // Pass it through; a second forwarding listener adds no isolation or lifetime.
+        if let Some(socket) = std::env::var_os("SSH_AUTH_SOCK") {
+            environment.insert(
+                "SSH_AUTH_SOCK".into(),
+                socket.to_string_lossy().into_owned(),
+            );
+        }
+        Ok(Self {
+            _askpass: askpass,
+            environment,
+        })
+    }
+
+    pub(crate) fn environment(&self) -> &ProcessEnvironment {
+        &self.environment
     }
 }

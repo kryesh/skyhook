@@ -1,8 +1,8 @@
 //! Private shim control services. These messages never enter tool output or session events.
 use super::{
     SensitivePrompt, SensitivePromptError, SensitivePromptFuture, SensitivePromptHandler,
-    askpass::{AskpassServer, PromptAnswer},
-    authentication::ProcessEnvironment,
+    backend::{ProcessEnvironment, WorkerBackends},
+    prompt::PromptAnswer,
     protocol::{Request, Response, write_frame},
 };
 use std::{
@@ -94,7 +94,7 @@ pub(super) struct WorkerServices<W> {
     pub tasks: tokio::task::JoinSet<std::io::Result<()>>,
     prompts: Arc<dyn SensitivePromptHandler>,
     pub environment: ProcessEnvironment,
-    _askpass: AskpassServer,
+    _backends: WorkerBackends,
 }
 impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
     pub fn new(output: Arc<Mutex<W>>) -> Result<Self, std::io::Error> {
@@ -104,16 +104,8 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
             answers: answers.clone(),
             next: AtomicU64::new(1),
         });
-        let askpass = AskpassServer::start(prompts.clone())?;
-        let mut environment = askpass.environment();
-        // OpenSSH already owns a private forwarded socket for this connection.
-        // Pass it through; a second forwarding listener adds no isolation or lifetime.
-        if let Some(socket) = std::env::var_os("SSH_AUTH_SOCK") {
-            environment.insert(
-                "SSH_AUTH_SOCK".into(),
-                socket.to_string_lossy().into_owned(),
-            );
-        }
+        let backends = WorkerBackends::new(prompts.clone())?;
+        let environment = backends.environment().clone();
         Ok(Self {
             output,
             answers,
@@ -121,7 +113,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
             tasks: tokio::task::JoinSet::new(),
             prompts,
             environment,
-            _askpass: askpass,
+            _backends: backends,
         })
     }
     pub async fn handle(&mut self, request: Request) -> Result<(), std::io::Error> {
@@ -134,7 +126,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
             Request::ResolveSsh { request_id, target } => {
                 let output = self.output.clone();
                 self.tasks.spawn(async move {
-                    let result = super::ssh::resolve_local(&target)
+                    let result = super::backend::resolve_local(&target)
                         .await
                         .map_err(|e| e.to_string());
                     write_frame(
@@ -169,7 +161,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
                 self.tasks.spawn(async move {
                     let result = async {
                         let stream = tokio::select! {
-                            stream = super::ssh::open(&route, &command, &environment, prompts) => stream?,
+                            stream = super::backend::open_ssh_request(&route, &command, &environment, prompts) => stream?,
                             () = cancellation.cancelled() => return Ok(()),
                         };
                         let super::transport::Transport { input: stdin, output: mut stdout, owner: _owner } = stream;

@@ -18,7 +18,7 @@ pub struct ToolContext {
     pub execution_location: ExecutionLocation,
     pub caller_location: ExecutionLocation,
     pub capabilities: CapabilitySet,
-    pub(crate) process_environment: crate::remote::authentication::ProcessEnvironment,
+    pub(crate) process_environment: crate::remote::backend::ProcessEnvironment,
     pub(crate) authorization: super::authorization::AuthorizationSubject,
     input: Arc<Mutex<mpsc::Receiver<Value>>>,
     jobs: crate::job::JobManager,

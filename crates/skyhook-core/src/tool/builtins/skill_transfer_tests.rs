@@ -2,8 +2,8 @@ use super::*;
 use crate::{
     execution::ExecutionLocation,
     remote::{
-        ConnectionFactory, ConnectionRequest, EmbeddedShimCatalog, PooledConnection,
-        RejectSensitivePrompts, RemoteError, RemoteManager,
+        ConnectionFactory, ConnectionRequest, EmbeddedShimCatalog, RejectSensitivePrompts,
+        RemoteError, RemoteManager, backend::Transport,
     },
     target::{TargetDefinition, TargetRegistry},
     tool::{
@@ -44,7 +44,7 @@ impl ConnectionFactory for RecordingFactory {
     fn connect(
         &self,
         request: ConnectionRequest,
-    ) -> futures_util::future::BoxFuture<'static, Result<PooledConnection, RemoteError>> {
+    ) -> futures_util::future::BoxFuture<'static, Result<Transport, RemoteError>> {
         self.0.lock().unwrap().push(request);
         Box::pin(async { Err(RemoteError::Protocol("fixture transport reached".into())) })
     }

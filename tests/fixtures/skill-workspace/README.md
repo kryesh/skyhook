@@ -41,14 +41,22 @@ SKYHOOK_LIVE_PROFILE=qwen36 cargo test -p skyhook-agent-core --test live_skill_f
 Profiles come from the user config. Codex uses the Skyhook-owned login; Terra runs with low
 reasoning effort to keep cost down. The harness disables write/exec/child-agent capabilities.
 
-The disposable loopback SSH integration additionally verifies remote-agent native
-calls, caller-workspace asset transfers, overwrite fidelity, and denied outside
-paths. It requires `sshd`, `ssh-keygen`, and a locally built shim; it does not use
-configured lab targets:
+Remote skill-transfer tests verify caller-workspace routing, host-owned reads, and
+write authorization without requiring SSH:
 
 ```sh
-cargo build -p skyhook-agent --bin skyhook-shim --no-default-features --features shim-bin
-SKYHOOK_TEST_SHIM="$PWD/target/debug/skyhook-shim" \
+cargo test -p skyhook-agent-core skill_transfer_tests
+```
+
+The disposable loopback SSH integration verifies direct and native-jump connections,
+shim-owned nested connections, shared SSH authentication, and duplex stream transfer.
+Run it on Linux with `sshd`, `ssh-keygen`, and a locally built `linux-ssh` shim; it does
+not use configured lab targets. This native, shim-only build does not enable embedded
+shims and does not require Zig or extra Rust musl targets:
+
+```sh
+cargo build -p skyhook-agent --bin linux-ssh --no-default-features --features shim-bin
+SKYHOOK_TEST_SHIM="$PWD/target/debug/linux-ssh" \
   cargo test -p skyhook-agent-core \
-  host_skills_from_remote_caller_copy_into_workspace_override -- --ignored --nocapture
+  native_jumps_and_shim_owned_connections_share_a_lazy_central_agent -- --ignored --nocapture
 ```

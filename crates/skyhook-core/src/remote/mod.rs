@@ -1,20 +1,23 @@
 //! Remote transport sessions, shim protocol, and platform artifacts.
 
 mod artifact;
-mod askpass;
-pub(crate) mod authentication;
+pub(crate) mod backend;
+pub mod backends;
+mod client;
 mod manager;
 mod prompt;
 mod protocol;
 mod service;
-pub mod ssh;
+pub use backends::ssh;
 mod transport;
 pub mod worker;
 
 pub use artifact::{ArtifactError, EmbeddedShim, EmbeddedShimCatalog};
-pub use manager::RemoteError;
 #[cfg(test)]
-pub(crate) use manager::{ConnectionFactory, ConnectionRequest, PooledConnection, test_connection};
+pub(crate) use backend::{ConnectionFactory, ConnectionRequest};
+#[cfg(test)]
+pub(crate) use client::test_transport;
+pub use manager::RemoteError;
 pub(crate) use manager::{PreparedConnection, RemoteManager};
 pub use prompt::{
     RejectSensitivePrompts, SecretValue, SensitivePrompt, SensitivePromptError,
@@ -25,5 +28,5 @@ pub fn run_askpass_helper(
     socket: &std::path::Path,
     prompt: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    askpass::run_helper(socket, prompt)
+    backends::ssh::run_askpass_helper(socket, prompt)
 }

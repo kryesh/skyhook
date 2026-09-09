@@ -25,10 +25,10 @@ async fn main() {
         [mode, expected] if mode == "--self-check" => {
             skyhook::remote::worker::self_check(expected).await
         }
-        _ => Err("usage: skyhook-shim --serve [AUTHORIZATION_ROOT] | --self-check SHA256".into()),
+        _ => Err("usage: linux-ssh --serve [AUTHORIZATION_ROOT] | --self-check SHA256".into()),
     };
     if let Err(error) = result {
-        eprintln!("skyhook-shim: {error}");
+        eprintln!("linux-ssh: {error}");
         std::process::exit(1);
     }
 }

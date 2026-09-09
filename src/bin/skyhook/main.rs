@@ -1,8 +1,6 @@
+mod embedded_shims;
 mod interaction;
 mod tui;
-mod embedded_shims {
-    include!(concat!(env!("OUT_DIR"), "/embedded_shims.rs"));
-}
 use clap::{Parser, Subcommand, ValueEnum};
 use skyhook::identity::SessionId;
 use std::path::PathBuf;

@@ -21,6 +21,12 @@ pub struct SensitivePrompt {
 
 pub struct SecretValue(Zeroizing<String>);
 
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) enum PromptAnswer {
+    Accepted(SecretValue),
+    Rejected,
+}
+
 impl SecretValue {
     #[must_use]
     pub fn new(value: String) -> Self {

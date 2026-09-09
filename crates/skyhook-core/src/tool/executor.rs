@@ -73,7 +73,7 @@ struct ExecutorServices {
     jobs: JobManager,
     root_location: ExecutionLocation,
     router: Option<TargetRouter>,
-    process_environment: crate::remote::authentication::ProcessEnvironment,
+    process_environment: crate::remote::backend::ProcessEnvironment,
 }
 
 impl ToolExecutor {
@@ -235,7 +235,7 @@ impl ToolExecutor {
 
     pub(crate) fn with_process_environment(
         mut self,
-        environment: crate::remote::authentication::ProcessEnvironment,
+        environment: crate::remote::backend::ProcessEnvironment,
     ) -> Self {
         Arc::make_mut(&mut self.shared).process_environment = environment;
         self
@@ -1242,7 +1242,7 @@ mod tests {
 
     #[tokio::test]
     async fn approved_remote_jobs_are_running_during_shared_connection_startup() {
-        use crate::remote::{ConnectionFactory, ConnectionRequest, PooledConnection};
+        use crate::remote::{ConnectionFactory, ConnectionRequest, backend::Transport};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct PendingConnection(AtomicUsize);
@@ -1250,7 +1250,7 @@ mod tests {
             fn connect(
                 &self,
                 _: ConnectionRequest,
-            ) -> futures_util::future::BoxFuture<'static, Result<PooledConnection, RemoteError>>
+            ) -> futures_util::future::BoxFuture<'static, Result<Transport, RemoteError>>
             {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Box::pin(std::future::pending())

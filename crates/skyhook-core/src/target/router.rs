@@ -104,7 +104,7 @@ impl TargetRouter {
 
     pub(crate) async fn environment(
         &self,
-    ) -> Result<crate::remote::authentication::ProcessEnvironment, RemoteError> {
+    ) -> Result<crate::remote::backend::ProcessEnvironment, RemoteError> {
         self.remote.environment().await
     }
     pub(crate) async fn shutdown(&self) {
@@ -245,7 +245,7 @@ impl super::normalize::ConfigResolver for RemoteResolver {
         target: &TargetDefinition,
     ) -> Result<crate::remote::ssh::ResolvedSsh, TargetError> {
         self.0
-            .resolve_ssh(target.clone())
+            .resolve_target(target.clone())
             .await
             .map_err(|e| TargetError::Import(e.to_string()))
     }
@@ -271,7 +271,7 @@ mod tests {
         job::CancellationToken,
         remote::{
             ConnectionFactory, ConnectionRequest, EmbeddedShimCatalog, RejectSensitivePrompts,
-            test_connection,
+            test_transport,
         },
         tool::policy::{AuthorizationRequest, Policy, PolicyDecision, PolicyFuture},
     };
@@ -397,7 +397,7 @@ mod tests {
         fn connect(
             &self,
             request: ConnectionRequest,
-        ) -> BoxFuture<'static, Result<crate::remote::PooledConnection, RemoteError>> {
+        ) -> BoxFuture<'static, Result<crate::remote::backend::Transport, RemoteError>> {
             assert_eq!(request.target, "build");
             assert!(!request.route.is_empty());
             assert_eq!(request.workspace, PathBuf::from("/override"));
@@ -408,7 +408,7 @@ mod tests {
             Box::pin(async move {
                 release.acquire().await.unwrap().forget();
                 completions.fetch_add(1, Ordering::SeqCst);
-                Ok(test_connection().await)
+                Ok(test_transport())
             })
         }
     }

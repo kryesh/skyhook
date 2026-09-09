@@ -151,7 +151,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         sessions,
         approve_all: args.approve_all || config.approve_all,
         config,
-        catalog: EmbeddedShimCatalog::from_assets(super::embedded_shims::EMBEDDED_SHIMS)?,
+        catalog: super::embedded_shims::catalog()?,
         interaction: Arc::new(interaction),
     };
     let session = match args.resume {

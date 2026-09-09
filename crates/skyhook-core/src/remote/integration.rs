@@ -1,14 +1,24 @@
 //! Disposable loopback SSH integration. Run with SKYHOOK_TEST_SHIM and --ignored.
-use super::*;
 use crate::{
-    remote::{SecretValue, SensitivePrompt, SensitivePromptFuture},
-    target::{SshOptions, TargetAuth, TargetConfig, TargetConfigType, TargetSource},
-    tool::policy::AllowAll,
+    job::CancellationToken,
+    remote::{
+        EmbeddedShimCatalog, RemoteManager, SecretValue, SensitivePrompt, SensitivePromptFuture,
+        SensitivePromptHandler,
+    },
+    target::{
+        ResolvedRoute, RouteIdentity, SshOptions, TargetAuth, TargetConfig, TargetConfigType,
+        TargetDefinition, TargetSource,
+    },
+    tool::{ToolContext, authorization::AuthorizationCoordinator, policy::AllowAll},
 };
 use std::{
     process::Stdio,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 struct Prompts(AtomicUsize);
 impl SensitivePromptHandler for Prompts {
@@ -162,16 +172,13 @@ async fn exercise_connections() {
     let server = Server::start().await;
     let shim = std::fs::read(std::env::var_os("SKYHOOK_TEST_SHIM").expect("set SKYHOOK_TEST_SHIM"))
         .unwrap();
-    let assets = Box::leak(
-        vec![(
-            "skyhook-shim-x86_64-linux",
-            Box::leak(shim.into_boxed_slice()) as &'static [u8],
-        )]
-        .into_boxed_slice(),
-    );
+    let assets = [(
+        format!("linux-ssh-{}", std::env::consts::ARCH),
+        std::borrow::Cow::Owned(shim),
+    )];
     let prompts = Arc::new(Prompts(AtomicUsize::new(0)));
     let manager = RemoteManager::new(
-        EmbeddedShimCatalog::from_assets(assets).unwrap(),
+        EmbeddedShimCatalog::from_embedded_assets(assets).unwrap(),
         prompts.clone(),
         AuthorizationCoordinator::new(Arc::new(AllowAll)),
     );
