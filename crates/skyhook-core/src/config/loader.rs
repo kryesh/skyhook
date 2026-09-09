@@ -7,17 +7,29 @@ use tokio::fs;
 use super::{Config, ConfigError};
 
 pub(super) async fn load(explicit: Option<&Path>) -> Result<Config, ConfigError> {
-    let value = match explicit {
-        Some(path) => read_required_toml(path).await?,
-        None => match user_config_path() {
-            Some(path) => read_optional_toml(&path).await?,
-            None => toml::Value::Table(toml::Table::new()),
-        },
+    let path = explicit.map(Path::to_path_buf).or_else(user_config_path);
+    let value = match path.as_deref() {
+        Some(path) if explicit.is_some() => read_required_toml(path).await?,
+        Some(path) => read_optional_toml(path).await?,
+        None => toml::Value::Table(toml::Table::new()),
     };
     if value.as_table().is_none_or(toml::Table::is_empty) {
         return Err(ConfigError::Missing);
     }
-    Ok(value.try_into()?)
+    let mut config: Config = value.try_into()?;
+    if let Some(path) = path {
+        // Resolve against the selected file, never the agent workspace or target.
+        let path = std::path::absolute(path)?;
+        let directory = path.parent().expect("absolute config path has a parent");
+        for server in config.mcp.values_mut() {
+            if let Some(cwd) = &mut server.cwd
+                && cwd.is_relative()
+            {
+                *cwd = directory.join(&*cwd);
+            }
+        }
+    }
+    Ok(config)
 }
 
 fn user_config_path() -> Option<PathBuf> {

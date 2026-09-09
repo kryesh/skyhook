@@ -1819,8 +1819,8 @@ fn wrap_words(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
 }
 
 #[cfg(test)]
-fn markdown(text: &str, p: Palette) -> Vec<Line<'static>> {
-    markdown::render(text, p, true)
+fn markdown(text: &str, p: Palette, width: usize) -> Vec<Line<'static>> {
+    markdown::render(text, p, true, width)
 }
 
 /// Truncate metadata at grapheme boundaries.
@@ -1937,15 +1937,19 @@ mod tests {
                     let (title, body) = text.split_once('\n').unwrap_or((&text, ""));
                     let mut lines = vec![Line::from(title.to_owned())];
                     if !body.is_empty() {
-                        lines.extend(markdown(body, p));
+                        lines.extend(markdown(body, p, geometry.body_width as usize));
                     }
                     lines
                 } else {
-                    let mut lines = markdown(&text, p);
-                    if entry.running
-                        && let Some(first) = lines.first_mut()
-                    {
-                        first.spans.insert(0, Span::raw("  "));
+                    let markdown_width = (geometry.body_width as usize)
+                        .saturating_sub(if entry.running { 2 } else { 0 });
+                    let mut lines = markdown(&text, p, markdown_width);
+                    if entry.running && !lines.is_empty() {
+                        if stream::starts_with_table(&text) {
+                            lines.insert(0, Line::from("  "));
+                        } else {
+                            lines[0].spans.insert(0, Span::raw("  "));
+                        }
                     }
                     lines
                 }
@@ -1956,7 +1960,7 @@ mod tests {
                     sender.to_owned(),
                     Style::default().add_modifier(Modifier::BOLD),
                 ))];
-                lines.extend(markdown(body, p));
+                lines.extend(markdown(body, p, geometry.body_width as usize));
                 if let Some(model) = &entry.footer {
                     lines.push(Line::default());
                     lines.push(Line::from(Span::styled(
@@ -2170,6 +2174,9 @@ mod tests {
             "Text [reference][id].\n\n[id]: https://example.com\n",
             "a\u{1b}[31mred\u{1b}[0m\nnext\rline\twide",
             "hello  \nworld\n\nparagraph",
+            "| Name | Description |\n| --- | --- |\n| 界 | **long words** and `code` |\n\nplain tail",
+            "> | Name | Description |\n> | --- | --- |\n> | 界 | long words |\n\nplain tail",
+            "# Heading\n\n| Name | Description |\n| --- | --- |\n| value | a long table cell |\n\nend",
             "```\n```\n\nhello",
             "```\n```\n\n# Heading",
         ];

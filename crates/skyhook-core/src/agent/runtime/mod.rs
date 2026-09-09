@@ -17,6 +17,7 @@ use crate::{
     agent::AgentProfile,
     identity::{AgentId, JobId, SessionId},
     job::{CancellationToken, JobManager},
+    mcp::{McpServerConfig, manager::McpManager},
     media::{MAX_IMAGE_BYTES, MAX_IMAGE_BYTES_PER_SUBMISSION, MAX_IMAGES_PER_SUBMISSION},
     provider::Provider,
     provider::profile::ModelProfile,
@@ -46,6 +47,8 @@ mod compaction;
 mod context;
 #[cfg(test)]
 mod context_tests;
+#[cfg(test)]
+mod mcp_tests;
 use context::AgentContext;
 pub(super) use context::recorded_context;
 mod prompt;
@@ -78,6 +81,7 @@ pub struct HarnessBuilder {
     policy: Arc<dyn Policy>,
     questions: Option<Arc<dyn QuestionHandler>>,
     extra_tools: ToolRegistry,
+    mcp: BTreeMap<String, McpServerConfig>,
     instructions: Vec<String>,
     max_child_depth: usize,
     capabilities: CapabilitySet,
@@ -100,6 +104,7 @@ impl HarnessBuilder {
             policy: Arc::new(AllowAll),
             questions: None,
             extra_tools: ToolRegistry::default(),
+            mcp: BTreeMap::new(),
             instructions: Vec::new(),
             max_child_depth: 4,
             capabilities: CapabilitySet::default(),
@@ -163,6 +168,13 @@ impl HarnessBuilder {
         self
     }
 
+    /// Configure root-owned MCP servers. Discovery occurs at session startup.
+    #[must_use]
+    pub fn mcp(mut self, servers: BTreeMap<String, McpServerConfig>) -> Self {
+        self.mcp = servers;
+        self
+    }
+
     #[must_use]
     pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
         self.instructions.push(instructions.into());
@@ -212,6 +224,11 @@ impl HarnessBuilder {
             &default_model_profile,
             self.default_agent_profile.as_deref(),
         )?;
+        for (name, config) in &self.mcp {
+            config.validate().map_err(|error| {
+                HarnessError::Initialization(format!("invalid MCP server {name}: {error}"))
+            })?;
+        }
         let session_root = self
             .session_root
             .unwrap_or_else(|| workspace.join(".skyhook/sessions"));
@@ -249,6 +266,7 @@ impl HarnessBuilder {
                 policy: self.policy,
                 questions: self.questions,
                 extra_tools: self.extra_tools,
+                mcp: self.mcp,
                 instructions,
                 skills,
                 max_child_depth: self.max_child_depth,
@@ -277,6 +295,7 @@ struct HarnessInner {
     policy: Arc<dyn Policy>,
     questions: Option<Arc<dyn QuestionHandler>>,
     extra_tools: ToolRegistry,
+    mcp: BTreeMap<String, McpServerConfig>,
     instructions: Vec<String>,
     skills: HostSkills,
     max_child_depth: usize,
@@ -349,7 +368,12 @@ impl SessionHandle {
         self.runtime.events.observe()
     }
 
-    /// Host diagnostics that must not write directly to a terminal.
+    /// Host-only startup diagnostics, never inserted into agent context.
+    pub fn startup_warnings(&self) -> &[String] {
+        &self.runtime.startup_warnings
+    }
+
+    /// Host skill diagnostics that must not write directly to a terminal.
     pub fn warnings(&self) -> &[String] {
         self.runtime.harness.skills.warnings()
     }
@@ -616,6 +640,7 @@ impl SessionHandle {
             .shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
         self.runtime.interrupt_tree(&self.root).await;
+        self.runtime.mcp.shutdown().await;
         self.runtime.router.shutdown().await;
         // Completed children retain idle loops for resumption, and must also stop.
         let senders = self
@@ -643,6 +668,8 @@ struct SessionRuntime {
     jobs: JobManager,
     todos: TodoStore,
     executor: ToolExecutor,
+    mcp: Arc<McpManager>,
+    startup_warnings: Vec<String>,
     // Keeps the script tool's weak executor lookup alive without an executor/registry cycle.
     _executor_slot: Arc<OnceLock<ToolExecutor>>,
     router: crate::target::TargetRouter,
@@ -754,6 +781,28 @@ impl SessionRuntime {
         install_script_tool(&mut builder, Arc::downgrade(&executor_slot))?;
         tools::register(&mut builder, runtime_slot.clone())?;
         builder.extend(&harness.extra_tools)?;
+        // Only the session-owning root constructs clients. Ineligible servers
+        // are not even contacted; per-agent filtering is still applied later.
+        let root_capabilities = harness.capabilities.for_agent(harness.max_child_depth);
+        let mcp_configs = harness
+            .mcp
+            .iter()
+            .filter(|(_, config)| {
+                config
+                    .capabilities
+                    .iter()
+                    .all(|cap| root_capabilities.contains(*cap))
+            })
+            .map(|(name, config)| (name.clone(), config.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mcp = Arc::new(McpManager::connect(&mcp_configs, CancellationToken::new()).await);
+        let mut startup_warnings = mcp.warnings().to_vec();
+        startup_warnings.extend(crate::mcp::adapter::register(
+            &mut builder,
+            mcp.clone(),
+            &mcp_configs,
+            store.clone(),
+        ));
         let executor = ToolExecutor::with_authorization(
             builder.build(),
             authorization,
@@ -797,6 +846,8 @@ impl SessionRuntime {
             jobs: jobs.clone(),
             executor,
             _executor_slot: executor_slot,
+            mcp,
+            startup_warnings,
             router,
             agents: StdRwLock::new(HashMap::new()),
             child_counters: RwLock::new(child_counters),

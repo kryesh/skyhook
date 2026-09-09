@@ -12,6 +12,7 @@
 use super::markdown;
 use super::{Palette, wrap_words};
 use ratatui::{style::Color, text::Line};
+use unicode_width::UnicodeWidthStr;
 
 pub(super) type Suffix = (usize, Vec<(Line<'static>, bool)>);
 
@@ -57,6 +58,9 @@ impl StreamLayout {
         prefix: &str,
     ) -> Option<Suffix> {
         let width = width.max(1);
+        // Reserve the first-line prefix even in later fragments: otherwise a
+        // committed table could change width compared with a full render.
+        let markdown_width = width.saturating_sub(prefix.width());
         let append = self.initialized
             && append_from == Some(self.len)
             && self.len <= text.len()
@@ -128,6 +132,7 @@ impl StreamLayout {
             let block = render(
                 &source[..boundary],
                 width,
+                markdown_width,
                 p,
                 if truncate == 0 { prefix } else { "" },
                 false,
@@ -156,6 +161,7 @@ impl StreamLayout {
             let block = render(
                 tail,
                 width,
+                markdown_width,
                 p,
                 if self.stable_rows == 0 { prefix } else { "" },
                 self.stable_rows == 0,
@@ -184,18 +190,23 @@ fn append_block(
 fn render(
     text: &str,
     width: usize,
+    markdown_width: usize,
     p: Palette,
     prefix: &str,
     placeholder: bool,
 ) -> Vec<(Line<'static>, bool)> {
     let cleaned = super::model::clean(text);
-    let mut lines = super::markdown::render(&cleaned, p, placeholder);
-    if let Some(first) = lines.first_mut()
-        && !prefix.is_empty()
-    {
-        first
-            .spans
-            .insert(0, ratatui::text::Span::raw(prefix.to_owned()));
+    let mut lines = super::markdown::render(&cleaned, p, placeholder, markdown_width);
+    if !prefix.is_empty() && !lines.is_empty() {
+        if starts_with_table(&cleaned) {
+            // A prefix on only the first grid row would shift its borders away
+            // from every subsequent row. Keep the spinner on its own line.
+            lines.insert(0, Line::from(prefix.to_owned()));
+        } else {
+            lines[0]
+                .spans
+                .insert(0, ratatui::text::Span::raw(prefix.to_owned()));
+        }
     }
     lines
         .into_iter()
@@ -206,6 +217,24 @@ fn render(
                 .map(|(i, line)| (line, i > 0))
         })
         .collect()
+}
+
+// Look through containers and empty blocks without changing the plain-prose
+// fast path. A list item already emits a marker before its table, whereas a
+// block quote does not emit a row until its content arrives.
+pub(super) fn starts_with_table(text: &str) -> bool {
+    use pulldown_cmark::{Event, Parser, Tag};
+    for event in Parser::new_ext(text, super::markdown::options()) {
+        match event {
+            Event::Start(Tag::Table(_)) => return true,
+            Event::Start(
+                Tag::BlockQuote(_) | Tag::Paragraph | Tag::Heading { .. } | Tag::CodeBlock(_),
+            )
+            | Event::End(_) => {}
+            _ => return false,
+        }
+    }
+    false
 }
 
 // Only commit complete top-level blocks with an explicit blank-line separator.
@@ -408,7 +437,7 @@ mod tests {
     }
 
     fn reference(text: &str, width: usize, p: Palette) -> Vec<(Line<'static>, bool)> {
-        markdown(text, p)
+        markdown(text, p, width.max(1))
             .into_iter()
             .flat_map(|line| {
                 wrap_words(line, width.max(1))
@@ -496,9 +525,224 @@ mod tests {
                     rows.extend(suffix);
                     assert_eq!(
                         canonical(&rows),
-                        canonical(&render(&text, width, p, "↳ ", true)),
+                        canonical(&render(
+                            &text,
+                            width,
+                            width.saturating_sub("↳ ".width()),
+                            p,
+                            "↳ ",
+                            true
+                        )),
                         "{text:?}, width {width}"
                     );
+                }
+            }
+        }
+    }
+
+    fn check_prefixed_chunks(chunks: &[&str], width: usize, prefix: &str) {
+        let p = Palette::new(false);
+        let mut cache = StreamLayout::default();
+        let mut text = String::new();
+        let mut rows = Vec::new();
+        for chunk in chunks {
+            let old = text.len();
+            text.push_str(chunk);
+            if let Some((at, suffix)) = cache.update_prefixed(&text, width, p, Some(old), prefix) {
+                assert!(at <= rows.len());
+                rows.truncate(at);
+                rows.extend(suffix);
+            }
+            let expected = render(
+                &text,
+                width,
+                width.max(1).saturating_sub(prefix.width()),
+                p,
+                prefix,
+                true,
+            );
+            assert_eq!(
+                canonical(&rows),
+                canonical(&expected),
+                "input {text:?}, width {width}, prefix {prefix:?}"
+            );
+        }
+    }
+
+    const NARROW_TABLE: &str = "| Name | Description |\n| :--- | ---: |\n| 界 | **long words** and `code` |\n| e\u{301} | abcdefghijklmnopqrstuvwxyz |";
+
+    #[test]
+    fn narrow_tables_keep_borders_on_single_rows() {
+        let p = Palette::new(false);
+        let quoted = NARROW_TABLE
+            .lines()
+            .map(|line| format!("> > {line}\n"))
+            .collect::<String>();
+        for source in [
+            NARROW_TABLE.to_owned(),
+            quoted,
+            format!("```\n```\n\n{NARROW_TABLE}"),
+        ] {
+            for prefix in ["", "  ", "↳ ", "界 "] {
+                for width in [18, 23, 28] {
+                    let mut cache = StreamLayout::default();
+                    let (_, rows) = cache
+                        .update_prefixed(&source, width, p, None, prefix)
+                        .unwrap();
+                    assert!(rows.len() > 4, "cells should wrap inside the table");
+                    let table_rows = if prefix.is_empty() {
+                        &rows[..]
+                    } else {
+                        assert_eq!(rows[0].0.to_string(), prefix);
+                        &rows[1..]
+                    };
+                    let separator = table_rows
+                        .iter()
+                        .find(|(line, _)| line.to_string().contains('├'))
+                        .unwrap()
+                        .0
+                        .to_string();
+                    // Measure actual screen columns, including quote containers;
+                    // stripping the spinner would hide first-row misalignment.
+                    let columns: Vec<_> = separator
+                        .char_indices()
+                        .filter(|(_, ch)| {
+                            matches!(
+                                ch,
+                                '│' | '├' | '┼' | '┤' | '┌' | '┬' | '┐' | '└' | '┴' | '┘'
+                            )
+                        })
+                        .map(|(at, _)| separator[..at].width())
+                        .collect();
+                    let mut separators = 0;
+                    for (line, continued) in table_rows {
+                        let text = line.to_string();
+                        assert!(line.width() <= width, "{text:?}, width {width}");
+                        assert!(!continued, "downstream wrapper split a table row: {text:?}");
+                        let actual: Vec<_> = text
+                            .char_indices()
+                            .filter(|(_, ch)| {
+                                matches!(
+                                    ch,
+                                    '│' | '├'
+                                        | '┼'
+                                        | '┤'
+                                        | '┌'
+                                        | '┬'
+                                        | '┐'
+                                        | '└'
+                                        | '┴'
+                                        | '┘'
+                                )
+                            })
+                            .map(|(at, _)| text[..at].width())
+                            .collect();
+                        assert_eq!(actual, columns, "misaligned physical borders: {text:?}");
+                        if text.contains('├') {
+                            separators += 1;
+                            assert!(text.ends_with('┤'));
+                            assert_eq!(text.matches('┼').count(), 1);
+                        } else if text.contains('┌') {
+                            assert!(text.ends_with('┐'));
+                            assert_eq!(text.matches('┬').count(), 1);
+                        } else if text.contains('└') {
+                            assert!(text.ends_with('┘'));
+                            assert_eq!(text.matches('┴').count(), 1);
+                        } else {
+                            assert!(text.starts_with('│') && text.ends_with('│'), "{text:?}");
+                        }
+                    }
+                    assert_eq!(separators, 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn table_resize_invalidates_committed_rows_and_continues_streaming() {
+        let p = Palette::new(false);
+        for prefix in ["", "  ", "界 "] {
+            let mut cache = StreamLayout::default();
+            let mut source = format!("{NARROW_TABLE}\n\nplain tail");
+            let (_, mut rows) = cache.update_prefixed(&source, 60, p, None, prefix).unwrap();
+            let wide_rows = rows.len();
+            for width in [17, 8, 3, 35, 60] {
+                // Claim an unchanged append so width, rather than replacement,
+                // must invalidate both the table and its committed checkpoint.
+                let (at, suffix) = cache
+                    .update_prefixed(&source, width, p, Some(source.len()), prefix)
+                    .unwrap();
+                assert_eq!(at, 0);
+                rows.truncate(at);
+                rows.extend(suffix);
+                assert_eq!(
+                    canonical(&rows),
+                    canonical(&render(
+                        &source,
+                        width,
+                        width.saturating_sub(prefix.width()),
+                        p,
+                        prefix,
+                        true
+                    ))
+                );
+                if width == 17 {
+                    assert!(rows.len() > wide_rows);
+                }
+                assert!(
+                    cache
+                        .update_prefixed(&source, width, p, Some(source.len()), prefix)
+                        .is_none()
+                );
+                let old = source.len();
+                source.push_str(" more");
+                let (at, suffix) = cache
+                    .update_prefixed(&source, width, p, Some(old), prefix)
+                    .unwrap();
+                rows.truncate(at);
+                rows.extend(suffix);
+                assert_eq!(
+                    canonical(&rows),
+                    canonical(&render(
+                        &source,
+                        width,
+                        width.saturating_sub(prefix.width()),
+                        p,
+                        prefix,
+                        true
+                    ))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tables_match_full_render_at_every_chunk_boundary() {
+        let quoted = NARROW_TABLE
+            .lines()
+            .map(|line| format!("> {line}\n"))
+            .collect::<String>();
+        let listed = NARROW_TABLE
+            .lines()
+            .map(|line| format!("  {line}\n"))
+            .collect::<String>();
+        for source in [
+            format!("{NARROW_TABLE}\n\nplain tail"),
+            format!("```\n```\n\n{NARROW_TABLE}\n\nend"),
+            format!("# Heading\n\nfirst paragraph\n\n{NARROW_TABLE}\n\n{NARROW_TABLE}\n\nend"),
+            format!("{quoted}\nend"),
+            format!("- parent\n\n{listed}\nend"),
+        ] {
+            let chunks: Vec<_> = source
+                .char_indices()
+                .map(|(i, c)| &source[i..i + c.len_utf8()])
+                .collect();
+            for width in [3, 9, 17, 32] {
+                for prefix in ["", "  ", "界 "] {
+                    check_prefixed_chunks(&chunks, width, prefix);
+                    for (at, _) in source.char_indices() {
+                        check_prefixed_chunks(&[&source[..at], &source[at..]], width, prefix);
+                    }
                 }
             }
         }

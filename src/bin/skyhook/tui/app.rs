@@ -317,6 +317,7 @@ pub struct App {
     // Pending attachment reads belong to one composer draft, not the next submission/session.
     draft_revision: u64,
     pub status: super::status::StatusLog,
+    // UI-only notices, including startup diagnostics and failed status writes.
     unsaved_status: Vec<(AgentId, String)>,
     stopping: bool,
     pub light: bool,
@@ -471,6 +472,20 @@ impl App {
         if let Some(session) = &self.session {
             for warning in session.warnings() {
                 self.notice(format!("Startup warning: {warning}"));
+            }
+            // Connection diagnostics belong only to this host installation, not
+            // the journal or the agent's context. Reuse the UI-only status tail
+            // rather than notice(), which persists statuses for active sessions.
+            self.unsaved_status
+                .extend(session.startup_warnings().iter().map(|warning| {
+                    (
+                        session.root_agent().clone(),
+                        format!("Startup warning: {warning}"),
+                    )
+                }));
+            if !session.startup_warnings().is_empty() {
+                self.dirty = true;
+                self.invalidate_content();
             }
         }
     }
@@ -3065,6 +3080,118 @@ mod tests {
         .await
         .expect("lifecycle task completed")
     }
+    fn assert_startup_warnings_visible(app: &mut App) {
+        let session = app.session.as_ref().unwrap();
+        let warnings = session.startup_warnings().to_vec();
+        assert!(!warnings.is_empty());
+        let root = session.root_agent().clone();
+        for warning in &warnings {
+            assert!(
+                app.unsaved_status
+                    .contains(&(root.clone(), format!("Startup warning: {warning}"),))
+            );
+        }
+        // Rebuilding must retain the notices without duplicating them.
+        for _ in 0..2 {
+            app.refresh();
+            app.rebuild_content();
+            for warning in &warnings {
+                assert_eq!(
+                    app.entries
+                        .iter()
+                        .filter(|entry| {
+                            entry.text == format!("Status · Startup warning: {warning}")
+                        })
+                        .count(),
+                    1,
+                );
+            }
+        }
+    }
+
+    async fn assert_startup_warnings_not_recorded(app: &App) {
+        app.status.flush().await;
+        let session = app.session.as_ref().unwrap();
+        let snapshot = session.observe().await.snapshot;
+        for warning in session.startup_warnings() {
+            let encoded = serde_json::to_string(warning).unwrap();
+            let fragment = &encoded[1..encoded.len() - 1];
+            assert!(
+                !snapshot
+                    .records
+                    .values()
+                    .any(|record| { serde_json::to_string(record).unwrap().contains(fragment) })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_warnings_are_ui_only_on_initial_started_and_resumed_sessions() {
+        let (_root, mut draft) = draft_fixture().await;
+        let missing_command = draft.launch.workspace.join("missing-mcp-server");
+        let server = toml::from_str(&format!(
+            "transport = 'stdio'\nstart_command = [{}]\nstartup_timeout_secs = 1",
+            serde_json::to_string(&missing_command.to_string_lossy()).unwrap(),
+        ))
+        .unwrap();
+        Arc::make_mut(&mut draft.launch.config)
+            .mcp
+            .insert("unavailable".into(), server);
+        let session = draft.launch.create(None).await.unwrap();
+        let id = session.id();
+        let snapshot = session.observe().await.snapshot;
+        let (tx, _) = mpsc::unbounded_channel();
+        let mut initial = App::new(
+            Some(session.clone()),
+            draft.launch.clone(),
+            snapshot.clone(),
+            None,
+            tx,
+            KeyMap::new(&Default::default()).unwrap(),
+            false,
+        );
+        assert_startup_warnings_visible(&mut initial);
+        assert_startup_warnings_not_recorded(&initial).await;
+
+        draft.session_started(session.clone(), snapshot);
+        assert_startup_warnings_visible(&mut draft);
+        assert_startup_warnings_not_recorded(&draft).await;
+        session.shutdown().await.unwrap();
+        drop(initial);
+        drop(session);
+
+        draft.set_session(None, ObservationSnapshot::default());
+        draft.rebuild_content();
+        assert!(draft.unsaved_status.is_empty());
+        assert!(
+            !draft
+                .entries
+                .iter()
+                .any(|entry| { entry.text.starts_with("Status · Startup warning:") })
+        );
+
+        // Shutdown queues termination of the agent loops. Their runtime/store
+        // references may outlive the handle until those commands are consumed.
+        let resumed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match draft.launch.create(Some(id)).await {
+                    Ok(session) => break session,
+                    Err(error) if error.contains("already open") => {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Err(error) => panic!("could not resume session: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("agent loops release the session after shutdown");
+        let snapshot = resumed.observe().await.snapshot;
+        draft.set_session(Some(resumed), snapshot);
+        assert_startup_warnings_visible(&mut draft);
+        assert_startup_warnings_not_recorded(&draft).await;
+        draft.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn reconnecting_keeps_input_delivery_busy_until_interrupted() {
         let (_root, mut app) = draft_fixture().await;

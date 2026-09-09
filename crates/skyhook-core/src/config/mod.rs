@@ -7,6 +7,7 @@ use std::{
 
 use crate::{
     agent::{AgentProfile, HarnessBuilder},
+    mcp::config::McpServerConfig,
     provider::backends::OpenAiApi,
     provider::profile::ModelProfile,
     target::TargetsConfig,
@@ -41,6 +42,9 @@ pub struct Config {
     pub agents: BTreeMap<String, AgentProfile>,
     #[serde(default)]
     pub targets: TargetsConfig,
+    /// Named, trusted MCP server connections. Empty by default.
+    #[serde(default)]
+    pub mcp: BTreeMap<String, McpServerConfig>,
     #[serde(default = "default_child_depth")]
     pub max_child_depth: usize,
 }
@@ -92,6 +96,11 @@ impl Config {
                 .validate_limits()
                 .map_err(|message| ConfigError::Model(name.clone(), message.to_owned()))?;
         }
+        for (name, server) in &self.mcp {
+            server
+                .validate()
+                .map_err(|message| ConfigError::Mcp(name.clone(), message))?;
+        }
         let mut capabilities = crate::tool::policy::CapabilitySet::default();
         if self.targets_enabled {
             capabilities.insert(crate::tool::policy::Capability::Targets);
@@ -100,6 +109,7 @@ impl Config {
             .default_model_profile(model)
             .max_child_depth(self.max_child_depth)
             .capabilities(capabilities)
+            .mcp(self.mcp.clone())
             .targets_config(self.targets.clone());
         if let Some(root) = &self.session_root {
             builder = builder.session_root(root.clone());
@@ -134,6 +144,8 @@ pub enum ConfigError {
     Provider(String, String),
     #[error("invalid model profile `{0}`: {1}")]
     Model(String, String),
+    #[error("invalid MCP server `{0}`: {1}")]
+    Mcp(String, String),
     #[error(transparent)]
     Harness(#[from] crate::agent::HarnessError),
 }
@@ -156,6 +168,51 @@ mod tests {
         assert_eq!(config.models.first().unwrap().0, "local");
         assert!(!config.approve_all);
         assert!(!config.targets_enabled);
+        assert!(config.mcp.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_cwd_is_relative_to_selected_config_directory() {
+        let current = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir_in(&current).unwrap();
+        let path = root.path().join("mcp.toml");
+        let absolute = root.path().join("absolute");
+        let mut config_value: toml::Value = toml::from_str(
+            "[mcp.relative]\ntransport = 'stdio'\nstart_command = ['server']\ncwd = 'work'\n[mcp.absolute]\ntransport = 'stdio'\nstart_command = ['server']\n[mcp.default]\ntransport = 'stdio'\nstart_command = ['server']",
+        ).unwrap();
+        config_value["mcp"]["absolute"]
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "cwd".to_owned(),
+                toml::Value::String(absolute.to_str().unwrap().to_owned()),
+            );
+        tokio::fs::write(&path, toml::to_string(&config_value).unwrap())
+            .await
+            .unwrap();
+        // A relative --config path must still produce absolute process directories.
+        let config = Config::load(Some(path.strip_prefix(&current).unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(config.mcp["relative"].cwd, Some(root.path().join("work")));
+        assert_eq!(config.mcp["absolute"].cwd, Some(absolute));
+        assert_eq!(config.mcp["default"].cwd, None);
+    }
+
+    #[test]
+    fn mcp_map_has_exact_name_and_validates_before_provider_credentials() {
+        assert!(toml::from_str::<Config>("[mcp]").unwrap().mcp.is_empty());
+        assert!(toml::from_str::<Config>("[mcp_servers]").is_err());
+        assert!(toml::from_str::<Config>("[mcp.invalid]\ntransport = 'stdio'").is_err());
+        let mut config: Config = toml::from_str(
+            "[mcp.test]\ntransport = 'stdio'\nstart_command = ['server']\n[providers.test]\nkind = 'anthropic'\nbase_url = 'https://api.anthropic.com/v1'\napi_key_env = 'SKYHOOK_TEST_MISSING_API_KEY'",
+        ).unwrap();
+        config.mcp.get_mut("test").unwrap().startup_timeout_secs = 0;
+        let Err(ConfigError::Mcp(name, message)) = config.harness_builder(".", "test") else {
+            panic!("expected MCP validation before credential loading");
+        };
+        assert_eq!(name, "test");
+        assert!(message.contains("startup_timeout_secs"));
     }
 
     #[test]

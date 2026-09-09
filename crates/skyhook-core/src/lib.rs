@@ -7,6 +7,7 @@ pub mod execution;
 mod fs;
 pub mod identity;
 pub mod job;
+pub mod mcp;
 pub mod media;
 pub mod provider;
 pub mod remote;

@@ -87,6 +87,8 @@ struct GeneratedToolDefinition {
     exposure: ToolExposure,
     script_binding: ScriptBinding,
     supports_background: bool,
+    preserve_required: bool,
+    preserve_schema_dialect: bool,
     required: BTreeSet<Capability>,
 }
 
@@ -100,8 +102,10 @@ impl GeneratedToolDefinition {
                 if self.supports_background {
                     add_background(&mut input_schema);
                 }
-                optional_defaults(&mut input_schema);
-                sanitize_schema(&mut input_schema);
+                if !self.preserve_required {
+                    optional_defaults(&mut input_schema);
+                }
+                sanitize_schema_inner(&mut input_schema, self.preserve_schema_dialect);
                 let result_schema = self.output_schema.as_ref().map(|schema| {
                     let mut schema = schema.generate(capabilities);
                     sanitize_schema(&mut schema);
@@ -174,6 +178,8 @@ pub(crate) struct PathArgument {
 pub struct ToolOptions {
     execution: ToolExecution,
     pub supports_background: bool,
+    preserve_required: bool,
+    preserve_schema_dialect: bool,
     exposure: ToolExposure,
     script_binding: ScriptBinding,
     required: BTreeSet<Capability>,
@@ -222,6 +228,8 @@ impl ToolOptions {
         let required = capabilities.iter().copied().collect();
         Self {
             supports_background: false,
+            preserve_required: false,
+            preserve_schema_dialect: false,
             execution: ToolExecution {
                 capabilities,
                 ..ToolExecution::default()
@@ -232,6 +240,22 @@ impl ToolOptions {
             conditional_inputs: Vec::new(),
             output_schema: None,
         }
+    }
+
+    /// Preserve JSON Schema required fields even when they have defaults.
+    /// External tools need this because defaults are annotations, not values
+    /// supplied by Skyhook or a typed argument deserializer.
+    #[must_use]
+    pub fn preserve_required(mut self) -> Self {
+        self.preserve_required = true;
+        self
+    }
+
+    /// Retain declared JSON Schema dialects for externally supplied schemas.
+    #[must_use]
+    pub fn preserve_schema_dialect(mut self) -> Self {
+        self.preserve_schema_dialect = true;
+        self
     }
 
     #[must_use]
@@ -631,6 +655,8 @@ impl ToolRegistryBuilder {
         let ToolOptions {
             execution,
             supports_background,
+            preserve_required,
+            preserve_schema_dialect,
             exposure,
             script_binding,
             required,
@@ -671,6 +697,8 @@ impl ToolRegistryBuilder {
             exposure,
             script_binding,
             supports_background,
+            preserve_required,
+            preserve_schema_dialect,
             required,
         };
         self.register_definition(definition, execution, handler)
@@ -920,17 +948,64 @@ fn optional_defaults(schema: &mut Value) {
 }
 
 fn sanitize_schema(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            object.remove("$schema");
-            object.remove("title");
-            object.remove("format");
-            for value in object.values_mut() {
-                sanitize_schema(value);
+    sanitize_schema_inner(value, false);
+}
+
+fn sanitize_schema_inner(value: &mut Value, preserve_dialect: bool) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if !preserve_dialect {
+        object.remove("$schema");
+    }
+    object.remove("title");
+    object.remove("format");
+    // Only descend into schemas. Property names and literal enum/default/example
+    // payloads may themselves contain keys such as "title" or "format".
+    for key in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "dependencies",
+    ] {
+        if let Some(children) = object.get_mut(key).and_then(Value::as_object_mut) {
+            children
+                .values_mut()
+                .for_each(|child| sanitize_schema_inner(child, preserve_dialect));
+        }
+    }
+    for key in [
+        "items",
+        "additionalItems",
+        "additionalProperties",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "contains",
+        "propertyNames",
+        "not",
+        "if",
+        "then",
+        "else",
+        "contentSchema",
+    ] {
+        if let Some(child) = object.get_mut(key) {
+            if let Some(children) = child.as_array_mut() {
+                children
+                    .iter_mut()
+                    .for_each(|child| sanitize_schema_inner(child, preserve_dialect));
+            } else {
+                sanitize_schema_inner(child, preserve_dialect);
             }
         }
-        Value::Array(values) => values.iter_mut().for_each(sanitize_schema),
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+    for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        if let Some(children) = object.get_mut(key).and_then(Value::as_array_mut) {
+            children
+                .iter_mut()
+                .for_each(|child| sanitize_schema_inner(child, preserve_dialect));
+        }
     }
 }
 
@@ -1245,4 +1320,77 @@ pub enum RegistryError {
     ReservedBackground,
     #[error("`target` is reserved for structurally targeted tools")]
     ReservedTarget,
+}
+
+#[cfg(test)]
+mod schema_normalization_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn sanitization_preserves_property_names_and_literal_payloads() {
+        let literal = json!({"title": "literal", "format": "custom", "$schema": "payload"});
+        let mut schema = json!({
+            "type": "object", "title": "schema title", "$schema": "dialect",
+            "properties": {
+                "title": {"type": "string", "title": "annotation"},
+                "format": {"type": "string", "format": "uri"},
+                "$schema": {"type": "object", "default": literal.clone()},
+                "value": {"enum": [literal.clone()], "examples": [literal.clone()]}
+            },
+            "$defs": {"title": {"type": "string", "title": "definition annotation"}},
+            "items": [{"type": "string", "format": "uri"}]
+        });
+        sanitize_schema(&mut schema);
+        assert!(schema.get("title").is_none());
+        assert!(schema.get("$schema").is_none());
+        assert_eq!(schema["properties"]["title"], json!({"type": "string"}));
+        assert_eq!(schema["properties"]["format"], json!({"type": "string"}));
+        assert_eq!(schema["properties"]["$schema"]["default"], literal);
+        assert_eq!(schema["properties"]["value"]["enum"][0], literal);
+        assert_eq!(schema["properties"]["value"]["examples"][0], literal);
+        assert_eq!(schema["$defs"]["title"], json!({"type": "string"}));
+        assert_eq!(schema["items"][0], json!({"type": "string"}));
+    }
+
+    #[test]
+    fn external_schema_defaults_do_not_make_required_fields_optional() {
+        let mut builder = ToolRegistryBuilder::default();
+        let schema = json!({"type": "object", "properties": {
+            "value": {"type": "string", "default": "example"}
+        }, "required": ["value"]});
+        for (name, options) in [
+            ("external", ToolOptions::default().preserve_required()),
+            ("builtin", ToolOptions::default()),
+        ] {
+            builder
+                .register_dynamic(
+                    name,
+                    "test",
+                    schema.clone(),
+                    options,
+                    |_context, _args| async { Ok(ToolOutput::new(Value::Null)) },
+                )
+                .unwrap();
+        }
+        let registry = builder.build();
+        let surface = registry.surface(&CapabilitySet::default());
+        let definitions = surface.definitions();
+        assert_eq!(
+            definitions
+                .iter()
+                .find(|d| d.name == "external")
+                .unwrap()
+                .input_schema["required"],
+            json!(["value"])
+        );
+        assert_eq!(
+            definitions
+                .iter()
+                .find(|d| d.name == "builtin")
+                .unwrap()
+                .input_schema["required"],
+            json!([])
+        );
+    }
 }

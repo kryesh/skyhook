@@ -91,3 +91,34 @@ import_ssh_config = false
 [agents.reviewer]
 instructions = "Review changes critically. Do not edit files unless explicitly asked."
 model_profile = "sonnet"
+
+# MCP servers are optional; an absent/empty [mcp] adds no tools or prompt guidance.
+# Commands in this user config are trusted: startup runs without model approval,
+# only on the local root/session host, never on a selected SSH target.
+# A server's tools require ALL listed capabilities; otherwise they are hidden.
+# capabilities defaults to []; valid names: read, write, exec, targets, agents.
+# Skyhook imports tools only; discovery is frozen at startup. Failed servers warn
+# and are skipped. Tools are available both directly and inside script. Native
+# input schemas are kept unless open/conflicting, when input uses `arguments`.
+#
+# [mcp.files]
+# transport = "stdio"
+# start_command = ["my-mcp-server", "--root", "/srv/project"] # argv, not shell text
+# capabilities = ["read"]
+# startup_timeout_secs = 30  # Positive integer seconds; default 30.
+# call_timeout_secs = 120   # Positive integer seconds; default 120.
+# cwd = "mcp-work"          # Relative to this config file's directory.
+# env = { LOG_LEVEL = "warn" } # Startup process environment overrides, not secrets.
+#
+# [mcp.service]
+# transport = "streamable_http"
+# url = "http://127.0.0.1:8080/mcp" # Full MCP endpoint; legacy HTTP+SSE unsupported.
+# capabilities = ["read", "write"]
+# headers_env = { Authorization = "MY_MCP_AUTHORIZATION" } # Env var, not secret.
+# The variable must be set to a valid HTTP header value, e.g. Bearer ...
+# Missing/non-Unicode variables fail startup; empty values are passed through.
+# Connect first. Start this optional local command ONLY if the endpoint is unreachable,
+# never for authentication or protocol errors. cwd/env require start_command.
+# start_command = ["my-http-mcp-server", "--port", "8080"]
+# Stdio requires start_command and rejects url/headers_env; HTTP requires url.
+# Unknown fields/capabilities, invalid combinations, and invalid timeouts are errors.
