@@ -15,6 +15,7 @@ pub(super) async fn restore(
 ) -> Result<JobManager, JobError> {
     let mut jobs = std::collections::HashMap::new();
     let mut maximum = 0_u64;
+    let mut children = std::collections::HashMap::new();
     for record in records {
         match &record.event {
             SessionEvent::JobCreated {
@@ -50,11 +51,22 @@ pub(super) async fn restore(
             }
             SessionEvent::AgentStarted {
                 owner_job: Some(job),
+                parent,
                 location,
                 ..
             } => {
                 if let Some(entry) = jobs.get_mut(job) {
                     entry.location.clone_from(location);
+                    if parent.as_ref() == Some(&entry.agent)
+                        && record.agent.parent().as_ref() == Some(&entry.agent)
+                        && entry
+                            .child
+                            .as_ref()
+                            .is_none_or(|child| child == &record.agent)
+                    {
+                        entry.child = Some(record.agent.clone());
+                        children.insert(record.agent.clone(), *job);
+                    }
                 }
             }
             SessionEvent::JobStateChanged { job, state } => {
@@ -81,6 +93,12 @@ pub(super) async fn restore(
                 }
             }
             SessionEvent::MessageCommitted { message } => {
+                if let Some(job) = children.get(&record.agent)
+                    && let Some(entry) = jobs.get_mut(job)
+                    && let Some(text) = super::messages::visible_text(message)
+                {
+                    entry.publish_message(*job, record.sequence, text);
+                }
                 acknowledge_message(&mut jobs, &record.agent, message);
             }
             SessionEvent::JobFinished {
@@ -151,9 +169,15 @@ pub(super) fn acknowledge_message(
         let UserContent::Runtime { text } = block else {
             continue;
         };
+        let legacy = text.starts_with("<skyhook_agent_messages>\n");
+        let tag = if legacy {
+            "skyhook_agent_messages"
+        } else {
+            "skyhook_job_events"
+        };
         let Some(json) = text
-            .strip_prefix("<skyhook_job_events>\n")
-            .and_then(|text| text.strip_suffix("\n</skyhook_job_events>"))
+            .strip_prefix(&format!("<{tag}>\n"))
+            .and_then(|text| text.strip_suffix(&format!("\n</{tag}>")))
         else {
             continue;
         };
@@ -164,16 +188,29 @@ pub(super) fn acknowledge_message(
             let Some(id) = envelope.get("id") else {
                 continue;
             };
-            let Some(state) = envelope.get("state") else {
-                continue;
-            };
-            let (Ok(id), Ok(state)) = (
-                serde_json::from_value::<JobId>(id.clone()),
-                serde_json::from_value::<super::JobState>(state.clone()),
-            ) else {
+            let Ok(id) = serde_json::from_value::<JobId>(id.clone()) else {
                 continue;
             };
             let Some(entry) = jobs.get_mut(&id) else {
+                continue;
+            };
+            if &entry.agent != owner {
+                continue;
+            }
+            if legacy || envelope.get("kind").and_then(serde_json::Value::as_str) == Some("message")
+            {
+                if let Some(sequence) = envelope.get("message").and_then(serde_json::Value::as_u64)
+                {
+                    entry.messages.retain(|message| message.message != sequence);
+                }
+                // A message item can never acknowledge lifecycle delivery, even if
+                // a malformed envelope also supplies a state.
+                continue;
+            }
+            let Some(state) = envelope.get("state") else {
+                continue;
+            };
+            let Ok(state) = serde_json::from_value::<super::JobState>(state.clone()) else {
                 continue;
             };
             if &entry.agent == owner
@@ -181,6 +218,20 @@ pub(super) fn acknowledge_message(
                 && entry.state.presented() == state
                 && entry.deliverable()
             {
+                // Before independent message delivery, a completed child
+                // notification carried its final visible reply in `result`. That
+                // committed parent history is an ACK for exactly the last source
+                // reply, not for earlier reports absent from parent history.
+                if state == super::JobState::Completed
+                    && envelope.get("kind").is_none()
+                    && envelope.get("last_message").is_none()
+                    && let Some(text) = envelope.get("result").and_then(serde_json::Value::as_str)
+                    && let Some(sequence) = entry.last_agent_message
+                {
+                    entry
+                        .messages
+                        .retain(|message| message.message != sequence || message.text != text);
+                }
                 entry.reserve_delivery(DeliveryState::Injected);
             }
         }

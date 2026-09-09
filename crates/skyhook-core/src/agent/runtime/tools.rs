@@ -164,7 +164,7 @@ fn register_child_agent(
 ) -> Result<(), RegistryError> {
     builder.register::<AgentArgs, String, _, _>(
         "agent",
-        "Start a child agent; questions suspend it. Send follow-ups with tool.job(id).send({value: instructions}), or answers if a question is pending. Running children receive input at the next model-request boundary without receive(); their intermediate replies are injected into the parent while they continue working. Completed children resume with retained history under the same job ID.",
+        "Start a child agent; questions suspend it. Send follow-ups with tool.job(id).send({value: instructions}), or answers if a question is pending. Running children receive input at the next model-request boundary without receive(); their visible replies are delivered as independent message events, without waiting for completion. Completed children resume with retained history under the same job ID.",
         ToolOptions::default()
             .named()
             .requires(Capability::Agents)

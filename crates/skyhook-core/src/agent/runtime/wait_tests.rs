@@ -189,12 +189,16 @@ async fn running_job(session: &SessionHandle, tool: &str) -> JobId {
 }
 
 async fn complete_background(session: &SessionHandle, value: &str) -> JobId {
+    complete_background_for(session, &session.root, value).await
+}
+
+async fn complete_background_for(session: &SessionHandle, owner: &AgentId, value: &str) -> JobId {
     let lease = session
         .runtime
         .jobs
         .create(JobSpec {
             background: true,
-            ..JobSpec::test(session.root.clone(), "wait-fixture")
+            ..JobSpec::test(owner.clone(), "wait-fixture")
         })
         .await
         .unwrap();
@@ -218,10 +222,20 @@ async fn complete_background(session: &SessionHandle, value: &str) -> JobId {
 
 fn events(request: &ModelRequest) -> Vec<Value> {
     runtime_entries(request, "skyhook_job_events")
+        .into_iter()
+        .filter(|entry| entry["kind"] != "message")
+        .collect()
 }
 
 fn agent_messages(request: &ModelRequest) -> Vec<Value> {
-    runtime_entries(request, "skyhook_agent_messages")
+    assert!(
+        runtime_entries(request, "skyhook_agent_messages").is_empty(),
+        "new child messages must share the job event envelope"
+    );
+    runtime_entries(request, "skyhook_job_events")
+        .into_iter()
+        .filter(|entry| entry["kind"] == "message")
+        .collect()
 }
 
 fn runtime_entries(request: &ModelRequest, tag: &str) -> Vec<Value> {
@@ -245,6 +259,34 @@ fn runtime_entries(request: &ModelRequest, tag: &str) -> Vec<Value> {
             _ => Vec::new(),
         })
         .collect()
+}
+
+async fn child_completed(session: &SessionHandle, job: JobId) {
+    bounded(async {
+        loop {
+            let state = session.runtime.jobs.snapshot(job).await.unwrap().state;
+            if state.is_terminal() {
+                assert_eq!(state, JobState::Completed);
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+}
+
+fn assert_child_completion(event: &Value, message: &Value) {
+    assert_eq!(event["id"], message["id"]);
+    assert_eq!(event["state"], "completed");
+    assert_eq!(event["last_message"], message["message"]);
+    assert!(
+        event.get("result").is_none(),
+        "completion must not repeat child text: {event}"
+    );
+    assert!(
+        event.get("text").is_none(),
+        "completion must reference the message, not copy it"
+    );
 }
 
 fn assert_reason(request: &ModelRequest, id: &str, reason: &str) {
@@ -470,9 +512,9 @@ async fn parent_input_wakes_wait_and_is_in_the_next_model_request() {
             .count(),
         1
     );
-    tracking.release(2);
-    running_job(&session, "wait").await;
     tracking.release(3);
+    child_completed(&session, child_job).await;
+    tracking.release(2);
     tracking.request(4).await;
     tracking.release(4);
     bounded(turn).await.unwrap().unwrap();
@@ -604,24 +646,215 @@ async fn child_completion_wakes_parent_and_injects_output_once() {
     tracking.request(1).await;
     tracking.request(2).await;
     let child_job = running_job(&session, "agent").await;
-    tracking.release(2);
-    running_job(&session, "wait").await;
+    // Keep the parent invoke gated until both independently published events
+    // are pending; neither event is required to coalesce with the other.
     tracking.release(1);
+    child_completed(&session, child_job).await;
+    tracking.release(2);
     let next = tracking.request(3).await;
     assert_reason(&next, "waiting", "event");
     let notifications = events(&next);
     assert_eq!(notifications.len(), 1);
     assert_eq!(notifications[0]["id"], child_job.get());
-    assert!(
-        serde_json::to_string(&notifications[0])
+    let messages = agent_messages(&next);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["text"], "child-output-marker");
+    assert!(messages[0]["message"].is_u64());
+    assert_child_completion(&notifications[0], &messages[0]);
+    assert_eq!(
+        session
+            .runtime
+            .jobs
+            .snapshot(child_job)
+            .await
             .unwrap()
-            .contains("child-output-marker")
+            .output,
+        Some(json!("child-output-marker")),
+        "saved job output remains the final response"
     );
     tracking.release(3);
     let again = tracking.request(4).await;
     assert_reason(&again, "again", "timeout");
     assert_eq!(events(&again), notifications);
+    assert_eq!(agent_messages(&again), messages);
     tracking.release(4);
+    bounded(turn).await.unwrap().unwrap();
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn no_tool_child_reports_survive_queued_input_and_wake_parent_independently() {
+    no_tool_child_reports(true, false).await;
+}
+
+#[tokio::test]
+async fn pending_no_tool_child_reports_survive_queued_input_at_request_boundary() {
+    no_tool_child_reports(false, false).await;
+}
+
+#[tokio::test]
+async fn no_tool_child_reports_survive_pending_runtime_event() {
+    no_tool_child_reports(false, true).await;
+}
+
+async fn no_tool_child_reports(parent_already_waiting: bool, pending_runtime_event: bool) {
+    const A: &str = "child-report-A";
+    const B: &str = "child-addendum-B";
+    let workspace = tempfile::tempdir().unwrap();
+    let tracking = Tracking::new(vec![
+        (
+            "root",
+            call(
+                "launch",
+                "agent",
+                json!({
+                    "prompt":"report", "model":"child", "name":"reporter", "bg":true
+                }),
+            ),
+        ),
+        ("child", AssistantContent::text("report", 0, A)),
+        ("root", call("first-report", "wait", json!({}))),
+        ("child", AssistantContent::text("addendum", 0, B)),
+        ("root", call("no-repeat", "wait", json!({"timeout":1}))),
+        ("root", call("last-report", "wait", json!({}))),
+        ("root", answer()),
+    ]);
+    let harness = harness(workspace.path(), tracking.clone()).await;
+    let session = Arc::new(harness.new_session().await.unwrap());
+    let turn = prompt(&session);
+    tracking.request(0).await;
+    tracking.release(0);
+    tracking.request(1).await;
+    tracking.request(2).await;
+    let job = running_job(&session, "agent").await;
+    let (child, sender) = {
+        let agents = session.runtime.agents.read().unwrap();
+        let (child, slot) = agents.iter().find(|(id, _)| **id != session.root).unwrap();
+        (child.clone(), slot.sender.clone())
+    };
+    if pending_runtime_event {
+        complete_background_for(&session, &child, "please add an addendum").await;
+        assert!(session.runtime.jobs.has_pending(&child).await);
+    } else {
+        let sent = bounded(session.run_script(format!(
+            "return await tool.job({}).send({{value:'please add an addendum'}});",
+            job.get()
+        )))
+        .await
+        .unwrap();
+        assert_eq!(sent.value["value"], json!({"accepted":true}));
+        // send() acknowledges the job mailbox; occupancy proves forwarding to the
+        // child's command queue while A's no-tool provider invoke is still gated.
+        bounded(async {
+            while sender.capacity() != AGENT_CHANNEL_CAPACITY - 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    }
+    if parent_already_waiting {
+        tracking.release(2);
+        running_job(&session, "wait").await;
+    }
+    tracking.release(1);
+    let addendum = tracking.request(3).await;
+    assert_eq!(
+        serde_json::to_string(&addendum.messages)
+            .unwrap()
+            .matches("please add an addendum")
+            .count(),
+        1
+    );
+    assert!(addendum.messages.iter().any(|message| matches!(message,
+        Message::Assistant(content) if content == &tracking.steps[1].content)));
+    if !parent_already_waiting {
+        assert!(
+            tracking
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(step, _)| *step < 4)
+        );
+        tracking.release(2);
+    }
+    let first = tracking.request(4).await;
+    assert_reason(&first, "first-report", "event");
+    let messages = agent_messages(&first);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["text"], A);
+    assert_eq!(messages[0]["id"], job.get());
+    assert_eq!(messages[0]["name"], "reporter");
+    assert!(
+        events(&first).is_empty(),
+        "A must not complete the still-working child"
+    );
+    assert_eq!(
+        session.runtime.jobs.snapshot(job).await.unwrap().state,
+        JobState::Running
+    );
+    assert!(
+        !turn.is_finished(),
+        "parent must not finish before addendum work"
+    );
+    tracking.release(4);
+    let waiting = tracking.request(5).await;
+    assert_reason(&waiting, "no-repeat", "timeout");
+    assert_eq!(agent_messages(&waiting), messages);
+    assert!(events(&waiting).is_empty());
+
+    // Hold this parent boundary until B and completion are both durable. They
+    // remain separate events, but need not wake two separate model requests.
+    tracking.release(3);
+    child_completed(&session, job).await;
+    tracking.release(5);
+    let completed = tracking.request(6).await;
+    assert_reason(&completed, "last-report", "event");
+    let delivered = agent_messages(&completed);
+    assert_eq!(delivered.len(), 2);
+    assert_eq!(delivered[0], messages[0]);
+    assert_eq!(delivered[1]["text"], B);
+    let records = session.runtime.store.records().await;
+    for (index, step) in [1, 3].into_iter().enumerate() {
+        let source = records
+            .iter()
+            .find(|record| {
+                record.agent == child
+                    && matches!(
+            &record.event, SessionEvent::MessageCommitted { message: Message::Assistant(content) }
+                if content == &tracking.steps[step].content)
+            })
+            .unwrap();
+        assert_eq!(delivered[index]["message"], source.sequence);
+    }
+    assert_ne!(delivered[0]["message"], delivered[1]["message"]);
+    let lifecycle = events(&completed);
+    assert_eq!(lifecycle.len(), 1);
+    assert_child_completion(&lifecycle[0], &delivered[1]);
+    let history = serde_json::to_string(&completed.messages).unwrap();
+    assert_eq!(
+        history.matches(A).count(),
+        1,
+        "A must not be overwritten or repeated"
+    );
+    assert_eq!(
+        history.matches(B).count(),
+        1,
+        "completion must not repeat B"
+    );
+    assert_eq!(
+        session.runtime.jobs.snapshot(job).await.unwrap().output,
+        Some(json!(B))
+    );
+    let saved =
+        bounded(session.run_script(format!("return await tool.job({}).output();", job.get())))
+            .await
+            .unwrap();
+    assert_eq!(
+        saved.value["value"]["result"], B,
+        "job_output retains final string"
+    );
+    tracking.release(6);
     bounded(turn).await.unwrap().unwrap();
     session.shutdown().await.unwrap();
 }
@@ -780,6 +1013,7 @@ async fn intermediate_child_reply(parent_already_waiting: bool) {
     assert_eq!(
         replies,
         vec![json!({
+            "kind":"message",
             "id":child_job.get(),
             "name":"child-replier",
             "message":committed[0].sequence,
@@ -804,21 +1038,18 @@ async fn intermediate_child_reply(parent_already_waiting: bool) {
         "do not inject another copy"
     );
     assert!(events(&again).is_empty());
-    tracking.release(6);
-    running_job(&session, "wait").await;
     tracking.release(4);
+    child_completed(&session, child_job).await;
+    tracking.release(6);
     let completed = tracking.request(7).await;
     assert_reason(&completed, "finish-wait", "event");
-    assert_eq!(agent_messages(&completed), replies);
+    let all_replies = agent_messages(&completed);
+    assert_eq!(&all_replies[..replies.len()], replies.as_slice());
+    assert_eq!(all_replies.len(), 2);
+    assert_eq!(all_replies[1]["text"], FINAL);
     let notifications = events(&completed);
     assert_eq!(notifications.len(), 1);
-    assert_eq!(notifications[0]["id"], child_job.get());
-    let notification = serde_json::to_string(&notifications[0]).unwrap();
-    assert!(notification.contains(FINAL));
-    assert!(
-        !notification.contains(REPLY),
-        "final notification repeated the reply"
-    );
+    assert_child_completion(&notifications[0], &all_replies[1]);
     let snapshot = session.runtime.jobs.snapshot(child_job).await.unwrap();
     assert_eq!(snapshot.state, JobState::Completed);
     let output = serde_json::to_string(&snapshot.output).unwrap();
@@ -831,7 +1062,7 @@ async fn intermediate_child_reply(parent_already_waiting: bool) {
     tracking.release(7);
     let last = tracking.request(8).await;
     assert_reason(&last, "after-final", "timeout");
-    assert_eq!(agent_messages(&last), replies);
+    assert_eq!(agent_messages(&last), all_replies);
     assert_eq!(events(&last), notifications);
     tracking.release(8);
     bounded(turn).await.unwrap().unwrap();
@@ -903,8 +1134,8 @@ async fn child_replies_at_no_tool_boundary(reply_count: usize, fill_mailbox: boo
     tracking.request(1).await;
     let child_job = running_job(&session, "agent").await;
     if fill_mailbox {
-        // Fill the command channel while the parent is inside invoke. Replies
-        // must use the separate payload queue even when JobsReady cannot fit.
+        // Fill the command channel while the parent is inside invoke. Durable
+        // message events must remain pending even when JobsReady cannot fit.
         while session.root_tx.capacity() > 0 {
             bounded(session.root_tx.send(AgentCommand::JobsReady))
                 .await
@@ -980,22 +1211,22 @@ async fn child_replies_at_no_tool_boundary(reply_count: usize, fill_mailbox: boo
             "unnamed child should omit name"
         );
     }
-    tracking.release(parent_reply);
-    running_job(&session, "wait").await;
     tracking.release(child_final);
+    child_completed(&session, child_job).await;
+    tracking.release(parent_reply);
     let completed = tracking.request(parent_completed).await;
     assert_reason(&completed, "finish-wait", "event");
+    let all_replies = agent_messages(&completed);
     assert_eq!(
-        agent_messages(&completed),
-        replies,
+        &all_replies[..reply_count],
+        replies.as_slice(),
         "retained replies are exactly once"
     );
+    assert_eq!(all_replies.len(), reply_count + 1);
+    assert_eq!(all_replies[reply_count]["text"], "mailbox-child-final");
     let notifications = events(&completed);
     assert_eq!(notifications.len(), 1);
-    assert_eq!(notifications[0]["id"], child_job.get());
-    let output = serde_json::to_string(&notifications[0]).unwrap();
-    assert!(output.contains("mailbox-child-final"));
-    assert!(!output.contains("mailbox-child-reply-"));
+    assert_child_completion(&notifications[0], &all_replies[reply_count]);
     tracking.release(parent_completed);
     bounded(turn).await.unwrap().unwrap();
     bounded(session.shutdown()).await.unwrap();
@@ -1055,64 +1286,116 @@ async fn idle_agent_batches_background_notifications_without_a_wait_call() {
     session.shutdown().await.unwrap();
 }
 
-/// A parent can be cancelled while output presentation/commit is still pending.
-/// Snapshotting must not consume the only live copy of a child's progress.
+/// Publish through the same durable source-history path as a real child, without
+/// invoking another provider. The owner stays gated while a test prepares receipts.
+async fn fixture_child(session: &SessionHandle, root: &Path) -> (JobId, AgentId) {
+    let lease = session
+        .runtime
+        .jobs
+        .create(JobSpec {
+            background: true,
+            ..JobSpec::test(session.root.clone(), "agent")
+        })
+        .await
+        .unwrap();
+    let child = session.root.child(123);
+    session
+        .runtime
+        .store
+        .append(
+            child.clone(),
+            SessionEvent::AgentStarted {
+                parent: Some(session.root.clone()),
+                owner_job: Some(lease.id),
+                model_profile: "child".into(),
+                max_context: None,
+                agent_profile: None,
+                location: crate::execution::ExecutionLocation::root(root.to_path_buf()),
+            },
+        )
+        .await
+        .unwrap();
+    session
+        .runtime
+        .jobs
+        .transition(lease.id, JobState::Running)
+        .await
+        .unwrap();
+    (lease.id, child)
+}
+
+async fn fixture_message(session: &SessionHandle, job: JobId, child: &AgentId, text: &str) -> u64 {
+    session
+        .runtime
+        .jobs
+        .commit_child_message(
+            child,
+            job,
+            Message::Assistant(vec![AssistantContent::text("fixture-reply", 0, text)]),
+            text.to_owned(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn pending_content(
+    session: &SessionHandle,
+    root: &Path,
+) -> (Vec<UserContent>, wait::PendingEventBatch) {
+    session
+        .runtime
+        .pending_event_content(
+            session.root_agent(),
+            &session.runtime.harness.capabilities,
+            &crate::execution::ExecutionLocation::root(root.to_path_buf()),
+        )
+        .await
+        .unwrap()
+}
+
+/// Snapshotting must not consume the only durable copy of a child's progress.
 #[tokio::test]
-async fn child_progress_snapshot_survives_abandoned_and_failed_parent_commits() {
+async fn child_progress_snapshot_survives_abandoned_parent_commits() {
     let workspace = tempfile::tempdir().unwrap();
     let tracking = Tracking::new(vec![("root", answer()), ("root", answer())]);
     let harness = harness(workspace.path(), tracking.clone()).await;
     let session = Arc::new(harness.new_session().await.unwrap());
     let turn = prompt(&session);
     tracking.request(0).await;
-    let root = session.root_agent();
-    let reply = |sequence, text: &str| wait::ChildMessage {
-        id: JobId::new(123).unwrap(),
-        name: Some("snapshot-child".into()),
-        message: sequence,
-        text: text.into(),
-    };
-    session
-        .root_tx
-        .child_message(reply(10, "retained-progress"));
-    let (content, batch) = session.runtime.child_message_content(root);
+    let (job, child) = fixture_child(&session, workspace.path()).await;
+    let first = fixture_message(&session, job, &child, "retained-progress").await;
+    let (content, batch) = pending_content(&session, workspace.path()).await;
     assert_eq!(content.len(), 1);
-    // Dropping a prepared delivery, as cancellation does before its commit,
-    // must not empty the mailbox.
     drop(batch);
-    assert!(session.root_tx.has_child_messages());
+    assert!(session.runtime.jobs.has_pending(session.root_agent()).await);
 
-    let (content, batch) = session.runtime.child_message_content(root);
-    let wrong_agent = AgentId::root(crate::identity::SessionId::from_bytes([99; 16]));
-    assert!(
-        batch
-            .commit(&session.runtime, &wrong_agent, Message::User(content))
-            .await
-            .is_err()
+    let (retry, batch) = pending_content(&session, workspace.path()).await;
+    assert_eq!(
+        retry, content,
+        "abandoning a receipt must retain its source message"
     );
-    assert!(session.root_tx.has_child_messages());
-
-    let (content, batch) = session.runtime.child_message_content(root);
-    // Arrival after snapshot (even with the same text) belongs to the next batch.
-    session
-        .root_tx
-        .child_message(reply(11, "retained-progress"));
     batch
-        .commit(&session.runtime, root, Message::User(content))
+        .commit(&session.runtime, session.root_agent(), Message::User(retry))
         .await
         .unwrap();
-    let (remaining, batch) = session.runtime.child_message_content(root);
-    let serialized = serde_json::to_string(&remaining).unwrap();
-    assert!(serialized.contains("retained-progress"));
-    assert!(serialized.contains("11"));
+    assert!(!session.runtime.jobs.has_pending(session.root_agent()).await);
+    // Equal text is a new independent event when its source sequence differs.
+    let second = fixture_message(&session, job, &child, "retained-progress").await;
+    assert_ne!(first, second);
+    let (remaining, batch) = pending_content(&session, workspace.path()).await;
+    assert!(
+        serde_json::to_string(&remaining)
+            .unwrap()
+            .contains("retained-progress")
+    );
     drop(batch);
     tracking.release(0);
     let next = tracking.request(1).await;
     let delivered = agent_messages(&next);
     assert_eq!(delivered.len(), 2);
-    assert_eq!(delivered[0]["message"], 10);
-    assert_eq!(delivered[1]["message"], 11);
-    assert!(!session.root_tx.has_child_messages());
+    assert_eq!(delivered[0]["message"], first);
+    assert_eq!(delivered[1]["message"], second);
+    assert!(!session.runtime.jobs.has_pending(session.root_agent()).await);
     tracking.release(1);
     bounded(turn).await.unwrap().unwrap();
     session.shutdown().await.unwrap();
@@ -1135,17 +1418,13 @@ async fn cancelled_notification_commit(with_completion: bool) {
     let session = Arc::new(harness.new_session().await.unwrap());
     let turn = prompt(&session);
     tracking.request(0).await;
-    let job = if with_completion {
-        complete_background(&session, "committed-completion").await
+    let completion = if with_completion {
+        Some(complete_background(&session, "committed-completion").await)
     } else {
-        JobId::new(123).unwrap()
+        None
     };
-    session.root_tx.child_message(wait::ChildMessage {
-        id: job,
-        name: Some("committed-child".into()),
-        message: 42,
-        text: "committed-progress".into(),
-    });
+    let (job, child) = fixture_child(&session, workspace.path()).await;
+    fixture_message(&session, job, &child, "committed-progress").await;
     let location = crate::execution::ExecutionLocation::root(workspace.path().to_path_buf());
     let (content, batch) = session
         .runtime
@@ -1158,14 +1437,10 @@ async fn cancelled_notification_commit(with_completion: bool) {
         .unwrap();
     assert_eq!(
         content.len(),
-        if with_completion { 2 } else { 1 },
-        "progress and completion share the same batch"
+        1,
+        "progress and completion share the same envelope"
     );
-    assert!(session.root_tx.has_child_messages());
-    assert_eq!(
-        session.runtime.jobs.has_pending(session.root_agent()).await,
-        with_completion
-    );
+    assert!(session.runtime.jobs.has_pending(session.root_agent()).await);
     let mut records = session.runtime.store.subscribe();
     {
         let commit = batch.commit(
@@ -1202,9 +1477,7 @@ async fn cancelled_notification_commit(with_completion: bool) {
                 break;
             }
         }
-        while session.root_tx.has_child_messages()
-            || session.runtime.jobs.has_pending(session.root_agent()).await
-        {
+        while session.runtime.jobs.has_pending(session.root_agent()).await {
             tokio::task::yield_now().await;
         }
     })
@@ -1219,7 +1492,7 @@ async fn cancelled_notification_commit(with_completion: bool) {
     assert_eq!(agent_messages(&next).len(), 1);
     assert_eq!(events(&next).len(), usize::from(with_completion));
     if with_completion {
-        assert_eq!(events(&next)[0]["id"], job.get());
+        assert_eq!(events(&next)[0]["id"], completion.unwrap().get());
     }
     tracking.release(1);
     bounded(turn).await.unwrap().unwrap();
@@ -1234,30 +1507,25 @@ async fn progress_and_completion_cross_the_same_no_tool_boundary_once() {
     let session = Arc::new(harness.new_session().await.unwrap());
     let turn = prompt(&session);
     tracking.request(0).await;
-    let job = complete_background(&session, "no-tool-completion").await;
-    session.root_tx.child_message(wait::ChildMessage {
-        id: job,
-        name: Some("no-tool-child".into()),
-        message: 42,
-        text: "no-tool-progress".into(),
-    });
+    complete_background(&session, "no-tool-completion").await;
+    let (job, child) = fixture_child(&session, workspace.path()).await;
+    fixture_message(&session, job, &child, "no-tool-progress").await;
     tracking.release(0);
     let next = tracking.request(1).await;
     assert_eq!(agent_messages(&next).len(), 1);
     assert_eq!(events(&next).len(), 1);
-    // Both envelopes must be in a single persisted parent user message, not
+    // Both entries must be in a single persisted parent runtime envelope, not
     // separate history/ack transactions or a follow-on idle turn.
     let records = session.runtime.store.records().await;
     assert!(records.iter().any(|record| {
         record.agent == session.root && matches!(&record.event,
             SessionEvent::MessageCommitted { message: Message::User(content) }
-                if content.len() == 2 && content.iter().all(|block| matches!(block, UserContent::Runtime { .. })))
+                if content.len() == 1 && content.iter().all(|block| matches!(block, UserContent::Runtime { .. })))
     }));
     assert!(
         !turn.is_finished(),
         "the earlier answer must not finish the caller's turn"
     );
-    assert!(!session.root_tx.has_child_messages());
     assert!(!session.runtime.jobs.has_pending(session.root_agent()).await);
     tracking.release(1);
     bounded(turn).await.unwrap().unwrap();

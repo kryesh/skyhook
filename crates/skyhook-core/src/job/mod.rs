@@ -35,12 +35,16 @@ pub(crate) mod output;
 pub use output::OutputArgs as JobOutputQuery;
 #[cfg(test)]
 mod delivery_tests;
+#[cfg(test)]
+mod message_tests;
+mod messages;
 mod persistence;
 mod progress;
 #[cfg(test)]
 mod progress_tests;
 
 const JOB_INPUT_CAPACITY: usize = 32;
+const DELIVERY_BATCH_BYTES: usize = 8192;
 const CANCELLATION_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq)]
@@ -107,6 +111,10 @@ struct PresentedJob<'a> {
     workspace: Option<&'a std::path::Path>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<&'a Value>,
+    /// Source sequence of the last visible child reply. Automatic completed-agent
+    /// notifications reference that message instead of repeating the saved result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_message: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a str>,
     #[serde(flatten)]
@@ -154,6 +162,7 @@ impl JobEnvelope {
         serde_json::to_value(PresentedJob {
             id: self.id,
             state: self.state.presented(),
+            last_message: None,
             parent: self.parent.filter(|_| detailed),
             tool: detailed.then_some(self.tool.as_str()),
             name: self
@@ -279,6 +288,9 @@ struct JobEntry {
     task_abort: Option<AbortHandle>,
     cancellation_watchdog_started: bool,
     delivery: DeliveryState,
+    child: Option<AgentId>,
+    messages: Vec<AgentMessage>,
+    last_agent_message: Option<u64>,
     background: bool,
     authorization_scope: Option<u64>,
     location: ExecutionLocation,
@@ -310,6 +322,9 @@ impl JobEntry {
                 task_abort: None,
                 cancellation_watchdog_started: false,
                 delivery: DeliveryState::Pending,
+                child: None,
+                messages: Vec::new(),
+                last_agent_message: None,
                 background: spec.background,
                 authorization_scope: spec.authorization_scope,
                 location: spec.location,
@@ -396,17 +411,32 @@ pub struct JobManager {
     inner: Arc<JobManagerInner>,
 }
 
-/// A non-destructive snapshot serialized against explicit claims and resumption.
-/// Dropping a receipt before committing leaves its jobs pending. Presentation must
-/// not claim jobs while this receipt holds the delivery gate.
+/// A visible child reply identified by its source MessageCommitted sequence.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct AgentMessage {
+    pub id: JobId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub message: u64,
+    pub text: String,
+}
+
+/// A non-destructive snapshot serialized against publication, claims and resumption.
+/// Dropping a receipt before committing leaves its messages and jobs pending.
+/// Presentation must not claim jobs while this receipt holds the delivery gate.
 pub(crate) struct PendingDelivery {
     manager: JobManager,
     owner: AgentId,
     envelopes: Vec<JobEnvelope>,
+    messages: Vec<AgentMessage>,
     _delivery: OwnedMutexGuard<()>,
 }
 
 impl PendingDelivery {
+    pub(crate) fn messages(&self) -> &[AgentMessage] {
+        &self.messages
+    }
+
     pub(crate) fn envelopes(&self) -> &[JobEnvelope] {
         &self.envelopes
     }
@@ -432,6 +462,17 @@ impl PendingDelivery {
         let mut jobs = self.manager.inner.jobs.lock().await;
         if let SessionEvent::MessageCommitted { message } = &record.event {
             persistence::acknowledge_message(&mut jobs, &self.owner, message);
+        }
+        // A bounded snapshot may leave more work. Wake after durable acknowledgement
+        // so the next parent turn cannot sleep with a pending suffix.
+        for (&job, entry) in jobs.iter() {
+            if entry.agent == self.owner && entry.has_pending() {
+                let _ = self.manager.inner.completions.send(JobCompletion {
+                    agent: self.owner.clone(),
+                    job,
+                });
+                break;
+            }
         }
         Ok(record.sequence)
     }
@@ -861,14 +902,14 @@ impl JobManager {
         states
     }
 
-    /// Whether a completion/question is ready for delivery, without reserving it.
+    /// Whether a child message or completion/question is ready, without reserving it.
     pub(crate) async fn has_pending(&self, owner: &AgentId) -> bool {
-        self.inner.jobs.lock().await.values().any(|entry| {
-            &entry.agent == owner
-                && entry.background
-                && entry.deliverable()
-                && entry.delivery == DeliveryState::Pending
-        })
+        self.inner
+            .jobs
+            .lock()
+            .await
+            .values()
+            .any(|entry| &entry.agent == owner && entry.has_pending())
     }
 
     /// Associate an agent job with the child's actual workspace and target.
@@ -1326,8 +1367,11 @@ impl JobManager {
     ) -> Result<PendingDelivery, JobError> {
         let delivery = self.inner.delivery_operation.clone().lock_owned().await;
         let jobs = self.inner.jobs.lock().await;
+        let messages = messages::pending_messages(&jobs, owner);
+        let through = messages.last().map_or(0, |message| message.message);
+        let remaining = DELIVERY_BATCH_BYTES.saturating_sub(messages::batch_size(&messages));
         let envelopes = self
-            .pending_ids(&jobs, owner)
+            .pending_ids(&jobs, owner, through, remaining, !messages.is_empty())
             .into_iter()
             .map(|id| jobs[&id].envelope(id))
             .collect();
@@ -1335,11 +1379,19 @@ impl JobManager {
             manager: self.clone(),
             owner: owner.clone(),
             envelopes,
+            messages,
             _delivery: delivery,
         })
     }
 
-    fn pending_ids(&self, jobs: &HashMap<JobId, JobEntry>, owner: &AgentId) -> Vec<JobId> {
+    fn pending_ids(
+        &self,
+        jobs: &HashMap<JobId, JobEntry>,
+        owner: &AgentId,
+        messages_through: u64,
+        mut remaining: usize,
+        has_messages: bool,
+    ) -> Vec<JobId> {
         let mut ids = jobs
             .iter()
             .filter(|(_, entry)| {
@@ -1347,12 +1399,14 @@ impl JobManager {
                     && entry.background
                     && entry.deliverable()
                     && entry.delivery == DeliveryState::Pending
+                    // Filter before budgeting: a blocked low-ID child must not
+                    // consume the lifecycle budget of an unrelated completion.
+                    && entry.messages.iter().all(|message| message.message <= messages_through)
             })
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
         ids.sort();
         let mut pending = Vec::new();
-        let mut budget = 0;
         for id in ids {
             let entry = &jobs[&id];
             let metadata =
@@ -1366,11 +1420,12 @@ impl JobManager {
             } else {
                 8192
             };
-            if !pending.is_empty() && budget + cost > 8192 {
-                break;
+            if cost > remaining && (has_messages || !pending.is_empty()) {
+                // A smaller later completion may fit the shared remaining budget.
+                continue;
             }
             pending.push(id);
-            budget += cost;
+            remaining = remaining.saturating_sub(cost);
         }
         pending
     }
@@ -1381,7 +1436,7 @@ impl JobManager {
         let pending = {
             let mut jobs = self.inner.jobs.lock().await;
             let mut pending = Vec::new();
-            for id in self.pending_ids(&jobs, owner) {
+            for id in self.pending_ids(&jobs, owner, 0, DELIVERY_BATCH_BYTES, false) {
                 let entry = jobs.get_mut(&id).expect("selected job");
                 if let Some(agent) = entry.reserve_delivery(DeliveryState::Injected) {
                     pending.push((id, agent, entry.envelope(id)));

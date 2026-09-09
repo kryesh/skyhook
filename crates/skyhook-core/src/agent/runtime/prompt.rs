@@ -2,7 +2,7 @@ use chrono::{DateTime, Local};
 use serde::Serialize;
 
 use crate::{
-    agent::{todo::TodoStore, TodoItem},
+    agent::{TodoItem, todo::TodoStore},
     execution::ExecutionLocation,
     identity::AgentId,
     job::{ActiveJob, JobManager},

@@ -1399,7 +1399,7 @@ fn job_event_entries(
     all: bool,
 ) -> Vec<Entry> {
     let kind = job_notification_kind(text);
-    let agent_message = matches!(kind, Some(JobNotificationKind::AgentMessage));
+    let legacy_agent_messages = matches!(kind, Some(JobNotificationKind::AgentMessage));
     let events = kind.and_then(|kind| {
         let (start, end) = kind.tags();
         text.trim()
@@ -1418,6 +1418,10 @@ fn job_event_entries(
         .iter()
         .enumerate()
         .map(|(index, event)| {
+            // Unified envelopes mix lifecycle and message items. The old envelope
+            // remains message-only for historical sessions without a kind field.
+            let agent_message = legacy_agent_messages
+                || event.get("kind").and_then(Value::as_str) == Some("message");
             let key = format!("{key}/event{index}");
             let open = view.is_expanded(&key, all);
             let id = event
@@ -2407,7 +2411,28 @@ mod tests {
     }
 
     #[test]
-    fn conversation_projects_both_job_envelopes_without_reclassifying_user_text() {
+    fn unified_agent_message_preserves_legacy_expansion_and_attribution() {
+        let payload = serde_json::json!([
+            {"id":253,"name":"reviewer","message":6577,"text":"Historical reply.\nNext line."},
+        ]);
+        let legacy = format!("<skyhook_agent_messages>\n{payload}\n</skyhook_agent_messages>");
+        let mut unified_payload = payload;
+        unified_payload[0]["kind"] = serde_json::json!("message");
+        let unified = format!("<skyhook_job_events>\n{unified_payload}\n</skyhook_job_events>");
+        let projection = Projection::default();
+        for expanded in [false, true] {
+            let view = View::default();
+            let legacy = job_event_entries("m42/0", &legacy, &projection, &view, expanded);
+            let unified = job_event_entries("m42/0", &unified, &projection, &view, expanded);
+            assert!(
+                unified == legacy,
+                "envelope migration changed message presentation"
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_projects_mixed_and_legacy_job_events_without_reclassifying_user_text() {
         let agent = AgentId::root(SessionId::from_bytes([2; 16]));
         let messages = format!(
             "<skyhook_agent_messages>\n{}\n</skyhook_agent_messages>",
@@ -2418,7 +2443,12 @@ mod tests {
         );
         let jobs = format!(
             "<skyhook_job_events>\n{}\n</skyhook_job_events>",
-            serde_json::json!([{"id":253,"tool":"agent","state":"completed","result":"final result"}]),
+            serde_json::json!([
+                {"kind":"message","id":253,"name":"reviewer","message":6579,"text":"independent reply"},
+                {"id":253,"tool":"agent","state":"completed","last_message":6579},
+                {"kind":"message","id":254,"message":6580,"text":"another child reply"},
+                {"id":255,"tool":"exec","state":"completed","result":{"stdout":"tool output"}},
+            ]),
         );
         let message = Message::User(vec![
             UserContent::Runtime {
@@ -2456,13 +2486,46 @@ mod tests {
             .iter()
             .filter(|entry| entry.surface == Surface::Tool)
             .collect();
-        assert_eq!(notifications.len(), 3);
+        assert_eq!(notifications.len(), 6);
         assert_eq!(notifications[0].key, format!("m{sequence}/0/event0"));
         assert_eq!(notifications[1].key, format!("m{sequence}/0/event1"));
-        assert_eq!(notifications[2].key, format!("m{sequence}/1/event0"));
+        for (index, notification) in notifications[2..].iter().enumerate() {
+            assert_eq!(notification.key, format!("m{sequence}/1/event{index}"));
+        }
         assert!(notifications[0].text.contains("first progress"));
         assert!(notifications[1].text.contains("second progress"));
-        assert!(notifications[2].text.contains("final result"));
+        assert!(
+            notifications[2]
+                .text
+                .contains("agent #253 · reviewer · message #6579")
+        );
+        assert!(
+            notifications[2]
+                .text
+                .contains("Agent message received by model")
+        );
+        assert!(notifications[2].text.contains("independent reply"));
+        assert!(notifications[3].text.contains("agent #253 · completed"));
+        assert!(
+            !notifications[3]
+                .text
+                .contains("Agent message received by model")
+        );
+        assert!(!notifications[3].text.contains("independent reply"));
+        assert!(notifications[4].text.contains("agent #254 · message #6580"));
+        assert!(
+            notifications[4]
+                .text
+                .contains("Agent message received by model")
+        );
+        assert!(notifications[4].text.contains("another child reply"));
+        assert!(notifications[5].text.contains("exec #255 · completed"));
+        assert!(notifications[5].text.contains("tool output"));
+        assert!(
+            !notifications[5]
+                .text
+                .contains("Agent message received by model")
+        );
         assert!(notifications.iter().all(|entry| entry.expandable
             && entry.job.is_none()
             && !entry.text.contains("<skyhook_")

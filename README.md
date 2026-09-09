@@ -667,18 +667,26 @@ errors include it in an `output` field; JavaScript callers can catch the error a
 - Child agents are profile-selectable and retain their conversation for follow-up work.
   `tool.job(id).send({value: instructions})` delivers unsolicited input automatically at a running
   child's next model-request boundary, without interrupting the current request or tools.
-  Children do not need `receive()` to read these updates. Intermediate text replies accompanying
-  child tool calls are injected into the parent's next model request and wake `wait`, without
-  waiting for the child job to finish. These attributed replies are separate from the final
-  job result, so progress text is not concatenated into the final answer. A foreground call
-  still needs to return before its parent can make another model request.
-  Progress and terminal/question notifications share a snapshot → parent-history commit →
+  Children do not need `receive()` to read these updates. Every visible child text reply,
+  including text-only and final replies, is delivered independently through the background-job
+  event path and wakes `wait`, without waiting for the child job to finish. Message events carry
+  `kind: "message"`, the child job `id`, source `message` sequence, optional `name`, and `text`.
+  Completion is determined separately by the agent's remaining work and queued inputs, not by
+  message delivery. A completed child notification references its `last_message` instead of
+  repeating that reply, as do automatic model tool responses for completed children. Explicit
+  `job_output` reads and native script/host calls still expose the saved final result.
+  Progress text is not concatenated into that final result. A foreground call still needs to
+  return before its parent can make another model request.
+  Messages and terminal/question notifications share a snapshot → parent-history commit →
   acknowledgment boundary. Failed or abandoned preparation leaves notifications pending, and
-  caller cancellation cannot split a started append/acknowledgment operation. Job replay recognizes
-  already-committed runtime notifications to avoid duplicate terminal delivery after restart.
-  Uncommitted child progress is still an in-memory queue: a host crash can lose its pending delivery,
-  although the original child conversation may retain the response. Delivery means inclusion in
-  parent history at a request boundary, not interruption of an in-flight model request.
+  caller cancellation cannot split a started append/acknowledgment operation. Pending messages
+  are recovered from committed child history after restart; committed parent notifications
+  acknowledge each message independently and prevent duplicate delivery. Reading or claiming a
+  job result does not consume its message events. Legacy message notifications and exact final
+  replies in completed runtime notifications are recognized on replay. An old output-claim marker
+  alone is not evidence of message delivery, so such a reply may be delivered again rather than
+  discarded. Delivery means inclusion in parent history at a request boundary, not interruption
+  of an in-flight model request.
   Sending to a completed child appends
   the instructions after its existing
   conversation and starts a new request under the same agent and job ID; it does not start

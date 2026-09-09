@@ -267,6 +267,23 @@ async fn running_child_receives_parent_inputs(first_calls_tool: bool) {
     .await;
     assert_eq!(tracking.requests.lock().unwrap().len(), 1);
 
+    // This test drives the parent through scripts and explicitly claims the
+    // child's result. Keep message and completion wakeups out of the autonomous
+    // parent loop: every visible response, including one before queued input,
+    // can now wake the idle parent. The child's real mailbox remains active.
+    let (quiet_sender, _quiet_receiver) = mpsc::channel(AGENT_CHANNEL_CAPACITY);
+    let root_sender = std::mem::replace(
+        &mut session
+            .runtime
+            .agents
+            .write()
+            .unwrap()
+            .get_mut(&session.root)
+            .unwrap()
+            .sender,
+        AgentSender::new(quiet_sender),
+    );
+
     tracking.release(0);
     let next = tracking.request(1).await;
     let expected = [
@@ -318,23 +335,6 @@ async fn running_child_receives_parent_inputs(first_calls_tool: bool) {
             .state
             .is_terminal(),
         "the child job must not complete before answering the parent updates"
-    );
-
-    // This test drives the parent through scripts and explicitly claims the
-    // child's result. Keep completion wakeups out of the autonomous parent loop:
-    // otherwise it can consume the result before jobs.wait claims it and make an
-    // unrelated third provider request. The child's real mailbox remains active.
-    let (quiet_sender, _quiet_receiver) = mpsc::channel(AGENT_CHANNEL_CAPACITY);
-    let root_sender = std::mem::replace(
-        &mut session
-            .runtime
-            .agents
-            .write()
-            .unwrap()
-            .get_mut(&session.root)
-            .unwrap()
-            .sender,
-        AgentSender::new(quiet_sender),
     );
 
     tracking.release(1);

@@ -287,28 +287,50 @@ impl ToolExecutor {
             .await?;
         let started = self.start(plan).await?;
         if matches!(kind, InvocationKind::Model) && name != "job_output" {
-            let job = started.job;
-            let background = started.background;
-            if !background {
-                self.shared.jobs.wait_foreground(job).await?;
-            }
-            let output = self
-                .shared
-                .jobs
-                .present_output_for(
-                    crate::job::output::OutputArgs::new(job),
-                    &self.capabilities,
-                    &self.caller_location,
-                    background,
-                )
-                .await?;
-            return Ok(ExecutionResult {
-                job,
-                background,
-                output: ToolOutput::new(output).with_images(self.shared.jobs.images(job).await?),
-            });
+            return self.collect_model_started(name, started).await;
         }
         self.collect_started(started).await
+    }
+
+    async fn collect_model_started(
+        &self,
+        name: &str,
+        started: StartedExecution,
+    ) -> Result<ExecutionResult, ExecutionError> {
+        let job = started.job;
+        let background = started.background;
+        if !background {
+            self.shared.jobs.wait_foreground(job).await?;
+        }
+        let mut output = self
+            .shared
+            .jobs
+            .present_output_for(
+                crate::job::output::OutputArgs::new(job),
+                &self.capabilities,
+                &self.caller_location,
+                background,
+            )
+            .await?;
+        // Automatic model responses reference independently published child
+        // replies instead of returning their text again. This also handles
+        // a background child that finishes before its launch is presented.
+        // Explicit job_output and native script/host results are unchanged.
+        if name == "agent"
+            && output["state"] == "completed"
+            && let Some(sequence) = self.shared.jobs.last_agent_message(job).await?
+            && let Some(view) = output.as_object_mut()
+        {
+            view.remove("result");
+            view.remove("preview");
+            view.remove("truncated");
+            view.insert("last_message".into(), serde_json::json!(sequence));
+        }
+        Ok(ExecutionResult {
+            job,
+            background,
+            output: ToolOutput::new(output).with_images(self.shared.jobs.images(job).await?),
+        })
     }
 
     pub(crate) async fn start_scoped(
@@ -1019,6 +1041,91 @@ mod tests {
             authorization.clone(),
         );
         TargetRouter::new(targets, remote, authorization)
+    }
+
+    #[tokio::test]
+    async fn automatic_completed_child_results_reference_independent_messages() {
+        use crate::{
+            job::JobSpec,
+            provider::protocol::{AssistantContent, Message},
+            session::SessionEvent,
+        };
+
+        // Cover foreground presentation and a background child that has already
+        // finished before its launch response is collected, without a timing race.
+        for background in [false, true] {
+            let runtime = crate::test_support::TestRuntime::new().await;
+            let executor = runtime.executor(ToolRegistryBuilder::default());
+            let child = runtime.agent.child(1);
+            let job = runtime
+                .jobs
+                .create(JobSpec {
+                    background,
+                    ..JobSpec::test(runtime.agent.clone(), "agent")
+                })
+                .await
+                .unwrap()
+                .id;
+            runtime
+                .store
+                .append(
+                    child.clone(),
+                    SessionEvent::AgentStarted {
+                        parent: Some(runtime.agent.clone()),
+                        owner_job: Some(job),
+                        model_profile: "test".into(),
+                        max_context: None,
+                        agent_profile: None,
+                        location: ExecutionLocation::root(runtime.root.path().to_owned()),
+                    },
+                )
+                .await
+                .unwrap();
+            runtime
+                .jobs
+                .transition(job, JobState::Running)
+                .await
+                .unwrap();
+            let text = (0..500)
+                .map(|line| format!("child answer line {line}\n"))
+                .collect::<String>();
+            let sequence = runtime
+                .jobs
+                .commit_child_message(
+                    &child,
+                    job,
+                    Message::Assistant(vec![AssistantContent::text("answer", 0, text.clone())]),
+                    text.clone(),
+                )
+                .await
+                .unwrap();
+            runtime
+                .jobs
+                .finish(
+                    job,
+                    JobOutcome::Completed(ToolOutput::new(serde_json::json!(text))),
+                )
+                .await
+                .unwrap();
+
+            let result = executor
+                .collect_model_started("agent", StartedExecution { job, background })
+                .await
+                .unwrap();
+            assert_eq!(result.output.value["state"], "completed");
+            assert_eq!(result.output.value["last_message"], sequence);
+            for field in ["result", "preview", "truncated"] {
+                assert!(result.output.value.get(field).is_none(), "{field}");
+            }
+            // Claiming the model result must not claim the independently
+            // deliverable reply, nor destroy the explicit saved final answer.
+            let pending = runtime.jobs.pending_delivery(&runtime.agent).await.unwrap();
+            assert_eq!(pending.messages().len(), 1);
+            assert_eq!(pending.messages()[0].text, text);
+            drop(pending);
+            let saved = runtime.jobs.snapshot(job).await.unwrap();
+            assert_eq!(saved.output, Some(serde_json::json!(text)));
+        }
     }
 
     #[tokio::test]

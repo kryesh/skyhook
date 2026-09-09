@@ -1267,9 +1267,7 @@ impl SessionRuntime {
                             if deferred
                                 .iter()
                                 .any(|command| matches!(command, AgentCommand::QueuedInputs(_)))
-                                || self
-                                    .agent_sender(&id)
-                                    .is_some_and(|sender| sender.has_child_messages())
+                                || self.jobs.has_pending(&id).await
                             {
                                 continue;
                             }
@@ -1363,9 +1361,7 @@ impl SessionRuntime {
                 if deferred
                     .iter()
                     .any(|command| matches!(command, AgentCommand::QueuedInputs(_)))
-                    || self
-                        .agent_sender(&id)
-                        .is_some_and(|sender| sender.has_child_messages())
+                    || self.jobs.has_pending(&id).await
                 {
                     continue;
                 }
@@ -1412,10 +1408,7 @@ impl SessionRuntime {
             if is_child && !self.jobs.has_running(&id).await {
                 // A descendant may have published a reply and then finished
                 // during the awaits above. Check after observing no live jobs.
-                if self
-                    .agent_sender(&id)
-                    .is_some_and(|sender| sender.has_child_messages())
-                {
+                if self.jobs.has_pending(&id).await {
                     continue;
                 }
                 *completing = false;
@@ -1652,7 +1645,13 @@ impl SessionRuntime {
                 }
             };
             let assistant = Message::Assistant(response.blocks);
-            let origin = self.commit(agent, assistant.clone()).await?;
+            let origin = if let Some(job) = owner_job {
+                self.jobs
+                    .commit_child_message(agent, job, assistant.clone(), response.text.clone())
+                    .await?
+            } else {
+                self.commit(agent, assistant.clone()).await?
+            };
             agent_context.projected.push((origin, assistant));
             if response.stop_reason == crate::provider::protocol::StopReason::Aborted {
                 // Preserve completed visible/replay content, but never turn a
@@ -1675,21 +1674,10 @@ impl SessionRuntime {
                 });
                 return Err(HarnessError::Interrupted);
             }
-            if let Some(job) = owner_job
-                && !response.calls.is_empty()
-                && !response.text.trim().is_empty()
-                && let Some(parent) = agent.parent().and_then(|parent| self.agent_sender(&parent))
-            {
-                let metadata = self.jobs.metadata(job).await?;
-                parent.child_message(wait::ChildMessage {
-                    id: job,
-                    name: metadata.name,
-                    message: origin,
-                    text: response.text.clone(),
-                });
-            } else {
-                // Child progress is delivered separately, not concatenated into
-                // the eventual final result (nor repeated at completion).
+            // Child replies are already independently published at commit, even
+            // when queued input will make a text-only response nonterminal. Only
+            // the eventual answer belongs in the saved final job result.
+            if owner_job.is_none() || response.calls.is_empty() {
                 final_text.push_str(&response.text);
             }
             self.events.send(RuntimeEvent::ResponseSettled {
@@ -3101,6 +3089,11 @@ mod tests {
                     text("premature child answer"),
                     text(&answer),
                     text("root done"),
+                    // The large final message occupies its own bounded delivery
+                    // batch after the premature response, independently of the
+                    // foreground tool result. A no-tool parent boundary must
+                    // continue to consume that pending batch before returning.
+                    text("root done"),
                 ],
             ),
         )
@@ -3148,13 +3141,42 @@ mod tests {
                 .unwrap(),
             "root done"
         );
+        assert_eq!(
+            session
+                .runtime
+                .jobs
+                .snapshot(agent_job.id)
+                .await
+                .unwrap()
+                .output,
+            Some(json!(answer)),
+            "saved output retains the complete final string"
+        );
         let requests = requests.lock().unwrap();
-        let Message::Tool(results) = request_history(requests.last().unwrap()).last().unwrap()
-        else {
-            panic!("child result expected")
-        };
-        assert_eq!(results[0].result["result"], answer);
-        assert!(results[0].result.get("truncated").is_none());
+        let last = requests.last().unwrap();
+        let result = request_history(last)
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool(results) => Some(results),
+                _ => None,
+            })
+            .flatten()
+            .find(|result| result.name == "agent")
+            .expect("child tool result expected");
+        assert_eq!(result.result["state"], "completed");
+        assert!(
+            result.result.get("result").is_none(),
+            "automatic tool result must not repeat final text"
+        );
+        assert!(result.result["last_message"].is_u64());
+        let serialized = serde_json::to_string(&last.messages).unwrap();
+        assert_eq!(serialized.matches("premature child answer").count(), 1);
+        assert_eq!(
+            serialized.matches("child work completed").count(),
+            500,
+            "large final message is delivered once independently of the tool result"
+        );
+        assert!(result.result.get("truncated").is_none());
         for request in requests.iter() {
             let system = &request.system[0].text;
             assert!(!system.contains("compaction"));
