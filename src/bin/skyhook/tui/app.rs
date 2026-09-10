@@ -3041,7 +3041,7 @@ mod tests {
             workspace: root.path().to_path_buf(),
             sessions: root.path().join(".skyhook/sessions"),
             catalog: EmbeddedShimCatalog::from_assets(&[]).unwrap(),
-            interaction: Arc::new(interaction),
+            interaction: Some(Arc::new(interaction)),
             approve_all: false,
         };
         let (tx, _) = mpsc::unbounded_channel();

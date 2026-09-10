@@ -2,9 +2,14 @@
 # With no saved selection, the first declared model below is used.
 # Set to true to skip interactive approval for every tool call.
 approve_all = false
-# Enables remote-target tools, arguments, JavaScript APIs, and prompt guidance.
-targets_enabled = false
+# Exact capability allowlist. Omitted uses this default; [] grants none.
+# Add "targets" for remote-target tools, arguments, JavaScript APIs, and guidance.
+# CLI --capabilities replaces this list; --non-interactive always removes interactive.
+capabilities = ["read", "write", "exec", "network", "agents", "interactive", "mcp"]
 
+# The CLI loads .env from its invocation directory (not --workspace or the config directory).
+# Existing process environment variables take precedence; no parent-directory search.
+# Host environment and .env values are not forwarded to remote targets.
 [providers.openai]
 kind = "openai"
 base_url = "https://api.openai.com/v1"
@@ -15,6 +20,10 @@ api_key_env = "OPENAI_API_KEY"
 kind = "anthropic"
 base_url = "https://api.anthropic.com/v1"
 api_key_env = "ANTHROPIC_API_KEY"
+# Alternatively, remove api_key_env and retrieve a key lazily on the first request:
+# api_key_command = "op read 'op://Private/Anthropic/api-key'"
+# Runs via /bin/sh -c on the host; trimmed stdout is cached for this provider.
+# Also supported by OpenAI-compatible providers; cannot be combined with api_key_env.
 
 # Run `skyhook auth login` (or `skyhook auth login --headless`) first.
 # Credentials belong to Skyhook; official Codex client credentials are never accessed.
@@ -95,8 +104,10 @@ model_profile = "sonnet"
 # MCP servers are optional; an absent/empty [mcp] adds no tools or prompt guidance.
 # Commands in this user config are trusted: startup runs without model approval,
 # only on the local root/session host, never on a selected SSH target.
-# A server's tools require ALL listed capabilities; otherwise they are hidden.
-# capabilities defaults to []; valid names: read, write, exec, targets, agents.
+# Global "mcp" capability is required before any server is launched or contacted.
+# A server's tools additionally require ALL listed capabilities; otherwise hidden.
+# Per-server capabilities defaults to [] (global mcp only, no approval prompt).
+# Valid names: read, write, exec, network, targets, agents, interactive, mcp.
 # Skyhook imports tools only; discovery is frozen at startup. Failed servers warn
 # and are skipped. Tools are available both directly and inside script. Native
 # input schemas are kept unless open/conflicting, when input uses `arguments`.

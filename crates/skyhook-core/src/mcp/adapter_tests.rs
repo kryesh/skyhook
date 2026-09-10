@@ -478,7 +478,9 @@ async fn registration_dispatch_capabilities_permissions_and_preapproval_validati
         let resource = tool.permission_resource().unwrap();
         assert_eq!(resource.namespace, "mcp");
         assert_eq!(resource.segments[0], "fixture");
-        let spec = tool.spec(&CapabilitySet::default()).unwrap();
+        let spec = tool
+            .spec(&CapabilitySet::default(), &runtime.agent)
+            .unwrap();
         assert!(matches!(spec.exposure, ToolExposure::ModelVisible));
         assert!(matches!(spec.script_binding, ScriptBinding::TopLevel));
         assert_eq!(spec.input_schema["properties"]["bg"]["type"], "boolean");
@@ -500,9 +502,13 @@ async fn registration_dispatch_capabilities_permissions_and_preapproval_validati
             assert!(!surface.is_valid(&json!({"arguments":{"count":0}})));
         }
     }
-    let mut limited = CapabilitySet::default();
-    limited.remove(Capability::Exec);
-    assert!(registry.surface(&limited).get(&native).is_none());
+    for missing in [Capability::Exec, Capability::Mcp] {
+        let mut limited = CapabilitySet::default();
+        limited.remove(missing);
+        assert!(registry.surface(&limited).get(&native).is_none());
+    }
+    let mut without_mcp = CapabilitySet::default();
+    without_mcp.remove(Capability::Mcp);
     let policy = Arc::new(RecordingPolicy::default());
     let executor = ToolExecutor::new(
         registry,
@@ -510,6 +516,20 @@ async fn registration_dispatch_capabilities_permissions_and_preapproval_validati
         runtime.jobs.clone(),
         runtime.root.path().to_path_buf(),
     );
+    let disabled = executor.clone().with_capabilities(without_mcp);
+    assert!(
+        disabled
+            .execute(runtime.agent.clone(), &native, json!({"count":1}), None)
+            .await
+            .is_err()
+    );
+    assert!(
+        disabled
+            .execute_script(runtime.agent.clone(), &native, json!({"count":1}), None)
+            .await
+            .is_err()
+    );
+    assert!(policy.0.lock().unwrap().is_empty());
     assert!(
         executor
             .execute(runtime.agent.clone(), &native, json!({"count":"bad"}), None)

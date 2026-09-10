@@ -88,7 +88,7 @@ async fn live_reasoning_and_tool_replay() {
         assert!(matches!(profile_name.as_str(), "qwen-red" | "qwen"));
         let config = Config::load(None).await.expect("load user configuration");
         let profile = config.models.get(&profile_name).expect("configured model profile");
-        let ProviderConfig::Openai { base_url, api, api_key_env, chat_reasoning_replay, .. } = &config.providers[&profile.provider] else {
+        let ProviderConfig::Openai { base_url, api, api_key_env, api_key_command, chat_reasoning_replay, .. } = &config.providers[&profile.provider] else {
             panic!("live compatibility fixture requires a Chat Completions profile");
         };
         assert_eq!(*api, OpenAiApi::ChatCompletions);
@@ -113,13 +113,17 @@ async fn live_reasoning_and_tool_replay() {
         }
         let model = std::env::var("SKYHOOK_LIVE_MODEL").unwrap_or_else(|_| profile.model.clone());
         let key = api_key_env.as_ref().map(|name| std::env::var(name).expect("configured credential environment"));
-        let provider: Arc<dyn Provider> = Arc::new(openai_compatible(
+        let mut provider = openai_compatible(
             &profile.provider, root.as_str(), *api, key,
         ).expect("construct provider")
             .with_timeouts(ProviderTimeouts {
                 startup: Duration::from_secs(180), read_idle: Duration::from_secs(120),
             })
-            .with_chat_reasoning_replay(replay));
+            .with_chat_reasoning_replay(replay);
+        if let Some(command) = api_key_command {
+            provider = provider.with_api_key_command(command.clone());
+        }
+        let provider: Arc<dyn Provider> = Arc::new(provider);
         let user = Message::User(vec![UserContent::Text {
             text: format!("Look up the value for key {KEY}. Call the supplied function first, then return its value."),
         }]);

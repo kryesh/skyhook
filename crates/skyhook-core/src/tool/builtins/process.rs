@@ -70,14 +70,48 @@ async fn run_process(
             "timeout must be 1 through 3600".to_owned(),
         ));
     }
+    // Override inherited/provider askpass settings even without Targets. Keep the
+    // rejecting broker alive until the command and its cleanup have completed.
+    let rejecting_askpass = if context.capabilities.contains(Capability::Interactive) {
+        None
+    } else {
+        Some(
+            crate::remote::AskpassServer::start(std::sync::Arc::new(
+                crate::remote::RejectSensitivePrompts,
+            ))
+            .map_err(|error| {
+                ToolError::Failed(format!("failed to start noninteractive askpass: {error}"))
+            })?,
+        )
+    };
+    command.envs(&context.process_environment);
+    if let Some(askpass) = &rejecting_askpass {
+        command.envs(askpass.environment());
+    }
     command
-        .envs(&context.process_environment)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
-    command.process_group(0);
+    if context.capabilities.contains(Capability::Interactive) {
+        command.process_group(0);
+    } else {
+        // Piped stdio alone still permits /dev/tty access (and SIGTTIN stops).
+        // A new session detaches the controlling terminal and also makes the
+        // child its process-group leader, preserving group-wide cleanup below.
+        // Do not combine this with process_group(0): a group leader cannot setsid.
+        // SAFETY: setsid is async-signal-safe and the hook does not allocate or
+        // access shared state between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     if context.is_cancelled() {
         return Err(ToolError::Cancelled);
     }
@@ -299,6 +333,10 @@ fn default_dot() -> String {
     ".".to_owned()
 }
 
+#[cfg(all(test, unix))]
+#[path = "process_terminal_tests.rs"]
+mod terminal_tests;
+
 #[cfg(test)]
 mod tests {
     use crate::test_support::TestRuntime;
@@ -312,43 +350,49 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_kills_descendants_even_after_the_shell_exits() {
-        let runtime = TestRuntime::new().await;
-        let agent = runtime.agent.clone();
-        let jobs = runtime.jobs.clone();
-        let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder).unwrap();
-        let executor = runtime.executor(builder);
-        let running = executor.execute(agent, "shell", serde_json::json!({
-            "command":"(sleep 0.3; printf escaped > escaped) & printf ready; exit 0", "bg":true
-        }), None).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let mut args = crate::job::output::OutputArgs::new(running.job);
-                args.field = Some("/result/stdout".into());
-                if jobs
-                    .present_output(args, &Default::default())
-                    .await
-                    .unwrap()["preview"]["lines"]
-                    .as_array()
-                    .is_some_and(|lines| !lines.is_empty())
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
+        for interactive in [false, true] {
+            let runtime = TestRuntime::new().await;
+            let agent = runtime.agent.clone();
+            let jobs = runtime.jobs.clone();
+            let mut builder = ToolRegistryBuilder::default();
+            register(&mut builder).unwrap();
+            let mut capabilities = crate::tool::policy::CapabilitySet::default();
+            if !interactive {
+                capabilities.remove(Capability::Interactive);
             }
-        })
-        .await
-        .unwrap();
-        jobs.cancel(running.job).await.unwrap();
-        assert_eq!(
-            jobs.wait(running.job, Some(Duration::from_secs(2)), true)
-                .await
-                .unwrap()
-                .state,
-            crate::job::JobState::Cancelled
-        );
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        assert!(!runtime.root.path().join("escaped").exists());
+            let executor = runtime.executor(builder).with_capabilities(capabilities);
+            let running = executor.execute(agent, "shell", serde_json::json!({
+                "command":"(sleep 0.3; printf escaped > escaped) & printf ready; exit 0", "bg":true
+            }), None).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let mut args = crate::job::output::OutputArgs::new(running.job);
+                    args.field = Some("/result/stdout".into());
+                    if jobs
+                        .present_output(args, &Default::default())
+                        .await
+                        .unwrap()["preview"]["lines"]
+                        .as_array()
+                        .is_some_and(|lines| !lines.is_empty())
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            jobs.cancel(running.job).await.unwrap();
+            assert_eq!(
+                jobs.wait(running.job, Some(Duration::from_secs(2)), true)
+                    .await
+                    .unwrap()
+                    .state,
+                crate::job::JobState::Cancelled
+            );
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            assert!(!runtime.root.path().join("escaped").exists());
+        }
     }
 
     #[tokio::test]

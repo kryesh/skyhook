@@ -82,7 +82,7 @@ impl Server {
         .trim()
         .to_owned();
         let config = format!(
-            "ListenAddress 127.0.0.1\nPort {port}\nHostKey {0}/host\nAuthorizedKeysFile {0}/authorized_keys\nPidFile {0}/pid\nStrictModes no\nUsePAM no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin yes\nAllowUsers {user}\nAllowTcpForwarding yes\nAllowAgentForwarding yes\nSetEnv HOME={0}\nLogLevel ERROR\n",
+            "ListenAddress 127.0.0.1\nPort {port}\nHostKey {0}/host\nAuthorizedKeysFile {0}/authorized_keys\nPidFile {0}/pid\nStrictModes no\nUsePAM no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin yes\nAllowUsers {user}\nAllowTcpForwarding yes\nAllowAgentForwarding yes\nAcceptEnv *\nSetEnv HOME={0} SKYHOOK_TEST_REMOTE_ENV=remote-value\nLogLevel ERROR\n",
             directory.path().display()
         );
         std::fs::write(directory.path().join("sshd_config"), config).unwrap();
@@ -159,6 +159,75 @@ fn route(definitions: Vec<TargetDefinition>) -> ResolvedRoute {
         },
         definitions,
     }
+}
+
+#[tokio::test]
+#[ignore = "requires sshd and loopback sockets; no shim required"]
+async fn local_environment_and_dotenv_keys_never_reach_remote_processes() {
+    const CHILD: &str = "SKYHOOK_TEST_REMOTE_ENV_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Isolate ambient variables in a child test process rather than mutate
+        // the environment of a multithreaded test runner. Loading .env ultimately
+        // installs exactly this sort of inherited process variable.
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "local_environment_and_dotenv_keys_never_reach_remote_processes",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("SKYHOOK_TEST_HOST_ENV", "ambient-host-secret")
+            .env("SKYHOOK_TEST_DOTENV_KEY", "invocation-dotenv-secret")
+            .env("SKYHOOK_TEST_REMOTE_ENV", "incorrect-host-value")
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let server = Server::start().await;
+        let mut target = server.target("environment", "first").await;
+        let options = &mut target.resolved.as_mut().unwrap().options;
+        // The server deliberately accepts every variable. A vulnerable client
+        // would export both inherited host variables and literal SSH SetEnv keys.
+        options.insert("sendenv".into(), vec!["*".into()]);
+        options.insert(
+            "SeTeNv".into(),
+            vec!["SKYHOOK_TEST_CONFIG_KEY=ssh-config-secret".into()],
+        );
+        let transport = crate::remote::ssh::open(
+            &[target],
+            "printf '%s\\n' \"${SKYHOOK_TEST_HOST_ENV-unset}\" \"${SKYHOOK_TEST_DOTENV_KEY-unset}\" \"${SKYHOOK_TEST_CONFIG_KEY-unset}\" \"${SKYHOOK_TEST_REMOTE_ENV-unset}\" \"$HOME\"",
+            &Default::default(),
+            Arc::new(crate::remote::RejectSensitivePrompts),
+        )
+        .await
+        .unwrap();
+        let crate::remote::transport::Transport {
+            mut input,
+            mut output,
+            owner: _owner,
+        } = transport;
+        input.shutdown().await.unwrap();
+        let mut text = String::new();
+        output.read_to_string(&mut text).await.unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "unset\nunset\nunset\nremote-value\n{}\n",
+                server.directory.path().display()
+            )
+        );
+    })
+    .await
+    .expect("SSH environment isolation test timed out");
 }
 
 #[tokio::test]

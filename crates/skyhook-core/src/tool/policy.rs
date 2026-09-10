@@ -1,8 +1,10 @@
 use std::{
     collections::BTreeSet,
+    fmt,
     future::Future,
     path::{Component, Path},
     pin::Pin,
+    str::FromStr,
 };
 
 use serde::{Deserialize, Serialize};
@@ -19,23 +21,70 @@ pub enum Capability {
     Network,
     Targets,
     Agents,
+    Interactive,
+    Mcp,
 }
 
 impl Capability {
-    pub(crate) const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Read,
         Self::Write,
         Self::Exec,
         Self::Network,
         Self::Targets,
         Self::Agents,
+        Self::Interactive,
+        Self::Mcp,
     ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Exec => "exec",
+            Self::Network => "network",
+            Self::Targets => "targets",
+            Self::Agents => "agents",
+            Self::Interactive => "interactive",
+            Self::Mcp => "mcp",
+        }
+    }
+}
+
+impl fmt::Display for Capability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "unknown capability {0:?}; expected read, write, exec, network, targets, agents, interactive, or mcp"
+)]
+pub struct ParseCapabilityError(String);
+
+impl FromStr for Capability {
+    type Err = ParseCapabilityError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|capability| capability.as_str() == value)
+            .ok_or_else(|| ParseCapabilityError(value.to_owned()))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilitySet(BTreeSet<Capability>);
 
 impl CapabilitySet {
+    /// Construct an exact empty set, unlike the enabled-by-default session set.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(BTreeSet::new())
+    }
+
     #[must_use]
     pub fn contains(&self, capability: Capability) -> bool {
         self.0.contains(&capability)
@@ -63,6 +112,12 @@ impl CapabilitySet {
     }
 }
 
+impl FromIterator<Capability> for CapabilitySet {
+    fn from_iter<T: IntoIterator<Item = Capability>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
 impl Default for CapabilitySet {
     fn default() -> Self {
         Self(BTreeSet::from([
@@ -71,6 +126,8 @@ impl Default for CapabilitySet {
             Capability::Exec,
             Capability::Network,
             Capability::Agents,
+            Capability::Interactive,
+            Capability::Mcp,
         ]))
     }
 }
@@ -266,6 +323,45 @@ impl Policy for AllowAll {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capability_names_round_trip_and_reject_unknown_names() {
+        for capability in Capability::ALL {
+            let name = capability.as_str();
+            assert_eq!(name.parse::<Capability>().unwrap(), capability);
+            assert_eq!(capability.to_string(), name);
+            assert_eq!(serde_json::to_value(capability).unwrap(), name);
+            assert_eq!(
+                serde_json::from_value::<Capability>(serde_json::json!(name)).unwrap(),
+                capability
+            );
+        }
+        for invalid in ["", "READ", " read", "read,write", "unknown"] {
+            assert!(invalid.parse::<Capability>().is_err());
+        }
+    }
+
+    #[test]
+    fn exact_sets_do_not_inherit_defaults() {
+        assert_eq!(CapabilitySet::empty().iter().count(), 0);
+        let exact: CapabilitySet = [Capability::Mcp, Capability::Mcp].into_iter().collect();
+        assert_eq!(exact.iter().collect::<Vec<_>>(), [Capability::Mcp]);
+        assert_eq!(
+            std::iter::empty::<Capability>().collect::<CapabilitySet>(),
+            CapabilitySet::empty()
+        );
+        let defaults = CapabilitySet::default();
+        for capability in Capability::ALL {
+            assert_eq!(
+                defaults.contains(capability),
+                capability != Capability::Targets
+            );
+        }
+        let child = defaults.for_agent(0);
+        assert!(!child.contains(Capability::Agents));
+        assert!(child.contains(Capability::Interactive));
+        assert!(child.contains(Capability::Mcp));
+    }
 
     #[test]
     fn network_capability_serializes_and_is_enabled_by_default() {

@@ -19,6 +19,7 @@ pub(super) fn build(name: &str, config: &ProviderConfig) -> Result<Arc<dyn Provi
             base_url,
             api,
             api_key_env,
+            api_key_command,
             chat_reasoning_replay,
             startup_timeout_secs,
             read_idle_timeout_secs,
@@ -27,28 +28,33 @@ pub(super) fn build(name: &str, config: &ProviderConfig) -> Result<Arc<dyn Provi
                 return Err(ConfigError::Provider(name.into(),
                     "chat_reasoning_replay applies only to Chat Completions; Responses replays native reasoning automatically".into()));
             }
-            let key = api_key_env.as_deref().map(required_env).transpose()?;
+            let key = api_key(name, api_key_env.as_deref(), api_key_command.as_deref())?;
             let timeouts = timeouts(name, *startup_timeout_secs, *read_idle_timeout_secs)?;
-            Ok(Arc::new(
-                openai_compatible(name, base_url, *api, key)
-                    .map_err(error)?
-                    .with_timeouts(timeouts)
-                    .with_chat_reasoning_replay(chat_reasoning_replay.unwrap_or_default()),
-            ))
+            let mut provider = openai_compatible(name, base_url, *api, key)
+                .map_err(error)?
+                .with_timeouts(timeouts)
+                .with_chat_reasoning_replay(chat_reasoning_replay.unwrap_or_default());
+            if let Some(command) = api_key_command {
+                provider = provider.with_api_key_command(command.clone());
+            }
+            Ok(Arc::new(provider))
         }
         ProviderConfig::Anthropic {
             base_url,
             api_key_env,
+            api_key_command,
             startup_timeout_secs,
             read_idle_timeout_secs,
         } => {
-            let key = api_key_env.as_deref().map(required_env).transpose()?;
+            let key = api_key(name, api_key_env.as_deref(), api_key_command.as_deref())?;
             let timeouts = timeouts(name, *startup_timeout_secs, *read_idle_timeout_secs)?;
-            Ok(Arc::new(
-                anthropic_api(name, base_url, key)
-                    .map_err(error)?
-                    .with_timeouts(timeouts),
-            ))
+            let mut provider = anthropic_api(name, base_url, key)
+                .map_err(error)?
+                .with_timeouts(timeouts);
+            if let Some(command) = api_key_command {
+                provider = provider.with_api_key_command(command.clone());
+            }
+            Ok(Arc::new(provider))
         }
         ProviderConfig::Codex {} => Ok(Arc::new(
             CodexProvider::new().map_err(error)?.with_name(name),
@@ -80,6 +86,27 @@ fn timeouts(
         ));
     }
     Ok(timeouts)
+}
+
+/// Validate without executing commands, including for currently unused providers.
+fn api_key(
+    provider: &str,
+    environment: Option<&str>,
+    command: Option<&str>,
+) -> Result<Option<String>, ConfigError> {
+    if environment.is_some() && command.is_some() {
+        return Err(ConfigError::Provider(
+            provider.to_owned(),
+            "api_key_env and api_key_command are mutually exclusive".to_owned(),
+        ));
+    }
+    if command.is_some_and(|command| command.trim().is_empty()) {
+        return Err(ConfigError::Provider(
+            provider.to_owned(),
+            "api_key_command must not be blank".to_owned(),
+        ));
+    }
+    environment.map(required_env).transpose()
 }
 
 fn required_env(name: &str) -> Result<String, ConfigError> {
@@ -181,6 +208,74 @@ max_output = 512
                 "unrelated provider accepted Chat-specific config"
             );
         }
+    }
+
+    fn native_configs(authentication: &str) -> impl Iterator<Item = ProviderConfig> + '_ {
+        [
+            "kind = 'openai'\napi = 'chat_completions'",
+            "kind = 'openai'\napi = 'responses'",
+            "kind = 'anthropic'",
+        ]
+        .into_iter()
+        .map(move |kind| {
+            toml::from_str(&format!(
+                "{kind}\nbase_url = 'https://example.com/v1'\n{authentication}"
+            ))
+            .unwrap()
+        })
+    }
+
+    #[test]
+    fn command_credentials_are_not_executed_by_build_or_open_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("executed");
+        let command = format!("printf key > '{}'", marker.display());
+        let authentication = format!(
+            "api_key_command = {}",
+            serde_json::to_string(&command).unwrap()
+        );
+        for config in native_configs(&authentication) {
+            let provider = build("test", &config).unwrap();
+            let _first = provider.open_context("first".to_owned()).unwrap();
+            let _second = provider.open_context("second".to_owned()).unwrap();
+            assert!(
+                !marker.exists(),
+                "credentials must be resolved only on first request"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_sources_are_exclusive_and_blank_commands_are_rejected() {
+        for config in native_configs(
+            "api_key_env = 'SKYHOOK_TEST_MISSING_API_KEY'\napi_key_command = 'echo secret'",
+        ) {
+            let error = build("test", &config).err().unwrap().to_string();
+            assert!(error.contains("mutually exclusive"), "{error}");
+            assert!(!error.contains("echo secret"));
+        }
+        for config in native_configs("api_key_command = '   '") {
+            let error = build("test", &config).err().unwrap().to_string();
+            assert!(error.contains("must not be blank"), "{error}");
+        }
+    }
+
+    #[test]
+    fn commands_do_not_change_keyless_or_required_environment_behavior() {
+        for config in native_configs("") {
+            assert!(build("test", &config).is_ok());
+        }
+        // No mutation of process-wide environment in concurrent tests.
+        for config in native_configs("api_key_env = 'SKYHOOK_TEST_MISSING_API_KEY'") {
+            assert!(matches!(
+                build("test", &config),
+                Err(ConfigError::MissingEnvironment(_))
+            ));
+        }
+        assert!(
+            toml::from_str::<ProviderConfig>("kind = 'codex'\napi_key_command = 'echo key'")
+                .is_err()
+        );
     }
 
     #[test]

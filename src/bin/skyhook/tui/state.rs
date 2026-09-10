@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use skyhook::config::Config;
 use std::{
     collections::BTreeMap,
     io::Write,
@@ -90,24 +89,4 @@ fn update(edit: impl FnOnce(&mut SavedState)) -> std::io::Result<()> {
     let (mut state, _) = load();
     edit(&mut state);
     atomic_write(&state_path(), &serde_json::to_vec(&state)?)
-}
-pub fn select(
-    config: &Config,
-    explicit: Option<&str>,
-    saved: Option<&str>,
-) -> Result<String, String> {
-    if let Some(name) = explicit {
-        return config
-            .models
-            .contains_key(name)
-            .then(|| name.to_owned())
-            .ok_or_else(|| format!("Unknown model profile: {name}"));
-    }
-    saved
-        .filter(|name| config.models.contains_key(*name))
-        .map(str::to_owned)
-        .or_else(|| config.models.first().map(|(name, _)| name.clone()))
-        .ok_or_else(|| {
-            "No model profiles configured. Add a [models.<name>] entry to your config.".into()
-        })
 }

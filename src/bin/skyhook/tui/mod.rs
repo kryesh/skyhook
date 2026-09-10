@@ -22,73 +22,14 @@ use crossterm::{
     },
 };
 use futures_util::StreamExt;
-use skyhook::{
-    agent::SessionHandle, config::Config, identity::SessionId, remote::EmbeddedShimCatalog,
-    session::SessionStore, tool::policy::AllowAll,
-};
 use std::{
     io::{self, IsTerminal, Write},
-    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
 use tokio::sync::mpsc;
 
-#[derive(Clone)]
-pub struct Launch {
-    config: Arc<Config>,
-    pub model: String,
-    pub profile: Option<String>,
-    pub workspace: PathBuf,
-    pub sessions: PathBuf,
-    catalog: EmbeddedShimCatalog,
-    interaction: Arc<UiInteraction>,
-    approve_all: bool,
-}
-impl Launch {
-    pub async fn create(&self, resume: Option<SessionId>) -> Result<SessionHandle, String> {
-        let mut model = self.model.clone();
-        let mut profile = self.profile.clone();
-        if let Some(id) = resume {
-            let records = SessionStore::read_records(&self.sessions, id)
-                .await
-                .map_err(|e| e.to_string())?;
-            if let Some((m, p)) =
-                skyhook::session::agent_selection(&records, &skyhook::identity::AgentId::root(id))
-            {
-                model = m;
-                profile = p;
-            }
-        }
-        if !self.config.models.contains_key(&model) {
-            return Err(format!(
-                "Model profile {model} is missing. Restore it in the configuration before resuming."
-            ));
-        }
-        let mut config = (*self.config).clone();
-        config.default_agent_profile = profile;
-        let builder = config
-            .harness_builder(&self.workspace, &model)
-            .map_err(|e| e.to_string())?
-            .shim_catalog(self.catalog.clone());
-        let builder = if self.approve_all {
-            builder.policy(Arc::new(AllowAll))
-        } else {
-            builder.policy(self.interaction.clone())
-        };
-        let harness = builder
-            .question_handler(self.interaction.clone())
-            .sensitive_prompt_handler(self.interaction.clone())
-            .build()
-            .await
-            .map_err(|e| e.to_string())?;
-        match resume {
-            Some(id) => harness.resume_session(id).await,
-            None => harness.new_session().await,
-        }
-        .map_err(|e| e.to_string())
-    }
-}
+pub(crate) use super::launch::Launch;
 
 pub struct TerminalGuard;
 impl TerminalGuard {
@@ -128,32 +69,17 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("Skyhook requires an interactive terminal. Run skyhook in a terminal; redirected input/output is not supported.".into());
     }
-    let config = Arc::new(Config::load(args.config.as_deref()).await?);
+    let config = Arc::new(super::launch::load_config(&args).await?);
     let (saved, warning) = state::load();
-    let model = state::select(&config, args.model.as_deref(), saved.model.as_deref())?;
+    let model =
+        super::launch::select_model(&config, args.model.as_deref(), saved.model.as_deref())?;
     let settings = state::settings()?;
     let keymap = keys::KeyMap::new(&settings.keybinds)?;
     if !matches!(settings.theme.as_str(), "dark" | "light") {
         return Err("tui.toml theme must be dark or light".into());
     }
-    let workspace = tokio::fs::canonicalize(&args.workspace).await?;
-    let sessions = config
-        .session_root
-        .clone()
-        .unwrap_or_else(|| workspace.join(".skyhook/sessions"));
     let (interaction, mut prompts) = UiInteraction::new();
-    let launch = Launch {
-        model,
-        profile: args
-            .agent_profile
-            .or_else(|| config.default_agent_profile.clone()),
-        workspace,
-        sessions,
-        approve_all: args.approve_all || config.approve_all,
-        config,
-        catalog: super::embedded_shims::catalog()?,
-        interaction: Arc::new(interaction),
-    };
+    let launch = Launch::from_args(&args, config, model, Some(Arc::new(interaction))).await?;
     let session = match args.resume {
         Some(id) => Some(launch.create(Some(id)).await?),
         None => None,

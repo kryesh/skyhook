@@ -9,6 +9,7 @@ mod prompt;
 mod protocol;
 mod service;
 pub use backends::ssh;
+pub(crate) use backends::ssh::AskpassServer;
 mod transport;
 pub mod worker;
 

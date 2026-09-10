@@ -98,7 +98,7 @@ async fn evaluate_inner(
         .build_async(&runtime)
         .await
         .map_err(|error| JsError::Initialization(error.to_string()))?;
-    let surface = Arc::new(executor.surface());
+    let surface = Arc::new(executor.surface_for_agent(&context.agent));
     let builders = surface.script_manifests();
     let builders = serde_json::to_string(&builders)
         .map_err(|error| JsError::Initialization(error.to_string()))?;

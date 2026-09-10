@@ -14,6 +14,9 @@ use crate::target::{TargetDefinition, TargetError, TargetType};
 
 pub(crate) use super::transport::Transport;
 
+/// Backend-owned authentication variables for a process on its credential origin.
+/// This is not a copy of the controller environment and is never an OpenSsh wire
+/// argument. Remote workers use their own environment plus these internal values.
 pub(crate) type ProcessEnvironment = BTreeMap<String, String>;
 
 #[derive(Clone)]

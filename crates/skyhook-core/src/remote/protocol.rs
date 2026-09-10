@@ -3,9 +3,15 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::{
     media::ImageReference,
-    tool::{ToolOutput, policy::PermissionUse},
+    tool::{
+        ToolOutput,
+        policy::{Capability, PermissionUse},
+    },
 };
 use serde_json::Value;
+
+// Version 2 requires exact originating capabilities on every tool request.
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
 
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
@@ -38,11 +44,14 @@ pub(crate) enum Request {
         prompt_id: u64,
         answer: super::prompt::PromptAnswer,
     },
-    Hello,
+    Hello {
+        version: u32,
+    },
     Tool {
         request_id: u64,
         name: String,
         arguments: Value,
+        capabilities: Vec<Capability>,
     },
     Cancel {
         request_id: u64,
@@ -93,7 +102,9 @@ pub(crate) enum Response {
         prompt_id: u64,
         prompt: super::SensitivePrompt,
     },
-    Ready,
+    Ready {
+        version: u32,
+    },
     Tool {
         request_id: u64,
         result: Result<RemoteToolOutput, RemoteToolError>,
@@ -275,6 +286,30 @@ pub(crate) async fn write_artifact<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_capabilities_are_required_and_empty_is_exact() {
+        let mut request = serde_json::json!({
+            "type": "tool", "request_id": 1, "name": "exec", "arguments": {}
+        });
+        assert!(serde_json::from_value::<super::Request>(request.clone()).is_err());
+        request["capabilities"] = serde_json::json!([]);
+        let decoded = serde_json::from_value::<super::Request>(request.clone()).unwrap();
+        assert!(
+            matches!(&decoded, super::Request::Tool { capabilities, .. } if capabilities.is_empty())
+        );
+        assert_eq!(serde_json::to_value(decoded).unwrap(), request);
+    }
+
+    #[test]
+    fn unversioned_handshakes_are_rejected() {
+        assert!(
+            serde_json::from_value::<super::Request>(serde_json::json!({"type":"hello"})).is_err()
+        );
+        assert!(
+            serde_json::from_value::<super::Response>(serde_json::json!({"type":"ready"})).is_err()
+        );
+    }
+
     use super::*;
 
     #[tokio::test]

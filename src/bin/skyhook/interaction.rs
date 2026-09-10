@@ -8,7 +8,8 @@ use skyhook::{
         SensitivePromptKind,
     },
     tool::policy::{
-        AuthorizationRequest, Capability, PermissionUse, Policy, PolicyDecision, PolicyFuture,
+        AuthorizationRequest, Capability, CapabilitySet, PermissionUse, Policy, PolicyDecision,
+        PolicyFuture,
     },
 };
 use std::{
@@ -84,7 +85,9 @@ impl UiInteraction {
 }
 fn requires_prompt(permission: &PermissionUse) -> bool {
     match permission.capability {
-        Capability::Read | Capability::Agents => false,
+        // These capabilities are enforced by the core capability gate, not an
+        // approval dialog. MCP adapters normally declare requires only.
+        Capability::Read | Capability::Agents | Capability::Interactive | Capability::Mcp => false,
         Capability::Exec | Capability::Targets | Capability::Network => true,
         Capability::Write => {
             permission.resource.namespace != "workspace"
@@ -96,18 +99,53 @@ fn requires_prompt(permission: &PermissionUse) -> bool {
         }
     }
 }
-impl Policy for UiInteraction {
+/// Host approval defaults, usable without a terminal or prompt channel.
+///
+/// Capability checks remain the core's responsibility. This policy additionally
+/// requires Interactive before asking for approval; it never turns a missing
+/// capability into an approval dialog. --approve-all selects AllowAll instead
+/// of this policy and does not enable questions or authentication.
+pub struct HostApprovalPolicy {
+    capabilities: CapabilitySet,
+    ui: Option<UiInteraction>,
+}
+
+impl HostApprovalPolicy {
+    pub fn new(capabilities: CapabilitySet, ui: Option<UiInteraction>) -> Self {
+        Self { capabilities, ui }
+    }
+
+    fn decision_without_prompt(&self, permissions: &[PermissionUse]) -> Option<PolicyDecision> {
+        if !permissions.iter().any(requires_prompt) {
+            return Some(PolicyDecision::allow());
+        }
+        if !self.capabilities.contains(Capability::Interactive) {
+            return Some(PolicyDecision::Deny {
+                reason: "approval requires the interactive capability".into(),
+            });
+        }
+        if self.ui.is_none() {
+            return Some(PolicyDecision::Deny {
+                reason: "approval requires an interactive interface".into(),
+            });
+        }
+        None
+    }
+}
+
+impl Policy for HostApprovalPolicy {
     fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
         Box::pin(async move {
-            if !request.permissions.iter().any(requires_prompt) {
-                return PolicyDecision::allow();
+            if let Some(decision) = self.decision_without_prompt(&request.permissions) {
+                return decision;
             }
             let grants = request
                 .permissions
                 .iter()
                 .filter_map(|p| p.proposed_grant.clone())
                 .collect();
-            match self.request(PromptKind::Approval(request)).await {
+            let ui = self.ui.as_ref().expect("approval interface checked above");
+            match ui.request(PromptKind::Approval(request)).await {
                 Ok(PromptResponse::Approval(ApprovalReply::Allow)) => PolicyDecision::allow(),
                 Ok(PromptResponse::Approval(ApprovalReply::Grant)) => {
                     PolicyDecision::Allow { grants }
@@ -120,6 +158,18 @@ impl Policy for UiInteraction {
         })
     }
 }
+// Preserve the existing UI-only policy API for embedders and test fixtures.
+// Launch uses HostApprovalPolicy with the actual configured capabilities.
+impl Policy for UiInteraction {
+    fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
+        Box::pin(async move {
+            HostApprovalPolicy::new(CapabilitySet::default(), Some(self.clone()))
+                .authorize(request)
+                .await
+        })
+    }
+}
+
 impl QuestionHandler for UiInteraction {
     fn ask(
         &self,
@@ -156,6 +206,138 @@ impl SensitivePromptHandler for UiInteraction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use skyhook::tool::policy::ResourceId;
+
+    fn permission(capability: Capability, namespace: &str, target: &str) -> PermissionUse {
+        PermissionUse::new(capability, ResourceId::new(namespace, [target, "item"]))
+    }
+
+    fn capabilities(interactive: bool) -> CapabilitySet {
+        let mut capabilities = CapabilitySet::default();
+        if interactive {
+            capabilities.insert(Capability::Interactive);
+        } else {
+            capabilities.remove(Capability::Interactive);
+        }
+        capabilities
+    }
+
+    #[test]
+    fn prompt_classification_covers_every_capability() {
+        for capability in [
+            Capability::Read,
+            Capability::Agents,
+            Capability::Interactive,
+            Capability::Mcp,
+        ] {
+            assert!(!requires_prompt(&permission(capability, "other", "build")));
+        }
+        for capability in [Capability::Exec, Capability::Targets, Capability::Network] {
+            assert!(requires_prompt(&permission(
+                capability,
+                "workspace",
+                "root"
+            )));
+        }
+        assert!(!requires_prompt(&permission(
+            Capability::Write,
+            "workspace",
+            "root"
+        )));
+        assert!(requires_prompt(&permission(
+            Capability::Write,
+            "workspace",
+            "build"
+        )));
+        assert!(requires_prompt(&permission(
+            Capability::Write,
+            "other",
+            "root"
+        )));
+        assert!(requires_prompt(&PermissionUse::new(
+            Capability::Write,
+            ResourceId::new("workspace", Vec::<String>::new()),
+        )));
+    }
+
+    #[test]
+    fn automatic_approvals_need_neither_interactive_nor_a_ui() {
+        let permissions = [
+            permission(Capability::Read, "other", "build"),
+            permission(Capability::Agents, "other", "build"),
+            permission(Capability::Write, "workspace", "root"),
+            // Gating-only capabilities must not become human approvals.
+            permission(Capability::Interactive, "other", "root"),
+            permission(Capability::Mcp, "other", "root"),
+        ];
+        for interactive in [false, true] {
+            let policy = HostApprovalPolicy::new(capabilities(interactive), None);
+            assert_eq!(
+                policy.decision_without_prompt(&[]),
+                Some(PolicyDecision::allow())
+            );
+            assert_eq!(
+                policy.decision_without_prompt(&permissions),
+                Some(PolicyDecision::allow()),
+            );
+        }
+    }
+
+    #[test]
+    fn approval_required_operations_deny_without_interactive_or_ui() {
+        let approvals = [
+            permission(Capability::Exec, "workspace", "root"),
+            permission(Capability::Targets, "other", "root"),
+            permission(Capability::Network, "network", "root"),
+            permission(Capability::Write, "workspace", "build"),
+            permission(Capability::Write, "other", "root"),
+        ];
+        for interactive in [false, true] {
+            let policy = HostApprovalPolicy::new(capabilities(interactive), None);
+            for approval in &approvals {
+                // An auto-allowed permission cannot mask another permission's
+                // need for approval.
+                let permissions = [
+                    permission(Capability::Read, "workspace", "root"),
+                    approval.clone(),
+                ];
+                let Some(PolicyDecision::Deny { reason }) =
+                    policy.decision_without_prompt(&permissions)
+                else {
+                    panic!("approval-required request was not denied");
+                };
+                assert!(reason.contains("interactive"));
+            }
+        }
+    }
+
+    #[test]
+    fn missing_interactive_never_queues_approval_even_with_live_ui() {
+        let (ui, mut rx) = UiInteraction::new();
+        let policy = HostApprovalPolicy::new(capabilities(false), Some(ui));
+        assert!(matches!(
+            policy.decision_without_prompt(&[permission(Capability::Exec, "workspace", "root")]),
+            Some(PolicyDecision::Deny { .. }),
+        ));
+        assert_eq!(
+            policy.decision_without_prompt(&[permission(Capability::Write, "workspace", "root")]),
+            Some(PolicyDecision::allow()),
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn interactive_ui_preserves_approval_prompts() {
+        let (ui, _rx) = UiInteraction::new();
+        let policy = HostApprovalPolicy::new(capabilities(true), Some(ui));
+        assert_eq!(
+            policy.decision_without_prompt(&[permission(Capability::Exec, "workspace", "root")]),
+            None,
+        );
+    }
 
     #[test]
     fn network_requests_require_user_approval_for_every_target() {

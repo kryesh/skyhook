@@ -124,24 +124,24 @@ struct PresentedJob<'a> {
 /// Minimal job information included in the model's current runtime snapshot.
 #[derive(Serialize)]
 pub(crate) struct ActiveJob {
-    job: JobId,
-    tool: String,
+    pub(crate) job: JobId,
+    pub(crate) tool: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-    state: JobState,
-    location: ActiveJobLocation,
-    age_seconds: u64,
+    pub(crate) name: Option<String>,
+    pub(crate) state: JobState,
+    pub(crate) location: ActiveJobLocation,
+    pub(crate) age_seconds: u64,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
-    progress: Option<progress::AgentProgress>,
+    pub(crate) progress: Option<progress::AgentProgress>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    children: Vec<ActiveJob>,
+    pub(crate) children: Vec<ActiveJob>,
 }
 
 #[derive(Serialize)]
-struct ActiveJobLocation {
+pub(crate) struct ActiveJobLocation {
     #[serde(skip_serializing_if = "Option::is_none")]
-    target: Option<String>,
-    workspace: std::path::PathBuf,
+    pub(crate) target: Option<String>,
+    pub(crate) workspace: std::path::PathBuf,
 }
 
 impl JobEnvelope {
@@ -385,6 +385,7 @@ enum DeliveryState {
 enum WaitMode {
     Foreground,
     Explicit { claim: bool },
+    Terminal,
 }
 
 impl DeliveryState {
@@ -973,6 +974,7 @@ impl JobManager {
                     WaitMode::Explicit { claim } => {
                         (entry.state.is_terminal() || pending_question, claim)
                     }
+                    WaitMode::Terminal => (entry.state.is_terminal(), false),
                 };
                 let claimed_agent = if ready && claim {
                     entry.reserve_delivery(DeliveryState::Claimed)
@@ -1247,6 +1249,31 @@ impl JobManager {
         ids.len()
     }
 
+    /// Cancel every remaining job and await its persisted terminal outcome.
+    /// Unlike an ordinary wait, a pending question is not a completion. Repeat
+    /// the snapshot to include descendants created while cancellation propagates.
+    pub(crate) async fn cancel_and_drain(&self) -> Result<(), JobError> {
+        loop {
+            let ids = self
+                .inner
+                .jobs
+                .lock()
+                .await
+                .iter()
+                .filter_map(|(id, entry)| (!entry.state.is_terminal()).then_some(*id))
+                .collect::<Vec<_>>();
+            if ids.is_empty() {
+                return Ok(());
+            }
+            for id in &ids {
+                self.cancel(*id).await?;
+            }
+            for id in ids {
+                self.wait_inner(id, None, WaitMode::Terminal).await?;
+            }
+        }
+    }
+
     async fn force_cancel(&self, id: JobId) {
         let task_abort = {
             let jobs = self.inner.jobs.lock().await;
@@ -1511,6 +1538,51 @@ mod tests {
     impl Policy for NeverAuthorize {
         fn authorize(&self, _request: AuthorizationRequest) -> PolicyFuture<'_> {
             Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_drain_waits_for_terminal_questions_and_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(root.path()).await.unwrap();
+        let agent = AgentId::root(store.id());
+        let jobs = JobManager::new(store.clone());
+        let parent = jobs
+            .create(JobSpec::test(agent.clone(), "script"))
+            .await
+            .unwrap();
+        jobs.transition(parent.id, JobState::Running).await.unwrap();
+        let question = jobs
+            .create(JobSpec {
+                parent: Some(parent.id),
+                accepts_input: true,
+                background: true,
+                ..JobSpec::test(agent, "ask")
+            })
+            .await
+            .unwrap();
+        jobs.transition(question.id, JobState::Running)
+            .await
+            .unwrap();
+        jobs.request_input(question.id, serde_json::json!({"prompt": "pending"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            jobs.snapshot(question.id).await.unwrap().state,
+            JobState::WaitingInput
+        );
+        tokio::time::timeout(Duration::from_secs(5), jobs.cancel_and_drain())
+            .await
+            .unwrap()
+            .unwrap();
+        for id in [parent.id, question.id] {
+            assert_eq!(jobs.snapshot(id).await.unwrap().state, JobState::Cancelled);
+            assert!(
+                store.records().await.iter().any(|record| {
+                    matches!(&record.event, SessionEvent::JobFinished { job, .. } if *job == id)
+                }),
+                "terminal cancellation must be journaled before shutdown returns"
+            );
         }
     }
 

@@ -66,8 +66,9 @@ skyhook --prompt "inspect this repository"
 
 Skyhook opens a full-screen terminal interface. `--prompt` submits an initial message;
 `--script workflow.js` starts a JavaScript workflow in the same interface. Both remain open
-for inspection and follow-up input after the work finishes. An interactive terminal is required;
-there is no plain-output or redirected-input conversation mode.
+for inspection and follow-up input after the work finishes. These interface modes require an
+interactive terminal. Add `--non-interactive` to `-p/--prompt` or `-s/--script` for headless execution
+with redirected input/output support and automatic exit; see [Headless execution](#headless-execution).
 
 Startup and `/new` open an empty draft without creating a session or its files. The session is
 created when you send the first message or explicitly run a script; leaving an unused draft
@@ -78,8 +79,9 @@ Use `--config path.toml` for explicit configuration, `--workspace PATH` for the 
 session. `--image PATH` attaches an image to the initial `--prompt`. `--approve-all` or
 `approve_all = true` bypasses approval prompts. Otherwise reads, agent operations, and writes
 inside the root workspace are allowed; execution, remote access, target changes, and writes
-outside the workspace require confirmation. Questions and SSH authentication appear in the
-interface for every launch mode.
+outside the workspace require confirmation. When the `interactive` capability is granted, questions
+and SSH authentication appear in the interface. Otherwise operations needing human input fail
+immediately; `approve_all` bypasses tool approvals but never restores questions or authentication.
 
 User messages appear on the right and assistant messages on the left. Tool previews show their
 remote execution target after the tool name, such as `exec @lab-monitoring`; local calls omit `@root`. Tool calls expand inline
@@ -230,6 +232,89 @@ both with a fresh observation. Durable records are identified by their original 
 consuming notifications; `cancel_job` explicitly requests cancellation. `SessionStore::read_records`
 reads an archive without acquiring a writer lock or repairing a partial final line.
 
+## Headless execution
+
+Use `--non-interactive` with exactly one initial prompt or script:
+
+```sh
+session_id=$(skyhook --non-interactive -p "Review this repository" --capabilities read,agents)
+skyhook --non-interactive -s workflow.js --approve-all
+skyhook --non-interactive --resume "$session_id" -p "Summarize the findings"
+```
+
+Headless mode does not require a terminal, read answers from stdin, or load TUI themes/keybindings.
+It creates or opens the session, prints **only its session ID followed by a newline to stdout**, and
+flushes that line before executing the prompt or workflow. It then exits automatically. The ID lets
+external programs locate and follow the normal session logs under the configured `session_root`
+(default: `<workspace>/.skyhook/sessions`). Resumed runs print the existing session ID.
+
+Assistant output, script console output/results, startup warnings, and execution diagnostics remain
+in the session logs; they are not printed to stdout or stderr. The process exits successfully when
+the submitted operation and shutdown succeed, and nonzero on failure or interruption. A failure
+before a session can be opened produces no session-ID line. Explicit `--help` and `--version`
+retain their normal output. Headless mode is not a line-oriented conversation over stdin.
+
+The submitted root turn or workflow defines completion. A workflow must explicitly await background
+work it needs completed; outstanding jobs are cancelled and drained during shutdown. Interrupt and
+termination signals also trigger cleanup and journaled status rather than a terminal prompt.
+
+`--non-interactive` always revokes the `interactive` capability, including when it appears in an
+explicit allowlist. Root `ask` is unavailable (also inside scripts and with `bg:true`). Child agents
+can still ask their owning parent agent. Operations requiring human approval fail immediately;
+ordinary automatically allowed operations still work. `--approve-all` (or config `approve_all = true`)
+bypasses tool approvals but does not enable questions, SSH passwords/passphrases, or host/agent
+confirmation prompts. SSH credentials that work without a prompt can still authenticate.
+
+Without `interactive`, `exec` and `shell` run in a new process session with no controlling terminal,
+so ordinary `/dev/tty` prompts cannot stop the job waiting for terminal input. Each command forces a
+Skyhook-owned rejecting askpass helper over inherited `SSH_ASKPASS` settings, even when `targets` is
+disabled. Existing `SSH_AUTH_SOCK` credentials are preserved unless the configured target-authentication
+setup replaces them. Remote tool requests carry the caller's exact capabilities, so remote commands
+apply the same restrictions; incompatible shim protocol versions are rejected rather than falling
+back to default capabilities. This is still not an OS sandbox against deliberately programmed
+subprocesses that establish their own external interaction mechanisms.
+
+Askpass sockets and helpers live in uniquely created `skyhook-askpass-<pid>-<random>` temporary
+directories. No fixed socket pathname is shared across Skyhook instances, or even across concurrent
+askpass servers in one instance. Directories and helpers have explicit `0700` permissions and sockets
+have `0600` permissions independent of umask; the listener accepts only peers with the same effective
+UID. Each owner removes only its own socket/helper/directory during cleanup.
+
+## Capabilities
+
+The top-level configuration has one exact capability allowlist:
+
+```toml
+# These are the defaults when capabilities is omitted. Add "targets" to enable targets.
+capabilities = ["read", "write", "exec", "network", "agents", "interactive", "mcp"]
+```
+
+| Capability | Controls | Default |
+| --- | --- | --- |
+| `read` | File reads, searches, and skill reads | Enabled |
+| `write` | File creation, modification, removal, and related write access | Enabled |
+| `exec` | `exec` and `shell` | Enabled |
+| `network` | HTTP(S) `fetch` | Enabled |
+| `targets` | Target-management tools and target-selection inputs | Disabled |
+| `agents` | Child-agent creation, also limited by available delegation depth | Enabled |
+| `interactive` | Human-facing root questions, approval prompts, and sensitive authentication | Enabled |
+| `mcp` | MCP server startup and MCP tool availability | Enabled |
+
+An explicit array replaces the defaults; `capabilities = []` grants none. Unknown names are errors.
+`--capabilities read,write` replaces the config allowlist for that invocation; `--capabilities=`
+selects an empty set. Resolution is **CLI allowlist > config allowlist > defaults**, followed by
+revoking `interactive` for `--non-interactive` and applying per-agent depth restrictions. Overrides
+also apply when resuming or creating another session in the interface. Omitting `interactive` alone
+disables human prompts but does not select the headless runner. `targets_enabled` has been replaced
+by including `"targets"` in this list and is no longer accepted.
+
+Capabilities gate both tool discovery and invocation, including JavaScript. Approval policies and
+cached grants cannot restore a missing capability. Ungated orchestration tools remain available even
+with an empty set. These gates are **not an OS sandbox**: allowing `exec` lets a command access files
+or the network independently of the corresponding built-in tool gates. Disabling `network` removes
+`fetch`, not model-provider traffic or trusted MCP transport setup; disable `mcp` to prevent MCP
+connections. Per-server MCP requirements are additional gates, not grants.
+
 ## Reconstructing model calls
 
 Session format 1 records the inputs needed to reconstruct each call at the shared `Provider`
@@ -338,9 +423,10 @@ compactions, failures, and ordinary request retries without printing the summary
 
 ## Execution targets
 
-Set top-level `targets_enabled = true` to grant the session's target capability. When it is false
-(the default), target-management tools, target arguments, JavaScript target setters, and target
-prompt guidance are all omitted from the model-visible surface.
+Include `"targets"` in the top-level `capabilities` array (or CLI `--capabilities` allowlist) to
+grant the session's target capability. It is not enabled by default. Without it, target-management
+tools, target arguments, JavaScript target setters, and target prompt guidance are all omitted
+from the model-visible surface. The former `targets_enabled` setting is no longer accepted.
 
 Targets are named directly under `[targets.<name>]`. Importing concrete aliases from the user's
 SSH configuration is disabled by default. Session tools can upsert targets without modifying TOML.
@@ -442,10 +528,11 @@ without a supplied shim returns an unsupported-platform error.
 
 ## Configuration
 
-Providers and models are separate named profiles. API secrets are read from environment variables;
-they are not stored in the TOML file. `openai` requires an explicit `base_url` and `api`
-(`chat_completions` or `responses`); `anthropic` requires an explicit `base_url`. Both accept an
-optional `api_key_env`, so a local endpoint can be keyless. URLs name the API root: Skyhook appends
+Providers and models are separate named profiles. API secrets can be read from environment variables
+or retrieved lazily by a command; no literal API-key field is supported in TOML. `openai` requires
+an explicit `base_url` and `api` (`chat_completions` or `responses`); `anthropic` requires an explicit
+`base_url`. Both accept either `api_key_env` or `api_key_command`, or neither for a keyless endpoint.
+URLs name the API root: Skyhook appends
 `/chat/completions`, `/responses`, or `/messages`. For the official services use
 `https://api.openai.com/v1` or `https://api.anthropic.com/v1`. There are no vendor presets, model
 aliases, or automatic vendor detection. Use full model identifiers. A shared Chat codec normalizes
@@ -454,7 +541,7 @@ unified `Provider` / `ProviderContext` interface.
 
 ```toml
 approve_all = false
-targets_enabled = false
+capabilities = ["read", "write", "exec", "network", "agents", "interactive", "mcp"]
 
 [providers.local]
 kind = "openai"
@@ -474,6 +561,57 @@ output limit you want Skyhook to use for that model; the example values are cons
 points. Both must be positive and `max_output` must be smaller than `max_context`. Protocol-specific
 limits are validated by the backend or service. Codex subscription does not accept an output-token
 limit on the wire; its configured limit remains available to local context budgeting.
+
+### API keys and environment files
+
+Reference an environment variable with `api_key_env`, or use a command to retrieve the key:
+
+```toml
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+api_key_env = "ANTHROPIC_API_KEY"
+# Alternatively, remove api_key_env and use:
+# api_key_command = "op read 'op://Private/Anthropic/api-key'"
+```
+
+`api_key_env` and `api_key_command` are mutually exclusive. Environment-variable keys are resolved
+when the provider is built and must be present and nonblank. Commands are run only on the provider's
+first model request, not when configuration is loaded or a conversation is opened. A successful
+command's stdout is decoded as UTF-8 and trimmed of leading/trailing whitespace and newlines, then
+cached in memory for that provider instance. Concurrent requests and child conversations share the
+cache; a new process or provider instance resolves the key again. Failed commands are not cached
+and may be retried on a subsequent request. Empty output, invalid UTF-8, invalid credential headers,
+and nonzero exits fail the request without including command output in the error. Stdout is limited
+to 64 KiB. Commands run before the HTTP startup timeout; there is no separate command timeout.
+Cancelling the invocation terminates the command's immediate child process, but does not guarantee
+termination of any descendants it launched.
+
+Commands are trusted host configuration, executed with `/bin/sh -c`, inheriting Skyhook's process
+working directory and environment, not an agent's workspace or remote target. They do not run
+through tool approval. Standard input is closed and standard error is discarded; use a noninteractive
+secret-manager command that writes only the key to stdout. Do not put literal secrets in command
+strings or commit them to configuration files.
+
+At CLI startup, Skyhook loads **`.env` in the invocation directory** before constructing providers.
+Existing process environment variables take precedence. A missing file is ignored; Skyhook does
+not search parent directories, the `--workspace` directory, or the configuration file's directory.
+Loaded variables are also inherited by API-key commands and other **local** child processes. Neither
+inherited host environment variables nor `.env` values are automatically forwarded into remote target
+processes; remote commands use the remote machine's environment. Managed SSH routes disable `SendEnv`,
+`SetEnv`, and X11 forwarding. Local SSH authentication/proxy helpers still use the host environment;
+Skyhook's deliberate SSH-agent forwarding remains supported separately. Library embedders manage
+their own process environment; loading a core `Config` does not load `.env`.
+
+For example, in the directory from which you run `skyhook`:
+
+```dotenv
+ANTHROPIC_API_KEY="your-key"
+```
+
+Keep `.env` out of version control and restrict its file permissions. The CLI supports normal dotenv
+quoting, comments, `export` declarations, and variable interpolation. A malformed or unreadable file
+fails startup without printing its contents; non-interactive startup errors remain silent.
 
 ### MCP servers
 
@@ -521,14 +659,19 @@ harness startup without a model tool-approval prompt, only on the local root/ses
 selected SSH targets. Only configure commands and endpoints you trust. MCP clients and launched
 processes are owned by the root session rather than independently restarted for each child agent.
 
-`capabilities` defaults to `[]`. Valid names are `read`, `write`, `exec`, `network`, `targets`, and `agents`.
-An agent must hold **all** listed capabilities to see or call a server's tools; otherwise those tools
-are hidden from both the model catalog and JavaScript access. Servers whose requirements exceed
-the session's capabilities are not contacted or launched at all. This is a host-configured gate, not
-an inference from server annotations. Nonempty lists also request those permissions through the
-normal approval policy, scoped to the MCP server/tool rather than a filesystem workspace.
-`approve_all` bypasses interactive approval but never bypasses missing capabilities. **An omitted
-or empty capability list imposes no capability gate and produces no permission prompt.**
+The session must hold the global **`mcp` capability** before any MCP server is launched or contacted,
+and before any MCP tool can be exposed or invoked. Each server's `capabilities` array defaults to
+`[]` and adds requirements to that global gate. Valid names are `read`, `write`, `exec`, `network`,
+`targets`, `agents`, `interactive`, and `mcp`. An agent must hold **all** listed capabilities to see
+or call a server's tools; otherwise those tools are hidden from both the model catalog and
+JavaScript access. Servers whose requirements exceed the session's capabilities are not contacted
+or launched at all. This is a host-configured gate, not an inference from server annotations.
+Nonempty lists also request those permissions through the normal approval policy, scoped to the
+MCP server/tool rather than a filesystem workspace. The implicit global `mcp` requirement is
+availability-only and introduces no approval prompt. `approve_all` never bypasses missing
+capabilities. **An omitted or empty per-server list requires only global `mcp` and produces no
+permission prompt.** MCP transports do not implicitly require `exec` or `network`; startup
+commands and endpoints remain trusted host configuration.
 
 Skyhook imports **tools only**, not MCP prompts or resources. At startup it initializes each server
 and discovers its tools, then freezes that catalog for the session lifetime; later catalog-change
@@ -959,38 +1102,58 @@ recorded statuses. Host interfaces can read all current lists through `SessionHa
 and observe `SessionEvent::TodosReplaced` through the existing runtime event subscription.
 The public `TodoItem`, `TodoStatus`, and `TodoSnapshot` types live in `skyhook::agent`.
 
-Each model request ends with one fresh `<skyhook_state>` snapshot containing the host's current
-local `date` (`YYYY-MM-DD`), and the caller's `todos` and `active_jobs`, including empty arrays.
-The date is refreshed per request instead of being fixed in the system prompt at agent startup.
-Active jobs include their execution `location` and `age_seconds`: elapsed whole seconds since
-job creation, including time queued or waiting for input. Age is clamped to zero if the clock
-moves before the creation timestamp. Child-agent jobs report the child's selected target and
-workspace once initialized. Location includes `target` when target capabilities are enabled;
-otherwise it contains only `workspace`.
+Each model request ends with one fresh, compact-text `<skyhook_state>` snapshot. Its first
+line is `date:YYYY-MM-DD`, using the host's current local date, refreshed per request rather
+than fixed in the system prompt at agent startup. The optional `jobs:` and `todos:` sections
+follow in that order; empty sections are omitted. The system prompt explains this format once.
+This presentation does not change the JSON returned by job or todo tools.
 
-Active agent jobs also include exclusive `turns` and `tool_calls` counters. A turn is a
-complete, committed assistant response (including responses containing tool calls); failed
-attempts, incomplete responses, retries, and compaction requests do not add turns. Tool calls
-count jobs launched by that child, including calls inside its scripts, but not work owned by
-its descendants. Counters remain cumulative across retained-child follow-ups and session resume.
-An optional `children` array recursively shows that agent's active child-agent jobs using the
-same fields. Ordinary tool jobs are not included in `children`; the field is omitted entirely
-when there are no active child agents. Counters are per-agent, not subtree totals.
+The jobs section starts with `jobs: job parent tool name state age_s turns tool_calls`.
+Each following row contains those fields separated by single spaces. `parent` is `-` for
+jobs directly visible to the caller; nested active child-agent rows identify their immediate
+parent job explicitly. Ordinary tool jobs are not included as nested children. Tool and name
+values are unquoted only when they consist of ASCII letters, digits, `_`, `-`, `.`, or `/`;
+other values, including a literal `-`, are JSON-quoted. Missing names or counters use `-`.
 
-```json
-{
-  "date": "2026-09-05",
-  "active_jobs": [{
-    "job": 7,
-    "tool": "exec",
-    "name": "run-tests",
-    "state": "running",
-    "location": {"workspace": "/home/user/project"},
-    "age_seconds": 12
-  }],
-  "todos": []
-}
+`age_s` counts elapsed whole seconds since job creation, including time queued or waiting for
+input, clamped to zero if the clock moves before the creation timestamp. Child-agent jobs report
+the child's selected target and workspace once initialized. Optional `target="..."` and
+`workspace="..."` fields use JSON-quoted values and appear only when they differ from the
+snapshot's current execution location. Every row is compared with that location, never with
+its parent row; omitted fields do not inherit a parent's overrides. Target fields are omitted
+when target capabilities are disabled.
+
+Active agent jobs include exclusive `turns` and `tool_calls` counters. A turn is a complete,
+committed assistant response (including responses containing tool calls); failed attempts,
+incomplete responses, retries, and compaction requests do not add turns. Tool calls count jobs
+launched by that child, including calls inside its scripts, but not work owned by its descendants.
+Counters remain cumulative across retained-child follow-ups and session resume. Counters are
+per-agent, not subtree totals.
+
+The todos section retains every item, including completed items, in its original order. Each
+consecutive run of the same status starts with `pending:`, `in_progress:`, or `completed:`;
+each item's text follows on its own line, indented by two spaces and JSON-quoted. A status
+heading repeats if that status occurs again after another status; items are not globally regrouped.
+
+```text
+<skyhook_state>
+date:2026-09-05
+jobs: job parent tool name state age_s turns tool_calls
+7 - exec run-tests running 12 - -
+8 - agent review running 9 2 3 workspace="/home/user/review"
+9 8 agent - waiting_input 4 1 0
+todos:
+completed:
+  "Inspect the implementation"
+in_progress:
+  "Make the change"
+pending:
+  "Run relevant checks"
+</skyhook_state>
 ```
+
+In this example, job 9 uses the snapshot's current location, not job 8's workspace override.
+With no active jobs or todos, only the date line remains inside the state block.
 
 These snapshots are assembled at request time
 and never appended to durable conversation history. Actual job notifications, tool exchanges,

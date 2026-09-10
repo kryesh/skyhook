@@ -211,14 +211,94 @@ async fn depth_zero_root_omits_agent_gated_mcp_before_launch_or_http_contact() {
 }
 
 #[tokio::test]
+async fn global_mcp_gate_blocks_empty_server_requirements_before_any_connection() {
+    let mut without_mcp = CapabilitySet::default();
+    without_mcp.remove(Capability::Mcp);
+    for capabilities in [CapabilitySet::empty(), without_mcp] {
+        let root = tempfile::tempdir().unwrap();
+        let provider = RecordingProvider::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http: McpServerConfig = serde_json::from_value(json!({
+            "transport":"streamable_http",
+            "url":format!("http://{}/mcp", listener.local_addr().unwrap()),
+            "capabilities":[],
+            "startup_timeout_secs":1
+        }))
+        .unwrap();
+        let harness = builder(root.path(), provider.clone())
+            .capabilities(capabilities)
+            // Approve-all cannot bypass the global availability gate.
+            .policy(Arc::new(crate::tool::policy::AllowAll))
+            .mcp(BTreeMap::from([
+                ("stdio".into(), stdio_config(root.path(), vec![])),
+                ("http".into(), http),
+            ]))
+            .build()
+            .await
+            .unwrap();
+        let session = harness.new_session().await.unwrap();
+        assert!(session.startup_warnings().is_empty());
+        assert!(
+            !session
+                .runtime
+                .executor
+                .registry()
+                .tools()
+                .any(|tool| tool.name().starts_with("mcp_"))
+        );
+        let executor = &session.runtime.executor;
+        assert!(executor.surface().get("mcp_stdio_echo").is_none());
+        session.prompt("list your tools").await.unwrap();
+        assert!(
+            provider.0.lock().unwrap()[0]
+                .tools
+                .iter()
+                .all(|tool| !tool.name.starts_with("mcp_"))
+        );
+        assert!(
+            executor
+                .execute(
+                    session.root.clone(),
+                    "mcp_stdio_echo",
+                    json!({"text":"denied"}),
+                    None
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            executor
+                .execute_script(
+                    session.root.clone(),
+                    "mcp_stdio_echo",
+                    json!({"text":"denied"}),
+                    None
+                )
+                .await
+                .is_err()
+        );
+        let script = session
+            .run_script("return typeof tool.mcp_stdio_echo;")
+            .await
+            .unwrap();
+        assert_eq!(script.value["value"], "undefined");
+        tests::shutdown_session(session).await;
+        assert!(!root.path().join("launched").exists());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
 async fn empty_capability_requirements_expose_direct_and_script_tools() {
     let root = tempfile::tempdir().unwrap();
     let provider = RecordingProvider::default();
-    // Neither Read nor Exec is implicitly required to use an MCP connection.
-    let mut capabilities = CapabilitySet::default();
-    for capability in Capability::ALL {
-        capabilities.remove(capability);
-    }
+    // Empty per-server requirements still need the global gate, but neither
+    // Read nor Exec is implicitly required to use an MCP connection.
+    let capabilities = [Capability::Mcp].into_iter().collect::<CapabilitySet>();
     let harness = builder(root.path(), provider.clone())
         .capabilities(capabilities.clone())
         .mcp(servers(stdio_config(root.path(), vec![])))
@@ -260,6 +340,32 @@ async fn empty_capability_requirements_expose_direct_and_script_tools() {
         script.value["value"]["structuredContent"],
         json!({"text":"script"})
     );
+    // Also test a discovered adapter with empty server requirements. Startup
+    // omission alone would not catch a missing adapter-level global gate.
+    let disabled = executor.with_capabilities(CapabilitySet::empty());
+    assert!(disabled.surface().get(&name).is_none());
+    assert!(
+        disabled
+            .execute(session.root.clone(), &name, json!({"text":"denied"}), None)
+            .await
+            .is_err()
+    );
+    assert!(
+        disabled
+            .execute_script(session.root.clone(), &name, json!({"text":"denied"}), None)
+            .await
+            .is_err()
+    );
+    let script = disabled
+        .execute(
+            session.root.clone(),
+            "script",
+            json!({"source":format!("return typeof tool.{name};")}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(script.output.value["value"], "undefined");
     tests::shutdown_session(session).await;
     assert_eq!(
         std::fs::read_to_string(root.path().join("launched")).unwrap(),

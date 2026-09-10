@@ -380,11 +380,17 @@ impl Fixture {
             .map(|(_, message)| message)
             .collect();
         let capabilities = CapabilitySet::default();
-        input.messages.push(Message::User(vec![
-            prompt::runtime_state_content(&runtime.jobs, &runtime.todos, agent, &capabilities)
-                .await,
-        ]));
         let location = ExecutionLocation::root(self._workspace.path().to_path_buf());
+        input.messages.push(Message::User(vec![
+            prompt::runtime_state_content(
+                &runtime.jobs,
+                &runtime.todos,
+                agent,
+                &capabilities,
+                &location,
+            )
+            .await,
+        ]));
         runtime
             .compact_history(
                 &TurnContext {

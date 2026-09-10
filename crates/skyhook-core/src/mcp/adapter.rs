@@ -13,7 +13,8 @@ use crate::{
     media::{MAX_IMAGE_BYTES, MAX_IMAGE_BYTES_PER_SUBMISSION, MAX_IMAGES_PER_SUBMISSION},
     session::SessionStore,
     tool::{
-        ToolError, ToolOptions, ToolOutput, ToolPlacement, ToolRegistryBuilder, policy::ResourceId,
+        ToolError, ToolOptions, ToolOutput, ToolPlacement, ToolRegistryBuilder,
+        policy::{Capability, ResourceId},
     },
 };
 
@@ -52,6 +53,7 @@ pub fn register(
         };
         let validator = adapted.clone();
         let options = ToolOptions::new(config.capabilities.clone())
+            .requires(Capability::Mcp)
             .preserve_required()
             .preserve_schema_dialect()
             .background()

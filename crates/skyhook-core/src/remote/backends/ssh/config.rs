@@ -56,6 +56,10 @@ impl SshConfig {
             writeln!(file, "  User {}", ssh_token(&resolved.user)?)?;
             writeln!(file, "  Port {}", resolved.port)?;
             for (key, values) in &resolved.options {
+                // Also enforce this for pre-resolved routes received over shim RPC.
+                if forwards_environment(key) {
+                    continue;
+                }
                 if !matches!(target.ssh.auth, TargetAuth::Openssh)
                     && matches!(key.as_str(), "identitiesonly" | "preferredauthentications")
                 {
@@ -94,7 +98,7 @@ impl SshConfig {
             }
             writeln!(
                 file,
-                "  ControlMaster no\n  ControlPath none\n  CanonicalizeHostname no"
+                "  ControlMaster no\n  ControlPath none\n  CanonicalizeHostname no\n  ForwardX11 no\n  ForwardX11Trusted no"
             )?;
             if let Some(previous) = &previous {
                 writeln!(file, "  ProxyJump {previous}")?;
@@ -137,6 +141,17 @@ pub struct ResolvedSsh {
     pub proxy_command: Option<String>,
 }
 
+// SSH clients retain their local environment for authentication and proxy commands,
+// but must not export it to a target. In particular, SendEnv * would include secrets
+// loaded from the invocation directory's .env. Drop SetEnv before resolved options
+// enter a route/RPC as well: its literal values can themselves contain local secrets.
+// X11 forwarding exports a derived DISPLAY and is not part of our worker protocol.
+fn forwards_environment(key: &str) -> bool {
+    ["sendenv", "setenv", "forwardx11", "forwardx11trusted"]
+        .iter()
+        .any(|option| key.eq_ignore_ascii_case(option))
+}
+
 pub(crate) async fn resolve_openssh(
     target: &TargetDefinition,
     source_config: &Path,
@@ -162,6 +177,10 @@ pub(crate) async fn resolve_openssh(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         ));
     }
+    parse_resolved_ssh(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_resolved_ssh(output: &str) -> Result<ResolvedSsh, RemoteError> {
     let mut host = None;
     let mut user = None;
     let mut port = None;
@@ -169,10 +188,13 @@ pub(crate) async fn resolve_openssh(
     let mut options = std::collections::BTreeMap::<String, Vec<String>>::new();
     let mut proxy_jump = None;
     let mut proxy_command = None;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    for line in output.lines() {
         let Some((key, value)) = line.split_once(' ') else {
             continue;
         };
+        if forwards_environment(key) {
+            continue;
+        }
         options
             .entry(key.to_owned())
             .or_default()
@@ -247,6 +269,10 @@ fn write_auth(
 }
 
 pub(crate) fn ssh_command(config: &SshConfig, destination: &str) -> Command {
+    // -F selects only our generated configuration (including for ProxyJump), so
+    // neither user nor system config can reintroduce SendEnv/SetEnv. Do not clear
+    // the local client environment: HOME, PATH and authentication helpers need it.
+    // -A deliberately forwards the session agent, not arbitrary environment values.
     let mut command = Command::new("ssh");
     command
         .args(["-F"])
@@ -279,3 +305,7 @@ pub(crate) async fn resolve_local(target: &TargetDefinition) -> Result<ResolvedS
     )?;
     resolve_openssh(target, &source).await
 }
+
+#[cfg(test)]
+#[path = "config_tests.rs"]
+mod tests;

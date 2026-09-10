@@ -138,6 +138,14 @@ impl ToolExecutor {
         self.shared.registry.surface(&self.capabilities)
     }
 
+    /// Generate model and JavaScript tools for the receiving agent.
+    #[must_use]
+    pub fn surface_for_agent(&self, agent: &AgentId) -> super::ToolSurface {
+        self.shared
+            .registry
+            .surface_for_agent(&self.capabilities, agent)
+    }
+
     #[must_use]
     pub(crate) fn with_target_router(mut self, router: TargetRouter) -> Self {
         Arc::make_mut(&mut self.shared).router = Some(router);
@@ -357,6 +365,7 @@ impl ToolExecutor {
     async fn prepare_invocation(
         &self,
         kind: InvocationKind,
+        agent: &AgentId,
         name: &str,
         arguments: Value,
         parent: Option<JobId>,
@@ -368,7 +377,7 @@ impl ToolExecutor {
             .get(name)
             .ok_or_else(|| ExecutionError::UnknownTool(name.to_owned()))?;
         let spec = tool
-            .spec(&self.capabilities)
+            .spec(&self.capabilities, agent)
             .ok_or_else(|| ToolError::InvalidArguments(format!("tool `{name}` is unavailable")))?;
         spec.validate_arguments(&arguments)?;
         validate_invocation(&spec, kind)?;
@@ -405,7 +414,7 @@ impl ToolExecutor {
             job_name,
             authorization_scope,
         } = self
-            .prepare_invocation(kind, name, arguments, parent, authorization_scope)
+            .prepare_invocation(kind, &agent, name, arguments, parent, authorization_scope)
             .await?;
         let selected = self
             .resolve_workspace_invocation(&tool, &original_arguments)

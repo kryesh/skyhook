@@ -1,6 +1,7 @@
 //! Native standard protocol providers and shared codecs.
 
 mod anthropic;
+mod api_key_command;
 mod chat;
 pub mod codex;
 mod common;
@@ -47,6 +48,7 @@ pub struct NativeProvider {
     client: reqwest::Client,
     endpoint: String,
     headers: HeaderMap,
+    api_key_command: Option<api_key_command::ApiKeyCommand>,
     protocol: Protocol,
     scope: String,
     timeouts: ProviderTimeouts,
@@ -79,6 +81,7 @@ pub fn openai_compatible(
         client: transport::client()?,
         endpoint,
         headers,
+        api_key_command: None,
         protocol,
         scope,
         timeouts: ProviderTimeouts::default(),
@@ -107,6 +110,7 @@ pub fn anthropic_api(
         client: transport::client()?,
         endpoint,
         headers,
+        api_key_command: None,
         protocol: Protocol::Anthropic,
         scope,
         timeouts: ProviderTimeouts::default(),
@@ -134,6 +138,18 @@ fn endpoint(base: &str, suffix: &str) -> Result<String, ProviderError> {
 }
 
 impl NativeProvider {
+    /// Resolve a credential lazily on the first valid invocation, overriding any
+    /// direct credential. Successful headers are shared across clones/contexts;
+    /// failures and cancelled attempts are not cached. Runs /bin/sh -c inside
+    /// the invocation future, before HTTP startup timeouts begin, with no separate
+    /// command deadline. Dropping that future kills the immediate child process
+    /// (not necessarily its descendants); no detached task owns the command.
+    #[must_use]
+    pub fn with_api_key_command(mut self, command: String) -> Self {
+        self.api_key_command = Some(api_key_command::ApiKeyCommand::new(command));
+        self
+    }
+
     #[must_use]
     pub fn with_chat_reasoning_replay(mut self, policy: ChatReasoningReplay) -> Self {
         self.chat_reasoning_replay = policy;
@@ -192,10 +208,22 @@ impl ProviderContext for NativeContext {
                     Decoder::Anthropic(anthropic::Decoder::new(request.model)),
                 ),
             };
+            let mut headers = provider.headers;
+            if let Some(command) = &provider.api_key_command {
+                let header = command.header(provider.protocol).await?;
+                match provider.protocol {
+                    Protocol::Chat | Protocol::Responses => {
+                        headers.insert(AUTHORIZATION, header);
+                    }
+                    Protocol::Anthropic => {
+                        headers.insert("x-api-key", header);
+                    }
+                }
+            }
             let events = transport::post_sse_with_timeouts(
                 &provider.client,
                 &provider.endpoint,
-                provider.headers,
+                headers,
                 &body,
                 provider.timeouts,
             )

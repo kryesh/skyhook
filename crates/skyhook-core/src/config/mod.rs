@@ -11,6 +11,7 @@ use crate::{
     provider::backends::OpenAiApi,
     provider::profile::ModelProfile,
     target::TargetsConfig,
+    tool::policy::{Capability, CapabilitySet},
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -32,8 +33,9 @@ pub struct Config {
     /// Approve all tool calls without consulting an interactive policy.
     #[serde(default)]
     pub approve_all: bool,
-    #[serde(default)]
-    pub targets_enabled: bool,
+    /// Exact session capabilities. An explicit empty array disables all capabilities.
+    #[serde(default = "default_capabilities")]
+    pub capabilities: Vec<Capability>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -53,6 +55,10 @@ const fn default_child_depth() -> usize {
     4
 }
 
+fn default_capabilities() -> Vec<Capability> {
+    CapabilitySet::default().iter().collect()
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderConfig {
@@ -63,6 +69,9 @@ pub enum ProviderConfig {
         /// Chat-only request field; absence uses the shared reasoning_content default.
         chat_reasoning_replay: Option<crate::provider::backends::ChatReasoningReplay>,
         api_key_env: Option<String>,
+        /// Shell command run on first provider request; trimmed stdout is cached as the key.
+        /// Mutually exclusive with api_key_env.
+        api_key_command: Option<String>,
         /// Time to receive HTTP response headers per attempt (default: 600 seconds).
         startup_timeout_secs: Option<u64>,
         /// Maximum interval between HTTP response body reads (default: 600 seconds).
@@ -71,6 +80,9 @@ pub enum ProviderConfig {
     Anthropic {
         base_url: String,
         api_key_env: Option<String>,
+        /// Shell command run on first provider request; trimmed stdout is cached as the key.
+        /// Mutually exclusive with api_key_env.
+        api_key_command: Option<String>,
         /// Time to receive HTTP response headers per attempt (default: 600 seconds).
         startup_timeout_secs: Option<u64>,
         /// Maximum interval between HTTP response body reads (default: 600 seconds).
@@ -101,14 +113,10 @@ impl Config {
                 .validate()
                 .map_err(|message| ConfigError::Mcp(name.clone(), message))?;
         }
-        let mut capabilities = crate::tool::policy::CapabilitySet::default();
-        if self.targets_enabled {
-            capabilities.insert(crate::tool::policy::Capability::Targets);
-        }
         let mut builder = HarnessBuilder::new(workspace)
             .default_model_profile(model)
             .max_child_depth(self.max_child_depth)
-            .capabilities(capabilities)
+            .capabilities(self.capabilities.iter().copied().collect())
             .mcp(self.mcp.clone())
             .targets_config(self.targets.clone());
         if let Some(root) = &self.session_root {
@@ -167,7 +175,7 @@ mod tests {
         let config = Config::load(Some(&path)).await.unwrap();
         assert_eq!(config.models.first().unwrap().0, "local");
         assert!(!config.approve_all);
-        assert!(!config.targets_enabled);
+        assert_eq!(config.capabilities, default_capabilities());
         assert!(config.mcp.is_empty());
     }
 
@@ -294,13 +302,50 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_are_exact_and_validate_names() {
+        let defaults: Config = toml::from_str("").unwrap();
+        let expected = vec![
+            Capability::Read,
+            Capability::Write,
+            Capability::Exec,
+            Capability::Network,
+            Capability::Agents,
+            Capability::Interactive,
+            Capability::Mcp,
+        ];
+        assert_eq!(defaults.capabilities, expected);
+
+        let empty: Config = toml::from_str("capabilities = []").unwrap();
+        assert!(empty.capabilities.is_empty());
+        let exact: Config = toml::from_str("capabilities = ['read', 'targets']").unwrap();
+        assert_eq!(exact.capabilities, [Capability::Read, Capability::Targets]);
+        for name in ["unknown", "Mcp", "Interactive", "READ"] {
+            let error = toml::from_str::<Config>(&format!("capabilities = ['{name}']"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(name), "{error}");
+            assert!(error.contains("unknown variant"), "{error}");
+        }
+        let all: Config = toml::from_str(
+            "capabilities = ['read', 'write', 'exec', 'network', 'targets', 'agents', 'interactive', 'mcp']",
+        )
+        .unwrap();
+        assert_eq!(all.capabilities, Capability::ALL);
+        let approved: Config = toml::from_str("approve_all = true\ncapabilities = []").unwrap();
+        assert!(approved.approve_all);
+        assert!(approved.capabilities.is_empty());
+        assert!(toml::from_str::<Config>("capabilities = 'read'").is_err());
+        assert!(toml::from_str::<Config>("targets_enabled = true").is_err());
+    }
+
+    #[test]
     fn approve_all_is_opt_in() {
         let disabled: Config = toml::from_str(
             "default_model_profile='test'\n[models.test]\nprovider='test'\nmodel='test'\nmax_context=128000\nmax_output=16384\nsupports_images=false\n",
         )
         .unwrap();
         assert!(!disabled.approve_all);
-        assert!(!disabled.targets_enabled);
+        assert!(!disabled.capabilities.contains(&Capability::Targets));
 
         let enabled: Config = toml::from_str(
             "default_model_profile='test'\napprove_all=true\n[models.test]\nprovider='test'\nmodel='test'\nmax_context=128000\nmax_output=16384\nsupports_images=false\n",

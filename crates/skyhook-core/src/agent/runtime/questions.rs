@@ -69,6 +69,17 @@ impl QuestionCoordinator {
         context: crate::tool::ToolContext,
         question: Question,
     ) -> Result<serde_json::Value, crate::tool::ToolError> {
+        // Enforce before batching or waiting on a job input channel: omitting the
+        // host handler alone would leave background root questions waiting forever.
+        if context.agent.parent().is_none()
+            && !context
+                .capabilities
+                .contains(crate::tool::policy::Capability::Interactive)
+        {
+            return Err(crate::tool::ToolError::Denied(
+                "root questions require the interactive capability".to_owned(),
+            ));
+        }
         let (result, received) = oneshot::channel();
         let agent = context.agent.clone();
         let launch = {

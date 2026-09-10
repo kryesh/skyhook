@@ -16,7 +16,9 @@ use tokio::{
 use crate::{
     identity::AgentId,
     job::JobManager,
-    remote::protocol::{RemoteToolError, Request, Response, read_frame, write_frame},
+    remote::protocol::{
+        PROTOCOL_VERSION, RemoteToolError, Request, Response, read_frame, write_frame,
+    },
     session::SessionStore,
     tool::{
         ToolRegistryBuilder,
@@ -46,7 +48,17 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     match read_frame::<_, Request>(&mut input).await? {
-        Some(Request::Hello) => write_frame(&mut output, &Response::Ready).await?,
+        Some(Request::Hello {
+            version: PROTOCOL_VERSION,
+        }) => {
+            write_frame(
+                &mut output,
+                &Response::Ready {
+                    version: PROTOCOL_VERSION,
+                },
+            )
+            .await?
+        }
         Some(request) => return Err(format!("expected hello, received {request:?}").into()),
         None => return Ok(()),
     }
@@ -95,12 +107,13 @@ where
                     };
                 };
                 match request {
-                    Request::Tool { request_id, name, arguments } => {
+                    Request::Tool { request_id, name, arguments, capabilities } => {
                         if request_id == 0 || active.insert(request_id, None).is_some() {
                             reader.abort();
                             return Err(format!("invalid or duplicate request ID {request_id}").into());
                         }
-                        let executor = executor.clone();
+                        // Collect an exact set: defaults would restore capabilities the caller lacks.
+                        let executor = executor.clone().with_capabilities(capabilities.into_iter().collect());
                         let store = store.clone();
                         let output = output.clone();
                         let worker_agent = worker_agent.clone();
@@ -168,7 +181,7 @@ where
                         }
                     }
                     control @ (Request::ResolveSsh { .. } | Request::OpenSsh { .. } | Request::StreamData { .. } | Request::StreamEnd { .. } | Request::StreamClose { .. } | Request::StreamAck { .. } | Request::SensitiveAnswer { .. }) => services.handle(control).await?,
-                    Request::Hello => {
+                    Request::Hello { .. } => {
                         reader.abort();
                         return Err("received a second hello".into());
                     }
@@ -387,6 +400,187 @@ mod tests {
     use crate::remote::protocol::RemoteToolOutput;
 
     #[tokio::test]
+    async fn incompatible_client_handshakes_are_rejected() {
+        for hello in [
+            serde_json::json!({"type":"hello"}),
+            serde_json::json!({"type":"hello", "version": PROTOCOL_VERSION - 1}),
+        ] {
+            let (mut client, server) = tokio::io::duplex(4096);
+            write_frame(&mut client, &hello).await.unwrap();
+            let (input, output) = tokio::io::split(server);
+            assert!(
+                serve_io_at(input, output, std::fs::canonicalize(".").unwrap())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                read_frame::<_, Response>(&mut client)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_enforces_exact_capabilities_without_restoring_defaults() {
+        use crate::tool::policy::Capability;
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut client_input, mut client_output) = tokio::io::split(client);
+        let (server_input, server_output) = tokio::io::split(server);
+        let worker = tokio::spawn(async move {
+            serve_io_at(
+                server_input,
+                server_output,
+                std::fs::canonicalize(".").unwrap(),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        });
+        write_frame(
+            &mut client_output,
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame::<_, Response>(&mut client_input).await.unwrap(),
+            Some(Response::Ready {
+                version: PROTOCOL_VERSION
+            })
+        ));
+        for (index, capabilities) in [
+            vec![],
+            vec![Capability::Read],
+            vec![Capability::Exec],
+            vec![],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request_id = index as u64 + 1;
+            let allowed = capabilities.contains(&Capability::Exec);
+            write_frame(
+                &mut client_output,
+                &Request::Tool {
+                    request_id,
+                    capabilities,
+                    name: "exec".into(),
+                    arguments: serde_json::json!({"argv":["/bin/sh", "-c", "printf exact"]}),
+                },
+            )
+            .await
+            .unwrap();
+            let response = tokio::time::timeout(
+                Duration::from_secs(10),
+                read_frame::<_, Response>(&mut client_input),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            let Response::Tool {
+                request_id: actual,
+                result,
+            } = response
+            else {
+                panic!("expected tool result, got {response:?}")
+            };
+            assert_eq!(actual, request_id);
+            if allowed {
+                assert_eq!(result.unwrap().value["stdout"], "exact");
+            } else {
+                assert_eq!(
+                    result.unwrap_err().message,
+                    "invalid tool arguments: tool `exec` is unavailable",
+                    "missing Exec must be rejected locally, not forwarded to host"
+                );
+            }
+        }
+        drop(client_output);
+        drop(client_input);
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn noninteractive_remote_exec_starts_a_new_process_session() {
+        use crate::tool::policy::Capability;
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut client_input, mut client_output) = tokio::io::split(client);
+        let (server_input, server_output) = tokio::io::split(server);
+        let worker = tokio::spawn(async move {
+            serve_io_at(
+                server_input,
+                server_output,
+                std::fs::canonicalize(".").unwrap(),
+            )
+            .await
+            .map_err(|error| error.to_string())
+        });
+        write_frame(
+            &mut client_output,
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame::<_, Response>(&mut client_input).await.unwrap(),
+            Some(Response::Ready {
+                version: PROTOCOL_VERSION
+            })
+        ));
+        for (index, interactive) in [false, true, false].into_iter().enumerate() {
+            let mut capabilities = vec![Capability::Exec];
+            if interactive {
+                capabilities.push(Capability::Interactive);
+            }
+            write_frame(&mut client_output, &Request::Tool {
+                request_id: index as u64 + 1, capabilities, name: "exec".into(),
+                arguments: serde_json::json!({"argv":["/bin/sh", "-c", "read pid comm state ppid pgrp sid rest < /proc/self/stat; printf '%s %s' \"$pid\" \"$sid\""]}),
+            }).await.unwrap();
+            let response = tokio::time::timeout(
+                Duration::from_secs(10),
+                read_frame::<_, Response>(&mut client_input),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            let Response::Tool { result, .. } = response else {
+                panic!("expected tool result, got {response:?}")
+            };
+            let result = result.unwrap();
+            let ids: Vec<_> = result.value["stdout"]
+                .as_str()
+                .unwrap()
+                .split_whitespace()
+                .collect();
+            assert_eq!(ids.len(), 2);
+            assert_eq!(
+                ids[0] == ids[1],
+                !interactive,
+                "only noninteractive exec should be a session leader: {ids:?}"
+            );
+        }
+        drop(client_output);
+        drop(client_input);
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn top_level_network_authorizations_are_forwarded_with_scope() {
         use crate::tool::policy::{Capability, PermissionUse, ResourceId};
         let runtime = crate::test_support::TestRuntime::new().await;
@@ -548,16 +742,26 @@ mod tests {
             .map_err(|error| error.to_string())
         });
 
-        write_frame(&mut client_output, &Request::Hello)
-            .await
-            .unwrap();
+        write_frame(
+            &mut client_output,
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             read_frame::<_, Response>(&mut client_input).await.unwrap(),
-            Some(Response::Ready)
+            Some(Response::Ready {
+                version: PROTOCOL_VERSION
+            })
         ));
         write_frame(
             &mut client_output,
             &Request::Tool {
+                capabilities: crate::tool::policy::CapabilitySet::default()
+                    .iter()
+                    .collect(),
                 request_id: 1,
                 name: "shell".to_owned(),
                 arguments: serde_json::json!({"command":"sleep 1; printf slow"}),
@@ -568,6 +772,9 @@ mod tests {
         write_frame(
             &mut client_output,
             &Request::Tool {
+                capabilities: crate::tool::policy::CapabilitySet::default()
+                    .iter()
+                    .collect(),
                 request_id: 2,
                 name: "shell".to_owned(),
                 arguments: serde_json::json!({"command":"printf fast"}),
@@ -602,6 +809,9 @@ mod tests {
         write_frame(
             &mut client_output,
             &Request::Tool {
+                capabilities: crate::tool::policy::CapabilitySet::default()
+                    .iter()
+                    .collect(),
                 request_id: 3,
                 name: "shell".to_owned(),
                 arguments: serde_json::json!({"command":"sleep 10; printf cancelled"}),
@@ -612,6 +822,9 @@ mod tests {
         write_frame(
             &mut client_output,
             &Request::Tool {
+                capabilities: crate::tool::policy::CapabilitySet::default()
+                    .iter()
+                    .collect(),
                 request_id: 4,
                 name: "shell".to_owned(),
                 arguments: serde_json::json!({"command":"sleep 0.1; printf sibling"}),
@@ -655,6 +868,9 @@ mod tests {
         write_frame(
             &mut client_output,
             &Request::Tool {
+                capabilities: crate::tool::policy::CapabilitySet::default()
+                    .iter()
+                    .collect(),
                 request_id: 5,
                 name: "shell".to_owned(),
                 arguments: serde_json::json!({"command":"printf reusable"}),
@@ -696,16 +912,26 @@ mod tests {
                 .map_err(|error| error.to_string())
         });
 
-        write_frame(&mut client_output, &Request::Hello)
-            .await
-            .unwrap();
+        write_frame(
+            &mut client_output,
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             read_frame::<_, Response>(&mut client_input).await.unwrap(),
-            Some(Response::Ready)
+            Some(Response::Ready {
+                version: PROTOCOL_VERSION
+            })
         ));
         write_frame(
             &mut client_output,
             &Request::Tool {
+                capabilities: crate::tool::policy::CapabilitySet::default()
+                    .iter()
+                    .collect(),
                 request_id: 10,
                 name: "read".to_owned(),
                 arguments: serde_json::json!({"path": path}),

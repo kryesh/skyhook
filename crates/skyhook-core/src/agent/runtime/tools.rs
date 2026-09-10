@@ -119,7 +119,7 @@ fn register_ask(
     builder.register::<Question, Value, _, _>(
         "ask",
         "Ask one structured question. Issue independent questions concurrently; the runtime merges calls that become ready together. Use bg:true to continue independent work while awaiting an answer; inspect the returned job with job_output.",
-        ToolOptions::default().background().input(),
+        ToolOptions::default().background().input().requires_for_root(Capability::Interactive),
         move |context, input| {
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
             async move {

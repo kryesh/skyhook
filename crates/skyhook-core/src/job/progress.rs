@@ -15,9 +15,9 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Default, Serialize)]
-pub(super) struct AgentProgress {
-    turns: u64,
-    tool_calls: u64,
+pub(crate) struct AgentProgress {
+    pub(crate) turns: u64,
+    pub(crate) tool_calls: u64,
 }
 
 #[derive(Default)]

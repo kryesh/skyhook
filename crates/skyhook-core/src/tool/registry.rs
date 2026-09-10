@@ -94,12 +94,18 @@ struct GeneratedToolDefinition {
     preserve_required: bool,
     preserve_schema_dialect: bool,
     required: BTreeSet<Capability>,
+    root_required: BTreeSet<Capability>,
 }
 
 impl GeneratedToolDefinition {
     fn generate(&self, capabilities: &CapabilitySet) -> Option<ToolSpec> {
+        self.generate_scoped(capabilities, false)
+    }
+
+    fn generate_scoped(&self, capabilities: &CapabilitySet, child: bool) -> Option<ToolSpec> {
         self.required
             .iter()
+            .chain(self.root_required.iter().filter(|_| !child))
             .all(|capability| capabilities.contains(*capability))
             .then(|| {
                 let mut input_schema = (self.input_schema)(capabilities);
@@ -204,6 +210,7 @@ pub struct ToolOptions {
     exposure: ToolExposure,
     script_binding: ScriptBinding,
     required: BTreeSet<Capability>,
+    root_required: BTreeSet<Capability>,
     conditional_inputs: Vec<(String, Capability, Value)>,
     output_schema: Option<OutputSchema>,
 }
@@ -260,9 +267,19 @@ impl ToolOptions {
             exposure: ToolExposure::ModelVisible,
             script_binding: ScriptBinding::TopLevel,
             required,
+            root_required: BTreeSet::new(),
             conditional_inputs: Vec::new(),
             output_schema: None,
         }
+    }
+
+    /// Require a capability only for root agents. Child-to-parent communication
+    /// can remain available without granting the child host-interaction rights.
+    /// Like `requires`, this is an availability gate, not an execution permission.
+    #[must_use]
+    pub fn requires_for_root(mut self, capability: Capability) -> Self {
+        self.root_required.insert(capability);
+        self
     }
 
     /// Preserve JSON Schema required fields even when they have defaults.
@@ -493,8 +510,13 @@ impl RegisteredTool {
         self.execution.capabilities.clone()
     }
 
-    pub(crate) fn spec(&self, capabilities: &CapabilitySet) -> Option<ToolSpec> {
-        self.definition.generate(capabilities)
+    pub(crate) fn spec(
+        &self,
+        capabilities: &CapabilitySet,
+        agent: &crate::identity::AgentId,
+    ) -> Option<ToolSpec> {
+        self.definition
+            .generate_scoped(capabilities, agent.parent().is_some())
     }
 
     #[must_use]
@@ -652,12 +674,26 @@ impl ToolRegistry {
 
     #[must_use]
     pub fn surface(&self, capabilities: &CapabilitySet) -> ToolSurface {
+        self.surface_scoped(capabilities, false)
+    }
+
+    /// Generate a surface for the receiving agent, preserving root-only requirements.
+    #[must_use]
+    pub fn surface_for_agent(
+        &self,
+        capabilities: &CapabilitySet,
+        agent: &crate::identity::AgentId,
+    ) -> ToolSurface {
+        self.surface_scoped(capabilities, agent.parent().is_some())
+    }
+
+    fn surface_scoped(&self, capabilities: &CapabilitySet, child: bool) -> ToolSurface {
         let tools = self
             .tools
             .values()
             .filter_map(|tool| {
                 tool.definition
-                    .generate(capabilities)
+                    .generate_scoped(capabilities, child)
                     .map(|spec| (spec.name.clone(), spec))
             })
             .collect();
@@ -733,6 +769,7 @@ impl ToolRegistryBuilder {
             exposure,
             script_binding,
             required,
+            root_required,
             conditional_inputs,
             output_schema,
         } = options;
@@ -773,6 +810,7 @@ impl ToolRegistryBuilder {
             preserve_required,
             preserve_schema_dialect,
             required,
+            root_required,
         };
         self.register_definition(definition, execution, handler)
     }

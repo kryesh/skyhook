@@ -4,6 +4,7 @@ mod authentication;
 mod config;
 mod process;
 
+pub(crate) use askpass::AskpassServer;
 pub(crate) use authentication::WorkerAuthentication;
 pub use config::ResolvedSsh;
 pub(crate) use config::resolve_local;

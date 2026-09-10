@@ -29,8 +29,8 @@ use crate::{
     session::{EventRecord, SessionError, SessionEvent, SessionStore},
     target::{TargetDefinition, TargetRegistry, TargetsConfig, import_ssh_targets},
     tool::builtins::{HostSkills, install_script_tool, register_coding_tools},
-    tool::policy::CapabilitySet,
     tool::policy::{AllowAll, Policy},
+    tool::policy::{Capability, CapabilitySet},
     tool::{ToolRegistry, ToolRegistryBuilder, executor::ToolExecutor},
 };
 
@@ -47,6 +47,8 @@ mod compaction;
 mod context;
 #[cfg(test)]
 mod context_tests;
+#[cfg(test)]
+mod interactive_tests;
 #[cfg(test)]
 mod mcp_tests;
 use context::AgentContext;
@@ -254,6 +256,13 @@ impl HarnessBuilder {
         .await?;
         TargetRegistry::from_definitions(target_definitions.clone())?;
         instructions.extend(self.instructions);
+        // A host handler must not restore a revoked interaction capability,
+        // including authentication forwarded from remote workers.
+        let sensitive_prompts = if self.capabilities.contains(Capability::Interactive) {
+            self.sensitive_prompts
+        } else {
+            Arc::new(RejectSensitivePrompts) as Arc<dyn SensitivePromptHandler>
+        };
         Ok(Harness {
             inner: Arc::new(HarnessInner {
                 workspace,
@@ -273,7 +282,7 @@ impl HarnessBuilder {
                 capabilities: self.capabilities,
                 target_definitions,
                 shim_catalog: self.shim_catalog,
-                sensitive_prompts: self.sensitive_prompts,
+                sensitive_prompts,
             }),
         })
     }
@@ -640,8 +649,6 @@ impl SessionHandle {
             .shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
         self.runtime.interrupt_tree(&self.root).await;
-        self.runtime.mcp.shutdown().await;
-        self.runtime.router.shutdown().await;
         // Completed children retain idle loops for resumption, and must also stop.
         let senders = self
             .runtime
@@ -651,9 +658,18 @@ impl SessionHandle {
             .values()
             .map(|agent| agent.sender.clone())
             .collect::<Vec<_>>();
-        for sender in senders {
+        for sender in &senders {
             let _ = sender.send(AgentCommand::Shutdown).await;
         }
+        self.runtime.jobs.cancel_and_drain().await?;
+        for sender in senders {
+            sender.closed().await;
+        }
+        // Agent loops can finish scheduling cancellation-owned descendants while
+        // they unwind. Persist those outcomes before the host drops its runtime.
+        self.runtime.jobs.cancel_and_drain().await?;
+        self.runtime.mcp.shutdown().await;
+        self.runtime.router.shutdown().await;
         Ok(())
     }
 
@@ -788,10 +804,11 @@ impl SessionRuntime {
             .mcp
             .iter()
             .filter(|(_, config)| {
-                config
-                    .capabilities
-                    .iter()
-                    .all(|cap| root_capabilities.contains(*cap))
+                root_capabilities.contains(Capability::Mcp)
+                    && config
+                        .capabilities
+                        .iter()
+                        .all(|cap| root_capabilities.contains(*cap))
             })
             .map(|(name, config)| (name.clone(), config.clone()))
             .collect::<BTreeMap<_, _>>();
@@ -1041,10 +1058,20 @@ impl SessionRuntime {
         self.todos.register(id.clone(), owner_job, todos).await?;
         let (tx, rx) = mpsc::channel(AGENT_CHANNEL_CAPACITY);
         let tx = AgentSender::new(tx);
-        self.agents
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
+        {
+            let mut agents = self
+                .agents
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Serialize this check with shutdown's agent snapshot. A child whose
+            // provider initialization raced shutdown must not leave an idle loop.
+            if self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(HarnessError::Interrupted);
+            }
+            agents.insert(
                 id.clone(),
                 LiveAgent {
                     model_profile: model_profile.clone(),
@@ -1054,6 +1081,7 @@ impl SessionRuntime {
                     completion_gate: Arc::new(Mutex::new(true)),
                 },
             );
+        }
         self.activity(&id, AgentActivity::Idle);
         let runtime = self.clone();
         tokio::spawn(async move {
@@ -1199,7 +1227,7 @@ impl SessionRuntime {
                 .executor
                 .clone()
                 .with_capabilities(capabilities.clone())
-                .surface()
+                .surface_for_agent(agent)
                 .definitions(),
             reasoning: profile.reasoning.clone(),
             response_schema: None,
@@ -1568,8 +1596,14 @@ impl SessionRuntime {
                 }
             };
             agent_context.refresh(&self.store.records().await, agent)?;
-            let runtime =
-                prompt::runtime_state_content(&self.jobs, &self.todos, agent, capabilities).await;
+            let runtime = prompt::runtime_state_content(
+                &self.jobs,
+                &self.todos,
+                agent,
+                capabilities,
+                location,
+            )
+            .await;
             let mut request = agent_context.request(runtime);
             if force_compaction || (!compaction_checked && agent_context.needs_compaction(&request))
             {
@@ -1795,8 +1829,14 @@ impl SessionRuntime {
             self.record_model_usage(agent, requested.sequence, response.usage)
                 .await?;
             agent_context.meter.observe(input_estimate, response.usage);
-            let runtime =
-                prompt::runtime_state_content(&self.jobs, &self.todos, agent, capabilities).await;
+            let runtime = prompt::runtime_state_content(
+                &self.jobs,
+                &self.todos,
+                agent,
+                capabilities,
+                location,
+            )
+            .await;
             let current = agent_context.request(runtime);
             self.events.send(RuntimeEvent::Context {
                 agent: agent.clone(),
@@ -2304,7 +2344,33 @@ mod tests {
             .count()
     }
 
+    fn request_runtime_state(request: &ModelRequest) -> &str {
+        assert_eq!(runtime_state_count(&request.messages), 1);
+        let Some(Message::User(content)) = request.messages.last() else {
+            panic!("expected transient runtime state at the end of the request");
+        };
+        let state = content
+            .iter()
+            .find_map(|content| match content {
+                UserContent::Runtime { text } => text
+                    .strip_prefix("<skyhook_state>\n")
+                    .and_then(|text| text.strip_suffix("\n</skyhook_state>")),
+                _ => None,
+            })
+            .expect("request has a compact runtime state block");
+        let date = state
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("date:"))
+            .expect("runtime state starts with the current local date");
+        assert_eq!(date.len(), 10);
+        let parsed = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
+        assert_eq!(parsed.format("%Y-%m-%d").to_string(), date);
+        state
+    }
+
     fn request_history(request: &ModelRequest) -> &[Message] {
+        request_runtime_state(request);
         assert_eq!(runtime_state_count(&request.messages), 1);
         let (state, history) = request.messages.split_last().unwrap();
         assert_eq!(runtime_state_count(std::slice::from_ref(state)), 1);
@@ -2389,6 +2455,66 @@ mod tests {
             .build()
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn revoked_interactive_rejects_supplied_sensitive_handler() {
+        use crate::remote::{
+            SecretValue, SensitivePrompt, SensitivePromptFuture, SensitivePromptKind,
+        };
+
+        struct RecordingSensitive(Arc<AtomicUsize>);
+        impl SensitivePromptHandler for RecordingSensitive {
+            fn prompt(&self, _prompt: SensitivePrompt) -> SensitivePromptFuture {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(SecretValue::new("answer".to_owned())) })
+            }
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        for interactive in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut capabilities = CapabilitySet::default();
+            if !interactive {
+                capabilities.remove(Capability::Interactive);
+            }
+            let harness =
+                test_builder(workspace.path(), sessions.path(), Arc::new(HangingProvider))
+                    .capabilities(capabilities)
+                    .policy(Arc::new(crate::tool::policy::AllowAll))
+                    .sensitive_prompt_handler(Arc::new(RecordingSensitive(calls.clone())))
+                    .build()
+                    .await
+                    .unwrap();
+            for kind in [
+                SensitivePromptKind::Password,
+                SensitivePromptKind::KeyboardInteractive,
+                SensitivePromptKind::KeyPassphrase,
+                SensitivePromptKind::HostConfirmation,
+                SensitivePromptKind::AgentConfirmation,
+            ] {
+                let result = harness
+                    .inner
+                    .sensitive_prompts
+                    .prompt(SensitivePrompt {
+                        kind,
+                        message: "authentication requested".to_owned(),
+                    })
+                    .await;
+                assert_eq!(result.is_ok(), interactive);
+                if !interactive {
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        "interactive authentication is unavailable"
+                    );
+                }
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                if interactive { 5 } else { 0 }
+            );
+        }
     }
 
     // Wait for owned agent loops to release the runtime before reopening its journal.
@@ -3098,6 +3224,8 @@ mod tests {
         assert_request_journal(&session.runtime.store, &requests).await;
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
+        assert_eq!(request_runtime_state(&requests[0]).lines().count(), 1);
+        assert_eq!(request_runtime_state(&requests[1]).lines().count(), 1);
         assert_eq!(requests[0].system, requests[1].system);
         assert_eq!(requests[0].tools, requests[1].tools);
         assert_eq!(requests[0].system.len(), 1);
@@ -3153,7 +3281,9 @@ mod tests {
         let todos = json!([
             {"text": "Inspect the implementation", "status": "completed"},
             {"text": "Make the change", "status": "in_progress"},
-            {"text": "Run relevant checks", "status": "pending"}
+            {"text": "Run relevant checks", "status": "pending"},
+            {"text": "Check \"quoted\" text\nand Unicode: café", "status": "pending"},
+            {"text": "Keep the original order", "status": "completed"}
         ]);
         let harness = test_harness(
             workspace.path(),
@@ -3195,21 +3325,23 @@ mod tests {
                 .text
                 .starts_with(prompt::CHILD_PROMPT)
         );
-        assert_eq!(runtime_state_count(&child_request.messages), 1);
-        let Some(Message::User(content)) = child_request.messages.last() else {
-            panic!("expected transient runtime state at the end of the first child request");
-        };
-        let state = content
-            .iter()
-            .find_map(|content| match content {
-                UserContent::Runtime { text } => text
-                    .strip_prefix("<skyhook_state>\n")
-                    .and_then(|text| text.strip_suffix("\n</skyhook_state>")),
-                _ => None,
-            })
-            .expect("first child request has a runtime state block");
-        let state: serde_json::Value = serde_json::from_str(state).unwrap();
-        assert_eq!(state["todos"], todos);
+        let state = request_runtime_state(child_request);
+        let (_, sections) = state.split_once('\n').unwrap();
+        assert_eq!(
+            sections,
+            concat!(
+                "todos:\n",
+                "completed:\n",
+                "  \"Inspect the implementation\"\n",
+                "in_progress:\n",
+                "  \"Make the change\"\n",
+                "pending:\n",
+                "  \"Run relevant checks\"\n",
+                "  \"Check \\\"quoted\\\" text\\nand Unicode: café\"\n",
+                "completed:\n",
+                "  \"Keep the original order\"",
+            )
+        );
     }
 
     #[tokio::test]
@@ -3309,6 +3441,20 @@ mod tests {
             "saved output retains the complete final string"
         );
         let requests = requests.lock().unwrap();
+        let active_state = request_runtime_state(&requests[2]);
+        let mut lines = active_state.lines().skip(1);
+        assert_eq!(
+            lines.next(),
+            Some("jobs: job parent tool name state age_s turns tool_calls")
+        );
+        let fields = lines.next().unwrap().split(' ').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 8, "same-location jobs need no overrides");
+        assert_eq!(fields[0], script.id.to_string());
+        assert_eq!(&fields[1..4], &["-", "script", "-"]);
+        assert!(matches!(fields[4], "queued" | "running"));
+        fields[5].parse::<u64>().unwrap();
+        assert_eq!(&fields[6..], &["-", "-"]);
+        assert!(lines.next().is_none(), "empty todos are omitted");
         let last = requests.last().unwrap();
         let result = request_history(last)
             .iter()
@@ -3444,6 +3590,16 @@ mod tests {
             restored.snapshot(job).await.unwrap().output,
             Some(json!("third answer"))
         );
+        // Shutdown now waits for agent receivers to close. Restore the real
+        // root loop instead of waiting on the intentionally unpolled test inbox.
+        session
+            .runtime
+            .agents
+            .write()
+            .unwrap()
+            .get_mut(&session.root)
+            .unwrap()
+            .sender = session.root_tx.clone();
         session.shutdown().await.unwrap();
     }
 

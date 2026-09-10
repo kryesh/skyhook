@@ -19,7 +19,10 @@ use crate::{
 
 use super::{
     manager::RemoteError,
-    protocol::{RemoteToolError, RemoteToolOutput, Request, Response, read_frame, write_frame},
+    protocol::{
+        PROTOCOL_VERSION, RemoteToolError, RemoteToolOutput, Request, Response, read_frame,
+        write_frame,
+    },
 };
 
 pub(super) type Session = Arc<PooledConnection>;
@@ -38,11 +41,21 @@ pub(crate) fn test_transport() -> super::transport::Transport {
     let owner = FakeShim(tokio::spawn(async move {
         if !matches!(
             read_frame::<_, Request>(&mut shim).await,
-            Ok(Some(Request::Hello))
+            Ok(Some(Request::Hello {
+                version: PROTOCOL_VERSION
+            }))
         ) {
             return;
         }
-        if write_frame(&mut shim, &Response::Ready).await.is_err() {
+        if write_frame(
+            &mut shim,
+            &Response::Ready {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .is_err()
+        {
             return;
         }
         while let Ok(Some(_)) = read_frame::<_, Request>(&mut shim).await {}
@@ -136,10 +149,18 @@ impl PooledConnection {
             mut output,
             owner,
         } = transport;
-        write_frame(&mut input, &Request::Hello).await?;
+        write_frame(
+            &mut input,
+            &Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await?;
         if !matches!(
             read_frame::<_, Response>(&mut output).await?,
-            Some(Response::Ready)
+            Some(Response::Ready {
+                version: PROTOCOL_VERSION
+            })
         ) {
             return Err(RemoteError::Protocol("invalid shim handshake".into()));
         }
@@ -191,6 +212,7 @@ async fn call_tool(
                     request_id,
                     name,
                     arguments,
+                    capabilities: context.capabilities.iter().collect(),
                 },
                 receiver,
             )
@@ -547,7 +569,7 @@ async fn route_responses<R>(
                     Ok(None)
                 });
             }
-            Response::Ready => {
+            Response::Ready { .. } => {
                 fail_connection(
                     state,
                     RemoteError::Protocol("received a second remote ready response".to_owned()),
@@ -874,6 +896,85 @@ mod tests {
             value: serde_json::json!(value),
             images: Vec::new(),
         })
+    }
+
+    #[tokio::test]
+    async fn tool_wire_preserves_the_exact_noninteractive_caller_capabilities() {
+        let runtime = crate::test_support::TestRuntime::new().await;
+        let mut context = fixture_context(&runtime);
+        context.capabilities = [Capability::Exec, Capability::Targets]
+            .into_iter()
+            .collect();
+        let (input, mut peer) = tokio::io::duplex(4096);
+        let connection = test_connection().await;
+        connection.writer.lock().await.input = Box::new(input);
+        let call = call_tool(
+            &connection,
+            "exec".into(),
+            serde_json::json!({"argv":["true"]}),
+            &context,
+        );
+        let inspect = async {
+            let Request::Tool {
+                request_id,
+                capabilities,
+                ..
+            } = read_frame::<_, Request>(&mut peer).await.unwrap().unwrap()
+            else {
+                panic!("expected tool request")
+            };
+            assert_eq!(
+                capabilities,
+                context.capabilities.iter().collect::<Vec<_>>()
+            );
+            assert!(!capabilities.contains(&Capability::Interactive));
+            assert!(!capabilities.contains(&Capability::Read));
+            connection
+                .state
+                .lock()
+                .await
+                .pending
+                .remove(&request_id)
+                .unwrap()
+                .sender
+                .send(Ok(output("done")))
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(call, inspect);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn incompatible_worker_handshakes_are_rejected() {
+        for reply in [
+            serde_json::json!({"type":"ready"}),
+            serde_json::json!({"type":"ready", "version": PROTOCOL_VERSION - 1}),
+        ] {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let peer = tokio::spawn(async move {
+                assert!(matches!(
+                    read_frame::<_, Request>(&mut server).await.unwrap(),
+                    Some(Request::Hello {
+                        version: PROTOCOL_VERSION
+                    })
+                ));
+                write_frame(&mut server, &reply).await.unwrap();
+            });
+            let (output, input) = tokio::io::split(client);
+            let result = PooledConnection::from_transport(
+                super::super::transport::Transport {
+                    input: Box::new(input),
+                    output: Box::new(output),
+                    owner: Box::new(()),
+                },
+                "test",
+                AuthorizationCoordinator::new(Arc::new(crate::tool::policy::AllowAll)),
+                Arc::new(crate::remote::RejectSensitivePrompts),
+            )
+            .await;
+            assert!(result.is_err());
+            peer.await.unwrap();
+        }
     }
 
     #[tokio::test]

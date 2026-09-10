@@ -517,13 +517,21 @@ mod factory_tests {
                 let shim = tokio::spawn(async move {
                     if !matches!(
                         read_frame::<_, Request>(&mut shim).await,
-                        Ok(Some(Request::Hello))
+                        Ok(Some(Request::Hello { .. }))
                     ) {
                         return;
                     }
                     hello.add_permits(1);
                     ready.acquire().await.unwrap().forget();
-                    if write_frame(&mut shim, &Response::Ready).await.is_err() {
+                    if write_frame(
+                        &mut shim,
+                        &Response::Ready {
+                            version: super::super::protocol::PROTOCOL_VERSION,
+                        },
+                    )
+                    .await
+                    .is_err()
+                    {
                         return;
                     }
                     while let Ok(Some(_)) = read_frame::<_, Request>(&mut shim).await {}

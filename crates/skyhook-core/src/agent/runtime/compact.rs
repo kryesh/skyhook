@@ -342,7 +342,14 @@ impl SessionRuntime {
             correlation: input.correlation.clone(),
         };
         input.messages.push(Message::User(vec![
-            prompt::runtime_state_content(&self.jobs, &self.todos, agent, turn.capabilities).await,
+            prompt::runtime_state_content(
+                &self.jobs,
+                &self.todos,
+                agent,
+                turn.capabilities,
+                turn.location,
+            )
+            .await,
         ]));
         let before_tokens = compaction::estimate_request(&input);
         // Keep only the original template for the post-compaction estimate.
@@ -580,6 +587,7 @@ impl SessionRuntime {
             agent,
             turn.capabilities,
             continuation.todos.clone(),
+            turn.location,
         )
         .await;
         compacted.messages.push(Message::User(vec![runtime]));

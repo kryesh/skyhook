@@ -107,7 +107,6 @@ impl AgentSender {
         self.sender.capacity()
     }
 
-    #[cfg(test)]
     pub(super) async fn closed(&self) {
         self.sender.closed().await
     }

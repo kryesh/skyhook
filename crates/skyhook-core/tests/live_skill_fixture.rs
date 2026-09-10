@@ -83,6 +83,7 @@ async fn live_skill_tool_images() {
             base_url,
             api,
             api_key_env,
+            api_key_command,
             chat_reasoning_replay,
             startup_timeout_secs,
             read_idle_timeout_secs,
@@ -98,12 +99,14 @@ async fn live_skill_tool_images() {
                     .map(std::time::Duration::from_secs)
                     .unwrap_or(defaults.read_idle),
             };
-            Arc::new(
-                openai_compatible(&profile.provider, base_url, *api, key)
-                    .unwrap()
-                    .with_timeouts(timeouts)
-                    .with_chat_reasoning_replay(chat_reasoning_replay.unwrap_or_default()),
-            )
+            let mut provider = openai_compatible(&profile.provider, base_url, *api, key)
+                .unwrap()
+                .with_timeouts(timeouts)
+                .with_chat_reasoning_replay(chat_reasoning_replay.unwrap_or_default());
+            if let Some(command) = api_key_command {
+                provider = provider.with_api_key_command(command.clone());
+            }
+            Arc::new(provider)
         }
         _ => panic!("unexpected provider"),
     };

@@ -1,8 +1,11 @@
+mod dotenv;
 mod embedded_shims;
+mod headless;
 mod interaction;
+mod launch;
 mod tui;
 use clap::{Parser, Subcommand, ValueEnum};
-use skyhook::identity::SessionId;
+use skyhook::{identity::SessionId, tool::policy::Capability};
 use std::path::PathBuf;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -30,15 +33,45 @@ struct Args {
     /// Approve every tool invocation without prompting.
     #[arg(long)]
     approve_all: bool,
+    /// Run without terminal interaction; requires --prompt or --script.
+    #[arg(long, requires = "input")]
+    non_interactive: bool,
+    /// Exact comma-separated capability allowlist (an empty value disables all).
+    #[arg(long, value_name = "LIST", value_parser = parse_capabilities)]
+    capabilities: Option<Capabilities>,
     /// Attach images to the first prompt.
-    #[arg(long = "image", requires = "prompt")]
+    #[arg(long = "image", requires = "prompt", conflicts_with = "script")]
     images: Vec<PathBuf>,
-    /// Open the interface and submit this initial prompt.
-    #[arg(short, long, conflicts_with = "script")]
+    /// Submit this initial prompt.
+    #[arg(short, long, conflicts_with = "script", group = "input")]
     prompt: Option<String>,
-    /// Open the interface and run this JavaScript workflow.
-    #[arg(short, long, value_name = "PATH", conflicts_with = "prompt")]
+    /// Run this JavaScript workflow.
+    #[arg(
+        short,
+        long,
+        value_name = "PATH",
+        conflicts_with = "prompt",
+        group = "input"
+    )]
     script: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct Capabilities(Vec<Capability>);
+
+fn parse_capabilities(value: &str) -> Result<Capabilities, String> {
+    if value.is_empty() {
+        return Ok(Capabilities(Vec::new()));
+    }
+    value
+        .split(',')
+        .map(|name| {
+            name.trim()
+                .parse::<Capability>()
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Capabilities)
 }
 
 #[derive(Subcommand)]
@@ -107,8 +140,7 @@ async fn run_auth(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     if std::env::args().nth(1).as_deref() == Some("--askpass") {
         let Some(socket) = std::env::var_os("SKYHOOK_ASKPASS_SOCKET") else {
             std::process::exit(1)
@@ -122,10 +154,71 @@ async fn main() {
         }
         return;
     }
-    let mut args = Args::parse();
+    // Clap normally prints parse errors. Machine-mode failures are silent even
+    // before a session exists; explicit help/version retain their normal output.
+    let cli: Vec<_> = std::env::args_os().collect();
+    let silent = cli
+        .iter()
+        .skip(1)
+        .take_while(|arg| arg.as_os_str() != "--")
+        .any(|arg| {
+            arg == "--non-interactive"
+                || arg
+                    .to_str()
+                    .is_some_and(|arg| arg.starts_with("--non-interactive="))
+        });
+    let args = match Args::try_parse_from(cli) {
+        Ok(args) => args,
+        Err(error) => {
+            if !silent
+                || matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                )
+            {
+                error.exit();
+            }
+            std::process::exit(2);
+        }
+    };
+    if args.non_interactive && args.command.is_some() {
+        std::process::exit(2);
+    }
+    // SAFETY: startup is still single-threaded: no Tokio runtime, terminal,
+    // tracing subscriber, provider, or background worker has been started.
+    // Parse Clap first so help/version do not depend on a valid .env file.
+    if let Err(error) = unsafe { dotenv::load_invocation_env() } {
+        if !args.non_interactive {
+            eprintln!("skyhook: {error}");
+        }
+        std::process::exit(1);
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            if !args.non_interactive {
+                eprintln!("skyhook: could not start async runtime");
+            }
+            std::process::exit(1);
+        }
+    };
+    runtime.block_on(run(args));
+}
+
+async fn run(mut args: Args) {
     if let Some(Command::Auth { command }) = args.command.take() {
         if let Err(error) = run_auth(command).await {
             eprintln!("skyhook auth: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.non_interactive {
+        // Do not install any terminal, renderer, or tracing subscriber here.
+        if headless::run(args).await.is_err() {
             std::process::exit(1);
         }
         return;
@@ -171,5 +264,46 @@ mod auth_cli_tests {
                 .command
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod headless_cli_tests {
+    use super::*;
+
+    #[test]
+    fn headless_requires_exactly_one_input() {
+        assert!(Args::try_parse_from(["skyhook", "--non-interactive"]).is_err());
+        assert!(
+            Args::try_parse_from(["skyhook", "--non-interactive", "-p", "hello"])
+                .unwrap()
+                .non_interactive
+        );
+        assert!(Args::try_parse_from(["skyhook", "--non-interactive", "-s", "run.js"]).is_ok());
+        assert!(
+            Args::try_parse_from([
+                "skyhook",
+                "--non-interactive",
+                "-p",
+                "hello",
+                "-s",
+                "run.js"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn capability_allowlist_accepts_empty_and_rejects_unknown_names() {
+        let empty = Args::try_parse_from(["skyhook", "--capabilities="]).unwrap();
+        assert!(empty.capabilities.unwrap().0.is_empty());
+        let selected =
+            Args::try_parse_from(["skyhook", "--capabilities", "read,exec,targets"]).unwrap();
+        assert_eq!(
+            selected.capabilities.unwrap().0,
+            vec![Capability::Read, Capability::Exec, Capability::Targets]
+        );
+        assert!(Args::try_parse_from(["skyhook", "--capabilities", "read,typo"]).is_err());
+        assert!(Args::try_parse_from(["skyhook", "--capabilities", "read,"]).is_err());
     }
 }
