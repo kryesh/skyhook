@@ -82,7 +82,7 @@ async fn response_body_payloads_are_truncated_but_full_output_is_retrievable() {
             .execute_model(
                 runtime.agent.clone(),
                 "fetch",
-                json!({"url":url, "response_format":format}),
+                json!({"url":url, "response_format":format, "include_headers":true}),
                 None,
             )
             .await
@@ -190,6 +190,7 @@ fn defaults_validation_and_schemas() {
     assert_eq!(a.max_bytes, DEFAULT_MAX_BYTES);
     assert_eq!(a.max_redirects, 5);
     assert!(!a.insecure);
+    assert!(!a.include_headers);
     assert_eq!(a.redirects, RedirectPolicy::Safe);
     for value in [
         json!({"url":"file:///etc/passwd"}),
@@ -290,7 +291,7 @@ async fn http_errors_query_repeated_headers_and_auth() {
     )])
     .await;
     let runtime = crate::test_support::TestRuntime::new().await;
-    let result = executor(&runtime).execute(runtime.agent.clone(), "fetch", json!({"url":format!("{url}/p?z=0"),"query":[["q","a b"],["q","c"]], "headers":{"x-repeat":["one","two"]},"auth":{"kind":"basic","username":"u","password":"p"}}), None).await.unwrap();
+    let result = executor(&runtime).execute(runtime.agent.clone(), "fetch", json!({"url":format!("{url}/p?z=0"),"query":[["q","a b"],["q","c"]], "include_headers":true, "headers":{"x-repeat":["one","two"]},"auth":{"kind":"basic","username":"u","password":"p"}}), None).await.unwrap();
     let output = result.output.value;
     assert_eq!(output["status"], 404);
     assert_eq!(output["ok"], false);
@@ -492,7 +493,7 @@ async fn extraction_failure_preserves_executed_response_metadata() {
         .execute(
             runtime.agent.clone(),
             "fetch",
-            json!({"url":url,"method":"POST","text":true}),
+            json!({"url":url,"method":"POST","text":true,"include_headers":true}),
             None,
         )
         .await

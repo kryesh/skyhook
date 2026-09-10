@@ -436,6 +436,7 @@ impl Decoder {
             return Err(ProviderError::protocol("Chat data received after [DONE]"));
         }
         if let Some(name) = event.event.as_deref()
+            && !name.is_empty()
             && name != "message"
             && name != "error"
         {
@@ -459,6 +460,19 @@ impl Decoder {
         {
             return Err(super::errors::classify_error(None, &value));
         }
+        // Serde structs can deserialize positional arrays. Wire chunks, choices,
+        // and usage must be objects even when absent/null containers are allowed.
+        if !value.is_object()
+            || value
+                .get("choices")
+                .and_then(Value::as_array)
+                .is_some_and(|choices| choices.iter().any(|choice| !choice.is_object()))
+            || value
+                .get("usage")
+                .is_some_and(|usage| !usage.is_null() && !usage.is_object())
+        {
+            return Err(ProviderError::protocol("Invalid Chat chunk shape"));
+        }
         let wire::Chunk {
             object,
             choices,
@@ -478,9 +492,9 @@ impl Decoder {
         }
         let mut chunks = Vec::new();
         if let Some(choice) = choices.first() {
-            if self.finish_reason.is_some() {
+            if choice.message.is_some() || choice.text.is_some() {
                 return Err(ProviderError::protocol(
-                    "Chat choice received after finish_reason",
+                    "Expected Chat streaming delta, not full output",
                 ));
             }
             if !matches!(
@@ -491,7 +505,18 @@ impl Decoder {
                     "Chat choice index must be zero or absent",
                 ));
             }
-            self.delta(&choice.delta, &mut chunks)?;
+            if self.finish_reason.is_some() {
+                // Generation has ended, but the stream may still carry metadata,
+                // usage, or repeated empty choice envelopes. Ignore only deltas
+                // that carry no output, independently of the provider or usage.
+                if !choice.delta.is_noop() {
+                    return Err(ProviderError::protocol(
+                        "Chat output received after finish_reason",
+                    ));
+                }
+            } else {
+                self.delta(&choice.delta, &mut chunks)?;
+            }
             if let Some(reason) = choice.finish_reason.as_deref() {
                 let stop_reason = match reason {
                     "stop" => StopReason::EndTurn,
@@ -508,14 +533,20 @@ impl Decoder {
                         return Err(ProviderError::protocol("Unsupported Chat finish_reason"));
                     }
                 };
-                self.end_blocks(
-                    &mut chunks,
-                    matches!(
-                        stop_reason,
-                        StopReason::MaxTokens | StopReason::Aborted | StopReason::ContentFilter
-                    ),
-                )?;
-                self.finish_reason = Some(stop_reason);
+                if let Some(previous) = &self.finish_reason {
+                    if previous != &stop_reason {
+                        return Err(ProviderError::protocol("Conflicting Chat finish_reason"));
+                    }
+                } else {
+                    self.end_blocks(
+                        &mut chunks,
+                        matches!(
+                            stop_reason,
+                            StopReason::MaxTokens | StopReason::Aborted | StopReason::ContentFilter
+                        ),
+                    )?;
+                    self.finish_reason = Some(stop_reason);
+                }
             }
         }
         if let Some(usage) = usage {
@@ -532,9 +563,9 @@ impl Decoder {
             self.raw_prompt_tokens = prompt;
             self.usage = usage;
             chunks.push(ResponseChunk::UsageUpdated { usage });
-        } else if choices.is_empty() {
-            return Err(ProviderError::protocol("Empty Chat choices without usage"));
         }
+        // Chunks without choices or usage are metadata/keepalives, not a
+        // completion signal. finish_reason is still required at EOF or [DONE].
         Ok(chunks)
     }
 
@@ -543,6 +574,9 @@ impl Decoder {
         delta: &wire::Delta,
         chunks: &mut Vec<ResponseChunk>,
     ) -> Result<(), ProviderError> {
+        if delta.is_noop() {
+            return Ok(());
+        }
         // Null placeholders carry no semantics; reject non-null unknown fields
         // rather than silently losing audio, legacy function_call, etc.
         if delta.extra.values().any(|value| !value.is_null()) {

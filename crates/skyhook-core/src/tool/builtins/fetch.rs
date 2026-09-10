@@ -68,8 +68,12 @@ pub(super) struct FetchArgs {
     /// Appends to the URL query.
     #[serde(default)]
     pub query: Vec<(String, String)>,
+    /// Request headers to send.
     #[serde(default)]
     pub headers: BTreeMap<String, HeaderValues>,
+    /// Include response headers in the result (omitted by default).
+    #[serde(default)]
+    pub include_headers: bool,
     pub body: Option<RequestBody>,
     pub auth: Option<Auth>,
     /// Extract readable HTML text.
@@ -156,7 +160,9 @@ pub(super) struct FetchOutput {
     ok: bool,
     url: String,
     method: String,
-    headers: BTreeMap<String, Vec<String>>,
+    /// Response headers, present only when include_headers is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headers: Option<BTreeMap<String, Vec<String>>>,
     redirects: Vec<Redirect>,
     body: ResponseBody,
     /// Decoded entity bytes received (before text extraction).
@@ -624,6 +630,7 @@ async fn execute(
                 &method,
                 &redirects,
                 started,
+                args.include_headers,
             ));
         }
         let location = location.to_str().map_err(|_| {
@@ -633,6 +640,7 @@ async fn execute(
                 &method,
                 &redirects,
                 started,
+                args.include_headers,
             )
         })?;
         let next = url.join(location).map_err(|_| {
@@ -642,6 +650,7 @@ async fn execute(
                 &method,
                 &redirects,
                 started,
+                args.include_headers,
             )
         })?;
         let mut next = parse_url(next.as_str()).map_err(|_| {
@@ -651,6 +660,7 @@ async fn execute(
                 &method,
                 &redirects,
                 started,
+                args.include_headers,
             )
         })?;
         next.set_fragment(None);
@@ -661,6 +671,7 @@ async fn execute(
                 &method,
                 &redirects,
                 started,
+                args.include_headers,
             ));
         }
         let (next_method, drop_body) = redirect_method(status, &method);
@@ -679,7 +690,9 @@ async fn execute(
         method = next_method;
     };
     let status = response.status();
-    let response_headers = collect_headers(response.headers());
+    let response_headers = args
+        .include_headers
+        .then(|| collect_headers(response.headers()));
     let content_type = response
         .headers()
         .get("content-type")
@@ -796,13 +809,14 @@ fn redirect_error(
     method: &Method,
     redirects: &[Redirect],
     started: Instant,
+    include_headers: bool,
 ) -> ToolError {
     let output = FetchOutput {
         status: response.status().as_u16(),
         ok: response.status().is_success(),
         url: response.url().to_string(),
         method: method.to_string(),
-        headers: collect_headers(response.headers()),
+        headers: include_headers.then(|| collect_headers(response.headers())),
         redirects: redirects.to_vec(),
         body: ResponseBody::Empty,
         received_bytes: 0,

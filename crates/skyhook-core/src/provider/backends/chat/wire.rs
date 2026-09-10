@@ -1,12 +1,13 @@
 //! Shared Chat wire shapes, independent of compatible server brands.
 //! Deserialization captures shape; the codec explicitly validates semantics.
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Deserialize)]
 pub(super) struct Chunk {
     pub object: Option<String>,
+    #[serde(default, deserialize_with = "null_default")]
     pub choices: Vec<Choice>,
     pub usage: Option<Usage>,
 }
@@ -27,8 +28,13 @@ pub(super) enum ChoiceIndex {
 pub(super) struct Choice {
     #[serde(default)]
     pub index: ChoiceIndex,
+    #[serde(default, deserialize_with = "null_default")]
     pub delta: Delta,
     pub finish_reason: Option<String>,
+    // These are output in non-streaming Chat / legacy Completions, not metadata.
+    // Capture them so a missing delta cannot silently discard a full answer.
+    pub message: Option<Value>,
+    pub text: Option<Value>,
 }
 
 #[derive(Default, Deserialize)]
@@ -41,6 +47,34 @@ pub(super) struct Delta {
     pub tool_calls: Option<Vec<ToolDelta>>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+impl Delta {
+    /// Whether this delta carries no output. Compatible servers vary between
+    /// omitted, null, and empty placeholders, including repeated assistant roles.
+    /// Never treat an unknown non-null output field as harmless metadata.
+    pub(super) fn is_noop(&self) -> bool {
+        self.role.as_deref().is_none_or(|role| role == "assistant")
+            && [
+                &self.content,
+                &self.refusal,
+                &self.reasoning_content,
+                &self.reasoning,
+            ]
+            .into_iter()
+            .all(|text| text.as_ref().is_none_or(String::is_empty))
+            && self.tool_calls.as_ref().is_none_or(Vec::is_empty)
+            && self.extra.values().all(Value::is_null)
+    }
+}
+
+/// Normalize absent/null containers without forgiving incorrectly typed values.
+fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 #[derive(Deserialize)]

@@ -8,8 +8,8 @@ use serde_json::Value;
 use super::diagnostics::{FetchDiagnostic, FetchErrorKind, FetchPhase, FetchTimeoutKind};
 use super::{FetchArgs, Redirect, ResponseBody, ToolError, ToolOutput, Url, collect_headers};
 
-/// Successful responses retain their existing shape; failures add diagnostics and
-/// only include HTTP response fields when a response actually arrived.
+/// Failures add diagnostics and only include HTTP response fields when a response
+/// actually arrived. Response headers also require explicit opt-in.
 #[derive(Serialize, JsonSchema)]
 pub(super) struct FetchFailureOutput {
     method: String,
@@ -30,7 +30,9 @@ struct FailureResponse {
     status: u16,
     ok: bool,
     url: String,
-    headers: std::collections::BTreeMap<String, Vec<String>>,
+    /// Response headers, present only when include_headers is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headers: Option<std::collections::BTreeMap<String, Vec<String>>>,
     body: ResponseBody,
 }
 
@@ -44,6 +46,7 @@ pub(super) struct FetchProgress {
     response: Option<FailureResponse>,
     proxy_origin: Option<String>,
     connect_timeout_ms: u64,
+    include_headers: bool,
 }
 
 impl FetchProgress {
@@ -58,6 +61,7 @@ impl FetchProgress {
             response: None,
             proxy_origin: args.proxy.as_deref().map(safe_origin),
             connect_timeout_ms: args.connect_timeout.saturating_mul(1000),
+            include_headers: args.include_headers,
         }
     }
 
@@ -76,7 +80,9 @@ impl FetchProgress {
             // Keep HTTP metadata, but never copy secret query parameters into
             // failure URL fields. The original request is already job input.
             url: response.url().origin().ascii_serialization(),
-            headers: collect_headers(response.headers()),
+            headers: self
+                .include_headers
+                .then(|| collect_headers(response.headers())),
             body: ResponseBody::Empty,
         });
     }
@@ -186,6 +192,13 @@ impl FetchProgress {
                     result.entry(key).or_insert(value);
                 }
             }
+        }
+        if !self.include_headers {
+            // Prior structured errors must not reintroduce headers during merging.
+            value
+                .as_object_mut()
+                .expect("fetch failure object")
+                .remove("headers");
         }
         ToolError::with_output(summary, ToolOutput::new(value).with_images(images))
     }

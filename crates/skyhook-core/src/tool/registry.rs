@@ -173,6 +173,8 @@ pub enum ToolPlacement {
 pub enum PathKind {
     Existing,
     Writable,
+    /// A writable path whose parent directories may not exist yet.
+    WritableWithParents,
     Removable,
 }
 

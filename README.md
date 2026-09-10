@@ -923,6 +923,13 @@ errors include it in an `output` field; JavaScript callers can catch the error a
   other APIs replay their compatible native reasoning state automatically. Null optional extension
   fields are tolerated; unsupported
   nonempty semantic fields fail explicitly. Generated image outputs are not supported.
+  Chat streaming compatibility is provider-neutral: absent/null choices and deltas are normalized
+  to empty containers, and metadata-only chunks are harmless before `[DONE]`. After `finish_reason`,
+  usage and no-op deltas (empty/null text, empty tool-call lists, assistant role headers, and null
+  extensions) remain accepted, with or without usage; identical finish reasons are idempotent.
+  Extra envelope, choice, and usage metadata is ignored. Actual post-finish output, conflicting
+  finish reasons, unsupported non-null delta fields, malformed tool calls or usage, and data after
+  `[DONE]` still fail. Metadata never substitutes for a finish reason at EOF or `[DONE]`.
 - Each agent loop owns an `AgentContext`: projected journal history, model profile and request
   template, token accounting, and its provider handle. Codex contexts have separate WebSocket
   connection and continuation state, with shared authentication tokens. Connection setup failures
@@ -1178,6 +1185,13 @@ job has completed; inspect its current status. Waiting does not stop background 
 Do independent work first rather than polling output in a tight loop. Output reads reject the old
 `wait` argument.
 
+### Creating files with `write`
+
+`write({path, content})` atomically creates or replaces a UTF-8 file. Set the optional
+`create_parents: true` to create missing parent directories recursively before writing, for example
+`write({path: "reports/run/summary.md", content: "...", create_parents: true})`.
+It defaults to `false`, so existing calls still fail when a parent directory is missing.
+
 ### HTTP requests with `fetch`
 
 `fetch` is a reqwest-backed HTTP tool, available directly and as `tool.fetch(...)` in scripts.
@@ -1242,8 +1256,10 @@ Do not combine `auth` with an `Authorization` header or embed credentials in URL
 Multipart form-data encoding is not supported. File bodies can set their media type through the
 `Content-Type` request header; they are not interchangeable with multipart uploads.
 
-Responses include final URL/method, status, `ok` (2xx), repeated headers, redirect history,
-received byte count, elapsed time, and a tagged `body`: `text`, `base64`, `file`, or `empty`.
+Responses include final URL/method, status, `ok` (2xx), redirect history, received byte count,
+elapsed time, and a tagged `body`: `text`, `base64`, `file`, or `empty`. Response headers are omitted
+by default; set the optional `include_headers: true` to return them as a map of repeated values.
+`include_headers` defaults to `false` and does not affect the `headers` request-header map.
 JSON responses remain decoded text; scripts can use `JSON.parse(response.body.text)`.
 `response_format` defaults to `auto` (text for textual content, base64 otherwise); `text` forces
 character decoding and `base64` preserves response entity bytes. HTTP decompression is automatic;
@@ -1251,7 +1267,7 @@ these are not raw wire bytes. `save_to` streams to a temporary file and commits 
 of embedding the payload. Errors or cancellation do not replace an existing destination.
 Automatic job presentation may shorten `body.text` and `body.data`, with continuation markers;
 retrieve the complete saved payload using `job_output` fields `/result/body/text` or
-`/result/body/data`. Status, headers, body kind, and other metadata remain intact. JavaScript
+`/result/body/data`. Status, opted-in headers, body kind, and other metadata remain intact. JavaScript
 calls still receive the complete payload for processing.
 
 `text:true` is separate from `response_format:"text"`: it extracts readable article content from
@@ -1286,12 +1302,14 @@ CONNECT failures, and response-processing failures are distinguished when the un
 provide evidence. Otherwise fetch reports a generic transport category; it never infers that a
 firewall caused an error. Diagnostic messages do not copy arbitrary error strings, query strings,
 credentials, headers, or bodies. Failure URL/redirect context is reduced to origins. Received HTTP
-headers retain their normal response semantics and may still contain sensitive response data.
+headers are included only with `include_headers: true`; they retain their normal response semantics
+and may still contain sensitive response data.
 `proxy_origin`, when present, describes an explicit proxy; omission does not rule out an environment
 proxy. Use the job's target for source attribution, and interpret OS codes using the reported platform.
 
 If headers arrived before a failure (including an outer timeout), the failure also retains the
-HTTP status, `ok`, headers, and byte count. Before any response, those HTTP fields are omitted,
+HTTP status, `ok`, and byte count, plus headers when `include_headers: true`. Before any response,
+those HTTP fields are omitted,
 not fabricated. HTTP 4xx/5xx responses still complete normally: a 405 establishes HTTP connectivity,
 not successful ingestion. Permission denial and cancellation retain their separate semantics.
 
@@ -1330,8 +1348,8 @@ All requests require the `network` capability and approval, not just filesystem 
 File uploads additionally require `read`, and downloads require `write`, including paths inside
 the workspace. Loopback and internal-service URLs are supported; this is a general-purpose network
 tool, not an isolated browser or a network sandbox. Returned content is untrusted data.
-There is no ambient shared cookie jar: set `Cookie` explicitly and inspect repeated `Set-Cookie`
-headers when needed. **Arguments, response bodies, and headers can contain secrets and are subject
+There is no ambient shared cookie jar: set `Cookie` explicitly and use `include_headers: true`
+to inspect repeated `Set-Cookie` headers when needed. **Arguments, response bodies, and headers can contain secrets and are subject
 to the normal session/job persistence rules**; do not assume HTTP credentials are omitted from
 session records or that `insecure` makes authentication safer.
 

@@ -203,3 +203,152 @@ async fn cancellation_preserves_destination_and_cleans_temporary_download() {
         "only sessions and original destination should remain: {entries:?}"
     );
 }
+
+#[tokio::test]
+async fn response_headers_are_opt_in_for_http_results_and_failures() {
+    let runtime = crate::test_support::TestRuntime::new().await;
+    let executor = executor(&runtime);
+    let output_schema = serde_json::to_value(schema_for!(FetchResultSchema)).unwrap();
+    let validator = jsonschema::validator_for(&output_schema).unwrap();
+    for include_headers in [None, Some(false), Some(true)] {
+        for (status, extra, options, error_kind) in [
+            ("200 OK", "", json!({}), None),
+            ("404 Not Found", "", json!({}), None),
+            ("200 OK", "", json!({"max_bytes":1}), Some("size_limit")),
+            (
+                "200 OK",
+                "",
+                json!({"text":true}),
+                Some("extraction_failure"),
+            ),
+            (
+                "302 Found",
+                "Location: /again\r\n",
+                json!({"max_redirects":0}),
+                Some("redirect_failure"),
+            ),
+        ] {
+            let (url, task) = server(vec![response(
+                status,
+                &format!(
+                    "Content-Type: application/pdf\r\nX-Result: one\r\nX-Result: two\r\n{extra}"
+                ),
+                "body",
+            )])
+            .await;
+            let mut arguments = options;
+            arguments["url"] = json!(url);
+            arguments["headers"] = json!({"X-Request":["one", "two"]});
+            if let Some(include) = include_headers {
+                arguments["include_headers"] = json!(include);
+            }
+            let result = executor
+                .execute(runtime.agent.clone(), "fetch", arguments, None)
+                .await;
+            let output = if let Some(kind) = error_kind {
+                let output = result.unwrap_err().into_failure().output.unwrap().value;
+                assert_eq!(output["diagnostic"]["error_kind"], kind);
+                output
+            } else {
+                let output = result.unwrap().output.value;
+                assert!(output.get("diagnostic").is_none());
+                assert_eq!(output["body"], json!({"kind":"base64", "data":"Ym9keQ=="}));
+                output
+            };
+            let status: u16 = status.split_whitespace().next().unwrap().parse().unwrap();
+            assert_eq!(output["status"], status);
+            assert_eq!(output["ok"], (200..300).contains(&status));
+            if include_headers == Some(true) {
+                assert_eq!(output["headers"]["x-result"], json!(["one", "two"]));
+                assert_eq!(
+                    output["headers"]["content-type"],
+                    json!(["application/pdf"])
+                );
+            } else {
+                assert!(output.get("headers").is_none(), "{output}");
+            }
+            assert!(validator.is_valid(&output), "{output}");
+            let requests = task.await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].contains("x-request: one\r\nx-request: two"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn transport_failures_have_no_response_headers_even_with_opt_in() {
+    let runtime = crate::test_support::TestRuntime::new().await;
+    let executor = executor(&runtime);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    for include_headers in [None, Some(false), Some(true)] {
+        let mut arguments = json!({"url":url});
+        if let Some(include) = include_headers {
+            arguments["include_headers"] = json!(include);
+        }
+        let error = executor
+            .execute(runtime.agent.clone(), "fetch", arguments, None)
+            .await
+            .unwrap_err();
+        let output = error.into_failure().output.unwrap().value;
+        assert_eq!(output["diagnostic"]["error_kind"], "connection_refused");
+        assert!(output.get("status").is_none());
+        assert!(output.get("headers").is_none());
+    }
+}
+
+#[tokio::test]
+async fn response_body_deadline_preserves_opt_in_headers() {
+    let runtime = crate::test_support::TestRuntime::new().await;
+    let executor = executor(&runtime);
+    for include_headers in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            assert!(socket.read(&mut buffer).await.unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nX-Result: waiting\r\n\r\n")
+                .await
+                .unwrap();
+            // Wait for the client to close after its total deadline.
+            let _ = socket.read(&mut buffer).await;
+        });
+        let mut arguments = json!({"url":url,"timeout":1});
+        if include_headers {
+            arguments["include_headers"] = json!(true);
+        }
+        let error = executor
+            .execute(runtime.agent.clone(), "fetch", arguments, None)
+            .await
+            .unwrap_err();
+        let output = error.into_failure().output.unwrap().value;
+        assert_eq!(output["status"], 200);
+        assert_eq!(output["diagnostic"]["timeout"]["kind"], "total");
+        if include_headers {
+            assert_eq!(output["headers"]["x-result"], json!(["waiting"]));
+        } else {
+            assert!(output.get("headers").is_none());
+        }
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[test]
+fn failure_progress_does_not_restore_headers_from_previous_output_by_default() {
+    let progress = FetchProgress::new(&args(json!({"url":"https://example.org"})));
+    let error = progress.failure(ToolError::with_output(
+        "previous failure",
+        ToolOutput::new(json!({"headers":{"x-result":["hidden"]}, "detail":"retained"})),
+    ));
+    let ToolError::FailedWithOutput { output, .. } = error else {
+        panic!("expected structured failure");
+    };
+    assert!(output.value.get("headers").is_none());
+    assert_eq!(output.value["detail"], "retained");
+}

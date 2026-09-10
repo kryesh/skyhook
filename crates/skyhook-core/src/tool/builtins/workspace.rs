@@ -19,10 +19,13 @@ pub(crate) async fn resolve_for_authorization(
     let path = match kind {
         PathKind::Existing => resolve_existing(workspace, input).await?,
         PathKind::Writable => resolve_writable(workspace, input).await?,
+        PathKind::WritableWithParents => resolve_writable_with_parents(workspace, input).await?,
         PathKind::Removable => resolve_removable(workspace, input).await?,
     };
     let directory = match kind {
-        PathKind::Writable if !fs::try_exists(&path).await? => false,
+        PathKind::Writable | PathKind::WritableWithParents if !fs::try_exists(&path).await? => {
+            false
+        }
         _ => fs::symlink_metadata(&path).await?.is_dir(),
     };
     Ok(ResolvedWorkspacePath { path, directory })
@@ -65,6 +68,37 @@ pub(crate) async fn resolve_writable(
         .file_name()
         .ok_or_else(|| ToolError::Failed("path has no filename".to_owned()))?;
     Ok(parent.join(name))
+}
+
+/// Resolve existing symlinks and parent traversal without creating anything.
+/// Authorization must finish before the write handler creates missing directories.
+pub(crate) async fn resolve_writable_with_parents(
+    workspace: &Path,
+    relative: &str,
+) -> Result<PathBuf, ToolError> {
+    let joined = lexical_path(workspace, relative)?;
+    let mut resolved = PathBuf::new();
+    for component in joined.components() {
+        resolved.push(component.as_os_str());
+        match fs::canonicalize(&resolved).await {
+            Ok(path) => resolved = path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling symlink is not a missing directory. Do not leave an
+                // unresolved link in a path that will be checked by the policy.
+                match fs::symlink_metadata(&resolved).await {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => return Err(error.into()),
+                    Err(error) => return Err(error.into()),
+                }
+                if component == std::path::Component::ParentDir {
+                    resolved.pop();
+                    resolved.pop();
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(resolved)
 }
 
 pub(crate) fn lexical_path(workspace: &Path, relative: &str) -> Result<PathBuf, ToolError> {
