@@ -18,7 +18,7 @@ on `PATH` (or set `CARGO_ZIGBUILD_ZIG_PATH` to its executable):
 ```sh
 zig version
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-cargo install skyhook-agent --locked
+cargo install --git https://github.com/kryesh/skyhook --locked
 ```
 
 `build.rs` uses the `cargo-zigbuild` Rust library with your installed Zig; you do not need to
@@ -749,6 +749,12 @@ Recovery is not a general replay guarantee for provider-hosted side-effecting to
 
 ### Reasoning history and local-server compatibility
 
+Responses and Codex automatically request reasoning summaries (`reasoning.summary = "auto"`),
+even when no model `reasoning` effort is configured. Configuring `reasoning` adds the effort without
+changing that summary request. Skyhook displays the plaintext reasoning or summaries the provider
+exposes; this does not guarantee access to raw OpenAI reasoning. What is returned depends on the
+provider and model, and compatible servers may differ in support for these request fields.
+
 All backends retain returned reasoning and replay state in the session journal. Responses and Codex
 replay native reasoning items (including encrypted state), and Anthropic replays signed thinking or
 redacted-thinking blocks. Native replay is automatic when provider, endpoint, protocol, and model
@@ -927,7 +933,7 @@ errors include it in an `output` field; JavaScript callers can catch the error a
   `ItemStarted`, `BlockStarted`, typed `BlockDelta`, `BlockEnded`, `ItemEnded`, `UsageUpdated`, and
   `ResponseEnded`. Item/block IDs identify content; explicit positions determine its order.
   Start events declare kinds, block ends contain authoritative final content, and item ends attach
-  replay metadata once. Each reasoning summary part is a separate visible block with its own end;
+  replay metadata once. Each readable reasoning part is a separate visible block with its own end;
   encrypted-only reasoning items need not create an empty visible section.
   `ResponseAssembler` validates lifecycles and supplies ordered snapshots to both the runtime and
   observation/UI layers. Cumulative usage snapshots replace earlier values, and response termination

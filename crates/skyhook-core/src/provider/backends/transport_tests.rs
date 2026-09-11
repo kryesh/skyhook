@@ -53,7 +53,17 @@ async fn wire_headers_body_and_eof() {
         "data: one\r\n\r\ndata: two",
     )])
     .await;
-    let body = serde_json::json!({"model":"literal-model","stream":true});
+    let body = super::super::responses::encode(&crate::provider::protocol::ModelRequest {
+        model: "literal-model".into(),
+        system: vec![],
+        messages: vec![],
+        tools: vec![],
+        response_schema: None,
+        reasoning: None,
+        max_output_tokens: None,
+        correlation: None,
+    })
+    .unwrap();
     let mut headers = HeaderMap::new();
     headers.insert("authorization", "Bearer test-key".parse().unwrap());
     let events = post_sse(&client().unwrap(), &url, headers, &body)
@@ -77,10 +87,9 @@ async fn wire_headers_body_and_eof() {
     let requests = task.await.unwrap();
     assert!(requests[0].contains("authorization: Bearer test-key"));
     assert!(requests[0].contains("accept: text/event-stream"));
-    assert_eq!(
-        serde_json::from_str::<Value>(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap(),
-        body
-    );
+    let wire: Value = serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(wire["reasoning"], serde_json::json!({"summary":"auto"}));
+    assert_eq!(wire, body);
 }
 #[tokio::test]
 async fn long_retry_after_and_codex_once_do_not_retry() {

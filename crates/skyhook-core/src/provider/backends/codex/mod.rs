@@ -702,6 +702,10 @@ mod tests {
             })
         )));
         assert!(chunks.iter().any(|chunk| matches!(chunk,
+            Ok(ResponseChunk::BlockEnded {
+                content: crate::provider::protocol::BlockContent::Reasoning { text }, ..
+            }) if text == "summary")));
+        assert!(chunks.iter().any(|chunk| matches!(chunk,
             Ok(ResponseChunk::ItemEnded { replay: Some(replay), .. })
                 if replay.payload["encrypted_content"] == "ciphertext")));
         let session = session.lock().await;
@@ -1118,6 +1122,7 @@ mod tests {
             serde_json::from_str(requests[1].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert!(body.get("previous_response_id").is_none());
         assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(body["reasoning"], json!({"summary":"auto"}));
         assert_eq!(body["input"], expected_input);
         assert_eq!(body["input"][0], reasoning_tool_output()[0]);
         assert_eq!(body["input"][1]["call_id"], body["input"][2]["call_id"]);
@@ -1149,6 +1154,7 @@ mod tests {
             let wire = ws.next().await.unwrap().unwrap().into_text().unwrap();
             let wire: Value = serde_json::from_str(&wire).unwrap();
             assert_eq!(wire["type"], "response.create");
+            assert_eq!(wire["reasoning"], json!({"summary":"auto"}));
             assert!(wire.get("previous_response_id").is_none());
             assert_eq!(wire["input"].as_array().unwrap().len(), 1);
             ws.send(Message::Text(json!({"type":"response.completed","response":{"id":"fresh","status":"completed","output":[]}}).to_string().into())).await.unwrap();

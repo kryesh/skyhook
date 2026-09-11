@@ -1,5 +1,9 @@
 //! Native OpenAI Responses wire codec, shared by HTTP/SSE and Codex WebSocket.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+#[cfg(test)]
+mod compatibility_tests;
+mod normalization;
 
 use serde_json::{Value, json};
 
@@ -103,7 +107,8 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
         }
     }
     let mut body = json!({"model":request.model, "input":input, "stream":true,
-        "store":false, "include":["reasoning.encrypted_content"]});
+        "store":false, "include":["reasoning.encrypted_content"],
+        "reasoning":{"summary":"auto"}});
     if !request.system.is_empty() {
         body["instructions"] = Value::String(
             request
@@ -145,7 +150,7 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
                 "Unsupported Responses reasoning effort: {effort}"
             )));
         }
-        body["reasoning"] = json!({"effort":effort, "summary":"auto"});
+        body["reasoning"]["effort"] = json!(effort);
     }
     if let Some(max) = request.max_output_tokens {
         if max == 0 {
@@ -219,17 +224,7 @@ fn final_parts(item: &Value) -> Result<Vec<BlockContent>, ProviderError> {
                 })
                 .collect()
         }
-        Kind::Reasoning => array(item, "summary")?
-            .iter()
-            .map(|part| {
-                if string(part, "type")? != "summary_text" {
-                    return Err(protocol("unsupported reasoning summary part"));
-                }
-                Ok(BlockContent::Reasoning {
-                    text: string(part, "text")?.into(),
-                })
-            })
-            .collect(),
+        Kind::Reasoning => Ok(reasoning_parts(item)?.into_values().collect()),
         Kind::Function => {
             let arguments = arguments(string(item, "arguments")?)?;
             let id = string(item, "call_id")?;
@@ -246,21 +241,83 @@ fn final_parts(item: &Value) -> Result<Vec<BlockContent>, ProviderError> {
     }
 }
 
-/// A completion snapshot may add native state, but must not erase or rewrite
-/// state already received. Arrays (including summaries) remain authoritative,
-/// indivisible values. This only validates; replay always uses the full snapshot.
+/// Readable content and summaries are independent wire namespaces. Interleaved
+/// internal positions preserve both namespaces without exposing native state.
+fn reasoning_position(position: usize, content: bool) -> Result<usize, ProviderError> {
+    position
+        .checked_mul(2)
+        .and_then(|position| position.checked_add(usize::from(content)))
+        .ok_or_else(|| protocol("reasoning part index overflow"))
+}
+
+fn readable_reasoning(part: &Value, summary: bool) -> Result<&str, ProviderError> {
+    match (summary, string(part, "type")?) {
+        (true, "summary_text") | (false, "reasoning_text" | "output_text") => {}
+        _ => return Err(protocol("unsupported reasoning content part")),
+    }
+    reasoning_text(part)
+}
+
+/// Some readable parts use `reasoning` instead of `text`. Do not guess when
+/// both fields supply conflicting values, or silently accept invalid types.
+fn reasoning_text(value: &Value) -> Result<&str, ProviderError> {
+    let field = |key| match value.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.as_str())),
+        _ => Err(protocol("invalid readable reasoning text")),
+    };
+    match (field("text")?, field("reasoning")?) {
+        (Some(text), None) | (None, Some(text)) => Ok(text),
+        (Some(text), Some(reasoning)) if text == reasoning => Ok(text),
+        _ => Err(protocol("missing or ambiguous readable reasoning text")),
+    }
+}
+
+fn reasoning_parts(item: &Value) -> Result<BTreeMap<usize, BlockContent>, ProviderError> {
+    let mut parts = BTreeMap::new();
+    for (field, content) in [("summary", false), ("content", true)] {
+        let values = match item.get(field) {
+            None | Some(Value::Null) => continue,
+            Some(Value::Array(values)) => values,
+            _ => return Err(protocol(format!("invalid reasoning {field}"))),
+        };
+        for (position, part) in values.iter().enumerate() {
+            parts.insert(
+                reasoning_position(position, content)?,
+                BlockContent::Reasoning {
+                    text: readable_reasoning(part, !content)?.into(),
+                },
+            );
+        }
+    }
+    Ok(parts)
+}
+
+/// Plaintext is reconciled separately against display blocks. Native replay is
+/// always an unchanged received snapshot, not a reconstruction from those blocks.
 fn native_enrichment(previous: &Value, terminal: &Value) -> bool {
-    if previous == terminal || previous.is_null() {
-        return true;
+    fn enrich(previous: &Value, terminal: &Value) -> bool {
+        if previous == terminal || previous.is_null() {
+            return true;
+        }
+        match (previous.as_object(), terminal.as_object()) {
+            (Some(previous), Some(terminal)) => previous.iter().all(|(key, value)| {
+                terminal.get(key).is_some_and(|next| {
+                    (key == "encrypted_content" && value.as_str() == Some("") && next.is_string())
+                        || enrich(value, next)
+                })
+            }),
+            _ => false,
+        }
     }
     match (previous.as_object(), terminal.as_object()) {
         (Some(previous), Some(terminal)) => previous.iter().all(|(key, value)| {
-            terminal.get(key).is_some_and(|next| {
-                // Some streams use an empty ciphertext placeholder until the
-                // final response. Nonempty ciphertext must never be rewritten.
-                (key == "encrypted_content" && value.as_str() == Some("") && next.is_string())
-                    || native_enrichment(value, next)
-            })
+            // Identity aliases are checked by end(); status is lifecycle metadata.
+            matches!(key.as_str(), "summary" | "content" | "id" | "status")
+                || terminal.get(key).is_some_and(|next| {
+                    (key == "encrypted_content" && value.as_str() == Some("") && next.is_string())
+                        || enrich(value, next)
+                })
         }),
         _ => false,
     }
@@ -291,12 +348,12 @@ impl Kind {
         }
     }
     fn part_id(self, position: usize) -> String {
-        let prefix = match self {
-            Self::Text => "content",
-            Self::Reasoning => "summary",
-            Self::Function => "arguments",
-        };
-        format!("{prefix}_{position}")
+        match self {
+            Self::Text => format!("content_{position}"),
+            Self::Reasoning if position.is_multiple_of(2) => format!("summary_{}", position / 2),
+            Self::Reasoning => format!("content_{}", position / 2),
+            Self::Function => format!("arguments_{position}"),
+        }
     }
 }
 
@@ -309,40 +366,16 @@ struct Part {
 
 struct Item {
     native_id: String,
+    aliases: BTreeSet<String>,
+    wire_index: Option<usize>,
     kind: Kind,
     ended: Option<Value>,
     parts: BTreeMap<usize, Part>,
-    // Native reasoning text uses content_index, independently of summary_index.
-    // It is replay state, not a replacement for the user-visible summary.
-    native_reasoning: BTreeMap<usize, Part>,
+    // Snapshot namespace migrations resolve to the original display block ID.
+    reasoning_aliases: BTreeMap<usize, usize>,
     call_id: Option<String>,
     name: Option<String>,
     final_arguments: Option<String>,
-}
-
-fn validate_native_reasoning(item: &Item, native: &Value) -> Result<(), ProviderError> {
-    for (position, streamed) in &item.native_reasoning {
-        let content = native
-            .get("content")
-            .and_then(Value::as_array)
-            .and_then(|content| content.get(*position))
-            .ok_or_else(|| protocol("final reasoning item omitted streamed native text"))?;
-        if string(content, "type")? != "reasoning_text" {
-            return Err(protocol("unsupported native reasoning content"));
-        }
-        let text = string(content, "text")?;
-        if (!streamed.streamed.is_empty() && streamed.streamed != text)
-            || streamed
-                .ended
-                .as_ref()
-                .is_some_and(|done| done != &BlockContent::Reasoning { text: text.into() })
-        {
-            return Err(protocol(
-                "final native reasoning disagrees with streamed text",
-            ));
-        }
-    }
-    Ok(())
 }
 
 pub(crate) struct Decoder {
@@ -395,6 +428,7 @@ impl Decoder {
             return Ok(vec![]);
         }
         if let Some(name) = &event.event
+            && !name.is_empty()
             && name != "message"
             && Some(name.as_str()) != value.get("type").and_then(Value::as_str)
         {
@@ -413,7 +447,12 @@ impl Decoder {
             return Err(protocol("duplicate output item index"));
         }
         let native_id = string(item, "id")?.to_owned();
-        if native_id.is_empty() || self.items.values().any(|old| old.native_id == native_id) {
+        if native_id.is_empty()
+            || self
+                .items
+                .values()
+                .any(|old| old.native_id == native_id || old.aliases.contains(&native_id))
+        {
             return Err(protocol("empty or duplicate output item ID"));
         }
         let item_kind = kind(item)?;
@@ -421,10 +460,12 @@ impl Decoder {
             id,
             Item {
                 native_id: native_id.clone(),
+                aliases: BTreeSet::new(),
+                wire_index: Some(id),
                 kind: item_kind,
                 ended: None,
                 parts: BTreeMap::new(),
-                native_reasoning: BTreeMap::new(),
+                reasoning_aliases: BTreeMap::new(),
                 call_id: item
                     .get("call_id")
                     .and_then(Value::as_str)
@@ -550,8 +591,14 @@ impl Decoder {
             .items
             .get(&id)
             .ok_or_else(|| protocol("end of unstarted output item"))?;
-        if string(native, "id")? != item.native_id || kind(native)? != item.kind {
+        if (string(native, "id")? != item.native_id
+            && !item.aliases.contains(string(native, "id")?))
+            || kind(native)? != item.kind
+        {
             return Err(protocol("final output item identity changed"));
+        }
+        if item.kind == Kind::Reasoning {
+            return self.end_reasoning(id, native, chunks, terminal);
         }
         // A tool may end with partial JSON before the terminal max-token or
         // filter reason arrives. Keep it provisional; an abnormal stop discards
@@ -567,29 +614,9 @@ impl Decoder {
             return Ok(());
         }
         let parts = final_parts(native)?;
-        if terminal
-            || native
-                .get("content")
-                .is_some_and(|content| !content.is_null())
-        {
-            validate_native_reasoning(item, native)?;
-        }
         if let Some(old) = &item.ended {
-            if !terminal || final_parts(old)? != parts {
-                return Err(protocol("duplicate or conflicting final output item"));
-            }
-            if item.kind == Kind::Reasoning && old != native {
-                // The terminal snapshot can supply ciphertext or other native
-                // state absent from output_item.done. Keep that exact snapshot;
-                // never reconstruct signed/encrypted fields from display text.
-                if !native_enrichment(old, native) {
-                    return Err(protocol("conflicting terminal reasoning state"));
-                }
-                chunks.push(ResponseChunk::ItemReplayUpdated {
-                    id: item.native_id.clone(),
-                    replay: reasoning_envelope("responses", &self.model, native.clone()),
-                });
-                self.items.get_mut(&id).expect("checked item").ended = Some(native.clone());
+            if final_parts(old)? != parts {
+                return Err(protocol("conflicting final output item"));
             }
             return Ok(());
         }
@@ -633,6 +660,87 @@ impl Decoder {
         Ok(())
     }
 
+    fn end_reasoning(
+        &mut self,
+        id: usize,
+        native: &Value,
+        chunks: &mut Vec<ResponseChunk>,
+        terminal: bool,
+    ) -> Result<(), ProviderError> {
+        let supplied = reasoning_parts(native)?;
+        let item = &self.items[&id];
+        if let Some(previous) = &item.ended
+            && !native_enrichment(previous, native)
+        {
+            return Err(protocol("conflicting final reasoning state"));
+        }
+        // A migration alias is only valid while the snapshots present one
+        // namespace. Once both are explicit, each needs its own display block.
+        // Retain the original block at its original position: close_part still
+        // rejects any attempt to rewrite text actually received there. The
+        // formerly aliased namespace may now supply its own distinct text.
+        self.items
+            .get_mut(&id)
+            .expect("checked item")
+            .reasoning_aliases
+            .retain(|position, _| {
+                !(supplied.contains_key(position) && supplied.contains_key(&(position ^ 1)))
+            });
+        for (position, content) in &supplied {
+            let item = &self.items[&id];
+            let mut target = item
+                .reasoning_aliases
+                .get(position)
+                .copied()
+                .unwrap_or(*position);
+            if !item.parts.contains_key(&target) && !supplied.contains_key(&(position ^ 1)) {
+                // A snapshot can move the same readable text from summary to
+                // content (or vice versa). Reuse its live block, but do not
+                // collapse independently supplied summary/content namespaces.
+                if let Some(other) = item.parts.get(&(position ^ 1)) {
+                    let text_matches = match content {
+                        BlockContent::Reasoning { text } => other
+                            .ended
+                            .as_ref()
+                            .map_or(other.streamed == *text, |old| old == content),
+                        _ => false,
+                    };
+                    if text_matches {
+                        target = position ^ 1;
+                        self.items
+                            .get_mut(&id)
+                            .expect("checked item")
+                            .reasoning_aliases
+                            .insert(*position, target);
+                    }
+                }
+            }
+            self.close_part(id, target, content.clone(), chunks)?;
+        }
+        // Missing final plaintext is not evidence that live display was wrong.
+        // Close received display locally without adding it to the native replay.
+        let remaining: Vec<_> = self.items[&id]
+            .parts
+            .iter()
+            .filter(|(_, part)| part.ended.is_none())
+            .map(|(position, part)| (*position, part.streamed.clone()))
+            .collect();
+        for (position, text) in remaining {
+            self.close_part(id, position, BlockContent::Reasoning { text }, chunks)?;
+        }
+        let item = self.items.get_mut(&id).expect("checked item");
+        item.ended = Some(native.clone());
+        // Keep the display item open until the terminal snapshot: it may supply
+        // additional readable content absent from output_item.done.
+        if terminal {
+            chunks.push(ResponseChunk::ItemEnded {
+                id: item.native_id.clone(),
+                replay: Some(reasoning_envelope("responses", &self.model, native.clone())),
+            });
+        }
+        Ok(())
+    }
+
     fn validate_arguments(&self, id: usize, text: &str) -> Result<(), ProviderError> {
         let value = arguments(text)?;
         let item = &self.items[&id];
@@ -651,11 +759,16 @@ impl Decoder {
     }
 
     /// Feed a native Responses event (also used by Codex WebSocket transport).
-    pub(crate) fn feed(&mut self, event: Value) -> Result<Vec<ResponseChunk>, ProviderError> {
+    pub(crate) fn feed(&mut self, mut event: Value) -> Result<Vec<ResponseChunk>, ProviderError> {
         if self.completed {
             return Err(protocol("event after terminal response"));
         }
         let mut chunks = Vec::new();
+        let supplied_output_index = event
+            .get("output_index")
+            .map(|_| index(&event, "output_index"))
+            .transpose()?;
+        self.normalize_event(&mut event, &mut chunks)?;
         match string(&event, "type")? {
             "response.created" | "response.in_progress" | "response.queued" => {
                 if !event.get("response").is_some_and(Value::is_object) {
@@ -669,6 +782,7 @@ impl Decoder {
                     event.get("item").ok_or_else(|| protocol("missing item"))?,
                     &mut chunks,
                 )?;
+                self.items.get_mut(&id).expect("started item").wire_index = supplied_output_index;
             }
             "response.output_item.done" => {
                 let id = index(&event, "output_index")?;
@@ -688,41 +802,27 @@ impl Decoder {
                     &mut chunks,
                 )?;
             }
-            // OpenAI's ResponseReasoningText{Delta,Done}Event uses a separate
-            // content_index and is finalized in ResponseReasoningItem.content.
             "response.reasoning_text.delta" | "response.reasoning_text.done" => {
                 let id = self.active(&event, Kind::Reasoning)?;
-                let position = index(&event, "content_index")?;
-                let part = self
-                    .items
-                    .get_mut(&id)
-                    .expect("checked item")
-                    .native_reasoning
-                    .entry(position)
-                    .or_default();
+                let position = reasoning_position(index(&event, "content_index")?, true)?;
                 if string(&event, "type")?.ends_with(".delta") {
-                    if part.ended.is_some() {
-                        return Err(protocol("native reasoning delta after done"));
-                    }
-                    part.streamed.push_str(string(&event, "delta")?);
+                    self.delta(id, position, string(&event, "delta")?, &mut chunks)?;
                 } else {
-                    let text = string(&event, "text")?;
-                    let final_content = BlockContent::Reasoning { text: text.into() };
-                    if (!part.streamed.is_empty() && part.streamed != text)
-                        || part.ended.as_ref().is_some_and(|old| old != &final_content)
-                    {
-                        return Err(protocol(
-                            "native reasoning done disagrees with streamed text",
-                        ));
-                    }
-                    part.ended = Some(final_content);
+                    self.close_part(
+                        id,
+                        position,
+                        BlockContent::Reasoning {
+                            text: reasoning_text(&event)?.into(),
+                        },
+                        &mut chunks,
+                    )?;
                 }
             }
             "response.reasoning_summary_text.delta" => {
                 let id = self.active(&event, Kind::Reasoning)?;
                 self.delta(
                     id,
-                    index(&event, "summary_index")?,
+                    reasoning_position(index(&event, "summary_index")?, false)?,
                     string(&event, "delta")?,
                     &mut chunks,
                 )?;
@@ -777,6 +877,11 @@ impl Decoder {
                         "content_index"
                     },
                 )?;
+                let position = if reasoning {
+                    reasoning_position(position, false)?
+                } else {
+                    position
+                };
                 let text = string(
                     &event,
                     if string(&event, "type")? == "response.refusal.done" {
@@ -795,33 +900,50 @@ impl Decoder {
             }
             "response.content_part.added"
             | "response.content_part.done"
+            | "response.reasoning_part.added"
+            | "response.reasoning_part.done"
             | "response.reasoning_summary_part.added"
             | "response.reasoning_summary_part.done" => {
                 let name = string(&event, "type")?;
-                let reasoning = name.starts_with("response.reasoning_summary_part.");
-                let id = self.active(
-                    &event,
-                    if reasoning {
-                        Kind::Reasoning
-                    } else {
-                        Kind::Text
-                    },
-                )?;
+                let summary = name.starts_with("response.reasoning_summary_part.");
+                let output_index = index(&event, "output_index")?;
+                let expected = if name.starts_with("response.reasoning_") {
+                    Kind::Reasoning
+                } else {
+                    self.items
+                        .get(&output_index)
+                        .ok_or_else(|| protocol("event for an unstarted output item"))?
+                        .kind
+                };
+                if expected == Kind::Function {
+                    return Err(protocol("content part on function item"));
+                }
+                let id = self.active(&event, expected)?;
+                let reasoning = expected == Kind::Reasoning;
                 let position = index(
                     &event,
-                    if reasoning {
+                    if summary {
                         "summary_index"
                     } else {
                         "content_index"
                     },
                 )?;
+                let position = if reasoning {
+                    reasoning_position(position, !summary)?
+                } else {
+                    position
+                };
                 let part = event
                     .get("part")
                     .ok_or_else(|| protocol("missing content part"))?;
-                let text = match (reasoning, string(part, "type")?) {
-                    (true, "summary_text") | (false, "output_text") => string(part, "text")?,
-                    (false, "refusal") => string(part, "refusal")?,
-                    _ => return Err(protocol("unsupported content part")),
+                let text = if reasoning {
+                    readable_reasoning(part, summary)?
+                } else {
+                    match string(part, "type")? {
+                        "output_text" => string(part, "text")?,
+                        "refusal" => string(part, "refusal")?,
+                        _ => return Err(protocol("unsupported content part")),
+                    }
                 }
                 .to_owned();
                 if name.ends_with(".done") {
@@ -855,11 +977,14 @@ impl Decoder {
                 let response = event
                     .get("response")
                     .ok_or_else(|| protocol("missing final response"))?;
-                let truncated = string(&event, "type")? == "response.incomplete";
-                if string(response, "status")? != if truncated { "incomplete" } else { "completed" }
-                {
-                    return Err(protocol("terminal response status disagrees with event"));
-                }
+                // A terminal event ends the stream; its status determines whether
+                // the generation succeeded. Never turn an incomplete snapshot into
+                // a successful tool-bearing response merely because of its tag.
+                let truncated = match string(response, "status")? {
+                    "incomplete" => true,
+                    "completed" if string(&event, "type")? == "response.completed" => false,
+                    _ => return Err(protocol("terminal response status disagrees with event")),
+                };
                 if truncated {
                     let details = response
                         .get("incomplete_details")
@@ -881,26 +1006,47 @@ impl Decoder {
                     && self.items.values().all(|item| {
                         item.ended.is_some() || (truncated && item.kind == Kind::Function)
                     });
-                if !omitted
-                    && self.items.iter().any(|(id, item)| {
-                        *id >= output.len() && !(truncated && item.kind == Kind::Function)
+                // Reserve stable identities before attempting semantic aliases:
+                // a new terminal-only item with equal text must not steal an
+                // existing item that is also explicitly present in the output.
+                let alias_candidates = self
+                    .items
+                    .iter()
+                    .filter_map(|(id, item)| {
+                        let retained = output.iter().any(|native| {
+                            native
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|native_id| {
+                                    native_id == item.native_id || item.aliases.contains(native_id)
+                                })
+                        });
+                        (!retained).then_some(*id)
                     })
-                {
-                    return Err(protocol("terminal response omitted a streamed output item"));
-                }
-                for (id, native) in output.iter().enumerate() {
-                    if !self.items.contains_key(&id) {
-                        self.start(id, native, &mut chunks)?;
+                    .collect();
+                let mut seen = BTreeSet::new();
+                for native in output {
+                    // Stable native IDs take precedence over terminal array
+                    // position. Regenerated IDs require unique semantic evidence.
+                    let id =
+                        self.snapshot_index(native, None, Some(&alias_candidates), &mut chunks)?;
+                    if !seen.insert(id) {
+                        return Err(protocol("duplicate terminal output item"));
                     }
                     if truncated && self.items[&id].kind == Kind::Function {
-                        if string(native, "id")? != self.items[&id].native_id
-                            || kind(native)? != Kind::Function
-                        {
+                        if kind(native)? != Kind::Function {
                             return Err(protocol("final output item identity changed"));
                         }
                         continue;
                     }
                     self.end(id, native, &mut chunks, true)?;
+                }
+                if !omitted
+                    && self.items.iter().any(|(id, item)| {
+                        !seen.contains(id) && !(truncated && item.kind == Kind::Function)
+                    })
+                {
+                    return Err(protocol("terminal response omitted a streamed output item"));
                 }
                 if truncated {
                     // Even syntactically complete tools are unsafe on an
@@ -915,18 +1061,18 @@ impl Decoder {
                         });
                     }
                 }
-                // Codex may omit the terminal output array; its completed item
-                // snapshots must still account for every native text delta.
+                // Reasoning display stays open through item.done so the final
+                // snapshot can supply previously absent readable content. Close
+                // it from its actual received snapshot on omitted-output streams.
                 if omitted {
-                    for item in self.items.values() {
-                        if truncated && item.kind == Kind::Function {
-                            continue;
-                        }
-                        let native = item.ended.as_ref().expect("checked ended");
-                        // Deferred malformed tools must fail on normal stops,
-                        // including Codex's no-output terminal dialect.
-                        final_parts(native)?;
-                        validate_native_reasoning(item, native)?;
+                    let snapshots: Vec<_> = self
+                        .items
+                        .iter()
+                        .filter(|(_, item)| !(truncated && item.kind == Kind::Function))
+                        .map(|(id, item)| (*id, item.ended.clone().expect("checked ended")))
+                        .collect();
+                    for (id, native) in snapshots {
+                        self.end(id, &native, &mut chunks, true)?;
                     }
                 }
                 if let Some(usage) = response.get("usage").filter(|u| !u.is_null()) {
@@ -1214,7 +1360,7 @@ mod tests {
         }
         let (items, _, reason) = assembler.finish().unwrap();
         assert_eq!(reason, StopReason::ToolUse);
-        assert!(items[0].blocks.is_empty());
+        assert_eq!(items[0].blocks.len(), 1);
         req.messages = vec![
             Message::Assistant(items),
             Message::Tool(vec![ToolResult {
@@ -1245,7 +1391,7 @@ mod tests {
                 unreachable!()
             };
             assert_eq!(items.len(), 2);
-            assert!(items[0].blocks.is_empty());
+            assert_eq!(items[0].blocks.len(), 1);
             assert!(items[0].replay.is_none());
             assert_eq!(
                 encode(&foreign).unwrap()["input"],
@@ -1263,12 +1409,12 @@ mod tests {
     }
 
     #[test]
-    fn native_reasoning_text_requires_lossless_final_state_in_both_terminal_dialects() {
+    fn native_reasoning_text_displays_without_requiring_final_plaintext() {
         // Shapes follow openai-python's ResponseReasoningTextDeltaEvent,
         // ResponseReasoningTextDoneEvent, and ResponseReasoningItem.content.
         for codex in [false, true] {
             for (content, valid) in [
-                (None, false),
+                (None, true),
                 (
                     Some(json!([{"type":"reasoning_text", "text":"different"}])),
                     false,
@@ -1290,14 +1436,22 @@ mod tests {
                         .feed(json!({"type":"response.reasoning_text.delta",
                     "output_index":0, "item_id":"rs_1", "content_index":0, "delta":"native"}))
                         .unwrap()
-                        .is_empty()
+                        .iter()
+                        .any(|chunk| matches!(
+                            chunk,
+                            ResponseChunk::BlockStarted { .. } | ResponseChunk::BlockEnded { .. }
+                        ))
                 );
                 assert!(
                     decoder
                         .feed(json!({"type":"response.reasoning_text.done",
                     "output_index":0, "item_id":"rs_1", "content_index":0, "text":"native"}))
                         .unwrap()
-                        .is_empty()
+                        .iter()
+                        .any(|chunk| matches!(
+                            chunk,
+                            ResponseChunk::BlockStarted { .. } | ResponseChunk::BlockEnded { .. }
+                        ))
                 );
                 if let Some(content) = content {
                     native["content"] = content;
@@ -1332,7 +1486,7 @@ mod tests {
             decoder.feed(done(0, old)).unwrap();
             let chunks = decoder.feed(completed(vec![terminal.clone()])).unwrap();
             assert!(chunks.iter().any(|chunk| matches!(chunk,
-                ResponseChunk::ItemReplayUpdated { replay, .. } if replay.payload == terminal)));
+                ResponseChunk::ItemEnded { replay: Some(replay), .. } if replay.payload == terminal)));
         }
         let old = reasoning_item();
         for terminal in [
@@ -1529,13 +1683,31 @@ mod tests {
     }
 
     #[test]
-    fn max_reasoning_effort_is_encoded_without_restricting_model_capabilities() {
+    fn request_always_requests_reasoning_summary_without_defaulting_effort() {
+        let body = encode(&request()).unwrap();
+        assert_eq!(body["reasoning"], json!({"summary":"auto"}));
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
+    fn request_reasoning_effort_is_encoded_without_restricting_model_capabilities() {
         let mut request = request();
-        request.reasoning = Some("max".into());
-        assert_eq!(
-            encode(&request).unwrap()["reasoning"],
-            json!({"effort":"max", "summary":"auto"})
-        );
+        for effort in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            request.reasoning = Some(effort.into());
+            let body = encode(&request).unwrap();
+            assert_eq!(
+                body["reasoning"],
+                json!({"effort":effort, "summary":"auto"})
+            );
+            assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        }
+    }
+
+    #[test]
+    fn request_rejects_unsupported_reasoning_effort() {
+        let mut request = request();
+        request.reasoning = Some("invalid".into());
+        assert!(encode(&request).is_err());
     }
 
     #[test]
@@ -1597,3 +1769,7 @@ mod tests {
         assert!(decoder.feed(completed(vec![])).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "responses/reasoning_tests.rs"]
+mod reasoning_tests;
