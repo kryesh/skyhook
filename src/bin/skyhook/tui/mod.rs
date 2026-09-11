@@ -1,4 +1,5 @@
 mod app;
+mod composer;
 mod editor;
 mod format;
 mod keys;
@@ -204,7 +205,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 app.external_editor = false;
                 drop(input);
                 TerminalGuard::restore();
-                let edited = edit_external(app.editor.text.clone()).await;
+                let edited = edit_external(app.editor.expanded_text()).await;
                 TerminalGuard::activate()?;
                 terminal.clear()?;
                 input = EventStream::new();

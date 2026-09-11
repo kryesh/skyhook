@@ -318,13 +318,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         1
     };
     let prompt_active = app.prompt_active && !app.prompts.is_empty();
-    let editor_lines = draft_lines(&app.editor, width.saturating_sub(4).max(1) as usize, p);
+    let editor_width = width.saturating_sub(4).max(1) as usize;
+    app.editor.set_width(editor_width);
+    let editor_layout = app.editor.layout(editor_width);
+    let editor_lines: Vec<_> = editor_layout
+        .rows
+        .iter()
+        .map(|row| {
+            row.line(
+                Style::default(),
+                Style::default().fg(p.accent),
+                Style::default().bg(p.selected),
+            )
+        })
+        .collect();
     let viewing_child = !app.selected.path().is_empty();
-    let editor_height = (editor_lines.len() as u16
-        + 2
-        + u16::from(!app.images.is_empty() || !app.pastes.is_empty()))
-    .clamp(3, 7)
-    .min(height.saturating_sub(footer_height + 3).max(3));
+    let editor_height = (editor_lines.len() as u16 + 2 + u16::from(!app.images.is_empty()))
+        .clamp(3, 7)
+        .min(height.saturating_sub(footer_height + 3).max(3));
     let composer_height = if prompt_active {
         (app.prompt_options().len() as u16 + 6)
             .clamp(7, 12)
@@ -637,7 +648,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             && app.focus == Focus::Content
             && row.selectable
             && row.entry == selected_entry;
-        let hovered = app.hover.is_some_and(|point| rect.contains(point.into()))
+        let hovered = navigation_active
+            && app.hover.is_some_and(|point| rect.contains(point.into()))
             && entry.is_some_and(|e| e.expandable);
         let bg = if !row.blank
             && selected.is_none()
@@ -817,7 +829,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let selected = agent.id == app.selected;
         let focused = navigation_active && app.focus == Focus::Tree && app.tree_cursor == index;
         let rect = r(2, y, width.saturating_sub(4), 1);
-        let hover = app.hover.is_some_and(|point| rect.contains(point.into()));
+        let hover = navigation_active && app.hover.is_some_and(|point| rect.contains(point.into()));
         let bg = if selected || focused || hover {
             p.selected
         } else {
@@ -884,9 +896,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if prompt_active {
         draw_prompt(frame, app, p);
     } else if !viewing_child {
-        let cursor_prefix = &app.editor.text[..app.editor.cursor];
-        let prefix_lines = wrap_plain(cursor_prefix, width.saturating_sub(4) as usize);
-        let cursor_line = prefix_lines.len().saturating_sub(1);
+        let (cursor_line, cursor_column) = editor_layout.cursor;
         let visible = composer_height.saturating_sub(2) as usize;
         let top = cursor_line.saturating_sub(visible.saturating_sub(1));
         for (i, line) in editor_lines.iter().skip(top).take(visible).enumerate() {
@@ -898,7 +908,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 p.input,
             );
         }
-        if !app.images.is_empty() || !app.pastes.is_empty() {
+        if !app.images.is_empty() {
             text(
                 frame,
                 r(
@@ -915,9 +925,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                             path.file_name().unwrap_or_default().to_string_lossy()
                         )
                     })
-                    .chain(app.pastes.iter().enumerate().map(|(i, paste)| {
-                        format!("[Paste {} · {} lines]", i + 1, paste.lines().count())
-                    }))
                     .collect::<Vec<_>>()
                     .join(" "),
                 p.muted,
@@ -929,7 +936,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ));
         }
         if app.focus == Focus::Composer && app.menu.is_none() && app.search_editor.is_none() {
-            let column = prefix_lines.last().map_or(0, |s| s.width()) as u16;
+            let column = cursor_column as u16;
             frame.set_cursor_position((
                 2 + column.min(width.saturating_sub(4)),
                 composer_y + 1 + (cursor_line - top) as u16,
@@ -1095,7 +1102,11 @@ fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette) {
                 p.input
             },
         );
-        if *index == app.prompt_choice && !cursor_drawn && app.menu.is_none() {
+        if *index == app.prompt_choice
+            && !cursor_drawn
+            && app.menu.is_none()
+            && !(app.multiple_questions() && app.question_editing)
+        {
             focus_cursor(frame, row.x - 1, row.y, p.input);
             cursor_drawn = true;
         }
@@ -1105,7 +1116,20 @@ fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette) {
     let input = if secret {
         "●".repeat(app.prompt_editor.text.graphemes(true).count())
     } else {
-        model::clean(&app.prompt_editor.text)
+        if app.multiple_questions() {
+            if app.question_editing {
+                let cursor = app.prompt_editor.cursor;
+                format!(
+                    "{}▏{}",
+                    model::clean(&app.prompt_editor.text[..cursor]),
+                    model::clean(&app.prompt_editor.text[cursor..])
+                )
+            } else {
+                model::clean(&app.prompt_editor.text)
+            }
+        } else {
+            format!("{}▏", model::clean(&app.prompt_editor.text))
+        }
     };
     let input_label = match app.prompts.front().map(|prompt| &prompt.kind) {
         Some(crate::interaction::PromptKind::Questions { questions, .. }) => {
@@ -1127,7 +1151,7 @@ fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette) {
             rect.width.saturating_sub(4),
             1,
         ),
-        format!("{input_label}{input}▏"),
+        format!("{input_label}{input}{}", if secret { "▏" } else { "" }),
         p.fg,
         p.input,
     );
@@ -1139,7 +1163,24 @@ fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette) {
             rect.width.saturating_sub(4),
             1,
         ),
-        "↑↓ choose · PgUp/PgDn text · Ctrl+PgUp/PgDn choices · Enter submit · Esc dismiss",
+        match app.prompts.front().map(|prompt| &prompt.kind) {
+            Some(crate::interaction::PromptKind::Questions { questions, .. })
+                if questions.len() > 1 && app.question_index < questions.len() =>
+            {
+                format!(
+                    "Question {}/{} · {} · ↑↓ choose · Enter answer · Esc dismiss",
+                    app.question_index + 1,
+                    questions.len(),
+                    if app.question_editing {
+                        "←→ cursor · Tab switch questions"
+                    } else {
+                        "←→ switch · Tab edit"
+                    }
+                )
+            }
+            _ => "↑↓ choose · PgUp/PgDn text · Ctrl+PgUp/PgDn choices · Enter submit · Esc dismiss"
+                .into(),
+        },
         p.muted,
         p.input,
     );
@@ -1148,7 +1189,58 @@ fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette) {
 /// Measure all agents, including off-screen rows, to keep columns stable on scroll.
 struct AgentStatsColumns([usize; 3]);
 
+const AGENT_STATS_HEADERS: [&str; 3] = ["Output", "Input (uncached)", "Context"];
+
 impl AgentStatsColumns {
+    fn menu<'a>(rows: impl IntoIterator<Item = &'a [String; 3]>, width: u16) -> Self {
+        let mut columns = Self::new(rows);
+        for (column, header) in columns.0.iter_mut().zip(AGENT_STATS_HEADERS) {
+            *column = (*column).max(header.width());
+        }
+        // Keep all three columns visible on narrow terminals. Headers and values
+        // wrap within the same columns instead of clipping away token fields.
+        let available = usize::from(width.saturating_sub(6));
+        while columns.0.iter().sum::<usize>() > available {
+            let largest = (0..3).max_by_key(|&index| columns.0[index]).unwrap();
+            columns.0[largest] = columns.0[largest].saturating_sub(1);
+        }
+        columns
+    }
+
+    fn wrapped(value: &str, width: usize) -> Vec<String> {
+        wrap_words(Line::from(value.to_owned()), width.max(1))
+            .into_iter()
+            .map(|line| line.to_string().trim_end().to_owned())
+            .collect()
+    }
+
+    fn wrapped_height(&self, row: &[String; 3]) -> usize {
+        row.iter()
+            .zip(self.0)
+            .map(|(value, width)| Self::wrapped(value, width).len())
+            .max()
+            .unwrap_or(1)
+    }
+
+    fn draw(&self, frame: &mut Frame, rect: Rect, row: &[String; 3], fg: Color, bg: Color) {
+        let mut x = rect.x;
+        for (value, width) in row.iter().zip(self.0) {
+            for (line, value) in Self::wrapped(value, width).into_iter().enumerate() {
+                if line >= usize::from(rect.height) {
+                    break;
+                }
+                text(
+                    frame,
+                    r(x, rect.y + line as u16, width as u16, 1),
+                    format!("{}{value}", " ".repeat(width.saturating_sub(value.width()))),
+                    fg,
+                    bg,
+                );
+            }
+            x += width as u16 + 3;
+        }
+    }
+
     fn new<'a>(rows: impl IntoIterator<Item = &'a [String; 3]>) -> Self {
         let mut widths = [0; 3];
         for row in rows {
@@ -1270,7 +1362,13 @@ fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
     app.refresh_agent_menu();
     let Some(menu) = &app.menu else { return };
     let area = app.content_rect;
-    let margin = 7.min(area.width.saturating_sub(20) / 2);
+    // Leave enough room for whole header words before spending space on margins.
+    let minimum_width = if matches!(menu.kind, MenuKind::Agents) {
+        31
+    } else {
+        20
+    };
+    let margin = 7.min(area.width.saturating_sub(minimum_width) / 2);
     let width = area.width.saturating_sub(margin * 2);
     let rect = r(area.x + margin, area.y, width, area.height);
     fill(frame, rect, p.input);
@@ -1299,23 +1397,48 @@ fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
     } else {
         Vec::new()
     };
-    let stats_columns = AgentStatsColumns::new(agent_stats.iter());
+    let stats_columns = AgentStatsColumns::menu(agent_stats.iter(), width.saturating_sub(2));
     let stats_width = stats_columns.width();
+    let headers = AGENT_STATS_HEADERS.map(String::from);
+    let header_height = if agent_menu {
+        stats_columns.wrapped_height(&headers) as u16
+    } else {
+        0
+    };
+    let stats_height = agent_stats
+        .iter()
+        .map(|row| stats_columns.wrapped_height(row))
+        .max()
+        .unwrap_or(1);
     // Match the inline tree's aligned status/token columns. On narrow screens,
-    // use a second line so the picker still exposes both status and token usage.
+    // use additional lines so the picker still exposes status and every token field.
     let compact_agents = agent_menu && width.saturating_sub(2) < stats_width + 50;
     let stacked_stats = compact_agents && width.saturating_sub(2) < stats_width + 30;
     let row_height = if stacked_stats {
-        3
+        2 + stats_height
     } else if compact_agents {
-        2
+        1 + stats_height
     } else {
         1
     };
-    let height = rect.height.saturating_sub(3) as usize / row_height;
+    if agent_menu && stats_width <= width.saturating_sub(2) {
+        stats_columns.draw(
+            frame,
+            r(
+                rect.right() - 1 - stats_width,
+                rect.y + 2,
+                stats_width,
+                header_height.min(rect.height.saturating_sub(2)),
+            ),
+            &headers,
+            p.muted,
+            p.input,
+        );
+    }
+    let height = rect.height.saturating_sub(3 + header_height) as usize / row_height;
     let top = menu.selected.saturating_sub(height.saturating_sub(1));
     for (i, item) in items.iter().enumerate().skip(top).take(height) {
-        let y = rect.y + 2 + ((i - top) * row_height) as u16;
+        let y = rect.y + 2 + header_height + ((i - top) * row_height) as u16;
         let selected = i == menu.selected;
         let bg = if selected { p.selected } else { p.input };
         let row = r(rect.x + 1, y, width.saturating_sub(2), 1);
@@ -1329,11 +1452,7 @@ fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
                 let (running, status) = app.agent_status(agent);
                 app.animating |= running;
                 let symbol = agent_symbol(running, &status, agent.terminal, app.tick_count);
-                let stats = stats_columns.format(&model::agent_footer_stats(
-                    &app.snapshot,
-                    &app.projection,
-                    &agent.id,
-                ));
+                let stats = model::agent_footer_stats(&app.snapshot, &app.projection, &agent.id);
                 let target = model::target_suffix(&agent.target);
                 let indent = (agent.id.depth() as u16 * 4).min(row.width / 3);
                 let name_width = if compact_agents {
@@ -1377,15 +1496,15 @@ fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
                     bg,
                 );
                 if stats_width <= row.width {
-                    text(
+                    stats_columns.draw(
                         frame,
                         r(
                             row.right() - stats_width,
                             status_row.y + u16::from(stacked_stats),
                             stats_width,
-                            1,
+                            stats_height as u16,
                         ),
-                        stats,
+                        &stats,
                         p.muted,
                         bg,
                     );
@@ -1408,7 +1527,12 @@ fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
     if items.is_empty() && !matches!(menu.kind, MenuKind::Attach | MenuKind::OutputSearch(_)) {
         text(
             frame,
-            r(rect.x + 1, rect.y + 2, width.saturating_sub(2), 1),
+            r(
+                rect.x + 1,
+                rect.y + 2 + header_height,
+                width.saturating_sub(2),
+                1,
+            ),
             "No matching entries",
             p.muted,
             p.input,
@@ -1694,30 +1818,6 @@ pub fn wrap_plain(text: &str, width: usize) -> Vec<String> {
         .map(|line| line.to_string())
         .collect()
 }
-fn draft_lines(editor: &super::editor::Editor, width: usize, p: Palette) -> Vec<Line<'static>> {
-    let selection = editor
-        .anchor
-        .map(|anchor| anchor.min(editor.cursor)..anchor.max(editor.cursor));
-    let mut lines = Vec::new();
-    let mut spans = Vec::new();
-    for (offset, grapheme) in editor.text.grapheme_indices(true) {
-        if grapheme == "\n" {
-            lines.extend(wrap_line(Line::from(std::mem::take(&mut spans)), width));
-            continue;
-        }
-        let style = if selection
-            .as_ref()
-            .is_some_and(|range| range.contains(&offset))
-        {
-            Style::default().bg(p.selected)
-        } else {
-            Style::default()
-        };
-        spans.push(Span::styled(grapheme.to_owned(), style));
-    }
-    lines.extend(wrap_line(Line::from(spans), width));
-    lines
-}
 fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     let mut result = Vec::new();
     let mut spans = Vec::new();
@@ -1848,6 +1948,78 @@ fn clipped_header(value: &str, width: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agents_palette_stats_headers_align_and_wrap_with_their_values() {
+        let headers = AGENT_STATS_HEADERS.map(String::from);
+        let values = ["12345".into(), "56789(12345)".into(), "54321".into()];
+        for width in [100, 44, 30, 20] {
+            let columns = AgentStatsColumns::menu([&values], width);
+            assert!(columns.width() <= width);
+            let header_height = columns.wrapped_height(&headers) as u16;
+            let value_height = columns.wrapped_height(&values) as u16;
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+                width,
+                header_height + value_height,
+            ))
+            .unwrap();
+            let p = Palette::new(false);
+            terminal
+                .draw(|frame| {
+                    columns.draw(
+                        frame,
+                        r(0, 0, width, header_height),
+                        &headers,
+                        p.muted,
+                        p.input,
+                    );
+                    columns.draw(
+                        frame,
+                        r(0, header_height, width, value_height),
+                        &values,
+                        p.muted,
+                        p.input,
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut x = 0;
+            for (index, column_width) in columns.0.iter().enumerate() {
+                let read_column = |y, height| {
+                    (y..y + height)
+                        .map(|y| {
+                            (x..x + *column_width as u16)
+                                .map(|x| buffer[(x, y)].symbol())
+                                .collect::<String>()
+                                .trim()
+                                .to_owned()
+                        })
+                        .collect::<String>()
+                };
+                assert_eq!(
+                    read_column(0, header_height).replace(' ', ""),
+                    headers[index].replace(' ', "")
+                );
+                assert_eq!(read_column(header_height, value_height), values[index]);
+                x += *column_width as u16 + 3;
+            }
+            if width >= 44 {
+                assert_eq!(header_height, 1);
+                assert_eq!(value_height, 1);
+                assert!(
+                    columns
+                        .0
+                        .iter()
+                        .zip(&headers)
+                        .all(|(width, header)| *width >= header.width())
+                );
+            }
+        }
+        assert_eq!(
+            AgentStatsColumns::wrapped("Input (uncached)", 10),
+            ["Input", "(uncached)"]
+        );
+    }
 
     #[test]
     fn request_rows_reserve_spinner_gutter_and_show_unlabelled_statistics() {

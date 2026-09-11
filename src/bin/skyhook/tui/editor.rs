@@ -15,10 +15,6 @@ impl Drop for Editor {
     }
 }
 impl Editor {
-    pub fn selected_text(&self) -> Option<&str> {
-        self.anchor
-            .map(|anchor| &self.text[anchor.min(self.cursor)..anchor.max(self.cursor)])
-    }
     pub fn clear_sensitive(&mut self) {
         use zeroize::Zeroize;
         self.text.zeroize();
@@ -54,12 +50,6 @@ impl Editor {
         self.selection();
         self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
-    }
-    pub fn take(&mut self) -> String {
-        self.save();
-        self.cursor = 0;
-        self.anchor = None;
-        std::mem::take(&mut self.text)
     }
     /// Transfer a secret without making an undo copy, and wipe its editing history.
     pub fn take_sensitive(&mut self) -> skyhook::remote::SecretValue {
@@ -239,12 +229,12 @@ mod tests {
                     editor.handle(KeyEvent::new(KeyCode::Left, M::SHIFT));
                 }
                 editor.handle(KeyEvent::new(KeyCode::Char(shortcut), M::CONTROL));
-                assert_eq!(editor.selected_text(), None);
+                assert_eq!(editor.anchor, None);
                 editor.insert("x");
                 editor.handle(KeyEvent::new(KeyCode::Char('-'), M::CONTROL));
                 editor.handle(KeyEvent::new(KeyCode::Char('-'), M::CONTROL));
                 assert_eq!(editor.text, text);
-                assert_eq!(editor.selected_text(), None);
+                assert_eq!(editor.anchor, None);
             }
         }
     }

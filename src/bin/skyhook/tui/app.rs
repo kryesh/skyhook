@@ -1,5 +1,6 @@
 use super::{
     Launch,
+    composer::Composer,
     editor::Editor,
     keys::{COMMANDS, KeyMap},
     model::{self, Entry, Projection, Tab, View},
@@ -33,6 +34,11 @@ pub enum Focus {
     Tree,
     Content,
 }
+#[derive(Default)]
+struct QuestionDraft {
+    editor: Editor,
+    choice: usize,
+}
 // Only non-authentication drafts are suspended; secrets never enter this state.
 struct SuspendedPrompt {
     id: u64,
@@ -41,6 +47,8 @@ struct SuspendedPrompt {
     body_scroll: usize,
     option_scroll: usize,
     question_index: usize,
+    question_drafts: HashMap<usize, QuestionDraft>,
+    question_editing: bool,
     answers: serde_json::Map<String, Value>,
     active: bool,
     focus: Focus,
@@ -278,12 +286,11 @@ pub struct App {
     pub focus: Focus,
     pub tree_cursor: usize,
     pub tree_scroll: usize,
-    pub editor: Editor,
+    pub editor: Composer,
     pub images: Vec<PathBuf>,
-    pub pastes: Vec<String>,
     pub history: Vec<String>,
     history_index: Option<usize>,
-    history_draft: String,
+    history_draft: Composer,
     pub queue: VecDeque<QueuedInput>,
     next_queued_id: u64,
     queue_sender: Option<mpsc::UnboundedSender<Vec<QueueDelivery>>>,
@@ -310,6 +317,8 @@ pub struct App {
     pub prompt_body_rows: usize,
     pub prompt_option_rows: usize,
     pub question_index: usize,
+    question_drafts: HashMap<usize, QuestionDraft>,
+    pub question_editing: bool,
     pub answers: serde_json::Map<String, Value>,
     pub menu: Option<Menu>,
     next_menu_id: u64,
@@ -379,12 +388,11 @@ impl App {
             focus: Focus::Composer,
             tree_cursor: 0,
             tree_scroll: 0,
-            editor: Editor::default(),
+            editor: Composer::default(),
             images: vec![],
-            pastes: vec![],
             history: vec![],
             history_index: None,
-            history_draft: String::new(),
+            history_draft: Composer::default(),
             queue: VecDeque::new(),
             next_queued_id: 0,
             queue_sender: None,
@@ -411,6 +419,8 @@ impl App {
             prompt_body_rows: 0,
             prompt_option_rows: 0,
             question_index: 0,
+            question_drafts: HashMap::new(),
+            question_editing: false,
             answers: serde_json::Map::new(),
             menu: None,
             next_menu_id: 0,
@@ -661,10 +671,9 @@ impl App {
         self.suspended_prompt = None;
         self.reset_prompt();
         self.prompt_active = false;
-        self.editor = Editor::default();
+        self.editor = Composer::default();
         self.draft_revision = self.draft_revision.wrapping_add(1);
         self.images.clear();
-        self.pastes.clear();
         self.queue.clear();
         self.switch_restore = None;
         self.creating = false;
@@ -1112,8 +1121,8 @@ impl App {
                 }
                 match result {
                     Ok((path, content)) => {
-                        self.pastes
-                            .push(format!("File: {}\n{content}", path.display()));
+                        self.editor
+                            .insert_paste(format!("File: {}\n{content}", path.display()));
                         self.notice(format!("Attached {}", path.display()));
                     }
                     Err(error) => self.notice(error),
@@ -1260,6 +1269,8 @@ impl App {
                         body_scroll: self.prompt_body_scroll,
                         option_scroll: self.prompt_option_scroll,
                         question_index: self.question_index,
+                        question_drafts: std::mem::take(&mut self.question_drafts),
+                        question_editing: self.question_editing,
                         answers: std::mem::take(&mut self.answers),
                         active: self.prompt_active,
                         focus: self.focus,
@@ -1300,6 +1311,8 @@ impl App {
         self.prompt_choice = 0;
         self.reset_prompt_view();
         self.question_index = 0;
+        self.question_drafts.clear();
+        self.question_editing = false;
         self.answers.clear();
         if self
             .suspended_prompt
@@ -1312,6 +1325,8 @@ impl App {
             self.prompt_body_scroll = saved.body_scroll;
             self.prompt_option_scroll = saved.option_scroll;
             self.question_index = saved.question_index;
+            self.question_drafts = saved.question_drafts;
+            self.question_editing = saved.question_editing;
             self.answers = saved.answers;
             self.prompt_active = saved.active;
             self.focus = saved.focus;
@@ -1407,7 +1422,64 @@ impl App {
             PromptKind::Authentication(p) => format!("Authentication\n{}", p.message),
         }
     }
+    pub fn multiple_questions(&self) -> bool {
+        matches!(self.prompts.front().map(|p| &p.kind),
+            Some(PromptKind::Questions { questions, .. }) if questions.len() > 1)
+    }
+    fn select_question(&mut self, index: usize) {
+        if index == self.question_index {
+            return;
+        }
+        // Drafts are independent of confirmed answers, including untouched and
+        // unanswered questions. Moving never confirms an answer.
+        if matches!(self.prompts.front().map(|p| &p.kind),
+            Some(PromptKind::Questions { questions, .. }) if self.question_index < questions.len())
+        {
+            self.question_drafts.insert(
+                self.question_index,
+                QuestionDraft {
+                    editor: std::mem::take(&mut self.prompt_editor),
+                    choice: self.prompt_choice,
+                },
+            );
+        } else {
+            self.prompt_editor = Editor::default();
+        }
+        self.question_index = index;
+        self.prompt_choice = 0;
+        self.question_editing = false;
+        self.reset_prompt_view();
+        self.restore_question_answer();
+    }
+    fn switch_question(&mut self, delta: isize) {
+        let Some(PromptKind::Questions { questions, .. }) = self.prompts.front().map(|p| &p.kind)
+        else {
+            return;
+        };
+        if questions.len() > 1 {
+            if self.question_index >= questions.len() && delta > 0 {
+                return;
+            }
+            let index = self
+                .question_index
+                .saturating_add_signed(delta)
+                .min(questions.len() - 1);
+            self.select_question(index);
+        }
+    }
+    fn invalidate_question_answer(&mut self) {
+        if let Some(PromptKind::Questions { questions, .. }) = self.prompts.front().map(|p| &p.kind)
+            && let Some(question) = questions.get(self.question_index)
+        {
+            self.answers.remove(&question.id);
+        }
+    }
     fn restore_question_answer(&mut self) {
+        if let Some(draft) = self.question_drafts.remove(&self.question_index) {
+            self.prompt_editor = draft.editor;
+            self.prompt_choice = draft.choice;
+            return;
+        }
         let Some(PromptKind::Questions { questions, .. }) = self.prompts.front().map(|p| &p.kind)
         else {
             return;
@@ -1484,25 +1556,32 @@ impl App {
                         Value::String(text.clone())
                     };
                     self.answers.insert(question.id.clone(), answer);
-                    self.question_index += 1;
-                    self.prompt_body_scroll = 0;
-                    self.prompt_option_scroll = 0;
-                    self.prompt_reveal = true;
-                    self.prompt_choice = 0;
-                    self.prompt_editor = Editor::default();
                     if questions.len() == 1 {
                         Some(PromptResponse::Questions(
                             self.answers.values().next().cloned().unwrap_or(Value::Null),
                         ))
                     } else {
+                        // Keep sequential review, but wrap to skipped questions
+                        // before offering submission at the end of the batch.
+                        let next = if self.question_index + 1 < questions.len() {
+                            self.question_index + 1
+                        } else {
+                            questions
+                                .iter()
+                                .position(|question| !self.answers.contains_key(&question.id))
+                                .unwrap_or(questions.len())
+                        };
+                        self.select_question(next);
                         None
                     }
                 } else if self.prompt_choice == 1 {
-                    self.question_index = 0;
-                    self.prompt_body_scroll = 0;
-                    self.prompt_option_scroll = 0;
-                    self.prompt_reveal = true;
-                    self.prompt_choice = 0;
+                    self.select_question(0);
+                    None
+                } else if let Some(index) = questions
+                    .iter()
+                    .position(|question| !self.answers.contains_key(&question.id))
+                {
+                    self.select_question(index);
                     None
                 } else {
                     Some(PromptResponse::Questions(Value::Object(
@@ -1519,8 +1598,6 @@ impl App {
             if self.prompts.is_empty() {
                 self.prompt_active = false;
             }
-        } else {
-            self.restore_question_answer();
         }
     }
     pub fn event(&mut self, event: Event) {
@@ -1534,6 +1611,23 @@ impl App {
         if let Event::Mouse(mouse) = &event
             && mouse.kind == MouseEventKind::Moved
         {
+            if let Some(menu) = &mut self.menu {
+                let point = (mouse.column, mouse.row);
+                self.hover = Some(point);
+                // Palettes own hover while open. Only real pointer movement
+                // changes the keyboard selection; drawing never re-applies it.
+                if let Some(index) = self.hits.iter().rev().find_map(|(rect, hit)| match hit {
+                    Hit::Menu(index) if rect.contains(point.into()) => Some(*index),
+                    _ => None,
+                }) && index < menu.filtered().len()
+                    && menu.selected != index
+                {
+                    menu.selected = index;
+                    self.dirty = true;
+                }
+                self.preview_theme();
+                return;
+            }
             let target = |point: Option<(u16, u16)>| {
                 point.and_then(|point| {
                     self.hits.iter().position(|(rect, hit)| {
@@ -1576,8 +1670,14 @@ impl App {
                     }
                     InputTarget::Prompt => {
                         self.prompt_editor.insert(&text);
+                        if self.multiple_questions() {
+                            self.question_editing = true;
+                            self.invalidate_question_answer();
+                        }
                     }
-                    InputTarget::Composer if text.lines().count() > 12 => self.pastes.push(text),
+                    InputTarget::Composer if text.lines().count() > 12 => {
+                        self.editor.insert_paste(text)
+                    }
                     InputTarget::Composer => self.editor.insert(&text),
                     InputTarget::None => {}
                 }
@@ -1662,7 +1762,11 @@ impl App {
                                 Hit::Attention => self.activate_prompt(),
                                 Hit::PromptChoice(index) => {
                                     self.activate_prompt();
+                                    if self.prompt_choice != index && self.multiple_questions() {
+                                        self.invalidate_question_answer();
+                                    }
                                     self.prompt_choice = index;
+                                    self.question_editing = false;
                                     self.prompt_reveal = true;
                                 }
                                 Hit::Latest => {
@@ -1790,6 +1894,16 @@ impl App {
         }
         if matches!(target, InputTarget::Prompt) {
             let options = self.prompt_options();
+            let multiple = self.multiple_questions();
+            let editing_question = multiple
+                && matches!(
+                self.prompts.front().map(|p| &p.kind),
+                Some(PromptKind::Questions { questions, .. }) if self.question_index < questions.len());
+            let old_choice = self.prompt_choice;
+            // Authentication editors contain secrets: never snapshot them for
+            // ordinary question draft change detection.
+            let old_text = editing_question.then(|| self.prompt_editor.text.clone());
+            let old_index = self.question_index;
             match key.code {
                 KeyCode::Esc => {
                     if matches!(
@@ -1819,11 +1933,19 @@ impl App {
                         height.max(1) as isize * if key.code == KeyCode::PageUp { -1 } else { 1 },
                     );
                 }
+                KeyCode::Left | KeyCode::Right if multiple && !self.question_editing => {
+                    self.switch_question(if key.code == KeyCode::Left { -1 } else { 1 });
+                }
+                KeyCode::Tab | KeyCode::BackTab if editing_question => {
+                    self.question_editing = !self.question_editing;
+                }
                 KeyCode::Up | KeyCode::BackTab => {
+                    self.question_editing = false;
                     self.prompt_choice = self.prompt_choice.saturating_sub(1);
                     self.prompt_reveal = true;
                 }
                 KeyCode::Down | KeyCode::Tab => {
+                    self.question_editing = false;
                     if !options.is_empty() {
                         self.prompt_choice = (self.prompt_choice + 1) % options.len();
                         self.prompt_reveal = true;
@@ -1831,8 +1953,26 @@ impl App {
                 }
                 KeyCode::Enter => self.answer(),
                 _ => {
+                    if editing_question
+                        && matches!(
+                            key.code,
+                            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
+                        )
+                    {
+                        self.question_editing = true;
+                    }
                     self.prompt_editor.handle(key);
                 }
+            }
+            if editing_question
+                && key.code != KeyCode::Enter
+                && self.question_index == old_index
+                && (self.prompt_choice != old_choice
+                    || old_text
+                        .as_deref()
+                        .is_some_and(|text| self.prompt_editor.text != text))
+            {
+                self.invalidate_question_answer();
             }
             return;
         }
@@ -1926,7 +2066,7 @@ impl App {
             }
             KeyCode::Char('c') if key.modifiers.contains(M::CONTROL) => {
                 if self.focus == Focus::Composer && !self.editor.text.is_empty() {
-                    self.editor.take();
+                    self.editor.clear();
                 } else if self.busy() {
                     self.interrupt();
                 } else {
@@ -1943,23 +2083,21 @@ impl App {
                     self.editor.insert("\n")
                 }
                 KeyCode::Enter => {
-                    let mut text = self.editor.take();
-                    if text.starts_with('/') && !text.contains('\n') {
+                    let has_pastes = self.editor.has_pastes();
+                    let text = self.editor.take();
+                    if !has_pastes && text.starts_with('/') && !text.contains('\n') {
                         let command = text.trim_start_matches('/').trim().to_owned();
                         self.command(&command);
                     } else {
-                        for paste in self.pastes.drain(..) {
-                            text.push_str(&format!("\n\n{paste}"));
-                        }
                         let images = std::mem::take(&mut self.images);
                         self.paused = false;
                         self.submit(text, images);
                     }
                 }
-                KeyCode::Up if !self.editor.text[..self.editor.cursor].contains('\n') => {
+                KeyCode::Up if key.modifiers.is_empty() && self.editor.is_first_visual_row() => {
                     self.prompt_history(false)
                 }
-                KeyCode::Down if !self.editor.text[self.editor.cursor..].contains('\n') => {
+                KeyCode::Down if key.modifiers.is_empty() && self.editor.is_last_visual_row() => {
                     self.prompt_history(true)
                 }
                 KeyCode::Char('/') if self.editor.text.is_empty() => self.command("commands"),
@@ -2149,7 +2287,7 @@ impl App {
             if forward {
                 return;
             }
-            self.history_draft = self.editor.text.clone();
+            self.history_draft = self.editor.clone();
             self.history_index = Some(n - 1);
         } else {
             self.history_index = Some(if forward {
@@ -2160,7 +2298,7 @@ impl App {
         }
         if let Some(i) = self.history_index {
             if i >= n {
-                self.editor.set(self.history_draft.clone());
+                self.editor = self.history_draft.clone();
                 self.history_index = None;
             } else {
                 self.editor.set(self.history[i].clone());
@@ -2450,7 +2588,7 @@ impl App {
             ),
             "attach" => self.open("Image path · Enter attach", MenuKind::Attach, vec![]),
             "attachments" => {
-                let mut items: Vec<_> = self.pastes.iter().enumerate().map(|(i, text)| Item::attachment(
+                let mut items: Vec<_> = self.editor.pastes().map(|(i, text)| Item::attachment(
                     Attachment::Paste(i),
                     format!("Pasted text / file · {} lines", text.lines().count()),
                     super::format::brief(text, 60),
@@ -2603,7 +2741,7 @@ impl App {
                     if let Some(item) = menu.filtered().get(menu.selected) {
                         match item.attachment {
                             Some(Attachment::Paste(index)) => {
-                                self.pastes.remove(index);
+                                self.editor.remove_paste(index);
                             }
                             Some(Attachment::Image(index)) => {
                                 self.images.remove(index);
@@ -2715,8 +2853,8 @@ impl App {
             }
             MenuKind::Attachments => match attachment {
                 Some(Attachment::Paste(index)) => {
-                    if let Some(text) = self.pastes.get(index) {
-                        self.info("Attachment", text.clone());
+                    if let Some(text) = self.editor.paste(index) {
+                        self.info("Attachment", text.to_owned());
                     }
                 }
                 Some(Attachment::Image(index)) => {
@@ -3241,6 +3379,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn composer_pastes_submit_in_place_and_restore_history_drafts() {
+        let (_root, mut app) = draft_fixture().await;
+        // Keep the submitted message queued without starting a provider/session.
+        app.creating = true;
+        let first = "first\n".repeat(13);
+        let second = "second\n".repeat(14);
+        app.editor.insert("before after");
+        app.editor.cursor = "before ".len();
+        app.event(Event::Paste(first.clone()));
+        app.editor.insert(" between ");
+        app.event(Event::Paste(second.clone()));
+        let expected = format!("before {first} between {second}after");
+        assert_eq!(app.editor.expanded_text(), expected);
+        assert_eq!(app.editor.pastes().count(), 2);
+        app.editor.anchor = Some(0);
+        app.editor.cursor = app.editor.text.len();
+        app.copy();
+        assert_eq!(app.clipboard.as_deref(), Some(expected.as_str()));
+        app.editor.anchor = None;
+
+        app.history.push("older prompt".into());
+        app.prompt_history(false);
+        assert_eq!(app.editor.expanded_text(), "older prompt");
+        app.prompt_history(true);
+        assert_eq!(app.editor.expanded_text(), expected);
+        assert_eq!(app.editor.pastes().count(), 2);
+
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.queue[0].text, expected);
+        assert!(app.editor.is_empty());
+        assert!(!app.editor.has_pastes());
+    }
+
+    #[tokio::test]
+    async fn composer_short_pastes_and_attachment_removal_use_editor_history() {
+        let (_root, mut app) = draft_fixture().await;
+        app.event(Event::Paste("short\npaste".into()));
+        assert!(!app.editor.has_pastes());
+        assert_eq!(app.editor.text, "short\npaste");
+        app.event(Event::Paste("long\n".repeat(13)));
+        app.command("attachments");
+        assert_eq!(app.menu.as_ref().unwrap().items.len(), 1);
+        key(&mut app, KeyCode::Delete, M::NONE);
+        assert!(!app.editor.has_pastes());
+        assert_eq!(app.editor.expanded_text(), "short\npaste");
+        key(&mut app, KeyCode::Esc, M::NONE);
+        app.editor
+            .handle(KeyEvent::new(KeyCode::Char('-'), M::CONTROL));
+        assert_eq!(app.editor.pastes().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn composer_clear_draft_can_undo_text_and_pastes() {
+        let (_root, mut app) = draft_fixture().await;
+        app.editor.insert("before ");
+        app.event(Event::Paste("payload\n".repeat(13)));
+        app.editor.insert(" after");
+        let expected = app.editor.expanded_text();
+        key(&mut app, KeyCode::Char('c'), M::CONTROL);
+        assert!(app.editor.is_empty());
+        key(&mut app, KeyCode::Char('-'), M::CONTROL);
+        assert_eq!(app.editor.expanded_text(), expected);
+        assert_eq!(app.editor.pastes().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn composer_wraps_words_and_vertical_arrows_do_not_skip_to_history() {
+        let (_root, mut app) = draft_fixture().await;
+        app.history.push("older prompt".into());
+        app.editor.insert(&format!("{}ending", "word ".repeat(16)));
+        let expected = app.editor.expanded_text();
+        let screen = draw(&mut app);
+        assert!(screen.contains("word word word"));
+        assert!(!app.editor.is_first_visual_row());
+        let cursor = app.editor.cursor;
+        key(&mut app, KeyCode::Up, M::NONE);
+        assert_eq!(app.editor.expanded_text(), expected);
+        assert!(app.editor.cursor < cursor);
+        assert!(app.history_index.is_none());
+        app.editor.cursor = 0;
+        key(&mut app, KeyCode::Up, M::NONE);
+        assert_eq!(app.editor.expanded_text(), "older prompt");
+    }
+
+    #[tokio::test]
     async fn attachment_reads_do_not_leak_into_the_next_submission_or_session() {
         let (_root, mut app) = draft_fixture().await;
         let attachment = |draft| Work::File {
@@ -3250,27 +3474,33 @@ mod tests {
         let draft = app.draft_revision;
         app.info("Unrelated overlay", "Still the same draft".into());
         app.work(attachment(draft));
-        assert_eq!(app.pastes, ["File: fixture.txt\ncontents"]);
-        app.pastes.clear();
+        assert_eq!(
+            app.editor
+                .pastes()
+                .map(|(_, text)| text)
+                .collect::<Vec<_>>(),
+            ["File: fixture.txt\ncontents"]
+        );
+        app.editor.take();
 
         // Queue without starting a session: even a queued submission consumes its draft.
         app.paused = true;
         app.submit("submitted".into(), vec![]);
         app.dirty = false;
         app.work(attachment(draft));
-        assert!(app.pastes.is_empty());
+        assert!(!app.editor.has_pastes());
         assert!(!app.dirty);
         let next_draft = app.draft_revision;
         app.work(attachment(next_draft));
-        assert_eq!(app.pastes.len(), 1);
+        assert_eq!(app.editor.pastes().count(), 1);
 
         app.set_session(None, ObservationSnapshot::default());
         app.dirty = false;
         app.work(attachment(next_draft));
-        assert!(app.pastes.is_empty());
+        assert!(!app.editor.has_pastes());
         assert!(!app.dirty);
         app.work(attachment(app.draft_revision));
-        assert_eq!(app.pastes.len(), 1);
+        assert_eq!(app.editor.pastes().count(), 1);
     }
 
     #[tokio::test]
@@ -3290,7 +3520,7 @@ mod tests {
         app.model = "second".into();
         app.submit("second input".into(), vec![PathBuf::from("queued.png")]);
         app.editor.set("still composing".into());
-        app.pastes.push("unsent attachment".into());
+        app.editor.insert_paste("unsent attachment".into());
         let Work::Started(Ok(session)) = next_lifecycle(&mut rx).await else {
             panic!("first submit should create a session");
         };
@@ -3305,8 +3535,17 @@ mod tests {
         assert_eq!(app.queue[0].text, "second input");
         assert_eq!(app.queue[0].model, "second");
         assert_eq!(app.queue[0].images, [PathBuf::from("queued.png")]);
-        assert_eq!(app.editor.text, "still composing");
-        assert_eq!(app.pastes, ["unsent attachment"]);
+        assert_eq!(
+            app.editor.expanded_text(),
+            "still composingunsent attachment"
+        );
+        assert_eq!(
+            app.editor
+                .pastes()
+                .map(|(_, text)| text)
+                .collect::<Vec<_>>(),
+            ["unsent attachment"]
+        );
         app.status.flush().await;
         let session = app.session.as_ref().unwrap();
         let snapshot = session.observe().await.snapshot;
@@ -3468,6 +3707,187 @@ mod tests {
         mouse(app, rect, MouseEventKind::Down(MouseButton::Left));
         mouse(app, rect, MouseEventKind::Up(MouseButton::Left));
     }
+    #[tokio::test]
+    async fn palette_hover_owns_selection_without_background_or_stationary_updates() {
+        let (_root, mut app) = fixture().await;
+        app.open(
+            "Models",
+            MenuKind::Models,
+            vec![
+                Item::new("first", "First", ""),
+                Item::new("second", "Second", ""),
+                Item::new("third", "Third", ""),
+            ],
+        );
+        draw(&mut app);
+        let rows: Vec<_> = app
+            .hits
+            .iter()
+            .filter_map(|(rect, hit)| {
+                if let Hit::Menu(index) = hit {
+                    Some((*rect, *index))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        mouse(&mut app, rows[1].0, MouseEventKind::Moved);
+        assert_eq!(app.menu.as_ref().unwrap().selected, 1);
+        key(&mut app, KeyCode::Down, M::NONE);
+        assert_eq!(app.menu.as_ref().unwrap().selected, 2);
+        app.dirty = false;
+        mouse(&mut app, rows[1].0, MouseEventKind::Moved);
+        assert_eq!(app.menu.as_ref().unwrap().selected, 2);
+        assert!(!app.dirty);
+        // A physical move inside the same row can take over from the keyboard.
+        let mut moved = rows[1].0;
+        moved.x += 1;
+        mouse(&mut app, moved, MouseEventKind::Moved);
+        assert_eq!(app.menu.as_ref().unwrap().selected, 1);
+        let selected_agent = app.selected.clone();
+        app.dirty = false;
+        let tree_rect = app.tree_rect;
+        mouse(&mut app, tree_rect, MouseEventKind::Moved);
+        assert_eq!(app.menu.as_ref().unwrap().selected, 1);
+        assert_eq!(app.selected, selected_agent);
+        assert!(!app.dirty);
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert!(app.menu.is_none());
+        assert_eq!(app.model, "second");
+        app.open(
+            "Models",
+            MenuKind::Models,
+            vec![
+                Item::new("hidden", "Hidden", ""),
+                Item::new("first", "Visible first", ""),
+                Item::new("second", "Visible second", ""),
+            ],
+        );
+        app.menu.as_mut().unwrap().input.set("Visible".into());
+        draw(&mut app);
+        let row = app
+            .hits
+            .iter()
+            .find_map(|(rect, hit)| matches!(hit, Hit::Menu(1)).then_some(*rect))
+            .unwrap();
+        mouse(&mut app, row, MouseEventKind::Moved);
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert_eq!(app.model, "second");
+        // Selection-dependent theme previews follow hover just like keyboard input.
+        let original_light = app.light;
+        app.command("themes");
+        draw(&mut app);
+        let other = usize::from(!original_light);
+        let mut row = app
+            .hits
+            .iter()
+            .find_map(|(rect, hit)| {
+                matches!(hit, Hit::Menu(index) if *index == other).then_some(*rect)
+            })
+            .unwrap();
+        row.x += 1;
+        mouse(&mut app, row, MouseEventKind::Moved);
+        assert_eq!(app.light, !original_light);
+        key(&mut app, KeyCode::Esc, M::NONE);
+        assert_eq!(app.light, original_light);
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn palette_background_hover_is_not_rendered() {
+        let (_root, mut app) = fixture().await;
+        let mut child = app.projection.agents[0].clone();
+        child.id = child.id.child(1);
+        app.projection.agents.push(child.clone());
+        app.open(
+            "Models",
+            MenuKind::Models,
+            vec![Item::new("first", "First", "")],
+        );
+        let before = draw_buffer(&mut app);
+        let row = app
+            .hits
+            .iter()
+            .find_map(|(rect, hit)| {
+                matches!(hit, Hit::Agent(id) if *id == child.id).then_some(*rect)
+            })
+            .unwrap();
+        mouse(&mut app, row, MouseEventKind::Moved);
+        let after = draw_buffer(&mut app);
+        for x in row.x..row.right() {
+            assert_eq!(before[(x, row.y)].bg, after[(x, row.y)].bg);
+        }
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn agents_palette_headers_are_fixed_and_hits_cover_only_items() {
+        let (_root, mut app) = fixture().await;
+        for index in 1..20 {
+            let mut child = app.projection.agents[0].clone();
+            child.id = child.id.child(index);
+            child.name = format!("worker {index}");
+            app.projection.agents.push(child);
+        }
+        app.command("agents");
+        for width in [120, 90, 60, 40] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 40)).unwrap();
+            terminal
+                .draw(|frame| super::super::render::draw(frame, &mut app))
+                .unwrap();
+            let first_rows: Vec<_> = app
+                .hits
+                .iter()
+                .filter_map(|(rect, hit)| {
+                    if let Hit::Menu(index) = hit {
+                        Some((*rect, *index))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert!(!first_rows.is_empty(), "width {width}");
+            let first_y = first_rows[0].0.y;
+            assert!(first_y > app.content_rect.y + 2);
+            let header = terminal.backend().buffer().clone();
+            key(&mut app, KeyCode::End, M::NONE);
+            terminal
+                .draw(|frame| super::super::render::draw(frame, &mut app))
+                .unwrap();
+            let rows: Vec<_> = app
+                .hits
+                .iter()
+                .filter_map(|(rect, hit)| {
+                    if let Hit::Menu(index) = hit {
+                        Some((*rect, *index))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(rows.last().unwrap().1, 19);
+            assert_eq!(rows[0].0.y, first_y);
+            for y in app.content_rect.y + 2..first_y {
+                for x in 0..width {
+                    assert_eq!(header[(x, y)], terminal.backend().buffer()[(x, y)]);
+                }
+            }
+            let mut header_point = rows[0].0;
+            header_point.y = first_y - 1;
+            mouse(&mut app, header_point, MouseEventKind::Moved);
+            assert_eq!(app.menu.as_ref().unwrap().selected, 19);
+            // Every line of a stacked item resolves to its filtered item index.
+            let (row, index) = rows[0];
+            let mut bottom = row;
+            bottom.y = row.bottom() - 1;
+            mouse(&mut app, bottom, MouseEventKind::Moved);
+            assert_eq!(app.menu.as_ref().unwrap().selected, index);
+            key(&mut app, KeyCode::Home, M::NONE);
+        }
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
     fn tool_hits(app: &App) -> Vec<Rect> {
         app.hits
             .iter()
@@ -4048,6 +4468,135 @@ mod tests {
                 description: format!("Use {label}"),
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn question_navigation_preserves_unanswered_drafts_and_clamps() {
+        let (_root, mut app) = fixture().await;
+        let mut response = question(&mut app, "Choose".into(), suggestions());
+        if let PromptKind::Questions { questions, .. } = &mut app.prompts.front_mut().unwrap().kind
+        {
+            for id in ["middle", "last"] {
+                questions.push(Question {
+                    id: id.into(),
+                    prompt: id.into(),
+                    options: vec![],
+                });
+            }
+        }
+        assert!(draw(&mut app).contains("Question 1/3 · ←→ switch · Tab edit"));
+        key(&mut app, KeyCode::Left, M::NONE);
+        assert_eq!(app.question_index, 0);
+        key(&mut app, KeyCode::Down, M::NONE);
+        app.event(Event::Paste("comment".into()));
+        key(&mut app, KeyCode::Left, M::NONE);
+        assert_eq!(app.question_index, 0);
+        assert_eq!(app.prompt_editor.cursor, 6);
+        let screen = draw(&mut app);
+        assert!(screen.contains("←→ cursor · Tab switch questions"));
+        assert!(screen.contains("commen▏t"));
+        key(&mut app, KeyCode::Tab, M::NONE);
+        app.prompt_body_scroll = 5;
+        app.prompt_option_scroll = 5;
+        key(&mut app, KeyCode::Right, M::NONE);
+        assert_eq!(app.prompt_body_scroll, 0);
+        assert_eq!(app.prompt_option_scroll, 0);
+        app.event(Event::Paste("draft".into()));
+        key(&mut app, KeyCode::Tab, M::NONE);
+        key(&mut app, KeyCode::Right, M::NONE);
+        key(&mut app, KeyCode::Right, M::NONE);
+        assert_eq!(app.question_index, 2);
+        assert!(app.prompt_editor.text.is_empty());
+        assert!(app.answers.is_empty());
+        assert!(matches!(
+            response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        key(&mut app, KeyCode::Left, M::NONE);
+        assert_eq!(app.prompt_editor.text, "draft");
+        key(&mut app, KeyCode::Left, M::NONE);
+        assert_eq!(app.prompt_choice, 1);
+        assert_eq!(app.prompt_editor.text, "comment");
+        assert_eq!(app.prompt_editor.cursor, 6);
+        let ssh = authentication(&mut app, 100);
+        key(&mut app, KeyCode::Esc, M::NONE);
+        assert!(ssh.await.unwrap().is_err());
+        key(&mut app, KeyCode::Right, M::NONE);
+        assert_eq!(app.prompt_editor.text, "draft");
+        assert!(app.answers.is_empty());
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn question_navigation_enter_wraps_skips_before_review_and_submit() {
+        let (_root, mut app) = fixture().await;
+        let mut response = question(&mut app, "First".into(), vec![]);
+        if let PromptKind::Questions { questions, .. } = &mut app.prompts.front_mut().unwrap().kind
+        {
+            questions.push(Question {
+                id: "last".into(),
+                prompt: "Last".into(),
+                options: vec![],
+            });
+        }
+        key(&mut app, KeyCode::Right, M::NONE);
+        app.event(Event::Paste("second".into()));
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert_eq!(app.question_index, 0);
+        assert_eq!(app.answers.len(), 1);
+        key(&mut app, KeyCode::Enter, M::NONE); // Empty free-form stays unanswered.
+        assert_eq!(app.question_index, 0);
+        assert!(matches!(
+            response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        app.event(Event::Paste("first".into()));
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert_eq!(app.prompt_editor.text, "second");
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert_eq!(app.question_index, 2); // Review, not submission.
+        assert!(matches!(
+            response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        key(&mut app, KeyCode::Right, M::NONE);
+        assert_eq!(app.question_index, 2);
+        key(&mut app, KeyCode::Left, M::NONE); // Review can return to last question.
+        assert_eq!(app.question_index, 1);
+        app.event(Event::Paste(" revised".into()));
+        assert!(!app.answers.contains_key("last"));
+        key(&mut app, KeyCode::Tab, M::NONE);
+        key(&mut app, KeyCode::Left, M::NONE);
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert_eq!(app.prompt_editor.text, "second revised");
+        key(&mut app, KeyCode::Enter, M::NONE);
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert!(
+            matches!(response.await.unwrap().unwrap(), PromptResponse::Questions(value)
+            if value == json!({"answer": "first", "last": "second revised"}))
+        );
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn question_navigation_does_not_change_single_question_or_auth_editing() {
+        let (_root, mut app) = fixture().await;
+        let response = question(&mut app, "Single".into(), vec![]);
+        app.event(Event::Paste("abc".into()));
+        key(&mut app, KeyCode::Left, M::NONE);
+        assert_eq!(app.prompt_editor.cursor, 2);
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert!(
+            matches!(response.await.unwrap().unwrap(), PromptResponse::Questions(value) if value == "abc")
+        );
+        let ssh = authentication(&mut app, 100);
+        app.event(Event::Paste("secret".into()));
+        key(&mut app, KeyCode::Left, M::NONE);
+        assert_eq!(app.prompt_editor.cursor, 5);
+        assert!(!draw(&mut app).contains("secret"));
+        key(&mut app, KeyCode::Esc, M::NONE);
+        assert!(ssh.await.unwrap().is_err());
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]

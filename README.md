@@ -183,9 +183,13 @@ state; it is not cumulative usage. Missing context data appears as `—`.
 
 The command palette omits navigation-only actions; `Ctrl+X I`, `Ctrl+X ↑`, and `Ctrl+X ↓`
 remain available to focus the conversation, select the parent, and select the first child.
-Menus use arrows, the mouse wheel, or `Ctrl+P/N`; Enter or Tab selects. Theme choices
-preview immediately; Escape restores the previous theme and Enter saves the choice. The composer supports word movement,
-selection, `Ctrl+A/E`, `Ctrl+W`, `Ctrl+U/K`, and undo/redo with `Ctrl+-` / `Ctrl+.`.
+Menus use arrows, mouse hover, the mouse wheel, or `Ctrl+P/N`; Enter or Tab activates
+the selected item. Open palettes isolate hover from the conversation underneath. The Agents
+palette labels its Output, Input (uncached), and Context statistics. Theme choices preview
+immediately; Escape restores the previous theme and Enter saves the choice. The composer
+wraps at word boundaries and supports word movement, selection, `Ctrl+A/E`, `Ctrl+W`,
+`Ctrl+U/K`, and undo/redo with `Ctrl+-` / `Ctrl+.`. Up/Down moves through displayed input
+rows, reaching prompt history only from the first/last row.
 Click agent and tool rows, scroll the relevant panel, or drag across text in user/agent messages
 and tool output, then copy the selected characters with `Ctrl+X Y` (or `y` while content is focused).
 Selection supports parts of a line and multiple lines; copying preserves Unicode and code indentation
@@ -193,8 +197,12 @@ without adding newlines at visual wraps.
 The workspace path and session ID in the top bar are plain text; use the terminal emulator’s
 selection gesture (usually Shift-drag) and copy shortcut. The bottom bar shows the model ID
 and token statistics. Copy uses the terminal's OSC 52 clipboard support. `@` attaches a workspace file; `/attach`
-adds an image. Large pastes appear as attachments; click their chips or use `/attachments` to
-inspect or remove them. Questions and permissions open even while inspecting the agent tree or
+adds an image. Pastes longer than 12 lines and attached file contents appear as inline items
+at the cursor. Type before, between, or after multiple paste items; move across, select, delete,
+and undo them as single editing units. Sending or copying expands their original contents in
+place. Shorter pastes remain ordinary editable text. Use `/attachments` to inspect or remove
+paste items and images; `$EDITOR` opens the fully expanded draft for editing.
+Questions and permissions open even while inspecting the agent tree or
 conversation; open menus and search keep input focus until closed. Dismissed requests can be
 reopened with `/attention`. SSH authentication/askpass prompts take priority over questions,
 permissions, menus, and search; interrupted question drafts resume afterward. `/diagnostics`
@@ -202,6 +210,10 @@ lists startup warnings such as skipped skills.
 
 Within questions and permissions, `↑`/`↓` selects an answer, `PageUp`/`PageDown` scrolls
 the prompt text, and `Ctrl+PageUp`/`Ctrl+PageDown` scrolls long answer descriptions.
+In multi-question prompts, `←`/`→` switches questions while navigating choices, preserving
+each question's selected option and unfinished text. Typing enters text-editing mode, where
+`←`/`→` moves the cursor; `Tab` switches between editing and question navigation. `Enter`
+confirms an answer and advances to an unanswered question; switching alone never submits.
 The mouse wheel scrolls the text or choices beneath the pointer. Drafts remain intact while
 answering questions or inspecting details.
 Question choices are suggestions: you can select one, optionally add a comment, or provide
