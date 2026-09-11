@@ -225,14 +225,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let bg = row.background(
             p,
             expanded,
-            expanded && app.render.rows.is_content_edge(row),
             (focused && entry.is_some_and(|e| e.expandable)) || hovered,
             selected.is_some(),
         );
         fill(frame, rect, bg);
-        if expanded && row.surface == Surface::Tool && !row.blank && !row.header && row.x < width {
-            frame.buffer_mut()[(row.x, y)].set_bg(p.selected);
-        }
         let text_rect = r(
             row.paragraph_x(),
             y,
@@ -528,6 +524,54 @@ mod tests {
                         && cells[13..15].iter().all(|cell| cell.fg == color)
                 })
             })
+    }
+
+    #[tokio::test]
+    async fn expanded_items_paint_solid_code_backgrounds_across_clipped_rows() {
+        let (_root, mut app) = fixture().await;
+        app.content_dirty = false;
+        app.entries = vec![model::Entry {
+            key: "solid-background".into(),
+            text: format!("Expandable tool\n{}", "body\n\n".repeat(20)),
+            surface: Surface::Tool,
+            expandable: true,
+            default_open: true,
+            running: false,
+            footer: None,
+            request: None,
+            indent: 0,
+            job: None,
+            compact_after: false,
+            header: None,
+            document: None,
+        }];
+        for light in [false, true] {
+            app.light = light;
+            let p = Palette::new(light);
+            for width in [30, 60] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                let scroll = app.content_rows - app.content_rect.height as usize;
+                assert!(scroll > 0, "exercise a viewport clipped inside the body");
+                let buffer = terminal.backend().buffer();
+                let mut empty_body_rows = 0;
+                for (offset, row) in app.render.rows.iter().skip(scroll).enumerate() {
+                    let y = app.content_rect.y + offset as u16;
+                    let expected = if row.blank { p.base } else { p.content.code_bg };
+                    if !row.blank && row.text().is_empty() {
+                        empty_body_rows += 1;
+                    }
+                    for x in row.x..row.x + row.width {
+                        assert_eq!(
+                            buffer[(x, y)].bg,
+                            expected,
+                            "light={light}, width={width}, row={offset}, x={x}"
+                        );
+                    }
+                }
+                assert!(empty_body_rows > 0, "blank body lines must also be filled");
+            }
+        }
     }
 
     #[tokio::test]

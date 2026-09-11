@@ -240,26 +240,21 @@ impl Document {
                 .collect::<Vec<_>>()
                 .join("\n");
             let mut language = output_language(tool, args, field);
-            let json = ((language.is_empty() && preview["next_start"].is_null())
-                || (language == "json" && field != "/result/content"))
-                .then(|| json_container(&source))
-                .flatten();
-            if language.is_empty() && preview["next_start"].is_null() && json.is_some() {
+            let incomplete = !preview["next_start"].is_null() || !preview["next_offset"].is_null();
+            let formatted = (field != "/result/content"
+                && (language.is_empty() || language == "json")
+                && lines.iter().all(Value::is_string))
+            .then(|| pretty_json_preview(&source, incomplete))
+            .flatten();
+            let source = if let Some(formatted) = formatted {
                 language = "json".into();
-            }
-            let source = if language == "json"
-                && field != "/result/content"
-                && lines.iter().all(Value::is_string)
-            {
-                json.as_ref()
-                    .and_then(|value| serde_json::to_string_pretty(value).ok())
-                    .unwrap_or(source)
+                formatted
             } else {
                 source
             };
             self.code(&source, &language, 2, vec![], Role::Plain);
             self.line(
-                if preview["next_start"].is_u64() {
+                if incomplete {
                     "More saved output available"
                 } else {
                     "End of available output"
@@ -323,6 +318,74 @@ impl Document {
         }
     }
 }
+/// Saved-output pages can stop inside a JSON container (or even a string).
+/// Format valid prefixes too, without completing them or changing saved source
+/// offsets. Non-JSON text and continuation pages that start mid-token stay raw.
+fn pretty_json_preview(text: &str, incomplete: bool) -> Option<String> {
+    match serde_json::from_str::<Value>(text) {
+        Ok(value @ (Value::Object(_) | Value::Array(_))) => Some(model::pretty(&value)),
+        Err(error) if incomplete && error.is_eof() && text.trim_start().starts_with(['{', '[']) => {
+            Some(pretty_json_prefix(text))
+        }
+        _ => None,
+    }
+}
+
+/// The parser has already verified that this is a container prefix. Preserve
+/// every token, including escapes and unfinished strings; only whitespace
+/// outside strings is replaced. Indentation is emitted lazily so a page ending
+/// just after an opening delimiter does not acquire fabricated content.
+fn pretty_json_prefix(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    let mut string = false;
+    let mut escaped = false;
+    let mut newline = false;
+    let mut previous = None;
+    for ch in text.chars() {
+        if string {
+            output.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                string = false;
+            }
+            continue;
+        }
+        if ch.is_ascii_whitespace() {
+            continue;
+        }
+        let closing = matches!(ch, '}' | ']');
+        let empty = closing && matches!(previous, Some('{' | '['));
+        if closing {
+            depth = depth.saturating_sub(1);
+            newline = !empty;
+        }
+        if newline && !empty {
+            output.push('\n');
+            for _ in 0..depth {
+                output.push_str("  ");
+            }
+        }
+        newline = false;
+        output.push(ch);
+        match ch {
+            '{' | '[' => {
+                depth += 1;
+                newline = true;
+            }
+            ',' => newline = true,
+            ':' => output.push(' '),
+            '"' => string = true,
+            _ => {}
+        }
+        previous = Some(ch);
+    }
+    output
+}
+
 fn json_container(text: &str) -> Option<Value> {
     let value: Value = serde_json::from_str(text).ok()?;
     matches!(value, Value::Object(_) | Value::Array(_)).then_some(value)
@@ -484,6 +547,109 @@ mod tests {
         );
         assert!(structured.plain_text().contains("validation failed"));
         assert!(structured.plain_text().contains("argv is required"));
+    }
+
+    #[test]
+    fn truncated_json_previews_are_formatted_for_scripts_and_other_tools() {
+        // The saved reader emits unindented JSON and can cut either at a line
+        // boundary or in the middle of a token. Both must remain readable.
+        for (tool, field, source, expected) in [
+            (
+                "script",
+                "",
+                "{\n\"result\": {\n\"value\": {\n\"items\": [\n{\n\"id\": 1,",
+                "{\n  \"result\": {\n    \"value\": {\n      \"items\": [\n        {\n          \"id\": 1,",
+            ),
+            (
+                "glob",
+                "",
+                "{\"result\":{\"paths\":[\"first.rs\",\"second",
+                "{\n  \"result\": {\n    \"paths\": [\n      \"first.rs\",\n      \"second",
+            ),
+            (
+                "exec",
+                "/result/stdout",
+                "{\"items\":[{},[],{\"name\":\"unfinished",
+                "{\n  \"items\": [\n    {},\n    [],\n    {\n      \"name\": \"unfinished",
+            ),
+        ] {
+            for byte_offset in [false, true] {
+                let mut output = json!({"preview": {
+                    "field": field, "lines": source.split('\n').collect::<Vec<_>>(),
+                    "total_lines": 1000, "next_start": 10
+                }});
+                if byte_offset {
+                    output["preview"]["next_offset"] = json!(200);
+                }
+                let original = output.clone();
+                let mut document = Document::default();
+                document.output(tool, &Value::Null, &output);
+                assert!(
+                    document.sections.iter().any(|section| {
+                        matches!(section, Section::Code { source, language, .. }
+                        if &**source == expected && language == "json")
+                    }),
+                    "{tool}: {}",
+                    document.plain_text()
+                );
+                assert!(
+                    document
+                        .plain_text()
+                        .contains("More saved output available")
+                );
+                assert_eq!(output, original);
+            }
+        }
+    }
+
+    #[test]
+    fn json_prefix_formatting_preserves_tokens_at_every_character_boundary() {
+        let value = json!({"items": [null, true, false, -12.5e20, {}, [], {
+            "text": "  spaces\t\n\"escaped\" \\ braces {},[] and unicode é雪"
+        }]});
+        let source = serde_json::to_string(&value).unwrap();
+        for (end, _) in source.char_indices().skip(1) {
+            let prefix = &source[..end];
+            let formatted = pretty_json_preview(prefix, true).unwrap();
+            let restored = formatted + &source[end..];
+            assert_eq!(
+                serde_json::from_str::<Value>(&restored).unwrap(),
+                value,
+                "{end}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_literal_source_and_non_json_pages_are_not_reformatted() {
+        for (tool, field, source, next) in [
+            ("read", "/result/content", "{\"items\":[1,2,", true),
+            ("read", "/result/content", "{\"items\":[1,2]}", false),
+            (
+                "exec",
+                "/result/stdout",
+                "  ordinary output\n  [not JSON",
+                true,
+            ),
+            ("script", "", "\"continuation\": [1, 2,", true),
+            ("script", "", "{\"malformed\": nope,", true),
+            ("script", "", "{\"unexpected EOF\": [", false),
+        ] {
+            let mut output = json!({"preview": {
+                "field": field, "lines": source.split('\n').collect::<Vec<_>>()
+            }});
+            if next {
+                output["preview"]["next_start"] = json!(2);
+            }
+            let mut document = Document::default();
+            document.output(tool, &json!({"path": "data.json"}), &output);
+            assert!(
+                document.sections.iter().any(|section| {
+                    matches!(section, Section::Code { source: shown, .. } if &**shown == source)
+                }),
+                "{tool}: {source}"
+            );
+        }
     }
 
     fn whole_output_preview(saved: &Value) -> Value {

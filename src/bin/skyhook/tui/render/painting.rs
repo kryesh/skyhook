@@ -216,20 +216,13 @@ impl Row {
         &self,
         p: Palette,
         expanded: bool,
-        content_edge: bool,
         interactive: bool,
         text_selected: bool,
     ) -> Color {
-        // Expanded framing is persistent; text selection must not erase an edge.
-        // Inside the body only the selected text range may change the background.
-        if !self.blank
-            && if expanded {
-                content_edge
-            } else {
-                interactive && !text_selected
-            }
-        {
-            p.selected
+        // Fill expanded items and collapsed hover/focus highlights uniformly.
+        // Text selection is painted separately over the persistent expanded fill.
+        if !self.blank && (expanded || (interactive && !text_selected)) {
+            p.content.code_bg
         } else {
             p.background(self.surface)
         }
@@ -505,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_backgrounds_frame_only_true_content_edges_even_with_selection() {
+    fn expanded_backgrounds_fill_all_content_rows_even_with_selection() {
         for light in [false, true] {
             let p = Palette::new(light);
             let entry = expandable_entry();
@@ -517,18 +510,13 @@ mod tests {
                 .filter(|row| !row.text().trim().is_empty())
                 .collect::<Vec<_>>();
             assert!(nonblank.len() > 4, "both header and body should wrap");
-            for (index, row) in nonblank.iter().enumerate() {
-                let edge = index == 0 || index + 1 == nonblank.len();
-                assert_eq!(rows.is_content_edge(row), edge);
-            }
             for row in rows.iter() {
-                let edge = rows.is_content_edge(row);
                 for interactive in [false, true] {
                     for text_selected in [false, true] {
                         assert_eq!(
-                            row.background(p, true, edge, interactive, text_selected),
-                            if edge {
-                                p.selected
+                            row.background(p, true, interactive, text_selected),
+                            if !row.blank {
+                                p.content.code_bg
                             } else {
                                 p.background(row.surface)
                             },
@@ -539,9 +527,9 @@ mod tests {
                 }
             }
             let row = nonblank[0];
-            assert_eq!(row.background(p, false, true, true, false), p.selected);
-            assert_eq!(row.background(p, false, true, false, false), p.base);
-            assert_eq!(row.background(p, false, true, true, true), p.base);
+            assert_eq!(row.background(p, false, true, false), p.content.code_bg);
+            assert_eq!(row.background(p, false, false, false), p.base);
+            assert_eq!(row.background(p, false, true, true), p.base);
         }
     }
 

@@ -723,6 +723,76 @@ mod tests {
         app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
     #[tokio::test]
+    async fn expanded_large_script_and_tool_results_pretty_print_partial_json() {
+        let (_root, mut app) = fixture().await;
+        for index in 0..250 {
+            std::fs::write(
+                app.launch.workspace.join(format!("item-{index:03}.json")),
+                "{}",
+            )
+            .unwrap();
+        }
+        app.session
+            .as_ref()
+            .unwrap()
+            .run_script("return await tool.glob({pattern:'item-*.json'});")
+            .await
+            .unwrap();
+        app.snapshot = app.session.as_ref().unwrap().observe().await.snapshot;
+        app.refresh();
+        let records = serde_json::to_vec(&app.snapshot.records).unwrap();
+        let mut jobs = Vec::new();
+        for tool in ["script", "glob"] {
+            let job = app
+                .projection
+                .jobs
+                .values()
+                .find(|job| job.tool == tool)
+                .unwrap()
+                .id;
+            app.fetch_output(job);
+            let query = app.output_queries[&job].clone();
+            assert_eq!(query.field.as_deref(), Some(""));
+            let output = app
+                .session
+                .as_ref()
+                .unwrap()
+                .inspect_output(query)
+                .await
+                .unwrap();
+            assert!(output["preview"]["next_start"].is_u64(), "{tool}: {output}");
+            let source = output["preview"]["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|line| line.as_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(serde_json::from_str::<Value>(&source).unwrap_err().is_eof());
+            app.outputs.insert(job, output);
+            jobs.push(job);
+        }
+        app.pending_outputs.clear();
+        app.command("details");
+        draw(&mut app);
+        for job in jobs {
+            let entry = app
+                .entries
+                .iter()
+                .find(|entry| entry.job == Some(job))
+                .unwrap();
+            assert!(entry.text.contains("More saved output available"));
+            assert!(
+                entry.text.contains("\n    \"result\": {\n      \""),
+                "{}",
+                entry.text
+            );
+        }
+        assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn file_preview_uses_source_fields_and_can_continue_truncated_output() {
         let (_root, mut app) = fixture().await;
         let source = (0..100)

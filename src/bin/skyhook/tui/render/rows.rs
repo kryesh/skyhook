@@ -59,7 +59,6 @@ impl Heights {
 #[derive(Default)]
 pub struct RowBlocks {
     blocks: Vec<Vec<Row>>,
-    content_edges: Vec<Option<(usize, usize)>>,
     heights: Heights,
     sources: HashMap<u64, HashSet<usize>>,
     entry_sources: HashMap<usize, Vec<u64>>,
@@ -78,16 +77,6 @@ impl RowBlocks {
         let (entry, offset) = self.heights.locate(row)?;
         self.blocks.get(entry)?.get(offset)
     }
-    /// Constant-time lookup for a retained row, independent of viewport clipping.
-    /// Entry-local offsets need no adjustment when earlier entries change height.
-    pub(super) fn is_content_edge(&self, row: &Row) -> bool {
-        let Some(&(first, last)) = self.content_edges.get(row.entry).and_then(Option::as_ref)
-        else {
-            return false;
-        };
-        let block = &self.blocks[row.entry];
-        std::ptr::eq(row, &block[first]) || std::ptr::eq(row, &block[last])
-    }
     pub fn iter(&self) -> Rows<'_> {
         Rows {
             rows: self,
@@ -96,7 +85,6 @@ impl RowBlocks {
     }
     pub fn clear(&mut self) {
         self.blocks.clear();
-        self.content_edges.clear();
         self.sources.clear();
         self.entry_sources.clear();
         self.heights = Heights::default();
@@ -110,7 +98,6 @@ impl RowBlocks {
             h.values.pop();
             h.tree.pop();
             self.blocks.pop();
-            self.content_edges.pop();
         }
     }
     pub(super) fn register_sources(&mut self, index: usize, sources: Vec<u64>) {
@@ -142,24 +129,11 @@ impl RowBlocks {
         while self.blocks.len() <= index {
             self.heights.set(self.blocks.len(), 0);
             self.blocks.push(Vec::new());
-            self.content_edges.push(None);
         }
         &mut self.blocks[index]
     }
     pub(super) fn finish_update(&mut self, index: usize) {
         let block = &self.blocks[index];
-        let content = |row: &Row| {
-            !row.blank
-                && row
-                    .line
-                    .spans
-                    .iter()
-                    .any(|span| !span.content.trim().is_empty())
-        };
-        self.content_edges[index] = block
-            .iter()
-            .position(content)
-            .zip(block.iter().rposition(content));
         self.heights.set(index, block.len());
     }
 }
@@ -194,80 +168,6 @@ impl ExactSizeIterator for Rows<'_> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn row(entry: usize, text: &str, blank: bool) -> Row {
-        Row {
-            line: std::sync::Arc::new(ratatui::text::Line::from(text.to_owned())),
-            header: false,
-            x: 2,
-            width: 40,
-            surface: super::super::Surface::Tool,
-            entry,
-            selectable: true,
-            blank,
-            continued: false,
-            layout: super::super::markdown::RowLayout::default(),
-            inset: 0,
-        }
-    }
-
-    #[test]
-    fn content_edges_ignore_padding_and_whitespace_and_survive_partial_views() {
-        let mut rows = RowBlocks::default();
-        *rows.block_mut(0) = vec![row(0, "previous", false)];
-        rows.finish_update(0);
-        *rows.block_mut(1) = vec![
-            row(1, "", true),
-            row(1, " \t", false),
-            row(1, "first header fragment", false),
-            row(1, "second header fragment", false),
-            row(1, "body", false),
-            row(1, "last wrapped body fragment", false),
-            row(1, "  ", false),
-            row(1, "", false),
-            row(1, "", true),
-        ];
-        rows.finish_update(1);
-        assert_eq!(rows.content_edges[1], Some((2, 5)));
-        let edges = |rows: &RowBlocks, start, count| {
-            rows.iter()
-                .skip(start)
-                .take(count)
-                .map(|row| rows.is_content_edge(row))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            edges(&rows, 1, 9),
-            [false, false, true, false, false, true, false, false, false]
-        );
-        assert_eq!(edges(&rows, 4, 2), [false, false]);
-        assert_eq!(edges(&rows, 5, 3), [false, true, false]);
-
-        // Earlier entry growth shifts global indices, not the cached local edges.
-        rows.block_mut(0).push(row(0, "more", false));
-        rows.finish_update(0);
-        assert_eq!(edges(&rows, 5, 2), [false, false]);
-        assert_eq!(edges(&rows, 6, 3), [false, true, false]);
-
-        // Appending/replacing content and truncation cannot leave stale edges.
-        rows.block_mut(1).push(row(1, "new last", false));
-        rows.finish_update(1);
-        assert_eq!(rows.content_edges[1], Some((2, 9)));
-        *rows.block_mut(1) = vec![row(1, "", true), row(1, "single", false)];
-        rows.finish_update(1);
-        assert_eq!(rows.content_edges[1], Some((1, 1)));
-        assert!(rows.is_content_edge(&rows[3]));
-        *rows.block_mut(1) = vec![row(1, " ", false)];
-        rows.finish_update(1);
-        assert_eq!(rows.content_edges[1], None);
-        rows.truncate_entries(1);
-        assert_eq!(rows.content_edges.len(), 1);
-        rows.clear();
-        assert!(rows.content_edges.is_empty());
-        rows.block_mut(0);
-        rows.finish_update(0);
-        assert_eq!(rows.content_edges, [None]);
-    }
-
     #[test]
     fn height_index_matches_flat_prefixes() {
         let mut h = Heights::default();
