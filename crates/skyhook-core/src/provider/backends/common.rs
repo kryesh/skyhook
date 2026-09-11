@@ -132,6 +132,24 @@ pub(crate) fn bind_reasoning_scope(
 pub(super) mod tests {
     use super::*;
 
+    /// Minimal request shared by codec/provider tests; cases override only the
+    /// inputs relevant to the behavior under test.
+    pub(crate) fn request(model: &str) -> crate::provider::protocol::ModelRequest {
+        use crate::provider::protocol::{Message, ModelRequest, UserContent};
+        ModelRequest {
+            model: model.into(),
+            system: vec![],
+            messages: vec![Message::User(vec![UserContent::Text {
+                text: "hello".into(),
+            }])],
+            tools: vec![],
+            response_schema: None,
+            reasoning: None,
+            max_output_tokens: Some(8192),
+            correlation: None,
+        }
+    }
+
     /// Exercise the actual journal boundary, not just a serde round trip. Keep
     /// this in backend tests so each codec verifies the resumed wire payload.
     pub(crate) async fn resume_request(
@@ -222,14 +240,8 @@ pub(super) mod tests {
             });
         let expected_blocks = block.blocks.clone();
         let request = ModelRequest {
-            model: "same-model".into(),
-            system: vec![],
             messages: vec![Message::Assistant(vec![block])],
-            tools: vec![],
-            response_schema: None,
-            reasoning: None,
-            max_output_tokens: None,
-            correlation: None,
+            ..request("same-model")
         };
         let mut matching = request.clone();
         filter_reasoning_scope(&mut matching, &a);

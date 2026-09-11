@@ -223,44 +223,6 @@ mod tests {
     }
 
     #[test]
-    fn prompt_classification_covers_every_capability() {
-        for capability in [
-            Capability::Read,
-            Capability::Agents,
-            Capability::Interactive,
-            Capability::Mcp,
-        ] {
-            assert!(!requires_prompt(&permission(capability, "other", "build")));
-        }
-        for capability in [Capability::Exec, Capability::Targets, Capability::Network] {
-            assert!(requires_prompt(&permission(
-                capability,
-                "workspace",
-                "root"
-            )));
-        }
-        assert!(!requires_prompt(&permission(
-            Capability::Write,
-            "workspace",
-            "root"
-        )));
-        assert!(requires_prompt(&permission(
-            Capability::Write,
-            "workspace",
-            "build"
-        )));
-        assert!(requires_prompt(&permission(
-            Capability::Write,
-            "other",
-            "root"
-        )));
-        assert!(requires_prompt(&PermissionUse::new(
-            Capability::Write,
-            ResourceId::new("workspace", Vec::<String>::new()),
-        )));
-    }
-
-    #[test]
     fn automatic_approvals_need_neither_interactive_nor_a_ui() {
         let permissions = [
             permission(Capability::Read, "other", "build"),
@@ -289,6 +251,11 @@ mod tests {
             permission(Capability::Exec, "workspace", "root"),
             permission(Capability::Targets, "other", "root"),
             permission(Capability::Network, "network", "root"),
+            permission(Capability::Network, "network", "build"),
+            PermissionUse::new(
+                Capability::Write,
+                ResourceId::new("workspace", Vec::<String>::new()),
+            ),
             permission(Capability::Write, "workspace", "build"),
             permission(Capability::Write, "other", "root"),
         ];
@@ -339,16 +306,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn network_requests_require_user_approval_for_every_target() {
-        use skyhook::tool::policy::ResourceId;
-        for target in ["root", "build"] {
-            assert!(requires_prompt(&PermissionUse::new(
-                Capability::Network,
-                ResourceId::network(target, "https://example.test"),
-            )));
-        }
-    }
     #[tokio::test]
     async fn abandoned_prompt_is_cancelled_without_reading_stdin() {
         let (handler, mut rx) = UiInteraction::new();

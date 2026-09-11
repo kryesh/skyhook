@@ -12,7 +12,6 @@ Assets cover:
 - `scripts/example.py`: source text (tests do not execute it).
 - `assets/diagram.svg`: SVG source, returned as text.
 - `assets/pixel.png`: a valid 1×1 PNG, returned as an image attachment.
-- `assets/vision.png`, `vision-other.png`: distinct 320×240 color/shape charts for live visual acceptance (large enough for reliable image preprocessing).
 - `assets/payload.bin`: arbitrary non-UTF-8 binary bytes.
 - `assets/nul.dat`: UTF-8-valid bytes containing NUL, treated as binary.
 
@@ -27,25 +26,11 @@ Run the skill tests with:
 cargo test -p skyhook-agent-core tool::builtins::skills::tests
 ```
 
-Live native-provider acceptance uses the actual harness in this workspace and a dedicated
-`target/live-skill-fixture/<profile>/` session root. It verifies image interpretation through both
-a direct `skill` call and a background `script` → `job_output` call using different charts, checks
-request-local image hydration, and fails on any model-request retries. These tests make real model
-requests and are never enabled by default:
-
-```sh
-SKYHOOK_LIVE_PROFILE=terra cargo test -p skyhook-agent-core --test live_skill_fixture -- --ignored --nocapture
-SKYHOOK_LIVE_PROFILE=qwen36 cargo test -p skyhook-agent-core --test live_skill_fixture -- --ignored --nocapture
-```
-
-Profiles come from the user config. Codex uses the Skyhook-owned login; Terra runs with low
-reasoning effort to keep cost down. The harness disables write/exec/child-agent capabilities.
-
 Remote skill-transfer tests verify caller-workspace routing, host-owned reads, and
 write authorization without requiring SSH:
 
 ```sh
-cargo test -p skyhook-agent-core skill_transfer_tests
+cargo test -p skyhook-agent-core tool::builtins::skill_transfer::tests
 ```
 
 The disposable loopback SSH integration verifies direct and native-jump connections,

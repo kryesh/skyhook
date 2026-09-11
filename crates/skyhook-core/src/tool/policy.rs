@@ -326,6 +326,7 @@ mod tests {
 
     #[test]
     fn capability_names_round_trip_and_reject_unknown_names() {
+        assert_eq!(Capability::Network.as_str(), "network");
         for capability in Capability::ALL {
             let name = capability.as_str();
             assert_eq!(name.parse::<Capability>().unwrap(), capability);
@@ -361,19 +362,6 @@ mod tests {
         assert!(!child.contains(Capability::Agents));
         assert!(child.contains(Capability::Interactive));
         assert!(child.contains(Capability::Mcp));
-    }
-
-    #[test]
-    fn network_capability_serializes_and_is_enabled_by_default() {
-        assert!(CapabilitySet::default().contains(Capability::Network));
-        assert_eq!(
-            serde_json::to_value(Capability::Network).unwrap(),
-            "network"
-        );
-        assert_eq!(
-            serde_json::from_value::<Capability>(serde_json::json!("network")).unwrap(),
-            Capability::Network
-        );
     }
 
     #[test]

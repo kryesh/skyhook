@@ -333,19 +333,36 @@ fn default_dot() -> String {
     ".".to_owned()
 }
 
-#[cfg(all(test, unix))]
-#[path = "process_terminal_tests.rs"]
-mod terminal_tests;
-
 #[cfg(test)]
 mod tests {
-    use crate::test_support::TestRuntime;
+    #[cfg(unix)]
+    use std::{
+        io::Read as _,
+        os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
+    };
+
+    use crate::tests::TestRuntime;
 
     use super::*;
     use crate::{
         job::JobState,
-        tool::{ToolRegistryBuilder, executor::ExecutionError},
+        tool::{
+            ToolRegistryBuilder,
+            executor::{ExecutionError, ToolExecutor},
+            policy::CapabilitySet,
+        },
     };
+
+    fn executor(runtime: &TestRuntime, interactive: bool) -> ToolExecutor {
+        let mut builder = ToolRegistryBuilder::default();
+        register(&mut builder).unwrap();
+        let mut capabilities = CapabilitySet::default();
+        capabilities.remove(Capability::Targets);
+        if !interactive {
+            capabilities.remove(Capability::Interactive);
+        }
+        runtime.executor(builder).with_capabilities(capabilities)
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -354,13 +371,7 @@ mod tests {
             let runtime = TestRuntime::new().await;
             let agent = runtime.agent.clone();
             let jobs = runtime.jobs.clone();
-            let mut builder = ToolRegistryBuilder::default();
-            register(&mut builder).unwrap();
-            let mut capabilities = crate::tool::policy::CapabilitySet::default();
-            if !interactive {
-                capabilities.remove(Capability::Interactive);
-            }
-            let executor = runtime.executor(builder).with_capabilities(capabilities);
+            let executor = executor(&runtime, interactive);
             let running = executor.execute(agent, "shell", serde_json::json!({
                 "command":"(sleep 0.3; printf escaped > escaped) & printf ready; exit 0", "bg":true
             }), None).await.unwrap();
@@ -400,9 +411,7 @@ mod tests {
         let runtime = TestRuntime::new().await;
         let agent = runtime.agent.clone();
         let jobs = runtime.jobs.clone();
-        let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder).unwrap();
-        let executor = runtime.executor(builder);
+        let executor = executor(&runtime, true);
         for (command, expected) in [
             ("exit 0", serde_json::json!({"exit_code":0})),
             (
@@ -463,5 +472,223 @@ mod tests {
         let envelope = jobs.snapshot(failed_job).await.unwrap();
         assert_eq!(envelope.state, JobState::Failed);
         assert_eq!(envelope.output.unwrap()["timed_out"], true);
+    }
+
+    // Use a separate session with a real controlling PTY; never change the
+    // test runner's own session or terminal state.
+    #[cfg(unix)]
+    const PTY_HELPER: &str = "SKYHOOK_PROCESS_PTY_TEST";
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capability_controls_terminal_access_under_a_pty() {
+        let mut master = -1;
+        let mut slave = -1;
+        // SAFETY: openpty initializes the two descriptor slots; optional arguments
+        // are null. OwnedFd below takes sole ownership on success.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let master = unsafe { OwnedFd::from_raw_fd(master) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        for fd in [&master, &slave] {
+            // SAFETY: these descriptors remain owned and valid throughout setup.
+            assert_ne!(
+                unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+                -1
+            );
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "tool::builtins::process::tests::pty_executor_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(PTY_HELPER, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let slave_fd = slave.as_raw_fd();
+        // SAFETY: only async-signal-safe syscalls are used in the child. The slave
+        // stays open until spawn finishes and is then closed on exec via CLOEXEC.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setsid() == -1 || libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        let _group = ProcessGroup(i32::try_from(child.id().unwrap()).unwrap());
+        let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
+            .await
+            .expect("PTY executor helper hung")
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "PTY helper failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "PTY helper filter did not execute the regression"
+        );
+
+        // Keep the slave open so an empty master returns EAGAIN rather than EIO.
+        // No tool should have emitted its attempted credential prompt to the PTY.
+        assert_ne!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+            -1
+        );
+        let mut master = std::fs::File::from(master);
+        let mut terminal_output = Vec::new();
+        match master.read_to_end(&mut terminal_output) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("reading PTY output: {error}"),
+        }
+        assert!(
+            terminal_output.is_empty(),
+            "unexpected terminal prompt: {:?}",
+            String::from_utf8_lossy(&terminal_output)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "invoked in a dedicated PTY/session by capability_controls_terminal_access_under_a_pty"]
+    fn pty_executor_helper() {
+        if std::env::var_os(PTY_HELPER).is_none() {
+            return;
+        }
+        // Establish that this is a real controlling terminal, not merely a tty FD.
+        let _tty = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .expect("helper must have a controlling terminal");
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            for interactive in [false, true] {
+                let runtime = TestRuntime::new().await;
+                // The fixture disables Targets: terminal gating must not depend on it.
+                let executor = executor(&runtime, interactive);
+                let (command, expected) = if interactive {
+                    ("if (: <> /dev/tty) 2>/dev/null; then printf attached; else printf missing; fi", "attached")
+                } else {
+                    // With only setpgid and piped stdio this emits a terminal prompt
+                    // then stops on SIGTTIN. The tool timeout makes that regression
+                    // fail promptly instead of hanging the test suite.
+                    ("if (: <> /dev/tty) 2>/dev/null; then exec 3<> /dev/tty; printf 'Password: ' >&3; read answer <&3; else printf isolated; fi", "isolated")
+                };
+                for tool in ["exec", "shell"] {
+                    let args = if tool == "exec" {
+                        serde_json::json!({"argv":["/bin/sh", "-c", command], "timeout":2})
+                    } else {
+                        serde_json::json!({"command":command, "timeout":2})
+                    };
+                    let output = executor.execute(runtime.agent.clone(), tool, args, None).await
+                        .unwrap_or_else(|error| panic!("{tool} interactive={interactive}: {error}"));
+                    assert_eq!(output.output.value["exit_code"], 0);
+                    assert_eq!(output.output.value["stdout"], expected);
+                }
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_noninteractive_descendants_after_shell_exit() {
+        let runtime = TestRuntime::new().await;
+        let executor = executor(&runtime, false);
+        let error = executor.execute(runtime.agent.clone(), "shell", serde_json::json!({
+            "command":"(sleep 1.5; printf escaped > escaped) & printf ready; exit 0", "timeout":1
+        }), None).await.expect_err("descendant-held pipes must time out");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(!runtime.root.path().join("escaped").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn noninteractive_askpass_overrides_provider_without_targets() {
+        for interactive in [false, true] {
+            let runtime = TestRuntime::new().await;
+            let environment = std::collections::BTreeMap::from([
+                ("SSH_ASKPASS".into(), "/inherited/prompt-helper".into()),
+                ("SSH_ASKPASS_REQUIRE".into(), "prefer".into()),
+                ("DISPLAY".into(), "inherited-display".into()),
+                (
+                    "SKYHOOK_ASKPASS_SOCKET".into(),
+                    "/inherited/prompt-socket".into(),
+                ),
+                ("SSH_AUTH_SOCK".into(), "/inherited/agent-socket".into()),
+            ]);
+            let executor = executor(&runtime, interactive).with_process_environment(environment);
+            for tool in ["exec", "shell"] {
+                let command = r#"printf '%s\n' "$SSH_ASKPASS" "$SSH_ASKPASS_REQUIRE" "$DISPLAY" "$SKYHOOK_ASKPASS_SOCKET" "$SSH_AUTH_SOCK"; if test -x "$SSH_ASKPASS" && test -S "$SKYHOOK_ASKPASS_SOCKET"; then printf live; fi"#;
+                let args = if tool == "exec" {
+                    serde_json::json!({"argv":["/bin/sh", "-c", command]})
+                } else {
+                    serde_json::json!({"command":command})
+                };
+                let output = executor
+                    .execute(runtime.agent.clone(), tool, args, None)
+                    .await
+                    .unwrap();
+                assert_eq!(output.output.value["exit_code"], 0);
+                let lines: Vec<_> = output.output.value["stdout"]
+                    .as_str()
+                    .unwrap()
+                    .lines()
+                    .collect();
+                assert_eq!(
+                    lines[4], "/inherited/agent-socket",
+                    "nonprompting credentials remain usable"
+                );
+                if interactive {
+                    assert_eq!(
+                        lines,
+                        [
+                            "/inherited/prompt-helper",
+                            "prefer",
+                            "inherited-display",
+                            "/inherited/prompt-socket",
+                            "/inherited/agent-socket"
+                        ]
+                    );
+                } else {
+                    assert_ne!(lines[0], "/inherited/prompt-helper");
+                    assert_eq!(lines[1], "force");
+                    assert_eq!(lines[2], "skyhook");
+                    assert_ne!(lines[3], "/inherited/prompt-socket");
+                    assert_eq!(
+                        lines[5], "live",
+                        "rejecting broker must live throughout command"
+                    );
+                    assert!(
+                        !std::path::Path::new(lines[0]).exists(),
+                        "helper must be cleaned up"
+                    );
+                    assert!(
+                        !std::path::Path::new(lines[3]).exists(),
+                        "socket must be cleaned up"
+                    );
+                }
+            }
+        }
     }
 }

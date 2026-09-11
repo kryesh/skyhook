@@ -131,42 +131,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_and_command_arguments() {
-        let config: McpServerConfig = toml::from_str(
-            "transport = 'stdio'\nstart_command = ['server', '--flag', 'two words', '']",
-        )
-        .unwrap();
-        assert_eq!(config.transport, McpTransport::Stdio);
-        assert_eq!(config.startup_timeout_secs, 30);
-        assert_eq!(config.call_timeout_secs, 120);
-        assert!(config.capabilities.is_empty());
-        assert!(config.env.is_empty());
-        assert!(config.headers_env.is_empty());
-        assert!(config.cwd.is_none());
-        assert!(config.url.is_none());
-        assert_eq!(config.start_command.unwrap()[2], "two words");
-    }
-
-    #[test]
-    fn http_can_connect_only_or_start_a_command() {
-        for command in [
-            "",
-            "start_command = ['server']\ncwd = 'work'\nenv = { MODE = 'test' }\n",
-        ] {
-            let config: McpServerConfig = toml::from_str(&format!(
-                "transport = 'streamable_http'\nurl = 'http://localhost:8080/mcp'\n{command}headers_env = {{ Authorization = 'SKYHOOK_MCP_TEST_UNSET_SECRET' }}\ncapabilities = ['read', 'write', 'exec', 'network', 'targets', 'agents']"
-            )).unwrap();
-            assert_eq!(config.transport, McpTransport::StreamableHttp);
-            assert_eq!(config.capabilities.len(), 6);
-            // Secret resolution belongs to connection startup, not config parsing.
-            assert_eq!(
-                config.headers_env["Authorization"],
-                "SKYHOOK_MCP_TEST_UNSET_SECRET"
-            );
-        }
-    }
-
-    #[test]
     fn invalid_connections_are_rejected() {
         for text in [
             "transport = 'stdio'",

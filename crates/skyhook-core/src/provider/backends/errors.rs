@@ -68,7 +68,7 @@ pub(super) fn classify_error(status: Option<u16>, native: &serde_json::Value) ->
 }
 
 #[cfg(test)]
-mod error_tests {
+mod tests {
     use super::*;
     use serde_json::json;
 

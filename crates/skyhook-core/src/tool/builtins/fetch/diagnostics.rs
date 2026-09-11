@@ -460,3 +460,19 @@ fn io_kind(kind: io::ErrorKind) -> FetchIoKind {
         _ => FetchIoKind::Other,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_use_stable_wire_values() {
+        let diagnostic = serde_json::to_value(FetchDiagnostic::new(
+            FetchPhase::Connect,
+            FetchErrorKind::ConnectionRefused,
+        ))
+        .unwrap();
+        assert_eq!(diagnostic["phase"], "connect");
+        assert_eq!(diagnostic["error_kind"], "connection_refused");
+    }
+}

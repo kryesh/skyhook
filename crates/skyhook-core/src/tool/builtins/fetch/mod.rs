@@ -1,0 +1,434 @@
+//! Bounded HTTP requests. Redirects are deliberately handled here, never by reqwest.
+use std::{collections::BTreeMap, time::Duration};
+
+use schemars::{JsonSchema, schema_for};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::fetch_text;
+use crate::tool::{
+    PathArgument, PathKind, RegistryError, ToolContext, ToolError, ToolOptions, ToolOutput,
+    ToolPlacement, ToolRegistryBuilder,
+    policy::{Capability, PathAccess, PermissionUse, ResourceId},
+};
+
+mod diagnostics;
+mod progress;
+mod redirects;
+mod request;
+mod response;
+mod tls;
+mod validation;
+
+use diagnostics::{FetchDiagnostic, FetchPhase};
+use progress::{FetchFailureOutput, FetchProgress, diagnostic_error};
+use request::execute;
+use validation::{parse_url, validate};
+
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum FetchResultSchema {
+    Response(FetchOutput),
+    Failure(FetchFailureOutput),
+}
+
+const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_UPLOAD_BYTES: u64 = MAX_BYTES;
+fn default_method() -> String {
+    "GET".into()
+}
+const fn default_timeout() -> u64 {
+    30
+}
+const fn default_connect_timeout() -> u64 {
+    10
+}
+const fn default_max_bytes() -> u64 {
+    DEFAULT_MAX_BYTES
+}
+const fn default_redirects() -> usize {
+    5
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FetchArgs {
+    /// HTTP(S), without URL credentials.
+    pub url: String,
+    #[serde(default = "default_method")]
+    pub method: String,
+    /// Appends to the URL query.
+    #[serde(default)]
+    pub query: Vec<(String, String)>,
+    /// Request headers to send.
+    #[serde(default)]
+    pub headers: BTreeMap<String, HeaderValues>,
+    /// Include response headers in the result (omitted by default).
+    #[serde(default)]
+    pub include_headers: bool,
+    pub body: Option<RequestBody>,
+    pub auth: Option<Auth>,
+    /// Extract readable HTML text.
+    #[serde(default)]
+    pub text: bool,
+    #[serde(default)]
+    pub response_format: ResponseFormat,
+    pub save_to: Option<String>,
+    #[serde(default)]
+    pub overwrite: bool,
+    /// Seconds.
+    #[serde(default = "default_timeout")]
+    #[schemars(range(min = 1, max = 3600))]
+    pub timeout: u64,
+    /// Seconds.
+    #[serde(default = "default_connect_timeout")]
+    #[schemars(range(min = 1, max = 3600))]
+    pub connect_timeout: u64,
+    /// Decoded response bytes; excess fails.
+    #[serde(default = "default_max_bytes")]
+    #[schemars(range(min = 1, max = 104857600))]
+    pub max_bytes: u64,
+    #[serde(default)]
+    pub redirects: RedirectPolicy,
+    #[serde(default = "default_redirects")]
+    #[schemars(range(min = 0, max = 20))]
+    pub max_redirects: usize,
+    pub proxy: Option<String>,
+    /// Skip TLS certificate verification.
+    #[serde(default)]
+    pub insecure: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub(super) enum HeaderValues {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum RequestBody {
+    Text { value: String },
+    Json { value: Value },
+    Form { fields: Vec<(String, String)> },
+    Base64 { value: String },
+    File { path: String },
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum Auth {
+    Basic {
+        username: String,
+        #[serde(default)]
+        password: String,
+    },
+    Bearer {
+        token: String,
+    },
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ResponseFormat {
+    #[default]
+    Auto,
+    Text,
+    Base64,
+}
+#[derive(Debug, Default, Clone, Copy, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RedirectPolicy {
+    #[default]
+    Safe,
+    Follow,
+    Manual,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct FetchOutput {
+    status: u16,
+    ok: bool,
+    url: String,
+    method: String,
+    /// Response headers, present only when include_headers is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headers: Option<BTreeMap<String, Vec<String>>>,
+    redirects: Vec<Redirect>,
+    body: ResponseBody,
+    /// Decoded entity bytes received (before text extraction).
+    received_bytes: u64,
+    elapsed_ms: u64,
+}
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct Redirect {
+    status: u16,
+    url: String,
+    location: String,
+    method: String,
+}
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ResponseBody {
+    Text {
+        #[schemars(extend("x-skyhook-truncatable" = true))]
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<fetch_text::ExtractionMetadata>,
+    },
+    Base64 {
+        #[schemars(extend("x-skyhook-truncatable" = true))]
+        data: String,
+    },
+    File {
+        path: String,
+        bytes: u64,
+    },
+    Empty,
+}
+
+pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
+    builder.register_dynamic(
+        "fetch",
+        "HTTP(S) from the selected target. HTTP error statuses are normal results. Safe redirects follow GET/HEAD only; no HTTPS downgrade or retries.",
+        serde_json::to_value(schema_for!(FetchArgs)).expect("fetch schema serializes"),
+        ToolOptions::new(vec![Capability::Network])
+            .argument_validator(|arguments| {
+                let args: FetchArgs = serde_json::from_value(arguments.clone()).map_err(invalid)?;
+                validate(&args)
+            })
+            .argument_permissions(|location, arguments| {
+                let args: FetchArgs = serde_json::from_value(arguments.clone()).map_err(invalid)?;
+                let url = parse_url(&args.url)?;
+                Ok(vec![PermissionUse::new(Capability::Network, ResourceId::network(&location.target, &url.origin().ascii_serialization()))])
+            })
+            .argument_paths(|arguments| {
+                let args: FetchArgs = serde_json::from_value(arguments.clone()).map_err(invalid)?;
+                let mut paths = Vec::new();
+                if args.save_to.is_some() { paths.push(PathArgument::pointer("/save_to", PathAccess::Write, PathKind::Writable)); }
+                if matches!(args.body, Some(RequestBody::File { .. })) {
+                    paths.push(PathArgument::pointer("/body/path", PathAccess::Read, PathKind::Existing));
+                }
+                Ok(paths)
+            })
+            .placement(ToolPlacement::TargetedWorkspace).background().named()
+            .output_schema(serde_json::to_value(schema_for!(FetchResultSchema)).expect("fetch output schema serializes")),
+        |context, arguments| async move {
+            let args: FetchArgs = serde_json::from_value(arguments).map_err(invalid)?;
+            validate(&args)?;
+            let mut progress = FetchProgress::new(&args);
+            let outcome = tokio::select! {
+                biased;
+                () = context.cancelled() => return Err(ToolError::Cancelled),
+                result = tokio::time::timeout(Duration::from_secs(args.timeout), execute(&context, &args, &mut progress)) => result,
+            };
+            match outcome {
+                Ok(Ok(result)) => Ok(ToolOutput::new(serde_json::to_value(result).map_err(failed)?)),
+                Ok(Err(error)) => Err(progress.failure(error)),
+                Err(_) => Err(progress.timeout(args.timeout)),
+            }
+        },
+    )?;
+    Ok(())
+}
+
+fn invalid(error: impl std::fmt::Display) -> ToolError {
+    ToolError::InvalidArguments(error.to_string())
+}
+fn failed(error: impl std::fmt::Display) -> ToolError {
+    ToolError::Failed(error.to_string())
+}
+fn network(error: reqwest::Error, phase: FetchPhase) -> ToolError {
+    diagnostic_error(FetchDiagnostic::from_reqwest(&error, phase))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::{net::TcpListener, task::JoinHandle};
+
+    pub(super) fn args(value: Value) -> FetchArgs {
+        serde_json::from_value(value).unwrap()
+    }
+    pub(super) fn executor(
+        runtime: &crate::tests::TestRuntime,
+    ) -> crate::tool::executor::ToolExecutor {
+        let mut builder = ToolRegistryBuilder::default();
+        register(&mut builder).unwrap();
+        runtime.executor(builder)
+    }
+    pub(super) async fn fetch(
+        runtime: &crate::tests::TestRuntime,
+        executor: &crate::tool::executor::ToolExecutor,
+        arguments: Value,
+    ) -> Result<Value, crate::tool::executor::ExecutionError> {
+        executor
+            .execute(runtime.agent.clone(), "fetch", arguments, None)
+            .await
+            .map(|result| result.output.value)
+    }
+
+    pub(super) async fn read_request(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> String {
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut buffer = [0u8; 4096];
+            let count = stream.read(&mut buffer).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&buffer[..count]);
+            if let Some(end) = request.windows(4).position(|v| v == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+        let length: usize = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("content-length:")
+                    .map(|n| n.trim().parse().unwrap())
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + length {
+            let mut buffer = [0u8; 4096];
+            let count = stream.read(&mut buffer).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&buffer[..count]);
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    pub(super) async fn server(
+        responses: Vec<impl AsRef<[u8]> + Send + 'static>,
+    ) -> (String, JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(10), async move {
+                let mut requests = Vec::new();
+                for response in responses {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    requests.push(read_request(&mut socket).await);
+                    socket.write_all(response.as_ref()).await.unwrap();
+                    socket.shutdown().await.unwrap();
+                }
+                requests
+            })
+            .await
+            .expect("fixture server timed out")
+        });
+        (url, task)
+    }
+    /// Send an incomplete response and keep the socket open until the client closes.
+    pub(super) async fn stalled_server(
+        response: &'static [u8],
+    ) -> (String, tokio::sync::oneshot::Receiver<()>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            socket.write_all(response).await.unwrap();
+            let _ = ready_tx.send(());
+            let _ = socket.read(&mut [0]).await;
+        });
+        (url, ready_rx, task)
+    }
+
+    pub(super) fn response(status: &str, headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: {}\r\n{headers}\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn response_body_payloads_are_truncated_but_full_output_is_retrievable() {
+        use crate::job::JobOutputQuery;
+
+        let runtime = crate::tests::TestRuntime::new().await;
+        let executor = executor(&runtime);
+        let payload = "body".repeat(1024);
+        let header = "h".repeat(3000);
+        for (format, field, expected) in [
+            ("text", "text", payload.clone()),
+            ("base64", "data", STANDARD.encode(payload.as_bytes())),
+        ] {
+            let (url, task) = server(vec![response(
+                "200 OK",
+                &format!("Content-Type: text/plain\r\nX-Details: {header}\r\n"),
+                &payload,
+            )])
+            .await;
+            let call = executor
+                .execute_model(
+                    runtime.agent.clone(),
+                    "fetch",
+                    json!({"url":url, "response_format":format, "include_headers":true}),
+                    None,
+                )
+                .await
+                .unwrap();
+            task.await.unwrap();
+            let view = call.output.value;
+            assert_eq!(view["state"], "completed");
+            assert_eq!(view["result"]["status"], 200);
+            assert_eq!(view["result"]["url"], format!("{url}/"));
+            assert_eq!(view["result"]["received_bytes"], payload.len());
+            assert_eq!(view["result"]["headers"]["x-details"][0], header);
+            assert_eq!(view["result"]["body"]["kind"], format);
+            let prefix = view["result"]["body"][field].as_str().unwrap();
+            assert!(prefix.len() < expected.len());
+            assert!(expected.starts_with(prefix));
+            let markers = view["truncated"].as_array().unwrap();
+            assert_eq!(markers.len(), 1);
+            let pointer = format!("/result/body/{field}");
+            assert_eq!(markers[0]["field"], pointer);
+            assert_eq!(markers[0]["next_start"], 1);
+            assert_eq!(markers[0]["next_offset"], prefix.len());
+
+            let mut query = JobOutputQuery::new(call.job);
+            query.field = Some(pointer);
+            let full = runtime
+                .jobs
+                .inspect_output(query.clone(), &Default::default())
+                .await
+                .unwrap();
+            assert_eq!(full["preview"]["lines"], json!([expected]));
+            query.start = Some(markers[0]["next_start"].as_u64().unwrap() as usize);
+            query.offset = Some(markers[0]["next_offset"].as_u64().unwrap() as usize);
+            let remainder = runtime
+                .jobs
+                .inspect_output(query, &Default::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                remainder["preview"]["lines"],
+                json!([&expected[prefix.len()..]])
+            );
+        }
+
+        // Small payloads keep their original shape and need no truncation marker.
+        let (url, task) = server(vec![response(
+            "200 OK",
+            "Content-Type: text/plain\r\n",
+            "ok",
+        )])
+        .await;
+        let call = executor
+            .execute_model(runtime.agent.clone(), "fetch", json!({"url":url}), None)
+            .await
+            .unwrap();
+        task.await.unwrap();
+        assert_eq!(
+            call.output.value["result"]["body"],
+            json!({"kind":"text", "text":"ok"})
+        );
+        assert!(call.output.value.get("truncated").is_none());
+    }
+}

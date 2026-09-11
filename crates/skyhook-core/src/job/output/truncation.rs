@@ -454,7 +454,7 @@ mod tests {
         let manager = JobManager::new(store.clone());
         let mut spec = JobSpec::test(AgentId::root(store.id()), "annotated");
         spec.output_schema = Some(schema);
-        let id = manager.create(spec).await.unwrap().id;
+        let id = manager.test_create(spec).await;
         let output = ToolOutput::new(value);
         let outcome = if let Some(message) = error {
             JobOutcome::Failed {

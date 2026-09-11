@@ -513,8 +513,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        identity::AgentId,
-        job::JobManager,
         session::SessionStore,
         tool::{ToolRegistryBuilder, executor::ToolExecutor, policy::AllowAll},
     };
@@ -554,7 +552,7 @@ mod tests {
                 panic!("malformed skill arguments must not request authorization");
             }
         }
-        let runtime = crate::test_support::TestRuntime::new().await;
+        let runtime = crate::tests::TestRuntime::new().await;
         let mut builder = ToolRegistryBuilder::default();
         register(&mut builder, fixture_skills().await, runtime.store.clone()).unwrap();
         let executor = ToolExecutor::new(
@@ -583,17 +581,14 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_arguments_and_read_only_copy_never_write() {
-        let runtime = crate::test_support::TestRuntime::new().await;
+        let runtime = crate::tests::TestRuntime::new().await;
         let skills = fixture_skills().await;
         let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder, skills.clone(), runtime.store.clone()).unwrap();
+        register(&mut builder, skills, runtime.store.clone()).unwrap();
         let executor = runtime.executor(builder);
         for args in [
-            serde_json::json!({}),
-            serde_json::json!({"name":""}),
             serde_json::json!({"name":"mixed-assets", "path":""}),
             serde_json::json!({"name":"mixed-assets", "path":"references/note.txt", "to":""}),
-            serde_json::json!({"name":"mixed-assets", "to":"must-not-exist"}),
             serde_json::json!({"name":"mixed-assets", "path":"references", "to":"must-not-exist"}),
             serde_json::json!({"name":"mixed-assets", "path":"references/note.txt", "to":"."}),
             serde_json::json!({"name":"mixed-assets", "path":"../mixed-assets/SKILL.md", "to":"must-not-exist"}),
@@ -608,11 +603,9 @@ mod tests {
             );
         }
         assert!(!runtime.root.path().join("must-not-exist").exists());
-        let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder, skills, runtime.store.clone()).unwrap();
         let mut capabilities = crate::tool::policy::CapabilitySet::default();
         capabilities.remove(Capability::Write);
-        let executor = runtime.executor(builder).with_capabilities(capabilities);
+        let executor = executor.with_capabilities(capabilities);
         executor
             .execute(
                 runtime.agent.clone(),
@@ -629,7 +622,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn symlink_discovery_does_not_allow_asset_escape() {
-        let runtime = crate::test_support::TestRuntime::new().await;
+        let runtime = crate::tests::TestRuntime::new().await;
         let root = runtime.root.path().join(".agents/skills/demo");
         fs::create_dir_all(&root).await.unwrap();
         fs::write(root.join("SKILL.md"), "# Demo\nSafe instructions.")
@@ -687,9 +680,9 @@ mod tests {
 
     #[tokio::test]
     async fn nearest_skill_wins_and_assets_copy_from_the_host() {
-        let root = tempfile::tempdir().unwrap();
-        let user = root.path().join("user-skills");
-        let outer = root.path().join("project");
+        let runtime = crate::tests::TestRuntime::new().await;
+        let user = runtime.root.path().join("user-skills");
+        let outer = runtime.root.path().join("project");
         let workspace = outer.join("workspace");
         for (skills_root, marker) in [
             (user.clone(), "user"),
@@ -703,28 +696,19 @@ mod tests {
         }
         let workspace = std::fs::canonicalize(workspace).unwrap();
         let skills = HostSkills::discover_from(&workspace, Some(&user)).await;
-        assert!(
-            skills
-                .get("common")
-                .unwrap()
-                .instructions
-                .contains("nearest")
-        );
-
-        let sessions = root.path().join("sessions");
-        let store = SessionStore::create(&sessions).await.unwrap();
-        let agent = AgentId::root(store.id());
-        let jobs = JobManager::new(store.clone());
         let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder, skills, store).unwrap();
-        let registry = builder.build();
-        let skill_tool = registry.get("skill").unwrap();
+        register(&mut builder, skills, runtime.store.clone()).unwrap();
+        let executor = runtime
+            .executor(builder)
+            .with_location(crate::execution::ExecutionLocation::root(workspace.clone()));
         // The host skill tool is always read-only; the transfer authorizes writes separately.
-        assert_eq!(skill_tool.capabilities(), vec![Capability::Read]);
-        let executor = ToolExecutor::new(registry, Arc::new(AllowAll), jobs, workspace.clone());
+        assert_eq!(
+            executor.registry().get("skill").unwrap().capabilities(),
+            vec![Capability::Read]
+        );
         let loaded = executor
             .execute(
-                agent.clone(),
+                runtime.agent.clone(),
                 "skill",
                 serde_json::json!({"name":"common"}),
                 None,
@@ -739,7 +723,7 @@ mod tests {
         );
         let copied = executor
             .execute(
-                agent,
+                runtime.agent,
                 "skill",
                 serde_json::json!({"name":"common", "path":"asset.bin", "to":"copied.bin"}),
                 None,

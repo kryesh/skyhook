@@ -428,9 +428,9 @@ mod tests {
     use super::*;
     use ratatui::style::Style;
 
-    fn canonical(
-        rows: &[LayoutLine],
-    ) -> Vec<(Vec<(String, Style)>, Style, bool, markdown::RowLayout)> {
+    type CanonicalRow = (Vec<(String, Style)>, Style, bool, markdown::RowLayout);
+
+    fn canonical(rows: &[LayoutLine]) -> Vec<CanonicalRow> {
         rows.iter()
             .map(|row| {
                 let mut spans: Vec<(String, Style)> = Vec::new();

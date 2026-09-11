@@ -468,7 +468,7 @@ mod tests {
     #[tokio::test]
     async fn grouped_search_is_captured_and_preserves_whitespace_and_binary_rollback() {
         use serde_json::json;
-        let runtime = crate::test_support::TestRuntime::new().await;
+        let runtime = crate::tests::TestRuntime::new().await;
         let directory = runtime.root.path().join("files");
         std::fs::create_dir(&directory).unwrap();
         std::fs::write(directory.join("a.txt"), "  needle  \nneedle again\n").unwrap();

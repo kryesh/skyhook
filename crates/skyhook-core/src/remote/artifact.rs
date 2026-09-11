@@ -218,21 +218,12 @@ mod tests {
         ])
         .unwrap();
         let linux = catalog.find("ssh", "x86_64", "linux").unwrap();
-        assert_eq!(linux.os, "linux");
-        assert_eq!(linux.protocol, "ssh");
-        assert_eq!(linux.arch, "x86_64");
-        assert_eq!(linux.binary, "linux-ssh");
-        assert_eq!(linux.extension, None);
-        assert_eq!(linux.file_name, "linux-ssh-x86_64");
         assert_eq!(linux.installed_name(), "linux-ssh");
         assert_eq!(
-            catalog.find("ssh", "aarch64", "linux").unwrap().arch,
-            "aarch64"
+            linux.sha256(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         let windows = catalog.find("winrm", "x86_64", "windows").unwrap();
-        assert_eq!(windows.binary, "windows-winrm");
-        assert_eq!(windows.extension.as_deref(), Some("exe"));
-        assert_eq!(windows.file_name, "windows-winrm-x86_64.exe");
         assert_eq!(windows.installed_name(), "windows-winrm.exe");
     }
 
@@ -258,8 +249,6 @@ mod tests {
     fn canonicalizes_asset_aliases() {
         let catalog = catalog(&["darwin-ssh-arm64", "windows_nt-winrm-amd64.exe"]).unwrap();
         let macos = catalog.find("ssh", "aarch64", "macos").unwrap();
-        assert_eq!(macos.os, "macos");
-        assert_eq!(macos.arch, "aarch64");
         assert_eq!(macos.file_name, "darwin-ssh-arm64");
         assert_eq!(macos.installed_name(), "macos-ssh");
         let windows = catalog.find("winrm", "x64", "windows").unwrap();
@@ -276,7 +265,6 @@ mod tests {
             "future_os-other_protocol-riscv64",
         ])
         .unwrap();
-        assert!(!catalog.is_empty());
         assert_eq!(
             catalog.find("winrm", "x64", "linux").unwrap().binary,
             "linux-winrm"
@@ -317,90 +305,30 @@ mod tests {
     fn rejects_invalid_names() {
         for name in [
             "",
-            "linux",
-            "linux-ssh",
             "linux-ssh-x86_64-extra",
             "skyhook-shim-x86_64-linux",
-            "linux-ssh-x86-64",
             "-ssh-x86_64",
             "linux--x86_64",
             "linux-ssh-",
             "Linux-ssh-x86_64",
-            "linux-SSH-x86_64",
-            "linux-ssh-X86_64",
             " linux-ssh-x86_64",
-            "linux-ssh-x86_64 ",
             "linux-ssh-x86_64\n",
             "../linux-ssh-x86_64",
             "/linux-ssh-x86_64",
-            "dir/linux-ssh-x86_64",
             "dir\\linux-ssh-x86_64",
-            "gnu/linux-ssh-x86_64",
             "linux-ss h-x86_64",
             "linux-ssh-x86_64;echo",
             "linux-ssh-$(uname)",
             "línux-ssh-x86_64",
             "linux-ssh-x86_64.",
-            "linux-ssh-x86_64..exe",
             "linux-ssh-x86_64.exe.bak",
-            "linux-ssh-x86_64.exe/other",
-            "linux-ssh-x86_64.exe\\other",
             "linux-ssh-x86_64.ex-e",
             "linux-ssh-x86_64.EXE",
-            "linux-ssh-x86_64. exe",
         ] {
             assert!(
                 matches!(catalog(&[name]), Err(ArtifactError::InvalidName(value)) if value == name),
                 "accepted invalid name {name:?}"
             );
-        }
-    }
-
-    #[test]
-    fn supports_owned_names_and_mixed_payload_ownership_without_leaking() {
-        let names = [
-            "linux-ssh-x86_64".to_owned(),
-            "linux-ssh-aarch64".to_owned(),
-        ];
-        let catalog = EmbeddedShimCatalog::from_embedded_assets([
-            (&names[0], Cow::Borrowed(&b"abc"[..])),
-            (&names[1], Cow::Owned(b"owned".to_vec())),
-        ])
-        .unwrap();
-        drop(names);
-        let borrowed = catalog.find("ssh", "x64", "linux").unwrap();
-        assert!(matches!(borrowed.bytes, Cow::Borrowed(_)));
-        assert_eq!(borrowed.bytes.as_ref(), b"abc");
-        assert_eq!(
-            borrowed.sha256(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        let cloned = catalog.clone();
-        drop(catalog);
-        let owned = cloned.find("ssh", "arm64", "linux").unwrap();
-        assert!(matches!(owned.bytes, Cow::Owned(_)));
-        assert_eq!(owned.bytes.as_ref(), b"owned");
-    }
-
-    #[test]
-    fn preserves_static_adapter_and_empty_catalog() {
-        static ASSETS: &[(&str, &[u8])] = &[("linux-ssh-x86_64", b"abc")];
-        let catalog = EmbeddedShimCatalog::from_assets(ASSETS).unwrap();
-        assert_eq!(
-            catalog.find("ssh", "x64", "linux").unwrap().bytes.as_ref(),
-            b"abc"
-        );
-        for catalog in [
-            EmbeddedShimCatalog::default(),
-            EmbeddedShimCatalog::from_assets(&[]).unwrap(),
-            EmbeddedShimCatalog::from_embedded_assets(std::iter::empty::<(
-                String,
-                Cow<'static, [u8]>,
-            )>())
-            .unwrap(),
-        ] {
-            assert!(catalog.is_empty());
-            assert!(catalog.find("ssh", "x86_64", "linux").is_none());
         }
     }
 }

@@ -1,0 +1,200 @@
+//! Shared foreground-only grammar and theme service for tools and code fences.
+use super::super::ContentTheme;
+use super::{MAX_LINE, MAX_SECTION, model};
+use ratatui::{
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+};
+use std::sync::OnceLock;
+use syntect::{
+    easy::HighlightLines, highlighting::Theme, parsing::SyntaxSet, util::LinesWithEndings,
+};
+
+pub(super) struct SyntaxResources {
+    syntaxes: SyntaxSet,
+    dark: Theme,
+    light: Theme,
+}
+pub(super) fn syntax_resources() -> &'static SyntaxResources {
+    static RESOURCES: OnceLock<SyntaxResources> = OnceLock::new();
+    RESOURCES.get_or_init(|| SyntaxResources {
+        syntaxes: SyntaxSet::load_defaults_newlines(),
+        dark: ContentTheme::new(false).syntax_theme(),
+        light: ContentTheme::new(true).syntax_theme(),
+    })
+}
+
+/// Shared, foreground-only syntax service for code fences and tools.
+/// Returns None for unknown languages, oversized sources/lines, or parse failures;
+/// callers should render their usual neutral fallback. Like the tool worker, run
+/// this off the UI thread: size limits bound input, not regex execution time.
+/// Grammars and both themes are initialized once and shared across workers.
+pub fn highlight_code(source: &str, language: &str, light: bool) -> Option<Vec<Line<'static>>> {
+    if source.len() > MAX_SECTION
+        || source.split('\n').any(|line| line.len() > MAX_LINE)
+        || language.is_empty()
+    {
+        return None;
+    }
+    highlight_source(source, language, light, syntax_resources())
+}
+
+fn highlight_source(
+    source: &str,
+    language: &str,
+    light: bool,
+    resources: &SyntaxResources,
+) -> Option<Vec<Line<'static>>> {
+    if language.is_empty() {
+        return None;
+    }
+    let syntaxes = &resources.syntaxes;
+    let syntax = syntaxes
+        .find_syntax_by_extension(language)
+        .or_else(|| syntaxes.find_syntax_by_token(language))?;
+    let theme = if light {
+        &resources.light
+    } else {
+        &resources.dark
+    };
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let mut lines = Vec::new();
+    for source_line in LinesWithEndings::from(source) {
+        let Ok(tokens) = highlighter.highlight_line(source_line, syntaxes) else {
+            return None;
+        };
+        let mut spans = Vec::new();
+        for (style, text) in tokens {
+            let mut rendered = Style::default().fg(Color::Rgb(
+                style.foreground.r,
+                style.foreground.g,
+                style.foreground.b,
+            ));
+            if style
+                .font_style
+                .contains(syntect::highlighting::FontStyle::BOLD)
+            {
+                rendered = rendered.add_modifier(Modifier::BOLD);
+            }
+            if style
+                .font_style
+                .contains(syntect::highlighting::FontStyle::ITALIC)
+            {
+                rendered = rendered.add_modifier(Modifier::ITALIC);
+            }
+            if style
+                .font_style
+                .contains(syntect::highlighting::FontStyle::UNDERLINE)
+            {
+                rendered = rendered.add_modifier(Modifier::UNDERLINED);
+            }
+            spans.push(Span::styled(
+                model::clean(text.strip_suffix('\n').unwrap_or(text)),
+                rendered,
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    if source.ends_with('\n') || source.is_empty() {
+        lines.push(Line::default());
+    }
+    Some(lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn shared_highlighter_maps_tokens_and_preserves_source_in_both_modes() {
+        let source = "let value = (true, 42, \"hello\");  \n\t// comment 界 👩‍💻\n\n";
+        for light in [false, true] {
+            let theme = ContentTheme::new(light);
+            let lines = highlight_code(source, "rust", light).unwrap();
+            assert_eq!(text(&lines), model::clean(source));
+            let spans: Vec<_> = lines.iter().flat_map(|line| &line.spans).collect();
+            assert!(spans.iter().all(|span| span.style.bg.is_none()));
+            for (token, color) in [
+                ("let", theme.secondary),
+                ("true", theme.primary),
+                ("42", theme.accent),
+                ("hello", theme.success),
+                ("comment", theme.muted),
+            ] {
+                assert!(
+                    spans
+                        .iter()
+                        .any(|span| span.content.contains(token) && span.style.fg == Some(color)),
+                    "{light}: {token}: {spans:?}"
+                );
+            }
+        }
+    }
+
+    /// Assert source ranges, not just scope names: grammars can classify real
+    /// tokens differently than a synthetic scope would suggest.
+    fn assert_source_color(lines: &[Line<'_>], needle: &str, expected: Color) {
+        let source = text(lines);
+        let mut colors = Vec::new();
+        for line in lines {
+            for span in &line.spans {
+                colors.extend(std::iter::repeat_n(span.style.fg, span.content.len()));
+                assert_eq!(span.style.bg, None);
+            }
+            colors.push(None); // line separator
+        }
+        assert!(source.contains(needle), "missing {needle:?}");
+        for (start, _) in source.match_indices(needle) {
+            assert!(
+                colors[start..start + needle.len()]
+                    .iter()
+                    .all(|color| *color == Some(expected)),
+                "{needle:?} at {start} should be {expected:?}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn javascript_function_names_use_standard_scopes_in_both_modes() {
+        let source = "async function declared() { const result = called(); return object.method(); }\nconst object = { async method() { return declared(); } };\nconst quoted = \"declared() called() method()\"; // declared() called() method()\n";
+        for light in [false, true] {
+            let theme = ContentTheme::new(light);
+            let lines = highlight_code(source, "javascript", light).unwrap();
+            assert_eq!(text(&lines), source);
+            // Inspect actual source tokens, not only synthetic theme selectors.
+            for token in ["declared", "called", "method"] {
+                assert_source_color(&lines[..2], token, theme.secondary);
+            }
+            assert_source_color(&lines[..1], "result", theme.fg);
+            let literal_line = &lines[2];
+            for (token, color) in [
+                ("declared() called() method()", theme.success),
+                (" declared() called() method()", theme.muted),
+            ] {
+                assert!(
+                    literal_line
+                        .spans
+                        .iter()
+                        .any(|span| span.content.as_ref() == token && span.style.fg == Some(color)),
+                    "{light}: {token}: {literal_line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_highlighter_declines_unrecognised_and_oversized_input() {
+        assert!(highlight_code("hello", "not-a-real-language", false).is_none());
+        assert!(highlight_code("hello", "", true).is_none());
+        assert!(highlight_code(&"x".repeat(MAX_LINE + 1), "rust", false).is_none());
+        assert!(highlight_code(&"x\n".repeat(MAX_SECTION / 2 + 1), "rust", true).is_none());
+    }
+}

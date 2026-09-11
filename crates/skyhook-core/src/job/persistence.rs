@@ -237,3 +237,123 @@ pub(super) fn acknowledge_message(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::ExecutionLocation;
+    use crate::job::{JobState, presented_job_schema};
+    use crate::tool::{ToolError, policy::CapabilitySet};
+
+    #[tokio::test]
+    async fn denial_survives_replay_and_agent_views_hide_pending_authorization() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(root.path()).await.unwrap();
+        let agent = AgentId::root(store.id());
+        let jobs = JobManager::new(store.clone());
+        let job = jobs.test_create(JobSpec::test(agent, "shell")).await;
+        jobs.transition(job, JobState::AwaitingApproval)
+            .await
+            .unwrap();
+        let pending = jobs.snapshot(job).await.unwrap();
+        assert_eq!(
+            pending.presented(&CapabilitySet::default()).unwrap()["state"],
+            "queued"
+        );
+        assert!(
+            !presented_job_schema(&CapabilitySet::default(), false)
+                .to_string()
+                .contains("awaiting_approval")
+        );
+        jobs.finish(job, ToolError::Denied("user reason".to_owned()).into())
+            .await
+            .unwrap();
+        let denied = jobs
+            .wait(job, None, true)
+            .await
+            .unwrap()
+            .presented(&CapabilitySet::default())
+            .unwrap();
+        assert_eq!(denied["code"], "permission_denied");
+        assert_eq!(denied["executed"], false);
+        assert_eq!(denied["error"], "user reason");
+        // The persisted terminal event is the source of truth for replay.
+        let session_id = store.id();
+        drop(jobs);
+        drop(store);
+        let (store, records) = SessionStore::open(root.path(), session_id).await.unwrap();
+        let restored = JobManager::restore(store, &records).await.unwrap();
+        assert_eq!(
+            restored
+                .snapshot(job)
+                .await
+                .unwrap()
+                .presented(&CapabilitySet::default())
+                .unwrap(),
+            denied
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_interrupts_active_jobs_and_advances_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(root.path()).await.unwrap();
+        let session = store.id();
+        let agent = AgentId::root(session);
+        let manager = JobManager::new(store.clone());
+        let lease = manager
+            .test_lease(JobSpec {
+                background: true,
+                ..JobSpec::test(agent.clone(), "long_task")
+            })
+            .await;
+        manager
+            .transition(lease.id, JobState::Running)
+            .await
+            .unwrap();
+        let located = manager
+            .test_lease(JobSpec {
+                background: true,
+                location: ExecutionLocation::named("build", "/srv/project".into()),
+                ..JobSpec::test(agent.clone(), "located")
+            })
+            .await;
+        manager
+            .transition(located.id, JobState::Running)
+            .await
+            .unwrap();
+        drop(lease);
+        drop(located);
+        drop(manager);
+        drop(store);
+
+        let (store, records) = SessionStore::open(root.path(), session).await.unwrap();
+        let restored = JobManager::restore(store, &records).await.unwrap();
+        assert_eq!(
+            restored
+                .snapshot(JobId::new(1).unwrap())
+                .await
+                .unwrap()
+                .state,
+            JobState::Interrupted
+        );
+        assert_eq!(
+            restored
+                .snapshot(JobId::new(1).unwrap())
+                .await
+                .unwrap()
+                .location,
+            ExecutionLocation::root(".".into())
+        );
+        assert_eq!(
+            restored
+                .snapshot(JobId::new(2).unwrap())
+                .await
+                .unwrap()
+                .location,
+            ExecutionLocation::named("build", "/srv/project".into())
+        );
+        let next = restored.create(JobSpec::test(agent, "next")).await.unwrap();
+        assert_eq!(next.id.get(), 3);
+    }
+}

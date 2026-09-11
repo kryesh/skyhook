@@ -500,4 +500,422 @@ mod tests {
             ]
         );
     }
+    use crate::agent::runtime::tests::*;
+    use crate::{
+        job::{JobEnvelope, JobSpec, JobState},
+        tool::policy::Capability,
+    };
+
+    async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .expect("question test stalled")
+    }
+
+    async fn until(
+        session: &SessionHandle,
+        job: JobId,
+        predicate: impl Fn(&JobEnvelope) -> bool,
+    ) -> JobEnvelope {
+        bounded(async {
+            loop {
+                let snapshot = session.runtime.jobs.snapshot(job).await.unwrap();
+                if predicate(&snapshot) {
+                    return snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+    }
+
+    async fn terminal(session: &SessionHandle, job: JobId) -> JobEnvelope {
+        until(session, job, |job| job.state.is_terminal()).await;
+        session.runtime.jobs.wait(job, None, true).await.unwrap()
+    }
+
+    async fn owner(session: &SessionHandle) -> JobId {
+        let job = session
+            .runtime
+            .jobs
+            .create(JobSpec {
+                accepts_input: true,
+                ..JobSpec::test(session.root.clone(), "agent")
+            })
+            .await
+            .unwrap();
+        session
+            .runtime
+            .jobs
+            .transition(job.id, JobState::Running)
+            .await
+            .unwrap();
+        job.id
+    }
+
+    fn ask(id: &str, index: usize) -> AssistantContent {
+        AssistantContent::tool_call(
+            format!("tool-{index}"),
+            index,
+            ToolCall {
+                id: id.into(),
+                name: "ask".into(),
+                arguments: json!({"id":id, "prompt":"Question?"}),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn concurrent_root_questions_are_merged_and_answers_are_split() {
+        let root = tempfile::tempdir().unwrap();
+        let requests: Arc<StdMutex<Vec<ModelRequest>>> = Arc::default();
+        let batches: Arc<StdMutex<Vec<Vec<Question>>>> = Arc::default();
+        let harness = question_harness(
+            root.path(),
+            &root.path().join("sessions"),
+            scripted_provider(
+                &requests,
+                [
+                    response(vec![ask("first", 0), ask("second", 1)]),
+                    answer("done"),
+                ],
+            ),
+            Arc::new(RecordingQuestions {
+                batches: batches.clone(),
+                answer: json!({"first":"yes", "second":{"value":2}, "extra":true}),
+            }),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(bounded(session.prompt("ask twice")).await.unwrap(), "done");
+        {
+            let batches = batches.lock().unwrap();
+            assert_eq!(batches.len(), 1);
+            assert_eq!(
+                batches[0].iter().map(|q| q.id.as_str()).collect::<Vec<_>>(),
+                ["first", "second"]
+            );
+            let requests = requests.lock().unwrap();
+            let Message::Tool(results) = request_history(&requests[1]).last().unwrap() else {
+                panic!("missing tool results")
+            };
+            assert_eq!(results[0].result["result"], "yes");
+            assert_eq!(results[1].result["result"], json!({"value":2}));
+        }
+        let events =
+            std::fs::read_to_string(session.runtime.store.directory().join("events.jsonl"))
+                .unwrap();
+        for kind in ["question_opened", "question_resolved"] {
+            assert_eq!(events.lines().filter(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["event"]["type"] == kind).count(), 2);
+        }
+        shutdown_session(session).await;
+    }
+
+    #[tokio::test]
+    async fn background_child_asks_merge_across_turns_and_resolve_independently() {
+        let root = tempfile::tempdir().unwrap();
+        let harness = test_harness(
+            root.path(),
+            &root.path().join("sessions"),
+            Arc::new(HangingProvider),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        let owner = owner(&session).await;
+        let mut asks = Vec::new();
+        for (index, id) in ["first", "second", "second"].into_iter().enumerate() {
+            let result = session
+                .runtime
+                .executor
+                .execute_model(
+                    session.root.child(1),
+                    "ask",
+                    json!({"id":id, "prompt":"Question?", "bg":true}),
+                    Some(owner),
+                )
+                .await
+                .unwrap();
+            assert!(result.background);
+            if index == 2 {
+                assert_eq!(terminal(&session, result.job).await.state, JobState::Failed);
+            } else {
+                asks.push(result.job);
+                until(&session, owner, |job| {
+                    job.state == JobState::WaitingInput
+                        && job.output.as_ref().unwrap()["questions"]
+                            .as_array()
+                            .unwrap()
+                            .len()
+                            == index + 1
+                })
+                .await;
+            }
+        }
+        for (index, (id, value)) in [("first", "one"), ("second", "two")]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                session
+                    .runtime
+                    .questions
+                    .answer_child_question(owner, json!({(id):value}))
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                terminal(&session, asks[index]).await.output,
+                Some(json!(value))
+            );
+            if index == 0 {
+                let remaining = session.runtime.jobs.snapshot(owner).await.unwrap();
+                assert_eq!(remaining.state, JobState::WaitingInput);
+                assert_eq!(remaining.output.unwrap()["questions"][0]["id"], "second");
+            }
+        }
+        assert_eq!(
+            session.runtime.jobs.snapshot(owner).await.unwrap().state,
+            JobState::Running
+        );
+        session.runtime.jobs.cancel(owner).await.unwrap();
+        shutdown_session(session).await;
+    }
+
+    #[tokio::test]
+    async fn stable_agent_job_routes_answers_and_duplicate_bursts_do_not_block_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let harness = test_harness(
+            root.path(),
+            &root.path().join("sessions"),
+            Arc::new(HangingProvider),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        let owner = owner(&session).await;
+        let mut asks = Vec::new();
+        for _ in 0..2 {
+            let ask = session
+                .runtime
+                .jobs
+                .create(JobSpec {
+                    parent: Some(owner),
+                    accepts_input: true,
+                    ..JobSpec::test(session.root.child(1), "ask")
+                })
+                .await
+                .unwrap();
+            session
+                .runtime
+                .jobs
+                .transition(ask.id, JobState::Running)
+                .await
+                .unwrap();
+            asks.push(ask);
+        }
+        let coordinator = &session.runtime.questions;
+        assert_eq!(
+            coordinator
+                .open_child_questions(
+                    vec![("first".into(), asks[0].id), ("second".into(), asks[1].id)],
+                    json!({"questions":[]})
+                )
+                .await
+                .unwrap(),
+            owner
+        );
+        assert_eq!(
+            session.runtime.jobs.snapshot(owner).await.unwrap().state,
+            JobState::WaitingInput
+        );
+        assert!(
+            coordinator
+                .answer_child_question(owner, json!({"first":"yes", "second":2}))
+                .await
+                .unwrap()
+        );
+        bounded(async {
+            for _ in 0..100 {
+                assert!(
+                    coordinator
+                        .answer_child_question(
+                            owner,
+                            json!({"first":"duplicate", "second":"duplicate"})
+                        )
+                        .await
+                        .unwrap()
+                );
+            }
+        })
+        .await;
+        assert_eq!(asks[0].input.recv().await.unwrap(), json!("yes"));
+        assert_eq!(asks[1].input.recv().await.unwrap(), json!(2));
+        coordinator
+            .resolve_child_question(owner, &[asks[0].id, asks[1].id])
+            .await
+            .unwrap();
+        assert_eq!(
+            session.runtime.jobs.snapshot(owner).await.unwrap().state,
+            JobState::Running
+        );
+        coordinator
+            .open_child_questions(vec![("cancel".into(), asks[0].id)], json!({"questions":[]}))
+            .await
+            .unwrap();
+        bounded(async {
+            for _ in 0..100 {
+                coordinator
+                    .answer_child_question(owner, json!("cancel me"))
+                    .await
+                    .unwrap();
+            }
+            coordinator.cancel_child_question(owner).await;
+        })
+        .await;
+        assert!(asks[0].cancellation.is_cancelled());
+        for ask in asks {
+            session.runtime.jobs.cancel(ask.id).await.unwrap();
+        }
+        session.runtime.jobs.cancel(owner).await.unwrap();
+        shutdown_session(session).await;
+    }
+
+    #[tokio::test]
+    async fn noninteractive_children_receive_parent_answers_directly_and_through_scripts() {
+        for scripted in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let requests: Arc<StdMutex<Vec<ModelRequest>>> = Arc::default();
+            let batches: Arc<StdMutex<Vec<Vec<Question>>>> = Arc::default();
+            let call = if scripted {
+                AssistantContent::tool_call(
+                    "script",
+                    0,
+                    ToolCall {
+                        id: "question".into(),
+                        name: "script".into(),
+                        arguments: json!({"source":"return await tool.ask({id:'child', prompt:'parent question'});"}),
+                    },
+                )
+            } else {
+                ask("child", 0)
+            };
+            let mut capabilities = CapabilitySet::default();
+            capabilities.remove(Capability::Interactive);
+            let harness = test_builder(
+                root.path(),
+                &root.path().join("sessions"),
+                scripted_provider(&requests, [response(vec![call]), answer("done")]),
+            )
+            .max_child_depth(1)
+            .capabilities(capabilities)
+            .question_handler(Arc::new(RecordingQuestions {
+                batches: batches.clone(),
+                answer: json!("host-answer"),
+            }))
+            .build()
+            .await
+            .unwrap();
+            let session = harness.new_session().await.unwrap();
+            let launched =
+                bounded(session.run_script(
+                    "return await tool.agent({prompt:'ask parent', depth:0, bg:true});",
+                ))
+                .await
+                .unwrap();
+            let owner = serde_json::from_value(launched.value["value"]["id"].clone()).unwrap();
+            let waiting = until(&session, owner, |job| job.state == JobState::WaitingInput).await;
+            assert_eq!(waiting.output.unwrap()["questions"][0]["id"], "child");
+            bounded(session.run_script(format!(
+                "return await tool.job({owner}).send({{value:'parent-answer'}});"
+            )))
+            .await
+            .unwrap();
+            assert_eq!(terminal(&session, owner).await.output, Some(json!("done")));
+            {
+                let requests = requests.lock().unwrap();
+                assert!(
+                    requests
+                        .iter()
+                        .all(|r| r.tools.iter().any(|tool| tool.name == "ask"))
+                );
+                assert!(
+                    serde_json::to_string(&requests[1].messages)
+                        .unwrap()
+                        .contains("parent-answer")
+                );
+            }
+            assert!(
+                batches.lock().unwrap().is_empty(),
+                "child asks must not reach host handler"
+            );
+            shutdown_session(session).await;
+        }
+    }
+    #[tokio::test]
+    async fn question_coordinator_rechecks_root_gate_before_waiting_for_input() {
+        for with_handler in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let batches: Arc<StdMutex<Vec<Vec<Question>>>> = Arc::default();
+            let mut capabilities = CapabilitySet::default();
+            capabilities.remove(Capability::Interactive);
+            let mut builder = test_builder(
+                root.path(),
+                &root.path().join("sessions"),
+                Arc::new(HangingProvider),
+            )
+            .capabilities(capabilities);
+            if with_handler {
+                builder = builder.question_handler(Arc::new(RecordingQuestions {
+                    batches: batches.clone(),
+                    answer: json!("unused"),
+                }));
+            }
+            let harness = builder.build().await.unwrap();
+            let session = harness.new_session().await.unwrap();
+            for background in [false, true] {
+                let lease = session
+                    .runtime
+                    .jobs
+                    .create(crate::job::JobSpec {
+                        accepts_input: true,
+                        background,
+                        ..crate::job::JobSpec::test(session.root.clone(), "ask")
+                    })
+                    .await
+                    .unwrap();
+                let location = crate::execution::ExecutionLocation::root(root.path().to_owned());
+                let context = crate::tool::ToolContext::new(
+                    crate::tool::authorization::AuthorizationSubject {
+                        agent: session.root.clone(),
+                        job: lease.id,
+                        parent: None,
+                        scope: None,
+                        capabilities: session.runtime.harness.capabilities.clone(),
+                        cancellation: lease.cancellation,
+                    },
+                    location.clone(),
+                    location,
+                    lease.input,
+                    session.runtime.jobs.clone(),
+                );
+                let error = bounded(session.runtime.questions.coordinate_question(
+                    context,
+                    Question {
+                        id: "bypass".into(),
+                        prompt: "question".into(),
+                        options: vec![],
+                    },
+                ))
+                .await
+                .unwrap_err();
+                assert!(matches!(error, crate::tool::ToolError::Denied(_)));
+                assert_ne!(
+                    session.runtime.jobs.snapshot(lease.id).await.unwrap().state,
+                    JobState::WaitingInput
+                );
+                session.runtime.jobs.cancel(lease.id).await.unwrap();
+            }
+            assert!(batches.lock().unwrap().is_empty());
+            shutdown_session(session).await;
+        }
+    }
 }

@@ -247,6 +247,66 @@ mod tests {
     }
 
     #[test]
+    fn generated_schema_accepts_continuations_and_rejects_invalid_contract_data() {
+        // Validate the schema after the same JSON round trip used by providers.
+        // Declaration order is a generation hint, not a response-key-order
+        // requirement: reordered valid responses must still validate and parse.
+        let schema = serde_json::from_str(&response_schema().to_string()).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let valid = summary();
+        let reordered: serde_json::Map<_, _> = valid
+            .as_object()
+            .unwrap()
+            .iter()
+            .rev()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let reordered = serde_json::Value::Object(reordered);
+        assert!(validator.is_valid(&reordered));
+        assert_eq!(
+            continuation(&reordered.to_string()).unwrap().message,
+            continuation(&valid.to_string()).unwrap().message
+        );
+        for field in valid.as_object().unwrap().keys() {
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(!validator.is_valid(&missing), "accepted missing {field}");
+        }
+        for (pointer, replacement) in [
+            ("/objective", serde_json::json!([])),
+            ("/findings", serde_json::json!([42])),
+            ("/jobs", serde_json::json!(["not a job id"])),
+            ("/todos/0/status", serde_json::json!("finished")),
+            ("/todos/0/text", serde_json::json!(null)),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid.pointer_mut(pointer).unwrap() = replacement;
+            assert!(!validator.is_valid(&invalid), "accepted invalid {pointer}");
+        }
+        for pointer in ["", "/todos/0"] {
+            let mut unknown = valid.clone();
+            unknown
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("unexpected".into(), serde_json::json!(true));
+            assert!(
+                !validator.is_valid(&unknown),
+                "accepted extra field at {pointer}"
+            );
+        }
+        for field in ["text", "status"] {
+            let mut missing = valid.clone();
+            missing["todos"][0].as_object_mut().unwrap().remove(field);
+            assert!(
+                !validator.is_valid(&missing),
+                "accepted todo without {field}"
+            );
+        }
+    }
+
+    #[test]
     fn continuation_preserves_section_text_and_reconciled_todos() {
         let value = summary();
         let continuation = continuation(&value.to_string()).unwrap();
@@ -341,85 +401,6 @@ mod tests {
                 .unwrap()
                 .todos
                 .is_empty()
-        );
-    }
-
-    #[test]
-    fn response_schema_requires_every_section_and_disallows_unknown_fields() {
-        let schema = response_schema();
-        assert_eq!(schema["additionalProperties"], false);
-        let required = schema["required"].as_array().unwrap();
-        assert_eq!(required.len(), summary().as_object().unwrap().len());
-        for key in summary().as_object().unwrap().keys() {
-            assert!(required.contains(&serde_json::Value::String(key.clone())));
-            match key.as_str() {
-                "objective" | "resumption_point" => {
-                    assert_eq!(schema["properties"][key]["type"], "string");
-                }
-                "jobs" => {
-                    assert_eq!(schema["properties"][key]["type"], "array");
-                    assert_eq!(schema["properties"][key]["items"]["type"], "integer");
-                }
-                "todos" => {}
-                _ => {
-                    assert_eq!(schema["properties"][key]["type"], "array");
-                    assert_eq!(schema["properties"][key]["items"]["type"], "string");
-                }
-            }
-        }
-        assert_eq!(schema["properties"]["todos"]["type"], "array");
-        let todo = &schema["properties"]["todos"]["items"];
-        assert_eq!(todo["additionalProperties"], false);
-        assert_eq!(todo["required"], serde_json::json!(["text", "status"]));
-        assert_eq!(
-            todo["properties"]["status"]["enum"],
-            serde_json::json!(["pending", "in_progress", "completed"])
-        );
-        assert!(!schema.to_string().contains("\"$ref\""));
-    }
-
-    #[test]
-    fn schema_serialization_preserves_evidence_before_todos_and_resumption() {
-        let expected = [
-            "objective",
-            "user_instructions",
-            "session_rules",
-            "plan",
-            "findings",
-            "open_issues",
-            "running_work",
-            "completed_work",
-            "decisions",
-            "recovery_details",
-            "jobs",
-            "additional_context",
-            "todo_reconciliation",
-            "todos",
-            "resumption_point",
-            "next_actions",
-        ];
-        // Replay and provider adapters deserialize schema Values; order must
-        // survive that round trip, not just the original schema generation.
-        let schema: serde_json::Value =
-            serde_json::from_str(&response_schema().to_string()).unwrap();
-        assert_eq!(
-            schema["properties"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            expected
-        );
-        assert_eq!(schema["required"], serde_json::json!(expected));
-        assert_eq!(
-            schema["properties"]["todos"]["items"]["properties"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            ["text", "status"]
         );
     }
 

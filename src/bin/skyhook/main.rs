@@ -229,8 +229,16 @@ async fn run(mut args: Args) {
 }
 
 #[cfg(test)]
-mod auth_cli_tests {
+mod tests {
     use super::*;
+    use std::{
+        fs,
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        process::{Child, Command as ProcessCommand, Output, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
     #[test]
     fn auth_commands_parse_without_starting_tui() {
         assert!(matches!(
@@ -264,11 +272,6 @@ mod auth_cli_tests {
                 .is_none()
         );
     }
-}
-
-#[cfg(test)]
-mod headless_cli_tests {
-    use super::*;
 
     #[test]
     fn headless_requires_exactly_one_input() {
@@ -304,5 +307,266 @@ mod headless_cli_tests {
         );
         assert!(Args::try_parse_from(["skyhook", "--capabilities", "read,typo"]).is_err());
         assert!(Args::try_parse_from(["skyhook", "--capabilities", "read,"]).is_err());
+    }
+    // Unit tests do not receive CARGO_BIN_EXE. Build the real CLI explicitly once,
+    // and use Cargo's artifact message rather than guessing a profile/target path.
+    fn cli_binary() -> &'static std::path::Path {
+        static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        BINARY.get_or_init(|| {
+            let features = if cfg!(feature = "embed-shims") {
+                "tui,embed-shims"
+            } else {
+                "tui"
+            };
+            let output = ProcessCommand::new(env!("CARGO"))
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .args([
+                    "build",
+                    "--locked",
+                    "--manifest-path",
+                    concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+                    "--bin",
+                    "skyhook",
+                    "--no-default-features",
+                    "--features",
+                    features,
+                    "--message-format=json",
+                ])
+                .output()
+                .expect("build CLI fixture");
+            assert!(
+                output.status.success(),
+                "CLI fixture build failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find_map(|message| {
+                    (message["reason"] == "compiler-artifact"
+                        && message["target"]["name"] == "skyhook")
+                        .then(|| message["executable"].as_str().map(PathBuf::from))
+                        .flatten()
+                })
+                .expect("Cargo did not report the skyhook executable")
+        })
+    }
+    pub(crate) struct Fixture {
+        pub(crate) root: tempfile::TempDir,
+        pub(crate) cwd: PathBuf,
+    }
+    impl Fixture {
+        pub(crate) fn new() -> Self {
+            // Finish compilation before starting provider/signal test deadlines.
+            cli_binary();
+            let root = tempfile::tempdir().unwrap();
+            let fixture = Self {
+                cwd: root.path().to_owned(),
+                root,
+            };
+            fs::create_dir_all(fixture.path("config/skyhook")).unwrap();
+            fixture.config("http://127.0.0.1:1/v1", "");
+            // Bad terminal settings must not prevent headless execution.
+            fs::create_dir_all(fixture.path("config/skyhook")).unwrap();
+            fs::write(fixture.path("config/skyhook/tui.toml"), "not valid TOML [").unwrap();
+            fixture
+        }
+        pub(crate) fn path(&self, name: &str) -> PathBuf {
+            self.root.path().join(name)
+        }
+        pub(crate) fn config(&self, endpoint: &str, top: &str) {
+            self.provider_config(endpoint, top, "");
+        }
+        pub(crate) fn provider_config(&self, endpoint: &str, top: &str, credential: &str) {
+            fs::write(self.path("config/skyhook/config.toml"), format!(
+            "{top}\n[providers.test]\nkind='openai'\napi='chat_completions'\nbase_url='{endpoint}'\n{credential}\n[models.first]\nprovider='test'\nmodel='fixture'\nmax_context=128000\nmax_output=4096\nsupports_images=true\n"
+        )).unwrap();
+        }
+        pub(crate) fn bare_command(&self) -> ProcessCommand {
+            let mut cmd = ProcessCommand::new(cli_binary());
+            cmd.current_dir(&self.cwd)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", self.root.path())
+                .env("XDG_CONFIG_HOME", self.path("config"))
+                .env("XDG_STATE_HOME", self.path("state"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            cmd
+        }
+        pub(crate) fn command(&self) -> ProcessCommand {
+            let mut cmd = self.bare_command();
+            cmd.arg("--config")
+                .arg(self.path("config/skyhook/config.toml"))
+                .arg("--workspace")
+                .arg(self.root.path());
+            cmd
+        }
+        pub(crate) fn script(&self, source: &str, extra: &[&str]) -> Output {
+            fs::write(self.path("run.js"), source).unwrap();
+            output(
+                self.command()
+                    .args(["--non-interactive", "-s"])
+                    .arg(self.path("run.js"))
+                    .args(extra),
+            )
+        }
+        pub(crate) fn artifacts(&self, output: &Output) -> String {
+            fn collect(path: &std::path::Path, text: &mut String) {
+                for entry in fs::read_dir(path).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        collect(&path, text);
+                    } else {
+                        text.push_str(&fs::read_to_string(path).unwrap_or_default());
+                    }
+                }
+            }
+            let id = std::str::from_utf8(&output.stdout).unwrap().trim();
+            let mut text = String::new();
+            collect(
+                &self.path(&format!(".skyhook/sessions/{id}/jobs")),
+                &mut text,
+            );
+            text
+        }
+        pub(crate) fn journal(&self, output: &Output) -> String {
+            assert!(
+                output.stderr.is_empty(),
+                "stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = std::str::from_utf8(&output.stdout).unwrap();
+            let id = stdout
+                .strip_suffix('\n')
+                .expect("session id ends with newline");
+            let _: skyhook::identity::SessionId =
+                id.parse().expect("stdout contains only one session ID");
+            fs::read_to_string(self.path(&format!(".skyhook/sessions/{id}/events.jsonl"))).unwrap()
+        }
+    }
+
+    pub(crate) fn output(command: &mut ProcessCommand) -> Output {
+        RunningHeadless(Some(command.spawn().unwrap())).finish()
+    }
+
+    pub(crate) fn wait_bounded(child: &mut Child) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("headless process did not terminate");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Keep cleanup reliable even if a socket/permission assertion fails mid-run.
+    pub(crate) struct RunningHeadless(pub(crate) Option<Child>);
+    impl RunningHeadless {
+        pub(crate) fn finish(mut self) -> Output {
+            wait_bounded(self.0.as_mut().unwrap());
+            self.0.take().unwrap().wait_with_output().unwrap()
+        }
+    }
+    impl Drop for RunningHeadless {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = ProcessCommand::new("kill")
+                    .args(["-TERM", &child.id().to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while child.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    pub(crate) fn mock_provider() -> (String, thread::JoinHandle<(String, String)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let (mut socket, _) = loop {
+                match listener.accept() {
+                    Ok(socket) => break socket,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("mock provider accept: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut headers = String::new();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                headers.push_str(&line);
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let response = concat!(
+                "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"mock-final-answer\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+            (headers, String::from_utf8(body).unwrap())
+        });
+        (endpoint, server)
+    }
+
+    #[test]
+    fn parse_and_early_runtime_failures_are_silent() {
+        let f = Fixture::new();
+        for args in [
+            vec!["--non-interactive", "--unknown"],
+            vec!["--non-interactive=true", "-p", "x"],
+            vec!["--non-interactive", "-p", "x", "-m", "missing"],
+        ] {
+            let out = f.command().args(&args).output().unwrap();
+            assert!(!out.status.success(), "{args:?}");
+            assert!(out.stdout.is_empty(), "{args:?}: {:?}", out.stdout);
+            assert!(out.stderr.is_empty(), "{args:?}: {:?}", out.stderr);
+        }
+        fs::write(f.path("config/skyhook/config.toml"), "invalid [").unwrap();
+        let out = f
+            .command()
+            .args(["--non-interactive", "-p", "x"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(out.stdout.is_empty() && out.stderr.is_empty());
+    }
+
+    #[test]
+    fn terminal_mode_still_rejects_redirected_io() {
+        let f = Fixture::new();
+        let out = f.command().args(["-p", "hello"]).output().unwrap();
+        assert!(!out.status.success());
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("interactive terminal"));
     }
 }

@@ -19,6 +19,42 @@ use crate::{
 
 use super::{AgentCommand, AgentLaunch, QueuedPromptToken, SessionRuntime, queue::QueuedInput};
 
+/// Connect only root-eligible MCP servers; adapters enforce per-agent gates later.
+pub(super) async fn connect_mcp(
+    builder: &mut ToolRegistryBuilder,
+    harness: &super::HarnessInner,
+    store: &crate::session::SessionStore,
+) -> (Arc<crate::mcp::manager::McpManager>, Vec<String>) {
+    let capabilities = harness.capabilities.for_agent(harness.max_child_depth);
+    let configs = harness
+        .mcp
+        .iter()
+        .filter(|(_, config)| {
+            capabilities.contains(Capability::Mcp)
+                && config
+                    .capabilities
+                    .iter()
+                    .all(|cap| capabilities.contains(*cap))
+        })
+        .map(|(name, config)| (name.clone(), config.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let manager = Arc::new(
+        crate::mcp::manager::McpManager::connect(
+            &configs,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await,
+    );
+    let mut warnings = manager.warnings().to_vec();
+    warnings.extend(crate::mcp::adapter::register(
+        builder,
+        manager.clone(),
+        &configs,
+        store.clone(),
+    ));
+    (manager, warnings)
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AgentArgs {
@@ -349,4 +385,454 @@ fn runtime_unavailable() -> ToolError {
 
 fn tool_error(error: &impl ToString) -> ToolError {
     ToolError::Failed(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::agent::runtime::tests::*;
+    use crate::{execution::ExecutionLocation, mcp::McpServerConfig, tool::policy::CapabilitySet};
+    use std::{collections::BTreeMap, path::Path, sync::Mutex as StdMutex, time::Duration};
+
+    fn builder(root: &Path, requests: Arc<StdMutex<Vec<ModelRequest>>>) -> HarnessBuilder {
+        test_builder(
+            root,
+            &root.join("sessions"),
+            scripted_provider(&requests, [answer("done"), answer("done")]),
+        )
+        .max_child_depth(1)
+    }
+    const FIXTURE: &str = r#"
+import json, os, sys
+with open(os.environ['MCP_RUNTIME_MARKER'], 'a') as marker:
+    marker.write('launched\n')
+for line in sys.stdin:
+    req = json.loads(line)
+    if 'id' not in req:
+        continue
+    method = req['method']
+    if method == 'initialize':
+        result = {'protocolVersion':req['params']['protocolVersion'],
+                  'capabilities':{'tools':{}},
+                  'serverInfo':{'name':'runtime-fixture','version':'1'}}
+    elif method == 'tools/list':
+        result = {'tools':[{'name':'echo', 'description':'runtime echo',
+                  'inputSchema':{'type':'object', 'properties':{'text':{'type':'string'}},
+                                 'required':['text'], 'additionalProperties':False}}]}
+    elif method == 'tools/call':
+        result = {'content':[], 'structuredContent':req['params']['arguments'], 'isError':False}
+    else:
+        result = {}
+    print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':result}), flush=True)
+"#;
+
+    fn stdio_config(root: &Path, capabilities: Vec<Capability>) -> McpServerConfig {
+        serde_json::from_value(json!({
+            "transport":"stdio",
+            "start_command":["python3", "-u", "-c", FIXTURE],
+            "env":{"MCP_RUNTIME_MARKER":root.join("launched")},
+            "capabilities":capabilities,
+            "startup_timeout_secs":5,
+            "call_timeout_secs":5
+        }))
+        .unwrap()
+    }
+
+    fn servers(config: McpServerConfig) -> BTreeMap<String, McpServerConfig> {
+        BTreeMap::from([("fixture".into(), config)])
+    }
+
+    fn mcp_name(session: &SessionHandle) -> String {
+        let names = session
+            .runtime
+            .executor
+            .registry()
+            .tools()
+            .filter(|tool| tool.name().starts_with("mcp_"))
+            .map(|tool| tool.name().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 1, "{:?}", session.startup_warnings());
+        names[0].clone()
+    }
+
+    #[tokio::test]
+    async fn mcp_gates_prevent_stdio_launch_and_http_contact() {
+        // Required permissions, effective root depth, and the unconditional MCP gate
+        // all apply before transport startup, even with an approve-all policy.
+        let mut cases = Vec::new();
+        for missing in Capability::ALL {
+            let mut capabilities = Capability::ALL.into_iter().collect::<CapabilitySet>();
+            capabilities.remove(missing);
+            cases.push((capabilities, Capability::ALL.to_vec(), 1));
+        }
+        cases.push((CapabilitySet::default(), vec![Capability::Agents], 0));
+        let mut without_mcp = CapabilitySet::default();
+        without_mcp.remove(Capability::Mcp);
+        cases.push((without_mcp, vec![], 1));
+        cases.push((CapabilitySet::empty(), vec![], 1));
+        for (capabilities, required, depth) in cases {
+            let root = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let http = serde_json::from_value(json!({
+                "transport":"streamable_http",
+                "url":format!("http://{}/mcp", listener.local_addr().unwrap()),
+                "capabilities":required, "startup_timeout_secs":1
+            }))
+            .unwrap();
+            let harness = builder(root.path(), Arc::default())
+                .capabilities(capabilities)
+                .max_child_depth(depth)
+                .policy(Arc::new(crate::tool::policy::AllowAll))
+                .mcp(BTreeMap::from([
+                    ("stdio".into(), stdio_config(root.path(), required)),
+                    ("http".into(), http),
+                ]))
+                .build()
+                .await
+                .unwrap();
+            let session = harness.new_session().await.unwrap();
+            assert!(session.startup_warnings().is_empty());
+            assert!(
+                !session
+                    .runtime
+                    .executor
+                    .registry()
+                    .tools()
+                    .any(|tool| tool.name().starts_with("mcp_"))
+            );
+            shutdown_session(session).await;
+            assert!(!root.path().join("launched").exists());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn empty_capability_requirements_expose_direct_and_script_tools() {
+        let root = tempfile::tempdir().unwrap();
+        let provider: Arc<StdMutex<Vec<ModelRequest>>> = Arc::default();
+        // Empty per-server requirements still need the global gate, but neither
+        // Read nor Exec is implicitly required to use an MCP connection.
+        let capabilities = [Capability::Mcp].into_iter().collect::<CapabilitySet>();
+        let harness = builder(root.path(), provider.clone())
+            .capabilities(capabilities.clone())
+            .mcp(servers(stdio_config(root.path(), vec![])))
+            .build()
+            .await
+            .unwrap();
+        let session = harness.new_session().await.unwrap();
+        assert!(session.startup_warnings().is_empty());
+        let name = mcp_name(&session);
+        let executor = session
+            .runtime
+            .executor
+            .clone()
+            .with_capabilities(capabilities);
+        assert_eq!(session.prompt("list your tools").await.unwrap(), "done");
+        assert!(
+            provider.lock().unwrap()[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == name)
+        );
+        let direct = executor
+            .execute(session.root.clone(), &name, json!({"text":"direct"}), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            direct.output.value["structuredContent"],
+            json!({"text":"direct"})
+        );
+        let script = session
+            .run_script(format!("return await tool.{name}({{text:'script'}});"))
+            .await
+            .unwrap();
+        assert_eq!(
+            script.value["value"]["structuredContent"],
+            json!({"text":"script"})
+        );
+        // Also test a discovered adapter with empty server requirements. Startup
+        // omission alone would not catch a missing adapter-level global gate.
+        let disabled = executor.with_capabilities(CapabilitySet::empty());
+        assert!(disabled.surface().get(&name).is_none());
+        assert!(
+            disabled
+                .execute(session.root.clone(), &name, json!({"text":"denied"}), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            disabled
+                .execute_script(session.root.clone(), &name, json!({"text":"denied"}), None)
+                .await
+                .is_err()
+        );
+        let script = disabled
+            .execute(
+                session.root.clone(),
+                "script",
+                json!({"source":format!("return typeof tool.{name};")}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(script.output.value["value"], "undefined");
+        shutdown_session(session).await;
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("launched")).unwrap(),
+            "launched\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn depth_zero_child_omits_agent_gated_mcp_without_reconnecting() {
+        let root = tempfile::tempdir().unwrap();
+        let provider: Arc<StdMutex<Vec<ModelRequest>>> = Arc::default();
+        let harness = builder(root.path(), provider.clone())
+            .max_child_depth(1)
+            .mcp(servers(stdio_config(root.path(), vec![Capability::Agents])))
+            .build()
+            .await
+            .unwrap();
+        let session = harness.new_session().await.unwrap();
+        let name = mcp_name(&session);
+        session.prompt("root request").await.unwrap();
+        let child = session
+            .run_script("return await tool.agent({prompt:'child request', depth:0});")
+            .await
+            .unwrap();
+        assert_eq!(child.value["value"], "done");
+        {
+            let requests = provider.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[0].tools.iter().any(|tool| tool.name == name));
+            assert!(!requests[1].tools.iter().any(|tool| tool.name == name));
+        }
+        let child_executor = session
+            .runtime
+            .executor
+            .clone()
+            .with_capabilities(session.runtime.harness.capabilities.for_agent(0));
+        assert!(
+            child_executor
+                .execute(session.root.clone(), &name, json!({"text":"denied"}), None)
+                .await
+                .is_err()
+        );
+        let script = child_executor
+            .execute(
+                session.root.clone(),
+                "script",
+                json!({"source":format!("return typeof tool.{name};")}),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(script.output.value["value"], "undefined");
+        shutdown_session(session).await;
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("launched")).unwrap(),
+            "launched\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_stays_on_host_for_remote_location() {
+        let root = tempfile::tempdir().unwrap();
+        let harness = builder(root.path(), Arc::default())
+            .mcp(servers(stdio_config(root.path(), vec![])))
+            .build()
+            .await
+            .unwrap();
+        let session = harness.new_session().await.unwrap();
+        let name = mcp_name(&session);
+        // This location has no route/worker. A targeted dispatch would fail; Host
+        // dispatch must still use the session-owning process and its MCP manager.
+        let remote = session
+            .runtime
+            .executor
+            .clone()
+            .with_location(ExecutionLocation::named(
+                "unconnected-remote",
+                PathBuf::from("/remote/workspace"),
+            ));
+        let output = remote
+            .execute(session.root.clone(), &name, json!({"text":"host"}), None)
+            .await
+            .unwrap();
+        assert_eq!(output.output.value["structuredContent"]["text"], "host");
+        shutdown_session(session).await;
+    }
+
+    #[tokio::test]
+    async fn failed_startup_is_reported_without_breaking_the_session() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = stdio_config(root.path(), vec![]);
+        config.start_command = Some(vec![
+            root.path()
+                .join("nonexistent-mcp")
+                .to_string_lossy()
+                .into_owned(),
+        ]);
+        let harness = builder(root.path(), Arc::default())
+            .mcp(servers(config))
+            .build()
+            .await
+            .unwrap();
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(session.startup_warnings().len(), 1);
+        assert!(session.startup_warnings()[0].contains("fixture"));
+        assert!(
+            !session
+                .runtime
+                .executor
+                .registry()
+                .tools()
+                .any(|tool| tool.name().starts_with("mcp_"))
+        );
+        assert_eq!(session.prompt("still usable").await.unwrap(), "done");
+        shutdown_session(session).await;
+    }
+
+    async fn terminal(
+        session: &SessionHandle,
+        job: crate::identity::JobId,
+    ) -> crate::job::JobEnvelope {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !session
+                .runtime
+                .jobs
+                .snapshot(job)
+                .await
+                .unwrap()
+                .state
+                .is_terminal()
+            {
+                tokio::task::yield_now().await;
+            }
+            session.runtime.jobs.wait(job, None, true).await.unwrap()
+        })
+        .await
+        .expect("tool test stalled")
+    }
+
+    #[tokio::test]
+    async fn root_interactive_gate_covers_dispatch_and_nested_scripts() {
+        for enabled in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let requests: Arc<StdMutex<Vec<ModelRequest>>> = Arc::default();
+            let batches: Arc<StdMutex<Vec<Vec<Question>>>> = Arc::default();
+            let mut capabilities = CapabilitySet::default();
+            if !enabled {
+                capabilities.remove(Capability::Interactive);
+            }
+            let harness = builder(root.path(), requests.clone())
+                .capabilities(capabilities.clone())
+                .question_handler(Arc::new(RecordingQuestions {
+                    batches: batches.clone(),
+                    answer: json!("host-answer"),
+                }))
+                .build()
+                .await
+                .unwrap();
+            let session = harness.new_session().await.unwrap();
+            let executor = session
+                .runtime
+                .executor
+                .clone()
+                .with_capabilities(capabilities);
+            session.prompt("list tools").await.unwrap();
+            assert_eq!(
+                requests.lock().unwrap()[0]
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == "ask"),
+                enabled
+            );
+            assert_eq!(
+                session
+                    .run_script("return typeof tool.ask;")
+                    .await
+                    .unwrap()
+                    .value["value"],
+                if enabled { "function" } else { "undefined" }
+            );
+            for background in [false, true] {
+                for route in ["host", "model", "script"] {
+                    let args = json!({"id":"root", "prompt":"question", "bg":background});
+                    let result = tokio::time::timeout(Duration::from_secs(5), async {
+                        match route {
+                            "host" => {
+                                executor
+                                    .execute(session.root.clone(), "ask", args, None)
+                                    .await
+                            }
+                            "model" => {
+                                executor
+                                    .execute_model(session.root.clone(), "ask", args, None)
+                                    .await
+                            }
+                            _ => {
+                                executor
+                                    .execute_script(session.root.clone(), "ask", args, None)
+                                    .await
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    if enabled {
+                        let job = result.unwrap().job;
+                        let output = terminal(&session, job).await;
+                        assert_eq!(output.output, Some(json!("host-answer")));
+                    } else {
+                        assert!(result.unwrap_err().to_string().contains("unavailable"));
+                    }
+                }
+                // Nested root asks cannot escape the gate through script jobs.
+                let result = executor
+                    .execute(
+                        session.root.clone(),
+                        "script",
+                        json!({
+                            "source":"return await tool.ask({id:'nested', prompt:'question'});",
+                            "bg":background,
+                        }),
+                        None,
+                    )
+                    .await;
+                if enabled || background {
+                    let output = terminal(&session, result.unwrap().job).await;
+                    assert_eq!(
+                        output.state,
+                        if enabled {
+                            crate::job::JobState::Completed
+                        } else {
+                            crate::job::JobState::Failed
+                        }
+                    );
+                    if enabled {
+                        assert_eq!(output.output.unwrap()["value"], "host-answer");
+                    }
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(crate::tool::executor::ExecutionError::Failed { .. })
+                    ));
+                }
+            }
+            assert_eq!(batches.lock().unwrap().len(), if enabled { 8 } else { 0 });
+            if !enabled {
+                assert!(
+                    session
+                        .inspect_jobs(&session.root)
+                        .await
+                        .iter()
+                        .all(|job| job.tool != "ask")
+                );
+            }
+            shutdown_session(session).await;
+        }
+    }
 }

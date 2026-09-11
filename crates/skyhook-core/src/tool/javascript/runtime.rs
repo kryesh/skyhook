@@ -329,7 +329,7 @@ fn wrapper_script(source: &str, builders: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::TestRuntime;
+    use crate::tests::TestRuntime;
     use schemars::JsonSchema;
     use serde::Deserialize;
 

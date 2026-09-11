@@ -317,6 +317,11 @@ fn decode_stream<G: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::protocol::{
+        Message, ResponseAssembler, StopReason, ToolDefinition, ToolResult, UserContent,
+    };
+    use serde_json::{Value, json};
+    use std::{sync::Arc, time::Duration};
 
     #[tokio::test]
     async fn terminal_event_closes_stream_without_waiting_for_upstream_eof() {
@@ -346,5 +351,163 @@ mod tests {
         let (items, _, reason) = assembler.finish().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(reason, StopReason::EndTurn);
+    }
+    // Synthetic llama-swap/vLLM acceptance exercises the configured provider and
+    // replay scope, while sharing transport's complete HTTP request reader.
+    async fn serve(bodies: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+        let replies = bodies.into_iter().map(|body| format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(), body
+        )).collect();
+        let (url, task) = transport::tests::server(replies).await;
+        let root = format!("{}/v1", url.trim_end_matches("/responses"));
+        let requests = tokio::spawn(async move {
+            task.await
+                .unwrap()
+                .into_iter()
+                .map(|request| {
+                    assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
+                })
+                .collect()
+        });
+        (root, requests)
+    }
+
+    fn chat_stream(frames: Vec<Value>) -> String {
+        let mut body: String = frames
+            .into_iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect();
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    fn request(model: &str, messages: Vec<Message>) -> ModelRequest {
+        ModelRequest {
+            messages,
+            tools: vec![ToolDefinition {
+                name: "lookup".into(),
+                description: "Find a value".into(),
+                input_schema: json!({"type":"object", "properties":{"q":{"type":"string"}}}),
+            }],
+            max_output_tokens: Some(512),
+            ..common::tests::request(model)
+        }
+    }
+
+    async fn complete(
+        context: &mut dyn ProviderContext,
+        request: ModelRequest,
+    ) -> ResponseAssembler {
+        let mut stream = context.invoke(request).await.unwrap();
+        let mut assembler = ResponseAssembler::default();
+        while let Some(event) = stream.next().await {
+            assembler.push(&event.unwrap()).unwrap();
+        }
+        assembler
+    }
+
+    #[tokio::test]
+    async fn chat_variations_and_scoped_reasoning_round_trip_through_public_interface() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for (policy, field) in [
+                (None, Some("reasoning_content")),
+                (Some(ChatReasoningReplay::Reasoning), Some("reasoning")),
+                (Some(ChatReasoningReplay::Unsupported), None),
+            ] {
+                for model in ["served-model", "another-model"] {
+                    let first = chat_stream(vec![
+                        json!({"choices":[{"delta":{"reasoning_content":"plan ","content":"checking"}}],
+                            "usage":{"prompt_tokens":100,"completion_tokens":1,"total_tokens":101}}),
+                        json!({"choices":[{"index":0,"delta":{"reasoning":"step","tool_calls":[
+                            {"index":0,"id":"call_a","type":"function","function":{"name":"lookup"}},
+                            {"index":0,"function":{"arguments":"{\"q\":\"x\"}"}}
+                        ]}}]}),
+                        json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+                        json!({"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":6,
+                            "total_tokens":106,"prompt_tokens_details":{"cached_tokens":80}}}),
+                    ]);
+                    let answer = chat_stream(vec![
+                        json!({"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}),
+                    ]);
+                    let (url, server) = serve(vec![first, answer.clone(), answer]).await;
+                    // Exercise the constructor default without a builder override.
+                    let configured = |name| {
+                        let provider = openai_compatible(name, &url, OpenAiApi::ChatCompletions, None).unwrap();
+                        match policy {
+                            Some(policy) => provider.with_chat_reasoning_replay(policy),
+                            None => provider,
+                        }
+                    };
+                    let provider: Arc<dyn Provider> = Arc::new(configured("local"));
+                    let mut context = provider.open_context("initial".into()).unwrap();
+                    let user = Message::User(vec![UserContent::Text {
+                        text: "find x".into(),
+                    }]);
+                    let (items, usage, stop) = complete(&mut *context, request(model, vec![user.clone()]))
+                        .await
+                        .finish()
+                        .unwrap();
+                    assert_eq!(stop, StopReason::ToolUse);
+                    assert_eq!(usage.input_tokens, 20);
+                    assert_eq!(usage.cached_input_tokens, 80);
+                    assert_eq!(usage.output_tokens, 6);
+                    assert!(
+                        items
+                            .iter()
+                            .filter_map(|item| item.replay.as_ref())
+                            .all(|replay| !replay.scope.is_empty())
+                    );
+                    // Persist/restore canonical history without any backend-specific request fields.
+                    let serialized = serde_json::to_vec(&Message::Assistant(items)).unwrap();
+                    let assistant: Message = serde_json::from_slice(&serialized).unwrap();
+                    let history = vec![
+                        user,
+                        assistant.clone(),
+                        Message::Tool(vec![ToolResult {
+                            call_id: "call_a".into(),
+                            name: "lookup".into(),
+                            result: json!({"value":42}),
+                            is_error: false,
+                            images: Vec::new(),
+                        }]),
+                    ];
+                    drop(context);
+                    let mut resumed = provider.open_context("resumed".into()).unwrap();
+                    complete(&mut *resumed, request(model, history.clone()))
+                        .await
+                        .finish()
+                        .unwrap();
+                    // Same URL/model, different configured provider identity: no private replay crossing.
+                    let foreign: Arc<dyn Provider> = Arc::new(configured("other-provider"));
+                    let mut foreign_context = foreign.open_context("foreign".into()).unwrap();
+                    complete(&mut *foreign_context, request(model, history.clone()))
+                        .await
+                        .finish()
+                        .unwrap();
+                    assert_eq!(serde_json::to_vec(&assistant).unwrap(), serialized);
+                    let requests = server.await.unwrap();
+                    assert_eq!(requests[0]["n"], 1);
+                    let assistant = &requests[1]["messages"][1];
+                    assert_eq!(assistant["content"], "checking");
+                    for candidate in ["reasoning_content", "reasoning"] {
+                        if field == Some(candidate) {
+                            assert_eq!(assistant[candidate], "plan step");
+                        } else {
+                            assert!(assistant.get(candidate).is_none());
+                        }
+                    }
+                    assert_eq!(requests[1]["messages"][1]["tool_calls"][0]["id"], "call_a");
+                    assert_eq!(requests[1]["messages"][2]["tool_call_id"], "call_a");
+                    for candidate in ["reasoning_content", "reasoning"] {
+                        assert!(requests[2]["messages"][1].get(candidate).is_none());
+                    }
+                    assert_eq!(requests[2]["messages"][1]["tool_calls"][0]["id"], "call_a");
+                }
+            }
+        })
+        .await
+        .unwrap();
     }
 }

@@ -4,6 +4,7 @@ mod artifact;
 pub(crate) mod backend;
 pub mod backends;
 mod client;
+mod error;
 mod manager;
 mod prompt;
 mod protocol;
