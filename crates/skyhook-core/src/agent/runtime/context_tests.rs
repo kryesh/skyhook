@@ -124,7 +124,6 @@ async fn cancelled_and_failed_children_release_only_their_own_context() {
                 id: child.clone(),
                 owner_job: Some(owner_job),
                 model_profile: "first".into(),
-                agent_profile: None,
                 todos: None,
                 available_depth: 0,
                 location: crate::execution::ExecutionLocation::root(root.path().to_owned()),

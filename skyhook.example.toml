@@ -2,10 +2,11 @@
 # With no saved selection, the first declared model below is used.
 # Set to true to skip interactive approval for every tool call.
 approve_all = false
-# Exact capability allowlist. Omitted uses this default; [] grants none.
+# Exact policy-capability allowlist. Omitted uses this default; [] grants no policy capabilities.
 # Add "targets" for remote-target tools, arguments, JavaScript APIs, and guidance.
-# CLI --capabilities replaces this list; --non-interactive always removes interactive.
-capabilities = ["read", "write", "exec", "network", "agents", "interactive", "mcp"]
+# CLI --capabilities replaces this list. Interaction is runtime-controlled, not configurable here.
+# Use --non-interactive to disable human interaction.
+capabilities = ["read", "write", "exec", "network", "agents", "mcp"]
 
 # The CLI loads .env from its invocation directory (not --workspace or the config directory).
 # Existing process environment variables take precedence; no parent-directory search.
@@ -96,10 +97,6 @@ import_ssh_config = false
 # [targets.build.ssh.auth]
 # kind = "key"
 # path = "~/.ssh/build_ed25519"
-
-[agents.reviewer]
-instructions = "Review changes critically. Do not edit files unless explicitly asked."
-model_profile = "sonnet"
 
 # MCP servers are optional; an absent/empty [mcp] adds no tools or prompt guidance.
 # Commands in this user config are trusted: startup runs without model approval,

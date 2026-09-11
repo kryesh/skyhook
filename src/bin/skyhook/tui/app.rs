@@ -88,7 +88,6 @@ impl Item {
 pub enum MenuKind {
     Commands,
     Models,
-    Profiles,
     Agents,
     Sessions,
     Themes,
@@ -2396,11 +2395,6 @@ impl App {
                     menu.selected = menu.items.iter().position(|item| item.value == self.model).unwrap_or(0);
                 }
             },
-            "profiles" => {
-                let mut items = vec![Item::new("", "Default instructions", "")];
-                items.extend(self.launch.config.agents.keys().map(|name| Item::new(name, name, "")));
-                self.open("Instruction profile · new sessions", MenuKind::Profiles, items);
-            }
             "agents" => self.open("Agents", MenuKind::Agents, self.agent_items()),
             "themes" => self.open("Theme", MenuKind::Themes, vec![
                 Item::new("dark", "Dark", ""), Item::new("light", "Light", ""),
@@ -2649,10 +2643,6 @@ impl App {
                 if !value.is_empty() {
                     self.model = value;
                 }
-            }
-            MenuKind::Profiles => {
-                self.launch.profile = if value.is_empty() { None } else { Some(value) };
-                self.notice("Instruction profile applies to new sessions");
             }
             MenuKind::Agents => {
                 if let Some(agent) = self
@@ -3037,7 +3027,6 @@ mod tests {
         let launch = Launch {
             config: Arc::new(config),
             model: "first".into(),
-            profile: None,
             workspace: root.path().to_path_buf(),
             sessions: root.path().join(".skyhook/sessions"),
             catalog: EmbeddedShimCatalog::from_assets(&[]).unwrap(),

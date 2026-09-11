@@ -15,7 +15,6 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("child", "First child", "ctrl+x down"),
     ("parent", "Parent agent", "ctrl+x up"),
     ("commands", "Command palette", "ctrl+p"),
-    ("profiles", "Instruction profile for new sessions", ""),
     ("jobs", "Agent jobs", ""),
     ("requests", "Model requests", ""),
     ("thinking", "Expand/collapse saved reasoning", ""),

@@ -519,7 +519,6 @@ async fn child_recovery_keeps_the_same_owner_job_and_does_not_fail_the_agent() {
             id: child.clone(),
             owner_job: Some(owner.id),
             model_profile: "test".into(),
-            agent_profile: None,
             todos: None,
             available_depth: 0,
             location: crate::execution::ExecutionLocation::root(

@@ -32,8 +32,6 @@ pub enum HarnessError {
     UnknownProvider(String),
     #[error("unknown model profile `{0}`")]
     UnknownModelProfile(String),
-    #[error("unknown agent profile `{0}`")]
-    UnknownAgentProfile(String),
     #[error("invalid profile: {0}")]
     InvalidProfile(String),
     #[error("compaction failed: {0}")]

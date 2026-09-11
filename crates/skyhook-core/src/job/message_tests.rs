@@ -24,7 +24,6 @@ async fn child_job(background: bool) -> (tempfile::TempDir, JobManager, AgentId,
                 owner_job: Some(job),
                 model_profile: "test".into(),
                 max_context: None,
-                agent_profile: None,
                 location: ExecutionLocation::root(".".into()),
             },
         )

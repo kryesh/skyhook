@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    agent::{AgentProfile, HarnessBuilder},
+    agent::HarnessBuilder,
     mcp::config::McpServerConfig,
     provider::backends::OpenAiApi,
     provider::profile::ModelProfile,
@@ -25,23 +25,20 @@ pub(crate) use paths::user_config_directory;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    // Accepted only for compatibility; model selection belongs to the host.
-    #[serde(default, rename = "default_model_profile")]
-    _legacy_model: Option<serde::de::IgnoredAny>,
-    pub default_agent_profile: Option<String>,
     pub session_root: Option<PathBuf>,
     /// Approve all tool calls without consulting an interactive policy.
     #[serde(default)]
     pub approve_all: bool,
-    /// Exact session capabilities. An explicit empty array disables all capabilities.
-    #[serde(default = "default_capabilities")]
+    /// Exact policy capabilities. Interaction is supplied separately by the runtime host.
+    #[serde(
+        default = "default_capabilities",
+        deserialize_with = "deserialize_capabilities"
+    )]
     pub capabilities: Vec<Capability>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
     pub models: indexmap::IndexMap<String, ModelProfile>,
-    #[serde(default)]
-    pub agents: BTreeMap<String, AgentProfile>,
     #[serde(default)]
     pub targets: TargetsConfig,
     /// Named, trusted MCP server connections. Empty by default.
@@ -56,7 +53,23 @@ const fn default_child_depth() -> usize {
 }
 
 fn default_capabilities() -> Vec<Capability> {
-    CapabilitySet::default().iter().collect()
+    CapabilitySet::default()
+        .iter()
+        .filter(|capability| *capability != Capability::Interactive)
+        .collect()
+}
+
+fn deserialize_capabilities<'de, D>(deserializer: D) -> Result<Vec<Capability>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let capabilities = Vec::<Capability>::deserialize(deserializer)?;
+    if capabilities.contains(&Capability::Interactive) {
+        return Err(serde::de::Error::custom(
+            "interactive is controlled by the runtime host, not the capability allowlist",
+        ));
+    }
+    Ok(capabilities)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -122,17 +135,11 @@ impl Config {
         if let Some(root) = &self.session_root {
             builder = builder.session_root(root.clone());
         }
-        if let Some(profile) = &self.default_agent_profile {
-            builder = builder.default_agent_profile(profile.clone());
-        }
         for (name, config) in &self.providers {
             builder = builder.provider(name.clone(), providers::build(name, config)?);
         }
         for (name, profile) in &self.models {
             builder = builder.model_profile(name.clone(), profile.clone());
-        }
-        for (name, profile) in &self.agents {
-            builder = builder.agent_profile(name.clone(), profile.clone());
         }
         Ok(builder)
     }
@@ -168,7 +175,7 @@ mod tests {
         let path = root.path().join("explicit.toml");
         tokio::fs::write(
             &path,
-            "default_model_profile = 'local'\n\n[models.local]\nprovider = 'local'\nmodel = 'test'\nmax_context = 128000\nmax_output = 16384\nsupports_images = false\n",
+            "[models.local]\nprovider = 'local'\nmodel = 'test'\nmax_context = 128000\nmax_output = 16384\nsupports_images = false\n",
         )
         .await
         .unwrap();
@@ -240,7 +247,7 @@ mod tests {
             (128000, 128001, "max_output must be smaller"),
         ] {
             let config: Config = toml::from_str(&format!(
-                "default_model_profile = 'test'\n[providers.test]\nkind = 'anthropic'\nbase_url = 'https://api.anthropic.com/v1'\napi_key_env = 'SKYHOOK_TEST_MISSING_API_KEY'\n[models.test]\nprovider = 'test'\nmodel = 'test'\nmax_context = {max_context}\nmax_output = {max_output}\n"
+                "[providers.test]\nkind = 'anthropic'\nbase_url = 'https://api.anthropic.com/v1'\napi_key_env = 'SKYHOOK_TEST_MISSING_API_KEY'\n[models.test]\nprovider = 'test'\nmodel = 'test'\nmax_context = {max_context}\nmax_output = {max_output}\n"
             )).unwrap();
             let Err(ConfigError::Model(name, message)) = config.harness_builder(".", "test") else {
                 panic!("expected limit validation before credential loading");
@@ -248,17 +255,6 @@ mod tests {
             assert_eq!(name, "test");
             assert!(message.contains(expected), "{message}");
         }
-    }
-
-    #[test]
-    fn removed_model_limit_name_is_rejected() {
-        let text = "default_model_profile = 'test'\n[models.test]\nprovider = 'test'\nmodel = 'test'\nmax_context = 128000\nmax_output = 16384\nmax_output_tokens = 16384\n";
-        assert!(
-            toml::from_str::<Config>(text)
-                .unwrap_err()
-                .to_string()
-                .contains("max_output_tokens")
-        );
     }
 
     #[test]
@@ -310,7 +306,6 @@ mod tests {
             Capability::Exec,
             Capability::Network,
             Capability::Agents,
-            Capability::Interactive,
             Capability::Mcp,
         ];
         assert_eq!(defaults.capabilities, expected);
@@ -327,10 +322,18 @@ mod tests {
             assert!(error.contains("unknown variant"), "{error}");
         }
         let all: Config = toml::from_str(
-            "capabilities = ['read', 'write', 'exec', 'network', 'targets', 'agents', 'interactive', 'mcp']",
+            "capabilities = ['read', 'write', 'exec', 'network', 'targets', 'agents', 'mcp']",
         )
         .unwrap();
-        assert_eq!(all.capabilities, Capability::ALL);
+        assert_eq!(
+            all.capabilities,
+            Capability::ALL
+                .into_iter()
+                .filter(|capability| *capability != Capability::Interactive)
+                .collect::<Vec<_>>()
+        );
+        let error = toml::from_str::<Config>("capabilities = ['interactive']").unwrap_err();
+        assert!(error.to_string().contains("controlled by the runtime host"));
         let approved: Config = toml::from_str("approve_all = true\ncapabilities = []").unwrap();
         assert!(approved.approve_all);
         assert!(approved.capabilities.is_empty());
@@ -341,14 +344,14 @@ mod tests {
     #[test]
     fn approve_all_is_opt_in() {
         let disabled: Config = toml::from_str(
-            "default_model_profile='test'\n[models.test]\nprovider='test'\nmodel='test'\nmax_context=128000\nmax_output=16384\nsupports_images=false\n",
+            "[models.test]\nprovider='test'\nmodel='test'\nmax_context=128000\nmax_output=16384\nsupports_images=false\n",
         )
         .unwrap();
         assert!(!disabled.approve_all);
         assert!(!disabled.capabilities.contains(&Capability::Targets));
 
         let enabled: Config = toml::from_str(
-            "default_model_profile='test'\napprove_all=true\n[models.test]\nprovider='test'\nmodel='test'\nmax_context=128000\nmax_output=16384\nsupports_images=false\n",
+            "approve_all=true\n[models.test]\nprovider='test'\nmodel='test'\nmax_context=128000\nmax_output=16384\nsupports_images=false\n",
         )
         .unwrap();
         assert!(enabled.approve_all);

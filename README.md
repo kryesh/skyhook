@@ -128,7 +128,7 @@ reopen it, including after resuming a session. `/thinking` toggles expansion of 
 
 Models are listed in configuration declaration order. For a new session, selection uses
 `--model`, then the most recently submitted configured model, then the first model in the list.
-The old `default_model_profile` configuration key is accepted but ignored. `/model` (or `Ctrl+X M`)
+`/model` (or `Ctrl+X M`)
 selects the model for subsequent user messages in the current session. Selection stays in the UI
 until a message is sent; cancelling the picker or leaving without sending does not change the
 session's recorded model. Each submitted message captures its model, including queued messages.
@@ -136,9 +136,8 @@ Queued messages are submitted together as one batch, in order, including their a
 The batch cannot be split across requests; the last message's captured model is used for that request.
 Tool follow-ups, retries, compaction, and `/retry` retain the active turn's model. The bottom bar
 shows the choice for the next message; reply footers identify the model that actually answered.
-Resumed sessions retain their last applied model and instruction profile. Instruction-profile
-changes still apply only to new sessions. `/models` remains an alias for `/model`.
-Restore a missing recorded profile before resuming rather than substituting another model.
+Resumed sessions retain their last applied model. `/models` remains an alias for `/model`.
+Restore a missing recorded model profile before resuming rather than substituting another model.
 
 The interface stores the last submitted model and theme selection in `$XDG_STATE_HOME/skyhook/ui.json`, falling back
 to `~/.local/state/skyhook/ui.json`. Writes are atomic and do not rewrite the model configuration.
@@ -164,7 +163,6 @@ state; it is not cumulative usage. Missing context data appears as `—`.
 | `Ctrl+P`, `/` | Commands |
 | `Ctrl+X N`, `Ctrl+X L` | New session, session picker |
 | `Ctrl+X M`, `/model` | Model for subsequent user messages |
-| `/profiles` | Instruction profile for new sessions |
 | `Ctrl+X A`, `Ctrl+X I` | Agent picker, focus conversation |
 | `/requests`, `/jobs` | Requests, jobs |
 | `Ctrl+X ↑`, `Ctrl+X ↓` | Parent, first child |
@@ -258,8 +256,7 @@ The submitted root turn or workflow defines completion. A workflow must explicit
 work it needs completed; outstanding jobs are cancelled and drained during shutdown. Interrupt and
 termination signals also trigger cleanup and journaled status rather than a terminal prompt.
 
-`--non-interactive` always revokes the `interactive` capability, including when it appears in an
-explicit allowlist. Root `ask` is unavailable (also inside scripts and with `bg:true`). Child agents
+`--non-interactive` always disables human interaction. Root `ask` is unavailable (also inside scripts and with `bg:true`). Child agents
 can still ask their owning parent agent. Operations requiring human approval fail immediately;
 ordinary automatically allowed operations still work. `--approve-all` (or config `approve_all = true`)
 bypasses tool approvals but does not enable questions, SSH passwords/passphrases, or host/agent
@@ -282,11 +279,11 @@ UID. Each owner removes only its own socket/helper/directory during cleanup.
 
 ## Capabilities
 
-The top-level configuration has one exact capability allowlist:
+The top-level configuration has one exact policy-capability allowlist:
 
 ```toml
 # These are the defaults when capabilities is omitted. Add "targets" to enable targets.
-capabilities = ["read", "write", "exec", "network", "agents", "interactive", "mcp"]
+capabilities = ["read", "write", "exec", "network", "agents", "mcp"]
 ```
 
 | Capability | Controls | Default |
@@ -297,16 +294,18 @@ capabilities = ["read", "write", "exec", "network", "agents", "interactive", "mc
 | `network` | HTTP(S) `fetch` | Enabled |
 | `targets` | Target-management tools and target-selection inputs | Disabled |
 | `agents` | Child-agent creation, also limited by available delegation depth | Enabled |
-| `interactive` | Human-facing root questions, approval prompts, and sensitive authentication | Enabled |
+| `interactive` (runtime only) | Human-facing root questions, approval prompts, and sensitive authentication | Enabled by the terminal host; disabled in headless mode |
 | `mcp` | MCP server startup and MCP tool availability | Enabled |
 
-An explicit array replaces the defaults; `capabilities = []` grants none. Unknown names are errors.
+An explicit array replaces the defaults; `capabilities = []` grants no policy capabilities.
+Unknown names and `interactive` are errors in this list and in `--capabilities`.
 `--capabilities read,write` replaces the config allowlist for that invocation; `--capabilities=`
-selects an empty set. Resolution is **CLI allowlist > config allowlist > defaults**, followed by
-revoking `interactive` for `--non-interactive` and applying per-agent depth restrictions. Overrides
-also apply when resuming or creating another session in the interface. Omitting `interactive` alone
-disables human prompts but does not select the headless runner. `targets_enabled` has been replaced
-by including `"targets"` in this list and is no longer accepted.
+selects an empty policy set. Resolution is **CLI allowlist > config allowlist > defaults**.
+The host then supplies `interactive` according to the runtime mode, independently of the allowlist,
+and per-agent depth restrictions narrow the result. Use `--non-interactive` to disable human
+interaction; an empty allowlist does not disable the terminal interface or root questions.
+Overrides also apply when resuming or creating another session in the interface. Enable target
+support by including `"targets"` in the allowlist.
 
 Capabilities gate both tool discovery and invocation, including JavaScript. Approval policies and
 cached grants cannot restore a missing capability. Ungated orchestration tools remain available even
@@ -321,7 +320,7 @@ Session format 1 records the inputs needed to reconstruct each call at the share
 boundary. It stores no backend-specific request bodies or authentication headers:
 
 - `model_context` records the configured provider name and a shared `ModelRequest` template:
-  actual model ID, assembled system prompt (including harness/profile instructions and location),
+  actual model ID, assembled system prompt (including harness instructions and location),
   tool descriptions and schemas, optional response schema, reasoning setting, output limit, and correlation. Its `messages`
   array is empty; conversation history remains in `message_committed` and `compaction` events.
 - `model_requested` is persisted before each provider invocation. It references the context event's
@@ -541,7 +540,7 @@ unified `Provider` / `ProviderContext` interface.
 
 ```toml
 approve_all = false
-capabilities = ["read", "write", "exec", "network", "agents", "interactive", "mcp"]
+capabilities = ["read", "write", "exec", "network", "agents", "mcp"]
 
 [providers.local]
 kind = "openai"
@@ -807,7 +806,8 @@ add explicit API-root URLs and OpenAI API choices, replace model aliases with fu
 log in separately for Codex.
 
 Instructions in `AGENTS.md` files are loaded from outermost ancestor to workspace, followed by
-instructions configured through the library.
+instructions configured through the library. Root and child agents use the built-in system prompts;
+there are no named agent profiles or `.agents/agents` role discovery.
 
 ## Embedded JavaScript
 
@@ -944,9 +944,9 @@ errors include it in an `output` field; JavaScript callers can catch the error a
   schemas; compact result shapes are included in model and script documentation.
 - `session::SessionStore` persists a versioned append-only JSONL log, content-addressed image blobs, job
   outputs, and line-addressable job output.
-- `agent::Harness` owns profiles and policy; each `agent::SessionHandle` owns an isolated agent tree
+- `agent::Harness` owns model profiles and policy; each `agent::SessionHandle` owns an isolated agent tree
   and registry.
-- Child agents are profile-selectable and retain their conversation for follow-up work.
+- Child agents retain their conversation for follow-up work.
   `tool.job(id).send({value: instructions})` delivers unsolicited input automatically at a running
   child's next model-request boundary, without interrupting the current request or tools.
   Children do not need `receive()` to read these updates. Every visible child text reply,
@@ -1002,10 +1002,8 @@ is omitted from both model tools and script bindings. Its optional `workspace` a
 absolute directories for both local and remote children. Relative overrides resolve against the
 workspace selected by the target rules. Children receive a fresh conversation, shared harness
 instructions and host-owned skills, and their parent's active model, including model switches and
-restored session selections. An explicit child `model` takes precedence over the model in an
-explicitly selected `profile`; otherwise the child inherits its parent's model. The harness default
-agent profile still supplies instructions when `profile` is omitted, without changing the inherited
-model. This applies equally to local children, remote children, and deeper descendants. Agents on
+restored session selections. An explicit child `model` overrides the inherited model.
+This applies equally to local children, remote children, and deeper descendants. Agents on
 the same target share files; a workspace override creates no filesystem isolation. Children must
 finish or cancel all owned jobs and descendants before their agent job completes. Only root agents
 may leave background services running after answering.

@@ -73,7 +73,6 @@ pub enum SessionEvent {
         model_profile: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_context: Option<u64>,
-        agent_profile: Option<String>,
         location: ExecutionLocation,
     },
     TodosReplaced {

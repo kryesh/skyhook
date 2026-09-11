@@ -11,7 +11,6 @@ async fn started(jobs: &JobManager, agent: &AgentId, owner: JobId, target: &str)
                 owner_job: Some(owner),
                 model_profile: "test".into(),
                 max_context: None,
-                agent_profile: None,
                 location: location.clone(),
             },
         )

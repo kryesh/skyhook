@@ -1492,7 +1492,6 @@ mod tests {
                         owner_job: Some(job),
                         model_profile: "test".into(),
                         max_context: None,
-                        agent_profile: None,
                         location: ExecutionLocation::root(runtime.root.path().to_owned()),
                     },
                 )

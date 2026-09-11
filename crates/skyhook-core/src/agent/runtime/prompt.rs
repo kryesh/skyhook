@@ -13,7 +13,7 @@ use crate::{
 };
 
 pub(super) const ROOT_PROMPT: &str = "You are an agent running in Skyhook. Prefer direct tools for simple operations and batch independent calls; use script for JavaScript control flow, transformation or bounded concurrency. Before finishing, wait for needed work, cancel unnecessary work, or explicitly identify jobs left running.";
-pub(super) const CHILD_PROMPT: &str = "You are an agent running in Skyhook. Complete your parent's task and return the result. Prefer direct tools for simple operations and batch independent calls; use script for JavaScript control flow, transformation or bounded concurrency. Before finishing, wait for needed work, cancel unnecessary work. You cannot complete while owned work is active.";
+pub(super) const CHILD_PROMPT: &str = "You are an agent running in Skyhook. Complete your parent's task and return the result. Your replies go directly to your parent. Stay quiet between meaningful milestones, blockers, and the final result; avoid routine progress narration. Prefer direct tools for simple operations and batch independent calls; use script for JavaScript control flow, transformation or bounded concurrency. Before finishing, wait for needed work, cancel unnecessary work. You cannot complete while owned work is active.";
 pub(super) const TARGET_PROMPT: &str = r#"Tools default to the target and workspace in skyhook_context. A tool's target selects the execution machine; write commands as if already on that machine. If the task's machine is unclear, use targets to discover available machines. Findings apply only to the target inspected.
 
 "root" selects the session host running Skyhook and its configured workspace; "local" identifies that host's target type. Selecting another target uses its configured workspace; selecting the current remote target preserves your workspace override.
@@ -46,7 +46,6 @@ struct TargetContext<'a> {
 
 pub(super) fn system_segment(
     instructions: &[String],
-    profile_instructions: Option<&str>,
     agent: &AgentId,
     location: &ExecutionLocation,
     target: Option<&crate::target::TargetDefinition>,
@@ -85,9 +84,6 @@ pub(super) fn system_segment(
         }
     }
     parts.extend(instructions.iter().cloned());
-    if let Some(instructions) = profile_instructions.filter(|value| !value.is_empty()) {
-        parts.push(instructions.to_owned());
-    }
     parts.push(format!(
         "<skyhook_context>\n{}\n</skyhook_context>",
         serde_json::to_string(&context).expect("Skyhook context is serializable")

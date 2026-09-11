@@ -29,10 +29,8 @@ pub(super) struct AgentArgs {
     /// Delegation depth available to the child; must be less than your available_depth.
     #[serde(default)]
     pub(super) depth: usize,
-    /// Model profile override; omitted/null inherits the parent's active model unless an explicit profile selects one.
+    /// Model override; omitted/null inherits the parent's active model.
     pub(super) model: Option<String>,
-    /// Agent profile override; its model is used unless model is explicitly supplied.
-    pub(super) profile: Option<String>,
     /// Execution target; defaults to the parent's.
     #[schemars(skip)]
     pub(super) target: Option<String>,
@@ -164,7 +162,7 @@ fn register_child_agent(
 ) -> Result<(), RegistryError> {
     builder.register::<AgentArgs, String, _, _>(
         "agent",
-        "Start a child agent; questions suspend it. Send follow-ups with tool.job(id).send({value: instructions}), or answers if a question is pending. Running children receive input at the next model-request boundary without receive(); their visible replies are delivered as independent message events, without waiting for completion. Completed children resume with retained history under the same job ID.",
+        "Start a child agent. Send follow-ups or answers with tool.job(id).send({value: ...}). Questions pause the child; follow-ups arrive automatically at its next model-request boundary. Replies arrive as events. Sending input to a completed child resumes its retained history under the same job ID.",
         ToolOptions::default()
             .named()
             .requires(Capability::Agents)
@@ -193,16 +191,11 @@ fn register_child_agent(
                     )));
                 }
                 let child = runtime.next_child(&context.agent).await;
-                let model = input.model.or_else(|| input.profile.as_ref()
-                    .and_then(|name| runtime.harness.agent_profiles.get(name))
-                    .and_then(|profile| profile.model_profile.clone()))
+                let model = input.model
                     .or_else(|| runtime.agents.read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .get(&context.agent).map(|agent| agent.model_profile.clone()))
                     .ok_or_else(|| ToolError::Failed("parent agent is no longer running".into()))?;
-                let agent_profile = input
-                    .profile
-                    .or_else(|| runtime.harness.default_agent_profile.clone());
                 let target = input.target.as_deref().unwrap_or(&context.caller_location.target);
                 let definition = if target == crate::target::ROOT_TARGET {
                     None
@@ -225,7 +218,6 @@ fn register_child_agent(
                     id: child.clone(),
                     owner_job: Some(context.job),
                     model_profile: model,
-                    agent_profile,
                     todos,
                     available_depth: input.depth,
                     location,

@@ -27,16 +27,13 @@ struct Args {
     /// Select and remember the root model for a new session.
     #[arg(short = 'm', long = "model")]
     model: Option<String>,
-    /// Override the configured root instruction profile.
-    #[arg(long)]
-    agent_profile: Option<String>,
     /// Approve every tool invocation without prompting.
     #[arg(long)]
     approve_all: bool,
     /// Run without terminal interaction; requires --prompt or --script.
     #[arg(long, requires = "input")]
     non_interactive: bool,
-    /// Exact comma-separated capability allowlist (an empty value disables all).
+    /// Exact comma-separated policy capabilities; interaction follows the runtime mode.
     #[arg(long, value_name = "LIST", value_parser = parse_capabilities)]
     capabilities: Option<Capabilities>,
     /// Attach images to the first prompt.
@@ -66,9 +63,11 @@ fn parse_capabilities(value: &str) -> Result<Capabilities, String> {
     value
         .split(',')
         .map(|name| {
-            name.trim()
-                .parse::<Capability>()
-                .map_err(|error| error.to_string())
+            let capability = name.trim().parse::<Capability>().map_err(|error| error.to_string())?;
+            if capability == Capability::Interactive {
+                return Err("interactive is controlled by the runtime mode; use --non-interactive to disable it".into());
+            }
+            Ok(capability)
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Capabilities)

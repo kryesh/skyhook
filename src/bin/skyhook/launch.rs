@@ -9,7 +9,7 @@ use skyhook::{
     identity::SessionId,
     remote::EmbeddedShimCatalog,
     session::SessionStore,
-    tool::policy::{AllowAll, Capability},
+    tool::policy::{AllowAll, Capability, CapabilitySet},
 };
 use std::{path::PathBuf, sync::Arc};
 
@@ -17,7 +17,6 @@ use std::{path::PathBuf, sync::Arc};
 pub struct Launch {
     pub(crate) config: Arc<Config>,
     pub model: String,
-    pub profile: Option<String>,
     pub workspace: PathBuf,
     pub sessions: PathBuf,
     pub(crate) catalog: EmbeddedShimCatalog,
@@ -27,16 +26,14 @@ pub struct Launch {
 impl Launch {
     pub async fn create(&self, resume: Option<SessionId>) -> Result<SessionHandle, String> {
         let mut model = self.model.clone();
-        let mut profile = self.profile.clone();
         if let Some(id) = resume {
             let records = SessionStore::read_records(&self.sessions, id)
                 .await
                 .map_err(|e| e.to_string())?;
-            if let Some((m, p)) =
+            if let Some(m) =
                 skyhook::session::agent_selection(&records, &skyhook::identity::AgentId::root(id))
             {
                 model = m;
-                profile = p;
             }
         }
         if !self.config.models.contains_key(&model) {
@@ -44,17 +41,18 @@ impl Launch {
                 "Model profile {model} is missing. Restore it in the configuration before resuming."
             ));
         }
-        let mut config = (*self.config).clone();
-        config.default_agent_profile = profile;
-        let builder = config
+        let capabilities = session_capabilities(&self.config, self.interaction.is_some());
+        let builder = self
+            .config
             .harness_builder(&self.workspace, &model)
             .map_err(|e| e.to_string())?
-            .shim_catalog(self.catalog.clone());
+            .shim_catalog(self.catalog.clone())
+            .capabilities(capabilities.clone());
         let builder = if self.approve_all {
             builder.policy(Arc::new(AllowAll))
         } else {
             builder.policy(Arc::new(HostApprovalPolicy::new(
-                self.config.capabilities.iter().copied().collect(),
+                capabilities,
                 self.interaction.as_deref().cloned(),
             )))
         };
@@ -74,21 +72,26 @@ impl Launch {
     }
 }
 
-/// CLI capability selection is an exact override, applied before host narrowing.
+/// Human interaction is a runtime fact, separate from the configured permissions.
+fn session_capabilities(config: &Config, interactive: bool) -> CapabilitySet {
+    let mut capabilities: CapabilitySet = config.capabilities.iter().copied().collect();
+    capabilities.remove(Capability::Interactive);
+    if interactive {
+        capabilities.insert(Capability::Interactive);
+    }
+    capabilities
+}
+
+/// CLI policy capabilities replace the configured allowlist.
 pub async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> {
     let mut config = Config::load(args.config.as_deref()).await?;
     if let Some(capabilities) = &args.capabilities {
         config.capabilities.clone_from(&capabilities.0);
     }
-    if args.non_interactive {
-        config
-            .capabilities
-            .retain(|capability| *capability != Capability::Interactive);
-    }
     Ok(config)
 }
 
-/// Preserve explicit, remembered, then configured model selection for both hosts.
+/// Select the explicit model, remembered model, or first configured model for both hosts.
 pub fn select_model(
     config: &Config,
     explicit: Option<&str>,
@@ -124,10 +127,6 @@ impl Launch {
             .unwrap_or_else(|| workspace.join(".skyhook/sessions"));
         Ok(Self {
             model,
-            profile: args
-                .agent_profile
-                .clone()
-                .or_else(|| config.default_agent_profile.clone()),
             workspace,
             sessions,
             approve_all: args.approve_all || config.approve_all,
@@ -135,5 +134,26 @@ impl Launch {
             catalog: super::embedded_shims::catalog()?,
             interaction,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interaction_follows_the_host_even_with_an_empty_allowlist() {
+        for text in ["capabilities = []", "capabilities = ['read']"] {
+            let config: Config = toml::from_str(text).unwrap();
+            for interactive in [false, true] {
+                let capabilities = session_capabilities(&config, interactive);
+                assert_eq!(capabilities.contains(Capability::Interactive), interactive);
+                assert_eq!(
+                    capabilities.contains(Capability::Read),
+                    config.capabilities.contains(&Capability::Read)
+                );
+                assert!(!capabilities.contains(Capability::Exec));
+            }
+        }
     }
 }

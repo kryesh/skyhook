@@ -14,7 +14,6 @@ use tokio::{
 };
 
 use crate::{
-    agent::AgentProfile,
     identity::{AgentId, JobId, SessionId},
     job::{CancellationToken, JobManager},
     mcp::{McpServerConfig, manager::McpManager},
@@ -77,9 +76,7 @@ pub struct HarnessBuilder {
     session_root: Option<PathBuf>,
     providers: BTreeMap<String, Arc<dyn Provider>>,
     model_profiles: BTreeMap<String, ModelProfile>,
-    agent_profiles: BTreeMap<String, AgentProfile>,
     default_model_profile: Option<String>,
-    default_agent_profile: Option<String>,
     policy: Arc<dyn Policy>,
     questions: Option<Arc<dyn QuestionHandler>>,
     extra_tools: ToolRegistry,
@@ -100,9 +97,7 @@ impl HarnessBuilder {
             session_root: None,
             providers: BTreeMap::new(),
             model_profiles: BTreeMap::new(),
-            agent_profiles: BTreeMap::new(),
             default_model_profile: None,
-            default_agent_profile: None,
             policy: Arc::new(AllowAll),
             questions: None,
             extra_tools: ToolRegistry::default(),
@@ -135,20 +130,8 @@ impl HarnessBuilder {
     }
 
     #[must_use]
-    pub fn agent_profile(mut self, name: impl Into<String>, profile: AgentProfile) -> Self {
-        self.agent_profiles.insert(name.into(), profile);
-        self
-    }
-
-    #[must_use]
     pub fn default_model_profile(mut self, name: impl Into<String>) -> Self {
         self.default_model_profile = Some(name.into());
-        self
-    }
-
-    #[must_use]
-    pub fn default_agent_profile(mut self, name: impl Into<String>) -> Self {
-        self.default_agent_profile = Some(name.into());
         self
     }
 
@@ -219,12 +202,10 @@ impl HarnessBuilder {
         let default_model_profile = self
             .default_model_profile
             .ok_or(HarnessError::MissingDefaultModelProfile)?;
-        validate_profiles(
+        validate_model_profiles(
             &self.providers,
             &self.model_profiles,
-            &self.agent_profiles,
             &default_model_profile,
-            self.default_agent_profile.as_deref(),
         )?;
         for (name, config) in &self.mcp {
             config.validate().map_err(|error| {
@@ -269,9 +250,7 @@ impl HarnessBuilder {
                 session_root,
                 providers: self.providers,
                 model_profiles: self.model_profiles,
-                agent_profiles: self.agent_profiles,
                 default_model_profile,
-                default_agent_profile: self.default_agent_profile,
                 policy: self.policy,
                 questions: self.questions,
                 extra_tools: self.extra_tools,
@@ -298,9 +277,7 @@ struct HarnessInner {
     session_root: PathBuf,
     providers: BTreeMap<String, Arc<dyn Provider>>,
     model_profiles: BTreeMap<String, ModelProfile>,
-    agent_profiles: BTreeMap<String, AgentProfile>,
     default_model_profile: String,
-    default_agent_profile: Option<String>,
     policy: Arc<dyn Policy>,
     questions: Option<Arc<dyn QuestionHandler>>,
     extra_tools: ToolRegistry,
@@ -722,7 +699,6 @@ struct AgentLaunch {
     id: AgentId,
     owner_job: Option<JobId>,
     model_profile: String,
-    agent_profile: Option<String>,
     todos: Option<Vec<TodoItem>>,
     available_depth: usize,
     location: crate::execution::ExecutionLocation,
@@ -883,21 +859,15 @@ impl SessionRuntime {
 
     async fn start_root(
         self: &Arc<Self>,
-        selection: Option<(String, Option<String>)>,
+        selection: Option<String>,
     ) -> Result<SessionHandle, HarnessError> {
         let root = AgentId::root(self.store.id());
-        let (model_profile, agent_profile) = selection.unwrap_or_else(|| {
-            (
-                self.harness.default_model_profile.clone(),
-                self.harness.default_agent_profile.clone(),
-            )
-        });
+        let model_profile = selection.unwrap_or_else(|| self.harness.default_model_profile.clone());
         let root_tx = self
             .spawn_agent(AgentLaunch {
                 id: root.clone(),
                 owner_job: None,
                 model_profile,
-                agent_profile,
                 todos: None,
                 available_depth: self.harness.max_child_depth,
                 location: crate::execution::ExecutionLocation::root(self.harness.workspace.clone()),
@@ -1013,7 +983,6 @@ impl SessionRuntime {
             id,
             owner_job,
             model_profile,
-            agent_profile,
             todos,
             available_depth,
             location,
@@ -1029,7 +998,6 @@ impl SessionRuntime {
         let (profile, system) = self
             .resolve_agent(
                 &model_profile,
-                agent_profile.as_deref(),
                 &id,
                 &location,
                 available_depth,
@@ -1047,7 +1015,6 @@ impl SessionRuntime {
                     owner_job,
                     model_profile: model_profile.clone(),
                     max_context: Some(context.profile.max_context),
-                    agent_profile: agent_profile.clone(),
                     location: location.clone(),
                 },
             )
@@ -1167,22 +1134,11 @@ impl SessionRuntime {
     async fn resolve_agent(
         &self,
         model_profile: &str,
-        agent_profile: Option<&str>,
         agent: &AgentId,
         location: &crate::execution::ExecutionLocation,
         available_depth: usize,
         capabilities: &CapabilitySet,
     ) -> Result<(ModelProfile, Vec<SystemSegment>), HarnessError> {
-        let profile_instructions = if let Some(name) = agent_profile {
-            let profile = self
-                .harness
-                .agent_profiles
-                .get(name)
-                .ok_or_else(|| HarnessError::UnknownAgentProfile(name.to_owned()))?;
-            Some(profile.instructions.as_str())
-        } else {
-            None
-        };
         let profile = self
             .harness
             .model_profiles
@@ -1196,7 +1152,6 @@ impl SessionRuntime {
         };
         let system = vec![prompt::system_segment(
             &self.harness.instructions,
-            profile_instructions,
             agent,
             location,
             target.as_ref(),
@@ -2079,20 +2034,13 @@ fn finish_response(
     })
 }
 
-fn validate_profiles(
+fn validate_model_profiles(
     providers: &BTreeMap<String, Arc<dyn Provider>>,
     models: &BTreeMap<String, ModelProfile>,
-    agents: &BTreeMap<String, AgentProfile>,
     default_model: &str,
-    default_agent: Option<&str>,
 ) -> Result<(), HarnessError> {
     if !models.contains_key(default_model) {
         return Err(HarnessError::UnknownModelProfile(default_model.to_owned()));
-    }
-    if let Some(name) = default_agent
-        && !agents.contains_key(name)
-    {
-        return Err(HarnessError::UnknownAgentProfile(name.to_owned()));
     }
     for (name, profile) in models {
         profile.validate_limits().map_err(|error| {
@@ -2102,15 +2050,6 @@ fn validate_profiles(
             return Err(HarnessError::InvalidProfile(format!(
                 "model profile `{name}` uses unknown provider `{}`",
                 profile.provider
-            )));
-        }
-    }
-    for (name, profile) in agents {
-        if let Some(model) = &profile.model_profile
-            && !models.contains_key(model)
-        {
-            return Err(HarnessError::InvalidProfile(format!(
-                "agent profile `{name}` uses unknown model profile `{model}`"
             )));
         }
     }
@@ -3643,7 +3582,6 @@ mod tests {
                 id: child.clone(),
                 owner_job: Some(owner_job),
                 model_profile: "test".to_owned(),
-                agent_profile: None,
                 todos: None,
                 available_depth: 0,
                 location: crate::execution::ExecutionLocation::root(workspace.path().to_path_buf()),

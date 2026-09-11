@@ -1309,7 +1309,6 @@ async fn fixture_child(session: &SessionHandle, root: &Path) -> (JobId, AgentId)
                 owner_job: Some(lease.id),
                 model_profile: "child".into(),
                 max_context: None,
-                agent_profile: None,
                 location: crate::execution::ExecutionLocation::root(root.to_path_buf()),
             },
         )

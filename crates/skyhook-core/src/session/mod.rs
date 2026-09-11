@@ -35,23 +35,16 @@ pub use request::{project_history, reconstruct_model_request};
 // The former flat assistant content format is intentionally not migrated.
 pub const SESSION_FORMAT_VERSION: u16 = 2;
 
-/// Restore applied model and instructions, including sessions predating per-turn selection.
-pub fn agent_selection(
-    records: &[EventRecord],
-    agent: &AgentId,
-) -> Option<(String, Option<String>)> {
+/// Restore the agent's last applied model.
+pub fn agent_selection(records: &[EventRecord], agent: &AgentId) -> Option<String> {
     let mut selection = None;
     for record in records.iter().filter(|record| &record.agent == agent) {
         match &record.event {
-            SessionEvent::AgentStarted {
-                model_profile,
-                agent_profile,
-                ..
-            } => {
-                selection = Some((model_profile.clone(), agent_profile.clone()));
+            SessionEvent::AgentStarted { model_profile, .. } => {
+                selection = Some(model_profile.clone());
             }
             SessionEvent::ModelChanged { model_profile, .. } => {
-                if let Some((model, _)) = &mut selection {
+                if let Some(model) = &mut selection {
                     model.clone_from(model_profile);
                 }
             }

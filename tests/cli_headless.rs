@@ -190,7 +190,7 @@ fn parse_and_early_runtime_failures_have_no_output_but_help_and_version_do() {
 }
 
 #[test]
-fn exact_capability_override_and_approve_all_never_restore_interactive() {
+fn exact_capability_override_and_approve_all_respect_permissions() {
     let f = Fixture::new();
     f.config("http://127.0.0.1:1/v1", "capabilities=[]");
     let empty = f.script("return 7;", &[]);
@@ -214,12 +214,6 @@ fn exact_capability_override_and_approve_all_never_restore_interactive() {
     );
     assert!(!removed.status.success());
     f.journal(&removed);
-    let questions = f.script(
-        "return await tool.ask({id:'q',prompt:'Must not prompt'});",
-        &["--capabilities", "interactive", "--approve-all"],
-    );
-    assert!(!questions.status.success());
-    f.journal(&questions);
     let approval = f.script(
         "return await tool.exec({argv:['sh','-c','echo not-approved']});",
         &["--capabilities", "exec"],
@@ -408,7 +402,7 @@ fn model_memory_explicit_selection_resume_and_startup_warnings_are_shared() {
         &skyhook::identity::AgentId::root(id.parse().unwrap()),
     )
     .unwrap();
-    assert_eq!(selection.0, "second");
+    assert_eq!(selection, "second");
     fs::write(f.path("state/skyhook/ui.json"), "invalid JSON").unwrap();
     let warning = f.script("return 'warning';", &[]);
     assert!(warning.status.success());

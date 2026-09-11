@@ -3,7 +3,6 @@
 mod error;
 mod interaction;
 mod observation;
-mod profile;
 mod runtime;
 mod todo;
 
@@ -14,7 +13,6 @@ pub use interaction::{
 pub use observation::{
     AgentActivity, ContextUsage, LiveResponse, Observation, ObservationSnapshot, ObservedEvent,
 };
-pub use profile::AgentProfile;
 pub use runtime::{
     Harness, HarnessBuilder, PromptOptions, QueuedPrompt, QueuedPromptToken, SessionHandle,
 };
