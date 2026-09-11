@@ -86,10 +86,22 @@ immediately; `approve_all` bypasses tool approvals but never restores questions 
 User messages appear on the right and assistant messages on the left. Tool previews show their
 remote execution target after the tool name, such as `exec @lab-monitoring`; local calls omit `@root`. Tool calls expand inline
 with named argument fields, nested lists, and syntax-highlighted scripts, commands, file content,
-and diffs. JSON results and result pages are pretty-printed; source and plain-text log whitespace
-is preserved. Light and dark themes each control the background and syntax colours; dark mode
-uses a pure black background. All
-formatting is local to the UI and leaves session records unchanged. Click an expanded body to
+and diffs. Prose arguments, such as agent prompts, wrap at word boundaries; commands and source
+retain whitespace-preserving wrapping. JSON results and result pages are pretty-printed; source
+and plain-text log whitespace is preserved. Light and dark themes use a consistent text and syntax palette throughout the UI:
+blue headings and emphasis, cyan links and targets, and semantic colours for code, tool output,
+and agent status. Command palette shortcut hints are muted and right-aligned.
+Tool-call headers keep neutral text with blue expand arrows, cyan remote targets, and status-coloured
+icons and labels. Failed calls keep their error details inside the expanded Output section,
+including failures that occur before a job is created, rather than adding separate JSON messages.
+Language-labelled Markdown code fences share the tool-output syntax palette and have a distinct,
+darker background sized to their content, with one cell of padding. Wrapped Markdown text retains
+list and quote indentation; visual padding is excluded from copied code. Unknown languages and
+oversized code retain readable fallback text. The interface keeps its neutral surfaces;
+dark mode uses a pure black background. All formatting is local to the UI and leaves session
+records unchanged. Expanded sections keep persistent highlights on their first and last content
+lines; tool calls also have a connecting gutter beneath the expand arrow. Their bodies retain the
+normal background, including on hover. Click an expanded body to
 collapse it, or drag to select text. The agent tree appears above the composer while children
 are active or a child agent is being viewed, with blank padding matching the input. Click an agent to inspect its conversation
 without mixing its output with other agents. Each agent retains its reading position and expanded rows.

@@ -7,6 +7,7 @@ mod model;
 mod render;
 pub mod state;
 mod status;
+mod theme;
 mod tool_view;
 
 use super::{Args, interaction::UiInteraction};

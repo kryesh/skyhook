@@ -8,20 +8,22 @@
 //! Source checkpoints are width-independent; a resize currently reparses to rebuild
 //! wrapped rows (resizes are not the routine streaming path).
 
-#[cfg(test)]
-use super::markdown;
+use super::markdown::{self, LayoutLine};
 use super::{Palette, wrap_words};
-use ratatui::{style::Color, text::Line};
+use ratatui::{
+    style::Style,
+    text::{Line, Span},
+};
 use unicode_width::UnicodeWidthStr;
 
-pub(super) type Suffix = (usize, Vec<(Line<'static>, bool)>);
+pub(super) type Suffix = (usize, Vec<LayoutLine>);
 
 #[derive(Default)]
 pub(super) struct StreamLayout {
     initialized: bool,
     len: usize,
     width: usize,
-    accent: Option<Color>,
+    theme: Option<super::super::theme::ContentTheme>,
     plain: Option<Plain>,
     prefix: String,
     stable_bytes: usize,
@@ -49,6 +51,7 @@ impl StreamLayout {
     /// `None` means no change. `append_from` must be the previous byte length,
     /// with an unchanged prefix; use `None` for replacement, even at equal length.
     /// Width and Markdown palette changes automatically invalidate the layout.
+    #[cfg(test)]
     pub(super) fn update_prefixed(
         &mut self,
         text: &str,
@@ -56,6 +59,18 @@ impl StreamLayout {
         p: Palette,
         append_from: Option<usize>,
         prefix: &str,
+    ) -> Option<Suffix> {
+        self.update_highlighted(text, width, p, append_from, prefix, None)
+    }
+
+    pub(super) fn update_highlighted(
+        &mut self,
+        text: &str,
+        width: usize,
+        p: Palette,
+        append_from: Option<usize>,
+        prefix: &str,
+        highlights: Option<&super::super::tool_view::HighlightCache>,
     ) -> Option<Suffix> {
         let width = width.max(1);
         // Reserve the first-line prefix even in later fragments: otherwise a
@@ -66,7 +81,7 @@ impl StreamLayout {
             && self.len <= text.len()
             && text.is_char_boundary(self.len)
             && self.width == width
-            && self.accent == Some(p.accent)
+            && self.theme == Some(p.content)
             && self.prefix == prefix;
         if append && self.len == text.len() {
             return None;
@@ -83,12 +98,12 @@ impl StreamLayout {
         self.initialized = true;
         self.len = text.len();
         self.width = width;
-        self.accent = Some(p.accent);
+        self.theme = Some(p.content);
         if !prefix.is_empty() && width < prefix.len() {
             self.plain = None;
         }
         if let Some(plain) = &mut self.plain {
-            if let Some(suffix) = plain.append(text, from, width, prefix) {
+            if let Some(suffix) = plain.append(text, from, width, prefix, p) {
                 return Some(suffix);
             }
             // An unsafe suffix can reinterpret any old prefix (setext headings,
@@ -116,6 +131,7 @@ impl StreamLayout {
                     from.saturating_sub(start),
                     width,
                     if truncate == 0 { prefix } else { "" },
+                    p,
                 )
             {
                 return Some((*row + truncate_tail, suffix));
@@ -136,6 +152,7 @@ impl StreamLayout {
                 p,
                 if truncate == 0 { prefix } else { "" },
                 false,
+                highlights,
             );
             append_block(&mut output, block, truncate > 0);
             self.stable_bytes += boundary;
@@ -149,6 +166,7 @@ impl StreamLayout {
                 0,
                 width,
                 if self.stable_rows == 0 { prefix } else { "" },
+                p,
             ) && plain.rows > 0
             {
                 let row = self.stable_rows + usize::from(self.stable_rows > 0);
@@ -165,6 +183,7 @@ impl StreamLayout {
                 p,
                 if self.stable_rows == 0 { prefix } else { "" },
                 self.stable_rows == 0,
+                highlights,
             );
             append_block(&mut output, block, self.stable_rows > 0);
         }
@@ -174,14 +193,10 @@ impl StreamLayout {
 
 // Fragments trim their edges. Restore the separator only when another visible
 // block follows, never as a trailing blank in the committed prefix.
-fn append_block(
-    output: &mut Vec<(Line<'static>, bool)>,
-    block: Vec<(Line<'static>, bool)>,
-    separated: bool,
-) {
+fn append_block(output: &mut Vec<LayoutLine>, block: Vec<LayoutLine>, separated: bool) {
     if !block.is_empty() {
         if separated {
-            output.push((Line::default(), false));
+            output.push((Line::default(), false).into());
         }
         output.extend(block);
     }
@@ -194,29 +209,18 @@ fn render(
     p: Palette,
     prefix: &str,
     placeholder: bool,
-) -> Vec<(Line<'static>, bool)> {
+    highlights: Option<&super::super::tool_view::HighlightCache>,
+) -> Vec<LayoutLine> {
     let cleaned = super::model::clean(text);
-    let mut lines = super::markdown::render(&cleaned, p, placeholder, markdown_width);
-    if !prefix.is_empty() && !lines.is_empty() {
-        if starts_with_table(&cleaned) {
-            // A prefix on only the first grid row would shift its borders away
-            // from every subsequent row. Keep the spinner on its own line.
-            lines.insert(0, Line::from(prefix.to_owned()));
-        } else {
-            lines[0]
-                .spans
-                .insert(0, ratatui::text::Span::raw(prefix.to_owned()));
-        }
-    }
-    lines
-        .into_iter()
-        .flat_map(|line| {
-            wrap_words(line, width)
-                .into_iter()
-                .enumerate()
-                .map(|(i, line)| (line, i > 0))
-        })
-        .collect()
+    markdown::layout_highlighted(
+        &cleaned,
+        p,
+        placeholder,
+        width,
+        markdown_width,
+        prefix,
+        highlights,
+    )
 }
 
 // Look through containers and empty blocks without changing the plain-prose
@@ -227,9 +231,7 @@ pub(super) fn starts_with_table(text: &str) -> bool {
     for event in Parser::new_ext(text, super::markdown::options()) {
         match event {
             Event::Start(Tag::Table(_)) => return true,
-            Event::Start(
-                Tag::BlockQuote(_) | Tag::Paragraph | Tag::Heading { .. } | Tag::CodeBlock(_),
-            )
+            Event::Start(Tag::BlockQuote(_) | Tag::Paragraph | Tag::Heading { .. })
             | Event::End(_) => {}
             _ => return false,
         }
@@ -239,7 +241,7 @@ pub(super) fn starts_with_table(text: &str) -> bool {
 
 // Only commit complete top-level blocks with an explicit blank-line separator.
 // The last block is retained because closing syntax can still reinterpret it.
-fn stable_boundary(text: &str) -> usize {
+pub(super) fn stable_boundary(text: &str) -> usize {
     use pulldown_cmark::{Event, Parser};
     let mut depth = 0usize;
     let mut boundary = 0;
@@ -283,7 +285,14 @@ fn stable_boundary(text: &str) -> usize {
 }
 
 impl Plain {
-    fn append(&mut self, text: &str, from: usize, width: usize, prefix: &str) -> Option<Suffix> {
+    fn append(
+        &mut self,
+        text: &str,
+        from: usize,
+        width: usize,
+        prefix: &str,
+        p: Palette,
+    ) -> Option<Suffix> {
         // The checkpoint subtracts the whole prefix from rendered bytes. It
         // cannot resume within a prefix that spans several wrapping rows.
         if !prefix.is_empty() && width < prefix.len() {
@@ -306,7 +315,7 @@ impl Plain {
                     self.visible_end = at + ch.len_utf8();
                 }
             }
-            self.emit(text, width, &mut output, prefix)?;
+            self.emit(text, width, &mut output, prefix, p)?;
             cursor += piece.len();
             if newline {
                 if self.visible_end <= self.line_start && self.rows > 0 {
@@ -322,7 +331,7 @@ impl Plain {
         // Initial empty input, or input containing only empty lines, has the
         // same single placeholder row as markdown(). It is not a stable row.
         if self.rows == 0 {
-            output.push((Line::from(prefix.to_owned()), false));
+            output.push((Line::from(prefix.to_owned()), false).into());
         }
         Some((truncate, output))
     }
@@ -331,14 +340,15 @@ impl Plain {
         &mut self,
         text: &str,
         width: usize,
-        output: &mut Vec<(Line<'static>, bool)>,
+        output: &mut Vec<LayoutLine>,
         prefix: &str,
+        p: Palette,
     ) -> Option<()> {
         if self.visible_end <= self.tail_start {
             return Some(());
         }
         if self.pending_blank {
-            output.push((Line::default(), false));
+            output.push((Line::default(), false).into());
             self.rows += 1;
             self.tail_row += 1;
             self.pending_blank = false;
@@ -347,12 +357,15 @@ impl Plain {
         let mut byte = self.tail_start;
         let mut checkpoints = Vec::new();
         let prefix_len = if self.tail_row == 0 { prefix.len() } else { 0 };
-        let mut source = String::new();
-        if self.tail_row == 0 {
-            source.push_str(prefix);
+        let mut spans = Vec::new();
+        if self.tail_row == 0 && !prefix.is_empty() {
+            spans.push(Span::raw(prefix.to_owned()));
         }
-        source.push_str(&text[byte..self.visible_end]);
-        let lines = wrap_words(Line::from(source), width);
+        spans.push(Span::styled(
+            text[byte..self.visible_end].to_owned(),
+            Style::default().fg(p.content.fg),
+        ));
+        let lines = wrap_words(Line::from(spans), width);
         let mut rendered_bytes = 0;
         for (i, line) in lines.into_iter().enumerate() {
             let continued = self.continued || i > 0;
@@ -363,7 +376,7 @@ impl Plain {
                 .map(|span| span.content.len())
                 .sum::<usize>();
             byte = self.tail_start + rendered_bytes.saturating_sub(prefix_len);
-            output.push((line, continued));
+            output.push((line, continued).into());
         }
         self.rows = start_row + checkpoints.len();
         // Retain TWO rows: appending VS16 / ZWJ / combining text can change the
@@ -415,11 +428,13 @@ mod tests {
     use super::*;
     use ratatui::style::Style;
 
-    fn canonical(rows: &[(Line<'static>, bool)]) -> Vec<(Vec<(String, Style)>, bool)> {
+    fn canonical(
+        rows: &[LayoutLine],
+    ) -> Vec<(Vec<(String, Style)>, Style, bool, markdown::RowLayout)> {
         rows.iter()
-            .map(|(line, continued)| {
+            .map(|row| {
                 let mut spans: Vec<(String, Style)> = Vec::new();
-                for span in &line.spans {
+                for span in &row.line.spans {
                     if span.content.is_empty() {
                         continue;
                     }
@@ -427,25 +442,71 @@ mod tests {
                         && *style == span.style
                     {
                         text.push_str(&span.content);
-                        continue;
+                    } else {
+                        spans.push((span.content.to_string(), span.style));
                     }
-                    spans.push((span.content.to_string(), span.style));
                 }
-                (spans, *continued)
+                (spans, row.line.style, row.continued, row.layout.clone())
             })
             .collect()
     }
 
-    fn reference(text: &str, width: usize, p: Palette) -> Vec<(Line<'static>, bool)> {
-        markdown(text, p, width.max(1))
-            .into_iter()
-            .flat_map(|line| {
-                wrap_words(line, width.max(1))
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, line)| (line, i > 0))
-            })
-            .collect()
+    fn reference(text: &str, width: usize, p: Palette) -> Vec<LayoutLine> {
+        markdown::layout_highlighted(text, p, true, width.max(1), width.max(1), "", None)
+    }
+
+    #[test]
+    fn markdown_code_geometry_streaming_resize_and_theme_match_saved() {
+        let input = "prose `inline`\n\n```rust\nlet answer = 42;  \n\n    \n// long comment with words for wrapping\n```\n\nafter";
+        let mut layout = StreamLayout::default();
+        let mut rows = Vec::new();
+        let mut text = String::new();
+        for light in [false, true, false] {
+            let p = Palette::new(light);
+            for width in [7, 29, 3] {
+                text.clear();
+                rows.clear();
+                for ch in input.chars() {
+                    let old = text.len();
+                    text.push(ch);
+                    if let Some((at, suffix)) =
+                        layout.update_prefixed(&text, width, p, (old != 0).then_some(old), "")
+                    {
+                        rows.truncate(at);
+                        rows.extend(suffix);
+                    }
+                    assert_eq!(
+                        canonical(&rows),
+                        canonical(&reference(&text, width, p)),
+                        "{text:?}, width {width}, light {light}"
+                    );
+                }
+                assert_eq!(rows.iter().filter(|row| row.layout.decorative).count(), 2);
+                let mut copied = String::new();
+                let mut first = true;
+                for row in rows.iter().filter(|row| !row.layout.decorative) {
+                    if !first && !row.continued {
+                        copied.push('\n');
+                    }
+                    copied.push_str(&row.line.to_string());
+                    first = false;
+                }
+                assert_eq!(
+                    copied,
+                    "prose inline\n\nlet answer = 42;  \n\n    \n// long comment with words for wrapping\n\nafter"
+                );
+            }
+        }
+        for (width, light) in [(7, false), (31, false), (31, true), (3, true)] {
+            let p = Palette::new(light);
+            if let Some((at, suffix)) =
+                layout.update_prefixed(&text, width, p, Some(text.len()), "")
+            {
+                rows.truncate(at);
+                rows.extend(suffix);
+            }
+            assert_eq!(canonical(&rows), canonical(&reference(&text, width, p)));
+        }
     }
 
     fn check_chunks(chunks: &[&str], width: usize) {
@@ -531,7 +592,8 @@ mod tests {
                             width.saturating_sub("↳ ".width()),
                             p,
                             "↳ ",
-                            true
+                            true,
+                            None
                         )),
                         "{text:?}, width {width}"
                     );
@@ -560,6 +622,7 @@ mod tests {
                 p,
                 prefix,
                 true,
+                None,
             );
             assert_eq!(
                 canonical(&rows),
@@ -590,17 +653,16 @@ mod tests {
                         .update_prefixed(&source, width, p, None, prefix)
                         .unwrap();
                     assert!(rows.len() > 4, "cells should wrap inside the table");
-                    let table_rows = if prefix.is_empty() {
-                        &rows[..]
-                    } else {
-                        assert_eq!(rows[0].0.to_string(), prefix);
-                        &rows[1..]
-                    };
+                    let table_start = rows
+                        .iter()
+                        .position(|row| row.line.to_string().contains('┌'))
+                        .unwrap();
+                    let table_rows = &rows[table_start..];
                     let separator = table_rows
                         .iter()
-                        .find(|(line, _)| line.to_string().contains('├'))
+                        .find(|row| row.line.to_string().contains('├'))
                         .unwrap()
-                        .0
+                        .line
                         .to_string();
                     // Measure actual screen columns, including quote containers;
                     // stripping the spinner would hide first-row misalignment.
@@ -615,7 +677,9 @@ mod tests {
                         .map(|(at, _)| separator[..at].width())
                         .collect();
                     let mut separators = 0;
-                    for (line, continued) in table_rows {
+                    for row in table_rows {
+                        let line = &row.line;
+                        let continued = row.continued;
                         let text = line.to_string();
                         assert!(line.width() <= width, "{text:?}, width {width}");
                         assert!(!continued, "downstream wrapper split a table row: {text:?}");
@@ -683,7 +747,8 @@ mod tests {
                         width.saturating_sub(prefix.width()),
                         p,
                         prefix,
-                        true
+                        true,
+                        None
                     ))
                 );
                 if width == 17 {
@@ -709,7 +774,8 @@ mod tests {
                         width.saturating_sub(prefix.width()),
                         p,
                         prefix,
-                        true
+                        true,
+                        None
                     ))
                 );
             }

@@ -1,13 +1,13 @@
 use super::{
     format::{agent_label, brief},
-    tool_view::{Document, Role},
+    tool_view::{Document, Role, Run, Section},
 };
 use serde_json::Value;
 use skyhook::{
     agent::{AgentActivity, LiveResponse, ObservationSnapshot},
     identity::{AgentId, JobId},
     job::JobState,
-    provider::protocol::{BlockContent, BlockKind, Message, Usage, UserContent},
+    provider::protocol::{BlockContent, BlockKind, Message, ToolResult, Usage, UserContent},
     session::{ModelPurpose, SessionEvent},
 };
 use std::{
@@ -67,6 +67,8 @@ pub struct Entry {
     pub indent: u16,
     pub job: Option<JobId>,
     pub document: Option<Document>,
+    /// Structured presentation-only header, shared by collapsed and expanded cards.
+    pub header: Option<Vec<Run>>,
     /// Omit the separator before a related sibling tool or this script's first child.
     pub compact_after: bool,
 }
@@ -126,6 +128,7 @@ impl Entry {
             indent: 0,
             job: None,
             document: None,
+            header: None,
             compact_after: false,
         }
     }
@@ -176,8 +179,7 @@ pub struct Projection {
     requests: HashMap<u64, RequestInfo>,
     active_request: HashMap<AgentId, u64>,
     response_requests: HashMap<u64, u64>,
-    tool_origins: HashSet<(u64, String)>,
-    tool_results: HashSet<(AgentId, String)>,
+    tool_origins: HashSet<(AgentId, u64, String)>,
 }
 impl Projection {
     fn response_committed(&self, request: u64) -> bool {
@@ -353,10 +355,11 @@ impl Projection {
                     origin: Some(origin),
                     ..
                 } => {
-                    self.tool_origins
-                        .insert((origin.message, origin.call_id.clone()));
-                    self.tool_results
-                        .insert((record.agent.clone(), origin.call_id.clone()));
+                    self.tool_origins.insert((
+                        record.agent.clone(),
+                        origin.message,
+                        origin.call_id.clone(),
+                    ));
                 }
                 _ => {}
             }
@@ -492,6 +495,20 @@ pub fn state_name(state: JobState) -> &'static str {
         JobState::Interrupted => "Interrupted",
     }
 }
+fn state_role(state: JobState) -> Role {
+    match state {
+        JobState::Running => Role::Indicator,
+        JobState::AwaitingApproval | JobState::WaitingInput => Role::Warning,
+        JobState::Completed => Role::Success,
+        JobState::Failed => Role::Error,
+        JobState::Queued | JobState::Cancelled | JobState::Interrupted => Role::Muted,
+    }
+}
+
+fn header_text(runs: &[Run]) -> String {
+    runs.iter().map(Run::text).collect()
+}
+
 pub fn agent_footer(
     snapshot: &ObservationSnapshot,
     projection: &Projection,
@@ -872,6 +889,52 @@ fn entries_inner(
                     _ => None,
                 })
                 .collect();
+            // Tool results have an explicit call ID but no message sequence. Resolve
+            // only within the current agent's most recent assistant turn, consuming
+            // each call once. Never let an old/reused ID suppress a later result.
+            let mut pending = HashMap::new();
+            let mut turn = None;
+            let mut call_results = HashMap::new();
+            let mut matched_results = HashSet::new();
+            for record in &records {
+                match &record.event {
+                    SessionEvent::MessageCommitted {
+                        message: Message::Assistant(items),
+                    } => {
+                        pending.clear();
+                        turn = Some(record.sequence);
+                        for block in items.iter().flat_map(|item| &item.blocks) {
+                            if let BlockContent::ToolCall(call) = &block.content {
+                                pending
+                                    .insert((call.id.clone(), call.name.clone()), record.sequence);
+                            }
+                        }
+                    }
+                    SessionEvent::JobCreated {
+                        origin: Some(origin),
+                        tool,
+                        ..
+                    } if turn.is_none_or(|turn| turn <= origin.message) => {
+                        // Retained job provenance also identifies a call whose
+                        // assistant message is no longer in the retained history.
+                        pending.insert((origin.call_id.clone(), tool.clone()), origin.message);
+                        turn = Some(origin.message);
+                    }
+                    SessionEvent::MessageCommitted {
+                        message: Message::Tool(results),
+                    } => {
+                        for (index, result) in results.iter().enumerate() {
+                            if let Some(message) =
+                                pending.remove(&(result.call_id.clone(), result.name.clone()))
+                            {
+                                call_results.insert((message, result.call_id.clone()), result);
+                                matched_results.insert((record.sequence, index));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             let mut entries = Vec::new();
             let mut tool_groups = HashMap::new();
             let agent_name = projection
@@ -1001,33 +1064,13 @@ fn entries_inner(
                                     BlockContent::ToolCall(call) => {
                                         let exists = projection
                                             .tool_origins
-                                            .contains(&(record.sequence, call.id.clone()));
+                                            .contains(&(agent.clone(), record.sequence, call.id.clone()));
                                         if !exists {
-                                            let key = block_key.clone();
-                                            let open = view.is_expanded(&key, all_details);
-                                            let header = format!(
-                                                "{} {}{}",
-                                                if open { "▾" } else { "▸" },
-                                                call.name,
-                                                if call.name == "agent" {
-                                                    target_suffix(
-                                                        projection
-                                                            .child_target(agent, &call.arguments),
-                                                    )
-                                                } else {
-                                                    String::new()
-                                                },
+                                            let e = call_entry(
+                                                block_key.clone(), &call.name, Some(&call.arguments),
+                                                call_results.get(&(record.sequence, call.id.clone())).copied(),
+                                                agent, projection, view, all_details,
                                             );
-                                            let mut e =
-                                                Entry::new(key, header.clone(), Surface::Tool);
-                                            if open {
-                                                let mut document = Document::default();
-                                                document.line(header, Role::Heading);
-                                                document.arguments(&call.name, &call.arguments);
-                                                e.text = document.plain_text();
-                                                e.document = Some(document);
-                                            }
-                                            e.expandable = true;
                                             tool_groups.insert(
                                                 e.key.clone(),
                                                 ToolGroup::Response(record.sequence),
@@ -1040,23 +1083,11 @@ fn entries_inner(
                             }
                         }
                         Message::Tool(results) => {
-                            for result in results {
-                                if !projection
-                                    .tool_results
-                                    .contains(&(agent.clone(), result.call_id.clone()))
-                                {
-                                    entries.push(Entry::new(
-                                        format!("{key}/{}", result.call_id),
-                                        format!(
-                                            "{} result\n{}",
-                                            result.name,
-                                            pretty(&result.result)
-                                        ),
-                                        if result.is_error {
-                                            Surface::Error
-                                        } else {
-                                            Surface::Tool
-                                        },
+                            for (index, result) in results.iter().enumerate() {
+                                if !matched_results.contains(&(record.sequence, index)) {
+                                    entries.push(call_entry(
+                                        format!("{key}/{}", result.call_id), &result.name, None,
+                                        Some(result), agent, projection, view, all_details,
                                     ));
                                 }
                             }
@@ -1496,21 +1527,39 @@ fn job_event_entries(
             } else {
                 String::new()
             };
-            let heading = format!(
-                "{} Job event · {}{}{} · {}",
-                if open { "▾" } else { "▸" },
-                tool,
-                id.map_or(String::new(), |id| format!(" #{id}")),
-                name,
-                state
-            );
-            let mut entry = Entry::new(key, heading.clone(), Surface::Tool);
+            let mut header = vec![
+                Run::new(if open { "▾" } else { "▸" }, Role::Indicator),
+                Run::new(" Job event", Role::Plain),
+                Run::new(" · ", Role::Muted),
+                Run::new(tool, Role::ToolName),
+                Run::new(
+                    id.map_or(String::new(), |id| format!(" #{id}")),
+                    Role::Muted,
+                ),
+            ];
+            if let Some(name) = name.strip_prefix(" · ") {
+                header.push(Run::new(" · ", Role::Muted));
+                header.push(Run::new(name, Role::Plain));
+            }
+            header.push(Run::new(" · ", Role::Muted));
+            // Only the envelope's typed state is semantic, never message prose or
+            // the job's current state (this notification is historical).
+            let role = if agent_message {
+                Role::Plain
+            } else {
+                serde_json::from_value::<JobState>(event["state"].clone())
+                    .map(state_role)
+                    .unwrap_or(Role::Plain)
+            };
+            header.push(Run::new(state, role));
+            let mut entry = Entry::new(key, header_text(&header), Surface::Tool);
+            entry.header = Some(header.clone());
             entry.expandable = true;
             // Deliberately not Entry.job: output refresh must not replace this
             // historical notification with a live job card or discard its key.
             if open {
                 let mut body = Document::default();
-                body.line(heading, Role::Heading);
+                body.sections.push(Section::Line(header));
                 if agent_message {
                     body.line("Agent message received by model", Role::Muted);
                     if let Some(text) = event.get("text").and_then(Value::as_str) {
@@ -1528,6 +1577,77 @@ fn job_event_entries(
             entry
         })
         .collect()
+}
+
+/// A call without an admitted job uses the original response expansion key and
+/// never acquires job navigation. The result is presentation-only session data.
+#[allow(clippy::too_many_arguments)]
+fn call_entry(
+    key: String,
+    tool: &str,
+    args: Option<&Value>,
+    result: Option<&ToolResult>,
+    agent: &AgentId,
+    projection: &Projection,
+    view: &View,
+    all: bool,
+) -> Entry {
+    let open = view.is_expanded(&key, all);
+    let mut header = vec![
+        Run::new(if open { "▾" } else { "▸" }, Role::Indicator),
+        Run::new(" ", Role::Plain),
+    ];
+    if let Some(result) = result {
+        header.push(Run::new(
+            if result.is_error { "×" } else { "✓" },
+            if result.is_error {
+                Role::Error
+            } else {
+                Role::Success
+            },
+        ));
+        header.push(Run::new(" ", Role::Plain));
+    }
+    header.push(Run::new(tool, Role::ToolName));
+    if tool == "agent"
+        && let Some(args) = args
+    {
+        header.push(Run::new(
+            target_suffix(projection.child_target(agent, args)),
+            Role::Target,
+        ));
+    }
+    if let Some(result) = result {
+        header.push(Run::new(" · ", Role::Muted));
+        header.push(Run::new(
+            if result.is_error {
+                "Failed"
+            } else {
+                "Completed"
+            },
+            if result.is_error {
+                Role::Error
+            } else {
+                Role::Success
+            },
+        ));
+    }
+    let mut entry = Entry::new(key, header_text(&header), Surface::Tool);
+    entry.expandable = true;
+    entry.header = Some(header.clone());
+    if open {
+        let mut document = Document::default();
+        document.sections.push(Section::Line(header));
+        if let Some(args) = args {
+            document.arguments(tool, args);
+        }
+        if let Some(result) = result {
+            document.output(tool, args.unwrap_or(&Value::Null), &result.result);
+        }
+        entry.text = document.plain_text();
+        entry.document = Some(document);
+    }
+    entry
 }
 
 fn job_entry(
@@ -1569,28 +1689,33 @@ fn job_entry(
         JobState::Running => "●",
         _ => "·",
     };
-    let target = target_suffix(projection.job_target(job));
-    let mut text = format!(
-        "{} {symbol} {}{} {} · {} · #{}",
-        if open { "▾" } else { "▸" },
-        job.tool,
-        target,
-        brief(&detail, 90),
-        state_name(job.state),
-        job.id
-    );
-    if let Some(error) = &job.error {
-        text.push_str(&format!("\n{error}"));
-    }
+    let header = vec![
+        Run::new(if open { "▾" } else { "▸" }, Role::Indicator),
+        Run::new(" ", Role::Plain),
+        Run::new(symbol, state_role(job.state)),
+        Run::new(" ", Role::Plain),
+        Run::new(job.tool.clone(), Role::ToolName),
+        Run::new(target_suffix(projection.job_target(job)), Role::Target),
+        Run::new(format!(" {}", brief(&detail, 90)), Role::Plain),
+        Run::new(" · ", Role::Muted),
+        Run::new(state_name(job.state), state_role(job.state)),
+        Run::new(" · ", Role::Muted),
+        Run::new(format!("#{}", job.id), Role::Muted),
+    ];
+    let mut text = header_text(&header);
     let mut document = None;
     if open {
         let mut body = Document::default();
-        // Header/error lines retain their separate semantics in the UI document.
-        body.line(text.clone(), Role::Heading);
+        body.sections.push(Section::Line(header.clone()));
         body.line(job.location.clone(), Role::Muted);
         body.arguments(&job.tool, &job.args);
-        if let Some(output) = outputs.get(&job.id) {
-            body.output(&job.tool, &job.args, output);
+        if outputs.contains_key(&job.id) || job.error.is_some() {
+            body.output_with_error(
+                &job.tool,
+                &job.args,
+                outputs.get(&job.id),
+                job.error.as_deref(),
+            );
         } else if job.remote && !job.state.is_terminal() {
             body.line(
                 "Running remotely · output available after completion",
@@ -1608,6 +1733,7 @@ fn job_entry(
     }
     let mut entry = Entry::new(key, text, Surface::Tool);
     entry.document = document;
+    entry.header = Some(header);
     entry.expandable = true;
     entry.job = Some(job.id);
     let mut parent = job.parent;
@@ -1629,6 +1755,514 @@ mod tests {
         },
         session::{ContextMessage, EventRecord},
     };
+    #[test]
+    fn job_headers_preserve_text_and_semantics_for_all_states_and_themes() {
+        use super::super::{theme::ContentTheme, tool_view::header_line};
+        use ratatui::style::Modifier;
+
+        let projection = Projection::default();
+        let states = [
+            (JobState::Queued, "·", "Queued", Role::Muted),
+            (
+                JobState::AwaitingApproval,
+                "◇",
+                "Waiting for permission",
+                Role::Warning,
+            ),
+            (JobState::Running, "●", "Running", Role::Indicator),
+            (
+                JobState::WaitingInput,
+                "?",
+                "Waiting for input",
+                Role::Warning,
+            ),
+            (JobState::Completed, "✓", "Completed", Role::Success),
+            (JobState::Failed, "×", "Failed", Role::Error),
+            (JobState::Cancelled, "·", "Cancelled", Role::Muted),
+            (JobState::Interrupted, "·", "Interrupted", Role::Muted),
+        ];
+        for (state, symbol, name, role) in states {
+            for target in ["root", "build-host"] {
+                let job = JobInfo {
+                    id: JobId::new(42).unwrap(),
+                    agent: AgentId::root(SessionId::from_bytes([1; 16])),
+                    name: None,
+                    tool: "exec".into(),
+                    args: serde_json::json!({"argv": ["echo", "Failed @fake Completed"]}),
+                    parent: None,
+                    state,
+                    target: target.into(),
+                    location: "/workspace".into(),
+                    remote: false,
+                    error: Some("Failure details\nsecond line".into()),
+                };
+                let collapsed =
+                    job_entry(&job, &projection, &View::default(), &HashMap::new(), false);
+                let expanded =
+                    job_entry(&job, &projection, &View::default(), &HashMap::new(), true);
+                for (entry, arrow) in [(&collapsed, "▸"), (&expanded, "▾")] {
+                    let expected = format!(
+                        "{arrow} {symbol} exec{} echo Failed @fake Completed · {name} · #42",
+                        target_suffix(target)
+                    );
+                    let runs = entry.header.as_ref().unwrap();
+                    assert_eq!(header_text(runs), expected);
+                    assert_eq!(entry.text.lines().next().unwrap(), expected);
+                    assert_eq!(runs[2], Run::new(symbol, role));
+                    assert_eq!(runs[8], Run::new(name, role));
+                    for light in [false, true] {
+                        let theme = ContentTheme::new(light);
+                        let line = header_line(runs, light);
+                        let spans = &line.spans;
+                        let status_color = match role {
+                            Role::Indicator => theme.primary,
+                            Role::Warning => theme.warning,
+                            Role::Success => theme.success,
+                            Role::Error => theme.error,
+                            _ => theme.muted,
+                        };
+                        assert_eq!(line.to_string(), expected);
+                        assert_eq!(line.style.fg, None);
+                        assert_eq!(spans[0].style.fg, Some(theme.primary));
+                        assert_eq!(spans[2].style.fg, Some(status_color));
+                        assert_eq!(spans[4].style.fg, Some(theme.fg));
+                        assert!(spans[4].style.add_modifier.contains(Modifier::BOLD));
+                        assert_eq!(spans[5].style.fg, Some(theme.accent));
+                        assert_eq!(spans[6].style.fg, Some(theme.fg));
+                        assert!(!spans[6].style.add_modifier.contains(Modifier::BOLD));
+                        assert_eq!(spans[8].style.fg, Some(status_color));
+                        for index in [7, 9, 10] {
+                            assert_eq!(spans[index].style.fg, Some(theme.muted));
+                        }
+                        if let Some(document) = &entry.document {
+                            assert_eq!(document.sections[0], Section::Line(runs.clone()));
+                            let lines = document.lines(None, light);
+                            assert_eq!(lines[0], line);
+                            let output = lines
+                                .iter()
+                                .position(|line| line.to_string() == "Output")
+                                .unwrap();
+                            for error in &lines[output + 1..=output + 2] {
+                                let text = error.spans.last().unwrap();
+                                assert_eq!(text.style.fg, Some(theme.error));
+                                assert!(!text.style.add_modifier.contains(Modifier::BOLD));
+                            }
+                        }
+                    }
+                }
+                assert_eq!(
+                    collapsed.text,
+                    header_text(collapsed.header.as_ref().unwrap())
+                );
+                assert!(collapsed.document.is_none());
+                let document = expanded.document.as_ref().unwrap();
+                assert_eq!(expanded.text, document.plain_text());
+                assert!(expanded.text.contains("Arguments"));
+                assert!(
+                    expanded
+                        .text
+                        .contains("Output\n  Failure details\n  second line")
+                );
+                assert!(!expanded.text.contains("Loading output"));
+                assert_eq!(
+                    collapsed.header.as_ref().unwrap()[1..],
+                    expanded.header.as_ref().unwrap()[1..]
+                );
+            }
+        }
+    }
+
+    fn call_record(snapshot: &mut ObservationSnapshot, agent: &AgentId, id: &str) -> u64 {
+        record(
+            snapshot,
+            agent,
+            SessionEvent::MessageCommitted {
+                message: Message::Assistant(vec![AssistantItem::tool_call(
+                    "tool",
+                    0,
+                    skyhook::provider::protocol::ToolCall {
+                        id: id.into(),
+                        name: "exec".into(),
+                        arguments: serde_json::json!({"argv": ["echo", "  original\ttext\n"]}),
+                    },
+                )]),
+            },
+        )
+    }
+
+    fn result_record(snapshot: &mut ObservationSnapshot, agent: &AgentId, id: &str, error: bool) {
+        record(
+            snapshot,
+            agent,
+            SessionEvent::MessageCommitted {
+                message: Message::Tool(vec![ToolResult {
+                    call_id: id.into(),
+                    name: "exec".into(),
+                    result: if error {
+                        serde_json::json!({"error": "Permission was denied", "code": "permission_denied", "executed": false})
+                    } else {
+                        serde_json::json!({"stdout": "  original\ttext\n"})
+                    },
+                    images: vec![],
+                    is_error: error,
+                }]),
+            },
+        );
+    }
+
+    #[test]
+    fn synchronous_failure_refreshes_the_existing_call_after_interleaved_user_input() {
+        let root = AgentId::root(SessionId::from_bytes([71; 16]));
+        let mut snapshot = ObservationSnapshot::default();
+        call_record(&mut snapshot, &root, "call");
+        let mut projection = Projection::default();
+        projection.rebuild(&snapshot);
+        let mut cache = ContentCache::default();
+        let mut cards = vec![];
+        let outputs = HashMap::new();
+        let mut view = View::default();
+        cache.update(
+            &mut cards,
+            &snapshot,
+            &projection,
+            EntryView {
+                agent: &root,
+                view: &view,
+                thinking: false,
+                all_details: false,
+            },
+            &outputs,
+            0,
+        );
+        assert_eq!(cards.len(), 1);
+        let key = cards[0].key.clone();
+        assert!(!cards[0].text.contains("Failed"));
+        record(
+            &mut snapshot,
+            &root,
+            SessionEvent::MessageCommitted {
+                message: Message::User(vec![UserContent::Text {
+                    text: "Continue after permission".into(),
+                }]),
+            },
+        );
+        result_record(&mut snapshot, &root, "call", true);
+        let records_before = serde_json::to_value(&snapshot.records).unwrap();
+        projection.rebuild(&snapshot);
+        let changes = cache.update(
+            &mut cards,
+            &snapshot,
+            &projection,
+            EntryView {
+                agent: &root,
+                view: &view,
+                thinking: false,
+                all_details: false,
+            },
+            &outputs,
+            0,
+        );
+        assert!(!changes.reset);
+        assert!(changes.dirty.contains(&0));
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].key, key);
+        assert_eq!(cards[0].surface, Surface::Tool);
+        assert!(cards[0].job.is_none());
+        assert_eq!(cards[0].text, "▸ × exec · Failed");
+        assert!(!cards[0].text.contains("Permission"));
+        view.expanded.insert(key.clone());
+        cache.update(
+            &mut cards,
+            &snapshot,
+            &projection,
+            EntryView {
+                agent: &root,
+                view: &view,
+                thinking: false,
+                all_details: false,
+            },
+            &outputs,
+            1,
+        );
+        assert_eq!(cards[0].key, key);
+        assert!(cards[0].text.contains("Arguments"));
+        assert!(cards[0].text.contains("Output\n  Permission was denied"));
+        assert!(cards[0].text.contains("permission_denied"));
+        assert_eq!(cards[0].text.matches("Permission was denied").count(), 1);
+        assert_eq!(
+            records_before,
+            serde_json::to_value(&snapshot.records).unwrap()
+        );
+    }
+
+    #[test]
+    fn synchronous_results_are_turn_scoped_and_orphans_remain_expandable() {
+        let root = AgentId::root(SessionId::from_bytes([72; 16]));
+        let mut snapshot = ObservationSnapshot::default();
+        call_record(&mut snapshot, &root, "reused");
+        result_record(&mut snapshot, &root, "reused", false);
+        call_record(&mut snapshot, &root, "reused");
+        result_record(&mut snapshot, &root, "reused", true);
+        result_record(&mut snapshot, &root, "orphan", true);
+        let mut projection = Projection::default();
+        projection.rebuild(&snapshot);
+        let cards = entries(
+            &snapshot,
+            &projection,
+            &root,
+            &View::default(),
+            &HashMap::new(),
+            false,
+            true,
+        );
+        assert_eq!(cards.len(), 3);
+        assert!(cards[0].text.starts_with("▾ ✓ exec · Completed"));
+        assert!(cards[1].text.starts_with("▾ × exec · Failed"));
+        assert_ne!(cards[0].key, cards[1].key);
+        assert!(cards[2].text.starts_with("▾ × exec · Failed"));
+        assert!(!cards[2].text.contains("Arguments"));
+        assert!(cards[2].text.contains("Output"));
+        assert!(cards[2].text.contains("permission_denied"));
+        assert!(
+            cards
+                .iter()
+                .all(|card| card.expandable && card.job.is_none() && card.surface == Surface::Tool)
+        );
+
+        // A new assistant turn closes the old call scope even if its old call
+        // never produced a result. Same-ID results in other agents cannot bind.
+        let other = root.child(1);
+        result_record(&mut snapshot, &other, "reused", true);
+        call_record(&mut snapshot, &root, "pending");
+        call_record(&mut snapshot, &root, "new-turn");
+        result_record(&mut snapshot, &root, "pending", true);
+        projection.rebuild(&snapshot);
+        let cards = entries(
+            &snapshot,
+            &projection,
+            &root,
+            &View::default(),
+            &HashMap::new(),
+            false,
+            false,
+        );
+        assert_eq!(cards.len(), 6);
+        assert_eq!(cards[3].text, "▸ exec");
+        assert_eq!(cards[4].text, "▸ exec");
+        assert_eq!(cards[5].text, "▸ × exec · Failed");
+        let other_cards = entries(
+            &snapshot,
+            &projection,
+            &other,
+            &View::default(),
+            &HashMap::new(),
+            false,
+            false,
+        );
+        assert_eq!(other_cards.len(), 1);
+    }
+
+    #[test]
+    fn admitted_results_use_exact_job_provenance_even_without_retained_calls() {
+        use skyhook::{execution::ExecutionLocation, session::ModelCallOrigin};
+        for retained in [false, true] {
+            let root = AgentId::root(SessionId::from_bytes([73; 16]));
+            let mut snapshot = ObservationSnapshot::default();
+            let origin = call_record(&mut snapshot, &root, "reused");
+            record(
+                &mut snapshot,
+                &root,
+                SessionEvent::JobCreated {
+                    job: JobId::new(42).unwrap(),
+                    parent: None,
+                    origin: Some(ModelCallOrigin {
+                        message: origin,
+                        call_id: "reused".into(),
+                    }),
+                    tool: "exec".into(),
+                    name: None,
+                    arguments: serde_json::json!({"argv": ["echo"]}),
+                    output_schema: None,
+                    accepts_input: false,
+                    background: false,
+                    location: ExecutionLocation::root("/workspace".into()),
+                },
+            );
+            result_record(&mut snapshot, &root, "reused", false);
+            if !retained {
+                snapshot.records.remove(&origin);
+            }
+            // A later call reuses the ID but fails before creating a job.
+            call_record(&mut snapshot, &root, "reused");
+            result_record(&mut snapshot, &root, "reused", true);
+            let mut projection = Projection::default();
+            projection.rebuild(&snapshot);
+            let cards = entries(
+                &snapshot,
+                &projection,
+                &root,
+                &View::default(),
+                &HashMap::new(),
+                false,
+                false,
+            );
+            assert_eq!(cards.len(), 2);
+            assert_eq!(cards[0].job, Some(JobId::new(42).unwrap()));
+            assert!(cards[1].job.is_none());
+            assert_eq!(cards[1].text, "▸ × exec · Failed");
+        }
+    }
+
+    #[test]
+    fn failed_jobs_put_errors_in_expanded_output_and_keep_real_results() {
+        let id = JobId::new(42).unwrap();
+        let job = JobInfo {
+            id,
+            agent: AgentId::root(SessionId::from_bytes([74; 16])),
+            name: None,
+            tool: "exec".into(),
+            args: serde_json::json!({"argv": ["echo"]}),
+            parent: None,
+            state: JobState::Failed,
+            target: "root".into(),
+            location: "/workspace".into(),
+            remote: false,
+            error: Some("failed exactly".into()),
+        };
+        let projection = Projection::default();
+        for output in [
+            None,
+            Some(
+                serde_json::json!({"error": "failed exactly", "result": {"stdout": "  saved output\t\n"}}),
+            ),
+            Some(serde_json::json!({"result": {"stderr": "other details"}})),
+        ] {
+            let outputs: HashMap<_, _> = output.into_iter().map(|output| (id, output)).collect();
+            let collapsed = job_entry(&job, &projection, &View::default(), &outputs, false);
+            assert_eq!(collapsed.text.lines().count(), 1);
+            assert!(!collapsed.text.contains("failed exactly"));
+            assert!(collapsed.document.is_none());
+            let expanded = job_entry(&job, &projection, &View::default(), &outputs, true);
+            assert!(expanded.text.contains("Output\n  failed exactly"));
+            assert_eq!(expanded.text.matches("failed exactly").count(), 1);
+            assert!(!expanded.text.contains("Loading output"));
+            if let Some(stdout) = outputs
+                .get(&id)
+                .and_then(|value| value.pointer("/result/stdout"))
+            {
+                assert!(expanded.document.as_ref().unwrap().sections.iter().any(|section| {
+                    matches!(section, Section::Code { source, .. } if &**source == stdout.as_str().unwrap())
+                }));
+            }
+            if outputs
+                .get(&id)
+                .is_some_and(|value| value.pointer("/result/stderr").is_some())
+            {
+                assert!(expanded.text.contains("other details"));
+            }
+        }
+    }
+
+    #[test]
+    fn pending_tool_calls_share_structured_headers_with_expanded_documents() {
+        use super::super::tool_view::header_line;
+        let mut snapshot = ObservationSnapshot::default();
+        let root = AgentId::root(SessionId::from_bytes([3; 16]));
+        let context = context(&mut snapshot, &root);
+        request(&mut snapshot, &root, context);
+        record(
+            &mut snapshot,
+            &root,
+            SessionEvent::MessageCommitted {
+                message: Message::Assistant(vec![AssistantItem::tool_call(
+                    "tool",
+                    0,
+                    skyhook::provider::protocol::ToolCall {
+                        id: "call_agent".into(),
+                        name: "agent".into(),
+                        arguments: serde_json::json!({"target":"build-host"}),
+                    },
+                )]),
+            },
+        );
+        let mut projection = Projection::default();
+        projection.rebuild(&snapshot);
+        for open in [false, true] {
+            let cards = entries(
+                &snapshot,
+                &projection,
+                &root,
+                &View::default(),
+                &HashMap::new(),
+                false,
+                open,
+            );
+            let card = cards
+                .iter()
+                .find(|card| card.surface == Surface::Tool)
+                .unwrap();
+            let header = card.header.as_ref().unwrap();
+            assert_eq!(
+                header,
+                &vec![
+                    Run::new(if open { "▾" } else { "▸" }, Role::Indicator),
+                    Run::new(" ", Role::Plain),
+                    Run::new("agent", Role::ToolName),
+                    Run::new(" @build-host", Role::Target),
+                ]
+            );
+            assert_eq!(
+                card.text.lines().next().unwrap(),
+                if open {
+                    "▾ agent @build-host"
+                } else {
+                    "▸ agent @build-host"
+                }
+            );
+            for light in [false, true] {
+                if open {
+                    assert_eq!(
+                        card.document.as_ref().unwrap().lines(None, light)[0],
+                        header_line(header, light)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn notification_headers_use_only_historical_typed_states() {
+        let text = format!(
+            "<skyhook_job_events>{}</skyhook_job_events>",
+            serde_json::json!([
+                {"id": 1, "tool": "exec", "state": "failed"},
+                {"id": 2, "tool": "exec", "state": "not failed but updated"},
+                {"id": 3, "tool": "agent", "kind": "message", "name": "Failed", "message": 4, "state": "failed", "text": "Completed"}
+            ])
+        );
+        let cards = job_event_entries("m1", &text, &Projection::default(), &View::default(), true);
+        let expected = [
+            ("▾ Job event · exec #1 · failed", Role::Error),
+            (
+                "▾ Job event · exec #2 · not failed but updated",
+                Role::Plain,
+            ),
+            ("▾ Job event · agent #3 · Failed · message #4", Role::Plain),
+        ];
+        for (card, (text, role)) in cards.iter().zip(expected) {
+            let runs = card.header.as_ref().unwrap();
+            assert_eq!(header_text(runs), text);
+            assert_eq!(
+                runs.last().unwrap(),
+                &Run::new(text.rsplit(" · ").next().unwrap(), role)
+            );
+            assert_eq!(
+                card.document.as_ref().unwrap().sections[0],
+                Section::Line(runs.clone())
+            );
+        }
+    }
+
     #[test]
     fn content_cache_refreshes_only_invalidated_tool_output() {
         let agent = AgentId::root(SessionId::from_bytes([34; 16]));

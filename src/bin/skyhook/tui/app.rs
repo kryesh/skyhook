@@ -69,6 +69,8 @@ pub enum ConfirmAction {
 pub struct Item {
     pub value: String,
     pub label: String,
+    /// Secondary metadata; Commands use configured shortcuts, kept searchable
+    /// separately from labels so rendering can align and mute the hint.
     pub detail: String,
     pub attachment: Option<Attachment>,
 }
@@ -614,6 +616,7 @@ impl App {
                     indent: 0,
                     job: None,
                     compact_after: false,
+                    header: None,
                     document: None,
                 });
             }
@@ -1728,6 +1731,7 @@ impl App {
                     MouseEventKind::Down(MouseButton::Left) => {
                         self.pressed_entry = None;
                         self.selection = None;
+                        let mut select_text = true;
                         if let Some((_, hit)) = self
                             .hits
                             .iter()
@@ -1771,10 +1775,13 @@ impl App {
                                 }
                                 Hit::Latest => {
                                     self.view().scroll = None;
+                                    // The text-only overlay sits over selectable history.
+                                    // Do not pin the viewport again by selecting beneath it.
+                                    select_text = false;
                                 }
                             }
                         }
-                        if let Some(position) = self.text_position(point) {
+                        if select_text && let Some(position) = self.text_position(point) {
                             let scroll = self
                                 .views
                                 .get(&self.selected)
@@ -3185,6 +3192,63 @@ mod tests {
         app.remembered_model = Some("first".into());
         (root, app)
     }
+    #[tokio::test]
+    async fn command_menu_keeps_configured_shortcuts_separate_and_searchable() {
+        let (_root, mut app) = draft_fixture().await;
+        app.command("commands");
+        let menu = app.menu.as_ref().unwrap();
+        assert!(matches!(menu.kind, MenuKind::Commands));
+        let hidden = ["commands", "child", "parent", "inspect"];
+        assert_eq!(menu.items.len(), COMMANDS.len() - hidden.len());
+        for (id, label, _) in COMMANDS {
+            if hidden.contains(id) {
+                assert!(!menu.items.iter().any(|item| item.value == *id));
+                continue;
+            }
+            let item = menu.items.iter().find(|item| item.value == *id).unwrap();
+            assert_eq!(item.label, *label);
+            assert_eq!(item.detail, app.keys.binding(id));
+        }
+        app.keys = KeyMap::new(&std::collections::BTreeMap::from([
+            ("new".into(), "alt+n".into()),
+            ("exit".into(), "none".into()),
+            ("models".into(), "alt+m".into()),
+        ]))
+        .unwrap();
+        app.command("commands");
+        let menu = app.menu.as_mut().unwrap();
+        let new = menu.items.iter().find(|item| item.value == "new").unwrap();
+        assert_eq!(new.label, "New session");
+        assert_eq!(new.detail, "Alt+N");
+        assert!(
+            menu.items
+                .iter()
+                .find(|item| item.value == "exit")
+                .unwrap()
+                .detail
+                .is_empty()
+        );
+        assert_eq!(
+            menu.items
+                .iter()
+                .find(|item| item.value == "model")
+                .unwrap()
+                .detail,
+            "Alt+M"
+        );
+        for (query, expected) in [("ALT+N", "new"), ("new SESSION", "new"), ("alt+m", "model")] {
+            menu.input.text = query.into();
+            let filtered = menu.filtered();
+            assert_eq!(filtered.len(), 1, "query: {query}");
+            assert_eq!(filtered[0].value, expected);
+        }
+        menu.input.text = "ctrl+x n".into();
+        assert!(
+            menu.filtered().is_empty(),
+            "overridden defaults must not remain searchable"
+        );
+    }
+
     async fn fixture() -> (tempfile::TempDir, App) {
         let (root, mut app) = draft_fixture().await;
         let session = app.launch.create(None).await.unwrap();
@@ -3679,13 +3743,134 @@ mod tests {
         receiver
     }
     fn draw_buffer(app: &mut App) -> ratatui::buffer::Buffer {
+        draw_sized_buffer(app, 60, 24)
+    }
+    fn draw_sized_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 24)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| super::super::render::draw(frame, app))
             .unwrap();
         terminal.backend().buffer().clone()
     }
+    #[tokio::test]
+    async fn tree_inspector_and_menu_roles_survive_selection_and_narrow_layouts() {
+        use super::super::render::Palette;
+        use ratatui::{buffer::Buffer, style::Color};
+        fn assert_role(buffer: &Buffer, rect: Rect, value: &str, fg: Color) {
+            let chars: Vec<_> = value.chars().map(|c| c.to_string()).collect();
+            for y in rect.y..rect.bottom() {
+                for x in rect.x..rect.right() {
+                    if x as usize + chars.len() <= rect.right() as usize
+                        && chars
+                            .iter()
+                            .enumerate()
+                            .all(|(i, ch)| buffer[(x + i as u16, y)].symbol() == ch)
+                    {
+                        assert!(
+                            (x..x + chars.len() as u16).all(|x| buffer[(x, y)].fg == fg),
+                            "wrong role: {value}"
+                        );
+                        return;
+                    }
+                }
+            }
+            panic!("missing {value:?} in {rect:?}");
+        }
+        let (_root, mut app) = fixture().await;
+        app.projection.agents[0].name = "Researcher".into();
+        app.projection.agents[0].target = "remote".into();
+        let id = app.projection.agents[0].id.clone();
+        // A root-only session intentionally hides the tree. Keep a live child
+        // so the fixture exercises the real visible-tree layout in every state.
+        let mut child = app.projection.agents[0].clone();
+        child.id = id.child(1);
+        child.name = "Child".into();
+        app.projection.agents.push(child);
+        for light in [false, true] {
+            app.light = light;
+            let p = Palette::new(light);
+            for (activity, terminal, status, role) in [
+                (AgentActivity::Working, false, "Working", p.content.primary),
+                (
+                    AgentActivity::WaitingChildren,
+                    false,
+                    "Waiting for child",
+                    p.content.warning,
+                ),
+                (
+                    AgentActivity::Failed("fixture".into()),
+                    false,
+                    "Failed",
+                    p.content.error,
+                ),
+                (AgentActivity::Interrupted, false, "Interrupted", p.muted),
+                (AgentActivity::Idle, true, "Completed", p.content.success),
+            ] {
+                app.projection.agents[0].terminal = terminal;
+                app.snapshot.activity.insert(id.clone(), activity);
+                app.menu = None;
+                let buffer = draw_sized_buffer(&mut app, 160, 36);
+                let row = app
+                    .hits
+                    .iter()
+                    .find_map(|(rect, hit)| {
+                        matches!(hit, Hit::Agent(agent) if agent == &id).then_some(*rect)
+                    })
+                    .unwrap();
+                assert_role(&buffer, row, "Researcher", p.content.fg);
+                assert_role(&buffer, row, "@remote", p.content.accent);
+                assert_role(&buffer, row, status, role);
+                for width in [45, 160] {
+                    app.command("agents");
+                    let buffer = draw_sized_buffer(&mut app, width, 36);
+                    let row = app
+                        .hits
+                        .iter()
+                        .find_map(|(rect, hit)| matches!(hit, Hit::Menu(0)).then_some(*rect))
+                        .unwrap();
+                    assert_role(&buffer, row, "Researcher", p.content.fg);
+                    assert_role(&buffer, row, "@remote", p.content.accent);
+                    assert_role(&buffer, row, status, role);
+                    assert_eq!(buffer[(row.x, row.y)].bg, p.selected);
+                }
+            }
+            app.keys = KeyMap::new(&std::collections::BTreeMap::from([(
+                "new".into(),
+                "alt+n".into(),
+            )]))
+            .unwrap();
+            app.command("commands");
+            let buffer = draw_sized_buffer(&mut app, 90, 36);
+            let row = app
+                .hits
+                .iter()
+                .find_map(|(rect, hit)| matches!(hit, Hit::Menu(0)).then_some(*rect))
+                .unwrap();
+            assert_role(&buffer, buffer.area, "Commands", p.content.primary);
+            assert_role(&buffer, row, "New session", p.content.primary);
+            assert_role(&buffer, row, "Alt+N", p.muted);
+            let hint: String = (row.right() - 5..row.right())
+                .map(|x| buffer[(x, row.y)].symbol())
+                .collect();
+            assert_eq!(hint, "Alt+N");
+            for x in row.x..row.right() {
+                assert_eq!(
+                    buffer[(x, row.y)].bg,
+                    p.selected,
+                    "selected palette row must have no background gap"
+                );
+            }
+            let buffer = draw_sized_buffer(&mut app, 20, 36);
+            let row = app
+                .hits
+                .iter()
+                .find_map(|(rect, hit)| matches!(hit, Hit::Menu(0)).then_some(*rect))
+                .unwrap();
+            assert_role(&buffer, row, "New session", p.content.primary);
+        }
+    }
+
     fn draw(app: &mut App) -> String {
         draw_buffer(app)
             .content
@@ -4072,6 +4257,706 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn markdown_continuations_keep_task_list_quote_and_ordered_indentation() {
+        use skyhook::{
+            provider::protocol::{AssistantItem, Message},
+            session::EventRecord,
+        };
+        let (_root, mut app) = fixture().await;
+        let body = "- [ ] alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima\n\n> quoteone quotetwo quotethree quotefour quotefive quotesix quoteseven\n\n10. orderone ordertwo orderthree orderfour orderfive ordersix\n\n> - nestedone nestedtwo nestedthree nestedfour nestedfive nestedsix";
+        let sequence = app.snapshot.records.last_key_value().unwrap().0 + 1;
+        app.snapshot.records.insert(
+            sequence,
+            EventRecord {
+                version: 1,
+                sequence,
+                timestamp_millis: 0,
+                agent: app.selected.clone(),
+                event: SessionEvent::MessageCommitted {
+                    message: Message::Assistant(vec![AssistantItem::text("indent", 0, body)]),
+                },
+            },
+        );
+        let records = serde_json::to_vec(&app.snapshot.records).unwrap();
+        app.refresh();
+        for light in [false, true] {
+            app.light = light;
+            for width in [30, 44] {
+                let buffer = draw_sized_buffer(&mut app, width, 60);
+                for word in ["alpha", "quoteone", "orderone", "nestedone"] {
+                    let (x, y) = (0..buffer.area.height)
+                        .find_map(|y| {
+                            (0..width.saturating_sub(word.len() as u16)).find_map(|x| {
+                                word.chars()
+                                    .enumerate()
+                                    .all(|(offset, c)| {
+                                        buffer[(x + offset as u16, y)].symbol() == c.to_string()
+                                    })
+                                    .then_some((x, y))
+                            })
+                        })
+                        .unwrap_or_else(|| panic!("missing {word}"));
+                    let continued_x = (0..width)
+                        .find(|&x| buffer[(x, y + 1)].symbol().chars().any(char::is_alphabetic))
+                        .unwrap();
+                    assert_eq!(continued_x, x, "{word}, width={width}, light={light}");
+                    if word == "quoteone" {
+                        assert_eq!(buffer[(x - 2, y + 1)].symbol(), "│");
+                    }
+                }
+            }
+        }
+        assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn markdown_code_keeps_stock_syntax_and_padded_backgrounds() {
+        use super::super::{
+            render::Palette,
+            theme::ContentTheme,
+            tool_view::{CodeSource, Document, Role, Section},
+        };
+        use skyhook::{
+            provider::protocol::{AssistantItem, Message},
+            session::EventRecord,
+        };
+        let (_root, mut app) = fixture().await;
+        let source = "const answer = 42;\n\nawait performWork(answer);\n";
+        let body = format!("Outside prose\n\n```js\n{source}```\n\nMore prose with `inline`.");
+        let sequence = app.snapshot.records.last_key_value().unwrap().0 + 1;
+        app.snapshot.records.insert(
+            sequence,
+            EventRecord {
+                version: 1,
+                sequence,
+                timestamp_millis: 0,
+                agent: app.selected.clone(),
+                event: SessionEvent::MessageCommitted {
+                    message: Message::Assistant(vec![AssistantItem::text("code", 0, &body)]),
+                },
+            },
+        );
+        let records = serde_json::to_vec(&app.snapshot.records).unwrap();
+        app.refresh();
+        let document = Document {
+            sections: vec![Section::Code {
+                source: CodeSource::from(source),
+                language: "js".into(),
+                indent: 0,
+                gutters: vec![],
+                role: Role::Constant,
+            }],
+        };
+        let locate = |buffer: &ratatui::buffer::Buffer, word: &str| {
+            let area = buffer.area;
+            (area.y..area.bottom())
+                .find_map(|y| {
+                    (area.x
+                        ..area
+                            .right()
+                            .saturating_sub(word.len() as u16)
+                            .saturating_add(1))
+                        .find_map(|x| {
+                            word.chars()
+                                .enumerate()
+                                .all(|(offset, c)| {
+                                    buffer[(x + offset as u16, y)].symbol() == c.to_string()
+                                })
+                                .then_some((x, y))
+                        })
+                })
+                .unwrap_or_else(|| panic!("missing {word}"))
+        };
+        for light in [false, true] {
+            app.light = light;
+            for width in [36, 64] {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let buffer = loop {
+                    let buffer = draw_sized_buffer(&mut app, width, 40);
+                    if app.render.highlights.is_fully_highlighted(&document, light) {
+                        break buffer;
+                    }
+                    assert!(Instant::now() < deadline);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+                let theme = ContentTheme::new(light);
+                for (word, foreground) in
+                    [("const", theme.secondary), ("performWork", theme.secondary)]
+                {
+                    let (x, y) = locate(&buffer, word);
+                    for offset in 0..word.len() as u16 {
+                        assert_eq!(
+                            buffer[(x + offset, y)].fg,
+                            foreground,
+                            "{word}, light={light}"
+                        );
+                        assert_eq!(buffer[(x + offset, y)].bg, theme.code_bg);
+                    }
+                }
+                let (code_x, y) = locate(&buffer, "const");
+                let (paragraph_x, paragraph_y) = locate(&buffer, "Outside");
+                let rect = app
+                    .hits
+                    .iter()
+                    .find_map(|(rect, hit)| {
+                        (rect.y == paragraph_y && matches!(hit, Hit::Entry(_, _))).then_some(*rect)
+                    })
+                    .unwrap();
+                let available = rect.width.saturating_sub(4);
+                let block_width =
+                    (source.lines().map(str::len).max().unwrap() as u16 + 2).min(available);
+                assert_eq!(
+                    code_x,
+                    paragraph_x + 1,
+                    "code starts after one padding column"
+                );
+                let (_, last_y) = locate(&buffer, "await");
+                for row in [y - 1, y, y + 1, last_y, last_y + 1] {
+                    for x in paragraph_x..paragraph_x + block_width {
+                        assert_eq!(buffer[(x, row)].bg, theme.code_bg, "code padding/blank row");
+                    }
+                    if paragraph_x + block_width < width {
+                        assert_eq!(
+                            buffer[(paragraph_x + block_width, row)].bg,
+                            Palette::new(light).agent,
+                            "code background stops at its content-sized right edge"
+                        );
+                    }
+                }
+                for word in ["Outside", "inline"] {
+                    let point = locate(&buffer, word);
+                    assert_eq!(buffer[point].bg, Palette::new(light).agent, "{word}");
+                }
+            }
+        }
+        assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expanded_agent_prompts_wrap_on_words_at_multiple_widths() {
+        use super::super::theme::ContentTheme;
+        use skyhook::{
+            provider::protocol::{AssistantItem, Message, ToolCall},
+            session::EventRecord,
+        };
+        let (_root, mut app) = fixture().await;
+        let words = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mango nectar orange papaya quince rocket sierra tango uniform victor whiskey xray yankee zulu"
+            .split_whitespace().collect::<Vec<_>>();
+        let prompt = format!(
+            "{}\n{}",
+            words.join(" "),
+            words.iter().rev().copied().collect::<Vec<_>>().join(" ")
+        );
+        let sequence = app.snapshot.records.last_key_value().unwrap().0 + 1;
+        app.snapshot.records.insert(
+            sequence,
+            EventRecord {
+                version: 1,
+                sequence,
+                timestamp_millis: 0,
+                agent: app.selected.clone(),
+                event: SessionEvent::MessageCommitted {
+                    message: Message::Assistant(vec![AssistantItem::tool_call(
+                        "prompt-item",
+                        0,
+                        ToolCall {
+                            id: "prompt-call".into(),
+                            name: "agent".into(),
+                            arguments: serde_json::json!({"prompt": prompt}),
+                        },
+                    )]),
+                },
+            },
+        );
+        let records = serde_json::to_vec(&app.snapshot.records).unwrap();
+        app.refresh();
+        draw_sized_buffer(&mut app, 64, 60);
+        let index = app
+            .entries
+            .iter()
+            .position(|entry| entry.surface == model::Surface::Tool)
+            .unwrap();
+        app.view().row = index;
+        app.toggle();
+        for light in [false, true] {
+            app.light = light;
+            for width in [24, 40, 64] {
+                let buffer = draw_sized_buffer(&mut app, width, 60);
+                let mut displayed = Vec::new();
+                for (rect, hit) in &app.hits {
+                    if !matches!(hit, Hit::Entry(i, true) if *i == index) {
+                        continue;
+                    }
+                    let text = (rect.x..rect.right())
+                        .filter_map(|x| {
+                            let cell = &buffer[(x, rect.y)];
+                            (cell.fg == ContentTheme::new(light).success).then_some(cell.symbol())
+                        })
+                        .collect::<String>();
+                    // Every displayed fragment must contain whole prompt words,
+                    // not the prefix/suffix of a word cut at the terminal edge.
+                    displayed.extend(text.split_whitespace().map(str::to_owned));
+                }
+                let expected = words
+                    .iter()
+                    .chain(words.iter().rev())
+                    .map(|word| (*word).to_owned())
+                    .collect::<Vec<_>>();
+                assert_eq!(displayed, expected, "light={light}, width={width}");
+            }
+        }
+        assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn expanded_edges_persist_without_body_focus_or_hover_backgrounds() {
+        use super::super::render::Palette;
+        use skyhook::{
+            provider::protocol::{AssistantItem, Message, ToolCall, ToolResult},
+            session::EventRecord,
+        };
+        let (_root, mut app) = fixture().await;
+        let sequence = app.snapshot.records.last_key_value().unwrap().0 + 1;
+        let calls = ["first", "second"].map(|id| ToolCall {
+            id: id.into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": format!("{id}.txt")}),
+        });
+        app.snapshot.records.insert(
+            sequence,
+            EventRecord {
+                version: 1,
+                sequence,
+                timestamp_millis: 0,
+                agent: app.selected.clone(),
+                event: SessionEvent::MessageCommitted {
+                    message: Message::Assistant(
+                        calls
+                            .iter()
+                            .enumerate()
+                            .map(|(index, call)| {
+                                AssistantItem::tool_call(call.id.clone(), index, call.clone())
+                            })
+                            .collect(),
+                    ),
+                },
+            },
+        );
+        app.snapshot.records.insert(sequence + 1, EventRecord {
+            version: 1, sequence: sequence + 1, timestamp_millis: 1, agent: app.selected.clone(),
+            event: SessionEvent::MessageCommitted { message: Message::Tool(calls.iter().map(|call| ToolResult {
+                call_id: call.id.clone(), name: call.name.clone(),
+                result: serde_json::json!({"result": {"content": format!("{} body", call.id)}}),
+                images: vec![], is_error: false,
+            }).collect()) },
+        });
+        app.refresh();
+        draw_sized_buffer(&mut app, 80, 60);
+        let keys = app
+            .entries
+            .iter()
+            .filter(|entry| entry.surface == model::Surface::Tool)
+            .map(|entry| entry.key.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 2);
+        let rects = |app: &App, key: &str| {
+            let index = app
+                .entries
+                .iter()
+                .position(|entry| entry.key == key)
+                .unwrap();
+            app.hits
+                .iter()
+                .filter_map(|(rect, hit)| {
+                    matches!(hit, Hit::Entry(i, true) if *i == index).then_some(*rect)
+                })
+                .collect::<Vec<_>>()
+        };
+        let check = |app: &App, buffer: &ratatui::buffer::Buffer, key: &str| {
+            let rows = rects(app, key);
+            assert!(rows.len() > 2);
+            let p = Palette::new(app.light);
+            let arrow_x = rows[0].x;
+            for (index, rect) in rows.iter().enumerate() {
+                assert_eq!(
+                    buffer[(arrow_x, rect.y)].bg,
+                    p.selected,
+                    "connected tool gutter"
+                );
+                for x in rect.x..rect.right() {
+                    let expected = if index == 0 || index + 1 == rows.len() || x == arrow_x {
+                        p.selected
+                    } else {
+                        p.base
+                    };
+                    assert_eq!(buffer[(x, rect.y)].bg, expected, "{key} row {index}, x={x}");
+                }
+            }
+        };
+        for light in [false, true] {
+            app.light = light;
+            app.details = false;
+            app.view().expanded.clear();
+            app.view().collapsed.clear();
+            app.invalidate_content();
+            draw_sized_buffer(&mut app, 80, 60);
+            app.focus = Focus::Content;
+            app.view().row = app
+                .entries
+                .iter()
+                .position(|entry| entry.key == keys[0])
+                .unwrap();
+            app.toggle();
+            let buffer = draw_sized_buffer(&mut app, 80, 60);
+            check(&app, &buffer, &keys[0]);
+            let body = rects(&app, &keys[0])[1];
+            mouse(&mut app, body, MouseEventKind::Moved);
+            let buffer = draw_sized_buffer(&mut app, 80, 60);
+            check(&app, &buffer, &keys[0]);
+            let composer = app.composer_rect;
+            click(&mut app, composer);
+            let buffer = draw_sized_buffer(&mut app, 80, 60);
+            check(&app, &buffer, &keys[0]);
+            app.view().row = app
+                .entries
+                .iter()
+                .position(|entry| entry.key == keys[1])
+                .unwrap();
+            app.toggle();
+            let buffer = draw_sized_buffer(&mut app, 80, 60);
+            check(&app, &buffer, &keys[0]);
+            check(&app, &buffer, &keys[1]);
+            let first = rects(&app, &keys[0])[0];
+            click(&mut app, first);
+            draw_sized_buffer(&mut app, 80, 60);
+            let composer = app.composer_rect;
+            click(&mut app, composer);
+            app.hover = None;
+            let buffer = draw_sized_buffer(&mut app, 80, 60);
+            let first = rects(&app, &keys[0]);
+            assert_eq!(first.len(), 1);
+            assert_eq!(
+                buffer[(first[0].x, first[0].y)].bg,
+                Palette::new(light).base
+            );
+            check(&app, &buffer, &keys[1]);
+        }
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn latest_activity_is_text_only_and_still_jumps_to_the_end() {
+        use super::super::render::Palette;
+        let (_root, mut app) = fixture().await;
+        app.entries = vec![model::Entry {
+            key: "long-message".into(),
+            text: format!("Agent\n{}", "ordinary prose\n".repeat(100)),
+            surface: model::Surface::Agent,
+            expandable: false,
+            default_open: false,
+            running: false,
+            footer: None,
+            request: None,
+            indent: 0,
+            job: None,
+            header: None,
+            document: None,
+            compact_after: false,
+        }];
+        app.content_dirty = false;
+        for light in [false, true] {
+            app.light = light;
+            app.view().scroll = Some(0);
+            let buffer = draw_buffer(&mut app);
+            let popup = app
+                .hits
+                .iter()
+                .find_map(|(rect, hit)| matches!(hit, Hit::Latest).then_some(*rect))
+                .unwrap();
+            let message = app
+                .hits
+                .iter()
+                .find_map(|(rect, hit)| {
+                    (rect.y == popup.y && matches!(hit, Hit::Entry(0, _))).then_some(*rect)
+                })
+                .unwrap();
+            let p = Palette::new(light);
+            let mut label = String::new();
+            for x in popup.x..popup.right() {
+                let expected = if message.contains((x, popup.y).into()) {
+                    p.agent
+                } else {
+                    p.base
+                };
+                assert_eq!(buffer[(x, popup.y)].bg, expected);
+                label.push_str(buffer[(x, popup.y)].symbol());
+            }
+            assert_eq!(label, "↓ Latest activity");
+            click(&mut app, popup);
+            draw_buffer(&mut app);
+            assert!(app.view().scroll.is_none());
+            assert!(!app.hits.iter().any(|(_, hit)| matches!(hit, Hit::Latest)));
+        }
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pre_job_failure_updates_the_existing_tool_card_and_expands_in_place() {
+        use super::super::theme::ContentTheme;
+        use skyhook::{
+            provider::protocol::{AssistantItem, Message, ToolCall, ToolResult},
+            session::EventRecord,
+        };
+        let (_root, mut app) = fixture().await;
+        let sequence = app.snapshot.records.last_key_value().unwrap().0 + 1;
+        app.snapshot.records.insert(
+            sequence,
+            EventRecord {
+                version: 1,
+                sequence,
+                timestamp_millis: 0,
+                agent: app.selected.clone(),
+                event: SessionEvent::MessageCommitted {
+                    message: Message::Assistant(vec![AssistantItem::tool_call(
+                        "call-item",
+                        0,
+                        ToolCall {
+                            id: "denied-call".into(),
+                            name: "exec".into(),
+                            arguments: serde_json::json!({"argv": ["cargo", "test"]}),
+                        },
+                    )]),
+                },
+            },
+        );
+        app.refresh();
+        draw(&mut app);
+        let key = app
+            .entries
+            .iter()
+            .find(|entry| entry.surface == model::Surface::Tool)
+            .unwrap()
+            .key
+            .clone();
+        app.snapshot.records.insert(sequence + 1, EventRecord {
+            version: 1, sequence: sequence + 1, timestamp_millis: 1, agent: app.selected.clone(),
+            event: SessionEvent::MessageCommitted { message: Message::Tool(vec![ToolResult {
+                call_id: "denied-call".into(), name: "exec".into(),
+                result: serde_json::json!({"error": "Permission was denied", "code": "permission_denied", "executed": false}),
+                images: vec![], is_error: true,
+            }]) },
+        });
+        let records = serde_json::to_vec(&app.snapshot.records).unwrap();
+        app.refresh();
+        for light in [false, true] {
+            app.light = light;
+            let buffer = draw_buffer(&mut app);
+            let cards = app
+                .entries
+                .iter()
+                .filter(|entry| entry.surface == model::Surface::Tool)
+                .collect::<Vec<_>>();
+            assert_eq!(cards.len(), 1);
+            assert_eq!(cards[0].key, key);
+            assert!(cards[0].text.contains("Failed"));
+            assert!(!cards[0].text.contains("Permission was denied"));
+            assert!(cards[0].job.is_none());
+            assert!(cards[0].expandable);
+            assert!(buffer.content.windows(6).any(|cells| {
+                cells.iter().map(|cell| cell.symbol()).collect::<String>() == "Failed"
+                    && cells
+                        .iter()
+                        .all(|cell| cell.fg == ContentTheme::new(light).error)
+            }));
+            let index = app
+                .entries
+                .iter()
+                .position(|entry| entry.key == key)
+                .unwrap();
+            let hit = app
+                .hits
+                .iter()
+                .find_map(|(rect, hit)| {
+                    matches!(hit, Hit::Entry(i, true) if *i == index).then_some(*rect)
+                })
+                .unwrap();
+            click(&mut app, hit);
+            draw(&mut app);
+            let card = app.entries.iter().find(|entry| entry.key == key).unwrap();
+            assert!(card.text.contains("Arguments"));
+            assert!(card.text.contains("Output"));
+            assert!(card.text.contains("Permission was denied"));
+            assert!(card.text.contains("permission_denied"));
+            assert!(card.document.is_some());
+            assert_eq!(
+                app.entries
+                    .iter()
+                    .filter(|entry| entry.surface == model::Surface::Tool)
+                    .count(),
+                1
+            );
+            let hit = app
+                .hits
+                .iter()
+                .find_map(|(rect, hit)| {
+                    matches!(hit, Hit::Entry(i, true) if *i == index).then_some(*rect)
+                })
+                .unwrap();
+            click(&mut app, hit);
+            draw(&mut app);
+        }
+        assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordered_list_fences_highlight_without_parsing_generated_message_titles() {
+        use super::super::{
+            theme::ContentTheme,
+            tool_view::{CodeSource, Document, Role, Section},
+        };
+        use skyhook::{
+            provider::protocol::{AssistantItem, Message, UserContent},
+            session::EventRecord,
+        };
+        // A fresh cache for every case is important: another entry's identical
+        // highlighted source must not mask a missing metadata request.
+        for user in [false, true] {
+            for start in [2, 3] {
+                let (_root, mut app) = fixture().await;
+                let source = "let answer = 42;\n";
+                let body = format!("{start}. ```rust\n   {source}   ```");
+                let message = if user {
+                    Message::User(vec![UserContent::Text { text: body.clone() }])
+                } else {
+                    Message::Assistant(vec![AssistantItem::text("ordered-fence", 0, &body)])
+                };
+                let sequence = app.snapshot.records.last_key_value().unwrap().0 + 1;
+                app.snapshot.records.insert(
+                    sequence,
+                    EventRecord {
+                        version: 1,
+                        sequence,
+                        timestamp_millis: 0,
+                        agent: app.selected.clone(),
+                        event: SessionEvent::MessageCommitted { message },
+                    },
+                );
+                app.refresh();
+                let document = Document {
+                    sections: vec![Section::Code {
+                        source: CodeSource::from(source),
+                        language: "rust".into(),
+                        indent: 0,
+                        gutters: vec![],
+                        role: Role::Constant,
+                    }],
+                };
+                for light in [false, true] {
+                    app.light = light;
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        let buffer = draw_sized_buffer(&mut app, 60, 40);
+                        let painted = buffer.content.windows(2).any(|cells| {
+                            cells[0].symbol() == "4"
+                                && cells[1].symbol() == "2"
+                                && cells
+                                    .iter()
+                                    .all(|cell| cell.fg == ContentTheme::new(light).accent)
+                        });
+                        if app.render.highlights.is_fully_highlighted(&document, light) && painted {
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "missing ordered fence: start={start}, user={user}, light={light}"
+                        );
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+                app.session.as_ref().unwrap().shutdown().await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn markdown_fence_highlights_arrive_after_reset_resize_and_theme_switch() {
+        use super::super::{
+            theme::ContentTheme,
+            tool_view::{CodeSource, Document, Role, Section},
+        };
+        use skyhook::{
+            provider::protocol::{AssistantItem, Message},
+            session::EventRecord,
+        };
+        let (_root, mut app) = fixture().await;
+        let source = "let answer = 42;\n";
+        let message = format!("# Example\n\n```rust\n{source}```\n\n**Done**");
+        let sequence = app.snapshot.records.last_key_value().unwrap().0 + 1;
+        app.snapshot.records.insert(
+            sequence,
+            EventRecord {
+                version: 1,
+                sequence,
+                timestamp_millis: 0,
+                agent: app.selected.clone(),
+                event: SessionEvent::MessageCommitted {
+                    message: Message::Assistant(vec![AssistantItem::text("fence", 0, &message)]),
+                },
+            },
+        );
+        app.refresh();
+        let document = Document {
+            sections: vec![Section::Code {
+                source: CodeSource::from(source),
+                language: "rust".into(),
+                indent: 0,
+                gutters: vec![],
+                role: Role::Constant,
+            }],
+        };
+        let records = serde_json::to_vec(&app.snapshot.records).unwrap();
+        for (light, width) in [(false, 60), (true, 90), (false, 40)] {
+            app.light = light;
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                terminal
+                    .draw(|frame| super::super::render::draw(frame, &mut app))
+                    .unwrap();
+                // Inspect painted cells, not just cache readiness: this catches
+                // missing source-ID invalidation after an initial reset.
+                let painted = terminal.backend().buffer().content.windows(2).any(|cells| {
+                    cells[0].symbol() == "4"
+                        && cells[1].symbol() == "2"
+                        && cells
+                            .iter()
+                            .all(|cell| cell.fg == ContentTheme::new(light).accent)
+                });
+                if app.render.highlights.is_fully_highlighted(&document, light) && painted {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fence did not recolour: light={light}, width={width}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                app.entries
+                    .iter()
+                    .any(|entry| entry.text.ends_with(&message))
+            );
+            assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
+        }
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn highlighting_real_job_survives_resize_and_preserves_session_bytes() {
         let (_root, mut app) = fixture().await;
         let source = "const value = {answer: 42};  \n\treturn value;\n";
@@ -4152,12 +5037,59 @@ mod tests {
             .find_map(|entry| entry.document.as_ref())
             .unwrap()
             .clone();
+        // The arguments can finish before the output's separate code sections.
+        // Capture the fully highlighted document, not a timing-dependent mix.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            draw(&mut app);
+            if app
+                .render
+                .highlights
+                .is_fully_highlighted(&document, app.light)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let highlighted_document = document.lines(Some(&app.render.highlights), app.light);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 30)).unwrap();
         terminal
             .draw(|frame| super::super::render::draw(frame, &mut app))
             .unwrap();
+        assert_eq!(
+            document.lines(Some(&app.render.highlights), app.light),
+            highlighted_document
+        );
+        // Theme previews recolour cached code without changing its source or
+        // document geometry, and cancelling restores the exact original spans.
+        let original_light = app.light;
+        let plain_document = document.plain_text();
+        app.command("themes");
+        app.menu.as_mut().unwrap().selected = usize::from(!original_light);
+        app.preview_theme();
+        assert_eq!(app.light, !original_light);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            draw(&mut app);
+            if app
+                .render
+                .highlights
+                .is_fully_highlighted(&document, app.light)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let preview_document = document.lines(Some(&app.render.highlights), app.light);
+        assert_ne!(preview_document, highlighted_document);
+        assert_eq!(preview_document.len(), highlighted_document.len());
+        assert_eq!(document.plain_text(), plain_document);
+        key(&mut app, KeyCode::Esc, M::NONE);
+        draw(&mut app);
+        assert_eq!(app.light, original_light);
         assert_eq!(
             document.lines(Some(&app.render.highlights), app.light),
             highlighted_document
@@ -4188,6 +5120,7 @@ mod tests {
                 indent: 0,
                 job: None,
                 compact_after: false,
+                header: None,
                 document: None,
             })
             .collect();
@@ -4274,6 +5207,7 @@ mod tests {
                     indent: 0,
                     job: None,
                     compact_after: false,
+                    header: None,
                     document: None,
                 }];
                 app.content_dirty = false;
