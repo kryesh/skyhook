@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "AGPL-3.0-only"
-repository = "https://git.kryesh.tech/Apps/skyhook"
+repository = "https://github.com/kryesh/skyhook"
 
 [package]
 name = "skyhook-agent"
@@ -59,7 +59,6 @@ ratatui = { version = "0.30.2", default-features = false, features = [
     "crossterm_0_29",
     "layout-cache",
 ], optional = true }
-# Use level-triggered terminal polling so input bursts spanning multiple reads keep draining.
 crossterm = { version = "0.29", features = [
     "event-stream",
     "use-dev-tty",
