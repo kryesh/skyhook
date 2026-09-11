@@ -116,7 +116,7 @@ impl SessionRuntime {
             })
             .execute_model(agent.clone(), &call.name, call.arguments.clone(), parent)
             .await;
-        match result {
+        let mut result = match result {
             Ok(result) => {
                 let is_error = call.name != "job_output"
                     && result
@@ -156,7 +156,10 @@ impl SessionRuntime {
                     is_error: true,
                 }
             }
-        }
+        };
+        // Commit the same compact presentation that the model and UI display.
+        crate::job::omit_null_fields(&mut result.result);
+        result
     }
 
     pub(super) async fn resolve_agent(
@@ -267,6 +270,57 @@ impl SessionRuntime {
 mod tests {
     use super::*;
     use crate::agent::runtime::tests::*;
+
+    #[tokio::test]
+    async fn committed_tool_history_omits_null_fields() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            scripted_provider(
+                &requests,
+                [
+                    response(vec![AssistantContent::tool_call(
+                        "tool-0",
+                        0,
+                        ToolCall {
+                            id: "script-call".into(),
+                            name: "script".into(),
+                            arguments: json!({"source": "return {error: null, nested: {absent: null, ok: false}, array: [null, 0]};"}),
+                        },
+                    )]),
+                    response(vec![AssistantContent::text("answer", 0, "done")]),
+                ],
+            ),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(session.prompt("run").await.unwrap(), "done");
+        let records = session.runtime.store.records().await;
+        let results = records
+            .iter()
+            .find_map(|record| match &record.event {
+                SessionEvent::MessageCommitted {
+                    message: Message::Tool(results),
+                } => Some(results),
+                _ => None,
+            })
+            .expect("committed tool result");
+        assert_eq!(
+            results[0].result["result"]["value"],
+            json!({
+                "nested": {"ok": false},
+                "array": [null, 0]
+            })
+        );
+        let requests = requests.lock().unwrap();
+        let Message::Tool(sent) = request_history(&requests[1]).last().unwrap() else {
+            panic!("model tool result");
+        };
+        assert_eq!(sent, results);
+    }
 
     #[tokio::test]
     async fn child_first_request_includes_parent_supplied_todos() {

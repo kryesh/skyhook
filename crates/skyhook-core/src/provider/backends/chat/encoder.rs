@@ -243,7 +243,7 @@ mod tests {
             Message::Tool(vec![ToolResult {
                 call_id: "call-a".into(),
                 name: "inspect".into(),
-                result: json!({"ok":false}),
+                result: json!({"ok":false, "error":null}),
                 is_error: true,
                 images: vec![image()],
             }]),

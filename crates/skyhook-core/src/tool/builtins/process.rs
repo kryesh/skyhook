@@ -18,12 +18,11 @@ const PROCESS_CHUNK: usize = 8 * 1024;
 pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
     builder.register::<ExecArgs, ProcessOutput, _, _>(
         "exec",
-        "Run an exact argument vector without shell parsing.",
+        "Run an exact argument vector without shell parsing. Stdin is closed.",
         ToolOptions::new(vec![Capability::Exec])
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .named()
             .background()
-            .input()
             .default_path_argument("cwd", ".", PathAccess::Read, PathKind::Existing),
         move |context, args| async move {
             let (program, arguments) = args
@@ -38,12 +37,11 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
     )?;
     builder.register::<ShellArgs, ProcessOutput, _, _>(
         "shell",
-        "Run /bin/sh -lc in the workspace.",
+        "Run /bin/sh -lc in the workspace. Stdin is closed.",
         ToolOptions::new(vec![Capability::Exec])
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .named()
             .background()
-            .input()
             .default_path_argument("cwd", ".", PathAccess::Read, PathKind::Existing),
         move |context, args| async move {
             if args.command.is_empty() {
@@ -89,7 +87,7 @@ async fn run_process(
         command.envs(askpass.environment());
     }
     command
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -97,7 +95,7 @@ async fn run_process(
     if context.capabilities.contains(Capability::Interactive) {
         command.process_group(0);
     } else {
-        // Piped stdio alone still permits /dev/tty access (and SIGTTIN stops).
+        // Redirected stdio still permits /dev/tty access (and SIGTTIN stops).
         // A new session detaches the controlling terminal and also makes the
         // child its process-group leader, preserving group-wide cleanup below.
         // Do not combine this with process_group(0): a group leader cannot setsid.
@@ -121,10 +119,6 @@ async fn run_process(
         i32::try_from(child.id().expect("spawned process has an ID"))
             .map_err(|_| ToolError::Failed("process ID is out of range".to_owned()))?,
     );
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| ToolError::Failed("process stdin unavailable".to_owned()))?;
     let stdout = child
         .stdout
         .take()
@@ -134,21 +128,6 @@ async fn run_process(
         .take()
         .ok_or_else(|| ToolError::Failed("process stderr unavailable".to_owned()))?;
 
-    let input_context = context.clone();
-    let input_task = tokio::spawn(async move {
-        let mut stdin = stdin;
-        while let Ok(value) = input_context.receive().await {
-            let text = value.as_str().ok_or_else(|| {
-                ToolError::InvalidArguments("process input must be a string".to_owned())
-            })?;
-            stdin.write_all(text.as_bytes()).await?;
-            stdin.write_all(b"\n").await?;
-            stdin.flush().await?;
-        }
-        Ok::<(), ToolError>(())
-    });
-
-    let _input_guard = AbortTask(input_task.abort_handle());
     let deadline = async {
         match timeout {
             Some(seconds) => tokio::time::sleep(Duration::from_secs(seconds)).await,
@@ -204,13 +183,6 @@ async fn run_process(
         ));
     }
     Ok(output)
-}
-
-struct AbortTask(tokio::task::AbortHandle);
-impl Drop for AbortTask {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
 }
 
 #[cfg(unix)]

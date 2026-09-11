@@ -209,6 +209,67 @@ mod tests {
     use skyhook::identity::SessionId;
 
     #[test]
+    fn expanded_jobs_and_historical_call_results_omit_null_object_fields() {
+        let agent = AgentId::root(SessionId::from_bytes([1; 16]));
+        let id = JobId::new(42).unwrap();
+        let result = ToolResult {
+            call_id: "old-call".into(),
+            name: "exec".into(),
+            result: serde_json::json!({
+                "error": null, "result": {
+                    "absent": null, "items": [null, {"absent": null, "keep": false}],
+                    "stdout": "  literal null\t\n"
+                }
+            }),
+            images: vec![],
+            is_error: false,
+        };
+        let before = result.result.clone();
+        let job = JobInfo {
+            id,
+            agent: agent.clone(),
+            name: None,
+            tool: "exec".into(),
+            args: serde_json::json!({}),
+            parent: None,
+            state: JobState::Completed,
+            target: "root".into(),
+            location: "/workspace".into(),
+            remote: false,
+            error: None,
+        };
+        let projection = Projection::default();
+        let outputs = HashMap::from([(id, result.result.clone())]);
+        let entries = [
+            call_entry(
+                "old-call".into(),
+                "exec",
+                None,
+                Some(&result),
+                &agent,
+                &projection,
+                true,
+            ),
+            job_entry(&job, &projection, &View::default(), &outputs, true),
+        ];
+        for entry in entries {
+            assert!(!entry.text.contains("absent"));
+            assert!(!entry.text.contains("\"error\""));
+            let document = entry.document.unwrap();
+            assert!(document.sections.iter().any(|section| {
+                matches!(section, Section::Code { source, .. } if &**source == "  literal null\t\n")
+            }));
+            assert!(document.sections.iter().any(|section| {
+                matches!(section, Section::Code { source, .. }
+                    if serde_json::from_str::<Value>(source).ok()
+                        == Some(serde_json::json!({"result": {"items": [null, {"keep": false}]}})))
+            }));
+        }
+        assert_eq!(result.result, before);
+        assert_eq!(outputs[&id], before);
+    }
+
+    #[test]
     fn job_headers_preserve_historical_state_semantics() {
         let projection = Projection::default();
         let states = [

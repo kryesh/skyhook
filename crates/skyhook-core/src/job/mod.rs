@@ -32,7 +32,7 @@ use crate::{
 };
 
 pub(crate) mod output;
-pub use output::OutputArgs as JobOutputQuery;
+pub use output::{OutputArgs as JobOutputQuery, omit_null_fields};
 mod cancellation;
 mod delivery;
 mod input;

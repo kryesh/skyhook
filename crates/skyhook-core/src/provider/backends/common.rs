@@ -1,5 +1,6 @@
-//! Lossless shared input conversion and opaque reasoning provenance.
+//! Shared model-facing input conversion and opaque reasoning provenance.
 use crate::{
+    job::omit_null_fields,
     media::ImageReference,
     provider::{ProviderError, ProviderErrorKind, protocol::ToolResult},
 };
@@ -56,7 +57,9 @@ pub(crate) fn anthropic_image(image: &ImageReference) -> Result<Value, ProviderE
 pub(crate) fn tool_text(tool: &ToolResult) -> String {
     // Keep the result and failure status distinguishable; a JSON result
     // that happens to contain similarly named keys must not overwrite metadata.
-    json!({"result":tool.result,"is_error":tool.is_error}).to_string()
+    let mut value = json!({"result":tool.result,"is_error":tool.is_error});
+    omit_null_fields(&mut value);
+    value.to_string()
 }
 
 pub(crate) fn opaque_payload<'a>(

@@ -230,7 +230,7 @@ mod tests {
             Message::Tool(vec![ToolResult {
                 call_id: "call_1".into(),
                 name: "search".into(),
-                result: json!({"answer":42}),
+                result: json!({"answer":42, "error":null}),
                 images: vec![image()],
                 is_error: true,
             }]),

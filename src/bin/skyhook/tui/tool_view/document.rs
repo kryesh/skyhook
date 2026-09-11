@@ -1,6 +1,7 @@
 //! Build semantic documents from tool arguments and result envelopes.
 use super::{CodeSource, Document, Role, Run, Section, model};
 use serde_json::Value;
+use skyhook::job::omit_null_fields;
 use unicode_width::UnicodeWidthStr;
 
 // Restrict deduplication to structured error/message fields, not arbitrary
@@ -200,7 +201,9 @@ impl Document {
                 self.code(text, "", 2, vec![], Role::Error);
             }
         } else {
-            self.code(&model::pretty(error), "json", 2, vec![], Role::Error);
+            let mut error = error.clone();
+            omit_null_fields(&mut error);
+            self.code(&model::pretty(&error), "json", 2, vec![], Role::Error);
         }
     }
     fn output_body(
@@ -220,7 +223,7 @@ impl Document {
                 shown_errors.push(error);
             }
         }
-        if let Some(preview) = output.get("preview") {
+        if let Some(preview) = output.get("preview").filter(|value| !value.is_null()) {
             let field = preview["field"].as_str().unwrap_or_default();
             self.line(
                 if field.is_empty() {
@@ -244,7 +247,10 @@ impl Document {
             let formatted = (field != "/result/content"
                 && (language.is_empty() || language == "json")
                 && lines.iter().all(Value::is_string))
-            .then(|| pretty_json_preview(&source, incomplete))
+            // Only the whole saved document is known to be structured JSON.
+            // Selected fields can be literal text containing JSON, so retain
+            // their null fields just as we do for stdout and file content.
+            .then(|| pretty_json_preview(&source, incomplete, field.is_empty()))
             .flatten();
             let source = if let Some(formatted) = formatted {
                 language = "json".into();
@@ -264,6 +270,7 @@ impl Document {
         } else {
             // Split literal text fields out of the display copy; the original Value is untouched.
             let mut metadata = output.clone();
+            omit_null_fields(&mut metadata);
             for pointer in ["/error", "/result/error"] {
                 if output
                     .pointer(pointer)
@@ -321,9 +328,14 @@ impl Document {
 /// Saved-output pages can stop inside a JSON container (or even a string).
 /// Format valid prefixes too, without completing them or changing saved source
 /// offsets. Non-JSON text and continuation pages that start mid-token stay raw.
-fn pretty_json_preview(text: &str, incomplete: bool) -> Option<String> {
+fn pretty_json_preview(text: &str, incomplete: bool, structured: bool) -> Option<String> {
     match serde_json::from_str::<Value>(text) {
-        Ok(value @ (Value::Object(_) | Value::Array(_))) => Some(model::pretty(&value)),
+        Ok(mut value @ (Value::Object(_) | Value::Array(_))) => {
+            if structured {
+                omit_null_fields(&mut value);
+            }
+            Some(model::pretty(&value))
+        }
         Err(error) if incomplete && error.is_eof() && text.trim_start().starts_with(['{', '[']) => {
             Some(pretty_json_prefix(text))
         }
@@ -610,7 +622,7 @@ mod tests {
         let source = serde_json::to_string(&value).unwrap();
         for (end, _) in source.char_indices().skip(1) {
             let prefix = &source[..end];
-            let formatted = pretty_json_preview(prefix, true).unwrap();
+            let formatted = pretty_json_preview(prefix, true, true).unwrap();
             let restored = formatted + &source[end..];
             assert_eq!(
                 serde_json::from_str::<Value>(&restored).unwrap(),
@@ -702,7 +714,9 @@ mod tests {
                     document.plain_text().matches("failed exactly").count(),
                     if pointer == "both" { 2 } else { 1 }
                 );
-                let source = serde_json::to_string_pretty(&saved).unwrap();
+                let mut display = saved.clone();
+                omit_null_fields(&mut display);
+                let source = serde_json::to_string_pretty(&display).unwrap();
                 assert!(document.sections.iter().any(|section| {
                     matches!(section, Section::Code { source: shown, .. } if **shown == source)
                 }));
@@ -768,7 +782,9 @@ mod tests {
             let mut document = Document::default();
             document.output("exec", &Value::Null, &output);
             assert_eq!(error_sources(&document), ["failed exactly"], "{saved}");
-            let source = serde_json::to_string_pretty(&saved).unwrap();
+            let mut display = saved.clone();
+            omit_null_fields(&mut display);
+            let source = serde_json::to_string_pretty(&display).unwrap();
             assert!(document.sections.iter().any(|section| {
                 matches!(section, Section::Code { source: shown, role: Role::Plain, .. } if **shown == source)
             }));

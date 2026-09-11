@@ -22,6 +22,20 @@ pub(crate) const CONTENT_BYTES: usize = PAGE_BYTES - 2048;
 
 pub(crate) use truncation::annotated_fields;
 
+/// Omit null-valued object fields from tool-output presentation copies.
+/// Use for model, history, and UI views, not lossless saved or script-native output.
+/// Null array entries and literal strings stay intact to preserve indices and text.
+pub fn omit_null_fields(value: &mut Value) {
+    match value {
+        Value::Object(fields) => fields.retain(|_, value| {
+            omit_null_fields(value);
+            !value.is_null()
+        }),
+        Value::Array(values) => values.iter_mut().for_each(omit_null_fields),
+        _ => {}
+    }
+}
+
 fn capture_notice(output: &mut serde_json::Map<String, Value>, complete: Option<bool>) {
     if complete == Some(false) {
         output.insert("notice".into(), json!("Output incomplete."));
@@ -536,6 +550,7 @@ impl JobManager {
                 .await
                 .map_err(|e| ToolError::Failed(e.to_string()))?;
         }
+        omit_null_fields(&mut view);
         Ok(view)
     }
 
@@ -724,6 +739,38 @@ mod tests {
             .unwrap();
         manager.test_finish(lease.id, value).await;
         (root, manager, lease.id)
+    }
+
+    #[tokio::test]
+    async fn presentation_omits_null_fields_but_saved_output_stays_lossless() {
+        let raw = json!({
+            "error": null,
+            "nested": {"absent": null, "ok": false},
+            "array": [null, {"absent": null, "count": 0}]
+        });
+        let (_root, manager, id) = fixture(raw.clone()).await;
+        let expected = json!({
+            "nested": {"ok": false},
+            "array": [null, {"count": 0}]
+        });
+        let model = manager
+            .present_output(OutputArgs::new(id), &Default::default())
+            .await
+            .unwrap();
+        let host = manager
+            .inspect_output(OutputArgs::new(id), &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(model["result"], expected);
+        assert_eq!(host["result"], expected);
+
+        let saved: Value = serde_json::from_slice(
+            &tokio::fs::read(manager.output_directory(id).join("document.json"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["result"], raw);
     }
 
     #[tokio::test]

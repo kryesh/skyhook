@@ -254,7 +254,7 @@ mod tests {
             Message::Tool(vec![ToolResult {
                 call_id: "tool_1".into(),
                 name: "look".into(),
-                result: json!({"ok":false}),
+                result: json!({"ok":false, "error":null}),
                 images: vec![image()],
                 is_error: true,
             }]),
@@ -281,6 +281,9 @@ mod tests {
         let result = &body["messages"][2]["content"][0];
         assert_eq!(result["tool_use_id"], "tool_1");
         assert_eq!(result["is_error"], true);
+        let text: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text, json!({"result":{"ok":false},"is_error":true}));
         assert_eq!(result["content"][1]["type"], "image");
     }
 
