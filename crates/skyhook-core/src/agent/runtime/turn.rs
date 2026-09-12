@@ -24,7 +24,6 @@ impl SessionRuntime {
         let mut provider_attempt = 0u8;
         let mut connection_attempt = 1u8;
         let mut compaction_attempt = 1u8;
-        let mut compaction_checked = false;
         'requests: loop {
             if let Some(sender) = self.agent_sender(agent) {
                 sender.flush_events(cancellation).await?;
@@ -39,7 +38,6 @@ impl SessionRuntime {
             {
                 // A model change can replace both the template and its token meter.
                 context_sequence = None;
-                compaction_checked = false;
                 provider_attempt = 0;
                 connection_attempt = 1;
                 compaction_attempt = 1;
@@ -85,8 +83,7 @@ impl SessionRuntime {
             )
             .await;
             let mut request = agent_context.request(runtime);
-            if force_compaction || (!compaction_checked && agent_context.needs_compaction(&request))
-            {
+            if force_compaction {
                 self.compact_history(
                     &turn,
                     agent_context.provider.as_mut(),
@@ -96,7 +93,6 @@ impl SessionRuntime {
                 )
                 .await?;
                 force_compaction = false;
-                compaction_checked = true;
                 // Consume input received during compaction before starting the
                 // normal request, rather than delaying it by another request.
                 continue 'requests;
@@ -309,6 +305,9 @@ impl SessionRuntime {
             self.record_model_usage(agent, requested.sequence, response.usage)
                 .await?;
             agent_context.meter.observe(input_estimate, response.usage);
+            // Decide once from the successful completed response, never from an
+            // estimate that includes newly produced tool results or queued input.
+            let compact_completed_response = agent_context.needs_compaction(response.usage);
             let runtime = prompt::runtime_state_content(
                 &self.jobs,
                 &self.todos,
@@ -323,10 +322,37 @@ impl SessionRuntime {
                 tokens: agent_context.meter.estimate(&current),
                 capacity: profile.max_context,
             });
+            if !response.calls.is_empty() {
+                self.questions
+                    .prepare_question_batch(agent, &response.calls)
+                    .await;
+                self.activity(agent, AgentActivity::Tools);
+                let results = join_all(response.calls.iter().map(|call| {
+                    self.execute_call(agent, owner_job, call, origin, location, capabilities)
+                }))
+                .await;
+                let tools = Message::Tool(results);
+                let sequence = self.commit(agent, tools.clone()).await?;
+                agent_context.projected.push((sequence, tools));
+            }
+            if compact_completed_response {
+                // Checkpoints retain complete tool exchanges. Close the exchange
+                // first, then compact before its results reach the next normal
+                // model request. Text-only final responses compact here too.
+                self.compact_history(
+                    &turn,
+                    agent_context.provider.as_mut(),
+                    context,
+                    &current,
+                    profile.max_context,
+                )
+                .await?;
+                agent_context.refresh(&self.store.records().await, agent)?;
+                context_sequence = None;
+            }
             provider_attempt = 0;
             connection_attempt = 1;
             compaction_attempt = 1;
-            compaction_checked = false;
             if response.calls.is_empty() {
                 // Notifications arriving during this provider request must be
                 // processed before returning an answer based on earlier context.
@@ -357,17 +383,6 @@ impl SessionRuntime {
                 });
                 return Ok(final_text);
             }
-            self.questions
-                .prepare_question_batch(agent, &response.calls)
-                .await;
-            self.activity(agent, AgentActivity::Tools);
-            let results = join_all(response.calls.iter().map(|call| {
-                self.execute_call(agent, owner_job, call, origin, location, capabilities)
-            }))
-            .await;
-            let tools = Message::Tool(results);
-            let sequence = self.commit(agent, tools.clone()).await?;
-            agent_context.projected.push((sequence, tools));
         }
     }
 }
@@ -615,3 +630,6 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 }
+
+#[cfg(test)]
+mod compaction_tests;

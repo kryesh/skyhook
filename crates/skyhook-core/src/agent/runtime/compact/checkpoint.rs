@@ -287,6 +287,14 @@ impl SessionRuntime {
                 "todo state changed during summarization; retrying with current state".into(),
             ));
         }
+        // A final response may return immediately after automatic compaction,
+        // without another normal request to refresh the observed occupancy.
+        self.events
+            .send(crate::agent::runtime::RuntimeEvent::Context {
+                agent: agent.clone(),
+                tokens: after_tokens,
+                capacity: max_context,
+            });
         Ok(())
     }
 }

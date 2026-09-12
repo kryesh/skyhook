@@ -265,10 +265,28 @@ fn validate_graph(entries: &BTreeMap<String, TargetDefinition>) -> Result<(), Ta
     Ok(())
 }
 
+/// Validate known route edges while permitting references supplied at runtime.
+pub(super) fn validate_route_cycles(
+    entries: &BTreeMap<String, TargetDefinition>,
+) -> Result<(), TargetError> {
+    for name in entries.keys() {
+        walk_partial_route(entries, name, None)?;
+    }
+    Ok(())
+}
+
 fn walk_route<'a>(
     entries: &'a BTreeMap<String, TargetDefinition>,
     name: &str,
     unknown: fn(String) -> TargetError,
+) -> Result<Vec<&'a TargetDefinition>, TargetError> {
+    walk_partial_route(entries, name, Some(unknown))
+}
+
+fn walk_partial_route<'a>(
+    entries: &'a BTreeMap<String, TargetDefinition>,
+    name: &str,
+    unknown: Option<fn(String) -> TargetError>,
 ) -> Result<Vec<&'a TargetDefinition>, TargetError> {
     let mut route = Vec::new();
     let mut current = name;
@@ -277,9 +295,12 @@ fn walk_route<'a>(
         if !visited.insert(current) {
             return Err(TargetError::Cycle(current.to_owned()));
         }
-        let target = entries
-            .get(current)
-            .ok_or_else(|| unknown(current.to_owned()))?;
+        let Some(target) = entries.get(current) else {
+            return match unknown {
+                Some(error) => Err(error(current.to_owned())),
+                None => Ok(route),
+            };
+        };
         route.push(target);
         let Some(via) = target.via.as_deref() else {
             return Ok(route);

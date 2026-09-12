@@ -1,3 +1,20 @@
-/target
-/.skyhook
+# Cargo build output, including generated embedded SSH shims.
+/target/
+
+# Local Skyhook configuration, session data, and credentials.
+.skyhook/
 skyhook.toml
+codex-oauth.json
+
+# Environment secrets; keep sanitized templates available to commit.
+.env
+.env.*
+!.env.example
+!.env.*.example
+!.env.sample
+!.env.template
+
+# Python bytecode/cache from documentation tooling and skill scripts.
+__pycache__/
+*.pyc
+*.pyo

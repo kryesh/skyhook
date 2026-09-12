@@ -82,13 +82,60 @@ fn session_capabilities(config: &Config, interactive: bool) -> CapabilitySet {
     capabilities
 }
 
+/// Resolve exactly the configuration shared by startup and inspection.
+pub async fn resolve_config(
+    args: &Args,
+) -> Result<skyhook::config::ResolvedConfig, Box<dyn std::error::Error>> {
+    // The core resolver owns ordering and workspace resolution, including its
+    // diagnostics. Explicit files bypass workspace probing there entirely.
+    let mut resolved = Config::resolve(&args.workspace, args.config.as_deref()).await?;
+    let config = &mut resolved.config;
+    if let Some(capabilities) = &args.capabilities {
+        // Interaction is runtime-controlled, never part of the TOML allowlist.
+        config.capabilities = capabilities
+            .0
+            .iter()
+            .copied()
+            .filter(|capability| *capability != Capability::Interactive)
+            .collect();
+    }
+    config.approve_all |= args.approve_all;
+
+    Ok(resolved)
+}
+
+/// Validate the effective CLI configuration without opening provider contexts.
+pub fn validate_config(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    if config.models.is_empty() {
+        return Err(
+            "No model profiles configured. Add a [models.<name>] entry to your config.".into(),
+        );
+    }
+    for (name, model) in &config.models {
+        if !config.providers.contains_key(&model.provider) {
+            return Err(format!(
+                "Model profile {name} references unknown provider {}.",
+                model.provider
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// CLI policy capabilities replace the configured allowlist.
 pub async fn load_config(args: &Args) -> Result<Config, Box<dyn std::error::Error>> {
-    let mut config = Config::load(args.config.as_deref()).await?;
-    if let Some(capabilities) = &args.capabilities {
-        config.capabilities.clone_from(&capabilities.0);
+    let resolved = resolve_config(args).await?;
+    if !args.non_interactive {
+        for diagnostic in &resolved.report.diagnostics {
+            eprintln!(
+                "skyhook config: {}",
+                super::dump::diagnostic_text(diagnostic)
+            );
+        }
     }
-    Ok(config)
+    validate_config(&resolved.config)?;
+    Ok(resolved.config)
 }
 
 /// Select the explicit model, remembered model, or first configured model for both hosts.

@@ -402,16 +402,23 @@ mod tests {
             "todo_reconciliation":["Inspection finished"], "todos":reconciled,
             "resumption_point":"Run the focused verification", "next_actions":[]
         });
+        let mut completed = answer("checkpoint installed");
+        completed.insert(
+            completed.len() - 1,
+            ResponseChunk::UsageUpdated {
+                usage: Usage {
+                    input_tokens: 48_000,
+                    cached_input_tokens: 2_000,
+                    output_tokens: 1_200,
+                },
+            },
+        );
         let harness = test_builder(
             workspace.path(),
             sessions.path(),
             scripted_provider(
                 &requests,
-                [
-                    answer(summary.to_string()),
-                    answer("checkpoint installed"),
-                    answer("resumed"),
-                ],
+                [completed, answer(summary.to_string()), answer("resumed")],
             ),
         )
         .model_profile(
@@ -452,7 +459,8 @@ mod tests {
             .replace(&child, child_todos.clone())
             .await
             .unwrap();
-        // Exceed the real runtime threshold and the verbatim retention tail.
+        // Exceed the verbatim retention tail so the high-usage final response
+        // can install a checkpoint. History size alone must not trigger it.
         session
             .runtime
             .commit(
@@ -484,8 +492,11 @@ mod tests {
         let prior_request = {
             let captured = requests.lock().unwrap();
             assert_eq!(captured.len(), 2);
-            assert!(captured[0].response_schema.is_some());
-            captured[1].clone()
+            assert!(captured[0].response_schema.is_none());
+            assert!(captured[1].response_schema.is_some());
+            assert!(captured[1].messages.iter().any(|message| matches!(message,
+                Message::Assistant(items) if items == &vec![AssistantContent::text("answer", 0, "checkpoint installed")])));
+            captured[0].clone()
         };
         let id = session.id();
         shutdown_session(session).await;

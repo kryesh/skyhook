@@ -2,18 +2,18 @@
 
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::tool::policy::Capability;
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum McpTransport {
     Stdio,
     StreamableHttp,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(try_from = "RawMcpServerConfig")]
 pub struct McpServerConfig {
     pub transport: McpTransport,

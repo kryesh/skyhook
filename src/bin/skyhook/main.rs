@@ -1,4 +1,5 @@
 mod dotenv;
+mod dump;
 mod embedded_shims;
 mod headless;
 mod interaction;
@@ -15,7 +16,17 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
-    /// Explicit TOML config used instead of the user config.
+    /// Inspect effective config (default) or loaded skills without starting a session.
+    #[arg(
+        long,
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "config",
+        value_name = "WHAT",
+        conflicts_with_all = ["input", "resume", "images", "non_interactive", "model"]
+    )]
+    dump: Option<DumpKind>,
+    /// Use only this TOML config; disable user/workspace config discovery and merging.
     #[arg(long)]
     config: Option<PathBuf>,
     /// Workspace visible to coding tools.
@@ -51,6 +62,12 @@ struct Args {
         group = "input"
     )]
     script: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum DumpKind {
+    Config,
+    Skills,
 }
 
 #[derive(Clone, Debug)]
@@ -156,16 +173,22 @@ fn main() {
     // Clap normally prints parse errors. Machine-mode failures are silent even
     // before a session exists; explicit help/version retain their normal output.
     let cli: Vec<_> = std::env::args_os().collect();
-    let silent = cli
+    let dumping = cli
         .iter()
         .skip(1)
         .take_while(|arg| arg.as_os_str() != "--")
-        .any(|arg| {
-            arg == "--non-interactive"
-                || arg
-                    .to_str()
-                    .is_some_and(|arg| arg.starts_with("--non-interactive="))
-        });
+        .any(|arg| arg == "--dump" || arg.to_str().is_some_and(|arg| arg.starts_with("--dump=")));
+    let silent = !dumping
+        && cli
+            .iter()
+            .skip(1)
+            .take_while(|arg| arg.as_os_str() != "--")
+            .any(|arg| {
+                arg == "--non-interactive"
+                    || arg
+                        .to_str()
+                        .is_some_and(|arg| arg.starts_with("--non-interactive="))
+            });
     let args = match Args::try_parse_from(cli) {
         Ok(args) => args,
         Err(error) => {
@@ -180,6 +203,9 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Err(error) = dump::validate_options(&args) {
+        error.exit();
+    }
     if args.non_interactive && args.command.is_some() {
         std::process::exit(2);
     }
@@ -208,6 +234,13 @@ fn main() {
 }
 
 async fn run(mut args: Args) {
+    if let Some(kind) = args.dump {
+        if let Err(error) = dump::run(&args, kind).await {
+            eprintln!("skyhook dump: {}", dump::diagnostic_text(error));
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Some(Command::Auth { command }) = args.command.take() {
         if let Err(error) = run_auth(command).await {
             eprintln!("skyhook auth: {error}");

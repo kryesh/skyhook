@@ -10,6 +10,69 @@ use crate::provider::{
 
 use super::{ConfigError, ProviderConfig};
 
+/// Structural checks shared by resolution, without constructing a provider or
+/// looking up its environment variables/OAuth state.
+pub(super) fn validate(name: &str, config: &ProviderConfig) -> Result<(), ConfigError> {
+    let (base_url, environment, command, startup, idle) = match config {
+        ProviderConfig::Openai {
+            base_url,
+            api,
+            chat_reasoning_replay,
+            api_key_env,
+            api_key_command,
+            startup_timeout_secs,
+            read_idle_timeout_secs,
+        } => {
+            if *api != OpenAiApi::ChatCompletions && chat_reasoning_replay.is_some() {
+                return Err(ConfigError::Provider(name.into(),
+                    "chat_reasoning_replay applies only to Chat Completions; Responses replays native reasoning automatically".into()));
+            }
+            (
+                base_url,
+                api_key_env,
+                api_key_command,
+                startup_timeout_secs,
+                read_idle_timeout_secs,
+            )
+        }
+        ProviderConfig::Anthropic {
+            base_url,
+            api_key_env,
+            api_key_command,
+            startup_timeout_secs,
+            read_idle_timeout_secs,
+        } => (
+            base_url,
+            api_key_env,
+            api_key_command,
+            startup_timeout_secs,
+            read_idle_timeout_secs,
+        ),
+        ProviderConfig::Codex {} => return Ok(()),
+    };
+    validate_auth(name, environment.as_deref(), command.as_deref())?;
+    timeouts(name, *startup, *idle)?;
+    let url = reqwest::Url::parse(base_url).map_err(|_| {
+        ConfigError::Provider(
+            name.into(),
+            "base_url must be an absolute HTTP(S) API-root URL".into(),
+        )
+    })?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError::Provider(
+            name.into(),
+            "base_url must be HTTP(S), without credentials, query, or fragment".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn build(name: &str, config: &ProviderConfig) -> Result<Arc<dyn Provider>, ConfigError> {
     let error = |error: crate::provider::ProviderError| {
         ConfigError::Provider(name.to_owned(), error.to_string())
@@ -94,6 +157,15 @@ fn api_key(
     environment: Option<&str>,
     command: Option<&str>,
 ) -> Result<Option<String>, ConfigError> {
+    validate_auth(provider, environment, command)?;
+    environment.map(required_env).transpose()
+}
+
+fn validate_auth(
+    provider: &str,
+    environment: Option<&str>,
+    command: Option<&str>,
+) -> Result<(), ConfigError> {
     if environment.is_some() && command.is_some() {
         return Err(ConfigError::Provider(
             provider.to_owned(),
@@ -106,7 +178,13 @@ fn api_key(
             "api_key_command must not be blank".to_owned(),
         ));
     }
-    environment.map(required_env).transpose()
+    if environment.is_some_and(|name| name.trim().is_empty() || name.contains(['=', '\0'])) {
+        return Err(ConfigError::Provider(
+            provider.to_owned(),
+            "api_key_env must name a nonempty environment variable".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn required_env(name: &str) -> Result<String, ConfigError> {

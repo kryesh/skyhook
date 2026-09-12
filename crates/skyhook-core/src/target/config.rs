@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{TargetDefinition, TargetError, TargetSource};
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct TargetsConfig {
     #[serde(default)]
     pub import_ssh_config: bool,
@@ -14,6 +14,12 @@ pub struct TargetsConfig {
 }
 
 impl TargetsConfig {
+    /// Validate only the supplied definitions, without importing SSH configuration.
+    /// Missing route references may be supplied by later config layers or SSH aliases.
+    pub(crate) fn validate_structure(&self) -> Result<(), TargetError> {
+        super::normalize::validate_static_routes(self.definitions()?)
+    }
+
     pub(crate) fn definitions(&self) -> Result<Vec<TargetDefinition>, TargetError> {
         self.entries
             .iter()
@@ -24,7 +30,7 @@ impl TargetsConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetConfig {
     pub r#type: TargetConfigType,
@@ -40,7 +46,7 @@ pub struct TargetConfig {
 }
 
 /// Transports supported when creating a named target.
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetConfigType {
     Ssh,

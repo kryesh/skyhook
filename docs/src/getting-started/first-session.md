@@ -1,0 +1,79 @@
+# Your first session
+
+After [installing Skyhook](installation.md), create a configuration directory. The default
+location is `$XDG_CONFIG_HOME/skyhook` or `~/.config/skyhook`:
+
+```sh
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/skyhook"
+mkdir -p "$config_dir"
+```
+
+Create `config.toml` in that directory with a provider and model you can access. For example:
+
+```toml
+[providers.openai]
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+api = "responses"
+api_key_env = "OPENAI_API_KEY"
+
+[models.default]
+provider = "openai"
+model = "gpt-5.6"
+max_context = 1050000
+max_output = 128000
+```
+
+Use a model identifier supported by your account. These are the published GPT-5.6 Sol limits
+(the `gpt-5.6` alias routes to Sol), not automatic model detection. You can choose smaller
+budgets. For other providers, a keyless local server,
+or Codex OAuth, see [providers and models](../configuration/providers-and-models.md) and
+[authentication](../configuration/authentication.md).
+
+From a source checkout, you can instead copy the comprehensive example and edit it before running:
+
+```sh
+cp config.example.toml "$config_dir/config.toml"
+```
+
+The [full example](../configuration/overview.md#complete-example) configures several providers;
+remove unused providers and models or supply their required credentials.
+
+Start from the project directory you want to work on:
+
+```sh
+export OPENAI_API_KEY=...
+skyhook --prompt "inspect this repository"
+```
+
+Skyhook opens a full-screen terminal interface. `--prompt` submits an initial message;
+`--script workflow.js` starts a JavaScript workflow in the same interface. Both remain open
+for inspection and follow-up input after the work finishes. These interface modes require an
+interactive terminal. Add `--non-interactive` to `-p/--prompt` or `-s/--script` for headless execution
+with redirected input/output support and automatic exit; see [Headless execution](../guide/headless.md).
+
+An unused startup draft creates no saved session. The first sent message or explicitly run
+script creates the session. Use `--workspace PATH` to select another workspace. Normally,
+`<workspace>/.skyhook/config.toml` overlays the selected user configuration. Use
+`--config path.toml` to load **only** that file instead, with no user/workspace config merging.
+See [configuration layering](../configuration/overview.md#file-selection-and-layering), including
+its workspace trust boundary.
+
+To inspect configuration or available skills without a session or API credentials:
+
+```sh
+skyhook --dump config  # Effective TOML on stdout; diagnostics/source paths on stderr.
+skyhook --dump skills  # Winning skills, frontmatter, and asset tree.
+```
+
+Both return nonzero on errors; skills can still list valid entries when other entries fail.
+See [dump modes](../reference/cli.md#dump-modes) for compatible options.
+
+By default, execution, remote access, target changes, and writes outside the workspace
+require confirmation. See [permissions and capabilities](../guide/permissions.md) before
+using `--approve-all`; it bypasses tool approvals, not authentication prompts.
+
+Next, learn the [terminal interface](../guide/terminal-interface.md),
+[session and context behavior](../guide/sessions-and-context.md), or
+[headless execution](../guide/headless.md). All command-line options are summarized in the
+[CLI reference](../reference/cli.md).

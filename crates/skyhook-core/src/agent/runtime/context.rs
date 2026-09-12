@@ -9,7 +9,7 @@ use crate::{
     provider::{
         Provider, ProviderContext,
         profile::ModelProfile,
-        protocol::{Message, ModelRequest, UserContent},
+        protocol::{Message, ModelRequest, Usage, UserContent},
     },
     session::{EventRecord, SessionEvent, project_history},
 };
@@ -76,12 +76,14 @@ impl AgentContext {
         request
     }
 
-    pub fn needs_compaction(&self, request: &ModelRequest) -> bool {
-        self.meter.estimate(request)
-            >= self
-                .profile
-                .max_context
-                .saturating_sub(self.profile.max_output)
+    pub fn needs_compaction(&self, usage: Usage) -> bool {
+        // Use only the completed response's reported occupancy, including cached
+        // input and generated output. Estimates and output limits do not trigger
+        // automatic compaction. Widen before arithmetic to avoid overflow.
+        let tokens = u128::from(usage.input_tokens)
+            + u128::from(usage.cached_input_tokens)
+            + u128::from(usage.output_tokens);
+        tokens * 5 >= u128::from(self.profile.max_context) * 4
     }
 
     pub fn contains_images(&self) -> bool {
@@ -268,6 +270,60 @@ mod tests {
                         as ResponseStream,
                 )
             })
+        }
+    }
+
+    #[test]
+    fn completed_usage_compacts_at_eighty_percent_independently_of_output_budget() {
+        for (capacity, threshold) in [
+            (128_000, 102_400),
+            (128_001, 102_401),
+            (u64::MAX, 14_757_395_258_967_641_292),
+        ] {
+            for max_output in [1, capacity / 2, capacity - 1] {
+                let mut profile = profile("test");
+                profile.max_context = capacity;
+                profile.max_output = max_output;
+                let request = ModelRequest {
+                    model: profile.model.clone(),
+                    system: vec![],
+                    messages: vec![],
+                    tools: vec![],
+                    response_schema: None,
+                    reasoning: None,
+                    max_output_tokens: Some(max_output),
+                    correlation: None,
+                };
+                let context = super::AgentContext {
+                    profile,
+                    template: request.clone(),
+                    projected: vec![],
+                    meter: super::TokenMeter::default(),
+                    provider: Box::new(Context {
+                        tracking: Arc::new(Tracking::default()),
+                        id: 0,
+                    }),
+                    checkpoint: None,
+                };
+                assert!(!context.needs_compaction(Usage::default()));
+                for tokens in [threshold - 1, threshold, threshold + 1] {
+                    let usage = Usage {
+                        input_tokens: tokens / 3,
+                        cached_input_tokens: tokens / 3,
+                        output_tokens: tokens - 2 * (tokens / 3),
+                    };
+                    assert_eq!(
+                        context.needs_compaction(usage),
+                        tokens >= threshold,
+                        "context={capacity}, max_output={max_output}, total={tokens}",
+                    );
+                }
+                assert!(context.needs_compaction(Usage {
+                    input_tokens: u64::MAX,
+                    cached_input_tokens: u64::MAX,
+                    output_tokens: u64::MAX,
+                }));
+            }
         }
     }
 

@@ -1,4 +1,4 @@
-//! User configuration with explicit-file selection.
+//! Side-effect-free configuration resolution and provider construction.
 
 use std::{
     collections::BTreeMap,
@@ -13,18 +13,22 @@ use crate::{
     target::TargetsConfig,
     tool::policy::{Capability, CapabilitySet},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod loader;
 mod paths;
 mod providers;
 
+pub use loader::{ConfigDiagnostic, ConfigReport, ResolvedConfig};
 pub(crate) use paths::user_config_directory;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Session storage override. Relative paths retain their historical meaning:
+    /// relative to the process working directory, not the config or target directory.
+    /// When absent, the harness uses `<resolved workspace>/.skyhook/sessions`.
     pub session_root: Option<PathBuf>,
     /// Approve all tool calls without consulting an interactive policy.
     #[serde(default)]
@@ -72,7 +76,7 @@ where
     Ok(capabilities)
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderConfig {
     /// Standard OpenAI wire protocols, without endpoint or model presets.
@@ -106,9 +110,51 @@ pub enum ProviderConfig {
 }
 
 impl Config {
-    /// Loads an explicit config when supplied, otherwise the user-level config.
+    /// Loads an explicit config, or resolves user and current-workspace layers.
     pub async fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
-        loader::load(explicit).await
+        Self::load_for_workspace(Path::new("."), explicit).await
+    }
+
+    /// Resolve without constructing providers, reading credentials, or executing commands.
+    /// An explicit file disables all user/workspace configuration discovery.
+    pub async fn resolve(
+        workspace: &Path,
+        explicit: Option<&Path>,
+    ) -> Result<ResolvedConfig, ConfigError> {
+        loader::resolve(workspace, explicit).await
+    }
+
+    pub async fn load_for_workspace(
+        workspace: &Path,
+        explicit: Option<&Path>,
+    ) -> Result<Self, ConfigError> {
+        Ok(Self::resolve(workspace, explicit).await?.config)
+    }
+
+    /// Serialize effective configuration, including defaults and caller overrides.
+    pub fn to_toml(&self) -> Result<String, ConfigError> {
+        Ok(toml::to_string_pretty(self)?)
+    }
+
+    /// Validate entries without runtime model selection or external resources.
+    fn validate_structure(&self) -> Result<(), ConfigError> {
+        for (name, profile) in &self.models {
+            profile
+                .validate_limits()
+                .map_err(|message| ConfigError::Model(name.clone(), message.to_owned()))?;
+        }
+        for (name, server) in &self.mcp {
+            server
+                .validate()
+                .map_err(|message| ConfigError::Mcp(name.clone(), message))?;
+        }
+        for (name, provider) in &self.providers {
+            providers::validate(name, provider)?;
+        }
+        self.targets
+            .validate_structure()
+            .map_err(|error| ConfigError::Structure(error.to_string()))?;
+        Ok(())
     }
 
     pub fn harness_builder(
@@ -147,6 +193,15 @@ impl Config {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("{message}{report}")]
+    Resolution {
+        message: String,
+        report: ConfigReport,
+    },
+    #[error("could not serialize configuration: {0}")]
+    Serialize(#[from] toml::ser::Error),
+    #[error("invalid configuration: {0}")]
+    Structure(String),
     #[error("no Skyhook config found; pass --config or create ~/.config/skyhook/config.toml")]
     Missing,
     #[error("configuration I/O failed: {0}")]
@@ -163,6 +218,16 @@ pub enum ConfigError {
     Mcp(String, String),
     #[error(transparent)]
     Harness(#[from] crate::agent::HarnessError),
+}
+
+impl ConfigError {
+    /// Candidate diagnostics are retained when no effective config is available.
+    pub fn report(&self) -> Option<&ConfigReport> {
+        match self {
+            Self::Resolution { report, .. } => Some(report),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -260,7 +325,7 @@ mod tests {
     #[test]
     fn example_config_stays_valid() {
         let config: Config =
-            toml::from_str(include_str!("../../../../skyhook.example.toml")).unwrap();
+            toml::from_str(include_str!("../../../../config.example.toml")).unwrap();
         assert!(config.providers.contains_key("codex"));
         assert!(!config.models.is_empty());
     }

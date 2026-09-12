@@ -24,6 +24,29 @@ impl ConfigResolver for LocalResolver {
     }
 }
 
+/// Check route cycles that can be established without resolving SSH metadata.
+/// Unknown jumps terminate a partial route, rather than rejecting a config layer.
+pub(crate) fn validate_static_routes(
+    definitions: Vec<TargetDefinition>,
+) -> Result<(), TargetError> {
+    let entries = definitions
+        .into_iter()
+        .map(|mut target| {
+            if target.via.is_none() {
+                target.via = default_via(&target);
+            }
+            (target.name.clone(), target)
+        })
+        .collect();
+    super::registry::validate_route_cycles(&entries)
+}
+
+// SSH ProxyJump may insert hops before this anchor, but root is implicit and
+// never a jump. An explicit via replaces this default, not adds another edge.
+fn default_via(target: &TargetDefinition) -> Option<String> {
+    (target.origin != ROOT_TARGET).then(|| target.origin.clone())
+}
+
 pub(crate) async fn normalize(
     definitions: Vec<TargetDefinition>,
     existing: Vec<TargetDefinition>,
@@ -82,7 +105,7 @@ impl Normalizer {
             let resolved = self.resolver.resolve(&target).await?;
             target.host = resolved.host.clone();
             if target.via.is_none() {
-                let mut previous = (target.origin != ROOT_TARGET).then(|| target.origin.clone());
+                let mut previous = default_via(&target);
                 if let Some(jumps) = resolved.proxy_jump.as_deref().filter(|s| *s != "none") {
                     let jumps = expand_jump_tokens(jumps, &target.ssh_alias, &resolved);
                     for (index, token) in jumps.split(',').enumerate() {
@@ -266,6 +289,68 @@ mod tests {
         )
         .unwrap()
     }
+    #[tokio::test]
+    async fn static_cycles_follow_normalized_via_and_origin_routes() {
+        use super::super::TargetRegistry;
+
+        let cases = [
+            // Root is implicit, not a self-edge.
+            vec![("a", ROOT_TARGET, None), ("b", ROOT_TARGET, Some("a"))],
+            vec![("a", ROOT_TARGET, Some("a"))],
+            vec![("a", ROOT_TARGET, Some("b")), ("b", ROOT_TARGET, Some("a"))],
+            // An omitted via anchors the target on its non-root origin.
+            vec![("a", "b", None), ("b", ROOT_TARGET, None)],
+            vec![("a", "a", None)],
+            vec![("a", "b", None), ("b", "a", None)],
+            vec![("a", "b", None), ("b", ROOT_TARGET, Some("a"))],
+            // Explicit via wins: do not invent a direct a -> origin edge.
+            // Runtime rejects this as an invalid origin, NOT a route cycle.
+            vec![("a", "a", Some("b")), ("b", ROOT_TARGET, None)],
+        ];
+        for case in cases {
+            let definitions = case
+                .iter()
+                .map(|(name, origin, via)| {
+                    let mut target = definition(name);
+                    target.origin = (*origin).into();
+                    target.via = via.map(str::to_owned);
+                    target
+                })
+                .collect::<Vec<_>>();
+            let static_result = validate_static_routes(definitions.clone());
+            let normalized = normalize(
+                definitions,
+                vec![],
+                Arc::new(FixtureResolver(BTreeMap::new())),
+            )
+            .await
+            .unwrap();
+            let runtime = TargetRegistry::from_definitions(normalized);
+            assert_eq!(
+                matches!(static_result, Err(TargetError::Cycle(_))),
+                matches!(runtime, Err(TargetError::Cycle(_))),
+                "{case:?}"
+            );
+            assert!(static_result.is_ok() || matches!(static_result, Err(TargetError::Cycle(_))));
+        }
+    }
+
+    #[test]
+    fn unknown_origins_and_jumps_do_not_hide_other_static_cycles() {
+        let mut unknown_origin = definition("a");
+        unknown_origin.origin = "later-origin".into();
+        let mut unknown_jump = definition("b");
+        unknown_jump.via = Some("later-jump".into());
+        let partial = vec![unknown_origin, unknown_jump];
+        validate_static_routes(partial.clone()).unwrap();
+        let mut cyclic = definition("z");
+        cyclic.via = Some("z".into());
+        assert!(matches!(
+            validate_static_routes(partial.into_iter().chain([cyclic]).collect()),
+            Err(TargetError::Cycle(name)) if name == "z"
+        ));
+    }
+
     #[tokio::test]
     async fn remote_origins_anchor_automatic_jump_chains() {
         let mut destination = definition("dest");

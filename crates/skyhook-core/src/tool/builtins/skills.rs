@@ -17,6 +17,10 @@ use crate::{
     session::SessionStore,
 };
 
+#[path = "skills_inventory.rs"]
+mod inventory;
+pub use inventory::{SkillAsset, SkillAssetKind, SkillInventory, SkillInventoryEntry};
+
 const MAX_INLINE_BYTES: u64 = 1024 * 1024;
 const MAX_COPY_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DESCRIPTION_CHARS: usize = 512;
@@ -33,6 +37,7 @@ struct SkillEntry {
     description: String,
     root: PathBuf,
     instructions: String,
+    frontmatter: serde_yaml::Value,
 }
 
 impl HostSkills {
@@ -46,9 +51,16 @@ impl HostSkills {
         if let Some(user_root) = user_root {
             scan_root(user_root, &mut entries, &mut warnings).await;
         }
-        let workspace = fs::canonicalize(workspace)
-            .await
-            .unwrap_or_else(|_| workspace.to_path_buf());
+        let workspace = match fs::canonicalize(workspace).await {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                warnings.push(format!(
+                    "Cannot resolve skill workspace {}: {error}",
+                    workspace.display()
+                ));
+                workspace.to_path_buf()
+            }
+        };
         let mut ancestors = workspace.ancestors().collect::<Vec<_>>();
         ancestors.reverse();
         for ancestor in ancestors {
@@ -63,6 +75,12 @@ impl HostSkills {
             entries: Arc::new(entries),
             warnings: Arc::new(warnings),
         }
+    }
+
+    /// Inspect winning skills and their assets without reading asset contents or
+    /// creating a runtime, session, or provider. Discovery diagnostics are retained.
+    pub async fn inventory(&self) -> SkillInventory {
+        inventory::collect(self).await
     }
 
     pub fn warnings(&self) -> &[String] {
@@ -112,7 +130,7 @@ async fn scan_root(
             Ok(None) => break,
             Err(error) => {
                 warnings.push(format!("Cannot scan skills at {}: {error}", root.display()));
-                return;
+                break;
             }
         }
     }
@@ -175,12 +193,13 @@ async fn load_skill(path: &Path) -> Result<SkillEntry, String> {
         return Err(format!("SKILL.md exceeds {MAX_INLINE_BYTES} bytes"));
     }
     let instructions = String::from_utf8(bytes).map_err(|error| error.to_string())?;
-    let description = extract_description(&instructions)?;
+    let (description, frontmatter) = parse_instructions(&instructions)?;
     Ok(SkillEntry {
         name,
         description,
         root,
         instructions,
+        frontmatter,
     })
 }
 
@@ -189,10 +208,11 @@ struct Frontmatter {
     description: Option<String>,
 }
 
-fn extract_description(instructions: &str) -> Result<String, String> {
+fn parse_instructions(instructions: &str) -> Result<(String, serde_yaml::Value), String> {
     // Normalize only for parsing: the stored instructions retain their original bytes.
     let normalized = instructions.replace("\r\n", "\n");
     let instructions = normalized.as_str();
+    let mut metadata = serde_yaml::Value::Null;
     let body = if let Some(rest) = instructions.strip_prefix("---\n") {
         let (frontmatter, body) = rest
             .split_once("\n---\n")
@@ -201,10 +221,16 @@ fn extract_description(instructions: &str) -> Result<String, String> {
                     .map(|frontmatter| (frontmatter, ""))
             })
             .ok_or_else(|| "unterminated YAML frontmatter".to_owned())?;
+        metadata = serde_yaml::from_str(frontmatter)
+            .map_err(|error| format!("invalid YAML frontmatter: {error}"))?;
+        // Keep the original typed YAML validation. Deserializing this from Value
+        // instead changes serde_yaml's scalar-to-string coercion (for example a
+        // numeric description), and can change the existing runtime summary.
+        // Both views are produced here once at discovery, never at inventory time.
         let parsed: Frontmatter = serde_yaml::from_str(frontmatter)
             .map_err(|error| format!("invalid YAML frontmatter: {error}"))?;
         if let Some(description) = parsed.description.filter(|value| !value.trim().is_empty()) {
-            return Ok(compact_description(description.trim()));
+            return Ok((compact_description(description.trim()), metadata));
         }
         body
     } else {
@@ -214,6 +240,7 @@ fn extract_description(instructions: &str) -> Result<String, String> {
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with('#'))
         .map(compact_description)
+        .map(|description| (description, metadata))
         .ok_or_else(|| "skill has no description or prose".to_owned())
 }
 

@@ -31,10 +31,14 @@ api_key_env = "ANTHROPIC_API_KEY"
 [providers.codex]
 kind = "codex"
 
-# Keyless local endpoint example:
+# Keyless local llama.cpp endpoint; the model alias matches --alias below.
+# Example text-only server (requires enough memory for the configured context):
+# llama-server --model /path/to/Qwen3.8-27B.gguf --alias qwen3.8-27b \
+#   --host 127.0.0.1 --port 8080 --ctx-size 262144 --parallel 1 \
+#   --n-predict 131072 --jinja --reasoning-format deepseek
 [providers.local]
 kind = "openai"
-base_url = "http://127.0.0.1:11434/v1"
+base_url = "http://127.0.0.1:8080/v1"
 api = "chat_completions"
 # Chat-only, per-provider. Default "reasoning_content" replays returned reasoning.
 # Use "reasoning" for that wire convention, or "unsupported" to keep it local only.
@@ -44,35 +48,47 @@ api = "chat_completions"
 # startup_timeout_secs = 600
 # read_idle_timeout_secs = 600
 
+# Published model limits; smaller budgets can be chosen for cost/latency.
+# https://developers.openai.com/api/docs/models/gpt-5.6-sol
 [models.openai]
 provider = "openai"
 model = "gpt-5.6"
 reasoning = "high"
-max_context = 128000
-max_output = 16384
+max_context = 1050000
+max_output = 128000
 supports_images = true
 
+# https://platform.claude.com/docs/en/models/sonnet-4-6/overview
 [models.sonnet]
 provider = "anthropic"
 model = "claude-sonnet-4-6"
 reasoning = "high"
-max_context = 128000
-max_output = 16384
+max_context = 1000000
+max_output = 128000
 supports_images = true
 
+# Codex's catalog advertises a maximum context of 872000 (default: 272000).
+# https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json
+# max_output is required profile metadata, but is not sent to the Codex endpoint.
+# It does not control the 80%-of-context compaction threshold.
 [models.codex]
 provider = "codex"
 model = "gpt-5.6-sol"
 reasoning = "high"
-max_context = 128000
-max_output = 16384
+max_context = 872000
+max_output = 128000
 supports_images = true
 
+# https://huggingface.co/Qwen/Qwen3.8-27B
 [models.local]
 provider = "local"
-model = "qwen3-coder"
-max_context = 128000
-max_output = 16384
+model = "qwen3.8-27b"
+# Native context; match the llama-server per-slot context, not extended-context claims.
+max_context = 262144
+# Chosen total-generation cap matching --n-predict, NOT a published hard model limit.
+# Reasoning and final text share this allowance and the overall context window.
+max_output = 131072
+# The text-only server above has no multimodal projector configured.
 supports_images = false
 
 # Importing concrete aliases from ~/.ssh/config is opt-in.

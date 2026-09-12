@@ -20,7 +20,7 @@ use crate::{
 
 pub use process::ProcessOutput;
 pub(crate) use script::install_script_tool;
-pub use skills::HostSkills;
+pub use skills::{HostSkills, SkillAsset, SkillAssetKind, SkillInventory, SkillInventoryEntry};
 
 /// Register the standard workspace, process, and job-control tool set.
 pub(crate) fn register_coding_tools(
