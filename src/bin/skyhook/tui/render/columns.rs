@@ -8,8 +8,8 @@ pub(super) struct AgentStatsColumns([usize; 3]);
 
 pub(super) const AGENT_STATS_HEADERS: [&str; 3] = ["Output", "Input (uncached)", "Context"];
 
-/// Shared visibility policy: reserve identity space, then statistics as a group,
-/// then a fixed-width status column. Hidden columns never consume another row.
+/// Shared visibility policy: reserve identity space, then a fixed-width status
+/// column, then statistics as a group. Hidden columns never consume another row.
 pub(super) struct AgentColumnsLayout {
     pub(super) identity_width: u16,
     pub(super) status_width: u16,
@@ -17,24 +17,8 @@ pub(super) struct AgentColumnsLayout {
 }
 
 impl AgentColumnsLayout {
-    pub(super) fn new(
-        width: u16,
-        viewport_width: u16,
-        minimum_identity_width: u16,
-        stats_width: u16,
-    ) -> Self {
-        let stats_width = if usize::from(width)
-            >= usize::from(stats_width) + usize::from(minimum_identity_width) + 2
-        {
-            stats_width
-        } else {
-            0
-        };
-        let stats_reserved = if stats_width > 0 { stats_width + 2 } else { 0 };
-        let remaining = width.saturating_sub(stats_reserved);
-        let status_width = if viewport_width >= 70
-            && usize::from(remaining) >= usize::from(minimum_identity_width) + 30
-        {
+    pub(super) fn new(width: u16, minimum_identity_width: u16, stats_width: u16) -> Self {
+        let status_width = if usize::from(width) >= usize::from(minimum_identity_width) + 30 {
             28
         } else {
             0
@@ -44,8 +28,20 @@ impl AgentColumnsLayout {
         } else {
             0
         };
+        let remaining = width.saturating_sub(status_reserved);
+        // Statistics must not reappear after status is hidden, even when their
+        // measured width is smaller than the fixed-width status column.
+        let stats_width = if status_width > 0
+            && usize::from(remaining)
+                >= usize::from(stats_width) + usize::from(minimum_identity_width) + 2
+        {
+            stats_width
+        } else {
+            0
+        };
+        let stats_reserved = if stats_width > 0 { stats_width + 2 } else { 0 };
         Self {
-            identity_width: remaining.saturating_sub(status_reserved),
+            identity_width: remaining.saturating_sub(stats_reserved),
             status_width,
             stats_width,
         }
@@ -299,18 +295,18 @@ mod tests {
     fn agent_columns_hide_optional_fields_at_width_boundaries() {
         for (width, identity, stats, status) in [
             (0, 0, 0, 0),
-            (51, 51, 0, 0),
-            (52, 16, 34, 0),
-            (81, 45, 34, 0),
+            (45, 45, 0, 0),
+            (46, 16, 0, 28),
+            (51, 21, 0, 28),
+            (52, 22, 0, 28),
+            (81, 51, 0, 28),
             (82, 16, 34, 28),
         ] {
-            let columns = AgentColumnsLayout::new(width, width + 4, 16, 34);
+            let columns = AgentColumnsLayout::new(width, 16, 34);
             assert_eq!(columns.identity_width, identity);
             assert_eq!(columns.stats_width, stats);
             assert_eq!(columns.status_width, status);
         }
-        assert_eq!(AgentColumnsLayout::new(100, 69, 16, 34).status_width, 0);
-        assert_eq!(AgentColumnsLayout::new(100, 70, 16, 34).status_width, 28);
     }
 
     #[test]

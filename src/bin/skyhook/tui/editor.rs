@@ -1,3 +1,4 @@
+use super::composer::ComposerLayout;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -15,6 +16,12 @@ impl Drop for Editor {
     }
 }
 impl Editor {
+    /// Use the composer's visual rows without changing plain-text editing.
+    /// Secret fields must lay out a masked editor rather than their raw text.
+    pub fn layout(&self, width: usize) -> ComposerLayout {
+        ComposerLayout::plain_text(&self.text, self.cursor, self.anchor, width)
+    }
+
     pub fn clear_sensitive(&mut self) {
         use zeroize::Zeroize;
         self.text.zeroize();
@@ -242,7 +249,10 @@ mod tests {
     fn deletion_and_undo_preserve_graphemes() {
         let mut e = Editor::default();
         e.insert("a👩‍💻é");
+        assert_eq!(e.layout(3).cursor, (1, 1));
+        assert_eq!(e.layout(3).cursor_position("a👩‍💻".len()), (1, 0));
         e.handle(KeyEvent::new(KeyCode::Backspace, M::NONE));
+        assert_eq!(e.layout(3).cursor, (1, 0));
         assert_eq!(e.text, "a👩‍💻");
         e.handle(KeyEvent::new(KeyCode::Backspace, M::NONE));
         assert_eq!(e.text, "a");

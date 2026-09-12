@@ -1,5 +1,5 @@
 //! Visual composer rows, source-to-cell cursor mapping, and atomic paste clipping.
-use super::Composer;
+use super::{Composer, Token};
 use ratatui::{
     style::Style,
     text::{Line, Span},
@@ -73,9 +73,45 @@ impl Composer {
     /// A full last row gets an empty caret row; callers must not wrap these rows
     /// again. Tabs occupy four cells and other terminal controls are made visible.
     pub fn layout(&self, width: usize) -> ComposerLayout {
+        ComposerLayout::from_tokens(
+            self.tokens(),
+            self.text.len(),
+            self.cursor,
+            self.anchor,
+            width,
+        )
+    }
+}
+
+impl ComposerLayout {
+    /// Lay out plain text with the composer's whitespace-preserving wrapping and
+    /// source-byte cursor/selection mapping. Offsets inside a grapheme snap to
+    /// its start. Pass only masked text and masked offsets for secret fields.
+    /// Render these rows without further wrapping, reserving a padding cell for
+    /// the cursor at the exclusive edge of an exactly full explicit line.
+    pub fn plain_text(text: &str, cursor: usize, anchor: Option<usize>, width: usize) -> Self {
+        Self::from_tokens(
+            Token::plain(text, 0).collect(),
+            text.len(),
+            cursor,
+            anchor,
+            width,
+        )
+    }
+
+    fn from_tokens(
+        tokens: Vec<Token>,
+        text_len: usize,
+        cursor: usize,
+        anchor: Option<usize>,
+        width: usize,
+    ) -> Self {
         let width = width.max(1);
-        let tokens = self.tokens();
-        let selection = self.selection_range();
+        let cursor = Token::boundary(&tokens, text_len, cursor);
+        let selection = anchor.map(|a| {
+            let a = Token::boundary(&tokens, text_len, a);
+            a.min(cursor)..a.max(cursor)
+        });
         let mut rows = vec![ComposerRow::default()];
         let mut positions = BTreeMap::new();
         positions.insert(0, (0, 0));
@@ -148,14 +184,14 @@ impl Composer {
         }
         if rows.last().unwrap().width >= width {
             rows.push(ComposerRow::default());
-            positions.insert(self.text.len(), (rows.len() - 1, 0));
+            positions.insert(text_len, (rows.len() - 1, 0));
         }
         let mut layout = ComposerLayout {
             rows,
             cursor: (0, 0),
             positions,
         };
-        layout.cursor = layout.cursor_position(self.boundary(self.cursor));
+        layout.cursor = layout.cursor_position(cursor);
         layout
     }
 }
@@ -186,8 +222,37 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
 
     fn rows(editor: &Composer, width: usize) -> Vec<String> {
-        editor
-            .layout(width)
+        let layout = editor.layout(width);
+        if !editor.has_pastes() {
+            let mut plain = crate::tui::editor::Editor::default();
+            plain.set(editor.text.clone());
+            plain.cursor = editor.cursor;
+            plain.anchor = editor.anchor;
+            let plain_layout = plain.layout(width);
+            assert_eq!(plain_layout.cursor, layout.cursor);
+            assert_eq!(plain_layout.positions, layout.positions);
+            assert_eq!(
+                plain_layout
+                    .rows
+                    .iter()
+                    .map(|r| r.width)
+                    .collect::<Vec<_>>(),
+                layout.rows.iter().map(|r| r.width).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                plain_layout
+                    .rows
+                    .iter()
+                    .map(|r| r.line(Style::default(), Style::default(), Style::default()))
+                    .collect::<Vec<_>>(),
+                layout
+                    .rows
+                    .iter()
+                    .map(|r| r.line(Style::default(), Style::default(), Style::default()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        layout
             .rows
             .iter()
             .map(|r| r.spans.iter().map(|s| s.text.as_str()).collect())
@@ -240,6 +305,16 @@ mod tests {
         assert_eq!(layout.cursor, (1, 4));
         assert_eq!(rows(&plain("a\tb"), 6), ["a    b", ""]);
         assert_eq!(rows(&plain("\u{1b}[31m"), 80), ["�[31m"]);
+        assert_eq!(rows(&plain("界"), 1), ["�", ""]);
+        assert_eq!(rows(&plain("a\r\nb"), 4), ["a", "b"]);
+        // A literal object marker stays ordinary text in a plain editor.
+        assert!(!ComposerLayout::plain_text("\u{fffc}", 3, None, 4).rows[0].spans[0].paste);
+        let layout = ComposerLayout::plain_text("界e\u{301}\tq", 5, Some(3), 8);
+        assert_eq!(layout.cursor, (0, 2)); // Inside the combining grapheme.
+        assert_eq!(layout.cursor_position(2), (0, 0)); // Inside the wide UTF-8 glyph.
+        assert_eq!(layout.cursor_position(6), (0, 3));
+        assert_eq!(layout.cursor_position(7), (0, 7));
+        assert_eq!(layout.cursor_position(8), (1, 0));
     }
 
     #[test]
@@ -268,6 +343,17 @@ mod tests {
     #[test]
     fn selection_styling_tracks_wrapped_source_and_atomic_paste() {
         use ratatui::style::Color;
+        let plain_layout = ComposerLayout::plain_text("a\t界\nx", 6, Some(1), 8);
+        assert_eq!(plain_layout.cursor, (1, 0));
+        assert_eq!(
+            plain_layout.rows[0]
+                .spans
+                .iter()
+                .map(|s| (s.text.as_str(), s.selected))
+                .collect::<Vec<_>>(),
+            [("a", false), ("    ", true), ("界", true), (" ", true)]
+        );
+        assert!(!plain_layout.rows[1].spans[0].selected);
         let mut editor = plain("hello ");
         editor.insert_paste("contents".into());
         editor.insert(" end");

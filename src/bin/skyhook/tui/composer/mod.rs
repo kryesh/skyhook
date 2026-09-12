@@ -95,6 +95,37 @@ struct Token {
     whitespace: bool,
     newline: bool,
 }
+impl Token {
+    fn plain(text: &str, offset: usize) -> impl Iterator<Item = Self> + '_ {
+        text.grapheme_indices(true).map(move |(i, g)| {
+            let newline = g == "\n" || g == "\r\n";
+            let text = if newline {
+                String::new()
+            } else if g == "\t" {
+                "    ".to_owned()
+            } else {
+                g.chars()
+                    .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+                    .collect()
+            };
+            Self {
+                source: offset + i..offset + i + g.len(),
+                text,
+                paste: false,
+                whitespace: g.chars().all(char::is_whitespace),
+                newline,
+            }
+        })
+    }
+
+    fn boundary(tokens: &[Self], text_len: usize, offset: usize) -> usize {
+        let offset = offset.min(text_len);
+        tokens
+            .iter()
+            .find(|t| t.source.start < offset && offset < t.source.end)
+            .map_or(offset, |t| t.source.start)
+    }
+}
 impl Composer {
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
@@ -226,36 +257,14 @@ impl Composer {
                     .range(offset..)
                     .next()
                     .map_or(self.text.len(), |(&i, _)| i);
-                for (i, g) in self.text[offset..end].grapheme_indices(true) {
-                    let newline = g == "\n" || g == "\r\n";
-                    let text = if newline {
-                        String::new()
-                    } else if g == "\t" {
-                        "    ".to_owned()
-                    } else {
-                        g.chars()
-                            .map(|c| if c.is_control() { '\u{fffd}' } else { c })
-                            .collect()
-                    };
-                    tokens.push(Token {
-                        source: offset + i..offset + i + g.len(),
-                        text,
-                        paste: false,
-                        whitespace: g.chars().all(char::is_whitespace),
-                        newline,
-                    });
-                }
+                tokens.extend(Token::plain(&self.text[offset..end], offset));
                 offset = end;
             }
         }
         tokens
     }
     fn boundary(&self, offset: usize) -> usize {
-        let offset = offset.min(self.text.len());
-        self.tokens()
-            .iter()
-            .find(|t| t.source.start < offset && offset < t.source.end)
-            .map_or(offset, |t| t.source.start)
+        Token::boundary(&self.tokens(), self.text.len(), offset)
     }
     fn normalize(&mut self) {
         self.cursor = self.boundary(self.cursor);

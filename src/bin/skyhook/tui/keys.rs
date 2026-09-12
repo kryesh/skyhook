@@ -24,7 +24,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("queue", "Edit queued follow-ups", ""),
     ("resume", "Resume queued input", ""),
     ("retry", "Continue failed or interrupted turns", ""),
-    ("attention", "Pending questions and permissions", ""),
+    ("attention", "Reopen questions and permissions", "ctrl+x r"),
     ("help", "Help and shortcuts", ""),
 ];
 
@@ -75,6 +75,28 @@ impl KeyMap {
         self.bindings
             .iter()
             .any(|(keys, _)| keys.len() == 2 && keys[0] == key)
+    }
+    pub fn leader_hint(&self, prefix: KeyEvent) -> String {
+        let mut bindings = self
+            .bindings
+            .iter()
+            .filter(|(keys, _)| keys.len() == 2 && keys[0] == prefix)
+            .collect::<Vec<_>>();
+        // Keep reopening discoverable even when the terminal clips this row.
+        bindings.sort_by_key(|(_, action)| action != "attention");
+        let hints = bindings
+            .into_iter()
+            .map(|(keys, action)| {
+                let label = if action == "attention" {
+                    "questions"
+                } else {
+                    action.as_str()
+                };
+                format!("{} {label}", display(&keys[1]))
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        format!("{}: {hints}", display(&prefix))
     }
     pub fn binding(&self, action: &str) -> String {
         self.bindings

@@ -64,6 +64,59 @@ impl App {
         }
         self.dirty = true;
     }
+    pub(super) fn cancel_prompt(&mut self) {
+        let error = match self.prompts.front().map(|prompt| &prompt.kind) {
+            Some(PromptKind::Authentication(_)) => Some("authentication cancelled"),
+            Some(PromptKind::Questions {
+                background: true, ..
+            }) => Some("questions cancelled"),
+            _ => None,
+        };
+        if let Some(error) = error {
+            // Background asks have already released their caller. Reply once
+            // for the whole batch; these cancellations cannot be reopened.
+            if let Some(prompt) = self.prompts.pop_front() {
+                let _ = prompt.reply.send(Err(error.into()));
+            }
+            self.reset_prompt();
+            if self.prompts.is_empty() {
+                self.prompt_active = false;
+            }
+        } else {
+            // Keep a foreground caller blocked and retain all batch drafts so
+            // reopening is safe: no cancellation has reached the agent yet.
+            self.prompt_active = false;
+        }
+        self.dirty = true;
+    }
+    pub(super) fn reject_pending_questions(&mut self) {
+        let reset = self
+            .prompts
+            .front()
+            .is_some_and(|prompt| matches!(prompt.kind, PromptKind::Questions { .. }));
+        let pending = std::mem::take(&mut self.prompts);
+        for prompt in pending {
+            if matches!(prompt.kind, PromptKind::Questions { .. }) {
+                let _ = prompt
+                    .reply
+                    .send(Err("questions cancelled by a new user prompt".into()));
+            } else {
+                self.prompts.push_back(prompt);
+            }
+        }
+        if reset {
+            self.reset_prompt();
+        } else if self
+            .suspended_prompt
+            .as_ref()
+            .is_some_and(|saved| !self.prompts.iter().any(|prompt| prompt.id == saved.id))
+        {
+            self.suspended_prompt = None;
+        }
+        if self.prompts.is_empty() {
+            self.prompt_active = false;
+        }
+    }
     pub(super) fn activate_prompt(&mut self) {
         if self.prompts.is_empty() {
             return;
@@ -175,20 +228,20 @@ impl App {
                 r.tool,
                 crate::tui::format::brief(&model::pretty(&r.arguments), 240)
             ),
-            PromptKind::Questions { agent, questions } => {
-                questions.get(self.question_index).map_or_else(
-                    || format!("Review answers\n{}", model::pretty(&self.answers)),
-                    |q| {
-                        format!(
-                            "Agent {} · question {}/{}\n{}",
-                            crate::tui::format::agent_label(agent),
-                            self.question_index + 1,
-                            questions.len(),
-                            q.prompt
-                        )
-                    },
-                )
-            }
+            PromptKind::Questions {
+                agent, questions, ..
+            } => questions.get(self.question_index).map_or_else(
+                || format!("Review answers\n{}", model::pretty(&self.answers)),
+                |q| {
+                    format!(
+                        "Agent {} · question {}/{}\n{}",
+                        crate::tui::format::agent_label(agent),
+                        self.question_index + 1,
+                        questions.len(),
+                        q.prompt
+                    )
+                },
+            ),
             PromptKind::Authentication(p) => format!("Authentication\n{}", p.message),
         }
     }
@@ -451,6 +504,10 @@ mod tests {
         assert!(draw(&mut app).contains("Question 1/3 · ←→ switch · Tab edit"));
         key(&mut app, KeyCode::Left, M::NONE);
         assert_eq!(app.question_index, 0);
+        key(&mut app, KeyCode::Up, M::NONE);
+        assert_eq!(app.prompt_choice, 2);
+        key(&mut app, KeyCode::Down, M::NONE);
+        assert_eq!(app.prompt_choice, 0);
         key(&mut app, KeyCode::Down, M::NONE);
         app.event(Event::Paste("comment".into()));
         key(&mut app, KeyCode::Left, M::NONE);
@@ -458,7 +515,24 @@ mod tests {
         assert_eq!(app.prompt_editor.cursor, 6);
         let screen = draw(&mut app);
         assert!(screen.contains("←→ cursor · Tab switch questions"));
-        assert!(screen.contains("commen▏t"));
+        assert!(screen.contains("comment"));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::render::draw(frame, &mut app))
+            .unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(cursor.x, cursor.y)].symbol(), "t");
+        let p = crate::tui::render::Palette::new(app.light);
+        assert_eq!(buffer[(2, app.prompt_body_rect.y)].fg, p.warning);
+        let title = &buffer[(2, app.prompt_body_rect.y + 1)];
+        assert_eq!(title.fg, p.accent);
+        assert!(title.modifier.contains(ratatui::style::Modifier::BOLD));
+        let label = &buffer[(4, app.prompt_options_rect.y)];
+        assert_eq!(label.symbol(), "1");
+        assert_eq!(label.fg, p.fg);
+        assert!(!label.modifier.contains(ratatui::style::Modifier::BOLD));
         key(&mut app, KeyCode::Tab, M::NONE);
         app.prompt_body_scroll = 5;
         app.prompt_option_scroll = 5;
@@ -476,6 +550,18 @@ mod tests {
             response.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
         ));
+        key(&mut app, KeyCode::Esc, M::NONE);
+        assert!(!app.prompt_active);
+        assert_eq!(app.prompts.len(), 1);
+        assert!(matches!(
+            response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(!draw(&mut app).contains("/attention"));
+        key(&mut app, KeyCode::Char('x'), M::CONTROL);
+        key(&mut app, KeyCode::Char('r'), M::NONE);
+        assert!(app.prompt_active);
+        assert_eq!(app.question_index, 2);
         key(&mut app, KeyCode::Left, M::NONE);
         assert_eq!(app.prompt_editor.text, "draft");
         key(&mut app, KeyCode::Left, M::NONE);
@@ -698,7 +784,8 @@ mod tests {
         assert!(second.await.unwrap().is_err());
         assert!(!app.prompt_active);
         assert_eq!(app.prompt_editor.text, "saved answer");
-        app.command("attention");
+        key(&mut app, KeyCode::Char('x'), M::CONTROL);
+        key(&mut app, KeyCode::Char('r'), M::NONE);
         key(&mut app, KeyCode::Enter, M::NONE);
         assert!(
             matches!(answer.await.unwrap().unwrap(), PromptResponse::Questions(Value::String(value)) if value == "saved answer")
@@ -717,8 +804,41 @@ mod tests {
         assert!(response.await.unwrap().is_err());
         assert!(app.suspended_prompt.is_none());
         assert!(app.prompt_editor.text.is_empty());
-        let _next = question(&mut app, "Next question".into(), vec![]);
+        let cancelled = question(&mut app, "Background question".into(), vec![]);
+        if let PromptKind::Questions {
+            background,
+            questions,
+            ..
+        } = &mut app.prompts.front_mut().unwrap().kind
+        {
+            *background = true;
+            questions.push(Question {
+                id: "second".into(),
+                prompt: "Second question".into(),
+                options: vec![],
+            });
+        }
+        app.event(Event::Paste("partial answer".into()));
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert_eq!(app.answers.len(), 1);
+        key(&mut app, KeyCode::Esc, M::NONE);
+        assert!(cancelled.await.unwrap().is_err());
+        assert!(app.prompts.is_empty());
+        assert!(app.answers.is_empty());
+        key(&mut app, KeyCode::Char('x'), M::CONTROL);
+        key(&mut app, KeyCode::Char('r'), M::NONE);
+        assert!(!app.prompt_active);
+        let rejected = question(&mut app, "Next question".into(), vec![]);
         assert!(app.prompt_editor.text.is_empty());
+        key(&mut app, KeyCode::Esc, M::NONE);
+        app.paused = true;
+        app.submit("A new direction".into(), vec![]);
+        assert!(rejected.await.unwrap().is_err());
+        assert!(app.prompts.is_empty());
+        assert_eq!(app.queue.len(), 1);
+        key(&mut app, KeyCode::Char('x'), M::CONTROL);
+        key(&mut app, KeyCode::Char('r'), M::NONE);
+        assert!(!app.prompt_active);
         app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
     #[tokio::test]

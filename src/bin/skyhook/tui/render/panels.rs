@@ -2,22 +2,142 @@
 
 use super::*;
 
-pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette) {
+/// Measure the same wrapped content used for painting, so long questions,
+/// choices and typed answers can grow the prompt instead of being clipped.
+pub(super) struct PromptLayout {
+    body: Vec<String>,
+    title_start: Option<usize>,
+    options: Vec<PromptOptionLine>,
+    selected_start: usize,
+    input: super::super::composer::ComposerLayout,
+    input_label: Vec<String>,
+}
+
+impl PromptLayout {
+    pub(super) fn new(app: &App, width: u16) -> Self {
+        let width = width.saturating_sub(4);
+        let body_text = model::clean(&app.prompt_text());
+        let body = wrap_plain(&body_text, width as usize);
+        let title_start = match app.prompts.front().map(|prompt| &prompt.kind) {
+            Some(crate::interaction::PromptKind::Questions { questions, .. })
+                if app.question_index < questions.len() =>
+            {
+                body_text
+                    .split_once('\n')
+                    .map(|(header, _)| wrap_plain(header, width as usize).len())
+            }
+            _ => None,
+        };
+        let choices = match app.prompts.front().map(|prompt| &prompt.kind) {
+            Some(crate::interaction::PromptKind::Questions { questions, .. })
+                if app.question_index < questions.len() =>
+            {
+                questions[app.question_index]
+                    .options
+                    .iter()
+                    .enumerate()
+                    .map(|(index, option)| {
+                        (
+                            format!("{}: {}", index + 1, option.label),
+                            option.description.clone(),
+                        )
+                    })
+                    .chain(std::iter::once(("Write an answer…".into(), String::new())))
+                    .collect::<Vec<_>>()
+            }
+            _ => app
+                .prompt_options()
+                .into_iter()
+                .map(|label| (label, String::new()))
+                .collect(),
+        };
+        let (options, selected_start) = prompt_option_lines(&choices, app.prompt_choice, width);
+        let secret = app.prompts.front().is_some_and(|prompt| prompt.secret());
+        let input = if secret {
+            // Never give a password to the renderer. Map source graphemes onto
+            // mask bytes before using the same layout as a regular input field.
+            let mut masked = super::super::editor::Editor::default();
+            masked.set("●".repeat(app.prompt_editor.text.graphemes(true).count()));
+            masked.cursor = app.prompt_editor.text[..app.prompt_editor.cursor]
+                .graphemes(true)
+                .count()
+                * "●".len();
+            masked.anchor = app
+                .prompt_editor
+                .anchor
+                .map(|anchor| app.prompt_editor.text[..anchor].graphemes(true).count() * "●".len());
+            masked.layout(width as usize)
+        } else {
+            app.prompt_editor.layout(width as usize)
+        };
+        let input_label = match app.prompts.front().map(|prompt| &prompt.kind) {
+            Some(crate::interaction::PromptKind::Questions { questions, .. }) => {
+                match questions.get(app.question_index) {
+                    Some(question) if app.prompt_choice < question.options.len() => {
+                        "Comment (optional):"
+                    }
+                    Some(_) => "Answer:",
+                    None => "",
+                }
+            }
+            _ => "",
+        };
+        let input_label = if input_label.is_empty() {
+            Vec::new()
+        } else {
+            wrap_plain(input_label, width as usize)
+        };
+        Self {
+            body,
+            title_start,
+            options,
+            selected_start,
+            input,
+            input_label,
+        }
+    }
+
+    pub(super) fn height(&self) -> u16 {
+        (self.body.len()
+            + self.options.len()
+            + (self.input.rows.len() + self.input_label.len())
+            + 1)
+        .min(u16::MAX as usize) as u16
+    }
+
+    fn row_heights(&self, height: u16) -> [u16; 3] {
+        let wanted = [
+            self.body.len(),
+            self.options.len(),
+            (self.input.rows.len() + self.input_label.len()),
+        ];
+        let mut rows = [0; 3];
+        let mut remaining = height.saturating_sub(1);
+        // Share a screen-limited box between its sections, giving unused rows
+        // back to longer sections rather than always splitting it in half.
+        while remaining > 0 {
+            let mut grew = false;
+            for (rows, wanted) in rows.iter_mut().zip(wanted) {
+                if remaining > 0 && (*rows as usize) < wanted {
+                    *rows += 1;
+                    remaining -= 1;
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        rows
+    }
+}
+
+pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette, layout: &PromptLayout) {
     let rect = app.composer_rect;
-    let options = app.prompt_options();
-    let body = app.prompt_text();
-    let lines = wrap_plain(&model::clean(&body), rect.width.saturating_sub(4) as usize);
-    let available = rect.height.saturating_sub(2);
-    let body_height = if options.is_empty() {
-        available
-    } else {
-        (available / 2).max(1)
-    };
-    let option_height = if options.is_empty() {
-        0
-    } else {
-        available.saturating_sub(body_height)
-    };
+    let lines = &layout.body;
+    let option_lines = &layout.options;
+    let selected_start = layout.selected_start;
+    let [body_height, option_height, input_height] = layout.row_heights(rect.height);
     app.prompt_body_rect = r(2, rect.y, rect.width.saturating_sub(4), body_height);
     app.prompt_options_rect = r(
         2,
@@ -35,16 +155,19 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette) {
         .take(body_height as usize)
         .enumerate()
     {
-        text(
-            frame,
+        let title = layout
+            .title_start
+            .is_some_and(|start| app.prompt_body_scroll + offset >= start);
+        let style = if title {
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.warning)
+        };
+        frame.render_widget(
+            Paragraph::new(line.as_str()).style(style.bg(p.input)),
             r(2, rect.y + offset as u16, rect.width.saturating_sub(4), 1),
-            line.clone(),
-            p.warning,
-            p.input,
         );
     }
-    let (option_lines, selected_start) =
-        prompt_option_lines(&options, app.prompt_choice, rect.width.saturating_sub(4));
     app.prompt_option_rows = option_lines.len();
     if app.prompt_reveal {
         if selected_start < app.prompt_option_scroll {
@@ -59,7 +182,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette) {
         .prompt_option_scroll
         .min(option_lines.len().saturating_sub(option_height as usize));
     let mut cursor_drawn = false;
-    for (offset, (index, line)) in option_lines
+    for (offset, line) in option_lines
         .iter()
         .skip(app.prompt_option_scroll)
         .take(option_height as usize)
@@ -71,18 +194,11 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette) {
             rect.width.saturating_sub(4),
             1,
         );
-        text(
-            frame,
+        frame.render_widget(
+            Paragraph::new(line.text.as_str()).style(line.style(p, app.prompt_choice)),
             row,
-            line.clone(),
-            p.fg,
-            if *index == app.prompt_choice {
-                p.selected
-            } else {
-                p.input
-            },
         );
-        if *index == app.prompt_choice
+        if line.index == app.prompt_choice
             && !cursor_drawn
             && app.menu.is_none()
             && !(app.multiple_questions() && app.question_editing)
@@ -90,50 +206,69 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette) {
             focus_cursor(frame, row.x - 1, row.y, p.input);
             cursor_drawn = true;
         }
-        app.hits.push((row, Hit::PromptChoice(*index)));
+        app.hits.push((row, Hit::PromptChoice(line.index)));
     }
-    let secret = app.prompts.front().is_some_and(|prompt| prompt.secret());
-    let input = if secret {
-        "●".repeat(app.prompt_editor.text.graphemes(true).count())
-    } else {
-        if app.multiple_questions() {
-            if app.question_editing {
-                let cursor = app.prompt_editor.cursor;
-                format!(
-                    "{}▏{}",
-                    model::clean(&app.prompt_editor.text[..cursor]),
-                    model::clean(&app.prompt_editor.text[cursor..])
-                )
-            } else {
-                model::clean(&app.prompt_editor.text)
-            }
-        } else {
-            format!("{}▏", model::clean(&app.prompt_editor.text))
-        }
-    };
-    let input_label = match app.prompts.front().map(|prompt| &prompt.kind) {
-        Some(crate::interaction::PromptKind::Questions { questions, .. }) => {
-            match questions.get(app.question_index) {
-                Some(question) if app.prompt_choice < question.options.len() => {
-                    "Comment (optional): "
-                }
-                Some(_) => "Answer: ",
-                None => "",
-            }
-        }
-        _ => "",
-    };
-    text(
-        frame,
-        r(
-            2,
-            rect.bottom().saturating_sub(2),
-            rect.width.saturating_sub(4),
-            1,
-        ),
-        format!("{input_label}{input}{}", if secret { "▏" } else { "" }),
-        p.fg,
-        p.input,
+    let label_height = layout
+        .input_label
+        .len()
+        .min(input_height.saturating_sub(1) as usize) as u16;
+    let visible = input_height.saturating_sub(label_height) as usize;
+    let (cursor_row, cursor_column) = layout.input.cursor;
+    let input_top = cursor_row.saturating_sub(visible.saturating_sub(1));
+    let input_y = rect.bottom().saturating_sub(input_height + 1);
+    for (offset, label) in layout
+        .input_label
+        .iter()
+        .take(label_height as usize)
+        .enumerate()
+    {
+        text(
+            frame,
+            r(2, input_y + offset as u16, rect.width.saturating_sub(4), 1),
+            label.clone(),
+            p.muted,
+            p.input,
+        );
+    }
+    for (offset, row) in layout
+        .input
+        .rows
+        .iter()
+        .skip(input_top)
+        .take(visible)
+        .enumerate()
+    {
+        text(
+            frame,
+            r(
+                2,
+                input_y + label_height + offset as u16,
+                rect.width.saturating_sub(4),
+                1,
+            ),
+            row.line(
+                Style::default(),
+                Style::default(),
+                Style::default().bg(p.selected),
+            ),
+            p.fg,
+            p.input,
+        );
+    }
+    if visible > 0
+        && (!app.multiple_questions() || app.question_editing)
+        && app.menu.is_none()
+        && app.search_editor.is_none()
+    {
+        frame.set_cursor_position((
+            2 + (cursor_column as u16).min(rect.width.saturating_sub(4)),
+            input_y + label_height + (cursor_row - input_top) as u16,
+        ));
+    }
+    let question_counter = matches!(
+        app.prompts.front().map(|prompt| &prompt.kind),
+        Some(crate::interaction::PromptKind::Questions { questions, .. })
+            if questions.len() > 1 && app.question_index < questions.len()
     );
     text(
         frame,
@@ -148,7 +283,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette) {
                 if questions.len() > 1 && app.question_index < questions.len() =>
             {
                 format!(
-                    "Question {}/{} · {} · ↑↓ choose · Enter answer · Esc dismiss",
+                    "Question {}/{} · {} · ↑↓ choose · Enter answer · Esc cancel",
                     app.question_index + 1,
                     questions.len(),
                     if app.question_editing {
@@ -158,10 +293,16 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette) {
                     }
                 )
             }
-            _ => "↑↓ choose · PgUp/PgDn text · Ctrl+PgUp/PgDn choices · Enter submit · Esc dismiss"
-                .into(),
+            kind => format!(
+                "↑↓ choose · PgUp/PgDn text · Ctrl+PgUp/PgDn choices · Enter submit · Esc {}",
+                if matches!(kind, Some(crate::interaction::PromptKind::Approval(_))) {
+                    "dismiss"
+                } else {
+                    "cancel"
+                },
+            ),
         },
-        p.muted,
+        if question_counter { p.warning } else { p.muted },
         p.input,
     );
 }
@@ -205,7 +346,6 @@ pub(super) fn draw_tree(
         .unwrap_or(16);
     let columns = AgentColumnsLayout::new(
         width.saturating_sub(4),
-        width,
         minimum_name_width,
         stats_columns.width(),
     );
@@ -270,36 +410,63 @@ pub(super) fn draw_tree(
     }
 }
 
-/// Retain each choice's hit target across wrapped continuation rows.
+/// Every label and description row retains the choice's selection and hit target.
+struct PromptOptionLine {
+    index: usize,
+    text: String,
+    description: bool,
+}
+
+impl PromptOptionLine {
+    fn style(&self, p: Palette, selected: usize) -> Style {
+        let style = Style::default().bg(if self.index == selected {
+            p.selected
+        } else {
+            p.input
+        });
+        if self.description {
+            style.fg(p.muted)
+        } else {
+            style.fg(p.fg)
+        }
+    }
+}
+
+/// Wrap labels and descriptions independently so descriptions always start on
+/// a new line, and measure exactly the rows that draw_prompt will paint.
 fn prompt_option_lines(
-    options: &[String],
+    options: &[(String, String)],
     selected: usize,
     width: u16,
-) -> (Vec<(usize, String)>, usize) {
+) -> (Vec<PromptOptionLine>, usize) {
     let mut option_lines = Vec::new();
     let mut selected_start = 0;
-    for (index, option) in options.iter().enumerate() {
+    for (index, (label, description)) in options.iter().enumerate() {
         if index == selected {
             selected_start = option_lines.len();
         }
-        for (offset, line) in wrap_plain(
-            &model::clean(option),
-            width.saturating_sub(2).max(1) as usize,
-        )
-        .into_iter()
-        .enumerate()
-        {
-            option_lines.push((
-                index,
-                format!(
-                    "{} {line}",
-                    if offset == 0 && index == selected {
-                        ">"
-                    } else {
-                        " "
-                    }
-                ),
-            ));
+        for (description, source) in [(false, label), (true, description)] {
+            let source = model::clean(source);
+            if description && source.is_empty() {
+                continue;
+            }
+            for (offset, line) in wrap_plain(&source, width.saturating_sub(2).max(1) as usize)
+                .into_iter()
+                .enumerate()
+            {
+                option_lines.push(PromptOptionLine {
+                    index,
+                    text: format!(
+                        "{} {line}",
+                        if !description && offset == 0 && index == selected {
+                            ">"
+                        } else {
+                            " "
+                        }
+                    ),
+                    description,
+                });
+            }
         }
     }
     (option_lines, selected_start)
@@ -312,27 +479,58 @@ mod tests {
     #[test]
     fn prompt_choices_wrap_without_losing_unicode_or_selection_targets() {
         let options = vec![
-            "abc 界 👩‍💻 def".into(),
-            "\u{1b}[31msecond\u{1b}[0m choice".into(),
+            ("abc 界 👩‍💻 def".into(), "Details 界 👩‍💻 on a new line".into()),
+            (
+                "\u{1b}[31msecond\u{1b}[0m choice".into(),
+                "Muted details".into(),
+            ),
+            ("Write an answer…".into(), String::new()),
         ];
         for width in [6, 12, 30] {
             let (rows, selected_start) = prompt_option_lines(&options, 1, width);
-            assert_eq!(rows[selected_start].0, 1);
-            assert!(rows[selected_start].1.starts_with("> "));
+            assert_eq!(rows[selected_start].index, 1);
+            assert!(rows[selected_start].text.starts_with("> "));
             assert_eq!(
-                rows.iter()
-                    .filter(|(_, text)| text.starts_with("> "))
-                    .count(),
+                rows.iter().filter(|row| row.text.starts_with("> ")).count(),
                 1
             );
-            assert!(rows.iter().all(|(_, text)| text.width() <= width as usize));
-            for (index, source) in options.iter().enumerate() {
-                let reconstructed = rows
+            assert!(rows.iter().all(|row| row.text.width() <= width as usize));
+            assert!(rows.iter().all(|row| !row.text.contains('—')));
+            for (index, (label, description)) in options.iter().enumerate() {
+                let choice_rows = rows
                     .iter()
-                    .filter(|(choice, _)| *choice == index)
-                    .map(|(_, text)| &text[2..])
-                    .collect::<String>();
-                assert_eq!(reconstructed, model::clean(source));
+                    .filter(|row| row.index == index)
+                    .collect::<Vec<_>>();
+                assert!(!choice_rows[0].description);
+                for (is_description, source) in [(false, label), (true, description)] {
+                    let reconstructed = choice_rows
+                        .iter()
+                        .filter(|row| row.description == is_description)
+                        .map(|row| &row.text[2..])
+                        .collect::<String>();
+                    assert_eq!(reconstructed, model::clean(source));
+                }
+                if let Some(first_description) = choice_rows.iter().position(|row| row.description)
+                {
+                    assert!(first_description > 0);
+                    assert!(
+                        choice_rows[first_description..]
+                            .iter()
+                            .all(|row| row.description)
+                    );
+                }
+            }
+            for light in [false, true] {
+                let p = Palette::new(light);
+                for row in &rows {
+                    let style = row.style(p, 1);
+                    assert_eq!(
+                        style.bg,
+                        Some(if row.index == 1 { p.selected } else { p.input })
+                    );
+                    assert_eq!(style.fg, Some(if row.description { p.muted } else { p.fg }));
+                    assert!(!style.add_modifier.contains(Modifier::BOLD));
+                }
             }
         }
     }

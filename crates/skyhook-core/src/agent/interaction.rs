@@ -48,6 +48,23 @@ pub trait QuestionHandler: Send + Sync {
     /// the label as a string. Each value in a multi-question answer object uses the same
     /// format. The runtime preserves these answer values without interpreting their fields.
     fn ask(&self, agent: AgentId, questions: Vec<Question>) -> QuestionFuture;
+
+    /// Present a batch with its effective execution mode. `background` is true if
+    /// any ask, or any enclosing tool job up to the owning agent, runs in the
+    /// background. Mixed batches are therefore background batches as a whole.
+    ///
+    /// Hosts may dismiss and reopen foreground batches by retaining their pending
+    /// answer future. Cancelling a background batch must resolve the future with
+    /// an error: the running agent receives the failure and it cannot be undone.
+    /// The default preserves handlers that do not distinguish execution modes.
+    fn ask_with_background(
+        &self,
+        agent: AgentId,
+        questions: Vec<Question>,
+        _background: bool,
+    ) -> QuestionFuture {
+        self.ask(agent, questions)
+    }
 }
 
 #[derive(Clone, Debug, Error)]

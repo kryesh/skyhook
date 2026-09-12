@@ -47,21 +47,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let editor_height = (editor_lines.len() as u16 + 2 + u16::from(!app.images.is_empty()))
         .clamp(3, 7)
         .min(height.saturating_sub(footer_height + 3).max(3));
-    let composer_height = if prompt_active {
-        (app.prompt_options().len() as u16 + 6)
-            .clamp(7, 12)
-            .min(height / 2)
+    let notice_height = u16::from(
+        !app.queue.is_empty()
+            || (!app.prompts.is_empty() && !prompt_active)
+            || app.leader.is_some()
+            || app.toast.is_some(),
+    );
+    let prompt_layout = prompt_active.then(|| PromptLayout::new(app, width));
+    let composer_height = if let Some(layout) = &prompt_layout {
+        layout
+            .height()
+            .max(7)
+            .min(height.saturating_sub(footer_height + 2 + notice_height))
     } else if viewing_child {
         0
     } else {
         editor_height
     };
     let tree_agents = app.projection.visible(&app.selected);
-    let notice_height = u16::from(
-        !app.queue.is_empty()
-            || (!app.prompts.is_empty() && !prompt_active)
-            || app.leader.is_some(),
-    );
     let composer_y = height.saturating_sub(footer_height + composer_height);
     let tree_capacity = composer_y.saturating_sub(3 + notice_height).min(
         (height / 4).clamp(4, 10)
@@ -93,55 +96,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.tree_rect = r(0, tree_y, width, tree_height);
     app.content_rect = r(0, 2, width, tree_y.saturating_sub(2 + notice_height));
     fill(frame, r(0, 0, width, 2), p.panel);
-    let name = app
-        .projection
-        .agents
-        .iter()
-        .find(|a| a.id == app.selected)
-        .map_or("skyhook", |a| a.name.as_str());
-    // Keep the session ID visible alongside the workspace on narrow terminals.
     let workspace = app.launch.workspace.display().to_string();
-    let session = app.session.as_ref().map_or_else(
-        || "new session".to_owned(),
-        |session| session.id().to_string(),
-    );
-    let available = width.saturating_sub(4);
-    let name_width = if available >= 60 {
-        (name.width() as u16).min(20)
-    } else {
-        0
-    };
-    let mut x = 2;
-    if name_width > 0 {
-        text(
-            frame,
-            r(x, 0, name_width, 1),
-            name.to_owned(),
-            p.fg,
-            p.panel,
-        );
-        x += name_width;
-        text(frame, r(x, 0, 3, 1), " · ", p.muted, p.panel);
-        x += 3;
-    }
-    let remaining = width.saturating_sub(x + 2).saturating_sub(3);
-    let session_width = (session.width() as u16).min(remaining - (remaining / 2).min(16));
-    let workspace_width = (workspace.width() as u16).min(remaining.saturating_sub(session_width));
-    let session_width = (session.width() as u16).min(remaining - workspace_width);
+    let workspace = clipped_header(&workspace, width.saturating_sub(4));
+    let workspace_width = workspace.width() as u16;
     text(
         frame,
-        r(x, 0, workspace_width, 1),
-        clipped_header(&workspace, workspace_width),
-        p.fg,
-        p.panel,
-    );
-    x += workspace_width;
-    text(frame, r(x, 0, 3, 1), " · ", p.muted, p.panel);
-    x += 3;
-    text(
-        frame,
-        r(x, 0, session_width, 1),
-        clipped_header(&session, session_width),
+        r((width - workspace_width) / 2, 0, workspace_width, 1),
+        workspace,
         p.fg,
         p.panel,
     );
@@ -370,13 +331,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
     if notice_height > 0 {
-        let message = if app.leader.is_some() {
-            "Ctrl+X: N new · L sessions · M model · A agents · I inspect · E editor · Q quit".into()
+        let message = if let Some((prefix, _)) = app.leader {
+            app.keys.leader_hint(prefix)
+        } else if let Some((message, _)) = &app.toast {
+            message.clone()
         } else if !app.prompts.is_empty() && !prompt_active {
-            format!(
-                "{} request(s) need attention · /attention",
-                app.prompts.len()
-            )
+            let binding = app.keys.binding("attention");
+            let hint = if binding.is_empty() {
+                "Reopen questions and permissions in the command palette".to_owned()
+            } else {
+                format!("{binding} reopen")
+            };
+            format!("{} pending request(s) · {hint}", app.prompts.len())
         } else if !app.queue.is_empty() {
             format!(
                 "{} follow-up(s) queued{} · /queue",
@@ -388,12 +354,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         };
         let rect = r(1, tree_y.saturating_sub(1), width.saturating_sub(2), 1);
         text(frame, rect, model::clean(&message), p.warning, p.base);
-        app.hits.push((rect, Hit::Attention));
+        if app.leader.is_none() && app.toast.is_none() {
+            app.hits.push((
+                rect,
+                if !app.prompts.is_empty() && !prompt_active {
+                    Hit::Attention
+                } else {
+                    Hit::Queue
+                },
+            ));
+        }
     }
     draw_tree(frame, app, p, &tree_agents, tree_rows, navigation_active);
     fill(frame, app.composer_rect, p.input);
-    if prompt_active {
-        draw_prompt(frame, app, p);
+    if let Some(layout) = &prompt_layout {
+        draw_prompt(frame, app, p, layout);
     } else if !viewing_child {
         let (cursor_line, cursor_column) = editor_layout.cursor;
         let visible = composer_height.saturating_sub(2) as usize;
@@ -451,18 +426,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         agent.map_or(app.model.as_str(), |a| a.model.as_str())
     };
-    let metadata = app
+    let model = app
         .launch
         .config
         .models
         .get(model)
-        .map_or(model, |profile| profile.model.as_str())
-        .to_owned();
+        .map_or(model, |profile| profile.model.as_str());
+    let session = app.session.as_ref().map_or_else(
+        || "new session".to_owned(),
+        |session| session.id().to_string(),
+    );
     if footer_height > 1 {
         text(
             frame,
             r(1, fy, width.saturating_sub(2), 1),
-            metadata,
+            footer_metadata(model, &session, width.saturating_sub(2)),
             p.muted,
             p.base,
         );
@@ -479,7 +457,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let stat_width = stats.width() as u16;
         let model_width = width.saturating_sub(stat_width + 4);
         if model_width > 0 {
-            text(frame, r(1, fy, model_width, 1), metadata, p.muted, p.base);
+            text(
+                frame,
+                r(1, fy, model_width, 1),
+                footer_metadata(model, &session, model_width),
+                p.muted,
+                p.base,
+            );
         }
         text(
             frame,
@@ -495,6 +479,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
     draw_menu(frame, app, p);
+}
+
+/// Keep both model and session identifiable when the footer is compact.
+fn footer_metadata(model: &str, session: &str, width: u16) -> String {
+    if width < 5 {
+        return clipped_header(model, width);
+    }
+    let available = width - 3; // Separator between model and session.
+    let session_width = session
+        .width()
+        .min((available - (available / 2).min(16)) as usize);
+    let model_width = model.width().min(available as usize - session_width) as u16;
+    let session_width = available - model_width;
+    format!(
+        "{} · {}",
+        clipped_header(model, model_width),
+        clipped_header(session, session_width),
+    )
 }
 
 #[cfg(test)]

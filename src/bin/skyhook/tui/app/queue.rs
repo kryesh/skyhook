@@ -76,6 +76,7 @@ impl App {
         if text.trim().is_empty() && images.is_empty() {
             return;
         }
+        self.reject_pending_questions();
         self.draft_revision = self.draft_revision.wrapping_add(1);
         let queued = self.queued_input(text, images);
         if self.busy() || self.paused || !self.queue.is_empty() {

@@ -10,6 +10,11 @@ impl App {
     pub fn notice(&self, message: impl Into<String>) {
         self.notifier().send(message);
     }
+    /// Transient UI feedback; never sent to the status log or conversation.
+    pub(super) fn toast(&mut self, message: impl Into<String>) {
+        self.toast = Some((message.into(), Instant::now()));
+        self.dirty = true;
+    }
     pub fn view(&mut self) -> &mut View {
         self.views.entry(self.selected.clone()).or_default()
     }

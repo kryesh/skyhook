@@ -62,20 +62,8 @@ impl App {
             let old_index = self.question_index;
             match key.code {
                 KeyCode::Esc => {
-                    if matches!(
-                        self.prompts.front().map(|p| &p.kind),
-                        Some(PromptKind::Authentication(_))
-                    ) {
-                        if let Some(prompt) = self.prompts.pop_front() {
-                            let _ = prompt.reply.send(Err("authentication cancelled".into()));
-                        }
-                        self.reset_prompt();
-                        if self.prompts.is_empty() {
-                            self.prompt_active = false;
-                        }
-                    } else {
-                        self.prompt_active = false;
-                    }
+                    self.cancel_prompt();
+                    return;
                 }
                 KeyCode::PageUp | KeyCode::PageDown => {
                     let options = key.modifiers.contains(M::CONTROL);
@@ -97,8 +85,11 @@ impl App {
                 }
                 KeyCode::Up | KeyCode::BackTab => {
                     self.question_editing = false;
-                    self.prompt_choice = self.prompt_choice.saturating_sub(1);
-                    self.prompt_reveal = true;
+                    if !options.is_empty() {
+                        self.prompt_choice =
+                            (self.prompt_choice + options.len() - 1) % options.len();
+                        self.prompt_reveal = true;
+                    }
                 }
                 KeyCode::Down | KeyCode::Tab => {
                     self.question_editing = false;
@@ -400,7 +391,7 @@ impl App {
             && let Some(text) = self.editor.selected_text()
         {
             self.clipboard = Some(text.to_owned());
-            self.notice("Copied selected input");
+            self.toast("Copied selected input");
             return;
         }
         if let Some((a, b)) = self.selection
@@ -421,7 +412,9 @@ impl App {
                 })
                 .map(|e| model::clean(&e.text));
         }
-        self.notice("Copied to terminal clipboard");
+        if self.clipboard.is_some() {
+            self.toast("Copied to terminal clipboard");
+        }
     }
     pub(super) fn interrupt(&mut self) {
         self.paused = true;

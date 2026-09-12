@@ -173,12 +173,7 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
         })
         .max()
         .unwrap_or(16);
-    let columns = AgentColumnsLayout::new(
-        row_width,
-        width,
-        minimum_identity_width,
-        stats_columns.width(),
-    );
+    let columns = AgentColumnsLayout::new(row_width, minimum_identity_width, stats_columns.width());
     let headers = AGENT_STATS_HEADERS.map(String::from);
     let header_height = u16::from(agent_menu && columns.stats_width > 0);
     if header_height > 0 {
@@ -302,7 +297,13 @@ mod tests {
             })
             .collect();
         app.command("agents");
-        for (width, stats, status) in [(40, false, false), (80, true, false), (120, true, true)] {
+        for (width, stats, status) in [
+            (40, false, false),
+            (65, false, false),
+            (66, false, true),
+            (80, false, true),
+            (120, true, true),
+        ] {
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 10)).unwrap();
             app.content_rect = r(0, 0, width, 10);

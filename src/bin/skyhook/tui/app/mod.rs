@@ -132,6 +132,7 @@ pub struct App {
     pub tx: mpsc::UnboundedSender<Work>,
     pub keys: KeyMap,
     pub leader: Option<(KeyEvent, Instant)>,
+    pub toast: Option<(String, Instant)>,
     pub dirty: bool,
     pub content_dirty: bool,
     content_revision: u64,
@@ -232,6 +233,7 @@ impl App {
             tx: tx.clone(),
             keys,
             leader: None,
+            toast: None,
             dirty: true,
             content_dirty: true,
             content_revision: 0,
@@ -371,6 +373,7 @@ pub(super) mod tests {
             id: 1,
             kind: PromptKind::Questions {
                 agent: app.session.as_ref().unwrap().root_agent().clone(),
+                background: false,
                 questions: vec![Question {
                     id: "answer".into(),
                     prompt,

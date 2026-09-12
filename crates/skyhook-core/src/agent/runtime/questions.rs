@@ -178,12 +178,45 @@ impl QuestionCoordinator {
         }
     }
 
+    // A foreground ask inside a background script does not block the owning
+    // agent either. Stop at the agent boundary: its launch mode belongs to its
+    // parent, not to this agent's own question interaction.
+    async fn is_effectively_background(&self, mut job: JobId) -> Result<bool, HarnessError> {
+        loop {
+            let envelope = self.jobs.snapshot(job).await?;
+            if envelope.tool == "agent" {
+                return Ok(false);
+            }
+            if self.jobs.is_background(job).await? {
+                return Ok(true);
+            }
+            match envelope.parent {
+                Some(parent) => job = parent,
+                None => return Ok(false),
+            }
+        }
+    }
+
     async fn present_root_questions(
         &self,
         agent: AgentId,
         batch: Vec<PendingAsk>,
         questions: Vec<Question>,
     ) {
+        let mut background = false;
+        for ask in &batch {
+            match self.is_effectively_background(ask.context.job).await {
+                Ok(true) => {
+                    background = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    send_question_error(batch, error.to_string());
+                    return;
+                }
+            }
+        }
         let mut answers = batch
             .iter()
             .enumerate()
@@ -207,7 +240,7 @@ impl QuestionCoordinator {
         let answer = async {
             match &self.handler {
                 Some(handler) => handler
-                    .ask(agent, questions)
+                    .ask_with_background(agent, questions, background)
                     .await
                     .map_err(|error| error.to_string()),
                 None => std::future::pending().await,
@@ -567,6 +600,41 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_root_questions_are_merged_and_answers_are_split() {
+        struct QuestionsWithMode {
+            inner: RecordingQuestions,
+            backgrounds: Arc<StdMutex<Vec<bool>>>,
+            cancel: bool,
+        }
+
+        impl QuestionHandler for QuestionsWithMode {
+            fn ask(
+                &self,
+                agent: AgentId,
+                questions: Vec<Question>,
+            ) -> crate::agent::QuestionFuture {
+                self.inner.ask(agent, questions)
+            }
+
+            fn ask_with_background(
+                &self,
+                agent: AgentId,
+                questions: Vec<Question>,
+                background: bool,
+            ) -> crate::agent::QuestionFuture {
+                self.backgrounds.lock().unwrap().push(background);
+                if self.cancel {
+                    Box::pin(async {
+                        Err(crate::agent::QuestionError::Failed(
+                            "question cancelled".into(),
+                        ))
+                    })
+                } else {
+                    self.ask(agent, questions)
+                }
+            }
+        }
+
+        let backgrounds: Arc<StdMutex<Vec<bool>>> = Arc::default();
         let root = tempfile::tempdir().unwrap();
         let requests: Arc<StdMutex<Vec<ModelRequest>>> = Arc::default();
         let batches: Arc<StdMutex<Vec<Vec<Question>>>> = Arc::default();
@@ -580,9 +648,13 @@ mod tests {
                     answer("done"),
                 ],
             ),
-            Arc::new(RecordingQuestions {
-                batches: batches.clone(),
-                answer: json!({"first":"yes", "second":{"value":2}, "extra":true}),
+            Arc::new(QuestionsWithMode {
+                inner: RecordingQuestions {
+                    batches: batches.clone(),
+                    answer: json!({"first":"yes", "second":{"value":2}, "extra":true}),
+                },
+                backgrounds: backgrounds.clone(),
+                cancel: false,
             }),
         )
         .await;
@@ -608,7 +680,79 @@ mod tests {
         for kind in ["question_opened", "question_resolved"] {
             assert_eq!(events.lines().filter(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["event"]["type"] == kind).count(), 2);
         }
+        assert_eq!(*backgrounds.lock().unwrap(), [false]);
         shutdown_session(session).await;
+
+        // A mixed batch, or a foreground batch inside a background script, is
+        // irrevocable on dismissal. Neither nesting alone nor an agent's own
+        // launch mode makes its foreground tool questions background questions.
+        for (script_background, ask_background) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let root = tempfile::tempdir().unwrap();
+            let backgrounds: Arc<StdMutex<Vec<bool>>> = Arc::default();
+            let background = script_background || ask_background;
+            let harness = question_harness(
+                root.path(),
+                &root.path().join("sessions"),
+                Arc::new(HangingProvider),
+                Arc::new(QuestionsWithMode {
+                    inner: RecordingQuestions {
+                        batches: Arc::default(),
+                        answer: json!({"first":"yes", "second":"yes"}),
+                    },
+                    backgrounds: backgrounds.clone(),
+                    cancel: background,
+                }),
+            )
+            .await;
+            let session = harness.new_session().await.unwrap();
+            session
+                .runtime
+                .questions
+                .prepare_question_batch(
+                    &session.root,
+                    &["first", "second"].map(|id| ToolCall {
+                        id: id.into(),
+                        name: "ask".into(),
+                        arguments: json!({"id":id, "prompt":"Question?"}),
+                    }),
+                )
+                .await;
+            let script = bounded(session.runtime.executor.execute_model(
+                session.root.clone(),
+                "script",
+                json!({
+                    "source": format!(
+                        "async function ask(id, bg) {{ try {{ const answer = await tool.ask({{id,prompt:'Question?',bg}}); return bg ? {{job:answer.id}} : {{answer}}; }} catch (error) {{ return {{error:String(error)}}; }} }} return await Promise.all([ask('first',false), ask('second',{ask_background})]);"
+                    ),
+                    "bg": script_background,
+                }),
+                None,
+            ))
+            .await
+            .unwrap();
+            let output = terminal(&session, script.job).await.output.unwrap();
+            for ask in output["value"].as_array().unwrap() {
+                if let Some(job) = ask.get("job") {
+                    let result =
+                        terminal(&session, serde_json::from_value(job.clone()).unwrap()).await;
+                    assert_eq!(result.state, JobState::Failed);
+                    assert!(result.error.unwrap().contains("question cancelled"));
+                } else if background {
+                    assert!(
+                        ask["error"]
+                            .as_str()
+                            .unwrap()
+                            .contains("question cancelled")
+                    );
+                } else {
+                    assert_eq!(ask["answer"], json!("yes"));
+                }
+            }
+            assert_eq!(*backgrounds.lock().unwrap(), [background]);
+            shutdown_session(session).await;
+        }
     }
 
     #[tokio::test]

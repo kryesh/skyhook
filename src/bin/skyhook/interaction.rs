@@ -27,6 +27,7 @@ pub enum PromptKind {
     Questions {
         agent: AgentId,
         questions: Vec<Question>,
+        background: bool,
     },
     Authentication(SensitivePrompt),
 }
@@ -176,10 +177,22 @@ impl QuestionHandler for UiInteraction {
         agent: AgentId,
         questions: Vec<Question>,
     ) -> Pin<Box<dyn Future<Output = Result<Value, QuestionError>> + Send + 'static>> {
+        self.ask_with_background(agent, questions, false)
+    }
+    fn ask_with_background(
+        &self,
+        agent: AgentId,
+        questions: Vec<Question>,
+        background: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, QuestionError>> + Send + 'static>> {
         let this = self.clone();
         Box::pin(async move {
             match this
-                .request(PromptKind::Questions { agent, questions })
+                .request(PromptKind::Questions {
+                    agent,
+                    questions,
+                    background,
+                })
                 .await
             {
                 Ok(PromptResponse::Questions(value)) => Ok(value),

@@ -72,14 +72,32 @@ pub struct Menu {
 impl Menu {
     pub fn filtered(&self) -> Vec<&Item> {
         let query = self.input.text.to_lowercase();
-        self.items
+        let commands = matches!(self.kind, MenuKind::Commands);
+        let query = if commands {
+            query.trim_start_matches('/')
+        } else {
+            &query
+        };
+        let query = if commands && query == "models" {
+            "model"
+        } else {
+            query
+        };
+        let mut items: Vec<_> = self
+            .items
             .iter()
             .filter(|i| {
-                format!("{} {}", i.label, i.detail)
-                    .to_lowercase()
-                    .contains(&query)
+                (commands && i.value.contains(query))
+                    || format!("{} {}", i.label, i.detail)
+                        .to_lowercase()
+                        .contains(query)
             })
-            .collect()
+            .collect();
+        if commands {
+            // An advertised /resume must select that action, not Resume session.
+            items.sort_by_key(|item| item.value != query);
+        }
+        items
     }
 }
 
@@ -442,7 +460,7 @@ impl App {
                 "Mouse: click agent or tool, scroll, drag text then copy.\n",
                 "The workspace and session ID are plain text; use terminal selection to copy them.\n",
                 "Themes preview while navigating; Escape cancels and Enter saves.\n",
-                "Ctrl+X Y copies through the terminal clipboard (OSC 52).\n\n",
+                "Copy message uses the terminal clipboard (OSC 52).\n\n",
                 "Settings: {}",
             ), self.keys.help(), state::config_path().display())),
             "" => {}
@@ -865,17 +883,48 @@ mod tests {
                 .detail,
             "Alt+M"
         );
-        for (query, expected) in [("ALT+N", "new"), ("new SESSION", "new"), ("alt+m", "model")] {
+        for (query, expected) in [
+            ("ALT+N", "new"),
+            ("new SESSION", "new"),
+            ("alt+m", "model"),
+            ("attention", "attention"),
+            ("/ATTENTION", "attention"),
+            ("retry", "retry"),
+            ("thinking", "thinking"),
+            ("sessions", "sessions"),
+            ("agents", "agents"),
+            ("themes", "themes"),
+            ("exit", "exit"),
+        ] {
             menu.input.text = query.into();
             let filtered = menu.filtered();
             assert_eq!(filtered.len(), 1, "query: {query}");
             assert_eq!(filtered[0].value, expected);
         }
+        menu.input.text = "/models".into();
+        assert_eq!(menu.filtered()[0].value, "model");
         menu.input.text = "ctrl+x n".into();
         assert!(
             menu.filtered().is_empty(),
             "overridden defaults must not remain searchable"
         );
+        for (id, _, _) in COMMANDS {
+            if hidden.contains(id) {
+                continue;
+            }
+            menu.input.text = format!("/{id}");
+            assert_eq!(menu.filtered()[0].value, *id, "exact command: {id}");
+        }
+        // Typing /resume must run the queue action, not open Resume session.
+        app.menu = None;
+        app.paused = true;
+        key(&mut app, KeyCode::Char('/'), M::NONE);
+        for c in "resume".chars() {
+            key(&mut app, KeyCode::Char(c), M::NONE);
+        }
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert!(!app.paused);
+        assert!(app.menu.is_none());
     }
     #[tokio::test]
     async fn menu_loads_only_fill_the_originating_open_menu() {

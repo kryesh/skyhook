@@ -102,7 +102,8 @@ state; it is not cumulative usage. Missing context data appears as `—`.
 
 ## Keyboard and mouse
 
-`Ctrl+X` is a leader: release it, then press the next key within two seconds.
+The shortcuts below are defaults; configurable actions use your overrides in the command palette
+and `/help`. `Ctrl+X` is a leader: release it, then press the next key within two seconds.
 
 | Shortcut | Action |
 | --- | --- |
@@ -110,6 +111,7 @@ state; it is not cumulative usage. Missing context data appears as `—`.
 | `Ctrl+X N`, `Ctrl+X L` | New session, session picker |
 | `Ctrl+X M`, `/model` | Model for subsequent user messages |
 | `Ctrl+X A`, `Ctrl+X I` | Agent picker, focus conversation |
+| `Ctrl+X R`, `/attention` | Reopen pending questions and permissions |
 | `/requests`, `/jobs` | Requests, jobs |
 | `Ctrl+X ↑`, `Ctrl+X ↓` | Parent, first child |
 | `Ctrl+X T` | Dark/light theme |
@@ -123,10 +125,12 @@ state; it is not cumulative usage. Missing context data appears as `—`.
 | `Home`, `End` in content | Beginning, latest |
 | `/`, `n`, `N` in content | Search, next/previous match |
 | `[`, `]` in content | Previous/next inspector tab |
-| `Esc` | Dismiss local interaction or interrupt work |
+| `Esc` | Close local UI, dismiss/cancel prompts, otherwise interrupt work |
 | `Ctrl+C` | Clear draft, otherwise interrupt/quit |
 | `Ctrl+X Q` | Quit |
 
+Type `/` in an empty composer to open the command palette. Search by command name
+(with or without `/`), label, or configured shortcut; exact command names take priority over label matches.
 The command palette omits navigation-only actions; `Ctrl+X I`, `Ctrl+X ↑`, and `Ctrl+X ↓`
 remain available to focus the conversation, select the parent, and select the first child.
 Menus use arrows, mouse hover, the mouse wheel, or `Ctrl+P/N`; Enter or Tab activates
@@ -140,19 +144,23 @@ Click agent and tool rows, scroll the relevant panel, or drag across text in use
 and tool output, then copy the selected characters with `Ctrl+X Y` (or `y` while content is focused).
 Selection supports parts of a line and multiple lines; copying preserves Unicode and code indentation
 without adding newlines at visual wraps.
-The workspace path and session ID in the top bar are plain text; use the terminal emulator’s
-selection gesture (usually Shift-drag) and copy shortcut. The bottom bar shows the model ID
-and token statistics. Copy uses the terminal's OSC 52 clipboard support. `@` attaches a workspace file; `/attach`
+The workspace path is centered in the top bar. The bottom bar shows the model ID, session ID,
+and token statistics. These are plain text; use the terminal emulator’s selection gesture
+(usually Shift-drag) and copy shortcut. Copy uses the terminal's OSC 52 clipboard support. `@` attaches a workspace file; `/attach`
 adds an image. Pastes longer than 12 lines and attached file contents appear as inline items
 at the cursor. Type before, between, or after multiple paste items; move across, select, delete,
 and undo them as single editing units. Sending or copying expands their original contents in
 place. Shorter pastes remain ordinary editable text. Use `/attachments` to inspect or remove
 paste items and images; `$EDITOR` opens the fully expanded draft for editing.
 Questions and permissions open even while inspecting the agent tree or
-conversation; open menus and search keep input focus until closed. Dismissed requests can be
-reopened with `/attention`. SSH authentication/askpass prompts take priority over questions,
-permissions, menus, and search; interrupted question drafts resume afterward. `/diagnostics`
-lists startup warnings such as skipped skills.
+conversation; open menus and search keep input focus until closed. `Esc` dismisses foreground
+questions and permissions without answering them; reopen pending requests with `Ctrl+X R`
+(or `/attention`, labelled **Reopen questions and permissions** in the palette).
+Submitting a new prompt rejects any pending question batches; those batches can no longer be reopened.
+For background questions and SSH authentication/askpass prompts, `Esc` cancels the request;
+cancelled requests cannot be reopened. SSH authentication prompts take priority over questions,
+permissions, menus, and search; interrupted question drafts resume afterward.
+Startup warnings, such as skipped skills, appear in the conversation as status messages.
 
 Within questions and permissions, `↑`/`↓` selects an answer, `PageUp`/`PageDown` scrolls
 the prompt text, and `Ctrl+PageUp`/`Ctrl+PageDown` scrolls long answer descriptions.

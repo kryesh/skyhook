@@ -10,7 +10,7 @@ mod status;
 mod theme;
 mod tool_view;
 
-use super::{Args, interaction::UiInteraction};
+use super::{interaction::UiInteraction, Args};
 use app::{App, Work};
 use crossterm::{
     event::{
@@ -19,8 +19,8 @@ use crossterm::{
     },
     execute, queue,
     terminal::{
-        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
-        disable_raw_mode, enable_raw_mode,
+        disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+        EnterAlternateScreen, LeaveAlternateScreen,
     },
 };
 use futures_util::StreamExt;
@@ -120,7 +120,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Clicks and typing paint immediately. Coalesce continuous mouse/background
     // bursts to avoid flooding the terminal; this is NOT a CPU rendering budget.
-    let frame_interval = Duration::from_millis(16);
+    let frame_interval = Duration::from_millis(4);
     let mut last_draw = tokio::time::Instant::now() - frame_interval;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;

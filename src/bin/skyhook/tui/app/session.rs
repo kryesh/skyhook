@@ -43,6 +43,7 @@ impl App {
             .as_ref()
             .map(|s| s.root_agent().clone())
             .unwrap_or_else(draft_root);
+        self.toast = None;
         self.views.clear();
         self.content_cache = model::ContentCache::default();
         self.render.reset_session();

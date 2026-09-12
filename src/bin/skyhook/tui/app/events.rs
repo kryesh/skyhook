@@ -46,6 +46,7 @@ pub enum Hit {
     Composer,
     Attachments,
     Attention,
+    Queue,
     PromptChoice(usize),
     Latest,
 }
@@ -155,6 +156,14 @@ impl App {
             .is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(2))
         {
             self.leader = None;
+            self.dirty = true;
+        }
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(2))
+        {
+            self.toast = None;
             self.dirty = true;
         }
         let previous = self.prompts.front().map(|p| p.id);
@@ -402,6 +411,7 @@ impl App {
                                 Hit::Composer => self.focus = Focus::Composer,
                                 Hit::Attachments => self.command("attachments"),
                                 Hit::Attention => self.activate_prompt(),
+                                Hit::Queue => self.command("queue"),
                                 Hit::PromptChoice(index) => {
                                     self.activate_prompt();
                                     if self.prompt_choice != index && self.multiple_questions() {
