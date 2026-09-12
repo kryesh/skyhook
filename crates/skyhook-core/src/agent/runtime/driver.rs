@@ -27,16 +27,22 @@ impl SessionRuntime {
             },
             None => CancellationToken::new(),
         };
-        let completion_gate = self
-            .agents
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&id)
-            .expect("registered live agent")
-            .completion_gate
-            .clone();
+        let (completion_gate, retryable_interrupt) = {
+            let agents = self
+                .agents
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let agent = agents.get(&id).expect("registered live agent");
+            (
+                agent.completion_gate.clone(),
+                agent.retryable_interrupt.clone(),
+            )
+        };
         let mut child_done: Option<oneshot::Sender<Result<String, String>>> = None;
         let mut child_answer = None;
+        // A failed child retains its context but must not process descendant
+        // notifications as a new owner request until it is explicitly resumed.
+        let mut child_parked = false;
         let mut deferred = VecDeque::new();
         loop {
             let command = if let Some(command) = deferred.pop_front() {
@@ -52,6 +58,11 @@ impl SessionRuntime {
                     command = rx.recv() => match command { Some(command) => command, None => break },
                 }
             };
+            if is_child && child_parked && matches!(command, AgentCommand::JobsReady) {
+                // Leave durable notifications pending without rearming a failed
+                // turn or clearing its interruption marker before explicit resume.
+                continue;
+            }
             // Register before claiming/persisting a queued message: interrupt must
             // not be lost while a commit is in flight.
             let cancellation = self.begin_turn(&id);
@@ -88,7 +99,10 @@ impl SessionRuntime {
                     content,
                     done,
                     model,
-                } => (content, done, model),
+                } => {
+                    child_parked = false;
+                    (content, done, model)
+                }
                 AgentCommand::JobsReady => {
                     let content = match self
                         .pending_event_content(&id, &capabilities, &location)
@@ -189,14 +203,14 @@ impl SessionRuntime {
                     &mut deferred,
                 ) => result,
             };
-            if result.is_err() {
-                // Unclaimed queue entries remain caller-owned after an interrupt;
-                // do not silently start a new turn for them.
-                queue::reject_pending(&mut rx, &mut deferred);
-            }
             // Serialize the final mailbox check with owner forwarding. An accepted
             // update either joins this request cycle or starts a new retained turn.
             let mut completing = completion_gate.lock().await;
+            if result.is_err() {
+                // Reject under the forwarding gate too: a late queued update must
+                // not start an orphan turn after a retained child has failed.
+                queue::reject_pending(&mut rx, &mut deferred);
+            }
             if is_child && result.is_ok() {
                 while let Ok(command) = rx.try_recv() {
                     deferred.push_back(command);
@@ -229,8 +243,32 @@ impl SessionRuntime {
                 );
             }
             if is_child && result.is_err() {
-                self.interrupt_tree(&id).await;
-                // A cancelled child must not keep its command loop alive.
+                if matches!(&result, Err(HarnessError::Interrupted))
+                    && (owner_cancellation.is_cancelled()
+                        || !retryable_interrupt.load(Ordering::Acquire))
+                {
+                    // Explicit job/tree cancellation is deliberately final. A
+                    // session-turn interrupt only cancels `cancellation` and is
+                    // retained below as a retryable Interrupted child job.
+                    if let Some(done) = child_done.take() {
+                        let _ = done.send(
+                            result
+                                .as_ref()
+                                .map(Clone::clone)
+                                .map_err(ToString::to_string),
+                        );
+                    }
+                    let _ = self
+                        .store
+                        .append(id.clone(), SessionEvent::AgentInterrupted)
+                        .await;
+                    break;
+                }
+                // A provider/turn failure is terminal for this invocation, not for
+                // the retained child. Keep its command loop, provider session, and
+                // projected history alive so the owning job can restart it.
+                child_parked = true;
+                *completing = false;
                 if let Some(done) = child_done.take() {
                     let _ = done.send(
                         result
@@ -239,11 +277,7 @@ impl SessionRuntime {
                             .map_err(ToString::to_string),
                     );
                 }
-                let _ = self
-                    .store
-                    .append(id.clone(), SessionEvent::AgentInterrupted)
-                    .await;
-                break;
+                continue;
             }
             if is_child {
                 child_answer = result.as_ref().ok().cloned();
@@ -428,6 +462,359 @@ mod tests {
             assert!(!system.contains("compaction"));
             assert!(system.contains("Use job_output to retrieve truncated results."));
             assert!(!system.contains("Continue with the returned"));
+        }
+    }
+
+    async fn within_timeout<T>(future: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .expect("test operation completed within five seconds")
+    }
+
+    #[tokio::test]
+    async fn session_resume_restarts_all_interrupted_children_without_restarting_waiting_parent() {
+        #[derive(Clone)]
+        struct TwoChildrenProvider {
+            calls: Arc<AtomicUsize>,
+            release: Arc<tokio::sync::Semaphore>,
+            requests: Arc<StdMutex<Vec<ModelRequest>>>,
+        }
+        impl Provider for TwoChildrenProvider {
+            fn open_context(&self, _: String) -> Result<Box<dyn ProviderContext>, ProviderError> {
+                Ok(Box::new(self.clone()))
+            }
+        }
+        impl ProviderContext for TwoChildrenProvider {
+            fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                self.requests.lock().unwrap().push(request);
+                let release = self.release.clone();
+                Box::pin(async move {
+                    if matches!(call, 1 | 2) {
+                        return Ok(Box::pin(stream::pending()) as ResponseStream);
+                    }
+                    if matches!(call, 3 | 4) {
+                        release.acquire().await.unwrap().forget();
+                    }
+                    let chunks = if call == 0 {
+                        response((0..2).map(|index| AssistantContent::tool_call(
+                            format!("agent-{index}"), index,
+                            ToolCall { id: format!("agent-{index}"), name: "agent".into(),
+                                arguments: json!({"prompt":format!("child task {index}"), "depth":0}) },
+                        )).collect())
+                    } else if matches!(call, 3 | 4) {
+                        answer("child recovered")
+                    } else {
+                        answer("parent done")
+                    };
+                    Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))) as ResponseStream)
+                })
+            }
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let harness = test_harness(
+            workspace.path(),
+            sessions.path(),
+            Arc::new(TwoChildrenProvider {
+                calls: calls.clone(),
+                release: release.clone(),
+                requests: requests.clone(),
+            }),
+        )
+        .await;
+        let session = harness.new_session().await.unwrap();
+        let parent_session = session.clone();
+        let parent =
+            tokio::spawn(async move { parent_session.prompt("delegate both tasks").await });
+        within_timeout(async {
+            while calls.load(Ordering::SeqCst) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let original_jobs = session.runtime.jobs.list(&session.root).await;
+        assert_eq!(original_jobs.len(), 2);
+        assert_eq!(
+            session.interrupt().await,
+            2,
+            "interrupt children, not the waiting parent"
+        );
+        assert!(!parent.is_finished());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // Resume immediately, even if cancellation has not yet been journaled as
+        // Interrupted by the child worker. No second click or polling is required.
+        assert_eq!(within_timeout(session.continue_turn()).await.unwrap(), "");
+        within_timeout(async {
+            while calls.load(Ordering::SeqCst) < 5 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            !parent.is_finished(),
+            "resume must leave the original parent wait pending"
+        );
+        let records = session.runtime.store.records().await;
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(
+                    record.event,
+                    SessionEvent::JobFinished {
+                        state: crate::job::JobState::Interrupted,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.agent == session.root
+                    && matches!(record.event, SessionEvent::ModelRequested { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(
+                    record.event,
+                    SessionEvent::AgentStarted {
+                        owner_job: Some(_),
+                        ..
+                    }
+                ))
+                .count(),
+            2,
+            "continuation must not create replacement agents"
+        );
+        let resumed_jobs = session.runtime.jobs.list(&session.root).await;
+        assert_eq!(
+            resumed_jobs.iter().map(|job| job.id).collect::<Vec<_>>(),
+            original_jobs.iter().map(|job| job.id).collect::<Vec<_>>()
+        );
+        assert!(
+            resumed_jobs
+                .iter()
+                .all(|job| job.state == crate::job::JobState::Running)
+        );
+        {
+            let requests = requests.lock().unwrap();
+            for request in &requests[3..5] {
+                let history = request_history(request);
+                let text = serde_json::to_string(history).unwrap();
+                assert_eq!(text.matches("child task").count(), 1);
+                assert!(
+                    !history
+                        .iter()
+                        .any(|message| matches!(message, Message::User(content)
+                    if content.iter().any(|part| matches!(part, UserContent::ParentInput { .. }))))
+                );
+            }
+        }
+        release.add_permits(2);
+        assert_eq!(
+            within_timeout(parent).await.unwrap().unwrap(),
+            "parent done"
+        );
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_child_send_preserves_the_parents_pending_wait() {
+        #[derive(Clone)]
+        struct FailChildProvider {
+            script: ScriptedProvider,
+            calls: Arc<AtomicUsize>,
+            aborted: bool,
+        }
+        impl Provider for FailChildProvider {
+            fn open_context(&self, _: String) -> Result<Box<dyn ProviderContext>, ProviderError> {
+                Ok(Box::new(self.clone()))
+            }
+        }
+        impl ProviderContext for FailChildProvider {
+            fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    self.script.requests.lock().unwrap().push(request);
+                    if self.aborted {
+                        let mut chunks = answer("partial child answer");
+                        *chunks.last_mut().unwrap() = ResponseChunk::ResponseEnded {
+                            stop_reason: StopReason::Aborted,
+                        };
+                        return Box::pin(async move {
+                            Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok)))
+                                as ResponseStream)
+                        });
+                    }
+                    Box::pin(async {
+                        Err(ProviderError {
+                            retry_after: None,
+                            kind: crate::provider::ProviderErrorKind::Authentication,
+                            message: "fixture permanent failure".into(),
+                        })
+                    })
+                } else {
+                    self.script.invoke(request)
+                }
+            }
+        }
+        for aborted in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            let sessions = tempfile::tempdir().unwrap();
+            let requests = Arc::new(StdMutex::new(Vec::new()));
+            let release = Arc::new(tokio::sync::Semaphore::new(0));
+            let gate = release.clone();
+            let mut tools = crate::tool::ToolRegistryBuilder::default();
+            tools
+                .register_dynamic(
+                    "wait_fixture",
+                    "Wait for the test gate",
+                    json!({"type":"object"}),
+                    crate::tool::ToolOptions::default(),
+                    move |_, _| {
+                        let gate = gate.clone();
+                        async move {
+                            gate.acquire().await.unwrap().forget();
+                            Ok(crate::tool::ToolOutput::new(json!("released")))
+                        }
+                    },
+                )
+                .unwrap();
+            let harness = test_builder(
+                workspace.path(),
+                sessions.path(),
+                Arc::new(FailChildProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    aborted,
+                    script: scripted_provider(
+                        &requests,
+                        [
+                            response(vec![AssistantContent::tool_call(
+                                "wait",
+                                0,
+                                ToolCall {
+                                    id: "wait".into(),
+                                    name: "wait_fixture".into(),
+                                    arguments: json!({}),
+                                },
+                            )]),
+                            answer("child recovered"),
+                            answer("parent done"),
+                            answer("parent done"),
+                        ],
+                    )
+                    .as_ref()
+                    .clone(),
+                }),
+            )
+            .tools(tools.build())
+            .build()
+            .await
+            .unwrap();
+            let session = harness.new_session().await.unwrap();
+            let parent_session = session.clone();
+            let parent = tokio::spawn(async move { parent_session.prompt("wait for input").await });
+            let wait_job = within_timeout(async {
+                loop {
+                    let jobs = session.runtime.jobs.list(&session.root).await;
+                    if let Some(job) = jobs.into_iter().find(|job| {
+                        job.tool == "wait_fixture" && job.state == crate::job::JobState::Running
+                    }) {
+                        break job.id;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            let launched = session
+                .runtime
+                .executor
+                .execute(
+                    session.root.clone(),
+                    "agent",
+                    json!({"prompt":"retain my task", "bg":true}),
+                    None,
+                )
+                .await
+                .unwrap();
+            let job = launched.job;
+            let failed = session
+                .runtime
+                .jobs
+                .wait(job, Some(Duration::from_secs(5)), true)
+                .await
+                .unwrap();
+            assert_eq!(failed.state, crate::job::JobState::Failed);
+            let child = session.root.child(1);
+            assert_eq!(requests.lock().unwrap().len(), 2, "no automatic replay");
+            if aborted {
+                assert_eq!(failed.error.as_deref(), Some("provider aborted response"));
+                assert!(session.runtime.agents.read().unwrap().contains_key(&child));
+            }
+            let resumed = session
+                .run_script(format!(
+                    "return tool.job({job}).send({{value:'try again'}});"
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resumed.value["value"]["accepted"], true);
+            let recovered = session
+                .runtime
+                .jobs
+                .wait(job, Some(Duration::from_secs(5)), true)
+                .await
+                .unwrap();
+            assert_eq!(recovered.state, crate::job::JobState::Completed);
+            assert_eq!(recovered.output, Some(json!("child recovered")));
+            assert!(
+                !parent.is_finished(),
+                "child retry must not complete the parent's wait"
+            );
+            assert_eq!(
+                session.runtime.jobs.snapshot(wait_job).await.unwrap().state,
+                crate::job::JobState::Running
+            );
+            let records = session.runtime.store.records().await;
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| record.agent == session.root
+                        && matches!(record.event, SessionEvent::ModelRequested { .. }))
+                    .count(),
+                1,
+                "no new parent request before its pending wait is released"
+            );
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| record.agent == child
+                        && matches!(record.event, SessionEvent::AgentStarted { .. }))
+                    .count(),
+                1
+            );
+            let history = {
+                let requests = requests.lock().unwrap();
+                serde_json::to_string(&request_history(&requests[2])).unwrap()
+            };
+            assert_eq!(history.matches("retain my task").count(), 1);
+            assert_eq!(history.matches("try again").count(), 1);
+            assert_eq!(
+                history.matches("partial child answer").count(),
+                usize::from(aborted)
+            );
+            release.add_permits(1);
+            assert_eq!(
+                within_timeout(parent).await.unwrap().unwrap(),
+                "parent done"
+            );
+            session.shutdown().await.unwrap();
         }
     }
 

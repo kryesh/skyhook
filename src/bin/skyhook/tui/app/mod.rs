@@ -302,6 +302,47 @@ pub(super) mod tests {
         app.set_session(Some(session), snapshot);
         (root, app)
     }
+    /// A deterministic terminal failure, unlike a refused connection, which is
+    /// transient and now retries until cancellation.
+    pub(super) async fn permanent_failure_fixture() -> (tempfile::TempDir, App) {
+        use skyhook::provider::protocol::ModelRequest;
+        use skyhook::provider::{
+            Provider, ProviderContext, ProviderError, ProviderErrorKind, ProviderFuture,
+        };
+        struct Rejected;
+        impl Provider for Rejected {
+            fn open_context(&self, _: String) -> Result<Box<dyn ProviderContext>, ProviderError> {
+                Ok(Box::new(Self))
+            }
+        }
+        impl ProviderContext for Rejected {
+            fn invoke(&mut self, _: ModelRequest) -> ProviderFuture {
+                Box::pin(async {
+                    Err(ProviderError {
+                        kind: ProviderErrorKind::Authentication,
+                        message: "fixture credentials rejected".into(),
+                        retry_after: None,
+                    })
+                })
+            }
+        }
+        let (root, mut app) = draft_fixture().await;
+        let harness = app
+            .launch
+            .config
+            .harness_builder(&app.launch.workspace, &app.launch.model)
+            .unwrap()
+            .provider("test", Arc::new(Rejected))
+            .session_root(&app.launch.sessions)
+            .shim_catalog(app.launch.catalog.clone())
+            .build()
+            .await
+            .unwrap();
+        let session = harness.new_session().await.unwrap();
+        let snapshot = session.observe().await.snapshot;
+        app.set_session(Some(session), snapshot);
+        (root, app)
+    }
     pub(super) async fn next_lifecycle(rx: &mut mpsc::UnboundedReceiver<Work>) -> Work {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {

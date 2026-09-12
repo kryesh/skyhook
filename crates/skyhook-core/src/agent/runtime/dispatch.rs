@@ -72,6 +72,7 @@ impl SessionRuntime {
                     model_profile: model_profile.clone(),
                     sender: tx.clone(),
                     cancellation: CancellationToken::new(),
+                    retryable_interrupt: Arc::new(AtomicBool::new(false)),
                     available_depth,
                     completion_gate: Arc::new(Mutex::new(true)),
                 },
@@ -256,12 +257,13 @@ impl SessionRuntime {
 
     pub(super) fn begin_turn(&self, id: &AgentId) -> CancellationToken {
         let cancellation = CancellationToken::new();
-        self.agents
+        let mut agents = self
+            .agents
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_mut(id)
-            .expect("running agents are registered")
-            .cancellation = cancellation.clone();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let agent = agents.get_mut(id).expect("running agents are registered");
+        agent.retryable_interrupt.store(false, Ordering::Release);
+        agent.cancellation = cancellation.clone();
         cancellation
     }
 }

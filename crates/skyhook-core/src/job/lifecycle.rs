@@ -91,7 +91,10 @@ impl JobManager {
         let (agent, script) = {
             let jobs = self.inner.jobs.lock().await;
             let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
-            if entry.state.is_terminal() {
+            if entry.state.is_terminal()
+                && !(entry.state == JobState::Interrupted
+                    && matches!(outcome, JobOutcome::Cancelled))
+            {
                 return Err(JobError::AlreadyTerminal(id));
             }
             (entry.agent.clone(), entry.tool == "script")
@@ -164,14 +167,19 @@ impl JobManager {
         let (notify, background) = {
             let mut jobs = self.inner.jobs.lock().await;
             let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
-            if entry.state.is_terminal() {
+            if entry.state.is_terminal()
+                && !(entry.state == JobState::Interrupted && state == JobState::Cancelled)
+            {
                 return Err(JobError::AlreadyTerminal(id));
             }
             entry.state = state;
             // A terminal outcome is a new delivery even if an earlier question
             // was claimed or injected without returning through resume_input.
             entry.delivery = DeliveryState::Pending;
-            if state != JobState::Completed {
+            // Retained child agents can continue a failed or interrupted turn with
+            // the same job, identity, and projected history. Explicit cancellation
+            // remains final and drops the live continuation handler.
+            if state == JobState::Cancelled {
                 entry.resume = None;
             }
             entry.output = None;

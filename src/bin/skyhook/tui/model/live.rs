@@ -14,6 +14,17 @@ pub(super) fn working_label(
     if running {
         return None;
     }
+    // Attempt-aware requests carry status in their original journal position,
+    // including the short transition between failure and scheduled recovery.
+    if projection.active_request.get(agent).is_some_and(|request| {
+        projection.requests.get(request).is_some_and(|info| {
+            info.retry
+                .as_ref()
+                .is_some_and(super::retry::RetryState::has_error)
+        })
+    }) {
+        return None;
+    }
     let label = match snapshot.activity.get(agent) {
         Some(AgentActivity::Working)
             if !projection
@@ -26,7 +37,10 @@ pub(super) fn working_label(
         Some(AgentActivity::Reconnecting {
             attempt,
             max_attempts,
-        }) => format!("Reconnecting · attempt {attempt} of {max_attempts}"),
+        }) => match max_attempts {
+            Some(max) => format!("Reconnecting · attempt {attempt} of {max}"),
+            None => format!("Retrying · attempt {attempt}"),
+        },
         Some(AgentActivity::Compacting) => "Compacting".into(),
         _ => return None,
     };

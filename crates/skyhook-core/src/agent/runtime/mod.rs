@@ -3,7 +3,10 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock, RwLock as StdRwLock, Weak},
+    sync::{
+        Arc, OnceLock, RwLock as StdRwLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use futures_util::{StreamExt as _, future::join_all};
@@ -54,8 +57,6 @@ use wait::AgentSender;
 
 const AGENT_CHANNEL_CAPACITY: usize = 64;
 /// Initial generation plus two reconnects. Compaction has its own additive budget.
-const MAX_CONNECTION_ATTEMPTS: u8 = 3;
-const MAX_MODEL_ATTEMPTS: u8 = MAX_CONNECTION_ATTEMPTS + compact::MAX_PROVIDER_ATTEMPTS - 1;
 mod builder;
 mod dispatch;
 mod driver;
@@ -130,6 +131,7 @@ struct LiveAgent {
     model_profile: String,
     sender: AgentSender,
     cancellation: CancellationToken,
+    retryable_interrupt: Arc<AtomicBool>,
     available_depth: usize,
     completion_gate: Arc<Mutex<bool>>,
 }

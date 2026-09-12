@@ -21,9 +21,8 @@ impl SessionRuntime {
         let mut context_sequence = None;
         let mut final_text = String::new();
         let mut force_compaction = false;
-        let mut provider_attempt = 0u8;
-        let mut connection_attempt = 1u8;
-        let mut compaction_attempt = 1u8;
+        let mut provider_attempt = 0u64;
+        let mut context_failures = 0u8;
         'requests: loop {
             if let Some(sender) = self.agent_sender(agent) {
                 sender.flush_events(cancellation).await?;
@@ -39,8 +38,7 @@ impl SessionRuntime {
                 // A model change can replace both the template and its token meter.
                 context_sequence = None;
                 provider_attempt = 0;
-                connection_attempt = 1;
-                compaction_attempt = 1;
+                context_failures = 0;
             }
             if cancellation.is_cancelled() {
                 return Err(HarnessError::Interrupted);
@@ -105,35 +103,45 @@ impl SessionRuntime {
                     .expect("runtime state is present")
                     .clone(),
             });
-            // Freeze the request across connection recovery. Input/notifications and
+            // Freeze the request across provider recovery. Input/notifications and
             // model changes remain queued until the next normal request boundary.
             // Partial streamed output is display-only: only a fully assembled response
             // below is committed and allowed to execute Skyhook tools.
             let input_estimate = compaction::estimate_request(&request);
             let context_tokens = agent_context.meter.estimate(&request);
             self.store.hydrate_model_request(&mut request).await?;
+            let requested = self
+                .store
+                .append(
+                    agent.clone(),
+                    SessionEvent::ModelRequested {
+                        context,
+                        messages: messages.clone(),
+                        purpose: crate::session::ModelPurpose::Agent,
+                    },
+                )
+                .await?;
+            let mut transient_attempt = 0u64;
             let (requested, response) = 'attempts: loop {
                 if cancellation.is_cancelled() {
                     return Err(HarnessError::Interrupted);
                 }
-                let requested = self
-                    .store
-                    .append(
-                        agent.clone(),
-                        SessionEvent::ModelRequested {
-                            context,
-                            messages: messages.clone(),
-                            purpose: crate::session::ModelPurpose::Agent,
-                        },
-                    )
-                    .await?;
                 self.activity(agent, AgentActivity::Working);
                 self.events.send(RuntimeEvent::Context {
                     agent: agent.clone(),
                     tokens: context_tokens,
                     capacity: profile.max_context,
                 });
-                provider_attempt += 1;
+                provider_attempt = provider_attempt.saturating_add(1);
+                self.store
+                    .append(
+                        agent.clone(),
+                        SessionEvent::ModelAttemptStarted {
+                            request: requested.sequence,
+                            attempt: provider_attempt,
+                        },
+                    )
+                    .await?;
                 let invoked = tokio::select! {
                     response = agent_context.provider.invoke(request.clone()) => response,
                     () = cancellation.cancelled() => return Err(HarnessError::Interrupted),
@@ -149,28 +157,29 @@ impl SessionRuntime {
                             error.to_string(),
                         )
                         .await?;
-                        // Only explicitly eligible connection failures may replay an
-                        // uncommitted response. Native HTTP startup retries stay transport-owned.
+                        // The runtime alone applies the unbounded transient retry policy to an
+                        // eligible, uncommitted response; adapters do not own retry counts.
                         if error.recovery().is_some() {
+                            transient_attempt = transient_attempt.saturating_add(1);
                             self.schedule_model_recovery(
                                 &turn,
                                 requested.sequence,
-                                provider_attempt,
-                                connection_attempt,
+                                recovery::RecoveryAttempt {
+                                    model: provider_attempt,
+                                    transient: transient_attempt,
+                                },
                                 &error,
                                 agent_context.provider.as_mut(),
                             )
                             .await?;
-                            connection_attempt += 1;
                             continue 'attempts;
                         }
-                        if provider_attempt < MAX_MODEL_ATTEMPTS
-                            && compaction_attempt < compact::MAX_PROVIDER_ATTEMPTS
-                            && error.kind
-                                == crate::provider::ProviderErrorKind::ContextWindowExceeded
-                        {
+                        if error.kind == crate::provider::ProviderErrorKind::ContextWindowExceeded {
+                            context_failures += 1;
+                            if context_failures >= compact::MAX_COMPACTION_ATTEMPTS {
+                                return Err(error.into());
+                            }
                             force_compaction = true;
-                            compaction_attempt += 1;
                             continue 'requests;
                         }
                         return Err(error.into());
@@ -205,6 +214,7 @@ impl SessionRuntime {
                             )
                             .await?;
                             if error.recovery().is_some() {
+                                transient_attempt = transient_attempt.saturating_add(1);
                                 // The failed stream may own the connection mutex. Drop it
                                 // before resetting or waiting. No assistant message or tools
                                 // from this attempt have been committed/executed.
@@ -212,23 +222,25 @@ impl SessionRuntime {
                                 self.schedule_model_recovery(
                                     &turn,
                                     requested.sequence,
-                                    provider_attempt,
-                                    connection_attempt,
+                                    recovery::RecoveryAttempt {
+                                        model: provider_attempt,
+                                        transient: transient_attempt,
+                                    },
                                     &error,
                                     agent_context.provider.as_mut(),
                                 )
                                 .await?;
-                                connection_attempt += 1;
                                 continue 'attempts;
                             }
                             if !saw_content
-                                && provider_attempt < MAX_MODEL_ATTEMPTS
-                                && compaction_attempt < compact::MAX_PROVIDER_ATTEMPTS
                                 && error.kind
                                     == crate::provider::ProviderErrorKind::ContextWindowExceeded
                             {
+                                context_failures += 1;
+                                if context_failures >= compact::MAX_COMPACTION_ATTEMPTS {
+                                    return Err(error.into());
+                                }
                                 force_compaction = true;
-                                compaction_attempt += 1;
                                 continue 'requests;
                             }
                             return Err(error.into());
@@ -271,7 +283,7 @@ impl SessionRuntime {
             agent_context.projected.push((origin, assistant));
             if response.stop_reason == crate::provider::protocol::StopReason::Aborted {
                 // Preserve completed visible/replay content, but never turn a
-                // provider cancellation into a successful agent turn. The failure
+                // provider abort into a successful agent turn. The failure
                 // helper records observed usage exactly once before returning.
                 let error = "provider aborted response".to_owned();
                 self.record_model_failure(
@@ -288,7 +300,7 @@ impl SessionRuntime {
                     message: Some(origin),
                     error: Some(error),
                 });
-                return Err(HarnessError::Interrupted);
+                return Err(HarnessError::ProviderAborted);
             }
             // Child replies are already independently published at commit, even
             // when queued input will make a text-only response nonterminal. Only
@@ -351,8 +363,7 @@ impl SessionRuntime {
                 context_sequence = None;
             }
             provider_attempt = 0;
-            connection_attempt = 1;
-            compaction_attempt = 1;
+            context_failures = 0;
             if response.calls.is_empty() {
                 // Notifications arriving during this provider request must be
                 // processed before returning an answer based on earlier context.
@@ -542,7 +553,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aborted_response_preserves_visible_content_and_usage_but_settles_as_interrupted() {
+    async fn aborted_response_preserves_visible_content_and_usage_but_fails() {
         let workspace = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
         let requests = Arc::new(StdMutex::new(Vec::new()));
@@ -584,7 +595,13 @@ mod tests {
         let session = harness.new_session().await.unwrap();
         let mut events = session.runtime.events.subscribe();
         let error = session.prompt("Abort this turn.").await.unwrap_err();
-        assert!(error.to_string().contains("interrupted"));
+        assert!(
+            matches!(error, HarnessError::Agent(error) if error == HarnessError::ProviderAborted.to_string())
+        );
+        assert!(matches!(
+            session.runtime.events.observe().snapshot.activity.get(&session.root),
+            Some(AgentActivity::Failed(error)) if error == "provider aborted response"
+        ));
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert_eq!(session.usage().await, observed);
         let records = session.runtime.store.records().await;

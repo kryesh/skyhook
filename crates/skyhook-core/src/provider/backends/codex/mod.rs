@@ -55,12 +55,14 @@ impl Provider for CodexProvider {
 }
 fn error(kind: ProviderErrorKind, message: &str) -> ProviderError {
     ProviderError {
+        retry_after: None,
         kind,
         message: message.into(),
     }
 }
 fn auth_error(error: auth::AuthError) -> ProviderError {
     ProviderError {
+        retry_after: None,
         kind: ProviderErrorKind::Authentication,
         message: error.to_string(),
     }

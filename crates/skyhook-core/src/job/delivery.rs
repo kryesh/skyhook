@@ -99,10 +99,11 @@ impl JobManager {
                         entry.deliverable() || entry.background,
                         entry.state == JobState::WaitingInput,
                     ),
-                    WaitMode::Explicit { claim } => {
-                        (entry.state.is_terminal() || pending_question, claim)
-                    }
-                    WaitMode::Terminal => (entry.state.is_terminal(), false),
+                    WaitMode::Explicit { claim } => (
+                        !entry.suspended() && (entry.state.is_terminal() || pending_question),
+                        claim,
+                    ),
+                    WaitMode::Terminal => (entry.state.is_terminal() && !entry.suspended(), false),
                 };
                 let claimed_agent = if ready && claim {
                     entry.reserve_delivery(DeliveryState::Claimed)

@@ -322,20 +322,31 @@ impl App {
                 self.notice("Queued input resumed");
             }
             "retry" => {
-                if !self.busy() && matches!(
+                if self.creating || self.stopping || self.switch_restore.is_some()
+                    || !self.snapshot.activity.values().any(|activity|
+                        matches!(activity, AgentActivity::Failed(_) | AgentActivity::Interrupted))
+                {
+                    self.notice("No failed or interrupted turns to retry");
+                    return;
+                }
+                let Some(session) = self.session.clone() else { return; };
+                // Only own a new root operation if the old one has already ended.
+                // Resuming suspended children must leave a waiting parent alone.
+                let owns_operation = !self.operation && matches!(
                     self.snapshot.activity.get(self.root_agent()),
                     Some(AgentActivity::Failed(_) | AgentActivity::Interrupted),
-                ) {
-                    self.operation = true;
-                    let Some(session) = self.session.clone() else { return; };
-                    let tx = self.tx.clone();
-                    tokio::spawn(async move {
-                        let result = session.continue_turn().await.map(|_| ()).map_err(|e| e.to_string());
+                );
+                if owns_operation { self.operation = true; }
+                let tx = self.tx.clone();
+                let notices = self.root_notifier();
+                tokio::spawn(async move {
+                    let result = session.continue_turn().await.map(|_| ()).map_err(|e| e.to_string());
+                    if owns_operation {
                         let _ = tx.send(Work::Done { session: session.id(), result });
-                    });
-                } else {
-                    self.notice("No failed or interrupted root turn to retry");
-                }
+                    } else if let Err(error) = result {
+                        notices.send(error);
+                    }
+                });
             }
             "queue" => self.open(
                 "Queued follow-ups · Enter edit · Delete remove", MenuKind::Queue,
@@ -735,6 +746,81 @@ impl App {
 mod tests {
     use super::super::tests::*;
     use super::*;
+    async fn wait_for_failures(
+        session: &SessionHandle,
+        child_job: JobId,
+        count: usize,
+    ) -> ObservationSnapshot {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let snapshot = session.observe().await.snapshot;
+                let failures = snapshot
+                    .records
+                    .values()
+                    .filter(|record| {
+                        matches!(record.event, SessionEvent::JobFinished {
+                        job, state: skyhook::job::JobState::Failed, ..
+                    } if job == child_job)
+                    })
+                    .count();
+                if failures == count {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("child failures observed within ten seconds")
+    }
+
+    #[tokio::test]
+    async fn retry_children_without_selection_preserves_the_waiting_root_operation() {
+        let (_root, mut app) = permanent_failure_fixture().await;
+        let session = app.session.clone().unwrap();
+        let launched = session
+            .run_script(
+                "return await tool.agent({prompt:'Fail against the fixture provider', bg:true});",
+            )
+            .await
+            .unwrap();
+        let child_job: JobId =
+            serde_json::from_value(launched.value["value"]["id"].clone()).unwrap();
+        let failed_snapshot = wait_for_failures(&session, child_job, 1).await;
+        let root = session.root_agent().clone();
+        app.snapshot = failed_snapshot;
+        app.snapshot
+            .activity
+            .insert(root.clone(), AgentActivity::WaitingChildren);
+        assert_eq!(app.selected, root);
+        app.operation = true;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.tx = tx;
+        assert!(app.busy());
+
+        app.command("retry");
+        let snapshot = wait_for_failures(&session, child_job, 2).await;
+        assert!(!snapshot.records.values().any(|record| {
+            record.agent == root && matches!(record.event, SessionEvent::ModelRequested { .. })
+        }));
+        assert!(
+            app.operation,
+            "child retry does not replace the pending root operation"
+        );
+        assert_eq!(
+            app.snapshot.activity.get(&root),
+            Some(&AgentActivity::WaitingChildren)
+        );
+        while let Ok(work) = rx.try_recv() {
+            assert!(
+                !matches!(work, Work::Done { .. }),
+                "child retry must not finish the root operation"
+            );
+            app.work(work);
+        }
+        assert!(app.operation);
+        session.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn command_menu_keeps_configured_shortcuts_separate_and_searchable() {
         let (_root, mut app) = draft_fixture().await;

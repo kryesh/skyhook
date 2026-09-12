@@ -626,7 +626,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_authentication_abort_and_cancel_events_never_enable_recovery() {
+    async fn native_events_use_sanitized_provider_neutral_error_categories() {
         for (frame, kind) in [
             (Message::Text("not JSON SECRET".into()), ProviderErrorKind::Protocol),
             (Message::Binary(b"SECRET".to_vec().into()), ProviderErrorKind::Protocol),
@@ -652,7 +652,7 @@ pub(super) mod tests {
                 .collect::<Vec<_>>().await;
             let error = chunks.last().unwrap().as_ref().unwrap_err();
             assert_eq!(error.kind, kind);
-            assert_eq!(error.recovery(), None);
+            assert_eq!(error.recovery().is_some(), kind == ProviderErrorKind::Response);
             assert!(!format!("{error:?} {error}").contains("SECRET"));
             let session = session.lock().await;
             assert!(session.socket.is_none());

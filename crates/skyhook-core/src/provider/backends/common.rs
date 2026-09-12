@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 pub(crate) fn invalid(message: impl Into<String>) -> ProviderError {
     ProviderError {
+        retry_after: None,
         kind: ProviderErrorKind::InvalidRequest,
         message: message.into(),
     }

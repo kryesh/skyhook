@@ -107,6 +107,7 @@ impl Decoder {
                 _ => ProviderErrorKind::Response,
             };
             return Err(ProviderError {
+                retry_after: None,
                 kind,
                 message: match error_type {
                     "authentication_error" => "Anthropic authentication_error",

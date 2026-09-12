@@ -104,20 +104,27 @@ pub enum SessionEvent {
     Compaction {
         checkpoint: CompactionCheckpoint,
     },
+    /// A new attempt starts for an existing frozen logical request. This resets
+    /// its live output in host projections without changing model history.
+    ModelAttemptStarted {
+        request: u64,
+        attempt: u64,
+    },
     ModelFailed {
         request: u64,
-        attempt: u8,
+        attempt: u64,
         error: String,
     },
-    /// A failed model request will be retried after a bounded recovery delay.
+    /// A failed model request will be retried after a recovery delay.
     /// This is host-facing status, not model-visible conversation history.
     ModelRecoveryScheduled {
         /// Sequence of the failed `ModelRequested` event.
         request: u64,
         /// The next logical invocation (not an HTTP transport retry).
-        attempt: u8,
-        /// Total invocation limit, including the original attempt.
-        max_attempts: u8,
+        attempt: u64,
+        /// Historical bounded limits remain readable; None means retry indefinitely.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_attempts: Option<u64>,
         /// Backoff scheduled before the next invocation.
         delay_millis: u64,
         /// The connection failure that triggered this recovery.
@@ -283,9 +290,20 @@ mod tests {
             SessionEvent::ModelRecoveryScheduled {
                 request: 7,
                 attempt: 2,
-                max_attempts: 3,
+                max_attempts: Some(3),
                 delay_millis: 1000,
                 error: "connection lost".into(),
+            },
+            SessionEvent::ModelRecoveryScheduled {
+                request: 7,
+                attempt: 300,
+                max_attempts: None,
+                delay_millis: 30_000,
+                error: "provider HTTP 429 error [code=rate_limit_exceeded]".into(),
+            },
+            SessionEvent::ModelAttemptStarted {
+                request: 7,
+                attempt: 300,
             },
         ];
         let records: Vec<_> = events

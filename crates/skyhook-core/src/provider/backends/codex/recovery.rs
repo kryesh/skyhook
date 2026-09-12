@@ -74,7 +74,7 @@ mod tests {
     use tungstenite::error::ProtocolError;
 
     #[test]
-    fn recovery_is_structured_codex_only_and_sanitized() {
+    fn codex_errors_are_classified_and_sanitized() {
         for category in [
             CodexWebSocketError::EndOfStream,
             CodexWebSocketError::Closed,
@@ -87,19 +87,6 @@ mod tests {
             let error = websocket_error(category);
             assert_eq!(error.kind, ProviderErrorKind::CodexWebSocket(category));
             assert_eq!(error.recovery(), Some(ProviderRecovery::ResetContext));
-        }
-        for kind in [
-            ProviderErrorKind::Authentication,
-            ProviderErrorKind::RateLimited,
-            ProviderErrorKind::Timeout,
-            ProviderErrorKind::Transport,
-            ProviderErrorKind::Protocol,
-            ProviderErrorKind::InvalidRequest,
-            ProviderErrorKind::ContextWindowExceeded,
-            ProviderErrorKind::Response,
-        ] {
-            // Even an identical message cannot grant replay eligibility.
-            assert_eq!(error(kind, "Codex WebSocket read failed").recovery(), None);
         }
         for operation in [
             CodexWebSocketError::Read,
@@ -144,7 +131,10 @@ mod tests {
             close_error(Some(CloseCode::from(4001))).kind,
             ProviderErrorKind::Response
         );
-        assert_eq!(close_error(Some(CloseCode::from(4001))).recovery(), None);
+        assert_eq!(
+            close_error(Some(CloseCode::from(4001))).recovery(),
+            Some(ProviderRecovery::ResetContext)
+        );
         for code in [
             None,
             Some(CloseCode::Normal),

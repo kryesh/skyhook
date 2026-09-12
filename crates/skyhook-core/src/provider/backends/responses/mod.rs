@@ -4,8 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Value, json};
 
 use super::common::reasoning_envelope;
+#[cfg(test)]
+use crate::provider::ProviderErrorKind;
 use crate::provider::{
-    ProviderError, ProviderErrorKind,
+    ProviderError,
     protocol::{
         BlockContent, BlockKind, ContentDelta, ItemKind, ResponseChunk, StopReason, ToolCall, Usage,
     },

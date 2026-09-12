@@ -277,7 +277,7 @@ impl JobManager {
             .lock()
             .await
             .values()
-            .any(|entry| &entry.agent == owner && !entry.state.is_terminal())
+            .any(|entry| &entry.agent == owner && (!entry.state.is_terminal() || entry.suspended()))
     }
 
     pub async fn is_background(&self, id: JobId) -> Result<bool, JobError> {

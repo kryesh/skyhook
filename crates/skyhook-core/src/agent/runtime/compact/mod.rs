@@ -10,12 +10,13 @@ use crate::{
     session::{ContextMessage, EventRecord, ModelPurpose, SessionEvent},
 };
 
+/// Context/validation recovery is bounded independently of transient retries.
+pub(super) const MAX_COMPACTION_ATTEMPTS: u8 = 3;
+
 mod checkpoint;
 mod retention;
 mod summary;
 use checkpoint::CompactionInput;
-
-pub(super) const MAX_PROVIDER_ATTEMPTS: u8 = 3;
 
 pub(super) async fn retry_delay(
     cancellation: &crate::job::CancellationToken,
@@ -112,7 +113,8 @@ impl SessionRuntime {
         max_context: u64,
     ) -> Result<(), HarnessError> {
         let mut launches = self.jobs.active_launches(turn.agent).await;
-        for attempt in 1..=MAX_PROVIDER_ATTEMPTS {
+        let mut model_attempt = 0;
+        for attempt in 1..=MAX_COMPACTION_ATTEMPTS {
             let mut request_sequence = None;
             match self
                 .compact_inner(
@@ -122,6 +124,7 @@ impl SessionRuntime {
                         context,
                         request: input,
                         max_context,
+                        model_attempt: &mut model_attempt,
                     },
                     &mut request_sequence,
                     &mut launches,
@@ -136,14 +139,14 @@ impl SessionRuntime {
                             SessionEvent::CompactionFailed {
                                 request: request_sequence,
                                 error: format!(
-                                    "attempt {attempt}/{MAX_PROVIDER_ATTEMPTS}: {error}"
+                                    "attempt {attempt}/{MAX_COMPACTION_ATTEMPTS}: {error}"
                                 ),
                             },
                         )
                         .await?;
                     let retryable =
                         request_sequence.is_some() && matches!(&error, HarnessError::Compaction(_));
-                    if !retryable || attempt == MAX_PROVIDER_ATTEMPTS {
+                    if !retryable || attempt == MAX_COMPACTION_ATTEMPTS {
                         return Err(error);
                     }
                     retry_delay(turn.cancellation, attempt).await?;
@@ -254,6 +257,7 @@ mod tests {
                     )
                 };
                 let error = || ProviderError {
+                    retry_after: None,
                     kind: ProviderErrorKind::Transport,
                     message: "deterministic transient failure".into(),
                 };
@@ -332,6 +336,7 @@ mod tests {
                     }
                 } else if provider.overflow.swap(false, Ordering::SeqCst) {
                     vec![Err(ProviderError {
+                        retry_after: None,
                         kind: ProviderErrorKind::ContextWindowExceeded,
                         message: "prompt is too long".into(),
                     })]
@@ -595,10 +600,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permanent_summary_failures_preserve_history_without_provider_replays_or_tools() {
+    async fn exhausted_summary_failures_preserve_history_and_never_execute_tools() {
         // Exhaustive malformed-field cases belong to the continuation parser tests.
         // Here retain provider, truncation, tool-execution and semantic rollback contracts.
-        for failure in ["stream", "truncated", "tool_call", "blank_todo"] {
+        for failure in ["truncated", "tool_call", "blank_todo"] {
             let fixture = Fixture::new().await;
             let runtime = &fixture.session.runtime;
             let agent = &fixture.session.root;
@@ -614,10 +619,6 @@ mod tests {
                 .unwrap();
             let mut invalid = summary_value();
             match failure {
-                "stream" => fixture
-                    .provider
-                    .summary_stream_failures
-                    .store(10, Ordering::SeqCst),
                 "truncated" => fixture.provider.truncate.store(true, Ordering::SeqCst),
                 "tool_call" => fixture.provider.summary_tools.store(true, Ordering::SeqCst),
                 "blank_todo" => invalid["todos"] = json!([{"text":" \t", "status":"pending"}]),
@@ -644,7 +645,7 @@ mod tests {
             }
             assert_eq!(
                 fixture.provider.requests.lock().unwrap().len(),
-                if failure == "stream" { 2 } else { 4 },
+                4,
                 "{failure}"
             );
             assert_eq!(

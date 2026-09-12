@@ -20,6 +20,7 @@ pub(super) struct CompactionInput<'a> {
     pub(super) context: u64,
     pub(super) request: &'a ModelRequest,
     pub(super) max_context: u64,
+    pub(super) model_attempt: &'a mut u64,
 }
 
 impl SessionRuntime {
@@ -35,6 +36,7 @@ impl SessionRuntime {
             context,
             request: input,
             max_context,
+            model_attempt,
         } = source;
         let agent = turn.agent;
         let records = self.store.records().await;
@@ -141,7 +143,13 @@ impl SessionRuntime {
             .hydrate_model_request(&mut summary_request)
             .await?;
         let continuation = self
-            .summarize(turn, provider, summary_request, requested.sequence)
+            .summarize(
+                turn,
+                provider,
+                summary_request,
+                requested.sequence,
+                model_attempt,
+            )
             .await?;
         let mut message = continuation.message;
         for launch in self.jobs.active_launches(agent).await {

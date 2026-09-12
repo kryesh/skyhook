@@ -85,27 +85,45 @@ capacity, not an assumed aggregate. See the
 [llama.cpp server documentation](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
 for server options.
 
-## Model connection recovery
+## Model failure recovery
 
-If a Codex WebSocket connection is interrupted before its response is committed, Skyhook
-reconnects and requests a fresh response using the same committed history. Recovery stays within
-the existing root turn or child job: completed tools are not rerun, and tool calls from an
-interrupted response are never executed. Partial streamed output is marked as interrupted and
-is not added to the model's history. Inputs received during recovery wait until the next normal
-request boundary.
+Every provider uses the same runtime-owned policy: **transient/network failures retry
+until success or cancellation**, with no attempt limit. This covers startup and streaming
+transport failures, timeouts, rate limits, and other errors explicitly classified as
+transient by the provider adapter. Recovery is based on the normalized error category,
+never retry-sounding text in an upstream message. Authentication, invalid-request, and
+protocol errors remain terminal. Upstream error details are sanitized before journaling.
 
-Connection recovery allows three attempts in total, with cancellation-aware delays of roughly
-500 ms and 1.5 s plus up to 100 ms jitter. The UI and session journal show scheduled reconnects;
-a child is marked failed only after recovery is exhausted. Context-window compaction has a
-separate, additive budget, with at most five attempts at a logical agent response when both
-recovery paths are needed (excluding compaction's separate summary requests). These limits
-reset after a successful model response.
+A valid server `Retry-After` hint—delay-seconds or an HTTP-date—sets the delay,
+even when it exceeds 30 seconds. Past dates mean no delay; malformed or ambiguous
+headers fall back to the runtime policy. HTTP throttling during a WebSocket handshake
+also honors this delay instead of immediately switching to HTTP.
+Without a valid hint, delays grow exponentially: **1s, 2s, 4s, 8s, 16s, 30s**, then
+remain at 30s. This backoff counts only transient failures of the frozen request;
+rebuilding a request after compaction or validation starts the fallback at 1s again.
+Cancellation interrupts the wait immediately.
 
-Recovery applies to eligible Codex WebSocket close/EOF, I/O, write, ping, and read-timeout
-failures—not authentication failures, invalid requests, malformed protocol responses, explicit
-provider aborts, or user cancellation. Native HTTP startup retry and Codex handshake fallback
-policies are unchanged. Reconnecting clears the failed connection and its continuation state,
-so the next attempt sends full history rather than continuing the interrupted response.
+The exact request is frozen across transient retries: queued input and notifications
+wait until that response completes. Completed tools are not rerun; partial text and
+tool calls from failed attempts are discarded rather than committed or executed.
+Retries are internal to the runtime: failure details and retry status are not presented
+to agents, including the owning parent agent. The session journal and user interface
+may still show attempts and scheduled recovery. Only a terminal non-retryable failure
+is committed and presented as a failure. Its sanitized error is returned unchanged,
+without retry bookkeeping.
+
+Context-window overflow follows a separate compaction path, bounded to **three
+context failures** per logical response. Summarization validation likewise permits
+**three attempts**. Transient retries consume neither budget: summary requests also
+remain frozen and retry indefinitely under the shared backoff policy until they
+succeed or are cancelled. Invalid summary/checkpoint retries rebuild against current
+runtime state and remain bounded independently.
+
+HTTP transports perform one attempt per runtime invocation, with fresh startup and
+read-idle deadlines. There is no additional provider-specific HTTP retry loop. Codex
+WebSocket handshake fallback remains transport negotiation, not another retry budget.
+Recovery clears failed connection and continuation state so the next attempt sends
+full history rather than continuing the interrupted response.
 
 This prevents duplicate **Skyhook tool execution**, not duplicate provider inference: the
 provider may have processed the interrupted request, and additional usage may be incurred.
@@ -175,18 +193,18 @@ extensions. Server-side tool and reasoning parsers/templates must be configured 
 Skyhook does not infer them from model names. The current `max_completion_tokens` and usage-stream
 fields are shared by OpenAI, llama.cpp, vLLM, and SGLang; no automatic parameter renaming is applied.
 
-Native HTTP transport owns startup retries, with **at most three HTTP attempts** for pre-response connection/send
-failures, startup/header timeouts, and transient HTTP 408/429/500/502/503/504 responses. Each attempt receives a fresh startup
-deadline; three startup timeouts can therefore take about 30 minutes at the defaults, plus bounded
-backoff. Exhausted transient failures include the HTTP attempt count. Short `Retry-After` delays are honored;
-long or unparseable delays are returned to the caller rather than retried early. Cancellation drops
-the pending request or retry wait. The server may continue work if it does not honor disconnects.
+Native HTTP transports make one attempt per invocation; transient failures flow to the
+provider-independent runtime recovery policy described above. Each invocation receives a fresh
+startup deadline, so three startup timeouts can take about 30 minutes at the defaults, plus
+bounded runtime backoff. HTTP `Retry-After` headers do not create a separate retry budget or
+transport delay policy. Cancellation drops the pending request, stream, or runtime retry wait.
+The server may continue work if it does not honor disconnects.
 
-After successful HTTP headers are accepted, malformed SSE streams, read-idle timeouts, and partial
-output are not replayed. Deterministic protocol/configuration failures and refusals are not regenerated
-by the agent loop. Context-overflow recovery remains a separate compaction path. Codex retains
-single-attempt HTTP; eligible WebSocket interruptions use the bounded runtime recovery described
-above. Aborted or truncated tool generation never makes incomplete arguments executable.
+After successful HTTP headers are accepted, transport/read-idle failures remain transient and
+may retry the frozen request, discarding failed partial output. Malformed SSE/protocol responses
+are permanent; context overflow follows the separate bounded compaction path. Codex uses the
+same attempt count and eligibility, while preserving its WebSocket handshake fallback.
+Aborted or truncated tool generation never makes incomplete arguments executable.
 
 ## Migrating older configurations
 

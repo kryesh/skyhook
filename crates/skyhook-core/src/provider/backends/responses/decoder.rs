@@ -305,21 +305,16 @@ impl Decoder {
 }
 
 pub(super) fn api_error(error: &Value) -> ProviderError {
-    let code = error.get("code").and_then(Value::as_str).unwrap_or("");
-    let kind = match code {
-        "context_length_exceeded" | "context_window_exceeded" => {
-            ProviderErrorKind::ContextWindowExceeded
-        }
-        "invalid_api_key" | "authentication_error" => ProviderErrorKind::Authentication,
-        "rate_limit_exceeded" | "rate_limit_error" => ProviderErrorKind::RateLimited,
-        "timeout" | "request_timeout" => ProviderErrorKind::Timeout,
-        _ => ProviderErrorKind::Response,
-    };
-    // Never echo upstream messages or arbitrary codes: they may reflect prompts
-    // or credentials. Only the locally classified category is safe to surface.
+    let kind = super::super::errors::classify_error(None, error).kind;
+    // Keep useful machine diagnostics, but never arbitrary upstream messages.
+    let mut message = format!("Responses request failed ({kind:?})");
+    if let Some(code) = super::super::errors::safe_error_code(error) {
+        message.push_str(&format!(" [code={code}]"));
+    }
     ProviderError {
         kind,
-        message: format!("Responses request failed ({kind:?})"),
+        message,
+        retry_after: None,
     }
 }
 
@@ -327,6 +322,33 @@ pub(super) fn api_error(error: &Value) -> ProviderError {
 mod tests {
     use super::*;
     use crate::provider::protocol::ResponseAssembler;
+
+    #[test]
+    fn error_adapter_preserves_classification_and_sanitized_diagnostics() {
+        for (field, identifier, kind) in [
+            (
+                "type",
+                "invalid_request_error",
+                ProviderErrorKind::InvalidRequest,
+            ),
+            ("code", "server_error", ProviderErrorKind::Response),
+            ("code", "unknown_error_SECRET", ProviderErrorKind::Response),
+        ] {
+            let error =
+                api_error(&json!({field: identifier, "message": "SECRET prompt credential"}));
+            assert_eq!(error.kind, kind);
+            assert!(
+                error
+                    .message
+                    .starts_with(&format!("Responses request failed ({kind:?})"))
+            );
+            assert_eq!(
+                error.message.contains("[code="),
+                !identifier.contains("SECRET")
+            );
+            assert!(!error.message.contains("SECRET"));
+        }
+    }
 
     fn completed(output: Vec<Value>) -> Value {
         json!({"type":"response.completed", "response":{"status":"completed", "output":output,

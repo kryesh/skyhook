@@ -101,6 +101,7 @@ impl From<crate::tool::ToolError> for JobOutcome {
         };
         let (output, denial) = match error {
             ToolError::Cancelled => return Self::Cancelled,
+            ToolError::Interrupted => return Self::Interrupted,
             ToolError::Denied(_) => (None, Some(Denial::permission_denied())),
             ToolError::FailedWithOutput { output, .. } => (Some(*output), None),
             _ => (None, None),
@@ -122,7 +123,7 @@ pub struct JobCompletion {
 /// Explicitly installed by live child agents; ordinary input-capable tools cannot restart.
 pub(crate) type ResumeHandler = Arc<
     dyn Fn(
-            Value,
+            Option<Value>,
             mpsc::Receiver<Value>,
         )
             -> futures_util::future::BoxFuture<'static, Result<ToolOutput, crate::tool::ToolError>>
@@ -197,8 +198,14 @@ impl JobEntry {
         )
     }
 
+    fn suspended(&self) -> bool {
+        self.state == JobState::Interrupted && self.resume.is_some()
+    }
+
     fn deliverable(&self) -> bool {
-        self.state.is_terminal() || self.state == JobState::WaitingInput
+        // Keep parent waits pending across a retryable interruption. Snapshots
+        // still expose the interrupted state to the user.
+        !self.suspended() && (self.state.is_terminal() || self.state == JobState::WaitingInput)
     }
 
     fn reserve_delivery(&mut self, delivery: DeliveryState) -> Option<AgentId> {

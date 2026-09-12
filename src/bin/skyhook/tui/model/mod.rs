@@ -7,6 +7,7 @@ mod live;
 mod notifications;
 mod projection;
 mod requests;
+mod retry;
 
 pub use super::format::{clean, footer, number, pretty};
 pub use cache::{ContentCache, ContentChanges};

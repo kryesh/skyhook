@@ -167,7 +167,7 @@ mod tests {
             agent.clone(),
             AgentActivity::Reconnecting {
                 attempt: 2,
-                max_attempts: 3,
+                max_attempts: Some(3),
             },
         );
         assert!(app.busy());

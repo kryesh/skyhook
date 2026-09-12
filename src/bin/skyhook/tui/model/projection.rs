@@ -1,6 +1,7 @@
 //! Incremental journal indexes, agent lifecycle state, and usage totals.
 
 use super::super::format::agent_label;
+use super::retry::RetryState;
 use super::state_name;
 use serde_json::Value;
 use skyhook::agent::{AgentActivity, LiveResponse, ObservationSnapshot};
@@ -42,6 +43,7 @@ pub(super) struct RequestInfo {
     pub(super) usage: Option<Usage>,
     pub(super) model: Option<String>,
     pub(super) failed: bool,
+    pub(super) retry: Option<RetryState>,
     pub(super) response: Option<u64>,
 }
 
@@ -202,10 +204,35 @@ impl Projection {
                         info.finished_millis.get_or_insert(record.timestamp_millis);
                     }
                 }
-                SessionEvent::ModelFailed { request, .. } => {
+                SessionEvent::ModelFailed {
+                    request,
+                    attempt,
+                    error,
+                } => {
                     let info = self.requests.entry(*request).or_default();
                     info.failed = true;
+                    info.retry = Some(RetryState::failed(*attempt, error));
                     info.finished_millis.get_or_insert(record.timestamp_millis);
+                }
+                SessionEvent::ModelAttemptStarted { request, attempt } => {
+                    let info = self.requests.entry(*request).or_default();
+                    info.failed = false;
+                    info.finished_millis = None;
+                    info.retry = Some(RetryState::started(*attempt));
+                }
+                SessionEvent::ModelRecoveryScheduled {
+                    request,
+                    attempt,
+                    max_attempts,
+                    delay_millis,
+                    error,
+                } => {
+                    self.requests.entry(*request).or_default().retry = Some(RetryState::scheduled(
+                        *attempt,
+                        *max_attempts,
+                        *delay_millis,
+                        error,
+                    ));
                 }
                 SessionEvent::Usage {
                     request: Some(request),
@@ -324,7 +351,10 @@ impl Projection {
                 max_attempts,
             }) => (
                 true,
-                format!("Reconnecting · attempt {attempt} of {max_attempts}"),
+                match max_attempts {
+                    Some(max) => format!("Reconnecting · attempt {attempt} of {max}"),
+                    None => format!("Retrying · attempt {attempt}"),
+                },
             ),
             Some(AgentActivity::Compacting) => (true, "Compacting".into()),
             Some(AgentActivity::Interrupted) => (false, "Interrupted".into()),
@@ -406,7 +436,7 @@ mod tests {
             agent.id.clone(),
             AgentActivity::Reconnecting {
                 attempt: 2,
-                max_attempts: 3,
+                max_attempts: Some(3),
             },
         );
         let projection = Projection::default();

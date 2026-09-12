@@ -15,7 +15,10 @@ use tokio::sync::broadcast;
 pub enum AgentActivity {
     Idle,
     Working,
-    Reconnecting { attempt: u8, max_attempts: u8 },
+    Reconnecting {
+        attempt: u64,
+        max_attempts: Option<u64>,
+    },
     Tools,
     WaitingChildren,
     Compacting,
@@ -85,6 +88,27 @@ impl ObservationSnapshot {
                                 max_attempts: *max_attempts,
                             },
                         );
+                    }
+                    SessionEvent::ModelAttemptStarted { request, .. } => {
+                        // One logical request survives retries; native item/block
+                        // IDs may be reused. Clear only the displayed assembler,
+                        // never the journal's per-attempt audit records.
+                        self.responses
+                            .insert((record.agent.clone(), *request), LiveResponse::default());
+                        let activity = if self.records.get(request).is_some_and(|record| {
+                            matches!(
+                                record.event,
+                                SessionEvent::ModelRequested {
+                                    purpose: crate::session::ModelPurpose::Compaction,
+                                    ..
+                                }
+                            )
+                        }) {
+                            AgentActivity::Compacting
+                        } else {
+                            AgentActivity::Working
+                        };
+                        self.activity.insert(record.agent.clone(), activity);
                     }
                     SessionEvent::ModelRequested { .. }
                         if matches!(
@@ -405,7 +429,7 @@ mod tests {
             SessionEvent::ModelRecoveryScheduled {
                 request: 7,
                 attempt: 2,
-                max_attempts: 3,
+                max_attempts: Some(3),
                 delay_millis: 1000,
                 error: "connection lost".into(),
             },
@@ -415,7 +439,7 @@ mod tests {
             snapshot.activity[&agent],
             AgentActivity::Reconnecting {
                 attempt: 2,
-                max_attempts: 3
+                max_attempts: Some(3)
             }
         );
         let response = &snapshot.responses[&(agent.clone(), 7)];
@@ -444,7 +468,34 @@ mod tests {
             hub.observe().snapshot.activity[&agent],
             AgentActivity::Working
         );
-        record(&hub, &agent, 11, SessionEvent::AgentCompleted);
+        record(
+            &hub,
+            &agent,
+            11,
+            SessionEvent::ModelAttemptStarted {
+                request: 7,
+                attempt: 2,
+            },
+        );
+        let started = hub.observe().snapshot;
+        let response = &started.responses[&(agent.clone(), 7)];
+        assert!(!response.settled);
+        assert!(response.error.is_none());
+        assert!(response.snapshot().items.is_empty());
+        assert_eq!(
+            serde_json::to_value(&started.records[&8]).unwrap(),
+            serde_json::to_value(&snapshot.records[&8]).unwrap()
+        );
+        let records: Vec<_> = started.records.values().cloned().collect();
+        let replayed = RuntimeEvents::new(&records).observe().snapshot;
+        assert!(
+            replayed.responses[&(agent.clone(), 7)]
+                .snapshot()
+                .items
+                .is_empty()
+        );
+        assert!(replayed.responses[&(agent.clone(), 7)].error.is_none());
+        record(&hub, &agent, 12, SessionEvent::AgentCompleted);
         assert_eq!(hub.observe().snapshot.activity[&agent], AgentActivity::Idle);
         let records: Vec<_> = hub.observe().snapshot.records.values().cloned().collect();
         assert_eq!(
@@ -464,7 +515,7 @@ mod tests {
             SessionEvent::ModelRecoveryScheduled {
                 request: 7,
                 attempt: 3,
-                max_attempts: 3,
+                max_attempts: Some(3),
                 delay_millis: 1000,
                 error: "connection lost".into(),
             },

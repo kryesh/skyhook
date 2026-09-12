@@ -42,6 +42,8 @@ pub enum HarnessError {
     Agent(String),
     #[error("provider returned no assistant content")]
     EmptyResponse,
+    #[error("provider aborted response")]
+    ProviderAborted,
     #[error("agent turn was interrupted")]
     Interrupted,
     #[error("child-agent nesting limit reached")]

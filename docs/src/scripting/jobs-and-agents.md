@@ -2,9 +2,16 @@
 
 ## Delegation and child input
 
-Child agents retain their conversation for follow-up work.
-`tool.job(id).send({value: instructions})` delivers unsolicited input automatically at a running
-child's next model-request boundary, without interrupting the current request or tools.
+Child agents retain their conversation for follow-up work. `tool.job(id).send({value:
+instructions})` delivers unsolicited input automatically at a running child's next model-request
+boundary, without interrupting the current request or tools. A retained child whose job is
+`completed`, `failed`, or `interrupted` is restarted under the same job and agent identity; the
+new instruction is appended to its retained conversation. Explicitly `cancelled` jobs are not
+resumable. After a session interruption, retry resumes every retained failed/interrupted child
+(deepest descendants first), without selecting them individually. A child-only retry leaves a
+parent that is waiting on work untouched and does not add a root model request. Retrying without
+an instruction continues the same history without adding a synthetic user or parent-input
+message.
 Children do not need `receive()` to read these updates. Every visible child text reply,
 including text-only and final replies, is delivered independently through the background-job
 event path and wakes `wait`, without waiting for the child job to finish. Message events carry

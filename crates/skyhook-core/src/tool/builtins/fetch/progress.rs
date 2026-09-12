@@ -116,6 +116,7 @@ impl FetchProgress {
         match error {
             // These are not HTTP transport failures and keep their existing contracts.
             ToolError::Cancelled
+            | ToolError::Interrupted
             | ToolError::Denied(_)
             | ToolError::InvalidArguments(_)
             | ToolError::ArgumentsMustBeObject

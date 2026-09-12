@@ -35,11 +35,26 @@ The composer always sends to the root agent. While root is busy, Enter queues a 
 for its next model request, without interrupting the current request or tools. It does not wait
 for the entire turn to finish. `/queue` edits/removes input that has not yet been consumed,
 and `/resume` resumes a queue paused by interruption.
-`/retry` continues a failed or interrupted root turn without duplicating the original prompt.
+`/retry` continues failed or interrupted turns without duplicating their original prompts.
+After a session interruption it resumes all interrupted children automatically, regardless of
+which agent is selected. Parents with pending waits stay in those waits rather than starting
+another model request merely because recovery was requested.
+
+Normal conversation messages, reasoning, tool cards, and successful replies keep their existing
+presentation; they do not display attempt counters. Automatic model retries update one error block
+for the failed request instead of appending failure rows. Only that block displays the attempt
+number, next delay, and a compact diagnostic, including safe HTTP status and error codes
+when available. Only the latest failed attempt's partial output is shown in that block. It clears
+when the next attempt starts; streaming output and successful answers use the unchanged normal
+conversation rendering, without retry labels.
+Retries have no fixed attempt limit; older session logs with a recorded limit still display it.
+Every attempt start, failure, and scheduled delay remains in the session journal for auditing.
+These recovery events are visible to the UI and logs, not added to the model's conversation.
 
 The inspector provides Conversation, Requests, and Jobs tabs. Requests show one metadata row per
-model call, including retries and compaction calls, with token summaries alongside the row. Full
-request bodies remain in the session journal for reconstruction but are not rendered in the UI.
+logical model request, including compaction requests, with token summaries alongside the row.
+Transient retries reuse that request; older logs can contain separate request rows for each attempt.
+Full request bodies remain in the session journal for reconstruction but are not rendered in the UI.
 Startup warnings appear directly in the conversation log rather than a separate diagnostics page.
 Job output is paged and searchable without acknowledging the agent's pending notifications. Select a job
 and press `o` for output fields, regex search, and the next page; `c` requests cancellation.

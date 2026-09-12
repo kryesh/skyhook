@@ -217,6 +217,8 @@ pub enum ToolError {
     InputClosed,
     #[error("tool was cancelled")]
     Cancelled,
+    #[error("tool was interrupted")]
+    Interrupted,
     #[error("tool failed: {0}")]
     Failed(String),
     #[error("tool failed: {message}")]

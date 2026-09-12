@@ -23,7 +23,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("attachments", "Inspect or remove attachments", ""),
     ("queue", "Edit queued follow-ups", ""),
     ("resume", "Resume queued input", ""),
-    ("retry", "Continue after a failed or interrupted turn", ""),
+    ("retry", "Continue failed or interrupted turns", ""),
     ("attention", "Pending questions and permissions", ""),
     ("help", "Help and shortcuts", ""),
 ];

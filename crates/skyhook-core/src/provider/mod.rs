@@ -35,7 +35,7 @@ pub trait ProviderContext: Send {
 }
 
 /// Recovery is permission to retry an *uncommitted* local-tool response, not a
-/// claim of general request idempotency. The runtime owns the retry budget and
+/// claim of general request idempotency. The runtime owns the retry policy and
 /// must not replay committed responses or externally executed tool effects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderRecovery {
@@ -73,14 +73,26 @@ pub enum ProviderErrorKind {
 pub struct ProviderError {
     pub kind: ProviderErrorKind,
     pub message: String,
+    /// Server-directed delay for runtime-owned retries. Never included in Display.
+    pub retry_after: Option<std::time::Duration>,
 }
 
 impl ProviderError {
+    /// Classify retry eligibility independently of the provider adapter. Adapters
+    /// choose a sanitized error category and may reset transport state, while the
+    /// agent runtime owns the retry policy and cancellation.
     #[must_use]
     pub fn recovery(&self) -> Option<ProviderRecovery> {
         match self.kind {
-            ProviderErrorKind::CodexWebSocket(_) => Some(ProviderRecovery::ResetContext),
-            _ => None,
+            ProviderErrorKind::RateLimited
+            | ProviderErrorKind::Timeout
+            | ProviderErrorKind::Transport
+            | ProviderErrorKind::Response
+            | ProviderErrorKind::CodexWebSocket(_) => Some(ProviderRecovery::ResetContext),
+            ProviderErrorKind::Authentication
+            | ProviderErrorKind::Protocol
+            | ProviderErrorKind::InvalidRequest
+            | ProviderErrorKind::ContextWindowExceeded => None,
         }
     }
 
@@ -89,13 +101,14 @@ impl ProviderError {
         Self {
             kind: ProviderErrorKind::Protocol,
             message: message.into(),
+            retry_after: None,
         }
     }
 }
 
-/// HTTP startup is a per-attempt deadline; read-idle resets per body chunk.
-/// Native HTTP requests have at most three attempts, so startup can consume three
-/// times this duration plus bounded retry backoff. Codex HTTP remains single-attempt.
+/// HTTP startup is a per-attempt deadline; read-idle resets per body chunk. HTTP
+/// transports make one attempt. The agent runtime applies the provider-independent
+/// cancellable retry policy to transient failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProviderTimeouts {
     pub startup: std::time::Duration,
@@ -107,6 +120,46 @@ impl Default for ProviderTimeouts {
         Self {
             startup: std::time::Duration::from_secs(600),
             read_idle: std::time::Duration::from_secs(600),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_eligibility_is_category_based_and_provider_independent() {
+        for (kind, eligible) in [
+            (ProviderErrorKind::Response, true),
+            (ProviderErrorKind::Transport, true),
+            (ProviderErrorKind::Timeout, true),
+            (ProviderErrorKind::RateLimited, true),
+            (
+                ProviderErrorKind::CodexWebSocket(CodexWebSocketError::Read),
+                true,
+            ),
+            (ProviderErrorKind::Authentication, false),
+            (ProviderErrorKind::InvalidRequest, false),
+            (ProviderErrorKind::Protocol, false),
+            (ProviderErrorKind::ContextWindowExceeded, false),
+        ] {
+            for message in [
+                "provider error",
+                "retry reconnect timeout previous_response_not_found",
+            ] {
+                assert_eq!(
+                    ProviderError {
+                        retry_after: None,
+                        kind,
+                        message: message.into()
+                    }
+                    .recovery()
+                    .is_some(),
+                    eligible,
+                    "{kind:?}"
+                );
+            }
         }
     }
 }

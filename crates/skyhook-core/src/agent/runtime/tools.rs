@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use crate::{
-    agent::{Question, TodoItem, todo::TodoStore},
+    agent::{HarnessError, Question, TodoItem, todo::TodoStore},
     provider::protocol::UserContent,
     session::SessionEvent,
     tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::Capability},
@@ -258,7 +258,10 @@ fn register_child_agent(
                     available_depth: input.depth,
                     location,
                 }).await.map_err(|error| tool_error(&error))?;
-                // Only this live child session may opt its completed job into resumption.
+                // Associate immediately so a failed first turn is selectable for retry
+                // even when it never emitted visible assistant text.
+                runtime.jobs.set_child_agent(context.job, child.clone()).await.map_err(|error| tool_error(&error))?;
+                // Only this live child session may opt its terminal job into resumption.
                 // Keep a weak runtime reference: jobs must not retain their own manager.
                 let resume_runtime = Arc::downgrade(&runtime);
                 let resume_child = child.clone();
@@ -281,9 +284,11 @@ fn register_child_agent(
                         let context = crate::tool::ToolContext::new(
                             authorization, execution_location, caller_location, input, runtime.jobs.clone(),
                         );
+                        let content = value.into_iter().map(|value| UserContent::ParentInput {
+                            text: format!("Owner input: {value}"),
+                        }).collect();
                         let text = run_child_request(
-                            &runtime, &context, &child, &sender,
-                            vec![UserContent::ParentInput { text: format!("Owner input: {value}") }],
+                            &runtime, &context, &child, &sender, content,
                         ).await?;
                         Ok(crate::tool::ToolOutput::new(json!(text)))
                     })
@@ -328,7 +333,13 @@ async fn run_child_request(
             result = &mut done_rx => {
                 let text = result
                     .map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?
-                    .map_err(ToolError::Failed)?;
+                    .map_err(|error| {
+                        if error == HarnessError::Interrupted.to_string() {
+                            ToolError::Interrupted
+                        } else {
+                            ToolError::Failed(error)
+                        }
+                    })?;
                 let mut content = Vec::new();
                 for value in context.drain_input_or_close().await {
                     content.push(UserContent::ParentInput { text: format!("Owner input: {value}") });

@@ -90,7 +90,7 @@ pub(crate) fn register(
     let send = jobs.clone();
     builder.register::<JobSendArgs, Value, _, _>(
         "job_send",
-        "Send JSON input to a job. For child agents, answer pending questions or deliver follow-up instructions automatically at the next model-request boundary. Sending to a completed agent appends to its retained conversation and resumes it under the same job ID. Background scripts read input with await receive().",
+        "Send JSON input to a job. For child agents, answer pending questions or deliver follow-up instructions automatically at the next model-request boundary. Sending to a completed, failed, or interrupted child agent appends to its retained conversation and resumes it under the same job ID; cancelled jobs remain non-resumable. Background scripts read input with await receive().",
         ToolOptions::default()
             .script_only()
             .job_method("send", "job"),

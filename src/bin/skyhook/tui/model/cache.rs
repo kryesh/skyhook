@@ -136,6 +136,25 @@ impl ContentCache {
             self.history_running = entries.iter().any(|entry| entry.running);
             self.live.clear();
         }
+        if !reset && view.tab == Tab::Conversation {
+            // Retry cards live at their original journal position. Replace only
+            // the affected card, including authoritative equal-length updates.
+            for request in &dirty_responses {
+                if let Some(entry) =
+                    super::retry::retry_entry(snapshot, projection, agent, *request, thinking)
+                    && let Some(index) = entries[..self.history_len]
+                        .iter()
+                        .position(|old| old.key == entry.key)
+                    && entries[index] != entry
+                {
+                    entries[index] = entry;
+                    changes.dirty.push(index);
+                }
+            }
+            self.history_running = entries[..self.history_len]
+                .iter()
+                .any(|entry| entry.running);
+        }
         if !reset {
             for job in self.invalid_jobs.drain() {
                 if let Some(&index) = self.job_indices.get(&job)
@@ -185,7 +204,13 @@ impl ContentCache {
                 .responses
                 .iter()
                 .filter(|((owner, request), response)| {
-                    owner == agent && projection.live_response(*request, response)
+                    owner == agent
+                        && projection.live_response(*request, response)
+                        && !projection.requests.get(request).is_some_and(|info| {
+                            info.retry
+                                .as_ref()
+                                .is_some_and(super::retry::RetryState::has_error)
+                        })
                 })
                 .collect();
             responses.sort_by_key(|((_, request), _)| *request);
@@ -217,6 +242,11 @@ impl ContentCache {
             for request in requests {
                 if let Some(response) = snapshot.responses.get(&(agent.clone(), request))
                     && projection.live_response(request, response)
+                    && !projection.requests.get(&request).is_some_and(|info| {
+                        info.retry
+                            .as_ref()
+                            .is_some_and(super::retry::RetryState::has_error)
+                    })
                 {
                     let start = entries.len();
                     entries.extend(response_entries(
@@ -799,11 +829,11 @@ mod tests {
             AgentActivity::Working,
             AgentActivity::Reconnecting {
                 attempt: 2,
-                max_attempts: 3,
+                max_attempts: Some(3),
             },
             AgentActivity::Reconnecting {
                 attempt: 3,
-                max_attempts: 3,
+                max_attempts: Some(3),
             },
             AgentActivity::Interrupted,
         ] {
@@ -831,5 +861,212 @@ mod tests {
             assert!(rows == expected);
         }
         assert!(rows.is_empty());
+    }
+    #[test]
+    fn retry_error_lifecycle_matches_fresh_rendering_and_replay() {
+        let agent = AgentId::root(SessionId::from_bytes([41; 16]));
+        let mut snapshot = ObservationSnapshot::default();
+        let context = context(&mut snapshot, &agent);
+        let request = request(&mut snapshot, &agent, context);
+        let view = super::super::View::default();
+        let outputs = HashMap::new();
+        let presentation = EntryView {
+            agent: &agent,
+            view: &view,
+            thinking: false,
+            all_details: false,
+        };
+        let mut cache = ContentCache::default();
+        let mut projection = Projection::default();
+        let mut cards = Vec::new();
+        for attempt in 1..=3 {
+            record(
+                &mut snapshot,
+                &agent,
+                SessionEvent::ModelAttemptStarted { request, attempt },
+            );
+            projection.rebuild(&snapshot);
+            cache.update(
+                &mut cards,
+                &snapshot,
+                &projection,
+                presentation,
+                &outputs,
+                0,
+            );
+            assert_eq!(cards.len(), 1);
+            assert_ne!(cards[0].key, format!("failed{request}"));
+            assert!(!cards[0].text.contains("attempt"));
+            assert!(!cards[0].text.contains("partial"));
+            assert!(!cards[0].text.contains("HTTP"));
+            for (index, suffix) in [format!("partial {attempt}"), " updated".into()]
+                .into_iter()
+                .enumerate()
+            {
+                update(
+                    &mut snapshot,
+                    delta_event(agent.clone(), request, BlockKind::Text, suffix),
+                );
+                cache.observe_response(&agent, request);
+                let changes = cache.update(
+                    &mut cards,
+                    &snapshot,
+                    &projection,
+                    presentation,
+                    &outputs,
+                    0,
+                );
+                if index > 0 {
+                    assert!(!changes.reset);
+                }
+                let fresh = entries_inner(&snapshot, &projection, presentation, &outputs, true);
+                assert!(cards == fresh);
+                assert!(cards.iter().all(|entry| !entry.text.contains("attempt")));
+            }
+            if attempt == 3 {
+                break;
+            }
+            record(
+                &mut snapshot,
+                &agent,
+                SessionEvent::ModelFailed {
+                    request,
+                    attempt,
+                    error: "HTTP 503 [code=overloaded]".into(),
+                },
+            );
+            projection.rebuild(&snapshot);
+            let failed = cache.update(
+                &mut cards,
+                &snapshot,
+                &projection,
+                presentation,
+                &outputs,
+                0,
+            );
+            assert!(failed.reset);
+            assert_eq!(cards.len(), 1);
+            assert_eq!(cards[0].key, format!("failed{request}"));
+            record(
+                &mut snapshot,
+                &agent,
+                SessionEvent::ModelRecoveryScheduled {
+                    request,
+                    attempt: attempt + 1,
+                    max_attempts: None,
+                    delay_millis: 1000,
+                    error: "HTTP 503 [code=overloaded]".into(),
+                },
+            );
+            projection.rebuild(&snapshot);
+            let changes = cache.update(
+                &mut cards,
+                &snapshot,
+                &projection,
+                presentation,
+                &outputs,
+                0,
+            );
+            assert!(!changes.reset);
+            assert_eq!(cards.len(), 1);
+            assert!(
+                cards[0]
+                    .text
+                    .contains(&format!("Retrying · attempt {}", attempt + 1))
+            );
+            assert!(cards[0].text.contains("HTTP 503"));
+            assert!(cards[0].text.contains("retry delay 1000 ms"));
+            assert!(
+                cards[0]
+                    .text
+                    .ends_with(&format!("partial {attempt} updated"))
+            );
+            assert!(cards == entries_inner(&snapshot, &projection, presentation, &outputs, true));
+        }
+        record(
+            &mut snapshot,
+            &agent,
+            SessionEvent::MessageCommitted {
+                message: Message::Assistant(vec![
+                    skyhook::provider::protocol::AssistantContent::text(
+                        "answer",
+                        0,
+                        "final answer",
+                    ),
+                ]),
+            },
+        );
+        projection.rebuild(&snapshot);
+        cache.update(
+            &mut cards,
+            &snapshot,
+            &projection,
+            presentation,
+            &outputs,
+            0,
+        );
+        assert_eq!(cards.len(), 1);
+        assert!(cards[0].text.ends_with("final answer"));
+        assert!(!cards[0].text.contains("attempt") && !cards[0].text.contains("partial"));
+        assert!(cards[0].footer.is_some());
+        let mut replay = ObservationSnapshot::default();
+        for event in snapshot.records.values() {
+            update(&mut replay, RuntimeEvent::Record(Box::new(event.clone())));
+        }
+        projection.rebuild(&replay);
+        assert!(cards == entries_inner(&replay, &projection, presentation, &outputs, true));
+
+        // A provider abort commits its visible text before publishing ModelFailed.
+        // Keep the normal message intact and add diagnostics, including on replay.
+        let committed = cards[0].clone();
+        record(
+            &mut snapshot,
+            &agent,
+            SessionEvent::ModelFailed {
+                request,
+                attempt: 3,
+                error: "provider aborted response".into(),
+            },
+        );
+        projection.rebuild(&snapshot);
+        cache.update(
+            &mut cards,
+            &snapshot,
+            &projection,
+            presentation,
+            &outputs,
+            0,
+        );
+        assert_eq!(cards.len(), 2);
+        assert_eq!(
+            cards
+                .iter()
+                .filter(|card| card.key == format!("failed{request}"))
+                .count(),
+            1
+        );
+        let failure = cards
+            .iter()
+            .find(|card| card.key == format!("failed{request}"))
+            .unwrap();
+        assert_eq!(
+            failure.text,
+            "Request failed · attempt 3\nprovider aborted response"
+        );
+        assert!(cards.iter().any(|card| card == &committed));
+        assert_eq!(
+            cards
+                .iter()
+                .map(|card| card.text.matches("final answer").count())
+                .sum::<usize>(),
+            1
+        );
+        assert!(cards == entries_inner(&snapshot, &projection, presentation, &outputs, true));
+        let mut replay = ObservationSnapshot::default();
+        for event in snapshot.records.values() {
+            update(&mut replay, RuntimeEvent::Record(Box::new(event.clone())));
+        }
+        projection.rebuild(&replay);
+        assert!(cards == entries_inner(&replay, &projection, presentation, &outputs, true));
     }
 }

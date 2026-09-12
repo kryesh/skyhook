@@ -166,6 +166,19 @@ impl ProviderContext for Context {
                         session.socket = Some(socket);
                         session.affinity = affinity;
                     }
+                    // A throttle is not a WebSocket capability rejection. Let the
+                    // runtime honor its delay instead of immediately trying HTTP.
+                    Err(error)
+                        if error.retry_after.is_some()
+                            || matches!(
+                                error.kind,
+                                ProviderErrorKind::RateLimited
+                                    | ProviderErrorKind::Timeout
+                                    | ProviderErrorKind::Response
+                            ) =>
+                    {
+                        return Err(error);
+                    }
                     // No response.create has been sent, so full-history fallback is safe.
                     Err(_) => {
                         session.http_only = true;
@@ -267,11 +280,24 @@ async fn connect(
             "Codex WebSocket handshake timed out",
         )
     })?
-    .map_err(|_| {
-        error(
+    .map_err(|native| match native {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            let body = response
+                .body()
+                .as_ref()
+                .filter(|body| body.len() <= 16 * 1024)
+                .and_then(|body| serde_json::from_slice(body).ok())
+                .unwrap_or(Value::Null);
+            let mut error =
+                super::super::errors::classify_error(Some(response.status().as_u16()), &body);
+            error.retry_after =
+                transport::retry_after(response.headers(), std::time::SystemTime::now());
+            error
+        }
+        _ => error(
             ProviderErrorKind::Transport,
             "Codex WebSocket handshake failed",
-        )
+        ),
     })?;
     Ok((
         socket,
@@ -482,6 +508,36 @@ mod tests {
         assert!(headers["authorization"].is_sensitive());
         assert!(headers["chatgpt-account-id"].is_sensitive());
         assert!(auth_headers("bad\ntoken", "account", "session").is_err());
+    }
+
+    #[tokio::test]
+    async fn throttled_handshake_preserves_retry_after_without_http_fallback() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert!(read_http_request(&mut socket).await.starts_with("GET "));
+            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            drop(socket);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "a throttled handshake must not immediately try the HTTP endpoint"
+            );
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let provider = provider(address, directory.path());
+        let mut context = provider.open_context("context".into()).unwrap();
+        let error = match context.invoke(request()).await {
+            Err(error) => error,
+            Ok(_) => panic!("expected throttled handshake"),
+        };
+        assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+        assert_eq!(error.retry_after, Some(Duration::from_secs(120)));
+        assert!(error.message.contains("429"));
+        server.await.unwrap();
     }
 
     #[tokio::test]

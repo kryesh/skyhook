@@ -34,8 +34,7 @@ kind = "codex"
 # Keyless local llama.cpp endpoint; the model alias matches --alias below.
 # Example text-only server (requires enough memory for the configured context):
 # llama-server --model /path/to/Qwen3.8-27B.gguf --alias qwen3.8-27b \
-#   --host 127.0.0.1 --port 8080 --ctx-size 262144 --parallel 1 \
-#   --n-predict 131072 --jinja --reasoning-format deepseek
+#   --host 127.0.0.1 --port 8080 --ctx-size 262144 --parallel 1 --n-predict 131072
 [providers.local]
 kind = "openai"
 base_url = "http://127.0.0.1:8080/v1"

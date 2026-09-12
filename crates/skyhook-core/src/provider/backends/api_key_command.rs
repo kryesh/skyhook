@@ -34,6 +34,7 @@ impl ApiKeyCommand {
 fn failure(message: &'static str) -> ProviderError {
     // Never retain the command, output, exit status, or underlying OS error.
     ProviderError {
+        retry_after: None,
         kind: ProviderErrorKind::Authentication,
         message: message.into(),
     }

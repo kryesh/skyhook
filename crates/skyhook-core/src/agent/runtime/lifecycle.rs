@@ -133,6 +133,51 @@ impl SessionRuntime {
     }
 }
 impl SessionRuntime {
+    /// Interrupt current turns without cancelling their owner jobs. This is the
+    /// retryable session-interrupt path; explicit job/tree cancellation remains in
+    /// `interrupt_tree` below.
+    pub(super) async fn interrupt_turns(&self, root: &AgentId) -> usize {
+        let targets = self
+            .agents
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(agent, _)| {
+                agent.session() == root.session() && agent.path().starts_with(root.path())
+            })
+            .map(|(id, agent)| {
+                (
+                    id.clone(),
+                    agent.cancellation.clone(),
+                    agent.retryable_interrupt.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let activity = self.events.observe().snapshot.activity;
+        let mut interrupted = 0;
+        for (agent, cancellation, retryable) in &targets {
+            match activity.get(agent) {
+                // Preserve actual waits, not every agent with background jobs:
+                // an agent may be making a model request while its jobs run.
+                Some(AgentActivity::Tools | AgentActivity::WaitingChildren)
+                    if self.jobs.has_running(agent).await =>
+                {
+                    continue;
+                }
+                None
+                | Some(
+                    AgentActivity::Idle | AgentActivity::Failed(_) | AgentActivity::Interrupted,
+                ) => continue,
+                _ => {}
+            }
+            retryable.store(true, Ordering::Release);
+            cancellation.cancel();
+            self.activity(agent, AgentActivity::Interrupted);
+            interrupted += 1;
+        }
+        interrupted
+    }
+
     pub(super) async fn interrupt_tree(&self, root: &AgentId) -> usize {
         let targets = self
             .agents

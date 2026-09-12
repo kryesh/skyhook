@@ -113,8 +113,44 @@ impl SessionHandle {
     }
 
     /// Continue retained history after a failed/interrupted turn, without duplicating its input.
+    ///
+    /// A soft session interruption first restarts every retained interrupted child.
+    /// This deliberately does not enqueue a root request while a parent is still
+    /// waiting on those children; ordinary completion delivery wakes it later.
     pub async fn continue_turn(&self) -> Result<String, HarnessError> {
-        self.submit(Vec::new(), None).await
+        // Interrupt requests cancel model futures before their owning job has
+        // finished journaling. An immediate resume must not miss those children.
+        let interrupted = self
+            .runtime
+            .agents
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, agent)| agent.retryable_interrupt.load(Ordering::Acquire))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        self.runtime
+            .jobs
+            .settle_interrupted_agents(&interrupted)
+            .await;
+        let root_retryable = matches!(
+            self.runtime
+                .events
+                .observe()
+                .snapshot
+                .activity
+                .get(&self.root),
+            Some(crate::agent::AgentActivity::Failed(_) | crate::agent::AgentActivity::Interrupted)
+        );
+        self.runtime.jobs.continue_resumable_children().await?;
+        if root_retryable {
+            // An independently failed root has no live wait to preserve; continue
+            // it after scheduling descendant recovery.
+            return self.submit(Vec::new(), None).await;
+        }
+        // Child-only recovery deliberately leaves a live/waiting root request
+        // untouched. Its normal delivery path observes the replacement result.
+        Ok(String::new())
     }
 
     /// Execute a JavaScript workflow through the session's registered `script` tool.
@@ -344,8 +380,10 @@ impl SessionHandle {
         Ok(())
     }
 
+    /// Interrupt active turns while retaining child jobs for retry. Explicit
+    /// `job_cancel` remains the non-resumable cancellation path.
     pub async fn interrupt(&self) -> usize {
-        self.runtime.interrupt_tree(&self.root).await
+        self.runtime.interrupt_turns(&self.root).await
     }
 }
 

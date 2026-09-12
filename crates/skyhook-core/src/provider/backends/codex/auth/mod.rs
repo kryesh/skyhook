@@ -27,6 +27,7 @@ const REFRESH_SKEW: u64 = 60;
 
 fn error(message: &'static str) -> AuthError {
     ProviderError {
+        retry_after: None,
         kind: ProviderErrorKind::Authentication,
         message: message.into(),
     }

@@ -92,13 +92,6 @@ pub(super) fn entries_inner(
             })
             .collect(),
         Tab::Conversation => {
-            let recoveries: HashSet<_> = records
-                .iter()
-                .filter_map(|record| match &record.event {
-                    SessionEvent::ModelRecoveryScheduled { request, .. } => Some(*request),
-                    _ => None,
-                })
-                .collect();
             // Tool results have an explicit call ID but no message sequence. Resolve
             // only within the current agent's most recent assistant turn, consuming
             // each call once. Never let an old/reused ID suppress a later result.
@@ -156,6 +149,16 @@ pub(super) fn entries_inner(
                 let key = format!("m{}", record.sequence);
                 match &record.event {
                     SessionEvent::ModelRequested { .. } => {
+                        if let Some(entry) = super::retry::retry_entry(
+                            snapshot,
+                            projection,
+                            agent,
+                            record.sequence,
+                            thinking,
+                        ) {
+                            entries.push(entry);
+                            continue;
+                        }
                         if let Some(response) =
                             snapshot.responses.get(&(agent.clone(), record.sequence))
                             && response.settled
@@ -272,14 +275,22 @@ pub(super) fn entries_inner(
                                         ));
                                     }
                                     BlockContent::ToolCall(call) => {
-                                        let exists = projection
-                                            .tool_origins
-                                            .contains(&(agent.clone(), record.sequence, call.id.clone()));
+                                        let exists = projection.tool_origins.contains(&(
+                                            agent.clone(),
+                                            record.sequence,
+                                            call.id.clone(),
+                                        ));
                                         if !exists {
                                             let e = call_entry(
-                                                block_key.clone(), &call.name, Some(&call.arguments),
-                                                call_results.get(&(record.sequence, call.id.clone())).copied(),
-                                                agent, projection, view.is_expanded(&block_key, all_details),
+                                                block_key.clone(),
+                                                &call.name,
+                                                Some(&call.arguments),
+                                                call_results
+                                                    .get(&(record.sequence, call.id.clone()))
+                                                    .copied(),
+                                                agent,
+                                                projection,
+                                                view.is_expanded(&block_key, all_details),
                                             );
                                             tool_groups.insert(
                                                 e.key.clone(),
@@ -298,8 +309,13 @@ pub(super) fn entries_inner(
                                     let result_key = format!("{key}/{}", result.call_id);
                                     let open = view.is_expanded(&result_key, all_details);
                                     entries.push(call_entry(
-                                        result_key, &result.name, None,
-                                        Some(result), agent, projection, open,
+                                        result_key,
+                                        &result.name,
+                                        None,
+                                        Some(result),
+                                        agent,
+                                        projection,
+                                        open,
                                     ));
                                 }
                             }
@@ -355,43 +371,6 @@ pub(super) fn entries_inner(
                         format!("Status · {message}"),
                         Surface::Status,
                     )),
-                    SessionEvent::ModelFailed {
-                        attempt,
-                        error,
-                        request,
-                    } => {
-                        if recoveries.contains(request) {
-                            // The recovery status below represents this failure;
-                            // keep partial output, but do not imply a terminal turn.
-                            continue;
-                        }
-                        // This is the logical invocation count, not the provider's
-                        // internal HTTP retry count. Do not promise a fixed /3 here.
-                        // Exhausted HTTP retries report their count in the error.
-                        let label = if *attempt == 1 {
-                            "Request failed".to_owned()
-                        } else {
-                            format!("Request failed · attempt {attempt}")
-                        };
-                        entries.push(Entry::new(
-                            format!("failed{request}"),
-                            format!("{label}\n{error}"),
-                            Surface::Error,
-                        ));
-                    }
-                    SessionEvent::ModelRecoveryScheduled {
-                        attempt,
-                        max_attempts,
-                        delay_millis,
-                        error,
-                        ..
-                    } => entries.push(Entry::new(
-                        key,
-                        format!(
-                            "Reconnecting · attempt {attempt} of {max_attempts} · retry delay {delay_millis} ms\n{error}"
-                        ),
-                        Surface::Status,
-                    )),
                     SessionEvent::CompactionFailed { error, .. } => entries.push(Entry::new(
                         key,
                         format!("Compaction failed; previous context retained\n{error}"),
@@ -424,7 +403,13 @@ pub(super) fn entries_inner(
                 .responses
                 .iter()
                 .filter(|((owner, request), response)| {
-                    owner == agent && projection.live_response(*request, response)
+                    owner == agent
+                        && projection.live_response(*request, response)
+                        && !projection.requests.get(request).is_some_and(|info| {
+                            info.retry
+                                .as_ref()
+                                .is_some_and(super::retry::RetryState::has_error)
+                        })
                 })
                 .collect();
             responses.sort_by_key(|((_, request), _)| *request);
@@ -870,7 +855,7 @@ mod tests {
             (
                 1,
                 "Timeout: provider HTTP startup timeout (after 3 HTTP attempts)",
-                "Request failed\n",
+                "Request failed · attempt 1\n",
             ),
             (2, "Protocol: rejected", "Request failed · attempt 2\n"),
         ] {
@@ -969,5 +954,122 @@ mod tests {
         assert_eq!(text.matches("failed partial").count(), 1);
         assert!(!text.contains("child only"));
         assert!(entries.last().unwrap().text.contains("current stream"));
+    }
+    #[test]
+    fn ordinary_conversation_is_identical_with_or_without_attempt_tracking() {
+        let root = AgentId::root(SessionId::from_bytes([2; 16]));
+        let mut plain = ObservationSnapshot::default();
+        let context = context(&mut plain, &root);
+        let request = request(&mut plain, &root, context);
+        let mut tracked = plain.clone();
+        record(
+            &mut tracked,
+            &root,
+            SessionEvent::ModelAttemptStarted {
+                request,
+                attempt: 1,
+            },
+        );
+        for snapshot in [&mut plain, &mut tracked] {
+            update(
+                snapshot,
+                RuntimeEvent::Activity {
+                    agent: root.clone(),
+                    activity: skyhook::agent::AgentActivity::Working,
+                },
+            );
+        }
+        assert!(render(&plain, &root, false) == render(&tracked, &root, false));
+        for snapshot in [&mut plain, &mut tracked] {
+            stream(snapshot, &root, request, "normal stream");
+        }
+        assert!(render(&plain, &root, false) == render(&tracked, &root, false));
+        for snapshot in [&mut plain, &mut tracked] {
+            record(
+                snapshot,
+                &root,
+                SessionEvent::MessageCommitted {
+                    message: Message::Assistant(vec![
+                        AssistantItem::reasoning(
+                            "reasoning",
+                            0,
+                            "Normal reasoning",
+                            Some(replay()),
+                        ),
+                        AssistantItem::text("answer", 1, "Normal answer"),
+                        AssistantItem::tool_call(
+                            "tool",
+                            2,
+                            skyhook::provider::protocol::ToolCall {
+                                id: "call".into(),
+                                name: "read".into(),
+                                arguments: serde_json::json!({"path":"README.md"}),
+                            },
+                        ),
+                    ]),
+                },
+            );
+        }
+        for thinking in [false, true] {
+            let project = |snapshot: &ObservationSnapshot| {
+                let mut projection = Projection::default();
+                projection.rebuild(snapshot);
+                entries(
+                    snapshot,
+                    &projection,
+                    &root,
+                    &View::default(),
+                    &HashMap::new(),
+                    thinking,
+                    true,
+                )
+            };
+            let normal = project(&plain);
+            assert!(normal == project(&tracked));
+            assert!(normal.iter().all(|entry| !entry.text.contains("attempt")));
+        }
+    }
+
+    #[test]
+    fn retry_history_displays_finite_and_unbounded_attempts_with_compact_safe_diagnostics() {
+        for (max_attempts, expected) in [(Some(3), "attempt 2 of 3"), (None, "attempt 2")] {
+            let root = AgentId::root(SessionId::from_bytes([1; 16]));
+            let mut snapshot = ObservationSnapshot::default();
+            let context = context(&mut snapshot, &root);
+            let request = request(&mut snapshot, &root, context);
+            let error = format!("HTTP 503 overloaded\n\u{1b}[31m{}", "x".repeat(1000));
+            record(
+                &mut snapshot,
+                &root,
+                SessionEvent::ModelFailed {
+                    request,
+                    attempt: 1,
+                    error: error.clone(),
+                },
+            );
+            record(
+                &mut snapshot,
+                &root,
+                SessionEvent::ModelRecoveryScheduled {
+                    request,
+                    attempt: 2,
+                    max_attempts,
+                    delay_millis: 1000,
+                    error: error.clone(),
+                },
+            );
+            let cards = render(&snapshot, &root, false);
+            assert_eq!(cards.len(), 1);
+            assert!(cards[0].text.contains(expected));
+            assert!(cards[0].text.contains("HTTP 503 overloaded"));
+            assert!(!cards[0].text.contains('\u{1b}'));
+            assert_eq!(cards[0].text.lines().count(), 2);
+            assert!(cards[0].text.chars().count() < 320);
+            assert!(cards[0].text.ends_with('…'));
+            if max_attempts.is_none() {
+                assert!(!cards[0].text.contains(" of "));
+            }
+            assert!(snapshot.records.values().any(|r| matches!(&r.event, SessionEvent::ModelFailed { error: stored, .. } if stored == &error)));
+        }
     }
 }

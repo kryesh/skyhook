@@ -3,7 +3,7 @@ use super::errors::classify_error;
 use crate::provider::{ProviderError, ProviderErrorKind, ProviderTimeouts};
 use reqwest::{
     Client, Response,
-    header::{ACCEPT, CONTENT_TYPE, HeaderMap},
+    header::{ACCEPT, CONTENT_TYPE, HeaderMap, RETRY_AFTER},
 };
 use serde_json::Value;
 use std::time::Duration;
@@ -18,8 +18,7 @@ pub(crate) fn client() -> Result<Client, ProviderError> {
     Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
-        // This transport owns the complete HTTP attempt budget, including Codex's
-        // one-attempt policy; disable reqwest's automatic protocol-nack retries.
+        // The runtime owns retries; disable automatic protocol-nack retries here.
         .retry(reqwest::retry::never())
         .build()
         .map_err(http_error)
@@ -27,7 +26,10 @@ pub(crate) fn client() -> Result<Client, ProviderError> {
 
 pub(crate) fn http_error(error: reqwest::Error) -> ProviderError {
     ProviderError {
-        kind: if error.is_timeout() {
+        retry_after: None,
+        kind: if error.is_builder() {
+            ProviderErrorKind::InvalidRequest
+        } else if error.is_timeout() {
             ProviderErrorKind::Timeout
         } else {
             ProviderErrorKind::Transport
@@ -39,14 +41,15 @@ pub(crate) fn http_error(error: reqwest::Error) -> ProviderError {
 
 fn timeout_error(phase: &str) -> ProviderError {
     ProviderError {
+        retry_after: None,
         kind: ProviderErrorKind::Timeout,
         message: format!("provider HTTP {phase} timeout"),
     }
 }
 
-/// Retry startup timeouts, pre-response send failures and transient HTTP rejections,
-/// at most twice. Once a successful response is accepted no request is ever replayed,
-/// including malformed streams, EOF, idle timeouts, or caller cancellation.
+/// Make one HTTP/SSE attempt. Provider retries are owned centrally by the agent
+/// runtime so every backend receives the same policy. Once a response
+/// is accepted, dropping this stream cancels its body and transport state.
 #[cfg(test)]
 pub(crate) async fn post_sse(
     client: &Client,
@@ -57,135 +60,77 @@ pub(crate) async fn post_sse(
     post_sse_with_timeouts(client, url, headers, body, ProviderTimeouts::default()).await
 }
 
-/// Codex and other continuation protocols can disable even overload retries.
+/// Default-timeout entry point for continuation protocols.
 pub(crate) async fn post_sse_once(
     client: &Client,
     url: &str,
     headers: HeaderMap,
     body: &Value,
 ) -> Result<SseStream, ProviderError> {
-    post_sse_policy(client, url, headers, body, 1, ProviderTimeouts::default()).await
+    post_sse_with_timeouts(client, url, headers, body, ProviderTimeouts::default()).await
 }
 
 pub(crate) async fn post_sse_with_timeouts(
     client: &Client,
     url: &str,
-    headers: HeaderMap,
-    body: &Value,
-    timeouts: ProviderTimeouts,
-) -> Result<SseStream, ProviderError> {
-    post_sse_policy(client, url, headers, body, 3, timeouts).await
-}
-
-async fn post_sse_policy(
-    client: &Client,
-    url: &str,
     mut headers: HeaderMap,
     body: &Value,
-    attempts: u32,
     timeouts: ProviderTimeouts,
 ) -> Result<SseStream, ProviderError> {
     headers.insert(ACCEPT, "text/event-stream".parse().expect("static header"));
-    for attempt in 0..attempts {
-        // Startup is an HTTP-attempt budget, not a budget shared by retries or
-        // their backoff. Error diagnostics use this same remaining deadline.
-        let deadline = tokio::time::Instant::now() + timeouts.startup;
-        let backoff = Duration::from_millis(200 * (1 << attempt));
-        let sent = tokio::time::timeout_at(
-            deadline,
-            client.post(url).headers(headers.clone()).json(body).send(),
-        )
-        .await;
-        let response = match sent {
-            Ok(Ok(response)) => response,
-            failure => {
-                let (error, retryable) = match failure {
-                    Err(_) => (timeout_error("startup"), true),
-                    Ok(Err(error)) => {
-                        // The fixed JSON request is replayable. A connection
-                        // closed/reset before headers has the same ambiguity as
-                        // a header timeout; builder errors are not transient.
-                        let retryable =
-                            error.is_connect() || error.is_timeout() || error.is_request();
-                        (http_error(error), retryable)
-                    }
-                    Ok(Ok(_)) => unreachable!(),
-                };
-                if retryable && attempt + 1 < attempts {
-                    // No detached work: dropping this future cancels a pending
-                    // send or sleep and cannot launch a subsequent attempt.
-                    tokio::time::sleep(backoff).await;
-                    continue;
-                }
-                return Err(if retryable {
-                    with_attempt_count(error, attempt + 1)
-                } else {
-                    error
-                });
-            }
-        };
-        let status = response.status();
-        if !status.is_success() {
-            let retryable = matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504);
-            if retryable
-                && attempt + 1 < attempts
-                && let Some(delay) = retry_delay(response.headers(), backoff)
-            {
-                drop(response);
-                tokio::time::sleep(delay).await;
-                continue;
-            }
-            let error = status_error(response, deadline, timeouts.read_idle).await;
-            return Err(if retryable {
-                with_attempt_count(error, attempt + 1)
-            } else {
-                error
-            });
-        }
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
-        if !content_type
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .eq_ignore_ascii_case("text/event-stream")
-        {
-            return Err(ProviderError::protocol(
-                "provider returned a non-SSE content type",
-            ));
-        }
-        return Ok(response_stream(response, timeouts.read_idle));
-    }
-    unreachable!("bounded retry loop always returns")
-}
-
-fn with_attempt_count(mut error: ProviderError, attempts: u32) -> ProviderError {
-    error
-        .message
-        .push_str(&format!(" (after {attempts} HTTP attempts)"));
-    error
-}
-
-fn retry_delay(headers: &HeaderMap, backoff: Duration) -> Option<Duration> {
-    let mut values = headers.get_all("retry-after").iter();
-    let Some(value) = values.next() else {
-        return Some(backoff);
+    let deadline = tokio::time::Instant::now() + timeouts.startup;
+    let sent = tokio::time::timeout_at(
+        deadline,
+        client.post(url).headers(headers).json(body).send(),
+    )
+    .await;
+    let response = match sent {
+        Ok(Ok(response)) => response,
+        Err(_) => return Err(timeout_error("startup")),
+        Ok(Err(error)) => return Err(http_error(error)),
     };
-    // Never retry earlier than Retry-After. Decline long, HTTP-date, ambiguous
-    // or malformed values rather than exceeding this bounded short-delay policy.
+    if !response.status().is_success() {
+        return Err(status_error(response, deadline, timeouts.read_idle).await);
+    }
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|header| header.to_str().ok())
+        .unwrap_or("");
+    if !content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("text/event-stream")
+    {
+        return Err(ProviderError::protocol(
+            "provider returned a non-SSE content type",
+        ));
+    }
+    Ok(response_stream(response, timeouts.read_idle))
+}
+
+/// Parse a single Retry-After field without retaining server-controlled text.
+/// HTTP-date and delay-seconds are both supported; past dates mean no delay.
+/// Ambiguous, malformed, or unrepresentable delays fall back to runtime backoff.
+pub(crate) fn retry_after(headers: &HeaderMap, now: std::time::SystemTime) -> Option<Duration> {
+    let mut values = headers.get_all(RETRY_AFTER).iter();
+    let value = values.next()?.to_str().ok()?.trim();
     if values.next().is_some() {
         return None;
     }
-    let value = value.to_str().ok()?.trim();
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let seconds = value.parse::<u64>().ok().filter(|seconds| *seconds <= 2)?;
-    Some(backoff.max(Duration::from_secs(seconds)))
+    let delay = if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        Duration::from_secs(value.parse().ok()?)
+    } else {
+        httpdate::parse_http_date(value)
+            .ok()?
+            .duration_since(now)
+            .unwrap_or_default()
+    };
+    // A maliciously large value must not overflow the timer implementation.
+    std::time::Instant::now().checked_add(delay)?;
+    Some(delay)
 }
 
 async fn status_error(
@@ -194,6 +139,7 @@ async fn status_error(
     read_idle: Duration,
 ) -> ProviderError {
     let status = response.status().as_u16();
+    let retry_after = retry_after(response.headers(), std::time::SystemTime::now());
     let mut body = Vec::new();
     // Error diagnostics must not extend the startup budget. Keep both a small
     // total diagnostic cap and the configured per-read idle limit.
@@ -210,13 +156,82 @@ async fn status_error(
     })
     .await;
     let native: Option<Value> = serde_json::from_slice(&body).ok();
-    classify_error(Some(status), &native.unwrap_or(Value::Null))
+    let mut error = classify_error(Some(status), &native.unwrap_or(Value::Null));
+    error.retry_after = retry_after;
+    error
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use futures_util::StreamExt;
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates_without_capping_server_delays() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(784111717);
+        for (value, expected) in [
+            ("0", 0),
+            ("1", 1),
+            ("120", 120),
+            ("Sun, 06 Nov 1994 08:49:37 GMT", 60),
+            ("Sunday, 06-Nov-94 08:49:37 GMT", 60),
+            ("Sun Nov  6 08:49:37 1994", 60),
+            ("Sun, 06 Nov 1994 08:47:37 GMT", 0),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(RETRY_AFTER, value.parse().unwrap());
+            assert_eq!(
+                retry_after(&headers, now),
+                Some(Duration::from_secs(expected)),
+                "{value}"
+            );
+        }
+        for value in [
+            "",
+            "-1",
+            "+1",
+            "1.5",
+            "10, 20",
+            "invalid",
+            "18446744073709551615",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(RETRY_AFTER, value.parse().unwrap());
+            assert_eq!(retry_after(&headers, now), None, "{value}");
+        }
+        let mut headers = HeaderMap::new();
+        headers.append(RETRY_AFTER, "5".parse().unwrap());
+        headers.append(RETRY_AFTER, "10".parse().unwrap());
+        assert_eq!(retry_after(&headers, now), None);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_error_preserves_server_delay_and_safe_diagnostics() {
+        let (url, server) = server(vec![reply(
+            "429 Too Many Requests",
+            "Retry-After: 120\r\n",
+            r#"{"error":{"code":"rate_limit_exceeded","message":"private prompt or secret"}}"#,
+        )])
+        .await;
+        let error = match post_sse(
+            &client().unwrap(),
+            &url,
+            HeaderMap::new(),
+            &serde_json::json!({}),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected rate limit"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, ProviderErrorKind::RateLimited);
+        assert_eq!(error.retry_after, Some(Duration::from_secs(120)));
+        assert!(error.message.contains("429"));
+        assert!(error.message.contains("rate_limit_exceeded"));
+        assert!(!error.message.contains("private"));
+        assert!(!error.message.contains("secret"));
+        assert_eq!(server.await.unwrap().len(), 1, "HTTP itself must not retry");
+    }
 
     pub(super) fn reply(status: &str, headers: &str, body: &str) -> String {
         format!(
@@ -473,180 +488,82 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn slow_first_headers_retry_with_a_fresh_startup_deadline() {
-        let mut success = ResponsePlan::reply(successful_reply());
-        success.delay = Duration::from_millis(40);
-        let mut server =
-            ObservedServer::start(vec![ResponsePlan::stalled_headers(), success]).await;
+    async fn startup_timeout_is_one_attempt_and_a_new_call_gets_a_fresh_deadline() {
+        let mut server = ObservedServer::start(vec![
+            ResponsePlan::stalled_headers(),
+            ResponsePlan::reply(successful_reply()),
+        ])
+        .await;
+        let client = client().unwrap();
         let body = serde_json::json!({"model":"cold-model", "stream":true});
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer test-key".parse().unwrap());
-        let mut stream = tokio::time::timeout(
-            Duration::from_secs(2),
-            post_sse_with_timeouts(
-                &client().unwrap(),
-                &server.url,
-                headers,
-                &body,
-                short_timeouts(),
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(stream.next().await.unwrap().unwrap().data, "done");
-        assert!(stream.next().await.is_none());
-        let (first, first_at) = server.request().await;
-        let (second, second_at) = server.request().await;
-        assert_eq!(first, second);
-        // Allow for the gap between starting the timeout and loopback accept.
-        assert!(second_at.duration_since(first_at) >= Duration::from_millis(280));
-        server.no_more_requests().await;
-    }
-
-    #[tokio::test]
-    async fn every_slow_header_attempt_gets_its_own_budget_and_final_count() {
-        let mut server =
-            ObservedServer::start((0..3).map(|_| ResponsePlan::stalled_headers()).collect()).await;
-        let error = tokio::time::timeout(
-            Duration::from_secs(3),
-            post_sse_with_timeouts(
-                &client().unwrap(),
-                &server.url,
-                HeaderMap::new(),
-                &serde_json::json!({"model":"cold-model", "stream":true}),
-                short_timeouts(),
-            ),
-        )
-        .await
-        .unwrap()
-        .err()
-        .unwrap();
-        assert_eq!(error.kind, ProviderErrorKind::Timeout);
-        assert_eq!(
-            error.message,
-            "provider HTTP startup timeout (after 3 HTTP attempts)"
-        );
-        let (first, first_at) = server.request().await;
-        let (second, second_at) = server.request().await;
-        let (third, third_at) = server.request().await;
-        assert_eq!(first, second);
-        assert_eq!(second, third);
-        // Allow for the gap between starting the timeout and loopback accept.
-        assert!(second_at.duration_since(first_at) >= Duration::from_millis(280));
-        assert!(third_at.duration_since(second_at) >= Duration::from_millis(480));
-        server.no_more_requests().await;
-    }
-
-    #[tokio::test]
-    async fn one_attempt_policy_never_replays_a_startup_timeout() {
-        let mut server = ObservedServer::start(vec![ResponsePlan::stalled_headers()]).await;
-        // Same policy used by post_sse_once, with a millisecond test budget.
-        let error = post_sse_policy(
-            &client().unwrap(),
+        let error = post_sse_with_timeouts(
+            &client,
             &server.url,
             HeaderMap::new(),
-            &Value::Null,
-            1,
+            &body,
             short_timeouts(),
         )
         .await
         .err()
         .unwrap();
         assert_eq!(error.kind, ProviderErrorKind::Timeout);
-        assert!(error.message.ends_with("(after 1 HTTP attempts)"));
-        server.request().await;
+        assert_eq!(error.message, "provider HTTP startup timeout");
+        let first = server.request().await.0;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), server.requests.recv())
+                .await
+                .is_err()
+        );
+        let mut stream = post_sse_with_timeouts(
+            &client,
+            &server.url,
+            HeaderMap::new(),
+            &body,
+            short_timeouts(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap().data, "done");
+        assert!(stream.next().await.is_none());
+        assert_eq!(first, server.request().await.0);
         server.no_more_requests().await;
     }
 
     #[tokio::test]
-    async fn dropping_pending_send_or_backoff_cancels_future_attempts() {
-        for during_backoff in [false, true] {
-            let plan = if during_backoff {
-                ResponsePlan::reply(reply("503 Service Unavailable", "", ""))
-            } else {
-                ResponsePlan::stalled_headers()
-            };
-            let mut server = ObservedServer::start(vec![plan]).await;
-            let client = client().unwrap();
-            let url = server.url.clone();
-            let mut request = Box::pin(post_sse_with_timeouts(
-                &client,
-                &url,
-                HeaderMap::new(),
-                &Value::Null,
-                short_timeouts(),
-            ));
-            tokio::select! {
-                _ = &mut request => panic!("request finished before cancellation"),
-                _ = server.request() => {}
-            }
-            if during_backoff {
-                // Poll through the immediate rejection into its 200ms backoff.
-                tokio::select! {
-                    _ = &mut request => panic!("request finished during backoff"),
-                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-                }
-            }
-            drop(request);
-            server.no_more_requests().await;
+    async fn dropping_pending_send_cancels_the_request() {
+        let mut server = ObservedServer::start(vec![ResponsePlan::stalled_headers()]).await;
+        let client = client().unwrap();
+        let url = server.url.clone();
+        let mut request = Box::pin(post_sse_with_timeouts(
+            &client,
+            &url,
+            HeaderMap::new(),
+            &Value::Null,
+            short_timeouts(),
+        ));
+        tokio::select! {
+            _ = &mut request => panic!("request finished before cancellation"),
+            _ = server.request() => {}
         }
+        drop(request);
+        server.no_more_requests().await;
     }
 
     #[tokio::test]
-    async fn explicit_transient_http_rejections_retry_before_sse_acceptance() {
-        for status in [
-            "408 Request Timeout",
-            "429 Too Many Requests",
-            "500 Internal Server Error",
-            "502 Bad Gateway",
-            "503 Service Unavailable",
-            "504 Gateway Timeout",
-        ] {
-            let mut server = ObservedServer::start(vec![
-                ResponsePlan::reply(reply(
-                    status,
-                    "",
-                    r#"{"error":{"message":"secret prompt"}}"#,
-                )),
-                ResponsePlan::reply(successful_reply()),
-            ])
-            .await;
-            let mut stream = post_sse_with_timeouts(
-                &client().unwrap(),
-                &server.url,
-                HeaderMap::new(),
-                &Value::Null,
-                short_timeouts(),
-            )
-            .await
-            .unwrap();
-            assert_eq!(stream.next().await.unwrap().unwrap().data, "done");
-            let (first, first_at) = server.request().await;
-            let (second, second_at) = server.request().await;
-            assert_eq!(first, second);
-            assert!(second_at.duration_since(first_at) >= Duration::from_millis(200));
-            server.no_more_requests().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn transient_http_exhaustion_counts_attempts_and_sanitizes_body() {
+    async fn transient_http_rejections_are_sanitized_and_returned_without_transport_retries() {
         for (status, kind) in [
+            ("408 Request Timeout", ProviderErrorKind::Timeout),
             ("429 Too Many Requests", ProviderErrorKind::RateLimited),
+            ("500 Internal Server Error", ProviderErrorKind::Response),
+            ("502 Bad Gateway", ProviderErrorKind::Response),
             ("503 Service Unavailable", ProviderErrorKind::Response),
+            ("504 Gateway Timeout", ProviderErrorKind::Timeout),
         ] {
-            let mut server = ObservedServer::start(
-                (0..3)
-                    .map(|_| {
-                        ResponsePlan::reply(reply(
-                            status,
-                            "Retry-After: 0\r\n",
-                            r#"{"error":{"message":"secret prompt"}}"#,
-                        ))
-                    })
-                    .collect(),
-            )
+            let mut server = ObservedServer::start(vec![ResponsePlan::reply(reply(
+                status,
+                "Retry-After: 0\r\n",
+                r#"{"error":{"message":"secret prompt"}}"#,
+            ))])
             .await;
             let error = post_sse_with_timeouts(
                 &client().unwrap(),
@@ -659,11 +576,10 @@ pub(crate) mod tests {
             .err()
             .unwrap();
             assert_eq!(error.kind, kind);
-            assert!(error.message.ends_with("(after 3 HTTP attempts)"));
+            assert!(error.recovery().is_some());
             assert!(!error.message.contains("secret"));
-            let first = server.request().await.0;
-            assert_eq!(first, server.request().await.0);
-            assert_eq!(first, server.request().await.0);
+            assert!(!error.message.contains("attempt"));
+            server.request().await;
             server.no_more_requests().await;
         }
     }
@@ -703,62 +619,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn retry_after_is_never_shortened_by_backoff_or_startup_deadline() {
-        let mut server = ObservedServer::start(vec![
-            ResponsePlan::reply(reply("503 Service Unavailable", "Retry-After: 1\r\n", "")),
-            ResponsePlan::reply(successful_reply()),
-        ])
-        .await;
-        drop(
-            post_sse_with_timeouts(
-                &client().unwrap(),
-                &server.url,
-                HeaderMap::new(),
-                &Value::Null,
-                short_timeouts(),
-            )
-            .await
-            .unwrap(),
-        );
-        let (_, first_at) = server.request().await;
-        let (_, second_at) = server.request().await;
-        assert!(second_at.duration_since(first_at) >= Duration::from_secs(1));
-        server.no_more_requests().await;
-    }
-
-    #[tokio::test]
-    async fn long_malformed_or_ambiguous_retry_after_is_declined() {
-        for headers in [
-            "Retry-After: 3\r\n",
-            "Retry-After: not-a-delay\r\n",
-            "Retry-After: Wed, 21 Oct 2030 07:28:00 GMT\r\n",
-            "Retry-After: 0\r\nRetry-After: 1\r\n",
-        ] {
-            let mut server = ObservedServer::start(vec![ResponsePlan::reply(reply(
-                "503 Service Unavailable",
-                headers,
-                "reflected secret",
-            ))])
-            .await;
-            let error = post_sse_with_timeouts(
-                &client().unwrap(),
-                &server.url,
-                HeaderMap::new(),
-                &Value::Null,
-                short_timeouts(),
-            )
-            .await
-            .err()
-            .unwrap();
-            assert!(error.message.ends_with("(after 1 HTTP attempts)"));
-            assert!(!error.message.contains("secret"));
-            server.request().await;
-            server.no_more_requests().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn connect_failures_exhaust_the_transport_retry_budget() {
+    async fn connect_failures_return_sanitized_transient_errors() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/responses", listener.local_addr().unwrap());
         drop(listener);
@@ -777,21 +638,16 @@ pub(crate) mod tests {
         .err()
         .unwrap();
         assert_eq!(error.kind, ProviderErrorKind::Transport);
-        assert!(error.message.ends_with("(after 3 HTTP attempts)"));
+        assert!(!error.message.contains("HTTP attempts"));
         assert!(!error.message.contains(&url));
     }
 
     #[tokio::test]
-    async fn final_transient_error_body_uses_the_last_attempt_remaining_deadline() {
+    async fn transient_error_body_uses_the_remaining_startup_deadline() {
         let mut last = ResponsePlan::reply("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 999\r\n\r\n".into());
         last.delay = Duration::from_millis(60);
         last.stall_body = true;
-        let mut server = ObservedServer::start(vec![
-            ResponsePlan::reply(reply("503 Service Unavailable", "", "")),
-            ResponsePlan::reply(reply("503 Service Unavailable", "", "")),
-            last,
-        ])
-        .await;
+        let mut server = ObservedServer::start(vec![last]).await;
         let error = tokio::time::timeout(
             Duration::from_secs(2),
             post_sse_with_timeouts(
@@ -810,39 +666,33 @@ pub(crate) mod tests {
         .err()
         .unwrap();
         assert_eq!(error.kind, ProviderErrorKind::Response);
-        assert!(error.message.ends_with("(after 3 HTTP attempts)"));
-        for _ in 0..3 {
-            server.request().await;
-        }
+        assert!(!error.message.contains("HTTP attempts"));
+        server.request().await;
         server.no_more_requests().await;
     }
 
     #[tokio::test]
-    async fn reqwest_send_timeouts_are_retried_before_headers() {
-        let mut server = ObservedServer::start(vec![
-            ResponsePlan::stalled_headers(),
-            ResponsePlan::reply(successful_reply()),
-        ])
-        .await;
+    async fn reqwest_send_timeouts_return_without_retrying() {
+        let mut server = ObservedServer::start(vec![ResponsePlan::stalled_headers()]).await;
         let client = Client::builder()
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
-        drop(
-            post_sse_with_timeouts(
-                &client,
-                &server.url,
-                HeaderMap::new(),
-                &Value::Null,
-                ProviderTimeouts {
-                    startup: Duration::from_secs(2),
-                    read_idle: Duration::from_secs(2),
-                },
-            )
-            .await
-            .unwrap(),
-        );
-        assert_eq!(server.request().await.0, server.request().await.0);
+        let error = post_sse_with_timeouts(
+            &client,
+            &server.url,
+            HeaderMap::new(),
+            &Value::Null,
+            ProviderTimeouts {
+                startup: Duration::from_secs(2),
+                read_idle: Duration::from_secs(2),
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.kind, ProviderErrorKind::Timeout);
+        server.request().await;
         server.no_more_requests().await;
     }
 
@@ -864,47 +714,29 @@ pub(crate) mod tests {
         .err()
         .unwrap();
         assert_eq!(error.kind, ProviderErrorKind::Response);
-        assert!(error.message.ends_with("(after 1 HTTP attempts)"));
+        assert!(!error.message.contains("HTTP attempts"));
         assert!(!error.message.contains("secret"));
         server.request().await;
         server.no_more_requests().await;
     }
 
     #[tokio::test]
-    async fn connection_closed_after_post_before_headers_is_retried_with_identical_request() {
-        for succeeds in [true, false] {
-            // An empty wire response closes the socket after consuming the full POST.
-            let mut plans = vec![ResponsePlan::reply(String::new())];
-            if succeeds {
-                plans.push(ResponsePlan::reply(successful_reply()));
-            } else {
-                plans.extend((0..2).map(|_| ResponsePlan::reply(String::new())));
-            }
-            let mut server = ObservedServer::start(plans).await;
-            let body = serde_json::json!({"model":"cold-model", "stream":true});
-            let result = post_sse_with_timeouts(
-                &client().unwrap(),
-                &server.url,
-                HeaderMap::new(),
-                &body,
-                short_timeouts(),
-            )
-            .await;
-            if succeeds {
-                let mut stream = result.unwrap();
-                assert_eq!(stream.next().await.unwrap().unwrap().data, "done");
-            } else {
-                let error = result.err().unwrap();
-                assert_eq!(error.kind, ProviderErrorKind::Transport);
-                assert!(error.message.ends_with("(after 3 HTTP attempts)"));
-            }
-            let first = server.request().await.0;
-            assert_eq!(first, server.request().await.0);
-            if !succeeds {
-                assert_eq!(first, server.request().await.0);
-            }
-            server.no_more_requests().await;
-        }
+    async fn connection_closed_after_post_returns_without_replaying() {
+        // An empty response closes the socket after consuming the full POST.
+        let mut server = ObservedServer::start(vec![ResponsePlan::reply(String::new())]).await;
+        let error = post_sse_with_timeouts(
+            &client().unwrap(),
+            &server.url,
+            HeaderMap::new(),
+            &Value::Null,
+            short_timeouts(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.kind, ProviderErrorKind::Transport);
+        server.request().await;
+        server.no_more_requests().await;
     }
 
     #[tokio::test]
@@ -919,7 +751,7 @@ pub(crate) mod tests {
         .await
         .err()
         .unwrap();
-        assert_eq!(error.kind, ProviderErrorKind::Transport);
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
         assert!(!error.message.contains("HTTP attempts"));
     }
 

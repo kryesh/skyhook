@@ -30,7 +30,9 @@ impl JobManager {
             for job in descendants {
                 let entry = jobs.get_mut(&job).expect("known descendant");
                 entry.cancellation.cancel();
-                if !entry.state.is_terminal() && !entry.cancellation_watchdog_started {
+                if (!entry.state.is_terminal() || entry.state == JobState::Interrupted)
+                    && !entry.cancellation_watchdog_started
+                {
                     entry.cancellation_watchdog_started = true;
                     watchdogs.push(job);
                 }
@@ -56,7 +58,9 @@ impl JobManager {
             .await
             .iter()
             .filter_map(|(id, entry)| {
-                (&entry.agent == owner && !entry.state.is_terminal()).then_some(*id)
+                (&entry.agent == owner
+                    && (!entry.state.is_terminal() || entry.state == JobState::Interrupted))
+                    .then_some(*id)
             })
             .collect::<Vec<_>>();
         for id in &ids {
@@ -76,7 +80,10 @@ impl JobManager {
                 .lock()
                 .await
                 .iter()
-                .filter_map(|(id, entry)| (!entry.state.is_terminal()).then_some(*id))
+                .filter_map(|(id, entry)| {
+                    (!entry.state.is_terminal() || entry.state == JobState::Interrupted)
+                        .then_some(*id)
+                })
                 .collect::<Vec<_>>();
             if ids.is_empty() {
                 return Ok(());
@@ -96,7 +103,7 @@ impl JobManager {
             let Some(entry) = jobs.get(&id) else {
                 return;
             };
-            if entry.state.is_terminal() {
+            if entry.state.is_terminal() && entry.state != JobState::Interrupted {
                 return;
             }
             entry.task_abort.clone()

@@ -338,7 +338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_and_failed_children_release_only_their_own_context() {
+    async fn cancelled_children_release_but_failed_children_retain_their_context() {
         let root = tempfile::tempdir().unwrap();
         let tracking = Arc::new(Tracking::default());
         let harness = harness(root.path(), tracking.clone()).await;
@@ -375,7 +375,16 @@ mod tests {
                 session.runtime.interrupt_tree(&child).await;
             }
             assert!(received.await.unwrap().is_err());
-            wait_dropped(&tracking, index as usize).await;
+            if fail {
+                // Failed child turns are retained for retry with their provider
+                // session/history; explicit interruption still tears one down.
+                assert!(
+                    !tracking.dropped.lock().unwrap().contains(&(index as usize)),
+                    "failed child context must remain live for retry"
+                );
+            } else {
+                wait_dropped(&tracking, index as usize).await;
+            }
             tracking.fail_all_calls.store(false, Ordering::SeqCst);
             session.prompt("root still usable").await.unwrap();
             assert!(!tracking.dropped.lock().unwrap().contains(&0));
