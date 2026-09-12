@@ -327,7 +327,6 @@ impl App {
                 self.details = !self.details;
                 if self.details { for view in self.views.values_mut() { view.collapsed.clear(); } }
             }
-            "editor" => self.external_editor = true,
             "copy" => self.copy(),
             "attention" => self.activate_prompt(),
             "resume" => {
@@ -693,7 +692,12 @@ impl App {
                 }
             }
             MenuKind::Output(job) => {
-                if value == "search" {
+                if value == "automatic" {
+                    self.output_queries.remove(&job);
+                    *self.output_versions.entry(job).or_default() += 1;
+                    self.final_outputs.remove(&job);
+                    self.fetch_output(job);
+                } else if value == "search" {
                     self.open(
                         "Search saved output (regex)",
                         MenuKind::OutputSearch(job),
@@ -703,8 +707,19 @@ impl App {
                     if let Some(position) = self.outputs.get(&job).and_then(|value| {
                         value
                             .get("preview")
-                            .filter(|page| page["next_start"].is_u64())
+                            .filter(|page| {
+                                page["next_start"].is_u64() || page["next_offset"].is_u64()
+                            })
                             .or_else(|| value["truncated"].as_array()?.first())
+                            .or_else(|| {
+                                value["captures"]
+                                    .as_array()?
+                                    .iter()
+                                    .filter_map(|capture| capture["output"].get("preview"))
+                                    .find(|page| {
+                                        page["next_start"].is_u64() || page["next_offset"].is_u64()
+                                    })
+                            })
                     }) {
                         let mut query = self
                             .output_queries
@@ -745,25 +760,136 @@ impl App {
             self.open(
                 "Saved output",
                 MenuKind::Output(job),
-                vec![
-                    Item::new("field:/result/stdout", "stdout", ""),
-                    Item::new("field:/result/stderr", "stderr", ""),
-                    Item::new("field:/result/console", "script console", ""),
-                    Item::new("field:/result/value", "script return value", ""),
-                    Item::new("field:/result/content", "file content", ""),
-                    Item::new("field:", "complete result", ""),
-                    Item::new("search", "Search this field", "regex"),
-                    Item::new("next", "Next page", ""),
-                ],
+                output_items(Vec::new()),
             );
+            let Some(session) = self.session.clone() else {
+                return;
+            };
+            let id = self.next_menu_id;
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                // Discover saved pointers, not paths through presentation-only
+                // wrappers or a currently selected single-field page.
+                let result = session
+                    .inspect_output_fields(job)
+                    .await
+                    .map(output_items)
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(Work::MenuLoaded { id, result });
+            });
         }
     }
+}
+
+fn output_items(fields: Vec<String>) -> Vec<Item> {
+    let mut items: Vec<_> = fields
+        .into_iter()
+        .map(|field| Item::new(format!("field:{field}"), field, ""))
+        .collect();
+    items.extend([
+        Item::new(
+            "automatic",
+            "automatic output",
+            "structured result and live captures",
+        ),
+        Item::new("field:", "complete result", ""),
+        Item::new("search", "Search this field", "regex"),
+        Item::new("next", "Next page", ""),
+    ]);
+    items
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::tests::*;
     use super::*;
+
+    #[tokio::test]
+    async fn output_menu_uses_saved_pointers_from_a_paged_script_view() {
+        let (_root, mut app) = fixture().await;
+        std::fs::write(app.launch.workspace.join("child.txt"), "child data").unwrap();
+        app.session
+            .as_ref()
+            .unwrap()
+            .run_script("console.log('hello'); return {custom: {'a/b~c': [42]}, child: await tool.read({path: 'child.txt'})};")
+            .await
+            .unwrap();
+        app.snapshot = app.session.as_ref().unwrap().observe().await.snapshot;
+        app.refresh();
+        app.command("details");
+        draw(&mut app);
+        let job = app
+            .projection
+            .jobs
+            .values()
+            .find(|job| job.tool == "script")
+            .unwrap()
+            .id;
+        app.view().row = app
+            .entries
+            .iter()
+            .position(|entry| entry.job == Some(job))
+            .unwrap();
+        let mut query = JobOutputQuery::new(job);
+        query.field = Some("/result/console".into());
+        let page = app
+            .session
+            .as_ref()
+            .unwrap()
+            .inspect_output(query.clone())
+            .await
+            .unwrap();
+        assert!(page.get("result").is_none());
+        app.outputs.insert(job, page.clone());
+        app.output_queries.insert(job, query);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.tx = tx;
+        app.output_menu();
+        let work = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(work, Work::MenuLoaded { result: Ok(_), .. }));
+        app.work(work);
+        let menu = app.menu.as_mut().unwrap();
+        let fields: Vec<_> = menu
+            .items
+            .iter()
+            .filter(|item| item.value.starts_with("field:/"))
+            .map(|item| item.value.as_str())
+            .collect();
+        assert!(fields.contains(&"field:/result/value/child/content"));
+        assert!(!fields.contains(&"field:/result/value/child/result/content"));
+        assert!(!fields.contains(&"field:/result/value/child/id"));
+        assert_eq!(
+            app.outputs[&job], page,
+            "discovery must not replace the displayed page"
+        );
+        assert_eq!(
+            app.output_queries[&job].field.as_deref(),
+            Some("/result/console")
+        );
+        menu.selected = menu
+            .items
+            .iter()
+            .position(|item| item.value == "field:/result/value/custom/a~1b~0c/0")
+            .unwrap();
+        app.choose();
+        let query = app.output_queries[&job].clone();
+        assert_eq!(
+            query.field.as_deref(),
+            Some("/result/value/custom/a~1b~0c/0")
+        );
+        let output = app
+            .session
+            .as_ref()
+            .unwrap()
+            .inspect_output(query)
+            .await
+            .unwrap();
+        assert_eq!(output["preview"]["lines"], json!(["42"]));
+    }
+
     async fn wait_for_failures(
         session: &SessionHandle,
         child_job: JobId,
@@ -929,7 +1055,11 @@ mod tests {
     #[tokio::test]
     async fn menu_loads_only_fill_the_originating_open_menu() {
         let (_root, mut app) = draft_fixture().await;
-        for kind in [MenuKind::Sessions, MenuKind::Files] {
+        for kind in [
+            MenuKind::Sessions,
+            MenuKind::Files,
+            MenuKind::Output(JobId::new(42).unwrap()),
+        ] {
             app.open("Loading", kind, vec![]);
             let closed = app.menu.as_ref().unwrap().id;
             key(&mut app, KeyCode::Esc, M::NONE);

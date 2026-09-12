@@ -115,7 +115,6 @@ and `/help`. `Ctrl+X` is a leader: release it, then press the next key within tw
 | `/requests`, `/jobs` | Requests, jobs |
 | `Ctrl+X ↑`, `Ctrl+X ↓` | Parent, first child |
 | `Ctrl+X T` | Dark/light theme |
-| `Ctrl+X E` | Edit draft in `$EDITOR` |
 | `Ctrl+X Y`, `Ctrl+X X` | Copy message/selection, export conversation |
 | `Tab`, `Shift+Tab` | Focus composer, tree, content |
 | `Enter` | Send/queue, select, expand |
@@ -151,7 +150,7 @@ adds an image. Pastes longer than 12 lines and attached file contents appear as 
 at the cursor. Type before, between, or after multiple paste items; move across, select, delete,
 and undo them as single editing units. Sending or copying expands their original contents in
 place. Shorter pastes remain ordinary editable text. Use `/attachments` to inspect or remove
-paste items and images; `$EDITOR` opens the fully expanded draft for editing.
+paste items and images.
 Questions and permissions open even while inspecting the agent tree or
 conversation; open menus and search keep input focus until closed. `Esc` dismisses foreground
 questions and permissions without answering them; reopen pending requests with `Ctrl+X R`

@@ -88,7 +88,7 @@ impl JobManager {
         let operation = self.operation(id).await?;
         let _operation = operation.lock().await;
         let _delivery = self.inner.delivery_operation.lock().await;
-        let (agent, script) = {
+        let (agent, tool) = {
             let jobs = self.inner.jobs.lock().await;
             let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
             if entry.state.is_terminal()
@@ -97,7 +97,7 @@ impl JobManager {
             {
                 return Err(JobError::AlreadyTerminal(id));
             }
-            (entry.agent.clone(), entry.tool == "script")
+            (entry.agent.clone(), entry.tool.clone())
         };
         let (state, output, error, denial) = match outcome {
             JobOutcome::Completed(output) => (JobState::Completed, Some(output), None, None),
@@ -119,32 +119,27 @@ impl JobManager {
                 None,
             ),
         };
-        let (mut output, images) = output.map_or((None, Vec::new()), |output| {
+        let (output, images) = output.map_or((None, Vec::new()), |output| {
             (Some(output.value), output.images)
         });
         let directory = self.output_directory(id);
         let capture_complete = output
             .as_ref()
             .is_some_and(|value| value.get("timed_out") != Some(&Value::Bool(true)));
-        if output.is_none() && script {
-            output = Some(serde_json::json!({"value":null,"console":""}));
-        }
-        if output.is_none() {
-            let mut partial = serde_json::Map::new();
-            for field in ["stdout", "stderr"] {
-                if output::field_file(&directory, &format!("/result/{field}")).exists() {
-                    partial.insert(field.to_owned(), Value::String(String::new()));
-                }
-            }
-            if !partial.is_empty() {
-                output = Some(Value::Object(partial));
-            }
-        }
+        // Captures have independent pointer/type metadata. A failed tool need not
+        // produce a result, and unfinished JSON captures are not valid result trees.
         let document = serde_json::json!({"capture_complete":capture_complete, "result":output, "error":error});
-        tokio::task::spawn_blocking(move || output::save(&directory, &document))
-            .await
-            .map_err(|e| JobError::Internal(e.to_string()))?
-            .map_err(SessionError::from)?;
+        tokio::task::spawn_blocking(move || {
+            output::recover_legacy_captures(
+                &directory,
+                (!capture_complete).then_some(tool.as_str()),
+            )
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+            output::save(&directory, &document)
+        })
+        .await
+        .map_err(|e| JobError::Internal(e.to_string()))?
+        .map_err(SessionError::from)?;
         let output_path = Some(
             std::path::PathBuf::from("jobs")
                 .join(id.to_string())

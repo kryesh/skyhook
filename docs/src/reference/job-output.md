@@ -111,12 +111,31 @@ windows until more output arrives or capture closes. A wait timeout never stops 
 ## Persistence and live output
 
 Reads are repeatable and survive session resume, without opaque tokens or saved query state.
-The old `cursor` argument is no longer accepted. Capture completeness remains internal; finished
-jobs with retained partial output have an `Output incomplete.` notice.
+The old `cursor` argument is no longer accepted. Finished jobs with retained partial output have
+an `Output incomplete.` notice, including when viewing the final captured page.
 
-Local process output can be read while running. Remote shims capture first and transfer their
-results in bounded frames after execution completes. Once transferred, output can be queried
-without reconnecting to the remote machine.
+Output views advertise actual available captures, independently of tool names or whether a
+structured result was returned:
+
+```json
+{"captures":[{"field":"/result/console","kind":"text","complete":false}]}
+```
+
+`kind` is `text`, `json`, or `unknown`. `complete: false` means the capture is still live or
+incomplete; in particular, a partial JSON capture must not be treated as a valid JSON value.
+Select a descriptor's `field` to page or search its retained bytes. Capture descriptors survive
+failures, cancellation, and session resume even when there is no structured result containing
+those fields. Empty or absent result fields are not fabricated to represent partial captures.
+
+Local captures, including script console output, can be read while running. Remote shims capture
+first and transfer results in bounded frames; already-transferred captures can be queried locally,
+including during transfer, without reconnecting to the remote machine.
+
+The TUI's automatic output view shows the structured result and previews any available captures
+not represented there. This exposes both process streams while live and preserves stderr and exit
+status on completion. Explicit field, page, and search selections remain selected; choose
+**automatic output** in the Saved output menu to return to automatic viewing. Menu fields are
+generated from the result object and available capture descriptors.
 
 The journal stores the exact model-visible previews, pages, and notifications. Full artifacts
 are separate; provider-neutral request reconstruction reuses committed content rather than

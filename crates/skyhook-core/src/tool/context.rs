@@ -145,9 +145,23 @@ impl ToolContext {
     }
 
     pub(crate) async fn capture_path(&self, field: &str) -> Result<std::path::PathBuf, ToolError> {
+        self.capture_path_with_kind(field, crate::job::output::CaptureKind::Text)
+            .await
+    }
+
+    pub(crate) async fn capture_path_with_kind(
+        &self,
+        field: &str,
+        kind: crate::job::output::CaptureKind,
+    ) -> Result<std::path::PathBuf, ToolError> {
         let directory = self.jobs.output_directory(self.job);
-        tokio::fs::create_dir_all(&directory).await?;
-        Ok(crate::job::output::field_file(&directory, field))
+        let field = field.to_owned();
+        tokio::task::spawn_blocking(move || {
+            crate::job::output::register_capture(&directory, &field, kind)
+        })
+        .await
+        .map_err(|error| ToolError::Failed(error.to_string()))?
+        .map_err(Into::into)
     }
 
     pub(crate) async fn output_changed(&self) {

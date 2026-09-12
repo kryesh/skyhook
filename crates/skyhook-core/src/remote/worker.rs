@@ -135,8 +135,8 @@ where
                             if let Some(job) = captured_job {
                                 let directory = store.directory().join("jobs").join(job.to_string());
                                 match crate::job::output::transfer_fields(&directory) {
-                                    Ok(fields) => for (field, path) in fields {
-                                        if let Err(error) = super::protocol::write_artifact(&output, request_id, field, &path).await {
+                                    Ok(fields) => for (field, kind, path) in fields {
+                                        if let Err(error) = super::protocol::write_artifact(&output, request_id, field, kind, &path).await {
                                             return (request_id, Err(error));
                                         }
                                     },

@@ -1,4 +1,53 @@
 use super::*;
+use futures_util::{StreamExt, stream};
+
+// Keep explicit field/page/search selections intact. Automatic views show the
+// structured result plus any actual captures not represented in that result.
+async fn load_output(session: &SessionHandle, query: JobOutputQuery) -> Result<Value, String> {
+    let automatic = query.field.is_none()
+        && query.pattern.is_none()
+        && query.start.is_none()
+        && query.offset.is_none()
+        && query.limit.is_none();
+    let job = query.job;
+    let mut output = session
+        .inspect_output(query)
+        .await
+        .map_err(|error| error.to_string())?;
+    if automatic {
+        let missing: Vec<_> = output
+            .get("captures")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter_map(|(index, capture)| {
+                let field = capture.get("field")?.as_str()?;
+                output
+                    .pointer(field)
+                    .is_none()
+                    .then(|| (index, field.to_owned()))
+            })
+            .collect();
+        let pages = stream::iter(missing)
+            .map(|(index, field)| async move {
+                let mut query = JobOutputQuery::new(job);
+                query.field = Some(field);
+                let page = session
+                    .inspect_output(query)
+                    .await
+                    .unwrap_or_else(|error| json!({"error": error.to_string()}));
+                (index, page)
+            })
+            .buffered(4)
+            .collect::<Vec<_>>()
+            .await;
+        for (index, page) in pages {
+            output["captures"][index]["output"] = page;
+        }
+    }
+    Ok(output)
+}
 
 pub enum Work {
     QueueCommitted {
@@ -212,20 +261,14 @@ impl App {
         if self.session.is_none() || !self.pending_outputs.insert(job) {
             return;
         }
+        // Only explicit user selections are retained. The default asks the core
+        // for its structured/live projection, independently of the tool name,
+        // and can therefore change naturally when a running job finishes.
         let query = self
             .output_queries
-            .entry(job)
-            .or_insert_with(|| {
-                let mut q = JobOutputQuery::new(job);
-                q.field = match self.projection.jobs.get(&job).map(|job| job.tool.as_str()) {
-                    Some("exec" | "shell") => Some("/result/stdout".into()),
-                    // These schemas bound long fields in the structured projection.
-                    Some("read" | "write" | "replace" | "patch") => None,
-                    _ => Some(String::new()),
-                };
-                q
-            })
-            .clone();
+            .get(&job)
+            .cloned()
+            .unwrap_or_else(|| JobOutputQuery::new(job));
         let version = *self.output_versions.get(&job).unwrap_or(&0);
         let finished = self
             .projection
@@ -237,10 +280,7 @@ impl App {
         };
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = session
-                .inspect_output(query)
-                .await
-                .map_err(|e| e.to_string());
+            let result = load_output(&session, query).await;
             let _ = tx.send(Work::Output {
                 session: session.id(),
                 job,
@@ -518,6 +558,121 @@ impl App {
 mod tests {
     use super::super::tests::*;
     use super::*;
+
+    async fn fetch_output(app: &mut App, job: JobId) -> Value {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.tx = tx;
+        app.fetch_output(job);
+        let work = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(work, Work::Output { job: id, .. } if id == job));
+        app.work(work);
+        app.outputs[&job].clone()
+    }
+
+    fn capture_text(output: &Value, field: &str) -> String {
+        output["captures"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|capture| capture["field"].as_str() == Some(field))
+            .and_then(|capture| capture["output"]["preview"]["lines"].as_array())
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn automatic_output_follows_live_captures_then_structured_completion() {
+        let (_root, mut app) = draft_fixture().await;
+        app.launch.approve_all = true;
+        let session = app.launch.create(None).await.unwrap();
+        app.set_session(Some(session.clone()), session.observe().await.snapshot);
+        let launched = session.run_script(format!("return await tool.shell({});", json!({
+            "command": "printf 'live stdout\\n'; printf 'live stderr\\n' >&2; while [ ! -e release ]; do sleep 0.01; done; exit 1",
+            "timeout": 10,
+            "bg": true,
+        }))).await.unwrap();
+        let job: JobId = serde_json::from_value(launched.value["value"]["id"].clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let output = load_output(&session, JobOutputQuery::new(job))
+                    .await
+                    .unwrap();
+                if capture_text(&output, "/result/stdout").contains("live stdout")
+                    && capture_text(&output, "/result/stderr").contains("live stderr")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        app.snapshot = session.observe().await.snapshot;
+        app.refresh();
+        let live = fetch_output(&mut app, job).await;
+        assert!(capture_text(&live, "/result/stdout").contains("live stdout"));
+        assert!(capture_text(&live, "/result/stderr").contains("live stderr"));
+        assert!(!app.output_queries.contains_key(&job));
+        app.command("details");
+        draw(&mut app);
+        let entry = app
+            .entries
+            .iter()
+            .find(|entry| entry.job == Some(job))
+            .unwrap();
+        assert!(
+            entry.text.contains("live stdout") && entry.text.contains("live stderr"),
+            "{}",
+            entry.text
+        );
+
+        std::fs::write(app.launch.workspace.join("release"), "").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                app.snapshot = session.observe().await.snapshot;
+                app.refresh();
+                if app.projection.jobs[&job].state.is_terminal() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let complete = fetch_output(&mut app, job).await;
+        assert_eq!(complete["result"]["exit_code"], 1);
+        assert_eq!(complete["result"]["stdout"], "live stdout\n");
+        assert_eq!(complete["result"]["stderr"], "live stderr\n");
+        assert!(!app.output_queries.contains_key(&job));
+
+        let mut query = JobOutputQuery::new(job);
+        query.field = Some("/result/stderr".into());
+        app.output_queries.insert(job, query);
+        let selected = fetch_output(&mut app, job).await;
+        assert_eq!(selected["preview"]["field"], "/result/stderr");
+        assert!(
+            selected["captures"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .all(|capture| capture.get("output").is_none())
+        );
+        assert_eq!(
+            app.output_queries[&job].field.as_deref(),
+            Some("/result/stderr")
+        );
+        session.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn attachment_reads_do_not_leak_into_the_next_submission_or_session() {
         let (_root, mut app) = draft_fixture().await;
@@ -733,7 +888,7 @@ mod tests {
         app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
     #[tokio::test]
-    async fn expanded_large_script_and_tool_results_pretty_print_partial_json() {
+    async fn expanded_large_script_and_tool_results_use_structured_output() {
         let (_root, mut app) = fixture().await;
         for index in 0..250 {
             std::fs::write(
@@ -761,24 +916,25 @@ mod tests {
                 .unwrap()
                 .id;
             app.fetch_output(job);
-            let query = app.output_queries[&job].clone();
-            assert_eq!(query.field.as_deref(), Some(""));
-            let output = app
-                .session
-                .as_ref()
-                .unwrap()
-                .inspect_output(query)
+            assert!(!app.output_queries.contains_key(&job));
+            let output = load_output(app.session.as_ref().unwrap(), JobOutputQuery::new(job))
                 .await
                 .unwrap();
-            assert!(output["preview"]["next_start"].is_u64(), "{tool}: {output}");
-            let source = output["preview"]["lines"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|line| line.as_str().unwrap())
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(serde_json::from_str::<Value>(&source).unwrap_err().is_eof());
+            assert!(output.get("result").is_some(), "{tool}: {output}");
+            assert!(output.get("preview").is_none(), "{tool}: {output}");
+            // Unchanged child results retain their native JobView inside the
+            // script return value, including the child's truncation metadata.
+            let projected = if tool == "script" {
+                &output["result"]["value"]
+            } else {
+                &output
+            };
+            assert!(
+                projected["truncated"]
+                    .as_array()
+                    .is_some_and(|fields| !fields.is_empty()),
+                "{tool}: {output}"
+            );
             app.outputs.insert(job, output);
             jobs.push(job);
         }
@@ -791,7 +947,7 @@ mod tests {
                 .iter()
                 .find(|entry| entry.job == Some(job))
                 .unwrap();
-            assert!(entry.text.contains("More saved output available"));
+            assert!(entry.text.contains("\"truncated\""), "{}", entry.text);
             assert!(
                 entry.text.contains("\n    \"result\": {\n      \""),
                 "{}",
@@ -825,8 +981,8 @@ mod tests {
             .unwrap()
             .id;
         app.fetch_output(job);
-        let query = app.output_queries[&job].clone();
-        assert!(query.field.is_none());
+        assert!(!app.output_queries.contains_key(&job));
+        let query = JobOutputQuery::new(job);
         let output = app
             .session
             .as_ref()

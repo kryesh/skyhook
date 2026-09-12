@@ -85,6 +85,14 @@ impl SessionHandle {
             .await
     }
 
+    /// Selectable saved-output pointers, unaffected by presentation-only wrappers.
+    pub async fn inspect_output_fields(
+        &self,
+        job: JobId,
+    ) -> Result<Vec<String>, crate::tool::ToolError> {
+        self.runtime.jobs.inspect_output_fields(job).await
+    }
+
     pub async fn cancel_job(
         &self,
         job: JobId,

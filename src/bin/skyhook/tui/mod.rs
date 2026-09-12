@@ -37,17 +37,14 @@ pub struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         let guard = Self;
-        Self::activate()?;
-        Ok(guard)
-    }
-    fn activate() -> io::Result<()> {
         enable_raw_mode()?;
         execute!(
             io::stdout(),
             EnterAlternateScreen,
             EnableMouseCapture,
             EnableBracketedPaste
-        )
+        )?;
+        Ok(guard)
     }
     fn restore() {
         let _ = execute!(
@@ -202,20 +199,6 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 _ = hangup.recv() => app.shutdown(),
                 _ = interrupt.recv() => app.shutdown(),
             }
-            if app.external_editor {
-                app.external_editor = false;
-                drop(input);
-                TerminalGuard::restore();
-                let edited = edit_external(app.editor.expanded_text()).await;
-                TerminalGuard::activate()?;
-                terminal.clear()?;
-                input = EventStream::new();
-                match edited {
-                    Ok(text) => app.editor.set(text),
-                    Err(error) => app.notice(error.to_string()),
-                }
-                app.dirty = true;
-            }
             if app.dirty && (immediate || last_draw.elapsed() >= frame_interval) {
                 last_draw = tokio::time::Instant::now();
                 draw_terminal(&mut terminal, &mut app)?;
@@ -262,23 +245,6 @@ fn draw_terminal<W: Write>(
     rendered.and(ended)
 }
 
-async fn edit_external(text: String) -> io::Result<String> {
-    let mut file = tempfile::Builder::new().suffix(".md").tempfile()?;
-    file.write_all(text.as_bytes())?;
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-    // The user's configured editor is shell syntax; the file path is a positional argument.
-    let status = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("exec {editor} \"$1\""))
-        .arg("skyhook-editor")
-        .arg(file.path())
-        .status()
-        .await?;
-    if !status.success() {
-        return Err(io::Error::other("external editor failed"));
-    }
-    tokio::fs::read_to_string(file.path()).await
-}
 fn copy_terminal(text: &str) -> io::Result<()> {
     use base64::Engine as _;
     write!(

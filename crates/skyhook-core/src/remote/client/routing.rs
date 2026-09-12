@@ -63,12 +63,23 @@ pub(super) async fn route_responses<R>(
             Response::ToolArtifact {
                 request_id,
                 field,
+                kind,
                 offset,
                 data,
                 finished,
             } => {
                 if let Err(error) = results
-                    .artifact(state, request_id, field, offset, data, finished)
+                    .artifact(
+                        state,
+                        super::results::ArtifactFrame {
+                            request_id,
+                            field,
+                            kind,
+                            offset,
+                            data,
+                            finished,
+                        },
+                    )
                     .await
                 {
                     fail_connection(state, error).await;

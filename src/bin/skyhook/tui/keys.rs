@@ -8,7 +8,6 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("agents", "Inspect agent", "ctrl+x a"),
     ("inspect", "Focus conversation", "ctrl+x i"),
     ("themes", "Theme", "ctrl+x t"),
-    ("editor", "External editor", "ctrl+x e"),
     ("copy", "Copy message", "ctrl+x y"),
     ("export", "Export conversation", "ctrl+x x"),
     ("exit", "Quit", "ctrl+x q"),

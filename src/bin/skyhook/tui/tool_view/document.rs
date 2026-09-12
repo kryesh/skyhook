@@ -181,16 +181,18 @@ impl Document {
     ) {
         self.line("Output", Role::Heading);
         let whole_preview = output.and_then(complete_document_preview);
-        if let Some(error) = error
-            && !output.is_some_and(|output| contains_error(output, error))
-            && !whole_preview
-                .as_ref()
-                .is_some_and(|preview| document_has_error(preview, &Value::String(error.into())))
-        {
-            self.error(&Value::String(error.into()));
+        let summary = error.map(|error| Value::String(error.into()));
+        let shown_summary = summary.as_ref().filter(|summary| {
+            !output.is_some_and(|output| contains_error(output, summary.as_str().unwrap()))
+                && !whole_preview
+                    .as_ref()
+                    .is_some_and(|preview| document_has_error(preview, summary))
+        });
+        if let Some(error) = shown_summary {
+            self.error(error);
         }
         if let Some(output) = output {
-            self.output_body(tool, args, output, whole_preview.as_ref());
+            self.output_body(tool, args, output, whole_preview.as_ref(), shown_summary);
         }
     }
     fn error(&mut self, error: &Value) {
@@ -212,8 +214,20 @@ impl Document {
         args: &Value,
         output: &Value,
         whole_preview: Option<&Value>,
+        shown_summary: Option<&Value>,
     ) {
-        let mut shown_errors = Vec::new();
+        // Envelope notices describe the capture, not the selected payload.
+        // In particular, reaching the final preview page does not imply that
+        // the original output was captured completely.
+        let notice = output
+            .get("notice")
+            .and_then(Value::as_str)
+            .filter(|notice| !notice.trim().is_empty());
+        if let Some(notice) = notice {
+            self.line("Notice", Role::Label);
+            self.code(notice, "", 2, vec![], Role::Muted);
+        }
+        let mut shown_errors: Vec<_> = shown_summary.into_iter().collect();
         for pointer in ["/error", "/result/error"] {
             if let Some(error) = output.pointer(pointer).filter(|value| !value.is_null())
                 && !shown_errors.contains(&error)
@@ -223,54 +237,39 @@ impl Document {
                 shown_errors.push(error);
             }
         }
+        let captures = output.get("captures").and_then(Value::as_array);
+        let has_capture_previews = captures.is_some_and(|captures| {
+            captures.iter().any(|capture| {
+                capture
+                    .pointer("/output/preview")
+                    .is_some_and(|value| !value.is_null())
+            })
+        });
         if let Some(preview) = output.get("preview").filter(|value| !value.is_null()) {
-            let field = preview["field"].as_str().unwrap_or_default();
-            self.line(
-                if field.is_empty() {
-                    "Complete result"
-                } else {
-                    field
-                },
-                Role::Muted,
-            );
-            let lines = preview["lines"]
-                .as_array()
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            let source = lines
-                .iter()
-                .map(|line| line.as_str().unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let mut language = output_language(tool, args, field);
-            let incomplete = !preview["next_start"].is_null() || !preview["next_offset"].is_null();
-            let formatted = (field != "/result/content"
-                && (language.is_empty() || language == "json")
-                && lines.iter().all(Value::is_string))
-            // Only the whole saved document is known to be structured JSON.
-            // Selected fields can be literal text containing JSON, so retain
-            // their null fields just as we do for stdout and file content.
-            .then(|| pretty_json_preview(&source, incomplete, field.is_empty()))
-            .flatten();
-            let source = if let Some(formatted) = formatted {
-                language = "json".into();
-                formatted
-            } else {
-                source
-            };
-            self.code(&source, &language, 2, vec![], Role::Plain);
-            self.line(
-                if incomplete {
-                    "More saved output available"
-                } else {
-                    "End of available output"
-                },
-                Role::Muted,
-            );
+            // Live output may have no saved whole document yet. The selected
+            // capture views are more useful than an empty Complete result pane.
+            let empty_whole_preview = preview["field"].as_str() == Some("")
+                && preview["lines"].as_array().is_some_and(Vec::is_empty);
+            if !has_capture_previews || !empty_whole_preview {
+                self.output_preview(tool, args, preview);
+            }
         } else {
             // Split literal text fields out of the display copy; the original Value is untouched.
             let mut metadata = output.clone();
             omit_null_fields(&mut metadata);
+            // `output` is a TUI-only selected-field view, not capture metadata.
+            if let Some(captures) = metadata.get_mut("captures").and_then(Value::as_array_mut) {
+                for capture in captures {
+                    if let Some(capture) = capture.as_object_mut() {
+                        capture.remove("output");
+                    }
+                }
+            }
+            if notice.is_some()
+                && let Some(object) = metadata.as_object_mut()
+            {
+                object.remove("notice");
+            }
             for pointer in ["/error", "/result/error"] {
                 if output
                     .pointer(pointer)
@@ -316,7 +315,79 @@ impl Document {
                 }
             }
         }
+        if let Some(captures) = captures {
+            for capture in captures {
+                let mut labeled_error = false;
+                for pointer in ["/output/error", "/output/result/error"] {
+                    if let Some(error) = capture.pointer(pointer).filter(|value| !value.is_null())
+                        && !shown_errors.contains(&error)
+                        && !whole_preview.is_some_and(|preview| document_has_error(preview, error))
+                    {
+                        if !labeled_error {
+                            self.line(capture["field"].as_str().unwrap_or("Capture"), Role::Label);
+                            labeled_error = true;
+                        }
+                        self.error(error);
+                        shown_errors.push(error);
+                    }
+                }
+                if let Some(preview) = capture
+                    .pointer("/output/preview")
+                    .filter(|value| !value.is_null())
+                {
+                    // The parent owns capture notices; only independent read
+                    // failures above need additional envelope rendering.
+                    self.output_preview(tool, args, preview);
+                }
+            }
+        }
     }
+    fn output_preview(&mut self, tool: &str, args: &Value, preview: &Value) {
+        let field = preview["field"].as_str().unwrap_or_default();
+        self.line(
+            if field.is_empty() {
+                "Complete result"
+            } else {
+                field
+            },
+            Role::Muted,
+        );
+        let lines = preview["lines"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let source = lines
+            .iter()
+            .map(|line| line.as_str().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut language = output_language(tool, args, field);
+        let incomplete = !preview["next_start"].is_null() || !preview["next_offset"].is_null();
+        let formatted = (field != "/result/content"
+            && (language.is_empty() || language == "json")
+            && lines.iter().all(Value::is_string))
+        // Only the whole saved document is known to be structured JSON.
+        // Selected fields can be literal text containing JSON, so retain
+        // their null fields just as we do for stdout and file content.
+        .then(|| pretty_json_preview(&source, incomplete, field.is_empty()))
+        .flatten();
+        let source = if let Some(formatted) = formatted {
+            language = "json".into();
+            formatted
+        } else {
+            source
+        };
+        self.code(&source, &language, 2, vec![], Role::Plain);
+        self.line(
+            if incomplete {
+                "More saved output available"
+            } else {
+                "End of available output"
+            },
+            Role::Muted,
+        );
+    }
+
     fn result_text(&mut self, text: &str, language: &str) {
         if let Some(value) = json_container(text) {
             self.code(&model::pretty(&value), "json", 2, vec![], Role::Plain);
@@ -668,6 +739,86 @@ mod tests {
         let source = serde_json::to_string_pretty(saved).unwrap();
         let lines: Vec<_> = source.lines().collect();
         json!({"field": "", "total_lines": lines.len(), "lines": lines})
+    }
+
+    #[test]
+    fn output_notices_render_once_for_structured_and_paged_payloads() {
+        for preview in [
+            Value::Null,
+            json!({"field": "/result/stdout", "lines": ["payload"]}),
+            json!({"field": "/result/stdout", "lines": ["payload"], "next_start": 2}),
+            json!({"field": "/result/stdout", "lines": ["payload"], "next_offset": 200}),
+        ] {
+            let output = json!({"notice": "Output incomplete.", "preview": preview,
+                                "result": {"stdout": "payload"}});
+            let mut document = Document::default();
+            document.output("exec", &Value::Null, &output);
+            let text = document.plain_text();
+            assert_eq!(text.matches("Output incomplete.").count(), 1);
+            assert_eq!(text.matches("payload").count(), 1);
+            if !preview.is_null() {
+                let continuing =
+                    !preview["next_start"].is_null() || !preview["next_offset"].is_null();
+                assert!(text.contains(if continuing {
+                    "More saved output available"
+                } else {
+                    "End of available output"
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn live_captures_keep_unique_read_errors_without_duplicate_envelopes_or_empty_panes() {
+        for preview in [
+            Value::Null,
+            json!({"field": "", "lines": [], "total_lines": 0}),
+        ] {
+            let output = json!({
+                "state": "running", "result": null, "preview": preview,
+                "notice": "Output incomplete.", "error": "parent failure",
+                "captures": [
+                    {"field": "/result/custom", "kind": "text", "complete": false, "output": {
+                        "notice": "Output incomplete.", "error": "parent failure",
+                        "preview": {"field": "/result/custom", "lines": ["  live payload\t"], "next_start": 2}
+                    }},
+                    {"field": "/result/missing", "output": {"error": "field read failed"}},
+                    {"field": "/result/duplicate", "output": {"error": "field read failed"}}
+                ]
+            });
+            let mut document = Document::default();
+            document.output_with_error(
+                "custom_tool",
+                &Value::Null,
+                Some(&output),
+                Some("parent failure"),
+            );
+            let text = document.plain_text();
+            for marker in [
+                "Output incomplete.",
+                "parent failure",
+                "field read failed",
+                "live payload",
+            ] {
+                assert_eq!(text.matches(marker).count(), 1, "{text}");
+            }
+            for absent in [
+                "Complete result",
+                "End of available output",
+                "\"output\"",
+                "\"preview\"",
+            ] {
+                assert!(!text.contains(absent), "{text}");
+            }
+            assert!(text.contains("More saved output available"));
+            assert!(document.sections.iter().any(|section| {
+                matches!(section, Section::Line(runs) if runs.len() == 1
+                    && runs[0].text == "/result/missing" && runs[0].role == Role::Label)
+            }));
+            assert!(document.sections.iter().any(|section| {
+                matches!(section, Section::Code { source, .. } if &**source == "  live payload\t")
+            }));
+        }
     }
 
     fn error_sources(document: &Document) -> Vec<&str> {

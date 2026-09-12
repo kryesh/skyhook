@@ -70,6 +70,8 @@ pub(crate) enum Response {
     ToolArtifact {
         request_id: u64,
         field: String,
+        #[serde(default)]
+        kind: crate::job::output::CaptureKind,
         offset: u64,
         data: Vec<u8>,
         finished: bool,
@@ -259,6 +261,7 @@ pub(crate) async fn write_artifact<W: AsyncWrite + Unpin>(
     writer: &tokio::sync::Mutex<W>,
     request_id: u64,
     field: String,
+    kind: crate::job::output::CaptureKind,
     path: &std::path::Path,
 ) -> std::io::Result<()> {
     let mut input = tokio::fs::File::open(path).await?;
@@ -271,6 +274,7 @@ pub(crate) async fn write_artifact<W: AsyncWrite + Unpin>(
             &Response::ToolArtifact {
                 request_id,
                 field: field.clone(),
+                kind,
                 offset,
                 data: buffer[..length].to_vec(),
                 finished: length == 0,

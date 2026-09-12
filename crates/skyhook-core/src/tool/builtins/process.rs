@@ -161,8 +161,8 @@ async fn run_process(
         child.kill().await?;
         child.wait().await?
     };
-    let stdout_text = (stdout_capture.file.metadata().await?.len() > 0).then(String::new);
-    let stderr_text = (stderr_capture.file.metadata().await?.len() > 0).then(String::new);
+    let stdout_text = stdout_capture.finish().await?;
+    let stderr_text = stderr_capture.finish().await?;
     let output = ProcessOutput {
         exit_code: status.code(),
         stdout: stdout_text,
@@ -252,12 +252,25 @@ where
 
 struct Capture {
     file: tokio::fs::File,
+    path: std::path::PathBuf,
 }
 impl Capture {
     async fn new(path: std::path::PathBuf) -> Result<Self, ToolError> {
         Ok(Self {
             file: tokio::fs::File::create(&path).await?,
+            path,
         })
+    }
+
+    async fn finish(self) -> Result<Option<String>, ToolError> {
+        if self.file.metadata().await?.len() > 0 {
+            return Ok(Some(String::new()));
+        }
+        // Empty streams are omitted from ProcessOutput, so retain no orphaned
+        // capture that would be advertised or transferred as incomplete.
+        drop(self.file);
+        tokio::fs::remove_file(self.path).await?;
+        Ok(None)
     }
 }
 
@@ -401,6 +414,23 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(output.output.value, expected);
+            let view = jobs
+                .inspect_output(
+                    crate::job::output::OutputArgs::new(output.job),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            assert!(view.get("notice").is_none());
+            let captures = view["captures"].as_array().cloned().unwrap_or_default();
+            let expected_captures = if expected.get("stderr").is_some() {
+                vec![serde_json::json!({
+                    "field": "/result/stderr", "kind": "text", "complete": true
+                })]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(captures, expected_captures);
         }
         let output = executor
             .execute(

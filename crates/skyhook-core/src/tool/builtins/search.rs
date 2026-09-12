@@ -25,7 +25,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             .path_argument("path", PathAccess::Read, PathKind::Existing),
         |context, args| async move {
             let root = resolve_existing(&context.execution_location.workspace, &args.path).await?;
-            let capture = context.capture_path("/result/matches").await?;
+            let capture = context.capture_path_with_kind("/result/matches", crate::job::output::CaptureKind::Json).await?;
             let workspace = context.execution_location.workspace.clone();
             tokio::task::spawn_blocking(move || {
                 search_blocking(&workspace, &root, &args, &capture, &context.cancellation_token())
@@ -42,7 +42,9 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             .path_argument("path", PathAccess::Read, PathKind::Existing),
         |context, args| async move {
             let root = resolve_existing(&context.execution_location.workspace, &args.path).await?;
-            let capture = context.capture_path("/result/paths").await?;
+            let capture = context
+                .capture_path_with_kind("/result/paths", crate::job::output::CaptureKind::Json)
+                .await?;
             let workspace = context.execution_location.workspace.clone();
             tokio::task::spawn_blocking(move || {
                 glob_blocking(

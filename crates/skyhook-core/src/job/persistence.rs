@@ -243,7 +243,10 @@ mod tests {
     use super::*;
     use crate::execution::ExecutionLocation;
     use crate::job::{JobState, presented_job_schema};
-    use crate::tool::{ToolError, policy::CapabilitySet};
+    use crate::{
+        job::output,
+        tool::{ToolError, policy::CapabilitySet},
+    };
 
     #[tokio::test]
     async fn denial_survives_replay_and_agent_views_hide_pending_authorization() {
@@ -304,7 +307,7 @@ mod tests {
         let lease = manager
             .test_lease(JobSpec {
                 background: true,
-                ..JobSpec::test(agent.clone(), "long_task")
+                ..JobSpec::test(agent.clone(), "shell")
             })
             .await;
         manager
@@ -322,6 +325,24 @@ mod tests {
             .transition(located.id, JobState::Running)
             .await
             .unwrap();
+        // Legacy sessions had bare hashed captures, sometimes with an index but
+        // no sidecars. Neither recovery route may invent a structured result.
+        let shell_dir = manager.output_directory(lease.id);
+        std::fs::create_dir_all(&shell_dir).unwrap();
+        std::fs::write(output::field_file(&shell_dir, "/result/stdout"), "prefix\n").unwrap();
+        let located_dir = manager.output_directory(located.id);
+        std::fs::create_dir_all(&located_dir).unwrap();
+        std::fs::write(
+            output::field_file(&located_dir, "/result/custom"),
+            "{\"partial\":",
+        )
+        .unwrap();
+        std::fs::write(located_dir.join("fields.json"), r#"["/result/custom"]"#).unwrap();
+        std::fs::write(
+            located_dir.join("document.json"),
+            r#"{"result":{"custom":{}}}"#,
+        )
+        .unwrap();
         drop(lease);
         drop(located);
         drop(manager);
@@ -329,6 +350,20 @@ mod tests {
 
         let (store, records) = SessionStore::open(root.path(), session).await.unwrap();
         let restored = JobManager::restore(store, &records).await.unwrap();
+        for (job, field, kind) in [(1, "/result/stdout", "text"), (2, "/result/custom", "json")] {
+            let view = restored
+                .present_output(
+                    output::OutputArgs::new(JobId::new(job).unwrap()),
+                    &CapabilitySet::default(),
+                )
+                .await
+                .unwrap();
+            assert!(view.get("result").is_none());
+            assert_eq!(
+                view["captures"][0],
+                serde_json::json!({"field":field,"kind":kind,"complete":false})
+            );
+        }
         assert_eq!(
             restored
                 .snapshot(JobId::new(1).unwrap())

@@ -1,6 +1,15 @@
 //! Capture streamed result artifacts and assemble chunked tool results.
 use super::*;
 
+pub(super) struct ArtifactFrame {
+    pub request_id: u64,
+    pub field: String,
+    pub kind: crate::job::output::CaptureKind,
+    pub offset: u64,
+    pub data: Vec<u8>,
+    pub finished: bool,
+}
+
 #[derive(Default)]
 pub(super) struct Results {
     artifacts: HashMap<(u64, String), (tokio::fs::File, u64, bool)>,
@@ -10,12 +19,16 @@ impl Results {
     pub(super) async fn artifact(
         &mut self,
         state: &Mutex<ConnectionState>,
-        request_id: u64,
-        field: String,
-        offset: u64,
-        data: Vec<u8>,
-        finished: bool,
+        frame: ArtifactFrame,
     ) -> Result<(), RemoteError> {
+        let ArtifactFrame {
+            request_id,
+            field,
+            kind,
+            offset,
+            data,
+            finished,
+        } = frame;
         let context = state
             .lock()
             .await
@@ -40,7 +53,7 @@ impl Results {
                     return Err(std::io::Error::other("invalid initial artifact offset"));
                 }
                 let path = context
-                    .capture_path(&field)
+                    .capture_path_with_kind(&field, kind)
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
                 entry.insert((tokio::fs::File::create(path).await?, 0, false));
@@ -137,9 +150,19 @@ mod tests {
             let payload = "line\n".repeat(250_000);
             let source = runtime.root.path().join("payload.txt");
             tokio::fs::write(&source, &payload).await.unwrap();
+            // No result/index exists for this small, unfinished JSON capture.
+            let captures = runtime.root.path().join("remote-captures");
+            let partial = crate::job::output::register_capture(
+                &captures,
+                "/result/custom~1partial",
+                crate::job::output::CaptureKind::Json,
+            )
+            .unwrap();
+            std::fs::write(partial, b"{\"key\":").unwrap();
             let mut builder = crate::tool::ToolRegistryBuilder::default();
             builder.register_dynamic("remote_fixture", "remote fixture", serde_json::json!({"type":"object","properties":{},"additionalProperties":false}), crate::tool::ToolOptions::default().output_schema(serde_json::to_value(schemars::schema_for!(crate::tool::builtins::ProcessOutput)).unwrap()), move |context, _| {
                 let source = source.clone();
+                let captures = captures.clone();
                 async move {
                     let (peer, stream) = tokio::io::duplex(64 * 1024);
                     let (sender, receiver) = oneshot::channel();
@@ -149,10 +172,15 @@ mod tests {
                     let writer = tokio::spawn(async move {
                         let peer = Mutex::new(peer);
                         if complete {
-                            crate::remote::protocol::write_artifact(&peer,1,"/result/stdout".into(),&source).await.unwrap();
+                            let fields = crate::job::output::transfer_fields(&captures).unwrap();
+                            assert_eq!(fields.len(), 1);
+                            for (field, kind, path) in fields {
+                                crate::remote::protocol::write_artifact(&peer, 1, field, kind, &path).await.unwrap();
+                            }
+                            crate::remote::protocol::write_artifact(&peer,1,"/result/stdout".into(),crate::job::output::CaptureKind::Text,&source).await.unwrap();
                             write_frame(&mut *peer.lock().await,&Response::Tool {request_id:1,result:Ok(RemoteToolOutput {value:serde_json::json!({"stdout":"","exit_code":0}),images:Vec::new()})}).await.unwrap();
                         } else {
-                            write_frame(&mut *peer.lock().await,&Response::ToolArtifact {request_id:1,field:"/result/stdout".into(),offset:0,data:b"retained prefix\n".to_vec(),finished:false}).await.unwrap();
+                            write_frame(&mut *peer.lock().await,&Response::ToolArtifact {request_id:1,field:"/result/stdout".into(),kind:crate::job::output::CaptureKind::Text,offset:0,data:b"retained prefix\n".to_vec(),finished:false}).await.unwrap();
                         }
                     });
                     let result = receiver.await.map_err(|e| ToolError::Failed(e.to_string()))?;
@@ -187,6 +215,20 @@ mod tests {
                     .unwrap();
                 assert_eq!(view["result"]["stdout"], "line\n".repeat(100));
                 assert_eq!(view["result"]["exit_code"], 0);
+                assert!(view["result"].get("custom/partial").is_none());
+                assert!(view["captures"].as_array().unwrap().iter().any(
+                    |capture| capture["field"] == "/result/custom~1partial"
+                        && capture["kind"] == "json"
+                        && capture["complete"] == false
+                ));
+                let mut partial = crate::job::output::OutputArgs::new(result.job);
+                partial.field = Some("/result/custom~1partial".into());
+                let partial = runtime
+                    .jobs
+                    .present_output(partial, &Default::default())
+                    .await
+                    .unwrap();
+                assert_eq!(partial["preview"]["lines"][0], "{\"key\":");
                 assert_eq!(view["truncated"][0]["field"], "/result/stdout");
                 let script = executor.execute_model(runtime.agent.clone(), "script", serde_json::json!({
                     "source":"const remote = await tool.remote_fixture({}); if (remote.stdout.length !== 1250000) throw new Error('truncated inside script'); return {remote};"
