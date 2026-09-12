@@ -29,6 +29,7 @@ pub struct Config {
     /// Session storage override. Relative paths retain their historical meaning:
     /// relative to the process working directory, not the config or target directory.
     /// When absent, the harness uses `<resolved workspace>/.skyhook/sessions`.
+    /// The CLI always uses that workspace-local directory, ignoring this override.
     pub session_root: Option<PathBuf>,
     /// Approve all tool calls without consulting an interactive policy.
     #[serde(default)]

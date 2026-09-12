@@ -8,35 +8,57 @@ pub(super) struct AgentStatsColumns([usize; 3]);
 
 pub(super) const AGENT_STATS_HEADERS: [&str; 3] = ["Output", "Input (uncached)", "Context"];
 
+/// Shared visibility policy: reserve identity space, then statistics as a group,
+/// then a fixed-width status column. Hidden columns never consume another row.
+pub(super) struct AgentColumnsLayout {
+    pub(super) identity_width: u16,
+    pub(super) status_width: u16,
+    pub(super) stats_width: u16,
+}
+
+impl AgentColumnsLayout {
+    pub(super) fn new(
+        width: u16,
+        viewport_width: u16,
+        minimum_identity_width: u16,
+        stats_width: u16,
+    ) -> Self {
+        let stats_width = if usize::from(width)
+            >= usize::from(stats_width) + usize::from(minimum_identity_width) + 2
+        {
+            stats_width
+        } else {
+            0
+        };
+        let stats_reserved = if stats_width > 0 { stats_width + 2 } else { 0 };
+        let remaining = width.saturating_sub(stats_reserved);
+        let status_width = if viewport_width >= 70
+            && usize::from(remaining) >= usize::from(minimum_identity_width) + 30
+        {
+            28
+        } else {
+            0
+        };
+        let status_reserved = if status_width > 0 {
+            status_width + 2
+        } else {
+            0
+        };
+        Self {
+            identity_width: remaining.saturating_sub(status_reserved),
+            status_width,
+            stats_width,
+        }
+    }
+}
+
 impl AgentStatsColumns {
-    pub(super) fn menu<'a>(rows: impl IntoIterator<Item = &'a [String; 3]>, width: u16) -> Self {
+    pub(super) fn menu<'a>(rows: impl IntoIterator<Item = &'a [String; 3]>) -> Self {
         let mut columns = Self::new(rows);
         for (column, header) in columns.0.iter_mut().zip(AGENT_STATS_HEADERS) {
             *column = (*column).max(header.width());
         }
-        // Keep all three columns visible on narrow terminals. Headers and values
-        // wrap within the same columns instead of clipping away token fields.
-        let available = usize::from(width.saturating_sub(6));
-        while columns.0.iter().sum::<usize>() > available {
-            let largest = (0..3).max_by_key(|&index| columns.0[index]).unwrap();
-            columns.0[largest] = columns.0[largest].saturating_sub(1);
-        }
         columns
-    }
-
-    pub(super) fn wrapped(value: &str, width: usize) -> Vec<String> {
-        wrap_words(Line::from(value.to_owned()), width.max(1))
-            .into_iter()
-            .map(|line| line.to_string().trim_end().to_owned())
-            .collect()
-    }
-
-    pub(super) fn wrapped_height(&self, row: &[String; 3]) -> usize {
-        row.iter()
-            .zip(self.0)
-            .map(|(value, width)| Self::wrapped(value, width).len())
-            .max()
-            .unwrap_or(1)
     }
 
     pub(super) fn draw(
@@ -47,20 +69,18 @@ impl AgentStatsColumns {
         fg: Color,
         bg: Color,
     ) {
+        if rect.height == 0 {
+            return;
+        }
         let mut x = rect.x;
         for (value, width) in row.iter().zip(self.0) {
-            for (line, value) in Self::wrapped(value, width).into_iter().enumerate() {
-                if line >= usize::from(rect.height) {
-                    break;
-                }
-                text(
-                    frame,
-                    r(x, rect.y + line as u16, width as u16, 1),
-                    format!("{}{value}", " ".repeat(width.saturating_sub(value.width()))),
-                    fg,
-                    bg,
-                );
-            }
+            text(
+                frame,
+                r(x, rect.y, width as u16, 1),
+                format!("{}{value}", " ".repeat(width.saturating_sub(value.width()))),
+                fg,
+                bg,
+            );
             x += width as u16 + 3;
         }
     }
@@ -88,6 +108,13 @@ impl AgentStatsColumns {
     }
 }
 
+pub(super) const REQUEST_STATS_HEADERS: [&str; 4] = [
+    AGENT_STATS_HEADERS[0],
+    AGENT_STATS_HEADERS[1],
+    "Cached",
+    "Time",
+];
+
 /// Like agent statistics, request fields use widths measured across the complete
 /// list, not the viewport. Metadata is left aligned and numeric fields are right aligned.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -98,7 +125,10 @@ pub(super) struct RequestColumns {
 
 impl RequestColumns {
     pub(super) fn new<'a>(rows: impl IntoIterator<Item = &'a model::RequestRow>) -> Self {
-        let mut columns = Self::default();
+        let mut columns = Self {
+            statistics: REQUEST_STATS_HEADERS.map(UnicodeWidthStr::width),
+            ..Self::default()
+        };
         for row in rows {
             for (width, value) in columns.metadata.iter_mut().zip(row.metadata()) {
                 *width = (*width).max(value.width());
@@ -124,19 +154,43 @@ impl RequestColumns {
         }
     }
 
-    pub(super) fn line(&self, row: &model::RequestRow, width: u16, p: Palette) -> Line<'static> {
-        // The animation overlay paints at column zero. Reserve its cell and a
-        // separator on every row so running/completed requests stay aligned.
-        let gutter = width.min(2);
-        let width = width - gutter;
-        let statistics = row
-            .statistics()
+    fn statistics_width(&self) -> usize {
+        self.statistics.iter().sum::<usize>() + 9
+    }
+
+    fn show_statistics(&self, width: u16) -> bool {
+        self.statistics_width() + 18 <= usize::from(width.saturating_sub(2))
+    }
+
+    fn format_statistics(&self, values: &[String; 4]) -> String {
+        values
             .iter()
             .zip(self.statistics)
             .map(|(value, width)| format!("{}{value}", " ".repeat(width - value.width())))
             .collect::<Vec<_>>()
-            .join(" · ");
-        let show_statistics = statistics.width() + 18 <= width as usize;
+            .join(" · ")
+    }
+
+    pub(super) fn header(&self, width: u16, p: Palette) -> Option<Line<'static>> {
+        if !self.show_statistics(width) {
+            return None;
+        }
+        Some(Line::from(vec![
+            Span::raw(" ".repeat(usize::from(width) - self.statistics_width())),
+            Span::styled(
+                self.format_statistics(&REQUEST_STATS_HEADERS.map(String::from)),
+                Style::default().fg(p.content.muted),
+            ),
+        ]))
+    }
+
+    pub(super) fn line(&self, row: &model::RequestRow, width: u16, p: Palette) -> Line<'static> {
+        let show_statistics = self.show_statistics(width);
+        // The animation overlay paints at column zero. Reserve its cell and a
+        // separator on every row so running/completed requests stay aligned.
+        let gutter = width.min(2);
+        let width = width - gutter;
+        let statistics = self.format_statistics(&row.statistics());
         let left_width = if show_statistics {
             width - statistics.width() as u16 - 2
         } else {
@@ -204,79 +258,63 @@ mod tests {
     use ratatui::widgets::Widget;
 
     #[test]
-    fn agents_palette_stats_headers_align_and_wrap_with_their_values() {
+    fn agents_palette_stats_align_without_delimiters() {
         let headers = AGENT_STATS_HEADERS.map(String::from);
-        let values = ["12345".into(), "56789(12345)".into(), "54321".into()];
-        for width in [100, 44, 30, 20] {
-            let columns = AgentStatsColumns::menu([&values], width);
-            assert!(columns.width() <= width);
-            let header_height = columns.wrapped_height(&headers) as u16;
-            let value_height = columns.wrapped_height(&values) as u16;
-            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
-                width,
-                header_height + value_height,
-            ))
+        let values = ["123456789".into(), "56789(12345)".into(), "54321".into()];
+        let columns = AgentStatsColumns::menu([&values]);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(columns.width(), 2)).unwrap();
+        let p = Palette::new(false);
+        terminal
+            .draw(|frame| {
+                for (y, row) in [&headers, &values].iter().enumerate() {
+                    columns.draw(
+                        frame,
+                        r(0, y as u16, columns.width(), 1),
+                        row,
+                        p.muted,
+                        p.input,
+                    );
+                }
+            })
             .unwrap();
-            let p = Palette::new(false);
-            terminal
-                .draw(|frame| {
-                    columns.draw(
-                        frame,
-                        r(0, 0, width, header_height),
-                        &headers,
-                        p.muted,
-                        p.input,
-                    );
-                    columns.draw(
-                        frame,
-                        r(0, header_height, width, value_height),
-                        &values,
-                        p.muted,
-                        p.input,
-                    );
-                })
-                .unwrap();
-            let buffer = terminal.backend().buffer();
+        let buffer = terminal.backend().buffer();
+        for (y, row) in [&headers, &values].iter().enumerate() {
             let mut x = 0;
-            for (index, column_width) in columns.0.iter().enumerate() {
-                let read_column = |y, height| {
-                    (y..y + height)
-                        .map(|y| {
-                            (x..x + *column_width as u16)
-                                .map(|x| buffer[(x, y)].symbol())
-                                .collect::<String>()
-                                .trim()
-                                .to_owned()
-                        })
-                        .collect::<String>()
-                };
-                assert_eq!(
-                    read_column(0, header_height).replace(' ', ""),
-                    headers[index].replace(' ', "")
-                );
-                assert_eq!(read_column(header_height, value_height), values[index]);
-                x += *column_width as u16 + 3;
-            }
-            if width >= 44 {
-                assert_eq!(header_height, 1);
-                assert_eq!(value_height, 1);
-                assert!(
-                    columns
-                        .0
-                        .iter()
-                        .zip(&headers)
-                        .all(|(width, header)| *width >= header.width())
-                );
+            for (index, width) in columns.0.iter().enumerate() {
+                let end = x + *width as u16;
+                let actual = (x..end)
+                    .map(|x| buffer[(x, y as u16)].symbol())
+                    .collect::<String>();
+                assert_eq!(actual.trim_start(), row[index]);
+                if index < 2 {
+                    assert!((end..end + 3).all(|x| buffer[(x, y as u16)].symbol() == " "));
+                }
+                x = end + 3;
             }
         }
-        assert_eq!(
-            AgentStatsColumns::wrapped("Input (uncached)", 10),
-            ["Input", "(uncached)"]
-        );
     }
 
     #[test]
-    fn request_rows_reserve_spinner_gutter_and_show_unlabelled_statistics() {
+    fn agent_columns_hide_optional_fields_at_width_boundaries() {
+        for (width, identity, stats, status) in [
+            (0, 0, 0, 0),
+            (51, 51, 0, 0),
+            (52, 16, 34, 0),
+            (81, 45, 34, 0),
+            (82, 16, 34, 28),
+        ] {
+            let columns = AgentColumnsLayout::new(width, width + 4, 16, 34);
+            assert_eq!(columns.identity_width, identity);
+            assert_eq!(columns.stats_width, stats);
+            assert_eq!(columns.status_width, status);
+        }
+        assert_eq!(AgentColumnsLayout::new(100, 69, 16, 34).status_width, 0);
+        assert_eq!(AgentColumnsLayout::new(100, 70, 16, 34).status_width, 28);
+    }
+
+    #[test]
+    fn request_rows_reserve_spinner_gutter_and_align_with_statistics_headers() {
         let running = model::RequestRow {
             sequence: 7,
             purpose: skyhook::session::ModelPurpose::Agent,
@@ -301,8 +339,22 @@ mod tests {
                 .map(|span| span.content.as_ref())
                 .collect();
             assert!(text.starts_with(&format!("  Request #{}", row.sequence)));
-            assert!(text.ends_with("84 · 80 · 20 · 1.2s"));
-            for label in ["Out ", "In ", "Cached ", "Time "] {
+            assert!(text.ends_with(&columns.format_statistics(&row.statistics())));
+            let header = columns
+                .header(100, Palette::new(false))
+                .unwrap()
+                .to_string();
+            assert_eq!(header.width(), text.width());
+            for (label, value) in REQUEST_STATS_HEADERS.iter().zip(row.statistics()) {
+                let header_end = header.find(label).unwrap() + label.len();
+                let value_end = text.rfind(&value).unwrap() + value.len();
+                assert_eq!(
+                    header[..header_end].width(),
+                    text[..value_end].width(),
+                    "{label} is not aligned"
+                );
+            }
+            for label in REQUEST_STATS_HEADERS {
                 assert!(!text.contains(label));
             }
             let area = Rect::new(0, 0, 100, 1);
@@ -337,8 +389,12 @@ mod tests {
                 .map(|span| span.content.as_ref())
                 .collect();
             assert!(text.starts_with(&" ".repeat(width.min(2) as usize)));
-            if width == 99 {
-                assert!(text.ends_with("— · — · — · —"));
+            let header = columns.header(width, Palette::new(false));
+            assert_eq!(header.is_some(), text.contains('—'));
+            if let Some(header) = header {
+                assert_eq!(header.width(), usize::from(width));
+                assert!(header.to_string().contains("Input (uncached)"));
+                assert!(text.ends_with(&columns.format_statistics(&row.statistics())));
             }
         }
     }

@@ -174,6 +174,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         x += n + 1;
     }
     prepare_rows(app, width, p);
+    if tab == Tab::Requests
+        && app.content_rect.height > 1
+        && let Some(entry) = app.entries.iter().find(|entry| entry.request.is_some())
+    {
+        let geometry = EntryGeometry::new(entry, width, 0);
+        if let Some(header) = app.render.request_columns.header(geometry.body_width, p) {
+            text(
+                frame,
+                r(geometry.x, app.content_rect.y, geometry.body_width, 1),
+                header,
+                p.content.muted,
+                p.base,
+            );
+            // The fixed header is not an entry: paging, hit testing and selection
+            // all use a viewport containing data rows only.
+            app.content_rect.y += 1;
+            app.content_rect.height -= 1;
+        }
+    }
     let max = app
         .content_rows
         .saturating_sub(app.content_rect.height as usize);
@@ -512,6 +531,58 @@ mod tests {
             },
         );
         app.refresh();
+    }
+
+    #[tokio::test]
+    async fn request_headers_stay_outside_the_scrolling_rows() {
+        let (_root, mut app) = fixture().await;
+        let first = app
+            .snapshot
+            .records
+            .last_key_value()
+            .map_or(1, |(seq, _)| seq + 1);
+        for sequence in first..first + 30 {
+            app.snapshot.records.insert(
+                sequence,
+                EventRecord {
+                    version: 1,
+                    sequence,
+                    timestamp_millis: sequence as i64 * 1000,
+                    agent: app.selected.clone(),
+                    event: SessionEvent::ModelRequested {
+                        context: 0,
+                        messages: Vec::new(),
+                        purpose: skyhook::session::ModelPurpose::Agent,
+                    },
+                },
+            );
+        }
+        app.view().tab = Tab::Requests;
+        app.refresh();
+        for (width, header) in [(80, true), (40, false)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 25)).unwrap();
+            for scroll in [0, 5] {
+                app.view().scroll = Some(scroll);
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                let line = (0..width)
+                    .map(|x| terminal.backend().buffer()[(x, 2)].symbol())
+                    .collect::<String>();
+                assert_eq!(line.contains("Input (uncached)"), header);
+                assert_eq!(app.content_rect.y, 2 + u16::from(header));
+                assert_eq!(app.content_rows, 30);
+                let (rect, index) = app
+                    .hits
+                    .iter()
+                    .find_map(|(rect, hit)| match hit {
+                        Hit::Entry(index, _) => Some((rect, *index)),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(rect.y, app.content_rect.y);
+                assert_eq!(index, scroll);
+            }
+        }
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 
     fn number_is_painted(buffer: &Buffer, color: Color) -> bool {

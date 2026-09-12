@@ -613,6 +613,9 @@ mod tests {
             &outputs,
             0,
         );
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|entry| entry.compact_after));
+        let unchanged = rows[1].clone();
         let job = JobId::new(1).unwrap();
         outputs.insert(
             job,
@@ -635,6 +638,9 @@ mod tests {
         assert!(!changes.reset);
         assert_eq!(changes.dirty, vec![0]);
         assert!(rows[0].text.contains("new output"));
+        assert!(rows.iter().all(|entry| entry.compact_after));
+        assert!(rows[1] == unchanged);
+        assert!(rows == entries(&snapshot, &projection, &agent, &view, &outputs, false, true,));
     }
 
     #[test]

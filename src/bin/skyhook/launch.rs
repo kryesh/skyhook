@@ -46,6 +46,9 @@ impl Launch {
             .config
             .harness_builder(&self.workspace, &model)
             .map_err(|e| e.to_string())?
+            // Keep creation/resume aligned with the workspace-local history menu,
+            // even when inherited configuration supplies a library storage override.
+            .session_root(self.sessions.clone())
             .shim_catalog(self.catalog.clone())
             .capabilities(capabilities.clone());
         let builder = if self.approve_all {
@@ -168,10 +171,9 @@ impl Launch {
         interaction: Option<Arc<UiInteraction>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let workspace = tokio::fs::canonicalize(&args.workspace).await?;
-        let sessions = config
-            .session_root
-            .clone()
-            .unwrap_or_else(|| workspace.join(".skyhook/sessions"));
+        // CLI history belongs only to the selected workspace, never to an
+        // inherited/global session_root or an ancestor workspace's history.
+        let sessions = workspace.join(".skyhook/sessions");
         Ok(Self {
             model,
             workspace,
@@ -187,6 +189,109 @@ impl Launch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    fn history_config(root: Option<PathBuf>) -> Arc<Config> {
+        let mut config: Config = toml::from_str(
+            r#"
+[providers.test]
+kind = 'openai'
+api = 'chat_completions'
+base_url = 'http://127.0.0.1:1/v1'
+[models.test]
+provider = 'test'
+model = 'fixture'
+max_context = 128000
+max_output = 4096
+[targets]
+import_ssh_config = false
+"#,
+        )
+        .unwrap();
+        config.session_root = root;
+        Arc::new(config)
+    }
+
+    #[tokio::test]
+    async fn history_root_is_selected_workspace_even_with_storage_override() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project/nested");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let args = Args::parse_from([
+            "skyhook",
+            "--workspace",
+            workspace.join("..").to_str().unwrap(),
+        ]);
+        let expected = std::fs::canonicalize(workspace.parent().unwrap())
+            .unwrap()
+            .join(".skyhook/sessions");
+        for configured in [
+            None,
+            Some(root.path().join("shared-sessions")),
+            Some(PathBuf::from("relative-sessions")),
+        ] {
+            let launch = Launch::from_args(&args, history_config(configured), "test".into(), None)
+                .await
+                .unwrap();
+            // This is the same root passed to the TUI history loader.
+            assert_eq!(launch.sessions, expected);
+            assert!(!launch.sessions.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn history_creation_and_resume_are_workspace_local_without_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let configured = root.path().join("shared-sessions");
+        let ancestor = root.path().join(".skyhook/sessions");
+        let sibling = root.path().join("other/.skyhook/sessions");
+        let mut outside_ids = vec![];
+        for outside in [&configured, &ancestor, &sibling] {
+            // Seed valid, resumable history, not merely empty session directories.
+            let harness = history_config(None)
+                .harness_builder(&workspace, "test")
+                .unwrap()
+                .session_root(outside)
+                .build()
+                .await
+                .unwrap();
+            let session = harness.new_session().await.unwrap();
+            outside_ids.push(session.id());
+            session.shutdown().await.unwrap();
+        }
+        let args = Args::parse_from(["skyhook", "--workspace", workspace.to_str().unwrap()]);
+        let launch = Launch::from_args(
+            &args,
+            history_config(Some(configured.clone())),
+            "test".into(),
+            None,
+        )
+        .await
+        .unwrap();
+        for id in outside_ids {
+            assert!(launch.create(Some(id)).await.is_err());
+        }
+        assert!(!launch.sessions.exists());
+
+        let session = launch.create(None).await.unwrap();
+        let id = session.id();
+        assert!(
+            launch
+                .sessions
+                .join(id.to_string())
+                .join("events.jsonl")
+                .is_file()
+        );
+        assert!(!configured.join(id.to_string()).exists());
+        session.shutdown().await.unwrap();
+        drop(session);
+
+        let resumed = launch.create(Some(id)).await.unwrap();
+        assert_eq!(resumed.id(), id);
+        resumed.shutdown().await.unwrap();
+    }
 
     #[test]
     fn interaction_follows_the_host_even_with_an_empty_allowlist() {

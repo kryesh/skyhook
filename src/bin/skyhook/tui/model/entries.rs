@@ -83,7 +83,13 @@ pub(super) fn entries_inner(
             .jobs
             .values()
             .filter(|j| &j.agent == agent)
-            .map(|job| job_entry(job, projection, view, outputs, all_details))
+            .map(|job| {
+                let mut entry = job_entry(job, projection, view, outputs, all_details);
+                // The Jobs tab is a dense list; conversation grouping owns its
+                // spacing separately, and expanded documents stay unchanged.
+                entry.compact_after = true;
+                entry
+            })
             .collect(),
         Tab::Conversation => {
             let recoveries: HashSet<_> = records

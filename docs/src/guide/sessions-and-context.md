@@ -6,8 +6,10 @@ Startup and `/new` open an empty draft without creating a session or its files. 
 created when you send the first message or explicitly run a script; leaving an unused draft
 behind does not create an empty saved session. Resuming an existing session still opens it immediately.
 
-Use `--resume SESSION_ID` to reopen a session. Session logs default to
-`<workspace>/.skyhook/sessions`; `session_root` in the configuration overrides that location.
+Use `--resume SESSION_ID` to reopen a session. The CLI stores session logs and looks for
+saved sessions only in `<workspace>/.skyhook/sessions`, where `--workspace` selects the workspace
+(default: the current directory). It does not search parent or sibling workspaces, and ignores
+the library-only `session_root` override.
 The terminal's `/new` and session picker manage drafts and saved sessions; model selection
 and UI state are described in the [terminal guide](terminal-interface.md#model-selection-and-ui-state).
 

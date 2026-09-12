@@ -85,8 +85,9 @@ value**. A user-defined `cwd` keeps its user-file base when other MCP fields are
 a workspace-defined `cwd` uses the workspace config's directory (`<workspace>/.skyhook`),
 not the workspace root.
 
-`session_root` optionally changes session storage from `<workspace>/.skyhook/sessions`.
-Its existing relative-path semantics are unchanged: relative values use the process working
+The CLI always stores and discovers sessions in `<workspace>/.skyhook/sessions`, including
+headless execution and resume. It does not search other workspaces or honor `session_root` overrides.
+For library users, `session_root` can still override storage; relative values use the process working
 directory, not the config file's directory. Remote target paths retain their existing remote
 semantics. The workspace is a base directory, not filesystem isolation.
 

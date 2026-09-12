@@ -11,8 +11,9 @@ skyhook --non-interactive --resume "$session_id" -p "Summarize the findings"
 Headless mode does not require a terminal, read answers from stdin, or load TUI themes/keybindings.
 It creates or opens the session, prints **only its session ID followed by a newline to stdout**, and
 flushes that line before executing the prompt or workflow. It then exits automatically. The ID lets
-external programs locate and follow the normal session logs under the configured `session_root`
-(default: `<workspace>/.skyhook/sessions`). Resumed runs print the existing session ID.
+external programs locate and follow the normal session logs under `<workspace>/.skyhook/sessions`.
+Headless mode uses only the selected workspace's history, just like the terminal UI; the CLI ignores
+`session_root` overrides. Resumed runs print the existing session ID.
 
 Assistant output, script console output/results, startup warnings, and execution diagnostics remain
 in the session logs; they are not printed to stdout or stderr. The process exits successfully when

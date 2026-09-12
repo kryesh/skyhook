@@ -126,7 +126,7 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
     app.refresh_agent_menu();
     let Some(menu) = &app.menu else { return };
     let area = app.content_rect;
-    // Leave enough room for whole header words before spending space on margins.
+    // Avoid spending scarce identity space on margins in narrow palettes.
     let minimum_width = if matches!(menu.kind, MenuKind::Agents) {
         31
     } else {
@@ -161,37 +161,33 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
     } else {
         Vec::new()
     };
-    let stats_columns = AgentStatsColumns::menu(agent_stats.iter(), width.saturating_sub(2));
-    let stats_width = stats_columns.width();
-    let headers = AGENT_STATS_HEADERS.map(String::from);
-    let header_height = if agent_menu {
-        stats_columns.wrapped_height(&headers) as u16
-    } else {
-        0
-    };
-    let stats_height = agent_stats
+    let row_width = width.saturating_sub(2);
+    let stats_columns = AgentStatsColumns::menu(agent_stats.iter());
+    let minimum_identity_width = app
+        .projection
+        .agents
         .iter()
-        .map(|row| stats_columns.wrapped_height(row))
+        .map(|agent| {
+            let indent = (agent.id.depth() as u16 * 4).min(row_width / 3);
+            indent + 16.max(model::target_suffix(&agent.target).width() as u16 + 8)
+        })
         .max()
-        .unwrap_or(1);
-    // Match the inline tree's aligned status/token columns. On narrow screens,
-    // use additional lines so the picker still exposes status and every token field.
-    let compact_agents = agent_menu && width.saturating_sub(2) < stats_width + 50;
-    let stacked_stats = compact_agents && width.saturating_sub(2) < stats_width + 30;
-    let row_height = if stacked_stats {
-        2 + stats_height
-    } else if compact_agents {
-        1 + stats_height
-    } else {
-        1
-    };
-    if agent_menu && stats_width <= width.saturating_sub(2) {
+        .unwrap_or(16);
+    let columns = AgentColumnsLayout::new(
+        row_width,
+        width,
+        minimum_identity_width,
+        stats_columns.width(),
+    );
+    let headers = AGENT_STATS_HEADERS.map(String::from);
+    let header_height = u16::from(agent_menu && columns.stats_width > 0);
+    if header_height > 0 {
         stats_columns.draw(
             frame,
             r(
-                rect.right() - 1 - stats_width,
+                rect.right() - 1 - columns.stats_width,
                 rect.y + 2,
-                stats_width,
+                columns.stats_width,
                 header_height.min(rect.height.saturating_sub(2)),
             ),
             &headers,
@@ -199,10 +195,10 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
             p.input,
         );
     }
-    let height = rect.height.saturating_sub(3 + header_height) as usize / row_height;
+    let height = rect.height.saturating_sub(3 + header_height) as usize;
     let top = menu.selected.saturating_sub(height.saturating_sub(1));
     for (i, item) in items.iter().enumerate().skip(top).take(height) {
-        let y = rect.y + 2 + header_height + ((i - top) * row_height) as u16;
+        let y = rect.y + 2 + header_height + (i - top) as u16;
         let selected = i == menu.selected;
         let bg = if selected { p.selected } else { p.input };
         let row = r(rect.x + 1, y, width.saturating_sub(2), 1);
@@ -219,11 +215,7 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
                 let stats = model::agent_footer_stats(&app.snapshot, &app.projection, &agent.id);
                 let target = model::target_suffix(&agent.target);
                 let indent = (agent.id.depth() as u16 * 4).min(row.width / 3);
-                let name_width = if compact_agents {
-                    row.width
-                } else {
-                    row.width.saturating_sub(stats_width + 32)
-                };
+                let name_width = columns.identity_width;
                 let name = agent_identity(
                     &agent.name,
                     &target,
@@ -235,31 +227,21 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
                     name_width,
                     p,
                 );
-                fill(frame, r(row.x, row.y, row.width, row_height as u16), bg);
+                fill(frame, row, bg);
                 text(frame, r(row.x, y, name_width, 1), name, p.fg, bg);
-                let status_row = if stacked_stats {
-                    r(row.x, y + 1, row.width, 1)
-                } else if compact_agents {
-                    r(row.x, y + 1, row.width.saturating_sub(stats_width + 2), 1)
-                } else {
-                    r(row.x + name_width + 2, y, 28, 1)
-                };
-                text(
-                    frame,
-                    status_row,
-                    status.clone(),
-                    agent_status_color(running, &status, p),
-                    bg,
-                );
-                if stats_width <= row.width {
+                if columns.status_width > 0 {
+                    text(
+                        frame,
+                        r(row.x + name_width + 2, y, columns.status_width, 1),
+                        status.clone(),
+                        agent_status_color(running, &status, p),
+                        bg,
+                    );
+                }
+                if columns.stats_width > 0 {
                     stats_columns.draw(
                         frame,
-                        r(
-                            row.right() - stats_width,
-                            status_row.y + u16::from(stacked_stats),
-                            stats_width,
-                            stats_height as u16,
-                        ),
+                        r(row.right() - columns.stats_width, y, columns.stats_width, 1),
                         &stats,
                         p.muted,
                         bg,
@@ -272,8 +254,7 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
         if selected {
             focus_cursor(frame, rect.x, y, p.input);
         }
-        app.hits
-            .push((r(row.x, row.y, row.width, row_height as u16), Hit::Menu(i)));
+        app.hits.push((row, Hit::Menu(i)));
     }
     if items.is_empty() && !matches!(menu.kind, MenuKind::Attach | MenuKind::OutputSearch(_)) {
         text(
@@ -306,6 +287,51 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn agents_palette_hides_columns_without_stacking_rows() {
+        let (_root, mut app) = crate::tui::app::tests::fixture().await;
+        let root = app.projection.agents[0].clone();
+        app.projection.agents = (0..2)
+            .map(|index| {
+                let mut agent = root.clone();
+                agent.id = root.id.child(index);
+                agent.name = format!("agent-{index}");
+                agent.terminal = true;
+                agent
+            })
+            .collect();
+        app.command("agents");
+        for (width, stats, status) in [(40, false, false), (80, true, false), (120, true, true)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 10)).unwrap();
+            app.content_rect = r(0, 0, width, 10);
+            app.hits.clear();
+            terminal
+                .draw(|frame| draw_menu(frame, &mut app, Palette::new(false)))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let line = |y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            };
+            assert_eq!(line(2).contains("Input (uncached)"), stats);
+            let rows = app
+                .hits
+                .iter()
+                .filter_map(|(rect, hit)| matches!(hit, Hit::Menu(_)).then_some(*rect))
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 2);
+            for (index, row) in rows.iter().enumerate() {
+                assert_eq!(row.height, 1);
+                assert_eq!(row.y, 2 + u16::from(stats) + index as u16);
+                assert!(line(row.y).contains(&format!("agent-{index}")));
+                assert_eq!(line(row.y).contains("Completed"), status);
+            }
+        }
+        app.session.as_ref().unwrap().shutdown().await.unwrap();
+    }
 
     #[test]
     fn menu_hints_are_muted_right_aligned_and_yield_to_labels() {

@@ -195,7 +195,6 @@ pub(super) fn draw_tree(
         .map(|agent| model::agent_footer_stats(&app.snapshot, &app.projection, &agent.id))
         .collect::<Vec<_>>();
     let stats_columns = AgentStatsColumns::new(agent_stats.iter());
-    let stats_column_width = stats_columns.width();
     let minimum_name_width = tree_agents
         .iter()
         .map(|agent| {
@@ -204,25 +203,12 @@ pub(super) fn draw_tree(
         })
         .max()
         .unwrap_or(16);
-    let tree_width = width.saturating_sub(4);
-    // Shared columns keep statuses aligned across agent depths and summary lengths.
-    // Reserve two blank cells between the name, status, and token columns.
-    let stats_reserved = if tree_width >= stats_column_width + minimum_name_width + 2 {
-        stats_column_width + 2
-    } else {
-        0
-    };
-    let status_width =
-        if width >= 70 && tree_width.saturating_sub(stats_reserved) >= minimum_name_width + 30 {
-            28
-        } else {
-            0
-        };
-    let status_reserved = if status_width > 0 {
-        status_width + 2
-    } else {
-        0
-    };
+    let columns = AgentColumnsLayout::new(
+        width.saturating_sub(4),
+        width,
+        minimum_name_width,
+        stats_columns.width(),
+    );
     for (index, agent) in tree_agents
         .iter()
         .enumerate()
@@ -246,8 +232,7 @@ pub(super) fn draw_tree(
         let indent = (agent.id.depth() as u16 * 4).min(width / 3);
         let target = model::target_suffix(&agent.target);
         let stats = stats_columns.format(&agent_stats[index]);
-        let available = width.saturating_sub(indent + 4);
-        let name_width = available.saturating_sub(status_reserved + stats_reserved);
+        let name_width = columns.identity_width.saturating_sub(indent);
         let name = agent_identity(
             &agent.name,
             &target,
@@ -263,24 +248,19 @@ pub(super) fn draw_tree(
         if focused {
             focus_cursor(frame, 2 + indent, y, bg);
         }
-        if status_width > 0 {
+        if columns.status_width > 0 {
             text(
                 frame,
-                r(
-                    width - status_width - stats_reserved - 2,
-                    y,
-                    status_width,
-                    1,
-                ),
+                r(columns.identity_width + 4, y, columns.status_width, 1),
                 status.clone(),
                 agent_status_color(running, &status, p),
                 bg,
             );
         }
-        if stats_reserved > 0 {
+        if columns.stats_width > 0 {
             text(
                 frame,
-                r(width - stats_column_width - 2, y, stats_column_width, 1),
+                r(width - columns.stats_width - 2, y, columns.stats_width, 1),
                 stats,
                 p.muted,
                 bg,
