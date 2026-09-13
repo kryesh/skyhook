@@ -243,7 +243,7 @@ mod tests {
             header: None,
             document: None,
         };
-        let rows = layout(std::slice::from_ref(&entry), 30, Palette::new(false), None);
+        let rows = layout(std::slice::from_ref(&entry), 30, Palette::new(), None);
         let start = rows
             .iter()
             .position(|row| row.text().starts_with("  first"))
@@ -275,7 +275,7 @@ mod tests {
         );
         let mut appended = entry.clone();
         appended.text.push_str("\nLater streaming text");
-        let updated = layout(&[appended], 30, Palette::new(false), None);
+        let updated = layout(&[appended], 30, Palette::new(), None);
         assert!(selection_unchanged(
             &rows[start..=end],
             updated.iter().skip(start),
@@ -283,7 +283,7 @@ mod tests {
         ));
         let mut changed = entry;
         changed.text = changed.text.replace("first", "other");
-        let updated = layout(&[changed], 30, Palette::new(false), None);
+        let updated = layout(&[changed], 30, Palette::new(), None);
         assert!(!selection_unchanged(
             &rows[start..=end],
             updated.iter().skip(start),

@@ -201,13 +201,6 @@ impl App {
     pub fn tick(&mut self) {
         self.tick_count = self.tick_count.wrapping_add(1);
         if self
-            .leader
-            .is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(2))
-        {
-            self.leader = None;
-            self.dirty = true;
-        }
-        if self
             .toast
             .as_ref()
             .is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(2))
@@ -315,7 +308,6 @@ impl App {
                     menu.selected = index;
                     self.dirty = true;
                 }
-                self.preview_theme();
                 return;
             }
             let target = |point: Option<(u16, u16)>| {
@@ -525,7 +517,6 @@ impl App {
             }
             _ => {}
         }
-        self.preview_theme();
     }
     pub(super) fn text_position(
         &self,
@@ -761,7 +752,7 @@ mod tests {
                     MouseEventKind::Up(MouseButton::Left),
                 );
                 let selected = draw_buffer(&mut app);
-                let color = crate::tui::render::Palette::new(app.light).selected;
+                let color = crate::tui::render::Palette::new().selected;
                 // Terminals paint wide characters from their leading cell; Ratatui's
                 // backend diff skips their continuation cells.
                 let mut column = x;
@@ -827,63 +818,60 @@ mod tests {
         });
         let records = serde_json::to_vec(&app.snapshot.records).unwrap();
         app.refresh();
-        for light in [false, true] {
-            app.light = light;
-            let buffer = draw_buffer(&mut app);
-            let cards = app
-                .entries
+        let buffer = draw_buffer(&mut app);
+        let cards = app
+            .entries
+            .iter()
+            .filter(|entry| entry.surface == model::Surface::Tool)
+            .collect::<Vec<_>>();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].key, key);
+        assert!(cards[0].text.contains("Failed"));
+        assert!(!cards[0].text.contains("Permission was denied"));
+        assert!(cards[0].job.is_none());
+        assert!(cards[0].expandable);
+        assert!(buffer.content.windows(6).any(|cells| {
+            cells.iter().map(|cell| cell.symbol()).collect::<String>() == "Failed"
+                && cells
+                    .iter()
+                    .all(|cell| cell.fg == ContentTheme::new().error)
+        }));
+        let index = app
+            .entries
+            .iter()
+            .position(|entry| entry.key == key)
+            .unwrap();
+        let hit = app
+            .hits
+            .iter()
+            .find_map(|(rect, hit)| {
+                matches!(hit, Hit::Entry(i, true) if *i == index).then_some(*rect)
+            })
+            .unwrap();
+        click(&mut app, hit);
+        draw(&mut app);
+        let card = app.entries.iter().find(|entry| entry.key == key).unwrap();
+        assert!(card.text.contains("Arguments"));
+        assert!(card.text.contains("Output"));
+        assert!(card.text.contains("Permission was denied"));
+        assert!(card.text.contains("permission_denied"));
+        assert!(card.document.is_some());
+        assert_eq!(
+            app.entries
                 .iter()
                 .filter(|entry| entry.surface == model::Surface::Tool)
-                .collect::<Vec<_>>();
-            assert_eq!(cards.len(), 1);
-            assert_eq!(cards[0].key, key);
-            assert!(cards[0].text.contains("Failed"));
-            assert!(!cards[0].text.contains("Permission was denied"));
-            assert!(cards[0].job.is_none());
-            assert!(cards[0].expandable);
-            assert!(buffer.content.windows(6).any(|cells| {
-                cells.iter().map(|cell| cell.symbol()).collect::<String>() == "Failed"
-                    && cells
-                        .iter()
-                        .all(|cell| cell.fg == ContentTheme::new(light).error)
-            }));
-            let index = app
-                .entries
-                .iter()
-                .position(|entry| entry.key == key)
-                .unwrap();
-            let hit = app
-                .hits
-                .iter()
-                .find_map(|(rect, hit)| {
-                    matches!(hit, Hit::Entry(i, true) if *i == index).then_some(*rect)
-                })
-                .unwrap();
-            click(&mut app, hit);
-            draw(&mut app);
-            let card = app.entries.iter().find(|entry| entry.key == key).unwrap();
-            assert!(card.text.contains("Arguments"));
-            assert!(card.text.contains("Output"));
-            assert!(card.text.contains("Permission was denied"));
-            assert!(card.text.contains("permission_denied"));
-            assert!(card.document.is_some());
-            assert_eq!(
-                app.entries
-                    .iter()
-                    .filter(|entry| entry.surface == model::Surface::Tool)
-                    .count(),
-                1
-            );
-            let hit = app
-                .hits
-                .iter()
-                .find_map(|(rect, hit)| {
-                    matches!(hit, Hit::Entry(i, true) if *i == index).then_some(*rect)
-                })
-                .unwrap();
-            click(&mut app, hit);
-            draw(&mut app);
-        }
+                .count(),
+            1
+        );
+        let hit = app
+            .hits
+            .iter()
+            .find_map(|(rect, hit)| {
+                matches!(hit, Hit::Entry(i, true) if *i == index).then_some(*rect)
+            })
+            .unwrap();
+        click(&mut app, hit);
+        draw(&mut app);
         assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
         app.session.as_ref().unwrap().shutdown().await.unwrap();
     }

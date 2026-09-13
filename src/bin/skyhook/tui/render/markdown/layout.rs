@@ -274,7 +274,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                painted_markdown(text, 12, Palette::new(false)),
+                painted_markdown(text, 12, Palette::new()),
                 expected,
                 "{text:?}"
             );
@@ -304,7 +304,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                painted_markdown(text, 12, Palette::new(false)),
+                painted_markdown(text, 12, Palette::new()),
                 expected,
                 "{text:?}"
             );

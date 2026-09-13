@@ -9,21 +9,11 @@ use std::{
 #[serde(default)]
 pub struct SavedState {
     pub model: Option<String>,
-    pub theme: Option<String>,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
-    pub theme: String,
     pub keybinds: BTreeMap<String, String>,
-}
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            theme: "dark".into(),
-            keybinds: BTreeMap::new(),
-        }
-    }
 }
 pub fn state_path() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
@@ -79,9 +69,6 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 pub fn remember(model: &str) -> std::io::Result<()> {
     update(|state| state.model = Some(model.into()))
-}
-pub fn remember_theme(theme: &str) -> std::io::Result<()> {
-    update(|state| state.theme = Some(theme.into()))
 }
 fn update(edit: impl FnOnce(&mut SavedState)) -> std::io::Result<()> {
     static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());

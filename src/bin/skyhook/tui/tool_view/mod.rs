@@ -77,8 +77,8 @@ impl Run {
     }
 }
 /// Render structured presentation metadata without inferring semantics from its text.
-pub fn header_line(runs: &[Run], light: bool) -> Line<'static> {
-    let theme = ContentTheme::new(light);
+pub fn header_line(runs: &[Run]) -> Line<'static> {
+    let theme = ContentTheme::new();
     Line::from(
         runs.iter()
             .map(|run| Span::styled(model::clean(&run.text), run.role.style(theme)))
@@ -147,24 +147,20 @@ impl Document {
         }
         text
     }
-    pub fn lines(&self, cache: Option<&HighlightCache>, light: bool) -> Vec<Line<'static>> {
-        self.layout_lines(cache, light)
+    pub fn lines(&self, cache: Option<&HighlightCache>) -> Vec<Line<'static>> {
+        self.layout_lines(cache)
             .into_iter()
             .map(|(line, _)| line)
             .collect()
     }
     /// Styled logical lines and their presentation-only reflow policy.
-    pub fn layout_lines(
-        &self,
-        cache: Option<&HighlightCache>,
-        light: bool,
-    ) -> Vec<(Line<'static>, Wrap)> {
-        let p = ContentTheme::new(light);
+    pub fn layout_lines(&self, cache: Option<&HighlightCache>) -> Vec<(Line<'static>, Wrap)> {
+        let p = ContentTheme::new();
         let mut lines = Vec::new();
         for section in &self.sections {
             match section {
-                Section::Line(runs) => lines.push((header_line(runs, light), Wrap::Hard)),
-                Section::Prose(runs) => lines.push((header_line(runs, light), Wrap::Words)),
+                Section::Line(runs) => lines.push((header_line(runs), Wrap::Hard)),
+                Section::Prose(runs) => lines.push((header_line(runs), Wrap::Words)),
                 Section::Code {
                     source,
                     language,
@@ -172,9 +168,8 @@ impl Document {
                     gutters,
                     role,
                 } => {
-                    let highlighted = cache.and_then(|cache| {
-                        cache.ready(&CodeKey::new(source.clone(), language, light))
-                    });
+                    let highlighted = cache
+                        .and_then(|cache| cache.ready(&CodeKey::new(source.clone(), language)));
                     // Split without trimming: empty lines and trailing whitespace are significant.
                     for (index, text) in source.split('\n').enumerate() {
                         let mut spans = vec![Span::raw(" ".repeat(*indent))];
@@ -240,9 +235,7 @@ mod tests {
             Role::Added,
         );
         document.code("", "", 0, vec![], Role::Plain);
-        for light in [false, true] {
-            assert_eq!(document.plain_text(), text(&document.lines(None, light)));
-        }
+        assert_eq!(document.plain_text(), text(&document.lines(None)));
         assert!(document.plain_text().ends_with("\n  \n"));
     }
 }

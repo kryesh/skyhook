@@ -17,35 +17,19 @@ pub struct Palette {
     pub warning: Color,
 }
 impl Palette {
-    pub fn new(light: bool) -> Self {
-        if light {
-            Self {
-                content: super::super::theme::ContentTheme::new(light),
-                base: Color::Rgb(245, 245, 245),
-                panel: Color::Rgb(234, 234, 234),
-                input: Color::Rgb(224, 224, 224),
-                agent: Color::Rgb(232, 232, 232),
-                user: Color::Rgb(218, 218, 218),
-                fg: Color::Rgb(28, 31, 35),
-                muted: Color::Rgb(85, 90, 98),
-                selected: Color::Rgb(192, 192, 192),
-                accent: super::super::theme::ContentTheme::new(light).primary,
-                warning: super::super::theme::ContentTheme::new(light).warning,
-            }
-        } else {
-            Self {
-                content: super::super::theme::ContentTheme::new(light),
-                base: Color::Rgb(0, 0, 0),
-                panel: Color::Rgb(28, 28, 28),
-                input: Color::Rgb(40, 40, 40),
-                agent: Color::Rgb(34, 34, 34),
-                user: Color::Rgb(44, 44, 44),
-                fg: Color::Rgb(222, 225, 230),
-                muted: Color::Rgb(146, 153, 163),
-                selected: Color::Rgb(64, 64, 64),
-                accent: super::super::theme::ContentTheme::new(light).primary,
-                warning: super::super::theme::ContentTheme::new(light).warning,
-            }
+    pub fn new() -> Self {
+        Self {
+            content: super::super::theme::ContentTheme::new(),
+            base: Color::Rgb(0, 0, 0),
+            panel: Color::Rgb(28, 28, 28),
+            input: Color::Rgb(40, 40, 40),
+            agent: Color::Rgb(34, 34, 34),
+            user: Color::Rgb(44, 44, 44),
+            fg: Color::Rgb(222, 225, 230),
+            muted: Color::Rgb(146, 153, 163),
+            selected: Color::Rgb(64, 64, 64),
+            accent: super::super::theme::ContentTheme::new().primary,
+            warning: super::super::theme::ContentTheme::new().warning,
         }
     }
     pub(super) fn background(self, surface: Surface) -> Color {
@@ -315,61 +299,59 @@ mod tests {
 
     #[test]
     fn markdown_code_geometry_fits_pads_wraps_and_preserves_copy() {
-        for light in [false, true] {
-            let p = Palette::new(light);
-            for input in [
-                "```\n  alpha beta gamma delta  \n\n    \nlast\n```",
-                "```unknown\n  alpha beta gamma delta  \n\n    \nlast\n```",
-                "    alpha beta gamma delta  \n\n    last",
-                "```\nlast",
-                "```\n界 👩‍💻 لا\n```",
-                "> ```\n> short  \n> \n> last\n> ```",
-                "- ```\n  short\n  last\n  ```",
-                "```\na\n```\n\n```\nlonger\n```",
-            ] {
-                let original = markdown(input, p, 80)
+        let p = Palette::new();
+        for input in [
+            "```\n  alpha beta gamma delta  \n\n    \nlast\n```",
+            "```unknown\n  alpha beta gamma delta  \n\n    \nlast\n```",
+            "    alpha beta gamma delta  \n\n    last",
+            "```\nlast",
+            "```\n界 👩‍💻 لا\n```",
+            "> ```\n> short  \n> \n> last\n> ```",
+            "- ```\n  short\n  last\n  ```",
+            "```\na\n```\n\n```\nlonger\n```",
+        ] {
+            let original = markdown(input, p, 80)
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            for width in [1, 2, 3, 7, 80] {
+                let rows = markdown_rows(input, width, p, None);
+                assert_code_geometry(&rows, p, width);
+                assert_eq!(copy_rows(&rows), original, "input {input:?}, width {width}");
+                let code_rows = rows
                     .iter()
-                    .map(Line::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                for width in [1, 2, 3, 7, 80] {
-                    let rows = markdown_rows(input, width, p, None);
-                    assert_code_geometry(&rows, p, width);
-                    assert_eq!(copy_rows(&rows), original, "input {input:?}, width {width}");
-                    let code_rows = rows
-                        .iter()
-                        .filter(|row| row.layout.code.is_some())
-                        .collect::<Vec<_>>();
-                    assert!(code_rows.len() >= 3);
-                    assert!(code_rows[0].layout.decorative);
-                    assert!(code_rows.last().unwrap().layout.decorative);
-                    for row in code_rows.iter().filter(|row| !row.layout.decorative) {
-                        assert!(row.line.style.bg.is_none());
-                        if row.layout.source_prefix == 0 && row.layout.prefix.width() == 0 {
-                            let pad = row.layout.code.unwrap().padding;
-                            assert_eq!(row.text_x(), 1 + pad as u16);
-                            assert_eq!(row.byte_at_column(row.text_x()), 0);
-                        }
+                    .filter(|row| row.layout.code.is_some())
+                    .collect::<Vec<_>>();
+                assert!(code_rows.len() >= 3);
+                assert!(code_rows[0].layout.decorative);
+                assert!(code_rows.last().unwrap().layout.decorative);
+                for row in code_rows.iter().filter(|row| !row.layout.decorative) {
+                    assert!(row.line.style.bg.is_none());
+                    if row.layout.source_prefix == 0 && row.layout.prefix.width() == 0 {
+                        let pad = row.layout.code.unwrap().padding;
+                        assert_eq!(row.text_x(), 1 + pad as u16);
+                        assert_eq!(row.byte_at_column(row.text_x()), 0);
                     }
                 }
             }
-            let rows = markdown_rows(
-                "before `inline` after\n\n```\nabc\n\nx\n```\n\nafter",
-                40,
-                p,
-                None,
-            );
-            let code = rows
-                .iter()
-                .filter_map(|row| row.layout.code)
-                .collect::<Vec<_>>();
-            assert_eq!(code.len(), 5); // three source rows plus top/bottom
-            assert!(code.iter().all(|code| code.width == 5 && code.padding == 1));
-            assert_code_geometry(&rows, p, 40);
-            assert!(rows.first().unwrap().layout.code.is_none());
-            assert!(rows.last().unwrap().layout.code.is_none());
-            assert_eq!(copy_rows(&rows), "before inline after\n\nabc\n\nx\n\nafter");
         }
+        let rows = markdown_rows(
+            "before `inline` after\n\n```\nabc\n\nx\n```\n\nafter",
+            40,
+            p,
+            None,
+        );
+        let code = rows
+            .iter()
+            .filter_map(|row| row.layout.code)
+            .collect::<Vec<_>>();
+        assert_eq!(code.len(), 5); // three source rows plus top/bottom
+        assert!(code.iter().all(|code| code.width == 5 && code.padding == 1));
+        assert_code_geometry(&rows, p, 40);
+        assert!(rows.first().unwrap().layout.code.is_none());
+        assert!(rows.last().unwrap().layout.code.is_none());
+        assert_eq!(copy_rows(&rows), "before inline after\n\nabc\n\nx\n\nafter");
     }
 
     #[test]
@@ -386,92 +368,88 @@ mod tests {
                 role: Role::Constant,
             }],
         };
-        for light in [false, true] {
-            let p = Palette::new(light);
-            let mut cache = HighlightCache::default();
-            let pending = markdown_rows(&input, 80, p, Some(&cache));
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                cache.prepare(std::iter::once(&document), light);
-                if cache.is_fully_highlighted(&document, light) {
-                    break;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "highlight worker did not finish"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(5));
+        let p = Palette::new();
+        let mut cache = HighlightCache::default();
+        let pending = markdown_rows(&input, 80, p, Some(&cache));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            cache.prepare(std::iter::once(&document));
+            if cache.is_fully_highlighted(&document) {
+                break;
             }
-            let highlighted = markdown_rows(&input, 80, p, Some(&cache));
-            assert_eq!(copy_rows(&pending), copy_rows(&highlighted));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "highlight worker did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let highlighted = markdown_rows(&input, 80, p, Some(&cache));
+        assert_eq!(copy_rows(&pending), copy_rows(&highlighted));
+        assert_eq!(
+            pending.iter().map(|row| &row.layout).collect::<Vec<_>>(),
+            highlighted
+                .iter()
+                .map(|row| &row.layout)
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(pending[1].line.spans, highlighted[1].line.spans);
+        for width in [1, 5, 80] {
+            assert_code_geometry(&markdown_rows(&input, width, p, Some(&cache)), p, width);
+        }
+        let tool_lines = document.lines(Some(&cache));
+        assert!(tool_lines.iter().all(|line| line.style.bg.is_none()));
+        assert!(
+            tool_lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style.bg.is_none())
+        );
+        for (markdown, tool) in highlighted
+            .iter()
+            .filter(|row| !row.layout.decorative)
+            .zip(tool_lines)
+        {
             assert_eq!(
-                pending.iter().map(|row| &row.layout).collect::<Vec<_>>(),
-                highlighted
+                markdown
+                    .line
+                    .spans
                     .iter()
-                    .map(|row| &row.layout)
+                    .filter(|span| !span.content.is_empty())
+                    .collect::<Vec<_>>(),
+                tool.spans
+                    .iter()
+                    .filter(|span| !span.content.is_empty())
                     .collect::<Vec<_>>()
             );
-            assert_ne!(pending[1].line.spans, highlighted[1].line.spans);
-            for width in [1, 5, 80] {
-                assert_code_geometry(&markdown_rows(&input, width, p, Some(&cache)), p, width);
-            }
-            let tool_lines = document.lines(Some(&cache), light);
-            assert!(tool_lines.iter().all(|line| line.style.bg.is_none()));
-            assert!(
-                tool_lines
-                    .iter()
-                    .flat_map(|line| &line.spans)
-                    .all(|span| span.style.bg.is_none())
-            );
-            for (markdown, tool) in highlighted
-                .iter()
-                .filter(|row| !row.layout.decorative)
-                .zip(tool_lines)
-            {
-                assert_eq!(
-                    markdown
-                        .line
-                        .spans
-                        .iter()
-                        .filter(|span| !span.content.is_empty())
-                        .collect::<Vec<_>>(),
-                    tool.spans
-                        .iter()
-                        .filter(|span| !span.content.is_empty())
-                        .collect::<Vec<_>>()
-                );
-            }
         }
     }
 
     #[test]
     fn markdown_hanging_prefixes_are_decorative_and_preserve_copy() {
-        for light in [false, true] {
-            let p = Palette::new(light);
-            for input in [
-                "- alpha bravo charlie delta echo foxtrot",
-                "10. alpha bravo charlie delta echo foxtrot",
-                "- [ ] alpha bravo charlie delta echo foxtrot",
-                "> alpha bravo charlie delta echo foxtrot",
-                "> - alpha bravo charlie delta echo foxtrot",
-                "1. outer\n   - inner alpha bravo charlie delta echo foxtrot",
-            ] {
-                let original = markdown(input, p, 80)
-                    .iter()
-                    .map(Line::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                for width in [8, 16, 24] {
-                    let rows = markdown_rows(input, width, p, None);
-                    assert_eq!(copy_rows(&rows), original, "{input:?}, width {width}");
-                    for row in rows.iter().filter(|row| row.continued) {
-                        assert!(
-                            row.layout.prefix.width() >= 2,
-                            "missing hanging prefix for {input:?}"
-                        );
-                        assert_eq!(row.byte_at_column(row.text_x()), 0);
-                        assert!(row.text_x() >= row.x + 2);
-                    }
+        let p = Palette::new();
+        for input in [
+            "- alpha bravo charlie delta echo foxtrot",
+            "10. alpha bravo charlie delta echo foxtrot",
+            "- [ ] alpha bravo charlie delta echo foxtrot",
+            "> alpha bravo charlie delta echo foxtrot",
+            "> - alpha bravo charlie delta echo foxtrot",
+            "1. outer\n   - inner alpha bravo charlie delta echo foxtrot",
+        ] {
+            let original = markdown(input, p, 80)
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            for width in [8, 16, 24] {
+                let rows = markdown_rows(input, width, p, None);
+                assert_eq!(copy_rows(&rows), original, "{input:?}, width {width}");
+                for row in rows.iter().filter(|row| row.continued) {
+                    assert!(
+                        row.layout.prefix.width() >= 2,
+                        "missing hanging prefix for {input:?}"
+                    );
+                    assert_eq!(row.byte_at_column(row.text_x()), 0);
+                    assert!(row.text_x() >= row.x + 2);
                 }
             }
         }
@@ -499,38 +477,36 @@ mod tests {
 
     #[test]
     fn expanded_backgrounds_fill_all_content_rows_even_with_selection() {
-        for light in [false, true] {
-            let p = Palette::new(light);
-            let entry = expandable_entry();
-            let mut rows = RowBlocks::default();
-            *rows.block_mut(0) = layout(std::slice::from_ref(&entry), 20, p, None);
-            rows.finish_update(0);
-            let nonblank = rows
-                .iter()
-                .filter(|row| !row.text().trim().is_empty())
-                .collect::<Vec<_>>();
-            assert!(nonblank.len() > 4, "both header and body should wrap");
-            for row in rows.iter() {
-                for interactive in [false, true] {
-                    for text_selected in [false, true] {
-                        assert_eq!(
-                            row.background(p, true, interactive, text_selected),
-                            if !row.blank {
-                                p.content.code_bg
-                            } else {
-                                p.background(row.surface)
-                            },
-                            "row {:?}, interactive={interactive}, selection={text_selected}",
-                            row.text()
-                        );
-                    }
+        let p = Palette::new();
+        let entry = expandable_entry();
+        let mut rows = RowBlocks::default();
+        *rows.block_mut(0) = layout(std::slice::from_ref(&entry), 20, p, None);
+        rows.finish_update(0);
+        let nonblank = rows
+            .iter()
+            .filter(|row| !row.text().trim().is_empty())
+            .collect::<Vec<_>>();
+        assert!(nonblank.len() > 4, "both header and body should wrap");
+        for row in rows.iter() {
+            for interactive in [false, true] {
+                for text_selected in [false, true] {
+                    assert_eq!(
+                        row.background(p, true, interactive, text_selected),
+                        if !row.blank {
+                            p.content.code_bg
+                        } else {
+                            p.background(row.surface)
+                        },
+                        "row {:?}, interactive={interactive}, selection={text_selected}",
+                        row.text()
+                    );
                 }
             }
-            let row = nonblank[0];
-            assert_eq!(row.background(p, false, true, false), p.content.code_bg);
-            assert_eq!(row.background(p, false, false, false), p.base);
-            assert_eq!(row.background(p, false, true, true), p.base);
         }
+        let row = nonblank[0];
+        assert_eq!(row.background(p, false, true, false), p.content.code_bg);
+        assert_eq!(row.background(p, false, false, false), p.base);
+        assert_eq!(row.background(p, false, true, true), p.base);
     }
 
     #[test]

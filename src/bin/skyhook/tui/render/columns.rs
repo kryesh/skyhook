@@ -260,7 +260,7 @@ mod tests {
         let columns = AgentStatsColumns::menu([&values]);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(columns.width(), 2)).unwrap();
-        let p = Palette::new(false);
+        let p = Palette::new();
         terminal
             .draw(|frame| {
                 for (y, row) in [&headers, &values].iter().enumerate() {
@@ -328,7 +328,7 @@ mod tests {
         completed.status = "Completed";
         let columns = RequestColumns::new([&running, &completed]);
         for row in [&running, &completed] {
-            let line = columns.line(row, 100, Palette::new(false));
+            let line = columns.line(row, 100, Palette::new());
             let text: String = line
                 .spans
                 .iter()
@@ -336,10 +336,7 @@ mod tests {
                 .collect();
             assert!(text.starts_with(&format!("  Request #{}", row.sequence)));
             assert!(text.ends_with(&columns.format_statistics(&row.statistics())));
-            let header = columns
-                .header(100, Palette::new(false))
-                .unwrap()
-                .to_string();
+            let header = columns.header(100, Palette::new()).unwrap().to_string();
             assert_eq!(header.width(), text.width());
             for (label, value) in REQUEST_STATS_HEADERS.iter().zip(row.statistics()) {
                 let header_end = header.find(label).unwrap() + label.len();
@@ -377,7 +374,7 @@ mod tests {
         };
         let columns = RequestColumns::new([&row]);
         for width in 0..100 {
-            let line = columns.line(&row, width, Palette::new(false));
+            let line = columns.line(&row, width, Palette::new());
             assert!(line.width() <= width as usize, "overflow at width {width}");
             let text: String = line
                 .spans
@@ -385,7 +382,7 @@ mod tests {
                 .map(|span| span.content.as_ref())
                 .collect();
             assert!(text.starts_with(&" ".repeat(width.min(2) as usize)));
-            let header = columns.header(width, Palette::new(false));
+            let header = columns.header(width, Palette::new());
             assert_eq!(header.is_some(), text.contains('—'));
             if let Some(header) = header {
                 assert_eq!(header.width(), usize::from(width));

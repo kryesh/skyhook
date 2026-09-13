@@ -4,7 +4,7 @@ use super::*;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let p = Palette::new(app.light);
+    let p = Palette::new();
     fill(frame, area, p.base);
     app.hits.clear();
     app.animating = false;
@@ -331,8 +331,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
     if notice_height > 0 {
-        let message = if let Some((prefix, _)) = app.leader {
-            app.keys.leader_hint(prefix)
+        let message = if let Some(prefix) = app.leader {
+            let mut visible = vec![("model", "Model"), ("agents", "Inspect agent")];
+            if !app.prompts.is_empty() {
+                visible.insert(0, ("attention", "Questions"));
+            }
+            if !app.queue.is_empty() {
+                visible.push(("queue", "Edit queue"));
+            }
+            app.keys.leader_hint(prefix, &visible)
         } else if let Some((message, _)) = &app.toast {
             message.clone()
         } else if !app.prompts.is_empty() && !prompt_active {
@@ -618,40 +625,38 @@ mod tests {
             header: None,
             document: None,
         }];
-        for light in [false, true] {
-            app.light = light;
-            let p = Palette::new(light);
-            for width in [30, 60] {
-                let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
-                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-                let scroll = app.content_rows - app.content_rect.height as usize;
-                assert!(scroll > 0, "exercise a viewport clipped inside the body");
-                let buffer = terminal.backend().buffer();
-                let mut empty_body_rows = 0;
-                for (offset, row) in app.render.rows.iter().skip(scroll).enumerate() {
-                    let y = app.content_rect.y + offset as u16;
-                    let expected = if row.blank { p.base } else { p.content.code_bg };
-                    if !row.blank && row.text().is_empty() {
-                        empty_body_rows += 1;
-                    }
-                    for x in row.x..row.x + row.width {
-                        assert_eq!(
-                            buffer[(x, y)].bg,
-                            expected,
-                            "light={light}, width={width}, row={offset}, x={x}"
-                        );
-                    }
+
+        let p = Palette::new();
+        for width in [30, 60] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let scroll = app.content_rows - app.content_rect.height as usize;
+            assert!(scroll > 0, "exercise a viewport clipped inside the body");
+            let buffer = terminal.backend().buffer();
+            let mut empty_body_rows = 0;
+            for (offset, row) in app.render.rows.iter().skip(scroll).enumerate() {
+                let y = app.content_rect.y + offset as u16;
+                let expected = if row.blank { p.base } else { p.content.code_bg };
+                if !row.blank && row.text().is_empty() {
+                    empty_body_rows += 1;
                 }
-                assert!(empty_body_rows > 0, "blank body lines must also be filled");
+                for x in row.x..row.x + row.width {
+                    assert_eq!(
+                        buffer[(x, y)].bg,
+                        expected,
+                        "width={width}, row={offset}, x={x}"
+                    );
+                }
             }
+            assert!(empty_body_rows > 0, "blank body lines must also be filled");
         }
     }
 
     #[tokio::test]
-    async fn completed_highlights_repaint_retained_frames_after_reset_resize_and_theme_changes() {
+    async fn completed_highlights_repaint_retained_frames_after_reset_and_resize() {
         let (_root, mut app) = fixture().await;
         let (notify, mut ready) = tokio::sync::mpsc::unbounded_channel();
-        app.render = RenderState::new(app.selected.clone(), app.light, notify);
+        app.render = RenderState::new(app.selected.clone(), notify);
         commit_message(
             &mut app,
             "# Example\n\n```rust\nlet answer = 42;\n```\n\n**Done**",
@@ -659,21 +664,19 @@ mod tests {
         let records = serde_json::to_vec(&app.snapshot.records).unwrap();
 
         // Exercise a cold frame, an explicit reset at unchanged dimensions, a
-        // resize with warm highlights, a new theme, and the cached original theme.
-        for (light, width, reset, completion) in [
-            (false, 60, false, true),
-            (false, 60, true, true),
-            (false, 90, false, false),
-            (true, 90, false, true),
-            (false, 40, false, false),
+        // resize with warm highlights at different widths.
+        for (width, reset, completion) in [
+            (60, false, true),
+            (60, true, true),
+            (90, false, false),
+            (40, false, false),
         ] {
-            app.light = light;
             if reset {
                 app.render.reset_session();
             }
             let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-            let accent = ContentTheme::new(light).accent;
+            let accent = ContentTheme::new().accent;
             if completion {
                 // The first frame paints fallback text and schedules the worker.
                 // Its retained rows must repaint when the worker wakes the UI,
@@ -692,7 +695,7 @@ mod tests {
             }
             assert!(
                 number_is_painted(terminal.backend().buffer(), accent),
-                "completed highlights did not reach the frame: light={light}, width={width}, reset={reset}"
+                "completed highlights did not reach the frame: width={width}, reset={reset}"
             );
             assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
         }
@@ -703,45 +706,43 @@ mod tests {
     async fn latest_activity_hit_restores_follow_tail_and_disappears() {
         let (_root, mut app) = fixture().await;
         commit_message(&mut app, &"ordinary prose\n".repeat(100));
-        for light in [false, true] {
-            app.light = light;
-            let mut terminal = Terminal::new(TestBackend::new(80, 25)).unwrap();
-            app.view().scroll = None;
-            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-            assert!(!app.hits.iter().any(|(_, hit)| matches!(hit, Hit::Latest)));
 
-            app.view().scroll = Some(0);
-            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-            let rect = app
-                .hits
-                .iter()
-                .find_map(|(rect, hit)| matches!(hit, Hit::Latest).then_some(*rect))
-                .expect("scrolled history should offer Latest activity");
-            let label: String = (rect.x..rect.right())
-                .map(|x| terminal.backend().buffer()[(x, rect.y)].symbol())
-                .collect();
-            assert_eq!(label, "↓ Latest activity");
-            assert_eq!(app.view().scroll, Some(0));
+        let mut terminal = Terminal::new(TestBackend::new(80, 25)).unwrap();
+        app.view().scroll = None;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(!app.hits.iter().any(|(_, hit)| matches!(hit, Hit::Latest)));
 
-            // Use the rendered hit coordinates and the real event handler. The
-            // overlay overlaps selectable text, which must not repin the view.
-            for kind in [
-                MouseEventKind::Down(MouseButton::Left),
-                MouseEventKind::Up(MouseButton::Left),
-            ] {
-                app.event(Event::Mouse(MouseEvent {
-                    kind,
-                    column: rect.x,
-                    row: rect.y,
-                    modifiers: KeyModifiers::NONE,
-                }));
-            }
-            assert!(app.view().scroll.is_none());
-            assert!(app.selection.is_none());
-            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-            assert!(app.view().scroll.is_none());
-            assert!(!app.hits.iter().any(|(_, hit)| matches!(hit, Hit::Latest)));
+        app.view().scroll = Some(0);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rect = app
+            .hits
+            .iter()
+            .find_map(|(rect, hit)| matches!(hit, Hit::Latest).then_some(*rect))
+            .expect("scrolled history should offer Latest activity");
+        let label: String = (rect.x..rect.right())
+            .map(|x| terminal.backend().buffer()[(x, rect.y)].symbol())
+            .collect();
+        assert_eq!(label, "↓ Latest activity");
+        assert_eq!(app.view().scroll, Some(0));
+
+        // Use the rendered hit coordinates and the real event handler. The
+        // overlay overlaps selectable text, which must not repin the view.
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.event(Event::Mouse(MouseEvent {
+                kind,
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            }));
         }
+        assert!(app.view().scroll.is_none());
+        assert!(app.selection.is_none());
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.view().scroll.is_none());
+        assert!(!app.hits.iter().any(|(_, hit)| matches!(hit, Hit::Latest)));
         app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 }

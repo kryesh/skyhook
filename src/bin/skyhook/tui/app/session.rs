@@ -67,7 +67,6 @@ impl App {
         self.paused = false;
         self.operation = false;
         self.menu = None;
-        self.preview_theme();
         self.unsaved_status.clear();
         self.tree_cursor = 0;
         self.tree_scroll = 0;

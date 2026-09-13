@@ -7,7 +7,7 @@ remote execution target after the tool name, such as `exec @lab-monitoring`; loc
 with named argument fields, nested lists, and syntax-highlighted scripts, commands, file content,
 and diffs. Prose arguments, such as agent prompts, wrap at word boundaries; commands and source
 retain whitespace-preserving wrapping. JSON results and result pages are pretty-printed; source
-and plain-text log whitespace is preserved. Light and dark themes use a consistent text and syntax palette throughout the UI:
+and plain-text log whitespace is preserved. The dark theme uses a consistent text and syntax palette throughout the UI:
 blue headings and emphasis, cyan links and targets, and semantic colours for code, tool output,
 and agent status. Command palette shortcut hints are muted and right-aligned.
 Tool-call headers keep neutral text with blue expand arrows, cyan remote targets, and status-coloured
@@ -33,8 +33,12 @@ log and are saved with the session. They are excluded from the model’s context
 Completed final replies show their recorded model ID in a muted footer below the answer.
 The composer always sends to the root agent. While root is busy, Enter queues a follow-up
 for its next model request, without interrupting the current request or tools. It does not wait
-for the entire turn to finish. `/queue` edits/removes input that has not yet been consumed,
-and `/resume` resumes a queue paused by interruption.
+for the entire turn to finish. `/queue` edits/removes input that has not yet been consumed.
+Selecting a queued message to edit pauses automatic queue delivery and moves it into the
+composer; merely opening the queue or deleting an item does not pause it. Interruption,
+submission or delivery errors, and session-start failures also pause queue delivery. `/resume`
+clears that pause, as does normal composer Enter (even with an empty draft); slash commands
+do not automatically resume the queue. There is no standalone `/pause` command.
 `/retry` continues failed or interrupted turns without duplicating their original prompts.
 After a session interruption it resumes all interrupted children automatically, regardless of
 which agent is selected. Parents with pending waits stay in those waits rather than starting
@@ -85,7 +89,7 @@ shows the choice for the next message; reply footers identify the model that act
 Resumed sessions retain their last applied model. `/models` remains an alias for `/model`.
 Restore a missing recorded model profile before resuming rather than substituting another model.
 
-The interface stores the last submitted model and theme selection in `$XDG_STATE_HOME/skyhook/ui.json`, falling back
+The interface stores the last submitted model in `$XDG_STATE_HOME/skyhook/ui.json`, falling back
 to `~/.local/state/skyhook/ui.json`. Writes are atomic and do not rewrite the model configuration.
 Session titles are stored separately from conversation history in each session's `ui.json`.
 
@@ -103,18 +107,19 @@ state; it is not cumulative usage. Missing context data appears as `—`.
 ## Keyboard and mouse
 
 The shortcuts below are defaults; configurable actions use your overrides in the command palette
-and `/help`. `Ctrl+X` is a leader: release it, then press the next key within two seconds.
+and `/help`. `Ctrl+X` is a leader: release it, then press the next key when ready, or `Esc` to cancel.
 
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+P`, `/` | Commands |
 | `Ctrl+X N`, `Ctrl+X L` | New session, session picker |
 | `Ctrl+X M`, `/model` | Model for subsequent user messages |
-| `Ctrl+X A`, `Ctrl+X I` | Agent picker, focus conversation |
+| `Ctrl+X A` | Agent picker |
+| `Ctrl+X I`, `/queue` | Edit queued follow-ups |
+| `Ctrl+X T`, `/details` | Toggle tool details |
 | `Ctrl+X R`, `/attention` | Reopen pending questions and permissions |
 | `/requests`, `/jobs` | Requests, jobs |
 | `Ctrl+X ↑`, `Ctrl+X ↓` | Parent, first child |
-| `Ctrl+X T` | Dark/light theme |
 | `Ctrl+X Y`, `Ctrl+X X` | Copy message/selection, export conversation |
 | `Tab`, `Shift+Tab` | Focus composer, tree, content |
 | `Enter` | Send/queue, select, expand |
@@ -128,14 +133,18 @@ and `/help`. `Ctrl+X` is a leader: release it, then press the next key within tw
 | `Ctrl+C` | Clear draft, otherwise interrupt/quit |
 | `Ctrl+X Q` | Quit |
 
+The `Ctrl+X` preview stays open until the next key; `Esc` cancels it. It shows Model
+and Inspect agent, plus Questions when requests are pending and Edit queue when
+queued messages are available. Other bound shortcuts still work even when hidden
+from the preview.
+
 Type `/` in an empty composer to open the command palette. Search by command name
 (with or without `/`), label, or configured shortcut; exact command names take priority over label matches.
-The command palette omits navigation-only actions; `Ctrl+X I`, `Ctrl+X ↑`, and `Ctrl+X ↓`
-remain available to focus the conversation, select the parent, and select the first child.
+The command palette omits navigation-only actions; `Ctrl+X ↑` and `Ctrl+X ↓`
+remain available to select the parent and the first child. Use `Tab` / `Shift+Tab` to focus the conversation.
 Menus use arrows, mouse hover, the mouse wheel, or `Ctrl+P/N`; Enter or Tab activates
 the selected item. Open palettes isolate hover from the conversation underneath. The Agents
-palette labels its Output, Input (uncached), and Context statistics. Theme choices preview
-immediately; Escape restores the previous theme and Enter saves the choice. The composer
+palette labels its Output, Input (uncached), and Context statistics. The composer
 wraps at word boundaries and supports word movement, selection, `Ctrl+A/E`, `Ctrl+W`,
 `Ctrl+U/K`, and undo/redo with `Ctrl+-` / `Ctrl+.`. Up/Down moves through displayed input
 rows, reaching prompt history only from the first/last row.
@@ -176,12 +185,18 @@ answers remain strings.
 
 Optional settings live in `$XDG_CONFIG_HOME/skyhook/tui.toml` (or `~/.config/skyhook/tui.toml`):
 
-```toml
-theme = "dark"
+Theme removal is a clean break: the interface always uses the dark palette. When upgrading,
+remove the old top-level `theme` setting and any `themes` entry from `[keybinds]`;
+these are no longer recognized and will cause a configuration error. Also remove the old example's `inspect = "ctrl+x i"`
+override to use the new queue shortcut. To retain that custom focus-conversation binding,
+assign `queue` another shortcut or set `queue = "none"` to avoid a conflict. `Ctrl+X T`
+now toggles tool details by default.
 
+```toml
 [keybinds]
 model = "ctrl+x m"
-inspect = "ctrl+x i"
+queue = "ctrl+x i"
+details = "ctrl+x t"
 # Disable an action binding with "none". /help lists available actions.
 ```
 

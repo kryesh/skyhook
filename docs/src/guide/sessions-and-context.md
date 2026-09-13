@@ -106,7 +106,7 @@ are not automatically retried. Ordinary model requests instead have separate con
 context-overflow recovery budgets, allowing up to five combined attempts when both recovery
 paths are needed; arbitrary streaming or protocol failures are not automatically replayed.
 Recognized provider context-overflow errors force compaction before the next ordinary attempt.
-See [model connection recovery](../configuration/providers-and-models.md#model-connection-recovery)
+See [model failure recovery](../configuration/providers-and-models.md#model-failure-recovery)
 for the retry conditions and budgets.
 
 Each attempt is journaled with its exact input, and failed streamed tool calls are never

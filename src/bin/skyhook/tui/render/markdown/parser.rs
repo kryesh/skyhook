@@ -238,7 +238,7 @@ impl Renderer<'_> {
                             role: tool_view::Role::Constant,
                         }],
                     };
-                    let mut lines = document.lines(self.highlights, self.palette.content.light);
+                    let mut lines = document.lines(self.highlights);
                     // Markdown's text() flushes the preceding row at a final
                     // newline; it does not emit split()'s trailing empty row.
                     if trailing_newline {
@@ -477,7 +477,7 @@ pub(in super::super) mod tests {
     }
 
     fn rendered(text: &str, width: usize) -> Vec<Line<'static>> {
-        render(text, Palette::new(false), false, width)
+        render(text, Palette::new(), false, width)
     }
 
     fn strings(lines: &[Line<'_>]) -> Vec<String> {
@@ -494,91 +494,87 @@ pub(in super::super) mod tests {
     }
     #[test]
     fn nested_foregrounds_preserve_heading_and_inline_modifiers() {
-        for light in [false, true] {
-            let p = Palette::new(light);
-            let lines = render(
-                "# head **strong** *italic* [link](https://example.com) **[*`code`*](https://code.example)**\n\n**bold *emphasis* [linked](https://strong.example) `inline`**\n\n*neutral* plain",
-                p,
-                false,
-                200,
-            );
-            for text in ["strong", "italic"] {
-                let style = span_style(&lines, text);
-                assert_eq!(style.fg, Some(p.content.heading));
-                assert!(style.add_modifier.contains(Modifier::BOLD));
-            }
-            assert!(
-                span_style(&lines, "italic")
-                    .add_modifier
-                    .contains(Modifier::ITALIC)
-            );
-            for text in [
-                "link",
-                " (https://example.com)",
-                "linked",
-                " (https://strong.example)",
-            ] {
-                let style = span_style(&lines, text);
-                assert_eq!(style.fg, Some(p.content.accent));
-                assert!(
-                    style
-                        .add_modifier
-                        .contains(Modifier::BOLD | Modifier::UNDERLINED)
-                );
-            }
-            let code = span_style(&lines, "code");
-            assert_eq!(code.fg, Some(p.content.inline_code));
-            assert!(
-                code.add_modifier
-                    .contains(Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED)
-            );
-            let emphasis = span_style(&lines, "emphasis");
-            assert_eq!(emphasis.fg, Some(p.content.strong));
-            assert!(
-                emphasis
-                    .add_modifier
-                    .contains(Modifier::BOLD | Modifier::ITALIC)
-            );
-            let inline = span_style(&lines, "inline");
-            assert_eq!(inline.fg, Some(p.content.inline_code));
-            assert!(inline.add_modifier.contains(Modifier::BOLD));
-            let neutral = span_style(&lines, "neutral");
-            assert_eq!(neutral.fg, Some(p.content.fg));
-            assert_eq!(neutral.add_modifier, Modifier::ITALIC);
+        let p = Palette::new();
+        let lines = render(
+            "# head **strong** *italic* [link](https://example.com) **[*`code`*](https://code.example)**\n\n**bold *emphasis* [linked](https://strong.example) `inline`**\n\n*neutral* plain",
+            p,
+            false,
+            200,
+        );
+        for text in ["strong", "italic"] {
+            let style = span_style(&lines, text);
+            assert_eq!(style.fg, Some(p.content.heading));
+            assert!(style.add_modifier.contains(Modifier::BOLD));
         }
+        assert!(
+            span_style(&lines, "italic")
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+        for text in [
+            "link",
+            " (https://example.com)",
+            "linked",
+            " (https://strong.example)",
+        ] {
+            let style = span_style(&lines, text);
+            assert_eq!(style.fg, Some(p.content.accent));
+            assert!(
+                style
+                    .add_modifier
+                    .contains(Modifier::BOLD | Modifier::UNDERLINED)
+            );
+        }
+        let code = span_style(&lines, "code");
+        assert_eq!(code.fg, Some(p.content.inline_code));
+        assert!(
+            code.add_modifier
+                .contains(Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED)
+        );
+        let emphasis = span_style(&lines, "emphasis");
+        assert_eq!(emphasis.fg, Some(p.content.strong));
+        assert!(
+            emphasis
+                .add_modifier
+                .contains(Modifier::BOLD | Modifier::ITALIC)
+        );
+        let inline = span_style(&lines, "inline");
+        assert_eq!(inline.fg, Some(p.content.inline_code));
+        assert!(inline.add_modifier.contains(Modifier::BOLD));
+        let neutral = span_style(&lines, "neutral");
+        assert_eq!(neutral.fg, Some(p.content.fg));
+        assert_eq!(neutral.add_modifier, Modifier::ITALIC);
     }
 
     #[test]
     fn quote_and_list_markers_use_content_roles_without_changing_text() {
-        for light in [false, true] {
-            let p = Palette::new(light);
-            let lines = render(
-                "> quoted *quiet*\n\n- bullet\n- [x] done\n\n3. numbered",
-                p,
-                false,
-                80,
-            );
-            assert_eq!(
-                strings(&lines),
-                [
-                    "│ quoted quiet",
-                    "",
-                    "• bullet",
-                    "• [x] done",
-                    "",
-                    "3. numbered"
-                ]
-            );
-            assert_eq!(span_style(&lines, "│ ").fg, Some(p.content.muted));
-            assert_eq!(span_style(&lines, "quoted ").fg, Some(p.content.quote));
-            let quiet = span_style(&lines, "quiet");
-            assert_eq!(quiet.fg, Some(p.content.quote));
-            assert_eq!(quiet.add_modifier, Modifier::ITALIC);
-            for marker in ["• ", "[x] ", "3. "] {
-                assert_eq!(span_style(&lines, marker).fg, Some(p.content.primary));
-            }
-            assert_eq!(span_style(&lines, "bullet").fg, Some(p.content.fg));
+        let p = Palette::new();
+        let lines = render(
+            "> quoted *quiet*\n\n- bullet\n- [x] done\n\n3. numbered",
+            p,
+            false,
+            80,
+        );
+        assert_eq!(
+            strings(&lines),
+            [
+                "│ quoted quiet",
+                "",
+                "• bullet",
+                "• [x] done",
+                "",
+                "3. numbered"
+            ]
+        );
+        assert_eq!(span_style(&lines, "│ ").fg, Some(p.content.muted));
+        assert_eq!(span_style(&lines, "quoted ").fg, Some(p.content.quote));
+        let quiet = span_style(&lines, "quiet");
+        assert_eq!(quiet.fg, Some(p.content.quote));
+        assert_eq!(quiet.add_modifier, Modifier::ITALIC);
+        for marker in ["• ", "[x] ", "3. "] {
+            assert_eq!(span_style(&lines, marker).fg, Some(p.content.primary));
         }
+        assert_eq!(span_style(&lines, "bullet").fg, Some(p.content.fg));
     }
 
     #[test]
@@ -609,7 +605,7 @@ pub(in super::super) mod tests {
         let body = format!("small\n{}  \n\nlast\n", "x".repeat(tool_view::MAX_SECTION));
         let named = format!("```rust\n{body}```");
         let unnamed = format!("```\n{body}```");
-        let p = Palette::new(false);
+        let p = Palette::new();
         let named = render(&named, p, false, 80);
         let unnamed = render(&unnamed, p, false, 80);
         assert_eq!(named, unnamed);
@@ -617,40 +613,36 @@ pub(in super::super) mod tests {
 
     #[test]
     fn named_code_fallback_uses_the_code_role() {
-        for light in [false, true] {
-            let p = Palette::new(light);
-            let lines = render("```not-a-language\nplain\n```", p, false, 80);
-            assert_eq!(strings(&lines), ["plain"]);
-            assert_eq!(span_style(&lines, "plain").fg, Some(p.content.inline_code));
-        }
+        let p = Palette::new();
+        let lines = render("```not-a-language\nplain\n```", p, false, 80);
+        assert_eq!(strings(&lines), ["plain"]);
+        assert_eq!(span_style(&lines, "plain").fg, Some(p.content.inline_code));
     }
     #[test]
     fn table_headers_have_heading_precedence_even_in_borderless_fallback() {
-        for light in [false, true] {
-            let p = Palette::new(light);
-            for width in [1, 80] {
-                let lines = render(
-                    "| **H** | *I* | [L](u) | `C` |\n| --- | --- | --- | --- |\n| body | **B** | plain | plain |",
-                    p,
-                    false,
-                    width,
-                );
-                for text in ["H", "I"] {
-                    let style = span_style(&lines, text);
-                    assert_eq!(style.fg, Some(p.content.heading));
-                    assert!(style.add_modifier.contains(Modifier::BOLD));
-                }
-                let link = span_style(&lines, "L");
-                assert_eq!(link.fg, Some(p.content.accent));
-                assert!(
-                    link.add_modifier
-                        .contains(Modifier::BOLD | Modifier::UNDERLINED)
-                );
-                let code = span_style(&lines, "C");
-                assert_eq!(code.fg, Some(p.content.inline_code));
-                assert!(code.add_modifier.contains(Modifier::BOLD));
-                assert_eq!(span_style(&lines, "B").fg, Some(p.content.strong));
+        let p = Palette::new();
+        for width in [1, 80] {
+            let lines = render(
+                "| **H** | *I* | [L](u) | `C` |\n| --- | --- | --- | --- |\n| body | **B** | plain | plain |",
+                p,
+                false,
+                width,
+            );
+            for text in ["H", "I"] {
+                let style = span_style(&lines, text);
+                assert_eq!(style.fg, Some(p.content.heading));
+                assert!(style.add_modifier.contains(Modifier::BOLD));
             }
+            let link = span_style(&lines, "L");
+            assert_eq!(link.fg, Some(p.content.accent));
+            assert!(
+                link.add_modifier
+                    .contains(Modifier::BOLD | Modifier::UNDERLINED)
+            );
+            let code = span_style(&lines, "C");
+            assert_eq!(code.fg, Some(p.content.inline_code));
+            assert!(code.add_modifier.contains(Modifier::BOLD));
+            assert_eq!(span_style(&lines, "B").fg, Some(p.content.strong));
         }
     }
 }

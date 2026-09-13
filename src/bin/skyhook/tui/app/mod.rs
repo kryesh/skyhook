@@ -117,8 +117,6 @@ pub struct App {
     // UI-only notices, including startup diagnostics and failed status writes.
     unsaved_status: Vec<(AgentId, String)>,
     stopping: bool,
-    pub light: bool,
-    theme_preview: Option<bool>,
     pub animating: bool,
     pub thinking: bool,
     pub details: bool,
@@ -131,7 +129,7 @@ pub struct App {
     last_output: Instant,
     pub tx: mpsc::UnboundedSender<Work>,
     pub keys: KeyMap,
-    pub leader: Option<(KeyEvent, Instant)>,
+    pub leader: Option<KeyEvent>,
     pub toast: Option<(String, Instant)>,
     pub dirty: bool,
     pub content_dirty: bool,
@@ -159,7 +157,6 @@ impl App {
         remembered_model: Option<String>,
         tx: mpsc::UnboundedSender<Work>,
         keys: KeyMap,
-        light: bool,
     ) -> Self {
         let selected = session
             .as_ref()
@@ -217,8 +214,6 @@ impl App {
             status: super::status::StatusLog::new(tx.clone()),
             unsaved_status: Vec::new(),
             stopping: false,
-            light,
-            theme_preview: None,
             animating: false,
             thinking: false,
             details: false,
@@ -249,7 +244,7 @@ impl App {
             pressed_entry: None,
             search_editor: None,
             hover: None,
-            render: super::render::RenderState::new(selected, light, tx),
+            render: super::render::RenderState::new(selected, tx),
         };
         app.refresh();
         if let Some(root) = app.projection.agents.iter().find(|a| a.id == app.selected) {
@@ -289,7 +284,6 @@ pub(super) mod tests {
             None,
             tx,
             KeyMap::new(&Default::default()).unwrap(),
-            false,
         );
         // Unit fixtures must not change the user's global model preference.
         app.remembered_model = Some("first".into());
@@ -483,7 +477,6 @@ pub(super) mod tests {
             None,
             tx,
             KeyMap::new(&Default::default()).unwrap(),
-            false,
         );
         assert_startup_warnings_visible(&mut initial);
         assert_startup_warnings_not_recorded(&initial).await;

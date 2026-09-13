@@ -1,7 +1,7 @@
 # Configuration overview
 
 Skyhook uses TOML configuration. The files are not rewritten when the terminal remembers a
-model or theme.
+model.
 
 ## File selection and layering
 
@@ -121,7 +121,7 @@ for selectors and incompatible options.
   and optional SSH-config import.
 - [MCP servers](mcp.md): trusted local server startup and imported tools.
 
-Terminal-specific theme and keybindings belong in the separate
+Terminal-specific keybindings belong in the separate
 [`tui.toml`](../guide/terminal-interface.md#keyboard-and-mouse).
 
 ## Complete example

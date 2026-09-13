@@ -101,8 +101,8 @@ mod tests {
     use super::super::{Palette, stream::StreamLayout};
     use super::*;
 
-    fn complete(cache: &mut HighlightCache, document: &Document, light: bool) {
-        cache.prepare(std::iter::once(document), light);
+    fn complete(cache: &mut HighlightCache, document: &Document) {
+        cache.prepare(std::iter::once(document));
         let expected: std::collections::HashSet<_> = document.highlight_sources().collect();
         let mut completed = std::collections::HashSet::new();
         let start = std::time::Instant::now();
@@ -180,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn async_saved_and_live_fences_preserve_layout_and_switch_themes() {
+    fn async_saved_and_live_fences_preserve_layout() {
         let mut cache = HighlightCache::default();
         let mut source = String::new();
         let mut fences = Fences::default();
@@ -192,7 +192,7 @@ mod tests {
             "\n// comment\n",
             "```\n\nTail",
         ];
-        let p = Palette::new(false);
+        let p = Palette::new();
         for chunk in chunks {
             let old = source.len();
             source.push_str(chunk);
@@ -205,7 +205,7 @@ mod tests {
             }
         }
         let fallback = text(&rows);
-        complete(&mut cache, &fences.document, false);
+        complete(&mut cache, &fences.document);
         // Completion invalidates the owning entry, including committed blocks.
         let (at, live) = stream
             .update_highlighted(&source, 18, p, None, "↳ ", Some(&cache))
@@ -229,28 +229,6 @@ mod tests {
             live.iter()
                 .flat_map(|row| &row.line.spans)
                 .all(|s| s.style.bg.is_none())
-        );
-
-        let light = Palette::new(true);
-        complete(&mut cache, &fences.document, true);
-        let (at, switched) = stream
-            .update_highlighted(&source, 18, light, Some(source.len()), "↳ ", Some(&cache))
-            .unwrap();
-        assert_eq!(at, 0);
-        assert_eq!(text(&switched), fallback);
-        assert_ne!(live, switched);
-        assert!(
-            stream
-                .update_highlighted(&source, 18, light, Some(source.len()), "↳ ", Some(&cache))
-                .is_none()
-        );
-        // A full theme identity, not the old accent-only key, invalidates prose.
-        let mut changed = light;
-        changed.content.fg = ratatui::style::Color::Red;
-        assert!(
-            stream
-                .update_highlighted(&source, 18, changed, Some(source.len()), "↳ ", Some(&cache))
-                .is_some()
         );
     }
 }

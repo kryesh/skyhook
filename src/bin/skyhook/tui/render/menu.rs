@@ -309,7 +309,7 @@ mod tests {
             app.content_rect = r(0, 0, width, 10);
             app.hits.clear();
             terminal
-                .draw(|frame| draw_menu(frame, &mut app, Palette::new(false)))
+                .draw(|frame| draw_menu(frame, &mut app, Palette::new()))
                 .unwrap();
             let buffer = terminal.backend().buffer();
             let line = |y| {
@@ -336,84 +336,73 @@ mod tests {
 
     #[test]
     fn menu_hints_are_muted_right_aligned_and_yield_to_labels() {
-        for light in [false, true] {
-            let p = Palette::new(light);
-            for (label, hint) in [
-                ("New session", "ctrl+x n"),
-                ("Quit", "alt+q"),
-                ("界面", "ctrl+shift+p"),
-                ("Unbound", ""),
-                ("Long custom shortcut", "ctrl+x ctrl+y ctrl+z"),
-            ] {
-                for width in [0, 1, 6, 12, 20, 38, 80] {
-                    for selected in [false, true] {
-                        let item = super::super::super::app::Item {
-                            value: String::new(),
-                            label: label.into(),
-                            detail: hint.into(),
-                            attachment: None,
-                        };
-                        let mut terminal =
-                            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 3))
-                                .unwrap();
-                        let row = r(3, 1, width, 1);
-                        let bg = if selected { p.selected } else { p.input };
-                        terminal
-                            .draw(|frame| {
-                                fill(frame, frame.area(), p.base);
-                                fill(frame, row, bg);
-                                draw_menu_item(
-                                    frame,
-                                    row,
-                                    &item,
-                                    &MenuKind::Commands,
-                                    selected,
-                                    p,
-                                    bg,
-                                );
-                            })
-                            .unwrap();
-                        let buffer = terminal.backend().buffer();
-                        let fits =
-                            !hint.is_empty() && label.width() + hint.width() + 2 <= width as usize;
-                        // Ratatui resets the hidden continuation cells of wide
-                        // graphemes. They are not independently painted terminal
-                        // cells: the leading cell's style covers the whole glyph.
-                        let mut painted = Vec::new();
-                        let mut x = row.x;
-                        while x < row.right() {
-                            painted.push(x);
-                            x += buffer[(x, 1)].symbol().width().max(1) as u16;
-                        }
-                        let actual = painted
-                            .iter()
-                            .map(|&x| buffer[(x, 1)].symbol())
-                            .collect::<String>();
-                        if fits {
-                            assert!(actual.ends_with(hint), "{actual:?}");
-                            let start = row.right() - hint.width() as u16;
-                            assert!((start..row.right()).all(|x| buffer[(x, 1)].fg == p.muted));
-                        } else if !hint.is_empty() {
-                            assert!(!actual.contains(hint), "{actual:?}");
-                        }
-                        if label.width() <= width as usize {
-                            assert!(actual.starts_with(label), "{actual:?}");
-                        }
-                        if width > 0 && !label.contains('界') {
-                            assert_eq!(
-                                buffer[(row.x, 1)].fg,
-                                if selected { p.content.primary } else { p.fg }
-                            );
-                        }
-                        assert!(
-                            painted.iter().all(|&x| buffer[(x, 1)].bg == bg),
-                            "row background: label={label:?}, hint={hint:?}, width={width}, selected={selected}, light={light}: {:?}",
-                            (row.x..row.right())
-                                .map(|x| (x, buffer[(x, 1)].symbol(), buffer[(x, 1)].bg))
-                                .collect::<Vec<_>>()
-                        );
-                        assert_eq!(buffer[(row.right(), 1)].bg, p.base);
+        let p = Palette::new();
+        for (label, hint) in [
+            ("New session", "ctrl+x n"),
+            ("Quit", "alt+q"),
+            ("界面", "ctrl+shift+p"),
+            ("Unbound", ""),
+            ("Long custom shortcut", "ctrl+x ctrl+y ctrl+z"),
+        ] {
+            for width in [0, 1, 6, 12, 20, 38, 80] {
+                for selected in [false, true] {
+                    let item = super::super::super::app::Item {
+                        value: String::new(),
+                        label: label.into(),
+                        detail: hint.into(),
+                        attachment: None,
+                    };
+                    let mut terminal =
+                        ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 3)).unwrap();
+                    let row = r(3, 1, width, 1);
+                    let bg = if selected { p.selected } else { p.input };
+                    terminal
+                        .draw(|frame| {
+                            fill(frame, frame.area(), p.base);
+                            fill(frame, row, bg);
+                            draw_menu_item(frame, row, &item, &MenuKind::Commands, selected, p, bg);
+                        })
+                        .unwrap();
+                    let buffer = terminal.backend().buffer();
+                    let fits =
+                        !hint.is_empty() && label.width() + hint.width() + 2 <= width as usize;
+                    // Ratatui resets the hidden continuation cells of wide
+                    // graphemes. They are not independently painted terminal
+                    // cells: the leading cell's style covers the whole glyph.
+                    let mut painted = Vec::new();
+                    let mut x = row.x;
+                    while x < row.right() {
+                        painted.push(x);
+                        x += buffer[(x, 1)].symbol().width().max(1) as u16;
                     }
+                    let actual = painted
+                        .iter()
+                        .map(|&x| buffer[(x, 1)].symbol())
+                        .collect::<String>();
+                    if fits {
+                        assert!(actual.ends_with(hint), "{actual:?}");
+                        let start = row.right() - hint.width() as u16;
+                        assert!((start..row.right()).all(|x| buffer[(x, 1)].fg == p.muted));
+                    } else if !hint.is_empty() {
+                        assert!(!actual.contains(hint), "{actual:?}");
+                    }
+                    if label.width() <= width as usize {
+                        assert!(actual.starts_with(label), "{actual:?}");
+                    }
+                    if width > 0 && !label.contains('界') {
+                        assert_eq!(
+                            buffer[(row.x, 1)].fg,
+                            if selected { p.content.primary } else { p.fg }
+                        );
+                    }
+                    assert!(
+                        painted.iter().all(|&x| buffer[(x, 1)].bg == bg),
+                        "row background: label={label:?}, hint={hint:?}, width={width}, selected={selected}: {:?}",
+                        (row.x..row.right())
+                            .map(|x| (x, buffer[(x, 1)].symbol(), buffer[(x, 1)].bg))
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(buffer[(row.right(), 1)].bg, p.base);
                 }
             }
         }

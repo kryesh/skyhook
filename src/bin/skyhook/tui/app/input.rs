@@ -123,7 +123,10 @@ impl App {
             }
             return;
         }
-        if let Some((prefix, _)) = self.leader.take() {
+        if let Some(prefix) = self.leader.take() {
+            if key.code == KeyCode::Esc {
+                return;
+            }
             if let Some(action) = self.keys.action(Some(prefix), key) {
                 self.command(&action);
             }
@@ -134,7 +137,7 @@ impl App {
             return;
         }
         if self.keys.prefix(key) {
-            self.leader = Some((key, Instant::now()));
+            self.leader = Some(key);
             return;
         }
         match key.code {

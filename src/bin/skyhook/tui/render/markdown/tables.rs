@@ -211,7 +211,7 @@ mod tests {
     use ratatui::style::Style;
 
     fn table(text: &str, width: usize) -> Vec<Line<'static>> {
-        render(text, Palette::new(false), false, width)
+        render(text, Palette::new(), false, width)
     }
 
     fn strings(lines: &[Line<'_>]) -> Vec<String> {
@@ -276,8 +276,10 @@ mod tests {
                 .any(|span| span.content == "cd"
                     && span.style.add_modifier.contains(Modifier::ITALIC))
         );
-        assert!(spans.iter().any(|span| span.content == "e"
-            && span.style.fg == Some(Palette::new(false).content.inline_code)));
+        assert!(
+            spans.iter().any(|span| span.content == "e"
+                && span.style.fg == Some(Palette::new().content.inline_code))
+        );
     }
 
     #[test]

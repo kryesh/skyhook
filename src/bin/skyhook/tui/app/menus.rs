@@ -51,7 +51,6 @@ pub enum MenuKind {
     Models,
     Agents,
     Sessions,
-    Themes,
     Files,
     Attach,
     Attachments,
@@ -237,29 +236,7 @@ impl App {
             .and_then(|id| menu.filtered().iter().position(|item| item.value == id))
             .unwrap_or(0);
     }
-    pub(super) fn preview_theme(&mut self) {
-        if let Some(menu) = &self.menu
-            && matches!(menu.kind, MenuKind::Themes)
-        {
-            if let Some(item) = menu.filtered().get(menu.selected) {
-                self.light = item.value == "light";
-            } else if let Some(previous) = self.theme_preview {
-                self.light = previous;
-            }
-        } else if let Some(previous) = self.theme_preview.take() {
-            self.light = previous;
-        }
-    }
     pub(super) fn open(&mut self, title: &str, kind: MenuKind, items: Vec<Item>) {
-        if let Some(previous) = self.theme_preview.take() {
-            self.light = previous;
-        }
-        let selected = if matches!(kind, MenuKind::Themes) {
-            self.theme_preview = Some(self.light);
-            usize::from(self.light)
-        } else {
-            0
-        };
         self.next_menu_id = self.next_menu_id.wrapping_add(1);
         self.menu = Some(Menu {
             id: self.next_menu_id,
@@ -267,9 +244,8 @@ impl App {
             kind,
             items,
             input: Editor::default(),
-            selected,
+            selected: 0,
         });
-        self.preview_theme();
     }
     pub(super) fn info(&mut self, title: &str, text: String) {
         self.open(
@@ -307,9 +283,6 @@ impl App {
                 }
             },
             "agents" => self.open("Agents", MenuKind::Agents, self.agent_items()),
-            "themes" => self.open("Theme", MenuKind::Themes, vec![
-                Item::new("dark", "Dark", ""), Item::new("light", "Light", ""),
-            ]),
             "inspect" => {
                 self.focus = Focus::Content;
                 self.view().tab = Tab::Conversation;
@@ -458,7 +431,6 @@ impl App {
                 "Model changes apply from the next submitted message. Instruction changes apply to new sessions.\n",
                 "Mouse: click agent or tool, scroll, drag text then copy.\n",
                 "The workspace and session ID are plain text; use terminal selection to copy them.\n",
-                "Themes preview while navigating; Escape cancels and Enter saves.\n",
                 "Copy message uses the terminal clipboard (OSC 52).\n\n",
                 "Settings: {}",
             ), self.keys.help(), state::config_path().display())),
@@ -575,20 +547,6 @@ impl App {
                     self.select(agent.id.clone());
                 }
             }
-            MenuKind::Themes => {
-                if !matches!(value.as_str(), "light" | "dark") {
-                    self.preview_theme();
-                    return;
-                }
-                self.theme_preview = None;
-                self.light = value == "light";
-                let notices = self.notifier();
-                tokio::task::spawn_blocking(move || {
-                    if let Err(e) = state::remember_theme(&value) {
-                        notices.send(e.to_string());
-                    }
-                });
-            }
             MenuKind::Sessions => {
                 if let Ok(id) = value.parse() {
                     if self.active_work() {
@@ -657,6 +615,8 @@ impl App {
                 if let Ok(id) = value.parse::<u64>()
                     && let Some(queued) = self.remove_queued(id)
                 {
+                    self.paused = true;
+                    self.cancel_queue_delivery();
                     if !self.editor.text.is_empty() || !self.images.is_empty() {
                         let text = self.editor.take();
                         let images = std::mem::take(&mut self.images);
@@ -1019,7 +979,6 @@ mod tests {
             ("thinking", "thinking"),
             ("sessions", "sessions"),
             ("agents", "agents"),
-            ("themes", "themes"),
             ("exit", "exit"),
         ] {
             menu.input.text = query.into();
@@ -1162,23 +1121,6 @@ mod tests {
         mouse(&mut app, row, MouseEventKind::Moved);
         key(&mut app, KeyCode::Enter, M::NONE);
         assert_eq!(app.model, "second");
-        // Selection-dependent theme previews follow hover just like keyboard input.
-        let original_light = app.light;
-        app.command("themes");
-        draw(&mut app);
-        let other = usize::from(!original_light);
-        let mut row = app
-            .hits
-            .iter()
-            .find_map(|(rect, hit)| {
-                matches!(hit, Hit::Menu(index) if *index == other).then_some(*rect)
-            })
-            .unwrap();
-        row.x += 1;
-        mouse(&mut app, row, MouseEventKind::Moved);
-        assert_eq!(app.light, !original_light);
-        key(&mut app, KeyCode::Esc, M::NONE);
-        assert_eq!(app.light, original_light);
         app.session.as_ref().unwrap().shutdown().await.unwrap();
     }
 }

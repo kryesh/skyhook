@@ -520,17 +520,15 @@ mod tests {
                     );
                 }
             }
-            for light in [false, true] {
-                let p = Palette::new(light);
-                for row in &rows {
-                    let style = row.style(p, 1);
-                    assert_eq!(
-                        style.bg,
-                        Some(if row.index == 1 { p.selected } else { p.input })
-                    );
-                    assert_eq!(style.fg, Some(if row.description { p.muted } else { p.fg }));
-                    assert!(!style.add_modifier.contains(Modifier::BOLD));
-                }
+            let p = Palette::new();
+            for row in &rows {
+                let style = row.style(p, 1);
+                assert_eq!(
+                    style.bg,
+                    Some(if row.index == 1 { p.selected } else { p.input })
+                );
+                assert_eq!(style.fg, Some(if row.description { p.muted } else { p.fg }));
+                assert!(!style.add_modifier.contains(Modifier::BOLD));
             }
         }
     }

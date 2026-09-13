@@ -23,7 +23,6 @@ pub(super) struct StreamLayout {
     initialized: bool,
     len: usize,
     width: usize,
-    theme: Option<super::super::theme::ContentTheme>,
     plain: Option<Plain>,
     prefix: String,
     stable_bytes: usize,
@@ -50,7 +49,7 @@ impl StreamLayout {
     /// Replace rows starting at the returned index with the returned suffix.
     /// `None` means no change. `append_from` must be the previous byte length,
     /// with an unchanged prefix; use `None` for replacement, even at equal length.
-    /// Width and Markdown palette changes automatically invalidate the layout.
+    /// Width changes automatically invalidate the layout.
     #[cfg(test)]
     pub(super) fn update_prefixed(
         &mut self,
@@ -81,7 +80,6 @@ impl StreamLayout {
             && self.len <= text.len()
             && text.is_char_boundary(self.len)
             && self.width == width
-            && self.theme == Some(p.content)
             && self.prefix == prefix;
         if append && self.len == text.len() {
             return None;
@@ -98,7 +96,6 @@ impl StreamLayout {
         self.initialized = true;
         self.len = text.len();
         self.width = width;
-        self.theme = Some(p.content);
         if !prefix.is_empty() && width < prefix.len() {
             self.plain = None;
         }
@@ -456,49 +453,47 @@ mod tests {
     }
 
     #[test]
-    fn markdown_code_geometry_streaming_resize_and_theme_match_saved() {
+    fn markdown_code_geometry_streaming_and_resize_match_saved() {
         let input = "prose `inline`\n\n```rust\nlet answer = 42;  \n\n    \n// long comment with words for wrapping\n```\n\nafter";
         let mut layout = StreamLayout::default();
         let mut rows = Vec::new();
         let mut text = String::new();
-        for light in [false, true, false] {
-            let p = Palette::new(light);
-            for width in [7, 29, 3] {
-                text.clear();
-                rows.clear();
-                for ch in input.chars() {
-                    let old = text.len();
-                    text.push(ch);
-                    if let Some((at, suffix)) =
-                        layout.update_prefixed(&text, width, p, (old != 0).then_some(old), "")
-                    {
-                        rows.truncate(at);
-                        rows.extend(suffix);
-                    }
-                    assert_eq!(
-                        canonical(&rows),
-                        canonical(&reference(&text, width, p)),
-                        "{text:?}, width {width}, light {light}"
-                    );
-                }
-                assert_eq!(rows.iter().filter(|row| row.layout.decorative).count(), 2);
-                let mut copied = String::new();
-                let mut first = true;
-                for row in rows.iter().filter(|row| !row.layout.decorative) {
-                    if !first && !row.continued {
-                        copied.push('\n');
-                    }
-                    copied.push_str(&row.line.to_string());
-                    first = false;
+        let p = Palette::new();
+        for width in [7, 29, 3] {
+            text.clear();
+            rows.clear();
+            for ch in input.chars() {
+                let old = text.len();
+                text.push(ch);
+                if let Some((at, suffix)) =
+                    layout.update_prefixed(&text, width, p, (old != 0).then_some(old), "")
+                {
+                    rows.truncate(at);
+                    rows.extend(suffix);
                 }
                 assert_eq!(
-                    copied,
-                    "prose inline\n\nlet answer = 42;  \n\n    \n// long comment with words for wrapping\n\nafter"
+                    canonical(&rows),
+                    canonical(&reference(&text, width, p)),
+                    "{text:?}, width {width}"
                 );
             }
+            assert_eq!(rows.iter().filter(|row| row.layout.decorative).count(), 2);
+            let mut copied = String::new();
+            let mut first = true;
+            for row in rows.iter().filter(|row| !row.layout.decorative) {
+                if !first && !row.continued {
+                    copied.push('\n');
+                }
+                copied.push_str(&row.line.to_string());
+                first = false;
+            }
+            assert_eq!(
+                copied,
+                "prose inline\n\nlet answer = 42;  \n\n    \n// long comment with words for wrapping\n\nafter"
+            );
         }
-        for (width, light) in [(7, false), (31, false), (31, true), (3, true)] {
-            let p = Palette::new(light);
+        for width in [7, 31, 3] {
+            let p = Palette::new();
             if let Some((at, suffix)) =
                 layout.update_prefixed(&text, width, p, Some(text.len()), "")
             {
@@ -510,7 +505,7 @@ mod tests {
     }
 
     fn check_chunks(chunks: &[&str], width: usize) {
-        let p = Palette::new(false);
+        let p = Palette::new();
         let mut cache = StreamLayout::default();
         let mut text = String::new();
         let mut rows = Vec::new();
@@ -562,7 +557,7 @@ mod tests {
 
     #[test]
     fn prefixed_fragment_boundaries_and_cleaning() {
-        let p = Palette::new(false);
+        let p = Palette::new();
         for source in [
             "# title\n\nplain\n\nnext\n\n**rich**\n\nend",
             "first\n\nsecond\nsoft  \nhard\n\n",
@@ -603,7 +598,7 @@ mod tests {
     }
 
     fn check_prefixed_chunks(chunks: &[&str], width: usize, prefix: &str) {
-        let p = Palette::new(false);
+        let p = Palette::new();
         let mut cache = StreamLayout::default();
         let mut text = String::new();
         let mut rows = Vec::new();
@@ -636,7 +631,7 @@ mod tests {
 
     #[test]
     fn narrow_tables_keep_borders_on_single_rows() {
-        let p = Palette::new(false);
+        let p = Palette::new();
         let quoted = NARROW_TABLE
             .lines()
             .map(|line| format!("> > {line}\n"))
@@ -724,7 +719,7 @@ mod tests {
 
     #[test]
     fn table_resize_invalidates_committed_rows_and_continues_streaming() {
-        let p = Palette::new(false);
+        let p = Palette::new();
         for prefix in ["", "  ", "界 "] {
             let mut cache = StreamLayout::default();
             let mut source = format!("{NARROW_TABLE}\n\nplain tail");
@@ -836,9 +831,9 @@ mod tests {
     }
 
     #[test]
-    fn reset_resize_palette_and_unchanged() {
+    fn reset_resize_and_unchanged() {
         let mut cache = StreamLayout::default();
-        let p = Palette::new(false);
+        let p = Palette::new();
         let text = "ordinary prose that wraps";
         let (_, rows) = cache.update_prefixed(text, 8, p, None, "").unwrap();
         assert_eq!(canonical(&rows), canonical(&reference(text, 8, p)));
@@ -847,11 +842,7 @@ mod tests {
                 .update_prefixed(text, 8, p, Some(text.len()), "")
                 .is_none()
         );
-        for (text, width, p) in [
-            (text, 3, p),
-            ("replacement", 3, p),
-            ("`code`", 3, Palette::new(true)),
-        ] {
+        for (text, width) in [(text, 3), ("replacement", 3), ("`code`", 3)] {
             let (at, rows) = cache.update_prefixed(text, width, p, None, "").unwrap();
             assert_eq!(at, 0);
             assert_eq!(canonical(&rows), canonical(&reference(text, width, p)));

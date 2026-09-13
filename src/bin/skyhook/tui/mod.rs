@@ -10,7 +10,7 @@ mod status;
 mod theme;
 mod tool_view;
 
-use super::{interaction::UiInteraction, Args};
+use super::{Args, interaction::UiInteraction};
 use app::{App, Work};
 use crossterm::{
     event::{
@@ -19,8 +19,8 @@ use crossterm::{
     },
     execute, queue,
     terminal::{
-        disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
-        EnterAlternateScreen, LeaveAlternateScreen,
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode,
     },
 };
 use futures_util::StreamExt;
@@ -74,9 +74,6 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         super::launch::select_model(&config, args.model.as_deref(), saved.model.as_deref())?;
     let settings = state::settings()?;
     let keymap = keys::KeyMap::new(&settings.keybinds)?;
-    if !matches!(settings.theme.as_str(), "dark" | "light") {
-        return Err("tui.toml theme must be dark or light".into());
-    }
     let (interaction, mut prompts) = UiInteraction::new();
     let launch = Launch::from_args(&args, config, model, Some(Arc::new(interaction))).await?;
     let session = match args.resume {
@@ -90,15 +87,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         (Default::default(), None)
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut app = App::new(
-        session,
-        launch,
-        snapshot,
-        saved.model,
-        tx.clone(),
-        keymap,
-        saved.theme.as_deref().unwrap_or(&settings.theme) == "light",
-    );
+    let mut app = App::new(session, launch, snapshot, saved.model, tx.clone(), keymap);
     if let Some(warning) = warning {
         app.notice(warning);
     }

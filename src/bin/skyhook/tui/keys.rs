@@ -6,8 +6,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("sessions", "Resume session", "ctrl+x l"),
     ("model", "Model", "ctrl+x m"),
     ("agents", "Inspect agent", "ctrl+x a"),
-    ("inspect", "Focus conversation", "ctrl+x i"),
-    ("themes", "Theme", "ctrl+x t"),
+    ("inspect", "Focus conversation", ""),
     ("copy", "Copy message", "ctrl+x y"),
     ("export", "Export conversation", "ctrl+x x"),
     ("exit", "Quit", "ctrl+x q"),
@@ -17,10 +16,10 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("jobs", "Agent jobs", ""),
     ("requests", "Model requests", ""),
     ("thinking", "Expand/collapse saved reasoning", ""),
-    ("details", "Toggle tool details", ""),
+    ("details", "Toggle tool details", "ctrl+x t"),
     ("attach", "Attach an image", ""),
     ("attachments", "Inspect or remove attachments", ""),
-    ("queue", "Edit queued follow-ups", ""),
+    ("queue", "Edit queued follow-ups", "ctrl+x i"),
     ("resume", "Resume queued input", ""),
     ("retry", "Continue failed or interrupted turns", ""),
     ("attention", "Reopen questions and permissions", "ctrl+x r"),
@@ -75,23 +74,14 @@ impl KeyMap {
             .iter()
             .any(|(keys, _)| keys.len() == 2 && keys[0] == key)
     }
-    pub fn leader_hint(&self, prefix: KeyEvent) -> String {
-        let mut bindings = self
-            .bindings
+    pub fn leader_hint(&self, prefix: KeyEvent, visible: &[(&str, &str)]) -> String {
+        let hints = visible
             .iter()
-            .filter(|(keys, _)| keys.len() == 2 && keys[0] == prefix)
-            .collect::<Vec<_>>();
-        // Keep reopening discoverable even when the terminal clips this row.
-        bindings.sort_by_key(|(_, action)| action != "attention");
-        let hints = bindings
-            .into_iter()
-            .map(|(keys, action)| {
-                let label = if action == "attention" {
-                    "questions"
-                } else {
-                    action.as_str()
-                };
-                format!("{} {label}", display(&keys[1]))
+            .filter_map(|(action, label)| {
+                self.bindings
+                    .iter()
+                    .find(|(keys, id)| keys.len() == 2 && keys[0] == prefix && id == action)
+                    .map(|(keys, _)| format!("{} {label}", display(&keys[1])))
             })
             .collect::<Vec<_>>()
             .join(" · ");

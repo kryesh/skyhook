@@ -966,7 +966,10 @@ mod tests {
         assert_eq!(view["notice"], "Output incomplete.");
         let mut query = OutputArgs::new(id);
         query.field = Some(field.into());
-        let page = manager.inspect_output(query, &Default::default()).await.unwrap();
+        let page = manager
+            .inspect_output(query, &Default::default())
+            .await
+            .unwrap();
         assert_eq!(page["notice"], "Output incomplete.");
         assert_eq!(page["preview"]["lines"], json!(["[unfinished"]));
     }

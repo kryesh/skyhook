@@ -550,7 +550,7 @@ mod tests {
                 "patch": "@@ -1 +1 @@\n-old\n+new\n"
             }),
         );
-        let lines = document.layout_lines(None, false);
+        let lines = document.layout_lines(None);
         for (markers, expected) in [
             (
                 &[
@@ -611,17 +611,15 @@ mod tests {
             matches!(section, Section::Code { source, .. } if &**source == "  exact\toutput\n\n")
         }));
         assert_eq!(output, before);
-        for light in [false, true] {
-            let lines = document.lines(None, light);
-            let error = lines
-                .iter()
-                .find(|line| line.to_string().contains("Permission was denied"))
-                .unwrap();
-            assert_eq!(
-                error.spans.last().unwrap().style.fg,
-                Some(ContentTheme::new(light).error)
-            );
-        }
+        let lines = document.lines(None);
+        let error = lines
+            .iter()
+            .find(|line| line.to_string().contains("Permission was denied"))
+            .unwrap();
+        assert_eq!(
+            error.spans.last().unwrap().style.fg,
+            Some(ContentTheme::new().error)
+        );
         let mut structured = Document::default();
         structured.output(
             "exec",

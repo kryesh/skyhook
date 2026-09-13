@@ -126,7 +126,6 @@ impl App {
         self.leader = None;
         self.menu = None;
         self.search_editor = None;
-        self.preview_theme();
     }
     pub(super) fn reset_prompt(&mut self) {
         self.prompt_editor.clear_sensitive();
@@ -524,7 +523,7 @@ mod tests {
         let cursor = terminal.get_cursor_position().unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(cursor.x, cursor.y)].symbol(), "t");
-        let p = crate::tui::render::Palette::new(app.light);
+        let p = crate::tui::render::Palette::new();
         assert_eq!(buffer[(2, app.prompt_body_rect.y)].fg, p.warning);
         let title = &buffer[(2, app.prompt_body_rect.y + 1)];
         assert_eq!(title.fg, p.accent);

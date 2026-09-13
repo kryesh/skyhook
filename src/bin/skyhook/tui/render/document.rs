@@ -89,7 +89,7 @@ pub(super) fn layout_document_or_plain_with_expansion(
     geometry.tool_gutter = expanded && entry.expandable && entry.surface == Surface::Tool;
     let block = matches!(entry.surface, Surface::User | Surface::Agent);
     let lines = if let Some(document) = &entry.document {
-        document.layout_lines(Some(highlights), p.content.light)
+        document.layout_lines(Some(highlights))
     } else {
         debug_assert!(!block && entry.surface != Surface::Reasoning);
         model::clean(&entry.text)
@@ -110,7 +110,7 @@ pub(super) fn layout_document_or_plain_with_expansion(
     for (line_index, (mut line, wrapping)) in lines.into_iter().enumerate() {
         if line_index == 0 && entry.surface == Surface::Tool {
             if let Some(header) = &entry.header {
-                line = super::super::tool_view::header_line(header, p.content.light);
+                line = super::super::tool_view::header_line(header);
             } else {
                 for span in &mut line.spans {
                     span.style.fg = Some(p.content.fg);
@@ -161,7 +161,6 @@ mod tests {
     fn assert_argument_reflow(
         document: &super::super::super::tool_view::Document,
         cache: &super::super::super::tool_view::HighlightCache,
-        light: bool,
     ) {
         use super::super::super::tool_view::Wrap;
         let entry = model::Entry {
@@ -181,9 +180,9 @@ mod tests {
         };
         for width in [0, 1, 2, 5, 12, 24, 40, 64, 120, 24] {
             let geometry = EntryGeometry::new(&entry, width, 0);
-            let rows = layout_document_or_plain(&entry, width, Palette::new(light), cache, 0);
+            let rows = layout_document_or_plain(&entry, width, Palette::new(), cache, 0);
             let expected = document
-                .layout_lines(Some(cache), light)
+                .layout_lines(Some(cache))
                 .into_iter()
                 .enumerate()
                 .flat_map(|(index, (line, wrap))| {
@@ -209,7 +208,7 @@ mod tests {
                         .map(|span| span.content.as_ref())
                         .collect::<String>())
                     .collect::<Vec<_>>(),
-                "width {width}, light {light}"
+                "width {width}"
             );
             let selection = (
                 TextPosition { row: 0, byte: 0 },
@@ -250,38 +249,36 @@ mod tests {
         let mut document = Document::default();
         document.line("agent", Role::ToolName);
         document.arguments("agent", &args);
-        for light in [false, true] {
-            assert_argument_reflow(&document, &cache, light);
-            // A long prompt's short words must never be split, even though its
-            // paragraphs are longer than the viewport and include indentation.
-            for (line, wrapping) in document.layout_lines(None, light) {
-                if wrapping != super::super::super::tool_view::Wrap::Words {
-                    continue;
-                }
-                let original = line
-                    .spans
+        assert_argument_reflow(&document, &cache);
+        // A long prompt's short words must never be split, even though its
+        // paragraphs are longer than the viewport and include indentation.
+        for (line, wrapping) in document.layout_lines(None) {
+            if wrapping != super::super::super::tool_view::Wrap::Words {
+                continue;
+            }
+            let original = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            if original.contains("extraordinarily") {
+                continue;
+            }
+            for width in [24, 40, 64] {
+                let parts = wrap_words(line.clone(), width);
+                let words = parts
                     .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>();
-                if original.contains("extraordinarily") {
-                    continue;
-                }
-                for width in [24, 40, 64] {
-                    let parts = wrap_words(line.clone(), width);
-                    let words = parts
-                        .iter()
-                        .flat_map(|part| {
-                            part.spans
-                                .iter()
-                                .map(|span| span.content.as_ref())
-                                .collect::<String>()
-                                .split_whitespace()
-                                .map(str::to_owned)
-                                .collect::<Vec<_>>()
-                        })
-                        .collect::<Vec<_>>();
-                    assert_eq!(words, original.split_whitespace().collect::<Vec<_>>());
-                }
+                    .flat_map(|part| {
+                        part.spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect::<String>()
+                            .split_whitespace()
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(words, original.split_whitespace().collect::<Vec<_>>());
             }
         }
         assert_eq!(args, original);
@@ -323,94 +320,90 @@ mod tests {
             document.line(tool, Role::ToolName);
             document.arguments(tool, &args);
             let original = document.clone();
-            for light in [false, true] {
-                assert_argument_reflow(&document, &cache, light);
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                loop {
-                    cache.prepare(std::iter::once(&document), light);
-                    if document.highlight_sources().next().is_none()
-                        || cache.is_fully_highlighted(&document, light)
-                    {
-                        break;
-                    }
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "highlight worker did not finish"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+            assert_argument_reflow(&document, &cache);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                cache.prepare(std::iter::once(&document));
+                if document.highlight_sources().next().is_none()
+                    || cache.is_fully_highlighted(&document)
+                {
+                    break;
                 }
-                assert_argument_reflow(&document, &cache, light);
-                assert_eq!(document, original);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "highlight worker did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
+            assert_argument_reflow(&document, &cache);
+            assert_eq!(document, original);
         }
     }
 
     #[test]
     fn segmented_tool_headers_keep_roles_when_wrapped_or_in_documents() {
         use super::super::super::tool_view::{Document, Role, Run, Section, header_line};
-        for light in [false, true] {
-            let p = Palette::new(light);
-            let header = vec![
-                Run::new("▸", Role::Indicator),
-                Run::new(" read ", Role::ToolName),
-                Run::new("@remote", Role::Target),
-                Run::new(" a long path ", Role::Plain),
-                Run::new("· ", Role::Muted),
-                Run::new("Completed", Role::Success),
-                Run::new(" · #42", Role::Muted),
-            ];
-            let line = header_line(&header, light);
-            let text = line
-                .spans
+        let p = Palette::new();
+        let header = vec![
+            Run::new("▸", Role::Indicator),
+            Run::new(" read ", Role::ToolName),
+            Run::new("@remote", Role::Target),
+            Run::new(" a long path ", Role::Plain),
+            Run::new("· ", Role::Muted),
+            Run::new("Completed", Role::Success),
+            Run::new(" · #42", Role::Muted),
+        ];
+        let line = header_line(&header);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let entry = model::Entry {
+            key: "tool-header".into(),
+            text,
+            surface: Surface::Tool,
+            expandable: true,
+            default_open: false,
+            running: false,
+            footer: None,
+            request: None,
+            indent: 0,
+            job: None,
+            document: None,
+            header: Some(header.clone()),
+            compact_after: false,
+        };
+        let mut expanded = entry.clone();
+        expanded.document = Some(Document {
+            sections: vec![Section::Line(header)],
+        });
+        let cache = super::super::super::tool_view::HighlightCache::default();
+        for width in [8, 25, 100] {
+            let rows = layout_document_or_plain(&entry, width, p, &cache, 0);
+            let document_rows = layout_document_or_plain(&expanded, width, p, &cache, 0);
+            let lines = |rows: &[Row]| {
+                rows.iter()
+                    .map(|row| (row.line.clone(), row.continued))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(lines(&rows), lines(&document_rows));
+            let name = rows
                 .iter()
+                .flat_map(|row| &row.line.spans)
+                .filter(|span| {
+                    span.style.fg == Some(p.content.fg)
+                        && span.style.add_modifier.contains(Modifier::BOLD)
+                })
                 .map(|span| span.content.as_ref())
                 .collect::<String>();
-            let entry = model::Entry {
-                key: "tool-header".into(),
-                text,
-                surface: Surface::Tool,
-                expandable: true,
-                default_open: false,
-                running: false,
-                footer: None,
-                request: None,
-                indent: 0,
-                job: None,
-                document: None,
-                header: Some(header.clone()),
-                compact_after: false,
-            };
-            let mut expanded = entry.clone();
-            expanded.document = Some(Document {
-                sections: vec![Section::Line(header)],
-            });
-            let cache = super::super::super::tool_view::HighlightCache::default();
-            for width in [8, 25, 100] {
-                let rows = layout_document_or_plain(&entry, width, p, &cache, 0);
-                let document_rows = layout_document_or_plain(&expanded, width, p, &cache, 0);
-                let lines = |rows: &[Row]| {
-                    rows.iter()
-                        .map(|row| (row.line.clone(), row.continued))
-                        .collect::<Vec<_>>()
-                };
-                assert_eq!(lines(&rows), lines(&document_rows));
-                let name = rows
-                    .iter()
+            assert!(name.contains("read"));
+            assert!(
+                rows.iter()
                     .flat_map(|row| &row.line.spans)
-                    .filter(|span| {
-                        span.style.fg == Some(p.content.fg)
-                            && span.style.add_modifier.contains(Modifier::BOLD)
-                    })
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>();
-                assert!(name.contains("read"));
-                assert!(
-                    rows.iter()
-                        .flat_map(|row| &row.line.spans)
-                        .any(|span| span.content.contains("▸")
-                            && span.style.fg == Some(p.content.primary))
-                );
-            }
+                    .any(|span| span.content.contains("▸")
+                        && span.style.fg == Some(p.content.primary))
+            );
         }
     }
 

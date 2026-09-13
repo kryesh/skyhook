@@ -3,12 +3,11 @@
 use super::*;
 
 /// Retained renderer state. Semantic changes arrive as one value, independently
-/// of width/theme reflow; row storage owns its own height index.
+/// of width reflow; row storage owns its own height index.
 pub struct RenderState {
     pub changes: model::ContentChanges,
     pub rows: RowBlocks,
     pub width: u16,
-    pub light: bool,
     pub agent: skyhook::identity::AgentId,
     pub highlights: super::super::tool_view::HighlightCache,
     pub entries: std::collections::HashMap<String, CachedEntry>,
@@ -18,7 +17,6 @@ pub struct RenderState {
 impl RenderState {
     pub fn new(
         agent: skyhook::identity::AgentId,
-        light: bool,
         notify: tokio::sync::mpsc::UnboundedSender<super::super::app::Work>,
     ) -> Self {
         Self {
@@ -28,7 +26,6 @@ impl RenderState {
             },
             rows: RowBlocks::default(),
             width: 0,
-            light,
             agent,
             highlights: super::super::tool_view::HighlightCache::with_notify(notify),
             entries: std::collections::HashMap::new(),
@@ -54,7 +51,6 @@ impl RenderState {
 #[derive(Default)]
 pub struct CachedEntry {
     pub(super) width: u16,
-    pub(super) light: bool,
     pub(super) stream: stream::StreamLayout,
     pub(super) fences: code::Fences,
     pub(super) body_offset: usize,
@@ -220,29 +216,26 @@ pub(super) fn update_entry_rows(
 pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
     let tab = app.view().tab;
     let content_changed = app.content_dirty;
-    let anchor = if app.render.agent == app.selected
-        && (content_changed || app.render.width != width || app.render.light != app.light)
-    {
-        app.views
-            .get(&app.selected)
-            .and_then(|view| view.scroll)
-            .and_then(|scroll| {
-                let row = app.render.rows.get(scroll)?;
-                Some((
-                    row.entry,
-                    app.entries.get(row.entry)?.key.clone(),
-                    scroll - app.render.rows.entry_start(row.entry)?,
-                ))
-            })
-    } else {
-        None
-    };
+    let anchor =
+        if app.render.agent == app.selected && (content_changed || app.render.width != width) {
+            app.views
+                .get(&app.selected)
+                .and_then(|view| view.scroll)
+                .and_then(|scroll| {
+                    let row = app.render.rows.get(scroll)?;
+                    Some((
+                        row.entry,
+                        app.entries.get(row.entry)?.key.clone(),
+                        scroll - app.render.rows.entry_start(row.entry)?,
+                    ))
+                })
+        } else {
+            None
+        };
     app.rebuild_content();
     app.render.highlights.poll();
-    let reset = app.render.changes.reset
-        || app.render.agent != app.selected
-        || app.render.width != width
-        || app.render.light != app.light;
+    let reset =
+        app.render.changes.reset || app.render.agent != app.selected || app.render.width != width;
     let mut dirty = std::mem::take(&mut app.render.changes.dirty);
     if reset {
         app.render.entries.clear();
@@ -281,17 +274,14 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
         let documents = std::iter::once(selected)
             .chain(dirty.iter().copied())
             .filter_map(|i| app.entries.get(i));
-        app.render.highlights.prepare(
-            documents.flat_map(|entry| {
-                entry.document.iter().chain(
-                    app.render
-                        .entries
-                        .get(&entry.key)
-                        .map(|cached| &cached.fences.document),
-                )
-            }),
-            app.light,
-        );
+        app.render.highlights.prepare(documents.flat_map(|entry| {
+            entry.document.iter().chain(
+                app.render
+                    .entries
+                    .get(&entry.key)
+                    .map(|cached| &cached.fences.document),
+            )
+        }));
     }
     let highlighted_sources = app.render.highlights.take_changed_sources();
     let mut highlighted_entries = Vec::new();
@@ -333,12 +323,10 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
             continue;
         };
         let cached = app.render.entries.entry(entry.key.clone()).or_default();
-        let append_from = (!reset
-            && !highlighted_entries.contains(&index)
-            && cached.width == width
-            && cached.light == app.light)
-            .then(|| app.render.changes.appends.get(&index).copied())
-            .flatten();
+        let append_from =
+            (!reset && !highlighted_entries.contains(&index) && cached.width == width)
+                .then(|| app.render.changes.appends.get(&index).copied())
+                .flatten();
         let block = app.render.rows.block_mut(index);
         update_entry_rows(
             block,
@@ -358,7 +346,6 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
             append_from,
         );
         cached.width = width;
-        cached.light = app.light;
 
         app.render.rows.finish_update(index);
         app.render.rows.register_sources(
@@ -401,7 +388,6 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
             app.view().scroll = Some(first + offset.min(count.saturating_sub(1)));
         }
         app.render.width = width;
-        app.render.light = app.light;
     }
     app.content_rows = app.render.rows.len();
 }
@@ -497,7 +483,7 @@ mod tests {
                     0,
                     EntryLayout {
                         width: 24,
-                        palette: Palette::new(false),
+                        palette: Palette::new(),
                         highlights: &highlights,
                         request_columns: RequestColumns::default(),
                         expanded: true,
@@ -512,7 +498,7 @@ mod tests {
                     0,
                     EntryLayout {
                         width: 24,
-                        palette: Palette::new(false),
+                        palette: Palette::new(),
                         highlights: &highlights,
                         request_columns: RequestColumns::default(),
                         expanded: true,
@@ -529,7 +515,7 @@ mod tests {
                     );
                 }
             }
-            // A non-append reflow must reset retained stream state on width/theme changes.
+            // A non-append reflow must reset retained stream state on width changes.
             for width in [8, 40] {
                 update_entry_rows(
                     &mut rows,
@@ -538,7 +524,7 @@ mod tests {
                     0,
                     EntryLayout {
                         width,
-                        palette: Palette::new(true),
+                        palette: Palette::new(),
                         highlights: &highlights,
                         request_columns: RequestColumns::default(),
                         expanded: true,
