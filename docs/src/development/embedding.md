@@ -7,7 +7,8 @@ and session ownership boundaries.
 
 ## Host observation API
 
-`Config::harness_builder(workspace, model)` takes an explicit model choice from its host.
+`config.into_runtime()?.select_model(name)?.harness_builder(workspace)?` admits the configuration,
+selects the host's explicit model choice, and returns a `HarnessBuilder` for that workspace.
 `SessionHandle::observe()` returns an atomic snapshot/receiver pair with revisioned updates,
 request-scoped live responses, current activity, and context estimates. On receiver lag, replace
 both with a fresh observation. Durable records are identified by their original sequence.
@@ -29,16 +30,17 @@ without a supplied shim returns an unsupported-platform error.
 
 ## Reconstructing model calls
 
-Session format 2 records the inputs needed to reconstruct each call at the shared `Provider`
+Session format 3 records the inputs needed to reconstruct each call at the shared `Provider`
 boundary. It stores no backend-specific request bodies or authentication headers:
 
 - `model_context` records the configured provider name and a shared `ModelRequest` template:
   actual model ID, assembled system prompt (including harness instructions and location),
-  tool descriptions and schemas, optional response schema, reasoning setting, output limit, and correlation. Its `messages`
-  array is empty; conversation history remains in `message_committed` and `compaction` events.
+  tool descriptions and schemas, optional response schema, reasoning setting, output limit, and correlation. Its `history`
+  and `tail` arrays are empty; conversation history remains in `message_committed` and `compaction` events.
 - `model_requested` is persisted before each provider invocation. It references the context event's
-  sequence and records an ordered list of source-event references and exact inline messages,
-  including transient runtime state and compaction directives. Its purpose distinguishes ordinary
+  sequence and records `history` as ordered source-event sequences (committed messages or compaction
+  checkpoints), `tail` as exact inline messages (transient runtime state and compaction directives),
+  and the request's `history_lifetime`. Its purpose distinguishes ordinary
   agent calls from summarization. Ordinary calls within a turn share one context record;
   summarization records a separate template containing its response schema.
 - `compaction` is an ordinary log event containing the exact replacement message, retained original
@@ -52,10 +54,17 @@ boundary. It stores no backend-specific request bodies or authentication headers
 
 `session::reconstruct_model_request(&records, sequence)` returns the provider name and reconstructed
 `ModelRequest` for a `model_requested` sequence, using sequence-ordered records from `SessionStore`.
-Image metadata references the existing session blobs;
-`store.hydrate_model_request(&mut request).await` restores their payloads when needed. This reconstructs
-Skyhook's provider-neutral input, not an API-specific wire encoding. Session journals use format version 2;
-there is no compatibility or migration layer for earlier layouts.
+Attachments and tool images reference content-addressed session blobs by sha256;
+`store.load_blobs(&mut request).await` loads their contents for provider encoding. This reconstructs
+Skyhook's provider-neutral input, not an API-specific wire encoding.
+
+A `ModelRequest` sends `history` (committed conversation, an unchanged prefix of later requests in the
+same context until compaction replaces it) followed by `tail` (rebuilt for each request and never
+cacheable); `request.messages()` iterates both in order. `history_lifetime` is `continuing` (the
+default) when later requests in the context extend this history, or `ending` when compaction replaces
+it after this request: compaction summaries, and agent requests whose own estimate already reaches the
+compaction threshold. Providers decide prompt-cache placement from `history`, `tail`, and the lifetime.
+Session journals use format version 3; there is no compatibility or migration layer for earlier layouts.
 
 Source: [session module](https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src/session)
 and [agent module](https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src/agent).

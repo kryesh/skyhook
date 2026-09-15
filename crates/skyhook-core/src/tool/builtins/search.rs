@@ -10,53 +10,61 @@ use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::workspace::{relative_path, resolve_existing};
+use super::workspace::relative_path;
+use crate::job::output::{CaptureWriter, CompletedCapture, PendingCapture};
 use crate::tool::{
     PathKind, RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
     policy::{Capability, PathAccess},
 };
 
 pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
-    builder.register::<SearchArgs, SearchOutput, _, _>(
+    builder.register_product::<SearchArgs, SearchOutput, _, _>(
         "search",
         "Search files with ripgrep regex, glob, and ignore semantics. Matches map file paths to arrays of \"line: text\" strings; details returns structured matches.",
         ToolOptions::new(vec![Capability::Read])
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
-            .path_argument("path", PathAccess::Read, PathKind::Existing),
+            .default_path_argument("path", ".", PathAccess::Read, PathKind::Existing),
         |context, args| async move {
-            let root = resolve_existing(&context.execution_location.workspace, &args.path).await?;
-            let capture = context.capture_path_with_kind("/result/matches", crate::job::output::CaptureKind::Json).await?;
-            let workspace = context.execution_location.workspace.clone();
+            let root = PathBuf::from(&args.path);
+            let capture = context.pending_stream_capture("/result/matches", crate::job::output::CaptureKind::Json).await?;
+            let workspace = context.execution_location().workspace.clone();
             tokio::task::spawn_blocking(move || {
-                search_blocking(&workspace, &root, &args, &capture, &context.cancellation_token())
+                search_blocking(&workspace, &root, &args, capture, &context.cancellation_token())
             })
             .await
             .map_err(|error| ToolError::Failed(error.to_string()))?
+            .and_then(|capture| {
+                let output = SearchOutput { matches: SearchMatches::Grouped(BTreeMap::new()) };
+                Ok(crate::tool::ToolOutput::new(serde_json::to_value(output)?).with_captures(vec![capture]))
+            })
         },
     )?;
-    builder.register::<GlobArgs, GlobOutput, _, _>(
+    builder.register_product::<GlobArgs, GlobOutput, _, _>(
         "glob",
         "Find files with ripgrep glob and ignore semantics.",
         ToolOptions::new(vec![Capability::Read])
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
-            .path_argument("path", PathAccess::Read, PathKind::Existing),
+            .default_path_argument("path", ".", PathAccess::Read, PathKind::Existing),
         |context, args| async move {
-            let root = resolve_existing(&context.execution_location.workspace, &args.path).await?;
+            let root = PathBuf::from(&args.path);
             let capture = context
-                .capture_path_with_kind("/result/paths", crate::job::output::CaptureKind::Json)
+                .pending_stream_capture("/result/paths", crate::job::output::CaptureKind::Json)
                 .await?;
-            let workspace = context.execution_location.workspace.clone();
+            let workspace = context.execution_location().workspace.clone();
             tokio::task::spawn_blocking(move || {
                 glob_blocking(
                     &workspace,
                     &root,
                     &args,
-                    &capture,
+                    capture,
                     &context.cancellation_token(),
                 )
             })
             .await
             .map_err(|error| ToolError::Failed(error.to_string()))?
+            .map(|capture| {
+                crate::tool::ToolOutput::new(serde_json::json!({})).with_captures(vec![capture])
+            })
         },
     )?;
     Ok(())
@@ -108,9 +116,9 @@ fn search_blocking(
     workspace: &Path,
     root: &Path,
     args: &SearchArgs,
-    capture: &Path,
+    capture: PendingCapture,
     cancellation: &crate::job::CancellationToken,
-) -> Result<SearchOutput, ToolError> {
+) -> Result<CompletedCapture, ToolError> {
     let mut matcher_builder = common_matcher();
     matcher_builder.fixed_strings(args.fixed).word(args.word);
     match args.case {
@@ -165,28 +173,21 @@ fn search_blocking(
         };
         searcher
             .search_path(&matcher, &path, &mut sink)
-            .map_err(|error| ToolError::Failed(error.to_string()))?;
+            .map_err(SearchStop::into_tool_error)?;
         if sink.binary {
             matches.rollback(checkpoint)?;
         }
     }
-    matches.finish()?;
-    Ok(SearchOutput {
-        matches: if args.details {
-            SearchMatches::Detailed(Vec::new())
-        } else {
-            SearchMatches::Grouped(BTreeMap::new())
-        },
-    })
+    Ok(matches.finish()?)
 }
 
 fn glob_blocking(
     workspace: &Path,
     root: &Path,
     args: &GlobArgs,
-    capture: &Path,
+    capture: PendingCapture,
     cancellation: &crate::job::CancellationToken,
-) -> Result<GlobOutput, ToolError> {
+) -> Result<CompletedCapture, ToolError> {
     if !root.is_dir() {
         return Err(ToolError::Failed("glob root is not a directory".into()));
     }
@@ -206,22 +207,21 @@ fn glob_blocking(
             paths.push(relative_path(workspace, entry.path()))?;
         }
     }
-    paths.finish()?;
-    Ok(GlobOutput { paths: Vec::new() })
+    Ok(paths.finish()?)
 }
 
 /// Streams the complete result into the owning job's capture. The handler returns
-/// only an empty placeholder; job collection hydrates the saved field.
+/// completed ownership evidence; the finalizer publishes the captured field.
 struct CapturedOutput {
-    file: std::io::BufWriter<std::fs::File>,
+    file: CaptureWriter,
     count: usize,
     grouped: bool,
     group: Option<String>,
 }
 impl CapturedOutput {
-    fn new(path: &Path, grouped: bool) -> std::io::Result<Self> {
+    fn new(capture: PendingCapture, grouped: bool) -> std::io::Result<Self> {
         use std::io::Write as _;
-        let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+        let mut file = capture.open();
         file.write_all(if grouped { b"{\n" } else { b"[\n" })?;
         Ok(Self {
             file,
@@ -248,11 +248,11 @@ impl CapturedOutput {
         self.count = checkpoint.0;
         self.group = checkpoint.2;
         self.file.flush()?;
-        self.file.get_ref().set_len(checkpoint.1)?;
+        self.file.truncate(checkpoint.1)?;
         self.file.seek(std::io::SeekFrom::Start(checkpoint.1))?;
         Ok(())
     }
-    fn finish(mut self) -> std::io::Result<()> {
+    fn finish(mut self) -> std::io::Result<CompletedCapture> {
         use std::io::Write as _;
         if self.grouped {
             if self.group.is_some() {
@@ -262,7 +262,7 @@ impl CapturedOutput {
         } else {
             self.file.write_all(b"\n]")?;
         }
-        self.file.flush()
+        self.file.finish()
     }
     fn push_match(&mut self, value: SearchMatch) -> std::io::Result<()> {
         use std::io::Write as _;
@@ -285,6 +285,39 @@ impl CapturedOutput {
     }
 }
 
+/// Grep errors retain their cause; cancellation is never inferred from text or
+/// from a token observed later than an unrelated IO failure.
+#[derive(Debug)]
+enum SearchStop {
+    Cancelled,
+    Io(std::io::Error),
+}
+
+impl grep_searcher::SinkError for SearchStop {
+    fn error_message<T: std::fmt::Display>(message: T) -> Self {
+        Self::Io(std::io::Error::other(message.to_string()))
+    }
+    fn error_io(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<std::io::Error> for SearchStop {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl SearchStop {
+    fn into_tool_error(self) -> ToolError {
+        match self {
+            Self::Cancelled => ToolError::Cancelled,
+            // Preserve the existing grep IO failure presentation.
+            Self::Io(error) => ToolError::Failed(error.to_string()),
+        }
+    }
+}
+
 struct SearchSink<'a> {
     matcher: &'a grep_regex::RegexMatcher,
     path: String,
@@ -293,14 +326,14 @@ struct SearchSink<'a> {
     cancellation: &'a crate::job::CancellationToken,
 }
 impl Sink for SearchSink<'_> {
-    type Error = std::io::Error;
+    type Error = SearchStop;
     fn matched(
         &mut self,
         _searcher: &Searcher,
         matched: &SinkMatch<'_>,
     ) -> Result<bool, Self::Error> {
         if self.cancellation.is_cancelled() {
-            return Err(std::io::Error::other("search cancelled"));
+            return Err(SearchStop::Cancelled);
         }
         let bytes = matched.bytes();
         let first = self
@@ -375,6 +408,10 @@ struct SearchOutput {
 #[serde(untagged)]
 enum SearchMatches {
     Grouped(BTreeMap<String, Vec<String>>),
+    #[expect(
+        dead_code,
+        reason = "schema-only alternative; completed captures own detailed output"
+    )]
     Detailed(Vec<SearchMatch>),
 }
 
@@ -431,45 +468,61 @@ pub(crate) fn output_matcher(pattern: &str) -> Result<grep_regex::RegexMatcher, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
 
-    fn captured_search(
-        workspace: &Path,
-        root: &Path,
-        args: &SearchArgs,
-    ) -> Result<Vec<SearchMatch>, ToolError> {
-        assert!(args.details);
-        let capture = tempfile::NamedTempFile::new()?;
-        search_blocking(
-            workspace,
-            root,
-            args,
-            capture.path(),
-            &crate::job::CancellationToken::new(),
-        )?;
-        Ok(serde_json::from_reader(capture.reopen()?)?)
+    fn pending_capture(directory: &Path) -> PendingCapture {
+        let job = crate::identity::JobId::new(1).unwrap();
+        let kind = crate::job::output::CaptureKind::Json;
+        PendingCapture::create(job, directory, "/result/test", kind).unwrap()
     }
 
-    fn captured_glob(
-        workspace: &Path,
-        root: &Path,
-        args: &GlobArgs,
-    ) -> Result<GlobOutput, ToolError> {
-        let capture = tempfile::NamedTempFile::new()?;
-        glob_blocking(
-            workspace,
-            root,
-            args,
-            capture.path(),
+    /// Runs a blocking walker into a fresh capture and decodes what it wrote.
+    fn captured<T: serde::de::DeserializeOwned, R>(
+        walk: impl FnOnce(PendingCapture, &crate::job::CancellationToken) -> Result<R, ToolError>,
+    ) -> Result<T, ToolError> {
+        let directory = tempfile::tempdir()?;
+        walk(
+            pending_capture(directory.path()),
             &crate::job::CancellationToken::new(),
         )?;
-        Ok(GlobOutput {
-            paths: serde_json::from_reader(capture.reopen()?)?,
-        })
+        let file = crate::job::output::field_file(directory.path(), "/result/test");
+        Ok(serde_json::from_reader(std::fs::File::open(file)?)?)
+    }
+
+    fn search(root: &Path, path: &Path, args: Value) -> Vec<SearchMatch> {
+        let args: SearchArgs = serde_json::from_value(args).unwrap();
+        assert!(args.details);
+        captured(|capture, cancel| search_blocking(root, path, &args, capture, cancel)).unwrap()
+    }
+
+    fn glob(root: &Path, path: &Path, args: Value) -> Vec<String> {
+        let args: GlobArgs = serde_json::from_value(args).unwrap();
+        captured(|capture, cancel| glob_blocking(root, path, &args, capture, cancel)).unwrap()
+    }
+
+    fn write_files(root: &Path, files: &[&str]) {
+        for file in files {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "needle\n").unwrap();
+        }
+    }
+
+    #[test]
+    fn cancellation_before_first_file_is_typed() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input");
+        std::fs::write(&input, "needle").unwrap();
+        let args: SearchArgs = serde_json::from_value(json!({"pattern":"needle"})).unwrap();
+        let cancellation = crate::job::CancellationToken::new();
+        cancellation.cancel();
+        let capture = pending_capture(root.path());
+        let result = search_blocking(root.path(), &input, &args, capture, &cancellation);
+        assert!(matches!(result, Err(ToolError::Cancelled)));
     }
 
     #[tokio::test]
     async fn grouped_search_is_captured_and_preserves_whitespace_and_binary_rollback() {
-        use serde_json::json;
         let runtime = crate::tests::TestRuntime::new().await;
         let directory = runtime.root.path().join("files");
         std::fs::create_dir(&directory).unwrap();
@@ -479,60 +532,30 @@ mod tests {
         let mut builder = ToolRegistryBuilder::default();
         register(&mut builder).unwrap();
         let executor = runtime.executor(builder);
-        let captured = executor
-            .execute(
-                runtime.agent.clone(),
-                "search",
-                json!({"path":"files","pattern":"needle"}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            captured.output.value,
-            json!({"matches":{
-                "files/a.txt":["1:   needle  ", "2: needle again"], "files/z.txt":["1: needle last"]
-            }})
-        );
-        let empty = executor
-            .execute(
-                runtime.agent.clone(),
-                "search",
-                json!({"path":"files","pattern":"absent"}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(empty.output.value, json!({"matches":{}}));
-        let detailed = executor
-            .execute(
-                runtime.agent.clone(),
-                "search",
-                json!({"path":"files","pattern":"needle","details":true}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            detailed.output.value["matches"][0],
-            json!({"path":"files/a.txt","line":1,"column":3,"text":"  needle  "})
-        );
-        std::fs::write(directory.join("a.txt"), "needle λ\n".repeat(500)).unwrap();
-        let preview = executor
-            .execute_model(
-                runtime.agent.clone(),
-                "search",
-                json!({"path":"files","pattern":"needle"}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(
-            serde_json::to_vec(&preview.output.value["result"]["matches"])
+        let search = async |args| {
+            executor
+                .run_host(&runtime.agent, "search", args)
+                .await
                 .unwrap()
-                .len()
-                <= 2048
-        );
+        };
+        let captured = search(json!({"path":"files","pattern":"needle"})).await;
+        let grouped = json!({"matches":{
+            "files/a.txt":["1:   needle  ", "2: needle again"], "files/z.txt":["1: needle last"]
+        }});
+        assert_eq!(captured.output.value, grouped);
+        let empty = search(json!({"path":"files","pattern":"absent"})).await;
+        assert_eq!(empty.output.value, json!({"matches":{}}));
+        let detailed = search(json!({"path":"files","pattern":"needle","details":true})).await;
+        let first = json!({"path":"files/a.txt","line":1,"column":3,"text":"  needle  "});
+        assert_eq!(detailed.output.value["matches"][0], first);
+        std::fs::write(directory.join("a.txt"), "needle λ\n".repeat(500)).unwrap();
+        let args = json!({"path":"files","pattern":"needle"});
+        let preview = executor
+            .run_model(&runtime.agent, "search", args)
+            .await
+            .unwrap();
+        let matches = serde_json::to_vec(&preview.output.value["result"]["matches"]).unwrap();
+        assert!(matches.len() <= 2048);
         assert_eq!(
             preview.output.value["truncated"][0]["field"],
             "/result/matches"
@@ -545,91 +568,79 @@ mod tests {
             .inspect_output(query, &Default::default())
             .await
             .unwrap();
-        assert_eq!(page["preview"]["lines"].as_array().unwrap().len(), 1);
-        assert!(
-            page["preview"]["lines"][0]
-                .as_str()
-                .unwrap()
-                .contains("500: needle λ")
-        );
+        let lines = page["preview"]["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].as_str().unwrap().contains("500: needle λ"));
     }
 
     #[test]
     fn wildcard_filters_respect_hidden_and_ignore_flags() {
-        let root = tempfile::tempdir().unwrap();
-        for directory in [".git", ".hidden", "build", "src"] {
-            std::fs::create_dir(root.path().join(directory)).unwrap();
-        }
-        std::fs::write(root.path().join(".gitignore"), "build/\n").unwrap();
-        for path in [
-            ".git/config",
-            ".hidden/secret",
-            "build/generated",
-            "src/visible",
-        ] {
-            std::fs::write(root.path().join(path), "needle\n").unwrap();
-        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write_files(
+            root,
+            &[
+                ".git/config",
+                ".hidden/secret",
+                "build/generated",
+                "src/visible",
+            ],
+        );
+        std::fs::write(root.join(".gitignore"), "build/\n").unwrap();
         for hidden in [false, true] {
             for no_ignore in [false, true] {
                 for pattern in ["*", "**/*"] {
-                    let args = GlobArgs {
-                        pattern: pattern.into(),
-                        path: ".".into(),
-                        hidden,
-                        no_ignore,
-                    };
-                    let paths = captured_glob(root.path(), root.path(), &args)
-                        .unwrap()
-                        .paths;
-                    assert!(paths.iter().any(|p| p == "src/visible"));
-                    assert_eq!(paths.iter().any(|p| p == ".git/config"), hidden);
-                    assert_eq!(paths.iter().any(|p| p == ".hidden/secret"), hidden);
-                    assert_eq!(paths.iter().any(|p| p == "build/generated"), no_ignore);
-                    let args: SearchArgs = serde_json::from_value(serde_json::json!({
-                        "pattern":"needle", "details":true, "glob":[pattern], "hidden":hidden, "no_ignore":no_ignore
-                    }))
-                    .unwrap();
-                    let matches = captured_search(root.path(), root.path(), &args).unwrap();
-                    assert_eq!(matches.iter().any(|m| m.path == ".git/config"), hidden);
+                    let args = json!({"pattern":pattern, "hidden":hidden, "no_ignore":no_ignore});
+                    let paths = glob(root, root, args);
+                    let has = |path: &str| paths.iter().any(|p| p == path);
+                    assert!(has("src/visible"));
                     assert_eq!(
-                        matches.iter().any(|m| m.path == "build/generated"),
-                        no_ignore
+                        (has(".git/config"), has(".hidden/secret")),
+                        (hidden, hidden)
                     );
-                    assert!(matches.iter().any(|m| m.path == "src/visible"));
+                    assert_eq!(has("build/generated"), no_ignore);
+                    let args = json!({
+                        "pattern":"needle", "details":true, "glob":[pattern], "hidden":hidden, "no_ignore":no_ignore
+                    });
+                    let matches = search(root, root, args);
+                    let has = |path: &str| matches.iter().any(|m| m.path == path);
+                    assert!(has("src/visible"));
+                    assert_eq!(
+                        (has(".git/config"), has("build/generated")),
+                        (hidden, no_ignore)
+                    );
                 }
             }
         }
         // An explicitly requested hidden root remains accessible.
-        let args: GlobArgs =
-            serde_json::from_value(serde_json::json!({"pattern":"*", "path":".git"})).unwrap();
-        assert_eq!(
-            captured_glob(root.path(), &root.path().join(".git"), &args)
-                .unwrap()
-                .paths,
-            [".git/config"]
+        let paths = glob(
+            root,
+            &root.join(".git"),
+            json!({"pattern":"*", "path":".git"}),
         );
+        assert_eq!(paths, [".git/config"]);
     }
 
     #[test]
     fn subdirectory_roots_inherit_ignores_and_globs_keep_precedence() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join(".git")).unwrap();
-        std::fs::create_dir(root.path().join("src")).unwrap();
-        std::fs::create_dir(root.path().join("src/nested")).unwrap();
-        std::fs::write(root.path().join("src/nested/file.rs"), "needle\n").unwrap();
-        std::fs::write(root.path().join(".gitignore"), "/src/generated.rs\n").unwrap();
-        std::fs::write(root.path().join(".ignore"), "skip.rs\n").unwrap();
-        for name in ["a.rs", "b.rs", "generated.rs", "skip.rs"] {
-            std::fs::write(root.path().join("src").join(name), "needle\n").unwrap();
-        }
-        let args: GlobArgs =
-            serde_json::from_value(serde_json::json!({"pattern":"*.rs", "path":"src"})).unwrap();
-        assert_eq!(
-            captured_glob(root.path(), &root.path().join("src"), &args)
-                .unwrap()
-                .paths,
-            ["src/a.rs", "src/b.rs", "src/nested/file.rs"]
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        write_files(
+            root,
+            &[
+                "src/nested/file.rs",
+                "src/a.rs",
+                "src/b.rs",
+                "src/generated.rs",
+                "src/skip.rs",
+            ],
         );
+        std::fs::write(root.join(".gitignore"), "/src/generated.rs\n").unwrap();
+        std::fs::write(root.join(".ignore"), "skip.rs\n").unwrap();
+        let src = root.join("src");
+        let paths = glob(root, &src, json!({"pattern":"*.rs", "path":"src"}));
+        assert_eq!(paths, ["src/a.rs", "src/b.rs", "src/nested/file.rs"]);
         for (glob, expected) in [
             (
                 vec!["*.rs", "!b.rs"],
@@ -642,11 +653,8 @@ mod tests {
             (vec!["!b.rs"], vec!["src/a.rs", "src/nested/file.rs"]),
             (vec!["*.rs", "!nested/"], vec!["src/a.rs", "src/b.rs"]),
         ] {
-            let args: SearchArgs = serde_json::from_value(
-                serde_json::json!({"pattern":"needle", "details":true, "path":"src", "glob":glob}),
-            )
-            .unwrap();
-            let matches = captured_search(root.path(), &root.path().join("src"), &args).unwrap();
+            let args = json!({"pattern":"needle", "details":true, "path":"src", "glob":glob});
+            let matches = search(root, &src, args);
             assert_eq!(
                 matches.iter().map(|m| m.path.as_str()).collect::<Vec<_>>(),
                 expected
@@ -655,50 +663,21 @@ mod tests {
     }
 
     #[test]
-    fn ripgrep_search_supports_smart_case_globs_and_binary_detection() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("upper.rs"), "Needle\n").unwrap();
-        std::fs::write(root.path().join("lower.rs"), "needle\n").unwrap();
-        std::fs::write(root.path().join("skip.txt"), "Needle\n").unwrap();
-        std::fs::write(root.path().join("binary.rs"), b"Needle\0hidden\n").unwrap();
-        let output = captured_search(
-            root.path(),
-            root.path(),
-            &SearchArgs {
-                pattern: "Needle".to_owned(),
-                details: true,
-                path: ".".to_owned(),
-                glob: vec!["*.rs".to_owned(), "!binary.rs".to_owned()],
-                fixed: false,
-                case: Case::Smart,
-                word: false,
-                hidden: false,
-                no_ignore: false,
-            },
-        )
-        .unwrap();
+    fn ripgrep_smart_case_binary_detection_and_sorted_relative_globs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("upper.rs"), "Needle\n").unwrap();
+        std::fs::write(root.join("lower.rs"), "needle\n").unwrap();
+        std::fs::write(root.join("skip.txt"), "Needle\n").unwrap();
+        std::fs::write(root.join("binary.rs"), b"Needle\0hidden\n").unwrap();
+        let args = json!({"pattern":"Needle", "details":true, "glob":["*.rs", "!binary.rs"], "case":"smart"});
+        let output = search(root, root, args);
         assert_eq!(output.len(), 1);
-        assert_eq!(output[0].path, "upper.rs");
-        assert_eq!(output[0].line, 1);
-        assert_eq!(output[0].column, 1);
-    }
-
-    #[test]
-    fn glob_uses_relative_sorted_paths() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("b.rs"), "").unwrap();
-        std::fs::write(root.path().join("a.rs"), "").unwrap();
-        let output = captured_glob(
-            root.path(),
-            root.path(),
-            &GlobArgs {
-                pattern: "*.rs".to_owned(),
-                path: ".".to_owned(),
-                hidden: false,
-                no_ignore: false,
-            },
-        )
-        .unwrap();
-        assert_eq!(output.paths, vec!["a.rs", "b.rs"]);
+        assert_eq!(
+            (output[0].path.as_str(), output[0].line, output[0].column),
+            ("upper.rs", 1, 1)
+        );
+        let paths = glob(root, root, json!({"pattern":"*.rs"}));
+        assert_eq!(paths, ["binary.rs", "lower.rs", "upper.rs"]);
     }
 }

@@ -265,8 +265,11 @@ impl Jump {
 
 #[cfg(test)]
 mod tests {
+    use super::super::TargetRegistry;
     use super::*;
+
     struct FixtureResolver(BTreeMap<String, Option<String>>);
+
     #[async_trait::async_trait]
     impl ConfigResolver for FixtureResolver {
         async fn resolve(&self, target: &TargetDefinition) -> Result<ResolvedSsh, TargetError> {
@@ -281,18 +284,22 @@ mod tests {
             })
         }
     }
-    fn definition(name: &str) -> TargetDefinition {
-        TargetDefinition::from_config(
-            name.into(),
-            serde_json::from_value(serde_json::json!({"type":"ssh","host":name})).unwrap(),
-            TargetSource::SshConfig,
-        )
-        .unwrap()
+
+    fn resolver(jumps: &[(&str, &str)]) -> Arc<FixtureResolver> {
+        let jumps = jumps
+            .iter()
+            .map(|(from, to)| (from.to_string(), Some(to.to_string())));
+        Arc::new(FixtureResolver(jumps.collect()))
     }
+
+    fn definition(name: &str) -> TargetDefinition {
+        let config = serde_json::from_value(serde_json::json!({"type":"ssh","host":name}));
+        TargetDefinition::from_config(name.into(), config.unwrap(), TargetSource::SshConfig)
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn static_cycles_follow_normalized_via_and_origin_routes() {
-        use super::super::TargetRegistry;
-
         let cases = [
             // Root is implicit, not a self-edge.
             vec![("a", ROOT_TARGET, None), ("b", ROOT_TARGET, Some("a"))],
@@ -303,8 +310,7 @@ mod tests {
             vec![("a", "a", None)],
             vec![("a", "b", None), ("b", "a", None)],
             vec![("a", "b", None), ("b", ROOT_TARGET, Some("a"))],
-            // Explicit via wins: do not invent a direct a -> origin edge.
-            // Runtime rejects this as an invalid origin, NOT a route cycle.
+            // Explicit via wins: runtime rejects this as an invalid origin, not a cycle.
             vec![("a", "a", Some("b")), ("b", ROOT_TARGET, None)],
         ];
         for case in cases {
@@ -318,25 +324,20 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let static_result = validate_static_routes(definitions.clone());
-            let normalized = normalize(
-                definitions,
-                vec![],
-                Arc::new(FixtureResolver(BTreeMap::new())),
-            )
-            .await
-            .unwrap();
+            let normalized = normalize(definitions, vec![], resolver(&[])).await.unwrap();
             let runtime = TargetRegistry::from_definitions(normalized);
+            let static_cycle = matches!(static_result, Err(TargetError::Cycle(_)));
             assert_eq!(
-                matches!(static_result, Err(TargetError::Cycle(_))),
+                static_cycle,
                 matches!(runtime, Err(TargetError::Cycle(_))),
                 "{case:?}"
             );
-            assert!(static_result.is_ok() || matches!(static_result, Err(TargetError::Cycle(_))));
+            assert!(static_result.is_ok() || static_cycle);
         }
     }
 
-    #[test]
-    fn unknown_origins_and_jumps_do_not_hide_other_static_cycles() {
+    #[tokio::test]
+    async fn unknown_names_do_not_hide_static_cycles_and_recursive_jumps_are_rejected() {
         let mut unknown_origin = definition("a");
         unknown_origin.origin = "later-origin".into();
         let mut unknown_jump = definition("b");
@@ -349,62 +350,41 @@ mod tests {
             validate_static_routes(partial.into_iter().chain([cyclic]).collect()),
             Err(TargetError::Cycle(name)) if name == "z"
         ));
+        let recursive = resolver(&[("one", "two"), ("two", "one")]);
+        let definitions = vec![definition("one"), definition("two")];
+        let result = normalize(definitions, vec![], recursive).await;
+        assert!(matches!(result, Err(TargetError::Cycle(_))));
     }
 
     #[tokio::test]
     async fn remote_origins_anchor_automatic_jump_chains() {
-        let mut destination = definition("dest");
-        destination.origin = "remote".into();
-        let existing = vec![definition("remote")];
-        let resolver = Arc::new(FixtureResolver(BTreeMap::from([(
-            "dest".into(),
-            Some("unnamed".into()),
-        )])));
-        let imported = normalize(vec![destination], existing.clone(), resolver)
-            .await
-            .unwrap();
-        assert!(imported.iter().all(|target| target.origin == "remote"));
-        let registry =
-            super::super::TargetRegistry::from_definitions(existing.into_iter().chain(imported))
+        for (jumps, expected) in [
+            (vec![("dest", "unnamed")], vec!["remote", "unnamed", "dest"]),
+            // The first remote jump retains its own jump chain.
+            (
+                vec![("dest", "inner"), ("inner", "outer")],
+                vec!["remote", "outer", "inner", "dest"],
+            ),
+        ] {
+            let mut destination = definition("dest");
+            destination.origin = "remote".into();
+            let existing = vec![definition("remote")];
+            let imported = normalize(vec![destination], existing.clone(), resolver(&jumps))
+                .await
                 .unwrap();
-        let route = registry.route("dest").await.unwrap();
-        assert_eq!(route[0].name, "remote");
-        assert_eq!(route[1].ssh_alias, "unnamed");
-        assert_eq!(route[2].name, "dest");
-    }
-    #[tokio::test]
-    async fn recursive_jump_cycles_are_rejected() {
-        let resolver = Arc::new(FixtureResolver(BTreeMap::from([
-            ("one".into(), Some("two".into())),
-            ("two".into(), Some("one".into())),
-        ])));
-        assert!(matches!(
-            normalize(vec![definition("one"), definition("two")], vec![], resolver).await,
-            Err(TargetError::Cycle(_))
-        ));
-    }
-    #[tokio::test]
-    async fn first_remote_jump_retains_its_own_jump_chain() {
-        let mut destination = definition("dest");
-        destination.origin = "remote".into();
-        let resolver = Arc::new(FixtureResolver(BTreeMap::from([
-            ("dest".into(), Some("inner".into())),
-            ("inner".into(), Some("outer".into())),
-        ])));
-        let existing = vec![definition("remote")];
-        let definitions = normalize(vec![destination], existing.clone(), resolver)
-            .await
-            .unwrap();
-        let registry =
-            super::super::TargetRegistry::from_definitions(existing.into_iter().chain(definitions))
-                .unwrap();
-        let route = registry.route("dest").await.unwrap();
-        assert_eq!(
-            route
+            assert!(imported.iter().all(|target| target.origin == "remote"));
+            let registry =
+                TargetRegistry::from_definitions(existing.into_iter().chain(imported)).unwrap();
+            let route = registry.route("dest").await.unwrap();
+            let aliases: Vec<_> = route
                 .iter()
                 .map(|target| target.ssh_alias.as_str())
-                .collect::<Vec<_>>(),
-            ["remote", "outer", "inner", "dest"]
-        );
+                .collect();
+            assert_eq!(aliases, expected);
+            assert_eq!(
+                (&*route[0].name, &*route[route.len() - 1].name),
+                ("remote", "dest")
+            );
+        }
     }
 }

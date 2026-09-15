@@ -2,15 +2,15 @@ use std::{borrow::Cow, sync::Arc};
 
 use thiserror::Error;
 
+/// Artifact identity validated by [`EmbeddedShimCatalog`].
 #[derive(Clone, Debug)]
 pub struct EmbeddedShim {
     pub arch: String,
     /// Canonical platform name, such as `linux`, `macos`, or `windows`.
     pub os: String,
     pub protocol: String,
-    /// Binary name derived from the canonical platform and protocol.
-    pub binary: String,
     pub extension: Option<String>,
+    /// Original embedded filename, preserving accepted aliases.
     pub file_name: String,
     pub bytes: Cow<'static, [u8]>,
 }
@@ -55,7 +55,6 @@ impl EmbeddedShimCatalog {
                     extension,
                 } = parse_name(name)?;
                 Ok(EmbeddedShim {
-                    binary: format!("{os}-{protocol}"),
                     arch,
                     os,
                     protocol,
@@ -110,6 +109,12 @@ impl EmbeddedShimCatalog {
 }
 
 impl EmbeddedShim {
+    /// Installed binary stem derived from canonical identity.
+    #[must_use]
+    pub fn binary(&self) -> String {
+        format!("{}-{}", self.os, self.protocol)
+    }
+
     #[must_use]
     pub fn sha256(&self) -> String {
         crate::sha256_hex(&self.bytes)
@@ -118,8 +123,8 @@ impl EmbeddedShim {
     #[must_use]
     pub fn installed_name(&self) -> String {
         self.extension.as_deref().map_or_else(
-            || self.binary.clone(),
-            |extension| format!("{}.{extension}", self.binary),
+            || self.binary(),
+            |extension| format!("{}.{extension}", self.binary()),
         )
     }
 }
@@ -210,74 +215,94 @@ mod tests {
     }
 
     #[test]
-    fn parses_artifact_metadata_and_installed_names() {
-        let catalog = catalog(&[
+    fn parses_artifact_metadata_and_canonical_installed_names() {
+        let linux = catalog(&[
             "linux-ssh-x86_64",
             "linux-ssh-aarch64",
             "windows-winrm-x86_64.exe",
-        ])
-        .unwrap();
-        let linux = catalog.find("ssh", "x86_64", "linux").unwrap();
+        ]);
+        let linux = linux.unwrap().find("ssh", "x86_64", "linux").unwrap();
+        assert_eq!(linux.arch, "x86_64");
+        assert_eq!(linux.os, "linux");
+        assert_eq!(linux.protocol, "ssh");
+        assert_eq!(linux.extension, None);
+        assert_eq!(linux.file_name, "linux-ssh-x86_64");
+        assert_eq!(&*linux.bytes, b"abc");
         assert_eq!(linux.installed_name(), "linux-ssh");
-        assert_eq!(
-            linux.sha256(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        let windows = catalog.find("winrm", "x86_64", "windows").unwrap();
-        assert_eq!(windows.installed_name(), "windows-winrm.exe");
-    }
-
-    #[test]
-    fn normalizes_lookup_aliases_and_case() {
-        let catalog = catalog(&[
-            "linux-ssh-x86_64",
-            "macos-ssh-aarch64",
-            "windows-winrm-x86_64.exe",
-        ])
-        .unwrap();
-        for arch in ["x86_64", "amd64", "x64", " AMD64 "] {
-            assert!(catalog.find(" SSH ", arch, " GNU/Linux ").is_some());
-            assert!(catalog.find("WinRM", arch, "Windows_NT").is_some());
-        }
-        for arch in ["aarch64", "arm64", " ARM64 "] {
-            assert!(catalog.find("ssh", arch, " Darwin ").is_some());
-            assert!(catalog.find("ssh", arch, "MacOS").is_some());
-        }
-    }
-
-    #[test]
-    fn canonicalizes_asset_aliases() {
-        let catalog = catalog(&["darwin-ssh-arm64", "windows_nt-winrm-amd64.exe"]).unwrap();
-        let macos = catalog.find("ssh", "aarch64", "macos").unwrap();
+        let sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert_eq!(linux.sha256(), sha);
+        // Asset aliases are canonicalized for installation.
+        let aliases = catalog(&["darwin-ssh-arm64", "windows_nt-winrm-amd64.exe"]).unwrap();
+        let macos = aliases.find("ssh", "aarch64", "macos").unwrap();
         assert_eq!(macos.file_name, "darwin-ssh-arm64");
         assert_eq!(macos.installed_name(), "macos-ssh");
-        let windows = catalog.find("winrm", "x64", "windows").unwrap();
+        let windows = aliases.find("winrm", "x64", "windows").unwrap();
         assert_eq!(windows.installed_name(), "windows-winrm.exe");
     }
 
     #[test]
-    fn separates_protocols_platforms_and_architectures() {
+    fn owned_artifact_retains_open_identity_and_payload_after_catalog_drop() {
+        let shim = {
+            let name = String::from("future_os-other_protocol-riscv64.custom");
+            let payload = Cow::Owned(b"owned payload".to_vec());
+            let catalog = EmbeddedShimCatalog::from_embedded_assets([(name, payload)]).unwrap();
+            catalog
+                .find(" OTHER_PROTOCOL ", " RISCV64 ", " FUTURE_OS ")
+                .unwrap()
+        };
+        assert_eq!(shim.arch, "riscv64");
+        assert_eq!(shim.os, "future_os");
+        assert_eq!(shim.protocol, "other_protocol");
+        assert_eq!(shim.extension.as_deref(), Some("custom"));
+        assert_eq!(shim.file_name, "future_os-other_protocol-riscv64.custom");
+        assert_eq!(shim.installed_name(), "future_os-other_protocol.custom");
+        assert_eq!(&*shim.bytes, b"owned payload");
+    }
+
+    #[test]
+    fn lookups_normalize_aliases_and_case_but_keep_platforms_apart() {
         let catalog = catalog(&[
             "linux-ssh-x86_64",
             "linux-winrm-x86_64",
             "windows-winrm-x86_64.exe",
             "linux-ssh-aarch64",
+            "macos-ssh-aarch64",
             "future_os-other_protocol-riscv64",
         ])
         .unwrap();
-        assert_eq!(
-            catalog.find("winrm", "x64", "linux").unwrap().binary,
-            "linux-winrm"
-        );
-        assert!(catalog.find("ssh", "x64", "windows").is_none());
-        assert!(catalog.find("winrm", "arm64", "linux").is_none());
-        assert!(catalog.find("other", "x64", "linux").is_none());
-        assert!(catalog.find("ssh", "riscv64", "linux").is_none());
-        assert!(
+        let binary = |protocol, arch, os| {
             catalog
-                .find("other_protocol", "riscv64", "future_os")
-                .is_some()
-        );
+                .find(protocol, arch, os)
+                .map(|shim| shim.binary().to_string())
+        };
+        let mut cases = vec![
+            ("winrm", "x64", "linux", Some("linux-winrm")),
+            ("ssh", "x64", "windows", None),
+            ("winrm", "arm64", "linux", None),
+            ("other", "x64", "linux", None),
+            ("ssh", "riscv64", "linux", None),
+            (
+                "other_protocol",
+                "riscv64",
+                "future_os",
+                Some("future_os-other_protocol"),
+            ),
+        ];
+        for arch in ["x86_64", "amd64", "x64", " AMD64 "] {
+            cases.push((" SSH ", arch, " GNU/Linux ", Some("linux-ssh")));
+            cases.push(("WinRM", arch, "Windows_NT", Some("windows-winrm")));
+        }
+        for arch in ["aarch64", "arm64", " ARM64 "] {
+            cases.push(("ssh", arch, " Darwin ", Some("macos-ssh")));
+            cases.push(("ssh", arch, "MacOS", Some("macos-ssh")));
+        }
+        for (protocol, arch, os, expected) in cases {
+            assert_eq!(
+                binary(protocol, arch, os).as_deref(),
+                expected,
+                "{protocol} {arch} {os}"
+            );
+        }
     }
 
     #[test]

@@ -235,29 +235,15 @@ mod tests {
         tool::policy::{ApprovalCoverage, Capability, PolicyFuture, ResourceId},
     };
 
-    struct GrantingPolicy {
-        calls: AtomicUsize,
-    }
-
-    impl Policy for GrantingPolicy {
-        fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let grants = request
-                .permissions
-                .into_iter()
-                .filter_map(|permission| permission.proposed_grant)
-                .collect();
-            Box::pin(async move { PolicyDecision::Allow { grants } })
-        }
-    }
-
-    struct BlockingPolicy {
+    /// Grants every proposal, optionally waiting for a release permit first.
+    #[derive(Default)]
+    struct CountingPolicy {
         calls: AtomicUsize,
         started: Notify,
-        release: Arc<Semaphore>,
+        release: Option<Arc<Semaphore>>,
     }
 
-    impl Policy for BlockingPolicy {
+    impl Policy for CountingPolicy {
         fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.started.notify_waiters();
@@ -265,10 +251,12 @@ mod tests {
             let grants = request
                 .permissions
                 .into_iter()
-                .filter_map(|permission| permission.proposed_grant)
+                .filter_map(|p| p.proposed_grant)
                 .collect();
             Box::pin(async move {
-                release.acquire().await.unwrap().forget();
+                if let Some(release) = release {
+                    release.acquire().await.unwrap().forget();
+                }
                 PolicyDecision::Allow { grants }
             })
         }
@@ -285,90 +273,65 @@ mod tests {
         }
     }
 
-    fn permission(resource: ResourceId) -> PermissionUse {
-        PermissionUse::new(Capability::Write, resource.clone())
-            .with_grant(ApprovalGrant::exact(Capability::Write, resource))
+    async fn authorize(
+        coordinator: &AuthorizationCoordinator,
+        subject: &AuthorizationSubject,
+        resource: &ResourceId,
+    ) -> Result<(), AuthorizationError> {
+        let permission = PermissionUse::new(Capability::Write, resource.clone())
+            .with_grant(ApprovalGrant::exact(Capability::Write, resource.clone()));
+        let arguments = serde_json::Value::Null;
+        coordinator
+            .authorize(subject, "tool".to_owned(), vec![permission], arguments)
+            .await
+            .map(drop)
     }
 
     #[tokio::test]
     async fn grants_are_cached_for_arbitrary_resources() {
-        let policy = Arc::new(GrantingPolicy {
-            calls: AtomicUsize::new(0),
-        });
+        let policy = Arc::new(CountingPolicy::default());
         let coordinator = AuthorizationCoordinator::new(policy.clone());
         let subject = subject(CancellationToken::new());
-        let resource = ResourceId::new("plugin", ["server", "operation"]);
+        let resource = ResourceId::custom("plugin", ["server", "operation"]).unwrap();
         for _ in 0..2 {
-            coordinator
-                .authorize(
-                    &subject,
-                    "dynamic".to_owned(),
-                    vec![permission(resource.clone())],
-                    serde_json::Value::Null,
-                )
-                .await
-                .unwrap();
+            authorize(&coordinator, &subject, &resource).await.unwrap();
         }
         assert_eq!(policy.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn cancelling_one_waiter_does_not_poison_shared_approval() {
-        let policy = Arc::new(BlockingPolicy {
-            calls: AtomicUsize::new(0),
-            started: Notify::new(),
-            release: Arc::new(Semaphore::new(0)),
+        let release = Arc::new(Semaphore::new(0));
+        let policy = Arc::new(CountingPolicy {
+            release: Some(release.clone()),
+            ..Default::default()
         });
         let coordinator = AuthorizationCoordinator::new(policy.clone());
         let first_cancellation = CancellationToken::new();
-        let first_subject = subject(first_cancellation.clone());
-        let second_subject = subject(CancellationToken::new());
-        let resource = ResourceId::new("anything", ["shared"]);
-        let first = tokio::spawn({
-            let coordinator = coordinator.clone();
-            let permission = permission(resource.clone());
-            async move {
-                coordinator
-                    .authorize(
-                        &first_subject,
-                        "first".to_owned(),
-                        vec![permission],
-                        serde_json::Value::Null,
-                    )
-                    .await
-            }
-        });
+        let resource = ResourceId::custom("anything", ["shared"]).unwrap();
+        let spawn = |subject: AuthorizationSubject| {
+            let (coordinator, resource) = (coordinator.clone(), resource.clone());
+            tokio::spawn(async move { authorize(&coordinator, &subject, &resource).await })
+        };
+        let first = spawn(subject(first_cancellation.clone()));
         while policy.calls.load(Ordering::SeqCst) == 0 {
             policy.started.notified().await;
         }
-        let second = tokio::spawn({
-            let coordinator = coordinator.clone();
-            let permission = permission(resource);
-            async move {
-                coordinator
-                    .authorize(
-                        &second_subject,
-                        "second".to_owned(),
-                        vec![permission],
-                        serde_json::Value::Null,
-                    )
-                    .await
-            }
-        });
+        let second = spawn(subject(CancellationToken::new()));
         tokio::task::yield_now().await;
         first_cancellation.cancel();
         assert!(matches!(
             first.await.unwrap(),
             Err(AuthorizationError::Cancelled)
         ));
-        policy.release.add_permits(1);
+        release.add_permits(1);
         second.await.unwrap().unwrap();
         assert_eq!(policy.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn exact_proposals_cannot_be_widened() {
-        let resource = ResourceId::new("opaque", ["one"]);
+        let resource = ResourceId::custom("opaque", ["one"]).unwrap();
         let proposed = ApprovalGrant::exact(Capability::Write, resource.clone());
         let widened = ApprovalGrant {
             capability: Capability::Write,

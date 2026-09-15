@@ -1,7 +1,7 @@
 //! Durable session event schema and replay validation.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Component, Path, PathBuf},
 };
 
@@ -10,22 +10,14 @@ use serde_json::Value;
 
 use crate::{
     execution::ExecutionLocation,
-    identity::{AgentId, JobId, SessionId},
-    job::JobState,
-    media::ImageReference,
-    provider::protocol::{Message, ModelRequest, Usage},
+    identity::{AgentId, EventId, JobId, QueueAttemptId, SessionId},
+    job::{JobRole, JobState},
+    media::ImageRef,
+    provider::protocol::{HistoryLifetime, Message, ModelRequest, Usage, UserContent},
     target::TargetDefinition,
 };
 
 use super::{SESSION_FORMAT_VERSION, SessionError};
-
-/// An exact request message, either journal-backed or request-specific.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContextMessage {
-    Source { sequence: u64 },
-    Inline { message: Message },
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -57,9 +49,35 @@ pub struct ModelCallOrigin {
     pub call_id: String,
 }
 
+/// Immutable accepted submission. Session and destination agent are bound by its record.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct QueueIntent {
+    pub attempt: QueueAttemptId,
+    pub content: Vec<UserContent>,
+    pub model: Option<String>,
+}
+
+/// Final resolution of an intent; NotCommitted explicitly abandons that attempt.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum QueueSettlement {
+    Committed { event: EventId },
+    NotCommitted,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
+    QueueIntent {
+        intent: QueueIntent,
+    },
+    QueueSettlement {
+        attempt: QueueAttemptId,
+        settlement: QueueSettlement,
+    },
+    QueueAcknowledged {
+        attempt: QueueAttemptId,
+    },
     SessionStarted {
         targets: Vec<TargetDefinition>,
     },
@@ -90,7 +108,7 @@ pub enum SessionEvent {
     Status {
         message: String,
     },
-    /// Shared request fields; template.messages is empty because history is already journaled.
+    /// Shared request fields; template history and tail are empty because history is already journaled.
     ModelContext {
         provider: String,
         template: ModelRequest,
@@ -98,7 +116,12 @@ pub enum SessionEvent {
     /// A provider call with exact ordered messages, independent of future state/configuration.
     ModelRequested {
         context: u64,
-        messages: Vec<ContextMessage>,
+        /// Journal sequences of the committed messages or compaction checkpoints sent as history.
+        history: Vec<u64>,
+        /// Request-specific messages sent after history.
+        tail: Vec<Message>,
+        #[serde(default)]
+        history_lifetime: HistoryLifetime,
         purpose: ModelPurpose,
     },
     Compaction {
@@ -147,6 +170,7 @@ pub enum SessionEvent {
         parent: Option<JobId>,
         origin: Option<ModelCallOrigin>,
         tool: String,
+        role: JobRole,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         arguments: Value,
@@ -164,7 +188,7 @@ pub enum SessionEvent {
         state: JobState,
         output_path: Option<PathBuf>,
         error: Option<String>,
-        images: Vec<ImageReference>,
+        images: Vec<ImageRef>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         denial: Option<crate::tool::Denial>,
     },
@@ -188,8 +212,23 @@ pub enum SessionEvent {
     AgentInterrupted,
 }
 
+impl SessionEvent {
+    /// The attempt a queue event inherently names.
+    pub(crate) fn queue_attempt(&self) -> Option<QueueAttemptId> {
+        match self {
+            Self::QueueIntent { intent } => Some(intent.attempt),
+            Self::QueueSettlement { attempt, .. } | Self::QueueAcknowledged { attempt } => {
+                Some(*attempt)
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct EventRecord {
+    pub id: EventId,
+    pub queue_attempt: Option<QueueAttemptId>,
     pub version: u16,
     pub sequence: u64,
     pub timestamp_millis: i64,
@@ -197,10 +236,22 @@ pub struct EventRecord {
     pub event: SessionEvent,
 }
 
+impl EventRecord {
+    pub(crate) fn append_identity(&self) -> super::AppendIdentity {
+        super::AppendIdentity {
+            event: self.id,
+            queue_attempt: self.queue_attempt,
+            session: self.agent.session(),
+            sequence: self.sequence,
+        }
+    }
+}
+
 pub(super) fn validate_records(records: &[EventRecord], id: SessionId) -> Result<(), SessionError> {
     let mut expected = 1;
+    let mut event_ids = HashSet::new();
     let mut jobs = HashSet::new();
-    let mut terminal = HashSet::new();
+    let mut terminal = HashMap::new();
     for (index, record) in records.iter().enumerate() {
         if record.version != SESSION_FORMAT_VERSION {
             return Err(SessionError::UnsupportedVersion(record.version));
@@ -214,6 +265,10 @@ pub(super) fn validate_records(records: &[EventRecord], id: SessionId) -> Result
         if record.agent.session() != id {
             return Err(SessionError::WrongSession);
         }
+        if !event_ids.insert(record.id) {
+            return Err(SessionError::DuplicateEvent(record.id));
+        }
+        super::queue::validate_queue_record(&records[..index], record)?;
         match &record.event {
             SessionEvent::Compaction { .. } => {
                 super::request::validate_compaction(&records[..index], record)?;
@@ -231,6 +286,20 @@ pub(super) fn validate_records(records: &[EventRecord], id: SessionId) -> Result
             {
                 return Err(SessionError::UnknownJob(*job));
             }
+            SessionEvent::JobStateChanged {
+                job,
+                state: JobState::Running,
+            } => {
+                // Retained jobs reuse their identity, not a terminal invocation.
+                // Cancellation remains final; only supported resumable outcomes
+                // reopen the per-invocation terminal-publication obligation.
+                if matches!(
+                    terminal.get(job),
+                    Some(JobState::Completed | JobState::Failed | JobState::Interrupted)
+                ) {
+                    terminal.remove(job);
+                }
+            }
             SessionEvent::JobFinished {
                 job,
                 state,
@@ -240,9 +309,15 @@ pub(super) fn validate_records(records: &[EventRecord], id: SessionId) -> Result
                 if !jobs.contains(job) {
                     return Err(SessionError::UnknownJob(*job));
                 }
-                if !state.is_terminal() || !terminal.insert(*job) {
+                let allowed = match terminal.get(job) {
+                    None => true,
+                    Some(JobState::Interrupted) => *state == JobState::Cancelled,
+                    Some(_) => false,
+                };
+                if !state.is_terminal() || !allowed {
                     return Err(SessionError::DuplicateTerminal(*job));
                 }
+                terminal.insert(*job, *state);
                 if output_path
                     .as_deref()
                     .is_some_and(|path| !is_safe_artifact_path(path))
@@ -269,38 +344,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recovery_event_round_trips_without_changing_existing_log_format() {
+    fn recovery_event_round_trips_in_v3_log_format() {
         let id = SessionId::from_bytes([42; 16]);
         let agent = AgentId::root(id);
-        // A failure from existing version-2 logs requires no new fields.
+        // A failure from version-3 logs requires no new fields.
         let failure: SessionEvent = serde_json::from_str(
             r#"{"type":"model_failed","request":7,"attempt":1,"error":"connection lost"}"#,
         )
         .unwrap();
-        assert_eq!(
-            failure,
-            SessionEvent::ModelFailed {
+        let expected = SessionEvent::ModelFailed {
+            request: 7,
+            attempt: 1,
+            error: "connection lost".into(),
+        };
+        assert_eq!(failure, expected);
+        let scheduled = |attempt, max_attempts, delay_millis, error: &str| {
+            SessionEvent::ModelRecoveryScheduled {
                 request: 7,
-                attempt: 1,
-                error: "connection lost".into(),
+                attempt,
+                max_attempts,
+                delay_millis,
+                error: error.into(),
             }
-        );
+        };
         let events = [
             failure,
-            SessionEvent::ModelRecoveryScheduled {
-                request: 7,
-                attempt: 2,
-                max_attempts: Some(3),
-                delay_millis: 1000,
-                error: "connection lost".into(),
-            },
-            SessionEvent::ModelRecoveryScheduled {
-                request: 7,
-                attempt: 300,
-                max_attempts: None,
-                delay_millis: 30_000,
-                error: "provider HTTP 429 error [code=rate_limit_exceeded]".into(),
-            },
+            scheduled(2, Some(3), 1000, "connection lost"),
+            scheduled(
+                300,
+                None,
+                30_000,
+                "provider HTTP 429 error [code=rate_limit_exceeded]",
+            ),
             SessionEvent::ModelAttemptStarted {
                 request: 7,
                 attempt: 300,
@@ -310,6 +385,8 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, event)| EventRecord {
+                id: crate::identity::EventId::generate().unwrap(),
+                queue_attempt: None,
                 version: SESSION_FORMAT_VERSION,
                 sequence: index as u64 + 1,
                 timestamp_millis: 0,
@@ -328,5 +405,86 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn retained_outcomes_reopen_only_after_a_running_reset_or_interrupted_cancellation() {
+        let finished = |job, state| SessionEvent::JobFinished {
+            job,
+            state,
+            output_path: None,
+            error: None,
+            images: Vec::new(),
+            denial: None,
+        };
+        let states = [
+            JobState::Completed,
+            JobState::Failed,
+            JobState::Interrupted,
+            JobState::Cancelled,
+        ];
+        for first in states {
+            for reset in [false, true] {
+                for second in states {
+                    let reopened_by_reset = reset && first != JobState::Cancelled;
+                    // Without a reset only a duplicate cancellation is exercised.
+                    if !reopened_by_reset && second != JobState::Cancelled {
+                        continue;
+                    }
+                    let root = tempfile::tempdir().unwrap();
+                    let store = crate::session::SessionStore::create(root.path())
+                        .await
+                        .unwrap();
+                    let agent = AgentId::root(store.id());
+                    let job = JobId::new(1).unwrap();
+                    let created = SessionEvent::JobCreated {
+                        job,
+                        parent: None,
+                        origin: None,
+                        tool: "agent".into(),
+                        role: JobRole::Agent,
+                        name: None,
+                        arguments: Value::Null,
+                        output_schema: None,
+                        accepts_input: true,
+                        background: true,
+                        location: ExecutionLocation::root(root.path().to_path_buf()),
+                    };
+                    let mut events = vec![created, finished(job, first)];
+                    if reset {
+                        events.push(SessionEvent::JobStateChanged {
+                            job,
+                            state: JobState::Running,
+                        });
+                    }
+                    events.push(finished(job, second));
+                    for event in events {
+                        store.append(agent.clone(), event).await.unwrap();
+                    }
+                    let id = store.id();
+                    store.close().await.unwrap();
+                    drop(store); // Closing the writer does not release a live owner's lock.
+                    // Exercise the physical archive validator, not just JobManager's
+                    // independent permissive projection of an in-memory record slice.
+                    let reopened = crate::session::SessionStore::open(root.path(), id).await;
+                    if !(reopened_by_reset
+                        || (first == JobState::Interrupted && second == JobState::Cancelled))
+                    {
+                        assert!(
+                            matches!(reopened, Err(SessionError::DuplicateTerminal(id)) if id == job)
+                        );
+                        continue;
+                    }
+                    let (store, records) = reopened.unwrap();
+                    assert_eq!(records.len(), 3 + usize::from(reset));
+                    let jobs = crate::job::JobManager::restore(store.clone(), &records)
+                        .await
+                        .unwrap();
+                    assert_eq!(jobs.metadata(job).await.unwrap().state, second);
+                    drop(jobs);
+                    store.close().await.unwrap();
+                }
+            }
+        }
     }
 }

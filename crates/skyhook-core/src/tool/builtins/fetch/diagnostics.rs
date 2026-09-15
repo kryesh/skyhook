@@ -8,10 +8,12 @@
 use std::{error::Error, fmt, io};
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+
+use super::ToolError;
 
 /// The operation which was in progress, not a guess at a transport substage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum FetchPhase {
     ClientPreparation,
@@ -28,7 +30,7 @@ pub(super) enum FetchPhase {
     LocalIo,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum FetchErrorKind {
     ConnectionRefused,
@@ -51,7 +53,7 @@ pub(super) enum FetchErrorKind {
 }
 
 /// A bounded, version-independent vocabulary rather than `ErrorKind`'s Debug text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum FetchIoKind {
     NotFound,
@@ -78,70 +80,132 @@ pub(super) enum FetchIoKind {
     Other,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub(super) struct FetchOsError {
     /// OS on the execution target; numeric codes are not portable across OSes.
-    pub platform: String,
+    platform: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<i32>,
+    code: Option<i32>,
     #[schemars(with = "String")]
-    pub kind: FetchIoKind,
+    kind: FetchIoKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum FetchTimeoutKind {
-    Total,
-    Connect,
+/// Safe text is a closed vocabulary, never a caller-provided string or an error display.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum DiagnosticMessage {
+    Standard,
+    ResponseExceedsMaxBytes,
+    TextExtractionUnsupported,
+    MaximumRedirectsExceeded,
+    InvalidRedirectLocationHeader,
+    InvalidRedirectUrl,
+    RedirectUrlNotHttp,
+    HttpsDowngradeBlocked,
+    UnexpectedBodyEof,
+    ProxyAuthRequired,
+    ProxyHeadersTooLong,
+    ProxyUnexpectedEof,
+    ProxyRejectedTunnel,
+    ProxyMissingHost,
+}
+
+impl DiagnosticMessage {
+    fn render(self, kind: FetchErrorKind, phase: FetchPhase) -> &'static str {
+        match self {
+            Self::Standard => message(kind, phase),
+            Self::ResponseExceedsMaxBytes => "response exceeds max_bytes",
+            Self::TextExtractionUnsupported => {
+                "text extraction is unsupported for this binary content type"
+            }
+            Self::MaximumRedirectsExceeded => "maximum redirects exceeded",
+            Self::InvalidRedirectLocationHeader => "invalid redirect location header",
+            Self::InvalidRedirectUrl => "invalid redirect URL",
+            Self::RedirectUrlNotHttp => "redirect URL must be HTTP(S) without embedded credentials",
+            Self::HttpsDowngradeBlocked => "HTTPS to HTTP redirect blocked",
+            Self::UnexpectedBodyEof => "The response body ended unexpectedly.",
+            Self::ProxyAuthRequired => "HTTP proxy authentication required.",
+            Self::ProxyHeadersTooLong => {
+                "The HTTP proxy response headers exceeded the supported limit."
+            }
+            Self::ProxyUnexpectedEof => {
+                "The HTTP proxy closed the connection before establishing the tunnel."
+            }
+            Self::ProxyRejectedTunnel => "The HTTP proxy rejected the CONNECT tunnel.",
+            Self::ProxyMissingHost => "The HTTP proxy tunnel destination is missing a host.",
+        }
+    }
+}
+
+/// Unknown timeout evidence cannot accidentally acquire a configured limit.
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum TimeoutAttribution {
     Unknown,
+    Total {
+        limit_ms: u64,
+    },
+    Connect {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit_ms: Option<u64>,
+    },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub(super) struct FetchTimeout {
-    pub kind: FetchTimeoutKind,
-    /// Present only when the caller knows which configured limit expired.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// Internal evidence is not deserializable: only the typed constructors below
+/// populate it (rendering the closed message once), and serialization is the
+/// single wire projection.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub(super) struct FetchDiagnostic {
-    // These are extensible diagnostic labels, not caller-supplied choices.
-    // Keep the advertised result schema compact without listing every label.
     #[schemars(with = "String")]
-    pub phase: FetchPhase,
+    phase: FetchPhase,
     #[schemars(with = "String")]
-    pub error_kind: FetchErrorKind,
-    /// Safe, fixed text; the human summary may separately add a sanitized origin.
-    pub message: String,
+    error_kind: FetchErrorKind,
+    message: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub os_error: Option<FetchOsError>,
+    os_error: Option<FetchOsError>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout: Option<FetchTimeout>,
+    timeout: Option<TimeoutAttribution>,
 }
 
 impl FetchDiagnostic {
     pub fn new(phase: FetchPhase, error_kind: FetchErrorKind) -> Self {
+        Self::classified(phase, error_kind, DiagnosticMessage::Standard)
+    }
+
+    pub fn classified(phase: FetchPhase, kind: FetchErrorKind, message: DiagnosticMessage) -> Self {
         Self {
             phase,
-            error_kind,
-            message: message(error_kind, phase).into(),
+            error_kind: kind,
+            message: message.render(kind, phase),
             os_error: None,
-            timeout: (error_kind == FetchErrorKind::Timeout).then_some(FetchTimeout {
-                kind: FetchTimeoutKind::Unknown,
-                limit_ms: None,
-            }),
+            timeout: (kind == FetchErrorKind::Timeout).then_some(TimeoutAttribution::Unknown),
         }
     }
 
-    pub fn timeout(phase: FetchPhase, kind: FetchTimeoutKind, limit_ms: u64) -> Self {
+    pub fn total_timeout(phase: FetchPhase, limit_ms: u64) -> Self {
         Self {
-            timeout: Some(FetchTimeout {
-                kind,
-                limit_ms: Some(limit_ms),
-            }),
+            timeout: Some(TimeoutAttribution::Total { limit_ms }),
             ..Self::new(phase, FetchErrorKind::Timeout)
         }
+    }
+
+    pub fn message(&self) -> &'static str {
+        self.message
+    }
+
+    pub fn os_code(&self) -> Option<(&str, i32)> {
+        self.os_error
+            .as_ref()
+            .and_then(|os| os.code.map(|code| (os.platform.as_str(), code)))
+    }
+
+    pub fn with_connect_limit(mut self, limit_ms: u64) -> Self {
+        if let Some(TimeoutAttribution::Connect {
+            limit_ms: limit @ None,
+        }) = &mut self.timeout
+        {
+            *limit = Some(limit_ms);
+        }
+        self
     }
 
     pub fn from_reqwest(error: &reqwest::Error, phase: FetchPhase) -> Self {
@@ -166,7 +230,7 @@ impl FetchDiagnostic {
             FetchErrorKind::TlsFailure
         } else if let Some(kind) = evidence.transport_kind {
             kind
-        } else if evidence.proxy {
+        } else if evidence.proxy.is_some() {
             FetchErrorKind::ProxyFailure
         } else if error.is_builder() {
             FetchErrorKind::ClientConfiguration
@@ -183,11 +247,9 @@ impl FetchDiagnostic {
         } else {
             fallback(phase)
         };
-        let mut diagnostic = Self::new(phase, kind);
-        diagnostic.message = evidence.message(kind, phase).into();
-        diagnostic.os_error = evidence.os_error;
+        let mut diagnostic = evidence.into_diagnostic(phase, kind);
         if kind == FetchErrorKind::Timeout && connecting {
-            diagnostic.timeout.as_mut().expect("timeout details").kind = FetchTimeoutKind::Connect;
+            diagnostic.timeout = Some(TimeoutAttribution::Connect { limit_ms: None });
         }
         diagnostic
     }
@@ -201,19 +263,58 @@ impl FetchDiagnostic {
             FetchErrorKind::DnsFailure
         } else if evidence.tls {
             FetchErrorKind::TlsFailure
+        } else if let Some(kind) = evidence.transport_kind {
+            kind
+        } else if evidence.proxy.is_some() {
+            FetchErrorKind::ProxyFailure
         } else {
-            evidence.transport_kind.unwrap_or_else(|| {
-                if evidence.proxy {
-                    FetchErrorKind::ProxyFailure
-                } else {
-                    fallback(phase)
-                }
-            })
+            fallback(phase)
         };
-        Self {
-            message: evidence.message(kind, phase).into(),
-            os_error: evidence.os_error,
-            ..Self::new(phase, kind)
+        evidence.into_diagnostic(phase, kind)
+    }
+}
+
+/// Fetch-local errors preserve typed diagnostics until progress performs the single
+/// tool-output projection. Generic errors are admitted only at named legacy/permission
+/// boundaries; arbitrary output payloads and error displays never become evidence.
+#[derive(Debug)]
+pub(super) enum FetchError {
+    Diagnostic(FetchDiagnostic),
+    /// Only control-flow/admission metadata crosses unchanged. A generic failed
+    /// error, arbitrary ToolOutput, or secret IO display is never retained.
+    Passthrough(ToolError),
+}
+
+impl From<FetchDiagnostic> for FetchError {
+    fn from(diagnostic: FetchDiagnostic) -> Self {
+        Self::Diagnostic(diagnostic)
+    }
+}
+
+impl FetchError {
+    /// Explicit admission for authorization, validation and the legacy fetch_text
+    /// API. Never inspect diagnostic JSON, preserve arbitrary outputs, or copy display text.
+    pub fn from_tool_error(error: ToolError, phase: FetchPhase) -> Self {
+        match error {
+            ToolError::Io(error) => FetchDiagnostic::from_io(&error, phase).into(),
+            ToolError::Failed(_) | ToolError::FailedWithOutput { .. } | ToolError::Json(_) => {
+                Self::Diagnostic(FetchDiagnostic::new(phase, fallback(phase)))
+            }
+            ToolError::Cancelled
+            | ToolError::Interrupted
+            | ToolError::Denied(_)
+            | ToolError::InvalidArguments(_)
+            | ToolError::ArgumentsMustBeObject
+            | ToolError::InvalidBackground
+            | ToolError::BackgroundUnsupported(_)
+            | ToolError::InputClosed => Self::Passthrough(error),
+        }
+    }
+
+    pub fn into_diagnostic(self) -> Result<FetchDiagnostic, ToolError> {
+        match self {
+            Self::Diagnostic(diagnostic) => Ok(diagnostic),
+            Self::Passthrough(error) => Err(error),
         }
     }
 }
@@ -306,14 +407,16 @@ type ProxyTunnelError = <hyper_util::client::legacy::connect::proxy::Tunnel<
     hyper_util::client::legacy::connect::HttpConnector,
 > as tower_service::Service<http::Uri>>::Error;
 
+/// Proxy evidence carries its closed message. This is independent of TLS/DNS/IO
+/// evidence: a single source chain can legitimately contain several.
 #[derive(Default)]
 struct Evidence {
     dns: bool,
-    proxy: bool,
-    proxy_message: Option<&'static str>,
+    proxy: Option<DiagnosticMessage>,
     tls: bool,
     timed_out: bool,
     unexpected_eof: bool,
+    /// Only observed IO connection causes refine transport classification.
     transport_kind: Option<FetchErrorKind>,
     os_error: Option<FetchOsError>,
 }
@@ -330,13 +433,17 @@ fn source_chain_is_bounded(error: &(dyn Error + 'static)) -> bool {
 }
 
 impl Evidence {
-    fn message(&self, kind: FetchErrorKind, phase: FetchPhase) -> &'static str {
-        if kind == FetchErrorKind::ResponseBodyFailure && self.unexpected_eof {
-            "The response body ended unexpectedly."
+    fn into_diagnostic(self, phase: FetchPhase, kind: FetchErrorKind) -> FetchDiagnostic {
+        let message = if kind == FetchErrorKind::ResponseBodyFailure && self.unexpected_eof {
+            DiagnosticMessage::UnexpectedBodyEof
         } else if kind == FetchErrorKind::ProxyFailure {
-            self.proxy_message.unwrap_or_else(|| message(kind, phase))
+            self.proxy.unwrap_or(DiagnosticMessage::Standard)
         } else {
-            message(kind, phase)
+            DiagnosticMessage::Standard
+        };
+        FetchDiagnostic {
+            os_error: self.os_error,
+            ..FetchDiagnostic::classified(phase, kind, message)
         }
     }
 
@@ -348,7 +455,7 @@ impl Evidence {
         }
         if self.dns {
             FetchPhase::Resolve
-        } else if self.proxy {
+        } else if self.proxy.is_some() {
             FetchPhase::Proxy
         } else if self.tls {
             FetchPhase::Tls
@@ -368,23 +475,14 @@ impl Evidence {
             let Some(error) = current else { break };
             evidence.dns |= error.is::<DnsFailure>();
             if let Some(error) = error.downcast_ref::<ProxyTunnelError>() {
-                evidence.proxy = true;
-                evidence.proxy_message = Some(match error {
-                    ProxyTunnelError::ProxyAuthRequired => "HTTP proxy authentication required.",
-                    ProxyTunnelError::ProxyHeadersTooLong => {
-                        "The HTTP proxy response headers exceeded the supported limit."
-                    }
-                    ProxyTunnelError::TunnelUnexpectedEof => {
-                        "The HTTP proxy closed the connection before establishing the tunnel."
-                    }
-                    ProxyTunnelError::TunnelUnsuccessful => {
-                        "The HTTP proxy rejected the CONNECT tunnel."
-                    }
-                    ProxyTunnelError::MissingHost => {
-                        "The HTTP proxy tunnel destination is missing a host."
-                    }
+                evidence.proxy = Some(match error {
+                    ProxyTunnelError::ProxyAuthRequired => DiagnosticMessage::ProxyAuthRequired,
+                    ProxyTunnelError::ProxyHeadersTooLong => DiagnosticMessage::ProxyHeadersTooLong,
+                    ProxyTunnelError::TunnelUnexpectedEof => DiagnosticMessage::ProxyUnexpectedEof,
+                    ProxyTunnelError::TunnelUnsuccessful => DiagnosticMessage::ProxyRejectedTunnel,
+                    ProxyTunnelError::MissingHost => DiagnosticMessage::ProxyMissingHost,
                     ProxyTunnelError::ConnectFailed(_) | ProxyTunnelError::Io(_) => {
-                        "The proxy connection failed."
+                        DiagnosticMessage::Standard
                     }
                 });
             }
@@ -393,8 +491,8 @@ impl Evidence {
                 let kind = io_kind(error.kind());
                 evidence.timed_out |= kind == FetchIoKind::TimedOut;
                 evidence.unexpected_eof |= kind == FetchIoKind::UnexpectedEof;
-                if let Some(kind) = transport_kind(kind) {
-                    evidence.transport_kind = Some(kind);
+                if let Some(cause) = transport_kind(kind) {
+                    evidence.transport_kind = Some(cause);
                 }
                 // Prefer an actual OS code over an outer custom I/O wrapper.
                 // When several OS errors exist, retain the deepest typed cause.
@@ -464,15 +562,97 @@ fn io_kind(kind: io::ErrorKind) -> FetchIoKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
-    fn diagnostics_use_stable_wire_values() {
-        let diagnostic = serde_json::to_value(FetchDiagnostic::new(
-            FetchPhase::Connect,
-            FetchErrorKind::ConnectionRefused,
-        ))
-        .unwrap();
-        assert_eq!(diagnostic["phase"], "connect");
-        assert_eq!(diagnostic["error_kind"], "connection_refused");
+    fn timeout_attribution_is_coherent_and_enrichment_is_evidence_limited() {
+        let unknown = FetchDiagnostic::new(FetchPhase::ResponseBody, FetchErrorKind::Timeout);
+        let total = FetchDiagnostic::total_timeout(FetchPhase::ResponseBody, 5000);
+        let connect = FetchDiagnostic {
+            timeout: Some(TimeoutAttribution::Connect { limit_ms: None }),
+            ..FetchDiagnostic::new(FetchPhase::Connect, FetchErrorKind::Timeout)
+        };
+        for (diagnostic, expected) in [
+            (unknown, json!({"kind":"unknown"})),
+            (total, json!({"kind":"total", "limit_ms":5000})),
+            (connect, json!({"kind":"connect", "limit_ms":1234})),
+        ] {
+            let value = serde_json::to_value(diagnostic.with_connect_limit(1234)).unwrap();
+            assert_eq!(
+                (&value["error_kind"], &value["timeout"]),
+                (&json!("timeout"), &expected)
+            );
+        }
+        // Stable wire values; non-timeouts carry no timeout attribution.
+        for (phase, kind, wire) in [
+            (
+                FetchPhase::Connect,
+                FetchErrorKind::ConnectionRefused,
+                ["connect", "connection_refused"],
+            ),
+            (
+                FetchPhase::ResponseBody,
+                FetchErrorKind::ConnectionReset,
+                ["response_body", "connection_reset"],
+            ),
+        ] {
+            let value =
+                serde_json::to_value(FetchDiagnostic::new(phase, kind).with_connect_limit(1234))
+                    .unwrap();
+            assert!(value.get("timeout").is_none());
+            assert_eq!(
+                [&value["phase"], &value["error_kind"]],
+                wire.map(|w| json!(w)).each_ref()
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_tls_dns_and_os_evidence_keep_precedence_and_deep_code() {
+        use FetchErrorKind as Kind;
+        use FetchPhase as Phase;
+        let tls = io::Error::other(rustls::Error::General("secret TLS detail".into()));
+        let reset = io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "https://secret:password@host/path?token=secret",
+        );
+        let proxy = io::Error::new(io::ErrorKind::TimedOut, ProxyTunnelError::ProxyAuthRequired);
+        for (error, phase, expected_phase, kind, message) in [
+            (
+                tls,
+                Phase::Request,
+                Phase::Tls,
+                Kind::TlsFailure,
+                "The TLS connection failed.",
+            ),
+            (
+                reset,
+                Phase::ResponseBody,
+                Phase::ResponseBody,
+                Kind::ConnectionReset,
+                "The connection was reset.",
+            ),
+            (
+                proxy,
+                Phase::Request,
+                Phase::Proxy,
+                Kind::Timeout,
+                "Establishing the proxy connection timed out.",
+            ),
+        ] {
+            let diagnostic = FetchDiagnostic::from_io(&error, phase);
+            assert_eq!(
+                (diagnostic.phase, diagnostic.error_kind),
+                (expected_phase, kind)
+            );
+            assert_eq!(diagnostic.message(), message);
+            let value = serde_json::to_value(diagnostic).unwrap();
+            assert!(!value.to_string().contains("secret"));
+            let timeout = (kind == Kind::Timeout).then(|| json!({"kind":"unknown"}));
+            assert_eq!(value.get("timeout"), timeout.as_ref());
+        }
+        let os = io::Error::other(io::Error::from_raw_os_error(12345));
+        let diagnostic = FetchDiagnostic::from_io(&os, FetchPhase::LocalIo);
+        assert_eq!(diagnostic.os_code(), Some((std::env::consts::OS, 12345)));
     }
 }

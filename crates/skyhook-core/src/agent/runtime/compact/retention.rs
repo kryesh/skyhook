@@ -8,13 +8,30 @@ use crate::{
 };
 use std::collections::BTreeSet;
 
+/// An original message selected from one immutable journal snapshot.
+/// Only retention can construct the sequence/payload pair; no payload is cloned.
+pub(super) struct RetainedSource<'a> {
+    sequence: u64,
+    message: &'a Message,
+}
+
+impl RetainedSource<'_> {
+    pub(super) fn message(&self) -> &Message {
+        self.message
+    }
+
+    pub(super) fn into_sequence(self) -> u64 {
+        self.sequence
+    }
+}
+
 /// Select complete original exchanges, including creators no longer in the visible tail.
-pub(super) fn retained_sources(
-    records: &[EventRecord],
+pub(super) fn retained_sources<'a>(
+    records: &'a [EventRecord],
     agent: &AgentId,
     projected: &[(u64, Message)],
     origins: &[ModelCallOrigin],
-) -> Result<Vec<u64>, HarnessError> {
+) -> Result<Vec<RetainedSource<'a>>, HarnessError> {
     let originals: Vec<_> = records
         .iter()
         .filter_map(|record| {
@@ -60,7 +77,7 @@ pub(super) fn retained_sources(
             ));
         };
         if !blocks.iter().flat_map(|item| &item.blocks).any(
-            |block| matches!(&block.content, BlockContent::ToolCall(call) if call.id == origin.call_id),
+            |block| matches!(&block.content, BlockContent::ToolCall(call) if call.id() == origin.call_id),
         ) {
             return Err(HarnessError::Compaction(
                 "active job creator call is missing".into(),
@@ -79,7 +96,7 @@ pub(super) fn retained_sources(
                 _ => None,
             })
         {
-            if !results.iter().any(|result| result.call_id == call.id) {
+            if !results.iter().any(|result| result.call_id == call.id()) {
                 return Err(HarnessError::Compaction(
                     "active job exchange has an unmatched tool call".into(),
                 ));
@@ -88,7 +105,13 @@ pub(super) fn retained_sources(
         retained.insert(origin.message);
         retained.insert(*result_sequence);
     }
-    Ok(retained.into_iter().collect())
+    let mut sources: Vec<_> = originals
+        .into_iter()
+        .filter(|(sequence, _)| retained.contains(sequence))
+        .map(|(sequence, message)| RetainedSource { sequence, message })
+        .collect();
+    sources.sort_unstable_by_key(|source| source.sequence);
+    Ok(sources)
 }
 
 // Only actual result envelopes count; status-only listings do not supply output.
@@ -148,37 +171,49 @@ pub(super) fn included_message_jobs(message: &Message, jobs: &mut BTreeSet<JobId
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::protocol::{
+        AssistantContent, ReplayEnvelope, ToolCall, ToolResult, UserContent,
+    };
     use serde_json::json;
+
+    fn committed(agent: &AgentId, messages: impl IntoIterator<Item = Message>) -> Vec<EventRecord> {
+        let records = messages
+            .into_iter()
+            .enumerate()
+            .map(|(i, message)| EventRecord {
+                id: crate::identity::EventId::generate().unwrap(),
+                queue_attempt: None,
+                version: 1,
+                sequence: i as u64 + 1,
+                timestamp_millis: 0,
+                agent: agent.clone(),
+                event: SessionEvent::MessageCommitted { message },
+            });
+        records.collect()
+    }
+
+    fn user(text: String) -> Message {
+        Message::User(vec![UserContent::Text { text }])
+    }
 
     #[test]
     fn active_exchange_retains_complete_reasoning_bundle_outside_visible_tail() {
-        use crate::provider::protocol::{
-            AssistantContent, ReplayEnvelope, ToolCall, ToolResult, UserContent,
-        };
         let agent = AgentId::root(crate::identity::SessionId::from_bytes([0; 16]));
         for protocol in ["chat_completions", "responses", "anthropic"] {
-            let reasoning = AssistantContent::reasoning(
-                "reason",
-                0,
-                "visible reasoning",
-                Some(ReplayEnvelope {
-                    version: 1,
-                    protocol: protocol.into(),
-                    model: "model".into(),
-                    scope: "scope".into(),
-                    payload: json!({"opaque":"must survive", "signature":"signed"}),
-                }),
-            );
-            let call = AssistantContent::tool_call(
-                "tool",
-                1,
-                ToolCall {
-                    id: "call".into(),
-                    name: "agent".into(),
-                    arguments: json!({"prompt":"continue"}),
-                },
-            );
-            let exchange = Message::Assistant(vec![reasoning, call]);
+            let replay = ReplayEnvelope {
+                version: 1,
+                protocol: protocol.into(),
+                model: "model".into(),
+                scope: "scope".into(),
+                payload: json!({"opaque":"must survive", "signature":"signed"}),
+            };
+            let reasoning =
+                AssistantContent::reasoning("reason", 0, "visible reasoning", Some(replay));
+            let call = ToolCall::new("call", "agent", json!({"prompt":"continue"})).unwrap();
+            let exchange = Message::Assistant(vec![
+                reasoning,
+                AssistantContent::tool_call("tool", 1, call),
+            ]);
             let results = Message::Tool(vec![ToolResult {
                 call_id: "call".into(),
                 name: "agent".into(),
@@ -186,50 +221,58 @@ mod tests {
                 images: vec![],
                 is_error: false,
             }]);
-            let tail = Message::User(vec![UserContent::Text {
-                text: "tail".repeat(10_000),
-            }]);
-            let records: Vec<_> = [exchange.clone(), results.clone(), tail.clone()]
-                .into_iter()
-                .enumerate()
-                .map(|(i, message)| EventRecord {
-                    version: 1,
-                    sequence: i as u64 + 1,
-                    timestamp_millis: 0,
-                    agent: agent.clone(),
-                    event: SessionEvent::MessageCommitted { message },
-                })
-                .collect();
+            let tail = user("tail".repeat(10_000));
+            let records = committed(&agent, [exchange.clone(), results.clone(), tail.clone()]);
             // Active creator is no longer visible after an earlier compaction.
-            let projected = vec![(3, tail)];
-            let retained = retained_sources(
-                &records,
-                &agent,
-                &projected,
-                &[ModelCallOrigin {
-                    message: 1,
-                    call_id: "call".into(),
-                }],
-            )
-            .unwrap();
-            assert_eq!(retained, vec![1, 2, 3]);
+            let origin = ModelCallOrigin {
+                message: 1,
+                call_id: "call".into(),
+            };
+            let retained = retained_sources(&records, &agent, &[(3, tail)], &[origin]).unwrap();
+            let sequences = retained
+                .iter()
+                .map(|source| source.sequence)
+                .collect::<Vec<_>>();
+            assert_eq!(sequences, vec![1, 2, 3]);
             // Original message identity is retained, not a visible-only reconstruction.
-            let persisted: Vec<EventRecord> =
-                serde_json::from_str(&serde_json::to_string(&records).unwrap()).unwrap();
-            assert_eq!(
-                persisted[0].event,
-                SessionEvent::MessageCommitted { message: exchange }
-            );
-            assert_eq!(
-                persisted[1].event,
-                SessionEvent::MessageCommitted { message: results }
-            );
+            assert_eq!(retained[0].message(), &exchange);
+            assert_eq!(retained[1].message(), &results);
         }
     }
 
     #[test]
+    fn retention_budget_keeps_original_tail_and_complete_tool_exchange() {
+        let agent = AgentId::root(crate::identity::SessionId::from_bytes([0; 16]));
+        let messages = [
+            user("old".into()),
+            Message::Assistant(vec![]),
+            Message::Tool(vec![]),
+            // Together with the tool result this is exactly the 8,000-token budget.
+            user("x".repeat(31_920)),
+        ];
+        let records = committed(&agent, messages.clone());
+        let mut projected: Vec<_> = (1..).zip(messages).collect();
+        let sequences = |projected: &[(u64, Message)]| {
+            let retained = retained_sources(&records, &agent, projected, &[]).unwrap();
+            retained
+                .into_iter()
+                .map(RetainedSource::into_sequence)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sequences(&projected), vec![2, 3, 4]);
+        // Even an oversized final message survives; its payload is the original,
+        // not the temporary projection used for token accounting.
+        projected[3].1 = user("x".repeat(40_000));
+        assert_eq!(sequences(&projected), vec![4]);
+        // A synthetic projected continuation is not an original message source.
+        projected.push((99, user("synthetic".into())));
+        assert_eq!(sequences(&projected), vec![4]);
+        assert!(sequences(&[]).is_empty());
+    }
+
+    #[test]
     fn retained_tool_results_include_nested_jobs_and_null_results_but_not_status_or_arguments() {
-        let message = Message::Tool(vec![crate::provider::protocol::ToolResult {
+        let message = Message::Tool(vec![ToolResult {
             call_id: "script-call".into(),
             name: "script".into(),
             result: json!({"id":1,"state":"completed","result":{

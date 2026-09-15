@@ -7,6 +7,6 @@
 pub(crate) mod adapter;
 pub mod config;
 pub(crate) mod manager;
-pub(crate) mod transport;
+mod transport;
 
-pub use config::{McpServerConfig, McpTransport};
+pub use config::{McpServerConfig, McpTransport, RawMcpServerConfig};

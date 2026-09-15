@@ -1,9 +1,5 @@
 //! Validation and conversion of native Anthropic content fields.
-use super::Block;
-use crate::provider::{
-    ProviderError,
-    protocol::{BlockContent, ToolCall},
-};
+use crate::provider::{ProviderError, protocol::ToolCall};
 use serde_json::Value;
 
 pub(super) fn protocol(message: impl Into<String>) -> ProviderError {
@@ -35,21 +31,18 @@ pub(super) fn validate_thinking(value: &Value) -> Result<(), ProviderError> {
     Ok(())
 }
 
-pub(super) fn tool_content(block: &Block) -> Result<BlockContent, ProviderError> {
-    let arguments = if block.has_json_delta {
-        serde_json::from_str::<Value>(&block.partial_json)
+pub(super) fn tool_content(
+    native: &Value,
+    partial_json: Option<&str>,
+) -> Result<ToolCall, ProviderError> {
+    let arguments = if let Some(partial_json) = partial_json {
+        serde_json::from_str::<Value>(partial_json)
             .map_err(|_| protocol("invalid tool input JSON"))?
     } else {
-        block.native["input"].clone()
+        native["input"].clone()
     };
-    if !arguments.is_object() {
-        return Err(protocol("tool input must be a JSON object"));
-    }
-    Ok(BlockContent::ToolCall(ToolCall {
-        id: string(&block.native, "id")?.into(),
-        name: string(&block.native, "name")?.into(),
-        arguments,
-    }))
+    ToolCall::new(string(native, "id")?, string(native, "name")?, arguments)
+        .map_err(|error| protocol(error.to_string()))
 }
 
 pub(super) fn index(value: &Value) -> Result<usize, ProviderError> {
@@ -99,5 +92,40 @@ pub(super) fn counter(
         }
         None if required => Err(protocol(format!("missing usage counter {key}"))),
         None => Ok(previous),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tool_block(id: &str, name: &str, input: Value) -> Value {
+        json!({"type":"tool_use", "id":id, "name":name, "input":input})
+    }
+
+    #[test]
+    fn completed_tool_input_rejects_empty_identity_and_nonobjects() {
+        for (id, name, input) in [
+            ("", "tool", json!({})),
+            ("call", "", json!({})),
+            ("call", "tool", Value::Null),
+            ("call", "tool", json!([])),
+            ("call", "tool", json!(1)),
+            ("call", "tool", json!("{}")),
+        ] {
+            let error = tool_content(&tool_block(id, name, input), None).unwrap_err();
+            assert_eq!(error.kind, crate::provider::ProviderErrorKind::Protocol);
+        }
+    }
+
+    #[test]
+    fn complete_json_fragments_preserve_arbitrary_arguments_and_native_names() {
+        let input = json!({"x-vendor":{"anyOf":[null, [1, false], "雪"]}});
+        let block = tool_block("call", "vendor.tool/雪", json!({}));
+        assert!(tool_content(&block, Some("{\"x-vendor\":")).is_err());
+        let call = tool_content(&block, Some(&input.to_string())).unwrap();
+        assert_eq!(call.name(), "vendor.tool/雪");
+        assert_eq!(Value::Object(call.arguments().clone()), input);
     }
 }

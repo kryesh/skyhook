@@ -1,44 +1,22 @@
 //! Terminal status, output completeness, usage accounting, and safe tool discard.
+use super::native::NativeItem;
+use super::normalization::TerminalOutcome;
 use super::*;
 
 impl Decoder {
     pub(super) fn complete_response(
         &mut self,
-        event: &Value,
+        output: &[Value],
+        usage: Option<Usage>,
+        outcome: TerminalOutcome,
         chunks: &mut Vec<ResponseChunk>,
     ) -> Result<(), ProviderError> {
-        let response = event
-            .get("response")
-            .ok_or_else(|| protocol("missing final response"))?;
-        // A terminal event ends the stream; its status determines whether
-        // the generation succeeded. Never turn an incomplete snapshot into
-        // a successful tool-bearing response merely because of its tag.
-        let truncated = match string(response, "status")? {
-            "incomplete" => true,
-            "completed" if string(event, "type")? == "response.completed" => false,
-            _ => return Err(protocol("terminal response status disagrees with event")),
-        };
-        if truncated {
-            let details = response
-                .get("incomplete_details")
-                .ok_or_else(|| protocol("missing incomplete details"))?;
-            match string(details, "reason")? {
-                "max_output_tokens" | "content_filter" => {}
-                _ => return Err(protocol("unsupported incomplete reason")),
-            }
-        }
-        let empty = Vec::new();
-        let output = if self.allow_omitted_terminal_output && response.get("output").is_none() {
-            &empty
-        } else {
-            array(response, "output")?
-        };
+        let truncated = !matches!(outcome, TerminalOutcome::Completed);
         let omitted = self.allow_omitted_terminal_output
             && output.is_empty()
-            && self
-                .items
-                .values()
-                .all(|item| item.ended.is_some() || (truncated && item.kind == Kind::Function));
+            && self.items.values().all(|item| {
+                item.snapshot().is_some() || (truncated && item.kind() == ItemKind::ToolCall)
+            });
         // Reserve stable identities before attempting semantic aliases:
         // a new terminal-only item with equal text must not steal an
         // existing item that is also explicitly present in the output.
@@ -59,14 +37,15 @@ impl Decoder {
             .collect();
         let mut seen = BTreeSet::new();
         for native in output {
+            let native = NativeItem::parse(native)?;
             // Stable native IDs take precedence over terminal array
             // position. Regenerated IDs require unique semantic evidence.
             let id = self.snapshot_index(native, None, Some(&alias_candidates), chunks)?;
             if !seen.insert(id) {
                 return Err(protocol("duplicate terminal output item"));
             }
-            if truncated && self.items[&id].kind == Kind::Function {
-                if kind(native)? != Kind::Function {
+            if truncated && self.items[&id].kind() == ItemKind::ToolCall {
+                if native.kind != ItemKind::ToolCall {
                     return Err(protocol("final output item identity changed"));
                 }
                 continue;
@@ -74,10 +53,9 @@ impl Decoder {
             self.end(id, native, chunks, true)?;
         }
         if !omitted
-            && self
-                .items
-                .iter()
-                .any(|(id, item)| !seen.contains(id) && !(truncated && item.kind == Kind::Function))
+            && self.items.iter().any(|(id, item)| {
+                !seen.contains(id) && !(truncated && item.kind() == ItemKind::ToolCall)
+            })
         {
             return Err(protocol("terminal response omitted a streamed output item"));
         }
@@ -87,7 +65,7 @@ impl Decoder {
             for item in self
                 .items
                 .values()
-                .filter(|item| item.kind == Kind::Function)
+                .filter(|item| item.kind() == ItemKind::ToolCall)
             {
                 chunks.push(ResponseChunk::ItemDiscarded {
                     id: item.native_id.clone(),
@@ -101,50 +79,29 @@ impl Decoder {
             let snapshots: Vec<_> = self
                 .items
                 .iter()
-                .filter(|(_, item)| !(truncated && item.kind == Kind::Function))
-                .map(|(id, item)| (*id, item.ended.clone().expect("checked ended")))
+                .filter(|(_, item)| !(truncated && item.kind() == ItemKind::ToolCall))
+                .map(|(id, item)| (*id, item.snapshot().expect("checked ended").clone()))
                 .collect();
             for (id, native) in snapshots {
-                self.end(id, &native, chunks, true)?;
+                self.end(id, NativeItem::parse(&native)?, chunks, true)?;
             }
         }
-        if let Some(usage) = response.get("usage").filter(|u| !u.is_null()) {
-            let count = |key: &str| {
-                usage
-                    .get(key)
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| protocol(format!("missing or invalid usage.{key}")))
-            };
-            let cached = match usage.get("input_tokens_details").filter(|v| !v.is_null()) {
-                Some(details) => details
-                    .get("cached_tokens")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| protocol("invalid cached input token usage"))?,
-                None => 0,
-            };
-            let total_input = count("input_tokens")?;
-            let uncached_input = total_input
-                .checked_sub(cached)
-                .ok_or_else(|| protocol("cached tokens exceed input tokens"))?;
-            // Internal input_tokens excludes reads served from cache.
-            let usage = Usage {
-                input_tokens: uncached_input,
-                cached_input_tokens: cached,
-                output_tokens: count("output_tokens")?,
-            };
+        if let Some(usage) = usage {
             chunks.push(ResponseChunk::UsageUpdated { usage });
         }
         self.completed = true;
-        let stop_reason = if truncated {
-            match response["incomplete_details"]["reason"].as_str() {
-                Some("max_output_tokens") => StopReason::MaxTokens,
-                Some("content_filter") => StopReason::ContentFilter,
-                _ => unreachable!("validated reason"),
+        let stop_reason = match outcome {
+            TerminalOutcome::MaxTokens => StopReason::MaxTokens,
+            TerminalOutcome::ContentFilter => StopReason::ContentFilter,
+            TerminalOutcome::Completed
+                if self
+                    .items
+                    .values()
+                    .any(|item| item.kind() == ItemKind::ToolCall) =>
+            {
+                StopReason::ToolUse
             }
-        } else if self.items.values().any(|item| item.kind == Kind::Function) {
-            StopReason::ToolUse
-        } else {
-            StopReason::EndTurn
+            TerminalOutcome::Completed => StopReason::EndTurn,
         };
         chunks.push(ResponseChunk::ResponseEnded { stop_reason });
         Ok(())
@@ -153,36 +110,9 @@ impl Decoder {
 
 #[cfg(test)]
 mod tests {
+    use super::fixtures::*;
     use super::*;
     use crate::provider::protocol::ResponseAssembler;
-
-    fn completed(output: Vec<Value>) -> Value {
-        json!({"type":"response.completed", "response":{"status":"completed", "output":output,
-            "usage":{"input_tokens":20, "output_tokens":7, "input_tokens_details":{"cached_tokens":12}}}})
-    }
-
-    fn done(id: usize, item: Value) -> Value {
-        json!({"type":"response.output_item.done", "output_index":id, "item":item})
-    }
-
-    fn added(id: usize, item: Value) -> Value {
-        json!({"type":"response.output_item.added", "output_index":id, "item":item})
-    }
-
-    fn call_item() -> Value {
-        json!({"type":"function_call", "id":"fc_1", "call_id":"call_1", "name":"search",
-            "arguments":"{\"query\":\"rust\"}", "status":"completed"})
-    }
-
-    fn reasoning_item() -> Value {
-        json!({"type":"reasoning", "id":"rs_1", "encrypted_content":"secret",
-            "summary":[{"type":"summary_text", "text":"first"}, {"type":"summary_text", "text":"second"}]})
-    }
-
-    fn message(id: &str, text: &str) -> Value {
-        json!({"type":"message", "id":id, "role":"assistant", "status":"completed",
-            "content":[{"type":"output_text", "text":text, "annotations":[]}]})
-    }
 
     #[test]
     fn abnormal_terminal_discards_tools_but_preserves_reasoning_and_usage() {

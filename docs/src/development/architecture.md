@@ -14,7 +14,7 @@
   observation/UI layers. Cumulative usage snapshots replace earlier values, and response termination
   carries a stop reason rather than a truncation boolean. Legacy unindexed delta events are removed.
   Completed assistant messages persist nested items/blocks with their IDs and positions. Session
-  journals now use format version 2; version-1 journals are rejected with an explicit unsupported-version
+  journals now use format version 3; earlier journals are rejected with an explicit unsupported-version
   error rather than guessing the missing block boundaries. Start a new session after this upgrade.
   Reasoning
   replay payloads retain provider/endpoint/protocol/model provenance: incompatible private reasoning
@@ -47,7 +47,7 @@
 - `tool::ToolRegistryBuilder` supports typed and JSON-based tools, while `tool::executor::ToolExecutor`
   turns every invocation into a supervised job. Typed registrations generate both input and output
   schemas; compact result shapes are included in model and script documentation.
-- `session::SessionStore` persists a versioned append-only JSONL log, content-addressed image blobs, job
+- `session::SessionStore` persists a versioned append-only JSONL log, content-addressed attachment and image blobs, job
   outputs, and line-addressable job output.
 - `agent::Harness` owns model profiles and policy; each `agent::SessionHandle` owns an isolated agent tree
   and registry.

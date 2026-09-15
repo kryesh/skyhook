@@ -1,35 +1,39 @@
 //! One journal-derived error block per failed logical request, not per attempt.
-use super::{Entry, Projection, Surface};
+use super::{Entry, EntryKey, Projection, Surface};
 use skyhook::agent::{AgentActivity, ObservationSnapshot};
 use skyhook::identity::AgentId;
 use skyhook::provider::protocol::BlockKind;
 
-#[derive(Clone)]
-pub(super) struct RetryState {
-    attempt: u64,
-    max_attempts: Option<u64>,
-    delay_millis: Option<u64>,
-    error: Option<String>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum RetryState {
+    Started {
+        attempt: u64,
+    },
+    Failed {
+        attempt: u64,
+        error: String,
+    },
+    Scheduled {
+        attempt: u64,
+        max_attempts: Option<u64>,
+        delay_millis: u64,
+        error: String,
+    },
 }
 
 impl RetryState {
     pub(super) fn has_error(&self) -> bool {
-        self.error.is_some()
+        !matches!(self, Self::Started { .. })
     }
 
     pub(super) fn started(attempt: u64) -> Self {
-        Self {
-            attempt,
-            max_attempts: None,
-            delay_millis: None,
-            error: None,
-        }
+        Self::Started { attempt }
     }
 
     pub(super) fn failed(attempt: u64, error: &str) -> Self {
-        Self {
-            error: Some(error.to_owned()),
-            ..Self::started(attempt)
+        Self::Failed {
+            attempt,
+            error: error.to_owned(),
         }
     }
 
@@ -39,14 +43,17 @@ impl RetryState {
         delay_millis: u64,
         error: &str,
     ) -> Self {
-        Self {
+        Self::Scheduled {
             attempt,
             max_attempts,
-            delay_millis: Some(delay_millis),
-            error: Some(error.to_owned()),
+            delay_millis,
+            error: error.to_owned(),
         }
     }
 }
+
+const DIAGNOSTIC_CHAR_LIMIT: usize = 240;
+const DIAGNOSTIC_ELLIPSIS_BUDGET: usize = DIAGNOSTIC_CHAR_LIMIT - 1;
 
 /// Diagnostics are a bounded, single-line summary. Full safe error messages and
 /// every attempt remain in the journal rather than growing history.
@@ -61,8 +68,8 @@ fn diagnostic(error: &str) -> String {
         .join(" ")
         .chars()
         .collect::<Vec<_>>();
-    if chars.len() > 240 {
-        chars.truncate(239);
+    if chars.len() > DIAGNOSTIC_CHAR_LIMIT {
+        chars.truncate(DIAGNOSTIC_ELLIPSIS_BUDGET);
         chars.push('…');
     }
     chars.into_iter().collect()
@@ -77,10 +84,18 @@ pub(super) fn retry_entry(
 ) -> Option<Entry> {
     let info = projection.requests.get(&request)?;
     let state = info.retry.as_ref()?;
-    // Successful responses use their existing renderer, without attempt labels.
-    if !state.has_error() {
-        return None;
-    }
+    // Started attempts have no diagnostic; scheduled retries always have one,
+    // even when their retry budget is unlimited.
+    let (attempt, max_attempts, delay_millis, error) = match state {
+        RetryState::Started { .. } => return None,
+        RetryState::Failed { attempt, error } => (*attempt, None, None, error),
+        RetryState::Scheduled {
+            attempt,
+            max_attempts,
+            delay_millis,
+            error,
+        } => (*attempt, *max_attempts, Some(*delay_millis), error),
+    };
     let interrupted = projection.active_request.get(agent) == Some(&request)
         && matches!(
             snapshot.activity.get(agent),
@@ -88,24 +103,22 @@ pub(super) fn retry_entry(
         );
     let running = projection.active_request.get(agent) == Some(&request)
         && !interrupted
-        && state.delay_millis.is_some();
+        && delay_millis.is_some();
     let label = if interrupted {
         "Interrupted"
-    } else if state.delay_millis.is_some() {
+    } else if delay_millis.is_some() {
         "Retrying"
     } else {
         "Request failed"
     };
-    let mut text = format!("{label} · attempt {}", state.attempt);
-    if let Some(max) = state.max_attempts {
+    let mut text = format!("{label} · attempt {attempt}");
+    if let Some(max) = max_attempts {
         text.push_str(&format!(" of {max}"));
     }
-    if let Some(delay) = state.delay_millis.filter(|_| !interrupted) {
+    if let Some(delay) = delay_millis.filter(|_| !interrupted) {
         text.push_str(&format!(" · retry delay {delay} ms"));
     }
-    if let Some(error) = &state.error {
-        text.push_str(&format!("\n{}", diagnostic(error)));
-    }
+    text.push_str(&format!("\n{}", diagnostic(error)));
     // Committed content is rendered by the normal message renderer, not twice.
     if info.response.is_none()
         && let Some(response) = snapshot.responses.get(&(agent.clone(), request))
@@ -129,7 +142,68 @@ pub(super) fn retry_entry(
             }
         }
     }
-    let mut entry = Entry::new(format!("failed{request}"), text, Surface::Status);
+    let mut entry = Entry::new(EntryKey::Retry(request), text, Surface::Status);
     entry.running = running;
     Some(entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_normalize_controls_and_apply_unicode_character_budget() {
+        assert_eq!(diagnostic("one\n\t two\r three"), "one two three");
+        let exact = "界".repeat(DIAGNOSTIC_CHAR_LIMIT);
+        assert_eq!(diagnostic(&exact), exact);
+        let long = diagnostic(&"界".repeat(DIAGNOSTIC_CHAR_LIMIT + 1));
+        assert_eq!(long.chars().count(), DIAGNOSTIC_CHAR_LIMIT);
+        assert!(long.ends_with('…'));
+    }
+    #[test]
+    fn retry_phases_preserve_unlimited_bounded_and_interrupted_labels() {
+        use skyhook::identity::SessionId;
+        let agent = AgentId::root(SessionId::from_bytes([1; 16]));
+        let mut projection = Projection::default();
+        let mut snapshot = ObservationSnapshot::default();
+        projection.active_request.insert(agent.clone(), 4);
+        for (state, expected, running) in [
+            (RetryState::started(1), None, false),
+            (
+                RetryState::failed(1, "failure"),
+                Some("Request failed · attempt 1\nfailure"),
+                false,
+            ),
+            (
+                RetryState::scheduled(2, None, 0, "failure"),
+                Some("Retrying · attempt 2 · retry delay 0 ms\nfailure"),
+                true,
+            ),
+            (
+                RetryState::scheduled(3, Some(4), 100, "failure"),
+                Some("Retrying · attempt 3 of 4 · retry delay 100 ms\nfailure"),
+                true,
+            ),
+        ] {
+            assert_eq!(state.has_error(), expected.is_some());
+            projection.requests.entry(4).or_default().retry = Some(state);
+            let entry = retry_entry(&snapshot, &projection, &agent, 4, false);
+            assert_eq!(entry.as_ref().map(Entry::text), expected);
+            assert_eq!(entry.as_ref().is_some_and(|entry| entry.running), running);
+        }
+        snapshot
+            .activity
+            .insert(agent.clone(), AgentActivity::Interrupted);
+        let entry = retry_entry(&snapshot, &projection, &agent, 4, false).unwrap();
+        assert_eq!(entry.text(), "Interrupted · attempt 3 of 4\nfailure");
+        assert!(!entry.running);
+        // Historical schedules retain their diagnostic but do not animate.
+        projection.active_request.insert(agent.clone(), 5);
+        let entry = retry_entry(&snapshot, &projection, &agent, 4, false).unwrap();
+        assert_eq!(
+            entry.text(),
+            "Retrying · attempt 3 of 4 · retry delay 100 ms\nfailure"
+        );
+        assert!(!entry.running);
+    }
 }

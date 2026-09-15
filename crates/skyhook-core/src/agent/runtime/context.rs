@@ -9,14 +9,14 @@ use crate::{
     provider::{
         Provider, ProviderContext,
         profile::ModelProfile,
-        protocol::{Message, ModelRequest, Usage, UserContent},
+        protocol::{HistoryLifetime, Message, ModelRequest, Usage, UserContent},
     },
-    session::{EventRecord, SessionEvent, project_history},
+    session::{EventRecord, ModelRequestTemplate, SessionEvent, project_history},
 };
 
 pub(super) struct AgentContext {
     pub profile: ModelProfile,
-    pub template: ModelRequest,
+    pub template: ModelRequestTemplate,
     pub projected: Vec<(u64, Message)>,
     pub meter: TokenMeter,
     pub provider: Box<dyn ProviderContext>,
@@ -27,7 +27,7 @@ impl AgentContext {
     pub fn open(
         agent: &AgentId,
         profile: ModelProfile,
-        template: ModelRequest,
+        template: ModelRequestTemplate,
         factory: &dyn Provider,
         records: &[EventRecord],
         restore_meter: bool,
@@ -35,7 +35,7 @@ impl AgentContext {
         let projected = project_history(records, agent)?;
         let provider = factory.open_context(agent.to_string())?;
         let meter = if restore_meter {
-            TokenMeter::restore(records, agent, &template)
+            TokenMeter::restore(records, agent, &template.to_request())
         } else {
             TokenMeter::default()
         };
@@ -65,14 +65,24 @@ impl AgentContext {
         Ok(())
     }
 
+    /// Build the next agent request: projected history, then runtime state as tail.
+    /// When this request's calibrated input estimate alone already reaches the
+    /// compaction threshold, its completed response will compact and replace this
+    /// history. The estimate excludes output, so it never predicts earlier than
+    /// `needs_compaction` decides.
     pub fn request(&self, runtime: UserContent) -> ModelRequest {
-        let mut request = self.template.clone();
-        request.messages = self
-            .projected
-            .iter()
-            .map(|(_, message)| message.clone())
-            .collect();
-        request.messages.push(Message::User(vec![runtime]));
+        let mut request = ModelRequest {
+            history: self
+                .projected
+                .iter()
+                .map(|(_, message)| message.clone())
+                .collect(),
+            tail: vec![Message::User(vec![runtime])],
+            ..self.template.to_request()
+        };
+        if self.reaches_compaction(u128::from(self.meter.estimate(&request))) {
+            request.history_lifetime = HistoryLifetime::Ending;
+        }
         request
     }
 
@@ -80,9 +90,14 @@ impl AgentContext {
         // Use only the completed response's reported occupancy, including cached
         // input and generated output. Estimates and output limits do not trigger
         // automatic compaction. Widen before arithmetic to avoid overflow.
-        let tokens = u128::from(usage.input_tokens)
-            + u128::from(usage.cached_input_tokens)
-            + u128::from(usage.output_tokens);
+        self.reaches_compaction(
+            u128::from(usage.input_tokens)
+                + u128::from(usage.cached_input_tokens)
+                + u128::from(usage.output_tokens),
+        )
+    }
+
+    fn reaches_compaction(&self, tokens: u128) -> bool {
         tokens * 5 >= u128::from(self.profile.max_context) * 4
     }
 
@@ -142,19 +157,19 @@ pub(in crate::agent) fn recorded_context(
         }) else {
             continue;
         };
-        let runtime = request.messages.pop().filter(|message| {
-            matches!(message, Message::User(blocks) if blocks.iter().any(|block| matches!(block, UserContent::Runtime { .. })))
-        });
-        request.messages.clear();
+        // The recorded tail is that request's runtime state; history is re-projected.
+        let tail = std::mem::take(&mut request.tail);
+        request.history.clear();
+        request.history_lifetime = HistoryLifetime::default();
         let meter = TokenMeter::restore(records, agent, &request);
-        let mut current = request;
         let Ok(history) = crate::session::project_history(records, agent) else {
             continue;
         };
-        current.messages = history.into_iter().map(|(_, message)| message).collect();
-        if let Some(message) = runtime {
-            current.messages.push(message);
-        }
+        let current = ModelRequest {
+            history: history.into_iter().map(|(_, message)| message).collect(),
+            tail,
+            ..request
+        };
         contexts.insert(
             agent.clone(),
             ContextUsage {
@@ -174,7 +189,7 @@ mod tests {
     };
     use std::time::Duration;
 
-    use tokio::sync::{Notify, Semaphore};
+    use tokio::sync::Notify;
 
     use super::super::*;
     use crate::provider::{
@@ -182,6 +197,7 @@ mod tests {
         protocol::{StopReason, events_for_content},
     };
 
+    #[derive(Default)]
     struct Tracking {
         next: AtomicUsize,
         opened: Mutex<Vec<(usize, String)>>,
@@ -189,21 +205,6 @@ mod tests {
         fail_all_calls: AtomicBool,
         entered: Notify,
         released: Notify,
-        gate: Semaphore,
-    }
-
-    impl Default for Tracking {
-        fn default() -> Self {
-            Self {
-                next: AtomicUsize::new(0),
-                opened: Mutex::default(),
-                dropped: Mutex::default(),
-                fail_all_calls: AtomicBool::new(false),
-                entered: Notify::new(),
-                released: Notify::new(),
-                gate: Semaphore::new(0),
-            }
-        }
     }
 
     struct Factory(Arc<Tracking>);
@@ -218,11 +219,7 @@ mod tests {
             correlation: String,
         ) -> Result<Box<dyn ProviderContext>, ProviderError> {
             let id = self.0.next.fetch_add(1, Ordering::SeqCst);
-            self.0
-                .opened
-                .lock()
-                .unwrap()
-                .push((id, correlation.clone()));
+            self.0.opened.lock().unwrap().push((id, correlation));
             Ok(Box::new(Context {
                 tracking: self.0.clone(),
                 id,
@@ -239,72 +236,96 @@ mod tests {
 
     impl ProviderContext for Context {
         fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
-            let latest = request
-                .messages
-                .iter()
-                .rev()
-                .find_map(|message| match message {
-                    Message::User(blocks) => blocks.iter().find_map(|block| match block {
-                        UserContent::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    }),
-                    _ => None,
-                });
-            let block = latest == Some("block");
+            let blocks = request.messages().rev().flat_map(|message| match message {
+                Message::User(blocks) => blocks.as_slice(),
+                _ => &[],
+            });
+            let mut texts = blocks.filter_map(|block| match block {
+                UserContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            });
+            let block = texts.next() == Some("block");
             let tracking = self.tracking.clone();
             Box::pin(async move {
                 if tracking.fail_all_calls.load(Ordering::SeqCst) {
                     return Err(ProviderError::protocol("retry this request"));
                 }
                 if block {
+                    // Blocked calls end only through interruption.
                     tracking.entered.notify_one();
-                    tracking.gate.acquire().await.unwrap().forget();
+                    std::future::pending::<()>().await;
                 }
-                let item = AssistantContent::text("text/0", 0, "done");
-                let mut events = events_for_content(&[item]);
+                let mut events = events_for_content(&[AssistantContent::text("text/0", 0, "done")]);
                 events.push(ResponseChunk::ResponseEnded {
                     stop_reason: StopReason::EndTurn,
                 });
-                Ok(
-                    Box::pin(futures_util::stream::iter(events.into_iter().map(Ok)))
-                        as ResponseStream,
-                )
+                let events = futures_util::stream::iter(events.into_iter().map(Ok));
+                Ok(Box::pin(events) as ResponseStream)
             })
         }
     }
 
+    fn test_context(capacity: u64, max_output: u64) -> super::AgentContext {
+        let profile = ModelProfile::new("test", "test", None, capacity, max_output, false);
+        let request = ModelRequest {
+            model: profile.model.clone(),
+            system: vec![],
+            history: Vec::new(),
+            tail: Vec::new(),
+            history_lifetime: Default::default(),
+            tools: vec![],
+            response_schema: None,
+            reasoning: None,
+            max_output_tokens: Some(max_output),
+            correlation: None,
+            blobs: Default::default(),
+        };
+        let provider = Box::new(Context {
+            tracking: Arc::new(Tracking::default()),
+            id: 0,
+        });
+        super::AgentContext {
+            profile,
+            template: request.try_into().unwrap(),
+            projected: vec![],
+            meter: super::TokenMeter::default(),
+            provider,
+            checkpoint: None,
+        }
+    }
+
+    #[test]
+    fn history_ends_once_the_request_itself_reaches_compaction() {
+        use crate::provider::protocol::HistoryLifetime::*;
+        let text = |len| {
+            (
+                1,
+                Message::User(vec![UserContent::Text {
+                    text: "x".repeat(len),
+                }]),
+            )
+        };
+        let mut context = test_context(10_000, 1_000);
+        let runtime = || UserContent::Runtime {
+            text: "state".into(),
+        };
+        context.projected = vec![text(100)];
+        assert_eq!(context.request(runtime()).history_lifetime, Continuing);
+        // The input alone reaches 80%: the response will compact this history away.
+        context.projected.push(text(40_000));
+        assert_eq!(context.request(runtime()).history_lifetime, Ending);
+    }
+
     #[test]
     fn completed_usage_compacts_at_eighty_percent_independently_of_output_budget() {
-        for (capacity, threshold) in [
+        let limits = [
             (128_000, 102_400),
             (128_001, 102_401),
             (u64::MAX, 14_757_395_258_967_641_292),
-        ] {
+        ];
+        for (capacity, threshold) in limits {
             for max_output in [1, capacity / 2, capacity - 1] {
-                let mut profile = profile("test");
-                profile.max_context = capacity;
-                profile.max_output = max_output;
-                let request = ModelRequest {
-                    model: profile.model.clone(),
-                    system: vec![],
-                    messages: vec![],
-                    tools: vec![],
-                    response_schema: None,
-                    reasoning: None,
-                    max_output_tokens: Some(max_output),
-                    correlation: None,
-                };
-                let context = super::AgentContext {
-                    profile,
-                    template: request.clone(),
-                    projected: vec![],
-                    meter: super::TokenMeter::default(),
-                    provider: Box::new(Context {
-                        tracking: Arc::new(Tracking::default()),
-                        id: 0,
-                    }),
-                    checkpoint: None,
-                };
+                let context = test_context(capacity, max_output);
                 assert!(!context.needs_compaction(Usage::default()));
                 for tokens in [threshold - 1, threshold, threshold + 1] {
                     let usage = Usage {
@@ -318,58 +339,71 @@ mod tests {
                         "context={capacity}, max_output={max_output}, total={tokens}",
                     );
                 }
+                let max = u64::MAX;
                 assert!(context.needs_compaction(Usage {
-                    input_tokens: u64::MAX,
-                    cached_input_tokens: u64::MAX,
-                    output_tokens: u64::MAX,
+                    input_tokens: max,
+                    cached_input_tokens: max,
+                    output_tokens: max,
                 }));
             }
         }
-    }
-
-    async fn child_job(session: &SessionHandle) -> JobId {
-        session
-            .runtime
-            .jobs
-            .create(crate::job::JobSpec::test(session.root.clone(), "agent"))
-            .await
-            .unwrap()
-            .id
     }
 
     #[tokio::test]
     async fn cancelled_children_release_but_failed_children_retain_their_context() {
         let root = tempfile::tempdir().unwrap();
         let tracking = Arc::new(Tracking::default());
-        let harness = harness(root.path(), tracking.clone()).await;
+        let profile = ModelProfile::new("test", "first", None, 128_000, 16_384, false);
+        let harness = HarnessBuilder::new(root.path())
+            .session_root(root.path().join("sessions"))
+            .provider("test", Arc::new(Factory(tracking.clone())))
+            .model_profile("first", profile)
+            .default_model_profile("first")
+            .build()
+            .await
+            .unwrap();
         let session = harness.new_session().await.unwrap();
+        let wait_dropped = async |id| {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let notified = tracking.released.notified();
+                    if tracking.dropped.lock().unwrap().contains(&id) {
+                        break;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("context released")
+        };
+        let jobs = &session.runtime.jobs;
         for (index, fail) in [(1, false), (2, true)] {
             let child = session.root.child(index);
-            let owner_job = child_job(&session).await;
-            let sender = session
-                .runtime
-                .spawn_agent(AgentLaunch {
-                    id: child.clone(),
-                    owner_job: Some(owner_job),
-                    model_profile: "first".into(),
-                    todos: None,
-                    available_depth: 0,
-                    location: crate::execution::ExecutionLocation::root(root.path().to_owned()),
-                })
-                .await
-                .unwrap();
+            let spec = crate::job::JobSpec {
+                role: crate::job::JobRole::Agent,
+                ..crate::job::JobSpec::test(session.root.clone(), "agent")
+            };
+            let owner_job = jobs.create(spec).await.unwrap().into_test_id();
+            let launch = AgentLaunch {
+                id: child.clone(),
+                owner_job: Some(owner_job),
+                model_profile: "first".into(),
+                todos: None,
+                available_depth: 0,
+                location: crate::execution::ExecutionLocation::root(root.path().to_owned()),
+            };
+            let sender = session.runtime.spawn_agent(launch).await.unwrap();
             tracking.fail_all_calls.store(fail, Ordering::SeqCst);
             let (done, received) = oneshot::channel();
-            sender
-                .send(AgentCommand::Input {
-                    model: None,
-                    content: vec![UserContent::Text {
-                        text: "block".into(),
-                    }],
-                    done: Some(done),
-                })
-                .await
-                .unwrap();
+            let content = vec![UserContent::Text {
+                text: "block".into(),
+            }];
+            let input = AgentCommand::Input {
+                model: None,
+                content,
+                done: Some(done),
+            };
+            sender.send(input).await.unwrap();
             if !fail {
                 tracking.entered.notified().await;
                 session.runtime.interrupt_tree(&child).await;
@@ -378,12 +412,10 @@ mod tests {
             if fail {
                 // Failed child turns are retained for retry with their provider
                 // session/history; explicit interruption still tears one down.
-                assert!(
-                    !tracking.dropped.lock().unwrap().contains(&(index as usize)),
-                    "failed child context must remain live for retry"
-                );
+                let dropped = tracking.dropped.lock().unwrap().contains(&(index as usize));
+                assert!(!dropped, "failed child context must remain live for retry");
             } else {
-                wait_dropped(&tracking, index as usize).await;
+                wait_dropped(index as usize).await;
             }
             tracking.fail_all_calls.store(false, Ordering::SeqCst);
             session.prompt("root still usable").await.unwrap();
@@ -391,42 +423,6 @@ mod tests {
         }
         assert_eq!(tracking.opened.lock().unwrap().len(), 3);
         session.shutdown().await.unwrap();
-        wait_dropped(&tracking, 0).await;
-    }
-
-    fn profile(model: &str) -> ModelProfile {
-        ModelProfile {
-            provider: "test".into(),
-            model: model.into(),
-            reasoning: None,
-            max_context: 128_000,
-            max_output: 16_384,
-            supports_images: false,
-        }
-    }
-
-    async fn harness(root: &Path, tracking: Arc<Tracking>) -> Harness {
-        HarnessBuilder::new(root)
-            .session_root(root.join("sessions"))
-            .provider("test", Arc::new(Factory(tracking)))
-            .model_profile("first", profile("first"))
-            .default_model_profile("first")
-            .build()
-            .await
-            .unwrap()
-    }
-
-    async fn wait_dropped(tracking: &Tracking, id: usize) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let notified = tracking.released.notified();
-                if tracking.dropped.lock().unwrap().contains(&id) {
-                    break;
-                }
-                notified.await;
-            }
-        })
-        .await
-        .expect("context released");
+        wait_dropped(0).await;
     }
 }

@@ -2,6 +2,7 @@
 //! available both as model tool calls and inside a sandboxed JavaScript runtime.
 
 pub mod agent;
+pub mod bounded_io;
 pub mod config;
 pub mod execution;
 mod fs;
@@ -16,27 +17,61 @@ pub mod target;
 pub mod tool;
 
 pub(crate) fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
-    use sha2::Digest as _;
-    use std::fmt::Write as _;
-
-    sha2::Sha256::digest(bytes)
-        .iter()
-        .fold(String::with_capacity(64), |mut output, byte| {
-            write!(output, "{byte:02x}").expect("writing to a string cannot fail");
-            output
-        })
+    media::BlobDigest::of(bytes.as_ref()).to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    use tokio_util::sync::CancellationToken;
 
     use crate::{
-        identity::AgentId,
-        job::JobManager,
+        execution::ExecutionLocation,
+        identity::{AgentId, JobId},
+        job::{JobLease, JobManager},
         session::SessionStore,
-        tool::{ToolRegistryBuilder, executor::ToolExecutor, policy::AllowAll},
+        tool::{
+            ToolContext, ToolRegistryBuilder,
+            authorization::AuthorizationSubject,
+            executor::ToolExecutor,
+            policy::{AllowAll, AuthorizationRequest, Policy, PolicyDecision, PolicyFuture},
+        },
     };
+
+    /// A valid PNG image: the PNG signature followed by `tail`.
+    pub(crate) fn png(tail: &[u8]) -> crate::media::Image {
+        crate::media::Image::new([&b"\x89PNG\r\n\x1a\n"[..], tail].concat()).unwrap()
+    }
+
+    /// Records every authorization request and decides synchronously from it.
+    pub(crate) struct RecordingPolicy {
+        pub requests: Mutex<Vec<AuthorizationRequest>>,
+        pub decide: Box<dyn Fn(&AuthorizationRequest) -> PolicyDecision + Send + Sync>,
+    }
+
+    impl RecordingPolicy {
+        pub fn allowing() -> Arc<Self> {
+            Self::deciding(|_| PolicyDecision::allow())
+        }
+
+        pub fn deciding(
+            decide: impl Fn(&AuthorizationRequest) -> PolicyDecision + Send + Sync + 'static,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                requests: Mutex::new(Vec::new()),
+                decide: Box::new(decide),
+            })
+        }
+    }
+
+    impl Policy for RecordingPolicy {
+        fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
+            let decision = (self.decide)(&request);
+            self.requests.lock().unwrap().push(request);
+            Box::pin(async move { decision })
+        }
+    }
 
     pub(crate) struct TestRuntime {
         pub root: tempfile::TempDir,
@@ -60,11 +95,42 @@ mod tests {
         }
 
         pub fn executor(&self, builder: ToolRegistryBuilder) -> ToolExecutor {
+            self.executor_with_policy(builder, Arc::new(AllowAll))
+        }
+
+        pub fn executor_with_policy(
+            &self,
+            builder: ToolRegistryBuilder,
+            policy: Arc<dyn Policy>,
+        ) -> ToolExecutor {
             ToolExecutor::new(
                 builder.build(),
-                Arc::new(AllowAll),
+                policy,
                 self.jobs.clone(),
                 self.root.path().to_path_buf(),
+            )
+        }
+
+        pub fn subject(&self, job: JobId, cancellation: CancellationToken) -> AuthorizationSubject {
+            AuthorizationSubject {
+                agent: self.agent.clone(),
+                job,
+                parent: None,
+                scope: None,
+                capabilities: Default::default(),
+                cancellation,
+            }
+        }
+
+        /// A root-located context for the lease's job, taking its input channel.
+        pub fn tool_context(&self, lease: &mut JobLease) -> ToolContext {
+            let location = ExecutionLocation::root(self.root.path().to_owned());
+            ToolContext::new(
+                self.subject(lease.id(), lease.cancellation_token()),
+                location.clone(),
+                location,
+                lease.take_input(),
+                self.jobs.clone(),
             )
         }
     }

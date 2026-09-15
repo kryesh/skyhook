@@ -121,7 +121,7 @@ fn check_cancelled(cancellation: &super::super::CancellationToken) -> Result<(),
     }
 }
 
-pub(super) fn empty(selection: &Selection, total: Option<usize>, terminal: bool) -> Value {
+pub(super) fn empty(selection: &Selection, total: Option<usize>, terminal: bool) -> OutputPreview {
     response(
         selection,
         total,
@@ -139,18 +139,13 @@ fn response(
     total: Option<usize>,
     lines: Vec<String>,
     next: Option<(usize, usize)>,
-) -> Value {
-    let mut page = json!({"field":selection.field,"lines":lines});
-    if let Some(total) = total {
-        page["total_lines"] = json!(total);
+) -> OutputPreview {
+    OutputPreview {
+        field: selection.field.clone(),
+        lines,
+        total_lines: total,
+        next: next.map(|(start, offset)| OutputContinuation { start, offset }),
     }
-    if let Some((start, offset)) = next {
-        page["next_start"] = json!(start);
-        if offset != 0 {
-            page["next_offset"] = json!(offset);
-        }
-    }
-    page
 }
 
 fn invalid_offset() -> ToolError {
@@ -251,7 +246,7 @@ pub(super) fn page(
     limit: usize,
     terminal: bool,
     cancellation: &super::super::CancellationToken,
-) -> Result<Value, ToolError> {
+) -> Result<OutputPreview, ToolError> {
     let index = match LineIndex::load(path, cancellation) {
         Ok(index) => index,
         Err(ToolError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -354,7 +349,7 @@ fn search(
     limit: usize,
     terminal: bool,
     cancellation: &super::super::CancellationToken,
-) -> Result<Value, ToolError> {
+) -> Result<OutputPreview, ToolError> {
     let matcher = selection.matcher.as_ref().expect("search matcher");
     // Validate independently of whether the starting line matches.
     index.seek_line(&mut reader, selection.start, cancellation)?;
@@ -487,9 +482,9 @@ mod tests {
         );
         let (_directory, path) = saved(&text);
         let first = page(&path, &selection(1, 0), 100, true, &Default::default()).unwrap();
-        assert_eq!(first["lines"].as_array().unwrap().len(), 1);
-        assert_eq!(first["next_start"], 2);
-        assert!(first["next_offset"].is_null());
+        assert_eq!(first.lines.len(), 1);
+        assert_eq!(first.next.unwrap().start, 2);
+        assert_eq!(first.next.unwrap().offset, 0);
         let mut query = selection(1, 0);
         let mut reconstructed = String::new();
         let mut previous = 1;
@@ -500,21 +495,18 @@ mod tests {
                 view,
                 page(&path, &query, 100, true, &Default::default()).unwrap()
             );
-            for (index, row) in view["lines"].as_array().unwrap().iter().enumerate() {
+            for (index, row) in view.lines.iter().enumerate() {
                 let number = (query.start + index) as u64;
                 if number != previous {
                     reconstructed.push('\n');
                 }
-                reconstructed.push_str(row.as_str().unwrap());
+                reconstructed.push_str(row.as_str());
                 previous = number;
             }
-            let Some(start) = view["next_start"].as_u64() else {
+            let Some(next) = view.next else {
                 break;
             };
-            query = selection(
-                start as usize,
-                view["next_offset"].as_u64().unwrap_or(0) as usize,
-            );
+            query = selection(next.start, next.offset);
         }
         assert_eq!(reconstructed, text);
     }
@@ -528,9 +520,9 @@ mod tests {
         ));
         query.context = 1;
         let first = page(&path, &query, 100, false, &Default::default()).unwrap();
-        assert_eq!(first["lines"].as_array().unwrap().len(), 1);
-        assert_eq!(first["lines"][0], "before");
-        assert_eq!(first["next_start"], 2);
+        assert_eq!(first.lines.len(), 1);
+        assert_eq!(first.lines[0], "before");
+        assert_eq!(first.next.unwrap().start, 2);
         let mut output = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -539,18 +531,16 @@ mod tests {
         query.start = 2;
         let rest = page(&path, &query, 100, true, &Default::default()).unwrap();
         assert_eq!(
-            rest["lines"]
-                .as_array()
-                .unwrap()
+            rest.lines
                 .iter()
-                .map(|row| row.as_str().unwrap())
+                .map(|row| row.as_str())
                 .collect::<Vec<_>>(),
             vec!["ERROR", "partial"]
         );
-        assert!(rest["next_start"].is_null());
+        assert!(rest.next.is_none());
         query.start = 3;
         query.offset = 1;
         let rest = page(&path, &query, 100, true, &Default::default()).unwrap();
-        assert_eq!(rest["lines"][0], "artial");
+        assert_eq!(rest.lines[0], "artial");
     }
 }

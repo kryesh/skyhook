@@ -167,40 +167,32 @@ mod tests {
             ),
         ]);
         let graphemes = |lines: &[Line<'_>]| {
-            lines
-                .iter()
-                .flat_map(|line| {
-                    line.spans
-                        .iter()
-                        .flat_map(|span| {
-                            span.content
-                                .graphemes(true)
-                                .map(|g| (g.to_owned(), span.style))
-                                .collect::<Vec<_>>()
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>()
+            let spans = lines.iter().flat_map(|line| &line.spans);
+            let graphemes = spans.flat_map(|span| {
+                span.content
+                    .graphemes(true)
+                    .map(|g| (g.to_owned(), span.style))
+                    .collect::<Vec<_>>()
+            });
+            graphemes.collect::<Vec<_>>()
         };
         for width in [0, 1, 2, 3, 5, 7, 12, 40] {
             let parts = wrap_words(line.clone(), width);
             assert_eq!(graphemes(&parts), graphemes(std::slice::from_ref(&line)));
         }
-        let words = wrap_words(line.clone(), 7)
-            .iter()
-            .map(|part| {
-                part.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            words
+        let parts = wrap_words(line, 7);
+        let parts = parts.iter().map(|part| {
+            part.spans
                 .iter()
-                .flat_map(|part| part.split_whitespace())
-                .collect::<Vec<_>>(),
-            ["préfix", "e\u{301}lan", "👩‍💻", "世界", "fin"]
-        );
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        });
+        let words: Vec<_> = parts
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(words, ["préfix", "e\u{301}lan", "👩‍💻", "世界", "fin"]);
     }
 }

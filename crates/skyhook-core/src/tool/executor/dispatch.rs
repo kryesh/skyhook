@@ -1,58 +1,59 @@
 //! Start local or remote jobs after planning and authorization.
 
-use super::results::import_remote_result;
 use super::*;
 
 impl ToolExecutor {
+    /// Authorize, prepare and launch one owned invocation. Nothing here is
+    /// Clone: reusable transport connections do not make authority reusable.
     pub(super) async fn start(
         &self,
         plan: InvocationPlan,
     ) -> Result<StartedExecution, ExecutionError> {
-        let lease = self
-            .shared
-            .jobs
-            .create(JobSpec {
-                origin: plan.origin,
-                agent: plan.agent.clone(),
-                parent: plan.parent,
-                tool: plan.tool.name().to_owned(),
-                name: plan.job_name.clone(),
-                arguments: plan.original_arguments.clone(),
-                output_schema: plan.tool.output_schema(&self.capabilities),
-                accepts_input: plan.tool.accepts_input(),
-                background: plan.background,
-                authorization_scope: plan.authorization_scope,
-                location: plan.execution_location.clone(),
-            })
-            .await?;
-        if lease.cancellation.is_cancelled() {
-            return Err(self.cancelled(lease.id).await);
+        let spec = JobSpec {
+            role: plan.tool.job_role(),
+            origin: plan.origin.clone(),
+            agent: plan.agent.clone(),
+            parent: plan.parent,
+            tool: plan.tool.name().to_owned(),
+            name: plan.job_name.clone(),
+            arguments: plan.original_arguments.clone(),
+            output_schema: plan.tool.output_schema(&self.capabilities),
+            accepts_input: plan.tool.accepts_input(),
+            background: plan.background,
+            authorization_scope: plan.authorization_scope,
+            location: plan.execution_location.clone(),
+        };
+        let mut lease = self.shared.jobs.create(spec).await?;
+        if lease.cancellation_token().is_cancelled() {
+            return Err(self.cancelled(lease).await);
         }
         self.shared
             .jobs
-            .transition(lease.id, JobState::AwaitingApproval)
+            .transition(lease.id(), JobState::AwaitingApproval)
             .await?;
         let subject = AuthorizationSubject {
-            agent: plan.agent,
-            job: lease.id,
+            agent: plan.agent.clone(),
+            job: lease.id(),
             parent: plan.parent,
             scope: plan.authorization_scope,
             capabilities: self.capabilities.clone(),
-            cancellation: lease.cancellation.clone(),
+            cancellation: lease.cancellation_token(),
         };
+        // Admission-time authorization snapshot: approval belongs to this
+        // exact owned subject/arguments/permission plan, not later revocations.
         if let Err(error) = self
             .shared
             .authorization
             .authorize(
                 &subject,
                 plan.tool.name().to_owned(),
-                plan.permissions,
+                plan.permissions.clone(),
                 plan.authorization_arguments.clone(),
             )
             .await
         {
             let error = match error {
-                AuthorizationError::Cancelled => return Err(self.cancelled(lease.id).await),
+                AuthorizationError::Cancelled => return Err(self.cancelled(lease).await),
                 AuthorizationError::Denied(reason) => ExecutionError::Denied(reason),
                 AuthorizationError::InvalidGrant(_) => ExecutionError::Failed {
                     message: "operation could not be started".to_owned(),
@@ -62,133 +63,119 @@ impl ToolExecutor {
                     ExecutionError::UnavailableTool(plan.tool.name().to_owned())
                 }
             };
-            return Err(self.fail_start(lease.id, error).await?);
+            return Err(self.fail_start(lease, error).await);
         }
-        // The policy has approved this invocation. Remote connection/bootstrap can
-        // still wait for network I/O or SSH authentication; that is execution, not
-        // a pending tool approval. Keep route reauthorization inside prepare.
+        // Route preparation may reauthorize a changed route, and seals its own
+        // admission snapshot under the router mutation gate. No gate is held
+        // across physical tool IO or promises execution-time freshness.
         self.shared
             .jobs
-            .transition(lease.id, JobState::Running)
+            .transition(lease.id(), JobState::Running)
             .await?;
-        let prepared = if let InvocationDispatch::Remote(route) = &plan.dispatch {
-            let router = self
-                .shared
-                .router
-                .as_ref()
-                .expect("remote plans require a target router");
-            match router
-                .prepare(route.clone(), &plan.execution_location.workspace, &subject)
-                .await
-            {
-                Ok(prepared) => Some(prepared),
-                Err(RemoteError::Cancelled) => {
-                    return Err(self.cancelled(lease.id).await);
-                }
-                Err(error) => {
-                    let error = match error {
-                        RemoteError::ApprovalDenied(reason) => ExecutionError::Denied(reason),
-                        RemoteError::ApprovalInvalidGrant(_) | RemoteError::ApprovalUnavailable => {
-                            ExecutionError::Failed {
+        let dispatch = match plan.dispatch {
+            InvocationDispatch::Local(admitted) => InvocationDispatch::Local(admitted),
+            InvocationDispatch::ReadError(output) => InvocationDispatch::ReadError(output),
+            InvocationDispatch::Remote { remote, arguments } => {
+                match remote
+                    .router
+                    .prepare(remote.route, &plan.execution_location.workspace, &subject)
+                    .await
+                {
+                    Ok(connection) => InvocationDispatch::Remote {
+                        remote: connection,
+                        arguments,
+                    },
+                    Err(RemoteError::Cancelled) => return Err(self.cancelled(lease).await),
+                    Err(error) => {
+                        let error = match error {
+                            RemoteError::ApprovalDenied(reason) => ExecutionError::Denied(reason),
+                            RemoteError::ApprovalInvalidGrant(_)
+                            | RemoteError::ApprovalUnavailable => ExecutionError::Failed {
                                 message: "target is unavailable in this context".to_owned(),
                                 output: None,
-                            }
-                        }
-                        error => ExecutionError::Failed {
-                            message: error.to_string(),
-                            output: None,
-                        },
-                    };
-                    return Err(self.fail_start(lease.id, error).await?);
+                            },
+                            error => ExecutionError::Failed {
+                                message: error.to_string(),
+                                output: None,
+                            },
+                        };
+                        return Err(self.fail_start(lease, error).await);
+                    }
                 }
             }
-        } else {
-            None
         };
-        if lease.cancellation.is_cancelled() {
-            return Err(self.cancelled(lease.id).await);
+        if lease.cancellation_token().is_cancelled() {
+            return Err(self.cancelled(lease).await);
         }
+        let tool = plan.tool;
         let mut context = ToolContext::new(
             subject,
             plan.execution_location,
             plan.caller_location,
-            lease.input,
+            lease.take_input(),
             self.shared.jobs.clone(),
+        )
+        .with_invocation_authority(
+            self.shared.authorization.clone(),
+            tool.name().to_owned(),
+            plan.authorization_arguments,
         );
         context.process_environment = self.shared.process_environment.clone();
-        context.authorizer = Some((
-            self.shared.authorization.clone(),
-            plan.tool.name().to_owned(),
-            plan.authorization_arguments.clone(),
-        ));
-        let authentication = if context.capabilities.contains(Capability::Targets)
-            && context.execution_location.is_root()
-            && matches!(plan.tool.name(), "exec" | "shell")
+        let authentication = if context.capabilities().contains(Capability::Targets)
+            && context.execution_location().is_root()
+            && tool.target_authentication()
         {
             self.shared.router.clone()
         } else {
             None
         };
-        let jobs = self.shared.jobs.clone();
-        let store = jobs.store().clone();
-        let job = lease.id;
-        let background = plan.background;
-        let worker = tokio::spawn(async move {
-            if let Some(router) = authentication {
-                context.process_environment.extend(
-                    router
-                        .environment()
-                        .await
-                        .map_err(|e| e.into_tool_error())?,
-                );
-            }
-            if context.is_cancelled() {
-                return Err(ToolError::Cancelled);
-            }
-            let cancellation = context.authorization.cancellation.clone();
-            let result = match plan.dispatch {
-                InvocationDispatch::Local => plan.tool.call(context, plan.handler_arguments).await,
-                InvocationDispatch::ReadError(output) => Ok(output),
-                InvocationDispatch::Remote(_) => {
-                    let result = prepared
-                        .expect("remote plans have prepared connections")
-                        .execute(
-                            plan.tool.name().to_owned(),
-                            plan.handler_arguments,
-                            &context,
-                        )
-                        .await;
-                    if context.is_cancelled() {
-                        Err(ToolError::Cancelled)
-                    } else {
-                        import_remote_result(&store, result).await
-                    }
+        let job = context.job();
+        lease
+            .start_supervised(async move {
+                if let Some(router) = authentication {
+                    context.process_environment.extend(
+                        router
+                            .environment()
+                            .await
+                            .map_err(|e| e.into_tool_error())?,
+                    );
                 }
-            };
-            if cancellation.is_cancelled() {
-                Err(ToolError::Cancelled)
-            } else {
-                result
-            }
-        });
-        self.shared
-            .jobs
-            .attach_task(job, worker.abort_handle())
+                if context.is_cancelled() {
+                    return Err(ToolError::Cancelled);
+                }
+                let cancellation = context.cancellation_token();
+                let result = match dispatch {
+                    InvocationDispatch::Local(admitted) => admitted?.call(context).await,
+                    InvocationDispatch::ReadError(output) => Ok(output),
+                    InvocationDispatch::Remote {
+                        remote: connection,
+                        arguments,
+                    } => {
+                        let result = connection
+                            .execute(tool.name().to_owned(), arguments, &context)
+                            .await;
+                        if context.is_cancelled() {
+                            Err(ToolError::Cancelled)
+                        } else {
+                            result.map_err(crate::remote::RemoteError::into_tool_error)
+                        }
+                    }
+                };
+                if cancellation.is_cancelled() {
+                    Err(ToolError::Cancelled)
+                } else {
+                    result
+                }
+            })
             .await?;
-        tokio::spawn(async move {
-            let completion = match worker.await {
-                Ok(Ok(output)) => JobOutcome::Completed(output),
-                Ok(Err(error)) => error.into(),
-                Err(error) if error.is_cancelled() => JobOutcome::Cancelled,
-                Err(_) => ToolError::Failed("tool handler panicked".to_owned()).into(),
-            };
-            persist_completion(&jobs, job, completion).await;
-        });
-        Ok(StartedExecution { job, background })
+        Ok(StartedExecution {
+            job,
+            background: plan.background,
+        })
     }
 
-    async fn cancelled(&self, job: JobId) -> ExecutionError {
-        persist_completion(&self.shared.jobs, job, JobOutcome::Cancelled).await;
+    async fn cancelled(&self, lease: crate::job::JobLease) -> ExecutionError {
+        lease.fail(JobOutcome::Cancelled).await;
         ExecutionError::Failed {
             message: "tool was cancelled".to_owned(),
             output: None,
@@ -197,9 +184,9 @@ impl ToolExecutor {
 
     async fn fail_start(
         &self,
-        job: JobId,
+        lease: crate::job::JobLease,
         error: ExecutionError,
-    ) -> Result<ExecutionError, JobError> {
+    ) -> ExecutionError {
         let message = match &error {
             ExecutionError::Denied(reason)
             | ExecutionError::Failed {
@@ -210,24 +197,18 @@ impl ToolExecutor {
             }
             error => error.to_string(),
         };
-        if matches!(error, ExecutionError::Denied(_)) {
-            self.shared
-                .jobs
-                .finish(job, ToolError::Denied(message).into())
-                .await?;
+        let outcome = if matches!(error, ExecutionError::Denied(_)) {
+            ToolError::Denied(message).into()
         } else {
-            self.shared
-                .jobs
-                .finish(job, ToolError::Failed(message).into())
-                .await?;
-        }
-        Ok(error)
+            ToolError::Failed(message).into()
+        };
+        lease.fail(outcome).await;
+        error
     }
 }
 
 #[cfg(test)]
 mod tests {
-
     use super::super::planning::tests::router;
     use super::*;
     use crate::{
@@ -248,11 +229,11 @@ mod tests {
             let route = request
                 .permissions
                 .iter()
-                .any(|permission| permission.capability == Capability::Targets);
+                .any(|p| p.capability == Capability::Targets);
             let grants = request
                 .permissions
                 .iter()
-                .filter_map(|permission| permission.proposed_grant.clone())
+                .filter_map(|p| p.proposed_grant.clone())
                 .collect();
             self.requests.lock().unwrap().push(request);
             Box::pin(async move {
@@ -262,6 +243,14 @@ mod tests {
                 PolicyDecision::Allow { grants }
             })
         }
+    }
+
+    fn remote_executor(executor: ToolExecutor, router: TargetRouter) -> ToolExecutor {
+        let mut capabilities = CapabilitySet::default();
+        capabilities.insert(Capability::Targets);
+        executor
+            .with_target_router(router)
+            .with_capabilities(capabilities)
     }
 
     fn remote_tool(capabilities: Vec<Capability>) -> ToolRegistryBuilder {
@@ -276,6 +265,19 @@ mod tests {
             )
             .unwrap();
         builder
+    }
+
+    fn targets() -> TargetRegistry {
+        TargetRegistry::from_definitions([TargetDefinition::test("build", "/build", None)]).unwrap()
+    }
+
+    fn spawn_remote(
+        executor: &ToolExecutor,
+        agent: &AgentId,
+    ) -> tokio::task::JoinHandle<Result<ExecutionResult, ExecutionError>> {
+        let (executor, agent) = (executor.clone(), agent.clone());
+        let arguments = serde_json::json!({"target":"build"});
+        tokio::spawn(async move { executor.run_host(&agent, "custom_remote", arguments).await })
     }
 
     #[tokio::test]
@@ -296,8 +298,7 @@ mod tests {
         }
 
         let runtime = crate::tests::TestRuntime::new().await;
-        let policy = Arc::new(crate::tool::policy::AllowAll);
-        let authorization = AuthorizationCoordinator::new(policy.clone());
+        let authorization = AuthorizationCoordinator::new(Arc::new(crate::tool::policy::AllowAll));
         let factory = Arc::new(PendingConnection(AtomicUsize::new(0)));
         let remote = crate::remote::RemoteManager::new(
             crate::remote::EmbeddedShimCatalog::default(),
@@ -305,36 +306,14 @@ mod tests {
             authorization.clone(),
         )
         .with_connection_factory(factory.clone());
-        let router = TargetRouter::new(
-            TargetRegistry::from_definitions([TargetDefinition::test("build", "/build", None)])
-                .unwrap(),
-            remote.clone(),
-            authorization,
+        let router = TargetRouter::new(targets(), remote.clone(), authorization);
+        let executor = remote_executor(
+            runtime.executor(remote_tool(vec![Capability::Exec])),
+            router,
         );
-        let builder = remote_tool(vec![Capability::Exec]);
-        let executor = runtime
-            .executor(builder)
-            .with_target_router(router)
-            .with_capabilities({
-                let mut capabilities = CapabilitySet::default();
-                capabilities.insert(Capability::Targets);
-                capabilities
-            });
-        let mut tasks = tokio::task::JoinSet::new();
-        for _ in 0..5 {
-            let executor = executor.clone();
-            let agent = runtime.agent.clone();
-            tasks.spawn(async move {
-                executor
-                    .execute(
-                        agent,
-                        "custom_remote",
-                        serde_json::json!({"target":"build"}),
-                        None,
-                    )
-                    .await
-            });
-        }
+        let tasks: Vec<_> = (0..5)
+            .map(|_| spawn_remote(&executor, &runtime.agent))
+            .collect();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let jobs = runtime.jobs.list(&runtime.agent).await;
@@ -350,8 +329,8 @@ mod tests {
         .await
         .expect("approved jobs must not appear to await approval during connection startup");
         assert_eq!(runtime.jobs.cancel_all(&runtime.agent).await, 5);
-        while let Some(result) = tasks.join_next().await {
-            assert!(result.unwrap().is_err());
+        for task in tasks {
+            assert!(task.await.unwrap().is_err());
         }
         remote.shutdown().await;
     }
@@ -359,41 +338,19 @@ mod tests {
     #[tokio::test]
     async fn route_approval_uses_the_job_subject_while_job_awaits_approval() {
         let runtime = crate::tests::TestRuntime::new().await;
-        let builder = remote_tool(Vec::new());
-        let targets =
-            TargetRegistry::from_definitions([TargetDefinition::test("build", "/build", None)])
-                .unwrap();
         let policy = Arc::new(BlockingRoutePolicy {
             requests: std::sync::Mutex::new(Vec::new()),
             release: tokio::sync::Notify::new(),
         });
-        let router = router(targets, policy.clone());
+        let root = runtime.root.path().to_path_buf();
         let executor = ToolExecutor::new(
-            builder.build(),
+            remote_tool(Vec::new()).build(),
             policy.clone(),
             runtime.jobs.clone(),
-            runtime.root.path().to_path_buf(),
-        )
-        .with_target_router(router)
-        .with_capabilities({
-            let mut capabilities = CapabilitySet::default();
-            capabilities.insert(Capability::Targets);
-            capabilities
-        });
-        let running = {
-            let executor = executor.clone();
-            let agent = runtime.agent.clone();
-            tokio::spawn(async move {
-                executor
-                    .execute(
-                        agent,
-                        "custom_remote",
-                        serde_json::json!({"target":"build"}),
-                        None,
-                    )
-                    .await
-            })
-        };
+            root,
+        );
+        let executor = remote_executor(executor, router(targets(), policy.clone()));
+        let running = spawn_remote(&executor, &runtime.agent);
         while policy.requests.lock().unwrap().is_empty() {
             tokio::task::yield_now().await;
         }
@@ -403,16 +360,20 @@ mod tests {
             tool_request
                 .permissions
                 .iter()
-                .any(|permission| permission.capability == Capability::Targets)
+                .any(|p| p.capability == Capability::Targets)
         );
-        assert_eq!(tool_request.arguments["tool"]["target"], "build");
-        assert_eq!(tool_request.arguments["route"]["destination"], "build");
-        assert_eq!(tool_request.arguments["route"]["route"][0], "build");
-        assert!(tool_request.arguments.get("workspace").is_none());
+        let arguments = &tool_request.arguments;
+        assert_eq!(arguments["tool"]["target"], "build");
         assert_eq!(
-            runtime.jobs.snapshot(tool_request.job).await.unwrap().state,
-            JobState::AwaitingApproval
+            (
+                &arguments["route"]["destination"],
+                &arguments["route"]["route"][0]
+            ),
+            (&"build".into(), &"build".into())
         );
+        assert!(arguments.get("workspace").is_none());
+        let state = runtime.jobs.snapshot(tool_request.job).await.unwrap().state;
+        assert_eq!(state, JobState::AwaitingApproval);
         runtime.jobs.cancel(tool_request.job).await.unwrap();
         assert!(running.await.unwrap().is_err());
     }

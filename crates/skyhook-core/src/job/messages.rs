@@ -118,6 +118,7 @@ impl JobManager {
     }
 
     /// Last committed *visible* child message, even after acknowledgement/resume.
+    #[cfg(test)]
     pub(crate) async fn last_agent_message(&self, job: JobId) -> Result<Option<u64>, JobError> {
         let jobs = self.inner.jobs.lock().await;
         Ok(jobs
@@ -175,24 +176,19 @@ mod tests {
         let owner = AgentId::root(store.id());
         let child = owner.child(1);
         let manager = JobManager::new(store);
-        let job = manager
-            .test_create(JobSpec {
-                background,
-                ..JobSpec::test(owner.clone(), "agent")
-            })
-            .await;
-        manager
-            .test_append(
-                child.clone(),
-                SessionEvent::AgentStarted {
-                    parent: Some(owner.clone()),
-                    owner_job: Some(job),
-                    model_profile: "test".into(),
-                    max_context: None,
-                    location: ExecutionLocation::root(".".into()),
-                },
-            )
-            .await;
+        let spec = JobSpec {
+            background,
+            ..JobSpec::test(owner.clone(), "agent")
+        };
+        let job = manager.test_create(spec).await;
+        let started = SessionEvent::AgentStarted {
+            parent: Some(owner.clone()),
+            owner_job: Some(job),
+            model_profile: "test".into(),
+            max_context: None,
+            location: ExecutionLocation::root(".".into()),
+        };
+        manager.test_append(child.clone(), started).await;
         manager.transition(job, JobState::Running).await.unwrap();
         (root, manager, owner, child, job)
     }
@@ -201,33 +197,41 @@ mod tests {
         Message::Assistant(vec![AssistantContent::text("text", 0, text)])
     }
 
+    fn runtime_text(text: String) -> Message {
+        Message::User(vec![UserContent::Runtime { text }])
+    }
+
+    fn job_events(items: impl serde::Serialize) -> Message {
+        let items = serde_json::to_string(&items).unwrap();
+        runtime_text(format!(
+            "<skyhook_job_events>\n{items}\n</skyhook_job_events>"
+        ))
+    }
+
     async fn commit(manager: &JobManager, child: &AgentId, job: JobId, text: &str) -> u64 {
+        let message = assistant(text);
         manager
-            .commit_child_message(child, job, assistant(text), text.into())
+            .commit_child_message(child, job, message, text.into())
             .await
             .unwrap()
     }
 
     fn notification(messages: &[AgentMessage], envelopes: &[JobEnvelope]) -> Message {
-        let mut items: Vec<_> = messages
+        let messages = messages.iter().map(|message| {
+            let mut value = serde_json::to_value(message).unwrap();
+            value["kind"] = serde_json::json!("message");
+            value
+        });
+        let envelopes = envelopes
             .iter()
-            .map(|message| {
-                let mut value = serde_json::to_value(message).unwrap();
-                value["kind"] = serde_json::json!("message");
-                value
-            })
-            .collect();
-        items.extend(
-            envelopes
-                .iter()
-                .map(|envelope| serde_json::to_value(envelope).unwrap()),
-        );
-        Message::User(vec![UserContent::Runtime {
-            text: format!(
-                "<skyhook_job_events>\n{}\n</skyhook_job_events>",
-                serde_json::to_string(&items).unwrap()
-            ),
-        }])
+            .map(|envelope| serde_json::to_value(envelope).unwrap());
+        job_events(messages.chain(envelopes).collect::<Vec<_>>())
+    }
+
+    /// Acknowledge everything the receipt presents.
+    async fn ack(receipt: PendingDelivery) {
+        let message = notification(receipt.messages(), receipt.envelopes());
+        receipt.commit(message).await.unwrap();
     }
 
     async fn finish(manager: &JobManager, job: JobId) {
@@ -244,6 +248,10 @@ mod tests {
             .collect()
     }
 
+    async fn first_pending(manager: &JobManager, owner: &AgentId) -> AgentMessage {
+        manager.pending_delivery(owner).await.unwrap().messages()[0].clone()
+    }
+
     #[tokio::test]
     async fn messages_are_independent_of_claims_and_foreground_lifecycle() {
         let (_root, manager, owner, child, job) = child_job(false).await;
@@ -258,29 +266,19 @@ mod tests {
         let receipt = manager.pending_delivery(&owner).await.unwrap();
         assert!(receipt.envelopes().is_empty());
         assert_eq!(sequences(&receipt), vec![first, second]);
-        receipt
-            .commit(notification(&receipt.messages()[..1], &[]))
-            .await
-            .unwrap();
-        drop(receipt);
+        let acknowledgement = notification(&receipt.messages()[..1], &[]);
+        receipt.commit(acknowledgement).await.unwrap();
         let restored = manager.test_replay().await;
         let receipt = restored.pending_delivery(&owner).await.unwrap();
-        assert_eq!(receipt.messages().len(), 1);
-        assert_eq!(receipt.messages()[0].message, second);
-        receipt
-            .commit(notification(receipt.messages(), &[]))
-            .await
-            .unwrap();
-        drop(receipt);
+        assert_eq!(sequences(&receipt), [second]);
+        ack(receipt).await;
         assert!(!restored.has_pending(&owner).await);
         assert_eq!(
             restored.last_agent_message(job).await.unwrap(),
             Some(second)
         );
-        assert_eq!(
-            restored.snapshot(job).await.unwrap().output,
-            Some(serde_json::json!("saved result"))
-        );
+        let output = restored.snapshot(job).await.unwrap().output;
+        assert_eq!(output, Some(serde_json::json!("saved result")));
         assert!(!restored.test_replay().await.has_pending(&owner).await);
     }
 
@@ -296,35 +294,26 @@ mod tests {
             },
         });
         // Simulate a crash after committing history but before in-memory publication.
+        let message = Message::Assistant(vec![item]);
         let source = manager
-            .test_append(
-                child.clone(),
-                SessionEvent::MessageCommitted {
-                    message: Message::Assistant(vec![item]),
-                },
-            )
+            .test_append(child.clone(), SessionEvent::MessageCommitted { message })
             .await;
         commit(&manager, &child, job, "").await;
         finish(&manager, job).await;
         let restored = manager.test_replay().await;
         let receipt = restored.pending_delivery(&owner).await.unwrap();
-        assert_eq!(
-            receipt.messages(),
-            &[AgentMessage {
-                id: job,
-                name: None,
-                message: source,
-                text: "visible".into()
-            }]
-        );
-        let ack = notification(receipt.messages(), &[]);
+        let expected = AgentMessage {
+            id: job,
+            name: None,
+            message: source,
+            text: "visible".into(),
+        };
+        assert_eq!(receipt.messages(), &[expected]);
+        let message = notification(receipt.messages(), &[]);
         drop(receipt);
         // Simulate a crash after parent history append but before in-memory ACK.
         manager
-            .test_append(
-                owner.clone(),
-                SessionEvent::MessageCommitted { message: ack },
-            )
+            .test_append(owner.clone(), SessionEvent::MessageCommitted { message })
             .await;
         let restored = manager.test_replay().await;
         assert!(!restored.has_pending(&owner).await);
@@ -341,10 +330,9 @@ mod tests {
         finish(&manager, job).await;
         drop(manager.pending_delivery(&owner).await.unwrap());
         let mut receipt = manager.pending_delivery(&owner).await.unwrap();
-        let ack = notification(receipt.messages(), receipt.envelopes());
+        let message = notification(receipt.messages(), receipt.envelopes());
         receipt.owner = AgentId::root(crate::identity::SessionId::generate().unwrap());
-        assert!(receipt.commit(ack).await.is_err());
-        drop(receipt);
+        assert!(receipt.commit(message).await.is_err());
         for state in [manager.clone(), manager.test_replay().await] {
             let receipt = state.pending_delivery(&owner).await.unwrap();
             assert_eq!(sequences(&receipt), [sequence]);
@@ -352,53 +340,52 @@ mod tests {
         }
     }
 
+    /// Message and lifecycle batches share one byte budget; later batches rewake
+    /// the owner and completion never overtakes undelivered messages.
     #[tokio::test]
     async fn bounded_batches_rewake_and_do_not_overtake_messages_with_completion() {
-        let (_root, manager, owner, child, job) = child_job(true).await;
-        let mut sequences = Vec::new();
-        for _ in 0..3 {
-            sequences.push(commit(&manager, &child, job, &"x".repeat(5000)).await);
-        }
-        finish(&manager, job).await;
-        let mut wakes = manager.subscribe_completions();
-        for (index, sequence) in sequences.into_iter().enumerate() {
-            let receipt = manager.pending_delivery(&owner).await.unwrap();
-            assert_eq!(receipt.messages().len(), 1);
-            assert_eq!(receipt.messages()[0].message, sequence);
-            assert_eq!(receipt.envelopes().len(), usize::from(index == 2));
-            receipt
-                .commit(notification(receipt.messages(), receipt.envelopes()))
-                .await
-                .unwrap();
-            drop(receipt);
-            if index < 2 {
-                assert_eq!(wakes.try_recv().unwrap().job, job);
+        // (message sizes, expected (messages, envelopes) per batch)
+        let cases = [
+            (vec![5000; 3], vec![(1, 0), (1, 0), (1, 1)]),
+            (vec![9000], vec![(1, 0), (0, 1)]),
+        ];
+        for (sizes, batches) in cases {
+            let (_root, manager, owner, child, job) = child_job(true).await;
+            let mut pending = Vec::new();
+            for size in sizes {
+                pending.push(commit(&manager, &child, job, &"x".repeat(size)).await);
             }
+            finish(&manager, job).await;
+            let mut wakes = manager.subscribe_completions();
+            for (index, (messages, envelopes)) in batches.iter().enumerate() {
+                let receipt = manager.pending_delivery(&owner).await.unwrap();
+                assert_eq!(
+                    sequences(&receipt),
+                    pending.drain(..*messages).collect::<Vec<_>>()
+                );
+                assert_eq!(receipt.envelopes().len(), *envelopes);
+                ack(receipt).await;
+                if index + 1 < batches.len() {
+                    assert_eq!(wakes.try_recv().unwrap().job, job);
+                }
+            }
+            assert!(!manager.has_pending(&owner).await);
+            assert!(wakes.try_recv().is_err());
+            assert!(!manager.test_replay().await.has_pending(&owner).await);
         }
-        assert!(!manager.has_pending(&owner).await);
-        assert!(wakes.try_recv().is_err());
-        assert!(!manager.test_replay().await.has_pending(&owner).await);
     }
 
     #[tokio::test]
     async fn message_ack_does_not_claim_lifecycle_and_resume_does_not_claim_messages() {
         let (_root, manager, owner, child, job) = child_job(true).await;
         let first = commit(&manager, &child, job, "before question").await;
-        manager
-            .request_input(job, serde_json::json!({"question":"continue?"}))
-            .await
-            .unwrap();
+        let question = serde_json::json!({"question":"continue?"});
+        manager.request_input(job, question).await.unwrap();
         let receipt = manager.pending_delivery(&owner).await.unwrap();
-        let malicious_state = Message::User(vec![UserContent::Runtime {
-            text: format!(
-                "<skyhook_job_events>\n{}\n</skyhook_job_events>",
-                serde_json::json!([{
-                    "kind":"message", "id":job, "message":first, "text":"before question", "state":"waiting_input"
-                }])
-            ),
-        }]);
+        let malicious_state = job_events(serde_json::json!([{
+            "kind":"message", "id":job, "message":first, "text":"before question", "state":"waiting_input"
+        }]));
         receipt.commit(malicious_state).await.unwrap();
-        drop(receipt);
         assert_eq!(
             manager
                 .pending_delivery(&owner)
@@ -420,10 +407,7 @@ mod tests {
             restored.last_agent_message(job).await.unwrap(),
             Some(second)
         );
-        assert_eq!(
-            restored.pending_delivery(&owner).await.unwrap().messages()[0].message,
-            second
-        );
+        assert_eq!(first_pending(&restored, &owner).await.message, second);
     }
 
     #[tokio::test]
@@ -431,12 +415,9 @@ mod tests {
         let (_root, manager, owner, child, job) = child_job(false).await;
         let receipt = manager.pending_delivery(&owner).await.unwrap();
         let mut wakes = manager.subscribe_completions();
-        let mut pending = Box::pin(manager.commit_child_message(
-            &child,
-            job,
-            assistant("survives"),
-            "survives".into(),
-        ));
+        let message = assistant("survives");
+        let mut pending =
+            Box::pin(manager.commit_child_message(&child, job, message, "survives".into()));
         // Poll through the internal spawn, then cancel the caller while the spawned
         // transaction is waiting on the receipt's delivery gate.
         assert!(
@@ -451,19 +432,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            manager.pending_delivery(&owner).await.unwrap().messages()[0].text,
-            "survives"
-        );
+        assert_eq!(first_pending(&manager, &owner).await.text, "survives");
         finish(&manager, job).await;
         assert_eq!(
-            manager
-                .test_replay()
+            first_pending(&manager.test_replay().await, &owner)
                 .await
-                .pending_delivery(&owner)
-                .await
-                .unwrap()
-                .messages()[0]
                 .text,
             "survives"
         );
@@ -478,12 +451,9 @@ mod tests {
             (owner.child(2), "visible"),
             (owner.clone(), "visible"),
         ] {
-            assert!(
-                manager
-                    .commit_child_message(&author, job, assistant("visible"), projection.into())
-                    .await
-                    .is_err()
-            );
+            let message = assistant("visible");
+            let result = manager.commit_child_message(&author, job, message, projection.into());
+            assert!(result.await.is_err());
         }
         assert_eq!(manager.store().records().await.len(), before);
         let mut wakes = manager.subscribe_completions();
@@ -500,32 +470,17 @@ mod tests {
         commit(&manager, &child, job, "reply").await;
         finish(&manager, job).await;
         let receipt = manager.pending_delivery(&owner).await.unwrap();
-        let text = format!(
-            "<skyhook_agent_messages>\n{}\n</skyhook_agent_messages>",
-            serde_json::to_string(receipt.messages()).unwrap()
-        );
-        receipt
-            .commit(Message::User(vec![UserContent::Text {
-                text: text.clone(),
-            }]))
-            .await
-            .unwrap();
-        drop(receipt);
+        let messages = serde_json::to_string(receipt.messages()).unwrap();
+        let text = format!("<skyhook_agent_messages>\n{messages}\n</skyhook_agent_messages>");
+        let user_text = Message::User(vec![UserContent::Text { text: text.clone() }]);
+        receipt.commit(user_text).await.unwrap();
+        let message = runtime_text(text.clone());
         manager
-            .test_append(
-                child,
-                SessionEvent::MessageCommitted {
-                    message: Message::User(vec![UserContent::Runtime { text: text.clone() }]),
-                },
-            )
+            .test_append(child, SessionEvent::MessageCommitted { message })
             .await;
         assert!(manager.test_replay().await.has_pending(&owner).await);
         let receipt = manager.pending_delivery(&owner).await.unwrap();
-        receipt
-            .commit(Message::User(vec![UserContent::Runtime { text }]))
-            .await
-            .unwrap();
-        drop(receipt);
+        receipt.commit(runtime_text(text)).await.unwrap();
         assert!(!manager.test_replay().await.has_pending(&owner).await);
     }
 
@@ -538,30 +493,23 @@ mod tests {
         manager
             .test_finish(job, serde_json::json!("large".repeat(10000)))
             .await;
-        let ordinary = manager
-            .test_create(JobSpec {
-                background: true,
-                ..JobSpec::test(owner.clone(), "ordinary")
-            })
-            .await;
+        let spec = JobSpec {
+            background: true,
+            ..JobSpec::test(owner.clone(), "ordinary")
+        };
+        let ordinary = manager.test_create(spec).await;
         finish(&manager, ordinary).await;
         assert!(job < ordinary);
         let receipt = manager.pending_delivery(&owner).await.unwrap();
         assert_eq!(receipt.messages().len(), 2);
-        assert_eq!(
-            receipt
-                .envelopes()
-                .iter()
-                .map(|envelope| envelope.id)
-                .collect::<Vec<_>>(),
-            vec![ordinary]
-        );
+        let envelopes: Vec<_> = receipt
+            .envelopes()
+            .iter()
+            .map(|envelope| envelope.id)
+            .collect();
+        assert_eq!(envelopes, [ordinary]);
         assert!(messages::batch_size(receipt.messages()) < DELIVERY_BATCH_BYTES);
-        receipt
-            .commit(notification(receipt.messages(), receipt.envelopes()))
-            .await
-            .unwrap();
-        drop(receipt);
+        ack(receipt).await;
         assert!(manager.has_pending(&owner).await);
     }
 
@@ -576,33 +524,20 @@ mod tests {
                 .await;
             // Old final replies were delivered as lifecycle `result`, without a
             // message discriminator/source sequence or the new last_message field.
+            let message =
+                job_events(serde_json::json!([{"id":job, "state":"completed", "result":result}]));
             manager
-                .test_append(
-                    owner.clone(),
-                    SessionEvent::MessageCommitted {
-                        message: Message::User(vec![UserContent::Runtime {
-                            text: format!(
-                                "<skyhook_job_events>\n{}\n</skyhook_job_events>",
-                                serde_json::json!([{
-                                    "id":job, "state":"completed", "result":result
-                                }])
-                            ),
-                        }]),
-                    },
-                )
+                .test_append(owner.clone(), SessionEvent::MessageCommitted { message })
                 .await;
             let restored = manager.test_replay().await;
             let receipt = restored.pending_delivery(&owner).await.unwrap();
             assert!(receipt.envelopes().is_empty());
-            let pending = sequences(&receipt);
-            assert_eq!(
-                pending,
-                if result == "final reply" {
-                    vec![first]
-                } else {
-                    vec![first, last]
-                }
-            );
+            let expected = if result == "final reply" {
+                vec![first]
+            } else {
+                vec![first, last]
+            };
+            assert_eq!(sequences(&receipt), expected);
             assert_eq!(restored.last_agent_message(job).await.unwrap(), Some(last));
         }
     }
@@ -616,37 +551,12 @@ mod tests {
                 .test_finish(job, serde_json::json!("final reply"))
                 .await;
             manager.claim(job).await.unwrap();
-            let restored = manager.test_replay().await;
             assert_eq!(
-                restored.pending_delivery(&owner).await.unwrap().messages()[0].message,
+                first_pending(&manager.test_replay().await, &owner)
+                    .await
+                    .message,
                 last
             );
         }
-    }
-
-    #[tokio::test]
-    async fn oversized_message_defers_lifecycle_to_next_shared_budget_and_rewakes() {
-        let (_root, manager, owner, child, job) = child_job(true).await;
-        commit(&manager, &child, job, &"x".repeat(9000)).await;
-        finish(&manager, job).await;
-        let mut wakes = manager.subscribe_completions();
-        let receipt = manager.pending_delivery(&owner).await.unwrap();
-        assert_eq!(receipt.messages().len(), 1);
-        assert!(receipt.envelopes().is_empty());
-        receipt
-            .commit(notification(receipt.messages(), &[]))
-            .await
-            .unwrap();
-        drop(receipt);
-        assert_eq!(wakes.try_recv().unwrap().job, job);
-        let receipt = manager.pending_delivery(&owner).await.unwrap();
-        assert!(receipt.messages().is_empty());
-        assert_eq!(receipt.envelopes().len(), 1);
-        receipt
-            .commit(notification(&[], receipt.envelopes()))
-            .await
-            .unwrap();
-        drop(receipt);
-        assert!(!manager.has_pending(&owner).await);
     }
 }

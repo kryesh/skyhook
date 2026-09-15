@@ -1,6 +1,7 @@
 //! Anthropic Messages request encoding.
-use super::super::common::{anthropic_image, invalid, opaque_payload, tool_text};
+use super::super::common::{anthropic_image, attachment_text, invalid, opaque_payload, tool_text};
 use super::native::validate_thinking;
+use crate::media::AttachmentRef;
 use crate::provider::{
     ProviderError,
     protocol::{BlockContent, ItemKind, Message, ModelRequest, UserContent},
@@ -41,7 +42,7 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
         body["system"] = Value::Array(system);
     }
     let mut messages: Vec<Value> = Vec::new();
-    for message in &request.messages {
+    for message in request.messages() {
         let (role, content) = match message {
             Message::User(items) => {
                 let mut blocks = Vec::new();
@@ -51,7 +52,12 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
                         | UserContent::Runtime { text }
                         | UserContent::ParentInput { text }
                         | UserContent::Compaction { text } => json!({"type":"text", "text":text}),
-                        UserContent::Image { image } => anthropic_image(image)?,
+                        UserContent::Attachment { attachment } => match attachment {
+                            AttachmentRef::Image(image) => anthropic_image(request, image)?,
+                            AttachmentRef::Text(text) => {
+                                json!({"type":"text", "text":attachment_text(request, text)?})
+                            }
+                        },
                     });
                 }
                 ("user", blocks)
@@ -74,15 +80,7 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
                             // Unsigned/foreign private reasoning is display-only.
                             BlockContent::Reasoning { .. } => {}
                             BlockContent::ToolCall(call) => {
-                                if call.id.is_empty()
-                                    || call.name.is_empty()
-                                    || !call.arguments.is_object()
-                                {
-                                    return Err(invalid(
-                                        "Anthropic tool calls require nonempty id/name and object arguments",
-                                    ));
-                                }
-                                blocks.push(json!({"type":"tool_use", "id":call.id, "name":call.name, "input":call.arguments}));
+                                blocks.push(json!({"type":"tool_use", "id":call.id(), "name":call.name(), "input":call.arguments()}));
                             }
                         }
                     }
@@ -97,7 +95,7 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
                     }
                     let mut content = vec![json!({"type":"text", "text":tool_text(result)})];
                     for image in &result.images {
-                        content.push(anthropic_image(image)?);
+                        content.push(anthropic_image(request, image)?);
                     }
                     blocks.push(json!({"type":"tool_result", "tool_use_id":result.call_id,
                         "content":content, "is_error":result.is_error}));
@@ -196,11 +194,13 @@ mod tests {
     use super::*;
     use crate::provider::backends::common::reasoning_envelope;
     use crate::{
-        media::ImageReference,
+        media::{AttachmentRef, BlobRef, ImageFormat, ImageRef, TextRef},
         provider::protocol::{
-            AssistantItem, ResponseSchema, SystemSegment, ToolCall, ToolDefinition, ToolResult,
+            AssistantBlock, AssistantItem, BlockContent, ReplayEnvelope, ResponseSchema,
+            SystemSegment, ToolCall, ToolDefinition, ToolResult,
         },
     };
+
     fn request() -> ModelRequest {
         ModelRequest {
             correlation: Some("local-trace".into()),
@@ -208,18 +208,28 @@ mod tests {
         }
     }
 
-    fn image() -> ImageReference {
-        ImageReference {
-            sha256: "hash".into(),
-            media_type: "image/png".into(),
-            name: "test.png".into(),
-            bytes: 1,
-            data_base64: Some("eA==".into()),
-        }
+    fn text(text: &str) -> UserContent {
+        UserContent::Text { text: text.into() }
+    }
+
+    fn continue_after(item: AssistantItem) -> Vec<Message> {
+        vec![
+            Message::Assistant(vec![item]),
+            Message::User(vec![text("continue")]),
+        ]
     }
 
     #[test]
     fn request_maps_native_schema_tools_system_cache_and_adaptive_effort() {
+        let image = ImageRef {
+            file: Some("image.png".into()),
+            format: ImageFormat::Png,
+            blob: BlobRef::of(b"x"),
+        };
+        let notes = TextRef {
+            file: Some("notes.txt".into()),
+            blob: BlobRef::of(b"notes"),
+        };
         let mut request = request();
         request.system = vec![SystemSegment {
             text: "cached".into(),
@@ -230,35 +240,33 @@ mod tests {
             description: "Look".into(),
             input_schema: json!({"type":"object"}),
         }];
+        let schema = json!({"type":"object", "properties":{}, "additionalProperties":false});
         request.response_schema = Some(ResponseSchema {
             name: "answer".into(),
-            schema: json!({"type":"object", "properties":{}, "additionalProperties":false}),
+            schema: schema.clone(),
         });
         request.reasoning = Some("high".into());
-        request.messages = vec![
+        let attach = |attachment| UserContent::Attachment { attachment };
+        let call = ToolCall::new("tool_1", "look", json!({"path":"test.png"})).unwrap();
+        request.history = vec![
             Message::User(vec![
-                UserContent::Text {
-                    text: "look".into(),
-                },
-                UserContent::Image { image: image() },
+                text("look"),
+                attach(AttachmentRef::Image(image.clone())),
+                attach(AttachmentRef::Text(notes.clone())),
             ]),
-            Message::Assistant(vec![AssistantItem::tool_call(
-                "0",
-                0,
-                ToolCall {
-                    id: "tool_1".into(),
-                    name: "look".into(),
-                    arguments: json!({"path":"test.png"}),
-                },
-            )]),
+            Message::Assistant(vec![AssistantItem::tool_call("0", 0, call)]),
             Message::Tool(vec![ToolResult {
                 call_id: "tool_1".into(),
                 name: "look".into(),
                 result: json!({"ok":false, "error":null}),
-                images: vec![image()],
+                images: vec![image.clone()],
                 is_error: true,
             }]),
         ];
+        assert!(encode(&request).is_err());
+        // Load the fixture blobs as the session store would.
+        request.blobs.insert(image.blob, b"x".to_vec());
+        request.blobs.insert(notes.blob, b"notes".to_vec());
         let body = encode(&request).unwrap();
         assert_eq!(body["max_tokens"], 8192);
         assert_eq!(
@@ -269,18 +277,22 @@ mod tests {
             body["tools"][0]["input_schema"],
             request.tools[0].input_schema
         );
-        assert_eq!(
-            body["output_config"]["format"]["schema"],
-            request.response_schema.unwrap().schema
-        );
+        assert_eq!(body["output_config"]["format"]["schema"], schema);
         assert_eq!(body["output_config"]["effort"], "high");
         assert_eq!(body["thinking"], json!({"type":"adaptive"}));
-        assert_eq!(body["messages"][0]["content"][0]["text"], "look");
-        assert_eq!(body["messages"][0]["content"][1]["source"]["data"], "eA==");
+        let user = &body["messages"][0]["content"];
+        assert_eq!(user[0]["text"], "look");
+        assert_eq!(user[1]["source"]["data"], "eA==");
+        assert_eq!(
+            user[2],
+            json!({"type":"text", "text":"File: notes.txt\nnotes"})
+        );
         assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
         let result = &body["messages"][2]["content"][0];
-        assert_eq!(result["tool_use_id"], "tool_1");
-        assert_eq!(result["is_error"], true);
+        assert_eq!(
+            (&result["tool_use_id"], &result["is_error"]),
+            (&json!("tool_1"), &json!(true))
+        );
         let text: Value =
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(text, json!({"result":{"ok":false},"is_error":true}));
@@ -289,20 +301,20 @@ mod tests {
 
     #[test]
     fn opaque_reasoning_replays_only_matching_version_protocol_and_model() {
-        use crate::provider::protocol::AssistantBlock;
         let native = json!({"type":"thinking", "thinking":"private", "signature":"signature", "future_field":42});
         let mut request = request();
         let envelope = reasoning_envelope("anthropic", &request.model, native.clone());
+        let mutations: [fn(&mut ReplayEnvelope); 3] = [
+            |envelope| envelope.version = 2,
+            |envelope| envelope.protocol = "responses".into(),
+            |envelope| envelope.model = "another-model".into(),
+        ];
         let mut envelopes = vec![(Some(envelope.clone()), true), (None, false)];
-        let mut foreign = envelope.clone();
-        foreign.version = 2;
-        envelopes.push((Some(foreign), false));
-        let mut foreign = envelope.clone();
-        foreign.protocol = "responses".into();
-        envelopes.push((Some(foreign), false));
-        let mut foreign = envelope.clone();
-        foreign.model = "another-model".into();
-        envelopes.push((Some(foreign), false));
+        envelopes.extend(mutations.map(|mutate| {
+            let mut foreign = envelope.clone();
+            mutate(&mut foreign);
+            (Some(foreign), false)
+        }));
         for (replay, matches) in envelopes {
             let mut item = AssistantItem::reasoning("r", 0, "visible", replay);
             item.blocks.push(AssistantBlock {
@@ -312,12 +324,7 @@ mod tests {
                     text: "second summary".into(),
                 },
             });
-            request.messages = vec![
-                Message::Assistant(vec![item]),
-                Message::User(vec![UserContent::Text {
-                    text: "continue".into(),
-                }]),
-            ];
+            request.history = continue_after(item);
             let body = encode(&request).unwrap();
             if matches {
                 assert_eq!(body["messages"][0]["content"], json!([native]));
@@ -326,16 +333,33 @@ mod tests {
                 assert!(!body.to_string().contains("private"));
             }
         }
-        request.messages = vec![Message::Assistant(vec![AssistantItem::reasoning(
-            "r",
-            0,
-            "",
-            Some(reasoning_envelope(
-                "anthropic",
-                &request.model,
-                json!({"type":"thinking","thinking":"x"}),
-            )),
-        )])];
+        let unsigned = json!({"type":"thinking","thinking":"x"});
+        let unsigned = reasoning_envelope("anthropic", &request.model, unsigned);
+        let item = AssistantItem::reasoning("r", 0, "", Some(unsigned));
+        request.history = vec![Message::Assistant(vec![item])];
         assert!(encode(&request).is_err());
+    }
+
+    #[test]
+    fn empty_and_replay_only_reasoning_keep_historical_behavior() {
+        let mut request = request();
+        let native = json!({"type":"redacted_thinking", "data":"opaque"});
+        let envelope = reasoning_envelope("anthropic", &request.model, native.clone());
+        for replay in [None, Some(envelope)] {
+            let has_replay = replay.is_some();
+            request.history = continue_after(AssistantItem {
+                id: "r".into(),
+                position: 0,
+                kind: ItemKind::Reasoning,
+                blocks: vec![],
+                replay,
+            });
+            let body = encode(&request).unwrap();
+            let messages = body["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 1 + usize::from(has_replay));
+            if has_replay {
+                assert_eq!(messages[0]["content"], json!([native]));
+            }
+        }
     }
 }

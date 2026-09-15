@@ -2,7 +2,7 @@
 use super::super::super::tool_view;
 use super::super::{Palette, wrap_line, wrap_words};
 use super::parser::{LineInfo, parse};
-use super::{CodeRow, LayoutLine, RowLayout};
+use super::{CodeGeometry, LayoutLine, RowLayout};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -22,17 +22,13 @@ pub(in super::super) fn layout_highlighted(
     let mut parsed = parse(text, palette, placeholder, markdown_width, cache);
     if !prefix.is_empty() && !parsed.lines.is_empty() {
         if super::super::stream::starts_with_table(text) {
-            parsed.lines.insert(0, Line::from(prefix.to_owned()));
-            parsed.info = parsed
-                .info
-                .into_iter()
-                .map(|(index, info)| (index + 1, info))
-                .collect();
+            parsed.lines.insert(0, Line::from(prefix.to_owned()).into());
         } else {
             parsed.lines[0]
+                .line
                 .spans
                 .insert(0, Span::raw(prefix.to_owned()));
-            let info = parsed.info.entry(0).or_default();
+            let info = &mut parsed.lines[0].info;
             if info.prefix_spans > 0 || info.code.is_some() {
                 info.prefix_spans += 1;
             }
@@ -43,8 +39,7 @@ pub(in super::super) fn layout_highlighted(
     let mut input = parsed
         .lines
         .into_iter()
-        .enumerate()
-        .map(|(index, line)| (line, parsed.info.remove(&index).unwrap_or_default()))
+        .map(|parsed| (parsed.line, parsed.info))
         .peekable();
     let mut output = Vec::new();
     while let Some((line, info)) = input.next() {
@@ -66,7 +61,6 @@ pub(in super::super) fn layout_highlighted(
                 .max()
                 .unwrap_or(0)
                 .min(width.saturating_sub(1));
-            let available = width.saturating_sub(indent).max(1);
             let longest = block
                 .iter()
                 .map(|(line, info)| {
@@ -79,7 +73,6 @@ pub(in super::super) fn layout_highlighted(
                 })
                 .max()
                 .unwrap_or(0);
-            let block_width = longest.saturating_add(2).min(available);
             // Very narrow containers prioritize a source grapheme over padding.
             let widest = block
                 .iter()
@@ -88,19 +81,12 @@ pub(in super::super) fn layout_highlighted(
                 .map(|g| g.width())
                 .max()
                 .unwrap_or(0);
-            let padding = usize::from(block_width >= widest.saturating_add(2));
-            let code = CodeRow {
-                indent,
-                width: block_width,
-                padding,
-            };
+            let code = CodeGeometry::new(width, indent, longest, widest);
             let decoration = LayoutLine {
-                layout: RowLayout {
-                    prefix: clipped_prefix(block[0].1.continuation.clone(), indent),
-                    code: Some(code),
-                    decorative: true,
-                    ..RowLayout::default()
-                },
+                layout: RowLayout::decoration(
+                    clipped_prefix(block[0].1.continuation.clone(), indent),
+                    code,
+                ),
                 ..LayoutLine::default()
             };
             output.push(decoration.clone());
@@ -139,7 +125,7 @@ fn layout_source(
     mut line: Line<'static>,
     info: LineInfo,
     width: usize,
-    code: Option<CodeRow>,
+    code: Option<CodeGeometry>,
     output: &mut Vec<LayoutLine>,
 ) {
     let body = line
@@ -154,7 +140,7 @@ fn layout_source(
     let indent = source_prefix_width.max(continuation.width());
     let budget = code.map_or_else(
         || width.saturating_sub(indent).max(1),
-        |code| code.width.saturating_sub(code.padding * 2).max(1),
+        |code| code.body_width().max(1),
     );
     let body = Line {
         spans: body,
@@ -175,18 +161,17 @@ fn layout_source(
         }
         output.push(LayoutLine {
             line: body,
-            continued: !first,
-            layout: RowLayout {
-                prefix: if first {
+            layout: RowLayout::source(
+                if first {
                     Line::default()
                 } else {
                     continuation.clone()
                 },
-                source_prefix: if first { source_prefix } else { 0 },
-                source_prefix_width: if first { source_prefix_width } else { 0 },
+                if first { source_prefix } else { 0 },
+                if first { source_prefix_width } else { 0 },
                 code,
-                decorative: false,
-            },
+            )
+            .with_flow(false, !first),
         });
     }
 }
@@ -199,119 +184,79 @@ mod tests {
 
     /// Exercise the paint path: source strings alone cannot reveal a gap
     /// inserted by source_prefix_width or decorative continuation prefixes.
-    fn painted_markdown(text: &str, width: u16, p: Palette) -> Vec<String> {
+    fn painted_markdown(text: &str) -> Vec<String> {
         use super::super::super::{
-            Row, RowBlocks, Surface, TextPosition, render_row_line, selected_text,
+            Row, RowBlocks, TextPosition, render_row_line, selected_text, tests::fixture_row,
         };
         use ratatui::{buffer::Buffer, layout::Rect};
-
-        let rows: Vec<Row> =
-            layout_highlighted(text, p, false, width as usize, width as usize, "", None)
-                .into_iter()
-                .map(|line| Row {
-                    line: std::sync::Arc::new(line.line),
-                    header: false,
-                    x: 0,
-                    width,
-                    surface: Surface::Tool,
-                    entry: 0,
-                    selectable: true,
-                    blank: false,
-                    continued: line.continued,
-                    layout: line.layout,
-                    inset: 0,
-                })
-                .collect();
+        let (p, width) = (Palette::new(), 12);
+        let lines = layout_highlighted(text, p, false, width as usize, width as usize, "", None);
+        let rows: Vec<Row> = lines
+            .into_iter()
+            .map(|line| fixture_row(line.line, line.layout, 0, width, 0))
+            .collect();
         let mut blocks = RowBlocks::default();
-        *blocks.block_mut(0) = rows.clone();
-        blocks.finish_update(0);
+        blocks.replace_entry(0, rows.clone(), Vec::new());
+        let end = TextPosition {
+            row: rows.len() - 1,
+            byte: usize::MAX,
+        };
+        let copied = selected_text(&blocks, (TextPosition { row: 0, byte: 0 }, end));
+        let source = render(text, p, false, width as usize);
+        let source: Vec<_> = source.iter().map(ToString::to_string).collect();
         assert_eq!(
-            selected_text(
-                &blocks,
-                (
-                    TextPosition { row: 0, byte: 0 },
-                    TextPosition {
-                        row: rows.len() - 1,
-                        byte: usize::MAX,
-                    },
-                ),
-            ),
-            strings(&render(text, p, false, width as usize)).join("\n"),
-            "wrapping/prefix geometry must not change copied source: {text:?}",
+            copied,
+            source.join("\n"),
+            "wrapping/prefix geometry must not change copied source: {text:?}"
         );
         rows.iter()
             .map(|row| {
                 let area = Rect::new(0, 0, width, 1);
                 let mut buffer = Buffer::empty(area);
                 render_row_line(row, area, &mut buffer, Style::default(), p);
-                (0..width)
-                    .map(|x| buffer[(x, 0)].symbol())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_owned()
+                let painted: String = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
+                painted.trim_end().to_owned()
             })
             .collect()
     }
 
     #[test]
-    fn task_descendant_markers_do_not_inherit_checkbox_hanging_indent() {
+    fn task_descendants_use_only_their_own_container_prefix_and_hanging_indent() {
         for (text, expected) in [
-            ("- [ ] task\n  - child", vec!["• [ ] task", "  • child"]),
-            ("- [ ] task\n  > quoted", vec!["• [ ] task", "  │ quoted"]),
-            (
-                "- [ ] task\n\n  10. child",
-                vec!["• [ ] task", "  10. child"],
-            ),
-            ("- [ ] task\n  - [x] hi", vec!["• [ ] task", "  • [x] hi"]),
+            ("- [ ] task\n  - child", &["• [ ] task", "  • child"][..]),
+            ("- [ ] task\n  > quoted", &["• [ ] task", "  │ quoted"]),
+            ("- [ ] task\n\n  10. child", &["• [ ] task", "  10. child"]),
+            ("- [ ] task\n  - [x] hi", &["• [ ] task", "  • [x] hi"]),
             (
                 "> - [ ] task\n>   - child",
-                vec!["│ • [ ] task", "│   • child"],
+                &["│ • [ ] task", "│   • child"],
             ),
-            ("- [ ] task\n  > - child", vec!["• [ ] task", "  │ • child"]),
+            ("- [ ] task\n  > - child", &["• [ ] task", "  │ • child"]),
             (
                 "10. [ ] task\n    - child",
-                vec!["10. [ ] task", "    • child"],
+                &["10. [ ] task", "    • child"],
             ),
-        ] {
-            assert_eq!(
-                painted_markdown(text, 12, Palette::new()),
-                expected,
-                "{text:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn task_descendant_wrapping_uses_only_its_own_container_prefix() {
-        for (text, expected) in [
+            // Wrapped descendants hang beneath their own markers only.
             (
                 "- [ ] task\n  - child one",
-                vec!["• [ ] task", "  • child", "    one"],
+                &["• [ ] task", "  • child", "    one"],
             ),
             (
                 "- [ ] task\n  > quoted one",
-                vec!["• [ ] task", "  │ quoted", "  │ one"],
+                &["• [ ] task", "  │ quoted", "  │ one"],
             ),
             // Nested tasks retain their own checkbox's hanging width.
             (
                 "- [ ] task\n  - [x] one two",
-                vec!["• [ ] task", "  • [x] one", "        two"],
+                &["• [ ] task", "  • [x] one", "        two"],
             ),
             // The task paragraph still hangs beneath its checkbox.
             (
                 "- [ ] alpha beta\n  gamma",
-                vec!["• [ ] alpha", "      beta", "      gamma"],
+                &["• [ ] alpha", "      beta", "      gamma"],
             ),
         ] {
-            assert_eq!(
-                painted_markdown(text, 12, Palette::new()),
-                expected,
-                "{text:?}"
-            );
+            assert_eq!(painted_markdown(text), expected, "{text:?}");
         }
-    }
-
-    fn strings(lines: &[Line<'_>]) -> Vec<String> {
-        lines.iter().map(ToString::to_string).collect()
     }
 }

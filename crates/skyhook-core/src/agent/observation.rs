@@ -269,110 +269,44 @@ mod tests {
     };
 
     fn emit(hub: &RuntimeEvents, agent: &AgentId, event: ResponseEvent) {
+        let (agent, request) = (agent.clone(), 7);
         hub.send(RuntimeEvent::ResponseEvent {
-            agent: agent.clone(),
-            request: 7,
+            agent,
+            request,
             event,
         });
     }
 
-    fn start_block(
-        hub: &RuntimeEvents,
-        agent: &AgentId,
-        item: &str,
-        block: &str,
-        position: usize,
-        kind: BlockKind,
-    ) {
-        emit(
-            hub,
-            agent,
-            ResponseEvent::BlockStarted {
-                item: item.into(),
-                id: block.into(),
-                position,
-                kind,
-            },
-        );
+    fn delta(hub: &RuntimeEvents, agent: &AgentId, text: &str) {
+        let delta = ContentDelta::Text(text.into());
+        let (item, block) = ("text".into(), "text".into());
+        emit(hub, agent, ResponseEvent::BlockDelta { item, block, delta });
     }
 
-    #[test]
-    fn snapshot_handoff_and_commit_do_not_duplicate_streams() {
-        let hub = RuntimeEvents::new(&[]);
-        let agent = AgentId::root(SessionId::from_bytes([1; 16]));
-        emit(
-            &hub,
-            &agent,
-            ResponseEvent::ItemStarted {
-                id: "text".into(),
-                position: 0,
-                kind: ItemKind::Text,
-            },
-        );
-        start_block(&hub, &agent, "text", "text", 0, BlockKind::Text);
-        emit(
-            &hub,
-            &agent,
-            ResponseEvent::BlockDelta {
-                item: "text".into(),
-                block: "text".into(),
-                delta: ContentDelta::Text("hello".into()),
-            },
-        );
-        let mut observation = hub.observe();
-        assert_eq!(
-            observation.snapshot.responses[&(agent.clone(), 7)]
-                .snapshot()
-                .items[0]
-                .blocks[0]
-                .text,
-            "hello"
-        );
-        emit(
-            &hub,
-            &agent,
-            ResponseEvent::BlockDelta {
-                item: "text".into(),
-                block: "text".into(),
-                delta: ContentDelta::Text("!".into()),
-            },
-        );
-        let update = observation.updates.try_recv().unwrap();
-        observation.snapshot.apply(update.clone());
-        observation.snapshot.apply(update);
-        assert_eq!(
-            observation.snapshot.responses[&(agent.clone(), 7)]
-                .snapshot()
-                .items[0]
-                .blocks[0]
-                .text,
-            "hello!"
-        );
-        hub.send(RuntimeEvent::ResponseSettled {
-            agent: agent.clone(),
-            request: 7,
-            message: Some(3),
-            error: None,
-        });
-        hub.send(RuntimeEvent::Record(Box::new(EventRecord {
-            version: 1,
-            sequence: 3,
-            timestamp_millis: 0,
-            agent,
-            event: SessionEvent::MessageCommitted {
-                message: Message::Assistant(vec![]),
-            },
-        })));
-        while let Ok(update) = observation.updates.try_recv() {
-            observation.snapshot.apply(update.clone());
-            observation.snapshot.apply(update);
-        }
-        assert!(observation.snapshot.responses.is_empty());
-        assert_eq!(observation.snapshot.records.len(), 1);
-        assert_eq!(observation.snapshot.revision, 6);
+    /// Starts request 7's text item and block, then streams `text` into it.
+    fn stream_text(hub: &RuntimeEvents, agent: &AgentId, text: &str) {
+        let (id, position) = ("text".to_owned(), 0);
+        let item = ResponseEvent::ItemStarted {
+            id: id.clone(),
+            position,
+            kind: ItemKind::Text,
+        };
+        emit(hub, agent, item);
+        let (item, kind) = (id.clone(), BlockKind::Text);
+        let block = ResponseEvent::BlockStarted {
+            item,
+            id,
+            position,
+            kind,
+        };
+        emit(hub, agent, block);
+        delta(hub, agent, text);
     }
+
     fn record(hub: &RuntimeEvents, agent: &AgentId, sequence: u64, event: SessionEvent) {
         hub.send(RuntimeEvent::Record(Box::new(EventRecord {
+            id: crate::identity::EventId::generate().unwrap(),
+            queue_attempt: None,
             version: crate::session::SESSION_FORMAT_VERSION,
             sequence,
             timestamp_millis: 0,
@@ -381,149 +315,130 @@ mod tests {
         })));
     }
 
+    fn scheduled(attempt: u64) -> SessionEvent {
+        SessionEvent::ModelRecoveryScheduled {
+            request: 7,
+            attempt,
+            max_attempts: Some(3),
+            delay_millis: 1000,
+            error: "connection lost".into(),
+        }
+    }
+
+    #[test]
+    fn snapshot_handoff_and_commit_do_not_duplicate_streams() {
+        let hub = RuntimeEvents::new(&[]);
+        let agent = AgentId::root(SessionId::from_bytes([1; 16]));
+        let key = (agent.clone(), 7);
+        stream_text(&hub, &agent, "hello");
+        let mut observation = hub.observe();
+        let text = |snapshot: &ObservationSnapshot| {
+            snapshot.responses[&key].snapshot().items[0].blocks[0]
+                .text
+                .clone()
+        };
+        assert_eq!(text(&observation.snapshot), "hello");
+        delta(&hub, &agent, "!");
+        let update = observation.updates.try_recv().unwrap();
+        observation.snapshot.apply(update.clone());
+        observation.snapshot.apply(update);
+        assert_eq!(text(&observation.snapshot), "hello!");
+        hub.send(RuntimeEvent::ResponseSettled {
+            agent: agent.clone(),
+            request: 7,
+            message: Some(3),
+            error: None,
+        });
+        let committed = SessionEvent::MessageCommitted {
+            message: Message::Assistant(vec![]),
+        };
+        record(&hub, &agent, 3, committed);
+        while let Ok(update) = observation.updates.try_recv() {
+            observation.snapshot.apply(update.clone());
+            observation.snapshot.apply(update);
+        }
+        assert!(observation.snapshot.responses.is_empty());
+        assert_eq!(observation.snapshot.records.len(), 1);
+        assert_eq!(observation.snapshot.revision, 6);
+    }
+
     #[test]
     fn recovery_is_active_replayable_and_preserves_failed_partial_output() {
         let hub = RuntimeEvents::new(&[]);
         let agent = AgentId::root(SessionId::from_bytes([2; 16]));
-        emit(
-            &hub,
-            &agent,
-            ResponseEvent::ItemStarted {
-                id: "text".into(),
-                position: 0,
-                kind: ItemKind::Text,
-            },
-        );
-        start_block(&hub, &agent, "text", "text", 0, BlockKind::Text);
-        emit(
-            &hub,
-            &agent,
-            ResponseEvent::BlockDelta {
-                item: "text".into(),
-                block: "text".into(),
-                delta: ContentDelta::Text("partial answer".into()),
-            },
-        );
+        let key = (agent.clone(), 7);
+        let replayed = |snapshot: &ObservationSnapshot| {
+            let records: Vec<_> = snapshot.records.values().cloned().collect();
+            RuntimeEvents::new(&records).observe().snapshot
+        };
+        stream_text(&hub, &agent, "partial answer");
+        let activity = AgentActivity::Working;
         hub.send(RuntimeEvent::Activity {
             agent: agent.clone(),
-            activity: AgentActivity::Working,
+            activity,
         });
-        record(
-            &hub,
-            &agent,
-            8,
-            SessionEvent::ModelFailed {
-                request: 7,
-                attempt: 1,
-                error: "connection lost".into(),
-            },
-        );
-        assert_eq!(
-            hub.observe().snapshot.activity[&agent],
-            AgentActivity::Working
-        );
-        record(
-            &hub,
-            &agent,
-            9,
-            SessionEvent::ModelRecoveryScheduled {
-                request: 7,
-                attempt: 2,
-                max_attempts: Some(3),
-                delay_millis: 1000,
-                error: "connection lost".into(),
-            },
-        );
+        let failed = SessionEvent::ModelFailed {
+            request: 7,
+            attempt: 1,
+            error: "connection lost".into(),
+        };
+        record(&hub, &agent, 8, failed);
+        let found = &hub.observe().snapshot.activity[&agent];
+        assert_eq!(*found, AgentActivity::Working);
+        record(&hub, &agent, 9, scheduled(2));
         let snapshot = hub.observe().snapshot;
-        assert_eq!(
-            snapshot.activity[&agent],
-            AgentActivity::Reconnecting {
-                attempt: 2,
-                max_attempts: Some(3)
-            }
-        );
-        let response = &snapshot.responses[&(agent.clone(), 7)];
+        let reconnecting = AgentActivity::Reconnecting {
+            attempt: 2,
+            max_attempts: Some(3),
+        };
+        assert_eq!(snapshot.activity[&agent], reconnecting);
+        let response = &snapshot.responses[&key];
         assert!(response.settled);
         assert_eq!(response.error.as_deref(), Some("connection lost"));
-        assert_eq!(
-            response.snapshot().items[0].blocks[0].text,
-            "partial answer"
-        );
-        let records: Vec<_> = snapshot.records.values().cloned().collect();
-        let replayed = RuntimeEvents::new(&records).observe().snapshot;
-        assert_eq!(replayed.activity[&agent], snapshot.activity[&agent]);
+        let found = &response.snapshot().items[0].blocks[0].text;
+        assert_eq!(*found, "partial answer");
+        assert_eq!(replayed(&snapshot).activity[&agent], reconnecting);
         // Duplicate journal delivery cannot roll a newer activity back.
-        record(
-            &hub,
-            &agent,
-            10,
-            SessionEvent::ModelRequested {
-                context: 1,
-                messages: Vec::new(),
-                purpose: crate::session::ModelPurpose::Agent,
-            },
-        );
-        hub.send(RuntimeEvent::Record(Box::new(records[1].clone())));
-        assert_eq!(
-            hub.observe().snapshot.activity[&agent],
-            AgentActivity::Working
-        );
-        record(
-            &hub,
-            &agent,
-            11,
-            SessionEvent::ModelAttemptStarted {
-                request: 7,
-                attempt: 2,
-            },
-        );
+        let requested = SessionEvent::ModelRequested {
+            context: 1,
+            history: Vec::new(),
+            tail: Vec::new(),
+            history_lifetime: Default::default(),
+            purpose: crate::session::ModelPurpose::Agent,
+        };
+        record(&hub, &agent, 10, requested);
+        hub.send(RuntimeEvent::Record(Box::new(snapshot.records[&9].clone())));
+        let found = &hub.observe().snapshot.activity[&agent];
+        assert_eq!(*found, AgentActivity::Working);
+        let attempt = SessionEvent::ModelAttemptStarted {
+            request: 7,
+            attempt: 2,
+        };
+        record(&hub, &agent, 11, attempt);
         let started = hub.observe().snapshot;
-        let response = &started.responses[&(agent.clone(), 7)];
+        let response = &started.responses[&key];
         assert!(!response.settled);
         assert!(response.error.is_none());
         assert!(response.snapshot().items.is_empty());
-        assert_eq!(
-            serde_json::to_value(&started.records[&8]).unwrap(),
-            serde_json::to_value(&snapshot.records[&8]).unwrap()
-        );
-        let records: Vec<_> = started.records.values().cloned().collect();
-        let replayed = RuntimeEvents::new(&records).observe().snapshot;
-        assert!(
-            replayed.responses[&(agent.clone(), 7)]
-                .snapshot()
-                .items
-                .is_empty()
-        );
-        assert!(replayed.responses[&(agent.clone(), 7)].error.is_none());
+        let json =
+            |snapshot: &ObservationSnapshot| serde_json::to_value(&snapshot.records[&8]).unwrap();
+        assert_eq!(json(&started), json(&snapshot));
+        let replayed_response = &replayed(&started).responses[&key];
+        assert!(replayed_response.snapshot().items.is_empty());
+        assert!(replayed_response.error.is_none());
         record(&hub, &agent, 12, SessionEvent::AgentCompleted);
-        assert_eq!(hub.observe().snapshot.activity[&agent], AgentActivity::Idle);
-        let records: Vec<_> = hub.observe().snapshot.records.values().cloned().collect();
-        assert_eq!(
-            RuntimeEvents::new(&records).observe().snapshot.activity[&agent],
-            AgentActivity::Idle
-        );
+        let completed = hub.observe().snapshot;
+        assert_eq!(completed.activity[&agent], AgentActivity::Idle);
+        assert_eq!(replayed(&completed).activity[&agent], AgentActivity::Idle);
     }
 
     #[test]
     fn interruption_replaces_pending_recovery() {
         let hub = RuntimeEvents::new(&[]);
         let agent = AgentId::root(SessionId::from_bytes([3; 16]));
-        record(
-            &hub,
-            &agent,
-            1,
-            SessionEvent::ModelRecoveryScheduled {
-                request: 7,
-                attempt: 3,
-                max_attempts: Some(3),
-                delay_millis: 1000,
-                error: "connection lost".into(),
-            },
-        );
+        record(&hub, &agent, 1, scheduled(3));
         record(&hub, &agent, 2, SessionEvent::AgentInterrupted);
-        assert_eq!(
-            hub.observe().snapshot.activity[&agent],
-            AgentActivity::Interrupted
-        );
+        let found = &hub.observe().snapshot.activity[&agent];
+        assert_eq!(*found, AgentActivity::Interrupted);
     }
 }

@@ -7,6 +7,7 @@ mod catalog;
 mod connection;
 
 use super::config::McpServerConfig;
+use crate::tool::policy::{Capability, CapabilitySet};
 use catalog::bounded_json_size;
 use connection::{Server, connect_one};
 use futures_util::{StreamExt, stream};
@@ -43,8 +44,10 @@ pub enum McpError {
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredTool {
-    pub server: String,
-    pub tool: Tool,
+    pub(crate) server: String,
+    pub(crate) tool: Tool,
+    /// Frozen registration requirements from the configuration admitted at startup.
+    pub(crate) capabilities: Vec<Capability>,
 }
 
 // rmcp request handles do not cancel on drop. Keep ownership until a response
@@ -74,12 +77,12 @@ pub struct McpManager {
 }
 
 impl McpManager {
-    /// Connect ONLY capability-eligible configurations. The root runtime must
-    /// filter the map before this call: even resolving headers or spawning a
-    /// command for an ineligible server would cross the capability boundary.
-    /// An individual failed server is excluded with a warning, not fatal.
+    /// Filter before creating startup futures: even secret lookup or a failed
+    /// connection for an ineligible server would cross the capability boundary.
+    /// An individual eligible server failure is a warning, not fatal.
     pub async fn connect(
         configs: &BTreeMap<String, McpServerConfig>,
+        capabilities: &CapabilitySet,
         cancel: CancellationToken,
     ) -> Self {
         let mut manager = Self {
@@ -92,14 +95,27 @@ impl McpManager {
         // lifetime leaks into the public Send future (including cross-crate use).
         let entries: Vec<_> = configs
             .iter()
+            .filter(|(_, config)| {
+                capabilities.contains(Capability::Mcp)
+                    && config
+                        .capabilities()
+                        .iter()
+                        .all(|cap| capabilities.contains(*cap))
+            })
             .map(|(name, config)| (name.clone(), config.clone()))
             .collect();
         let futures: Vec<_> = entries
             .into_iter()
-            .map(|(name, config)| connect_one(name, config, cancel.clone()))
+            .map(|(name, config)| {
+                let cancel = cancel.clone();
+                async move {
+                    let policy = config.capabilities().to_vec();
+                    (policy, connect_one(name, config, cancel).await)
+                }
+            })
             .collect();
         let mut pending = stream::iter(futures).buffer_unordered(4);
-        while let Some(result) = pending.next().await {
+        while let Some((policy, result)) = pending.next().await {
             let Some((name, result)) = result else {
                 continue;
             };
@@ -110,6 +126,7 @@ impl McpManager {
                         .extend(tools.into_iter().map(|tool| DiscoveredTool {
                             server: name.clone(),
                             tool,
+                            capabilities: policy.clone(),
                         }));
                     manager.servers.insert(name, server);
                 }
@@ -346,21 +363,18 @@ for line in sys.stdin:
 
     impl Fixture {
         pub(super) fn new() -> Option<Self> {
-            match std::process::Command::new("python3")
+            let python = std::process::Command::new("python3")
                 .arg("--version")
-                .output()
-            {
-                Ok(output) if output.status.success() => Some(Self {
-                    directory: tempfile::tempdir().expect("fixture directory"),
-                }),
-                _ => {
-                    eprintln!("skipping MCP subprocess test: python3 is unavailable");
-                    None
-                }
+                .output();
+            if !python.is_ok_and(|output| output.status.success()) {
+                eprintln!("skipping MCP subprocess test: python3 is unavailable");
+                return None;
             }
+            let directory = tempfile::tempdir().expect("fixture directory");
+            Some(Self { directory })
         }
 
-        pub(super) fn config(&self) -> McpServerConfig {
+        pub(super) fn config(&self) -> crate::mcp::config::RawMcpServerConfig {
             let mut env: BTreeMap<_, _> = ["pid", "started", "cancelled", "initialize", "list"]
                 .into_iter()
                 .map(|name| (format!("MCP_TEST_{}", name.to_uppercase()), self.path(name)))
@@ -385,27 +399,21 @@ for line in sys.stdin:
 
         #[cfg(unix)]
         pub(super) fn pid(&self) -> libc::pid_t {
-            std::fs::read_to_string(self.path("pid"))
-                .expect("fixture wrote its pid")
-                .parse()
-                .expect("fixture pid is numeric")
+            let pid = std::fs::read_to_string(self.path("pid")).expect("fixture wrote its pid");
+            pid.parse().expect("fixture pid is numeric")
         }
     }
 
     // Process handles (manager-owned or explicit test Children) have kill-on-drop
-    // fallbacks. Do not kill by saved PID here: a successfully reaped PID can be
-    // reused by an unrelated process before the fixture directory is dropped.
+    // fallbacks. Do not kill by saved PID: a reaped PID can be reused.
 
-    pub(super) async fn connect(config: McpServerConfig) -> McpManager {
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            McpManager::connect(
-                &BTreeMap::from([("fixture".into(), config)]),
-                CancellationToken::new(),
-            ),
-        )
-        .await
-        .expect("MCP startup is bounded")
+    pub(super) async fn connect(config: crate::mcp::config::RawMcpServerConfig) -> McpManager {
+        let configs = BTreeMap::from([("fixture".into(), config.try_into().unwrap())]);
+        let capabilities = CapabilitySet::default();
+        let connect = McpManager::connect(&configs, &capabilities, CancellationToken::new());
+        tokio::time::timeout(Duration::from_secs(10), connect)
+            .await
+            .expect("MCP startup is bounded")
     }
 
     pub(super) async fn fixture_call(
@@ -418,7 +426,7 @@ for line in sys.stdin:
     }
 
     pub(super) async fn shutdown(manager: &McpManager) {
-        // Leave room for the client's own five-second graceful-close deadline plus
+        // Leave room for the client's five-second graceful-close deadline plus
         // process teardown; this is a deadlock guard, not a timing assertion.
         tokio::time::timeout(Duration::from_secs(10), manager.shutdown())
             .await
@@ -438,20 +446,52 @@ for line in sys.stdin:
     #[cfg(unix)]
     pub(super) async fn assert_process_reaped(pid: libc::pid_t) {
         tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                // SAFETY: signal zero only checks whether the recorded child exists.
-                if unsafe { libc::kill(pid, 0) } == -1 {
-                    assert_eq!(
-                        std::io::Error::last_os_error().raw_os_error(),
-                        Some(libc::ESRCH)
-                    );
-                    break;
-                }
+            // SAFETY: signal zero only checks whether the recorded child exists.
+            while unsafe { libc::kill(pid, 0) } != -1 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+            let error = std::io::Error::last_os_error().raw_os_error();
+            assert_eq!(error, Some(libc::ESRCH));
         })
         .await
         .expect("owned MCP child must be terminated and reaped, not left as a zombie");
+    }
+
+    #[tokio::test]
+    async fn ineligible_servers_have_no_startup_effects_or_failure_warnings() {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut stdio = fixture.config();
+        stdio.capabilities = vec![Capability::Read, Capability::Exec];
+        let http: McpServerConfig = serde_json::from_value(json!({
+            "transport": "streamable_http", "url": format!("http://{address}/mcp"),
+            "start_command": stdio.start_command,
+            "env": stdio.env, "cwd": stdio.cwd,
+            "capabilities": ["read", "exec"],
+            "headers_env": {"Authorization": "SKYHOOK_MCP_TEST_MISSING_HEADER_90212829"}
+        }))
+        .unwrap();
+        let configs = BTreeMap::from([
+            ("stdio".into(), stdio.try_into().unwrap()),
+            ("http".into(), http),
+        ]);
+        for missing in [Capability::Mcp, Capability::Read, Capability::Exec] {
+            let mut capabilities = CapabilitySet::default();
+            capabilities.remove(missing);
+            let manager =
+                McpManager::connect(&configs, &capabilities, CancellationToken::new()).await;
+            assert!(manager.catalog().is_empty());
+            // Missing header resolution or command startup would produce a warning.
+            assert!(manager.warnings().is_empty(), "{:?}", manager.warnings());
+            assert!(!fixture.directory.path().join("pid").exists());
+            let accepted = listener.accept().unwrap_err();
+            assert_eq!(accepted.kind(), std::io::ErrorKind::WouldBlock);
+            shutdown(&manager).await;
+        }
     }
 
     #[tokio::test]
@@ -461,48 +501,42 @@ for line in sys.stdin:
         };
         let manager = connect(fixture.config()).await;
         assert!(manager.warnings().is_empty(), "{:?}", manager.warnings());
-        let names: Vec<_> = manager
-            .catalog()
+        let catalog = manager.catalog();
+        let names: Vec<_> = catalog
             .iter()
             .map(|entry| entry.tool.name.as_ref())
             .collect();
         assert_eq!(names, ["echo", "rpc_error", "slow", "tool_error"]);
 
         let arguments = json!({"message": "hello", "nested": {"number": 7}, "list": [true, null]});
-        let result = manager
-            .call(
-                "fixture",
-                "echo",
-                arguments.as_object().unwrap().clone(),
-                CancellationToken::new(),
-            )
-            .await
-            .expect("echo call succeeds");
-        let result = serde_json::to_value(result).unwrap();
+        let object = arguments.as_object().unwrap().clone();
+        let call = manager.call("fixture", "echo", object, CancellationToken::new());
+        let result = serde_json::to_value(call.await.expect("echo call succeeds")).unwrap();
         let payload: Value =
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(payload["arguments"], arguments);
         assert_eq!(payload["env"], "configured child value");
+        let cwd = std::fs::canonicalize(payload["cwd"].as_str().unwrap()).unwrap();
         assert_eq!(
-            std::fs::canonicalize(payload["cwd"].as_str().unwrap()).unwrap(),
-            std::fs::canonicalize(fixture.directory.path()).unwrap(),
+            cwd,
+            std::fs::canonicalize(fixture.directory.path()).unwrap()
         );
         shutdown(&manager).await;
     }
 
     #[tokio::test]
-    async fn preserves_tool_result_errors_and_reports_protocol_errors() {
+    async fn call_errors_cancellation_and_unknown_tools_do_not_poison_the_session() {
         let Some(fixture) = Fixture::new() else {
             return;
         };
         let manager = connect(fixture.config()).await;
+        assert_eq!(manager.catalog().len(), 4, "{:?}", manager.warnings());
         let result = fixture_call(&manager, "tool_error")
             .await
             .expect("isError is a valid MCP result, not a transport failure");
         let result = serde_json::to_value(result).unwrap();
         assert_eq!(result["isError"], true);
         assert_eq!(result["content"][0]["text"], "fixture tool error");
-
         let error = fixture_call(&manager, "rpc_error")
             .await
             .expect_err("JSON-RPC error must fail the call");
@@ -512,7 +546,20 @@ for line in sys.stdin:
         );
         // A failed call must not poison a healthy server session.
         assert!(fixture_call(&manager, "echo").await.is_ok());
+        // Pre-cancelled and unknown calls are not sent to the server.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = manager.call("fixture", "slow", Map::new(), cancel).await;
+        assert!(matches!(result, Err(McpError::Cancelled)), "{result:?}");
+        assert!(!fixture.directory.path().join("started").exists());
+        let result = fixture_call(&manager, "not-advertised").await;
+        assert!(
+            matches!(result, Err(McpError::UnknownTool { .. })),
+            "{result:?}"
+        );
         shutdown(&manager).await;
+        let result = fixture_call(&manager, "echo").await;
+        assert!(matches!(result, Err(McpError::Closed)), "{result:?}");
     }
 
     #[tokio::test]
@@ -538,99 +585,6 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn configured_call_timeout_bounds_an_unresponsive_tool() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
-        let mut config = fixture.config();
-        config.call_timeout_secs = 1;
-        let manager = connect(config).await;
-        let result = tokio::time::timeout(Duration::from_secs(5), fixture_call(&manager, "slow"))
-            .await
-            .expect("configured timeout must stop a pending call");
-        assert!(
-            fixture.directory.path().join("started").exists(),
-            "call reached server"
-        );
-        assert!(matches!(result, Err(McpError::Timeout)), "{result:?}");
-        assert!(fixture_call(&manager, "echo").await.is_ok());
-        shutdown(&manager).await;
-    }
-
-    #[tokio::test]
-    async fn one_failed_server_does_not_hide_healthy_server_tools() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
-        let mut bad = fixture.config();
-        bad.start_command = Some(vec![fixture.path("nonexistent-executable")]);
-        let configs =
-            BTreeMap::from([("broken".into(), bad), ("fixture".into(), fixture.config())]);
-        let manager = tokio::time::timeout(
-            Duration::from_secs(10),
-            McpManager::connect(&configs, CancellationToken::new()),
-        )
-        .await
-        .expect("partial startup is bounded");
-        assert_eq!(manager.catalog().len(), 4);
-        assert!(
-            manager
-                .catalog()
-                .iter()
-                .all(|entry| entry.server == "fixture")
-        );
-        assert!(
-            manager
-                .warnings()
-                .iter()
-                .any(|warning| warning.contains("broken")),
-            "{:?}",
-            manager.warnings()
-        );
-        shutdown(&manager).await;
-    }
-
-    #[tokio::test]
-    async fn pre_cancelled_and_unknown_calls_are_not_sent_to_server() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
-        let manager = connect(fixture.config()).await;
-        assert_eq!(manager.catalog().len(), 4, "{:?}", manager.warnings());
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        let result = manager.call("fixture", "slow", Map::new(), cancel).await;
-        assert!(matches!(result, Err(McpError::Cancelled)), "{result:?}");
-        assert!(!fixture.directory.path().join("started").exists());
-        let result = fixture_call(&manager, "not-advertised").await;
-        assert!(
-            matches!(result, Err(McpError::UnknownTool { .. })),
-            "{result:?}"
-        );
-        shutdown(&manager).await;
-        let result = fixture_call(&manager, "echo").await;
-        assert!(matches!(result, Err(McpError::Closed)), "{result:?}");
-    }
-
-    #[tokio::test]
-    async fn oversized_result_is_rejected_without_exposing_content() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
-        let mut config = fixture.config();
-        config
-            .env
-            .insert("MCP_TEST_LARGE_RESULT".into(), "1".into());
-        let manager = connect(config).await;
-        let error = fixture_call(&manager, "echo").await.unwrap_err();
-        assert!(
-            error.to_string().contains("result exceeds size limit"),
-            "{error}"
-        );
-        shutdown(&manager).await;
-    }
-
-    #[tokio::test]
     async fn dropping_call_future_sends_cancel_and_keeps_session_usable() {
         let Some(fixture) = Fixture::new() else {
             return;
@@ -646,22 +600,80 @@ for line in sys.stdin:
         shutdown(&manager).await;
     }
 
+    #[tokio::test]
+    async fn call_timeout_and_result_size_limits_are_enforced() {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let mut config = fixture.config();
+        config.call_timeout_secs = 1;
+        let manager = connect(config).await;
+        let call = fixture_call(&manager, "slow");
+        let result = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("configured timeout must stop a pending call");
+        assert!(
+            fixture.directory.path().join("started").exists(),
+            "call reached server"
+        );
+        assert!(matches!(result, Err(McpError::Timeout)), "{result:?}");
+        assert!(fixture_call(&manager, "echo").await.is_ok());
+        shutdown(&manager).await;
+        // Oversized results are rejected without exposing content.
+        let mut config = fixture.config();
+        config
+            .env
+            .insert("MCP_TEST_LARGE_RESULT".into(), "1".into());
+        let manager = connect(config).await;
+        let error = fixture_call(&manager, "echo").await.unwrap_err();
+        assert!(
+            error.to_string().contains("result exceeds size limit"),
+            "{error}"
+        );
+        shutdown(&manager).await;
+    }
+
+    #[tokio::test]
+    async fn one_failed_server_does_not_hide_healthy_server_tools() {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let mut bad = fixture.config();
+        bad.start_command = Some(vec![fixture.path("nonexistent-executable")]);
+        let configs = BTreeMap::from([
+            ("broken".into(), bad.try_into().unwrap()),
+            ("fixture".into(), fixture.config().try_into().unwrap()),
+        ]);
+        let capabilities = CapabilitySet::default();
+        let connect = McpManager::connect(&configs, &capabilities, CancellationToken::new());
+        let manager = tokio::time::timeout(Duration::from_secs(10), connect)
+            .await
+            .expect("partial startup is bounded");
+        assert_eq!(manager.catalog().len(), 4);
+        assert!(
+            manager
+                .catalog()
+                .iter()
+                .all(|entry| entry.server == "fixture")
+        );
+        let warnings = manager.warnings();
+        assert!(
+            warnings.iter().any(|warning| warning.contains("broken")),
+            "{warnings:?}"
+        );
+        shutdown(&manager).await;
+    }
+
     #[test]
     fn sdk_transport_error_diagnostics_are_redacted() {
-        use rmcp::transport::DynamicTransportError;
+        use rmcp::transport::{DynamicTransportError, async_rw::AsyncRwTransport};
+        type FixtureTransport = AsyncRwTransport<RoleClient, tokio::io::Empty, tokio::io::Sink>;
         let secret = "https://user:password@example.invalid/mcp?token=private-secret";
-        type FixtureTransport = rmcp::transport::async_rw::AsyncRwTransport<
-            RoleClient,
-            tokio::io::Empty,
-            tokio::io::Sink,
-        >;
-        let error = ServiceError::TransportSend(DynamicTransportError::new::<
-            FixtureTransport,
-            RoleClient,
-        >(std::io::Error::other(secret)));
-        let rendered = request_error(error).to_string();
-        assert!(!rendered.contains("private-secret"));
-        assert!(!rendered.contains("password"));
-        assert!(!rendered.contains("example.invalid"));
+        let error = std::io::Error::other(secret);
+        let error = DynamicTransportError::new::<FixtureTransport, RoleClient>(error);
+        let rendered = request_error(ServiceError::TransportSend(error)).to_string();
+        for leaked in ["private-secret", "password", "example.invalid"] {
+            assert!(!rendered.contains(leaked));
+        }
     }
 }

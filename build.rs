@@ -87,7 +87,6 @@ mod shims {
     #[cfg(feature = "embed-shims")]
     use super::SHIM_DIRECTORY;
     use std::{
-        collections::HashSet,
         fs,
         io::{self, Write},
         path::Path,
@@ -97,79 +96,47 @@ mod shims {
     #[cfg(feature = "embed-shims")]
     use std::{env, path::PathBuf, process::Command};
 
-    struct ShimTarget {
-        platform: &'static str,
-        protocol: &'static str,
-        arch: &'static str,
-        target: &'static str,
+    // The private build matrix is closed; runtime artifact names are not.
+    // Declare each supported architecture once, generating both enumeration and
+    // its coupled label/triple/ELF-machine mapping from the same definition.
+    macro_rules! shim_architectures {
+        ($($variant:ident => ($arch:literal, $triple:literal, $machine:literal)),+ $(,)?) => {
+            #[derive(Clone, Copy, Debug)]
+            enum ShimArchitecture { $($variant),+ }
+
+            impl ShimArchitecture {
+                const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+                fn arch(self) -> &'static str {
+                    match self { $(Self::$variant => $arch),+ }
+                }
+
+                fn triple(self) -> &'static str {
+                    match self { $(Self::$variant => $triple),+ }
+                }
+
+                fn machine(self) -> u16 {
+                    match self { $(Self::$variant => $machine),+ }
+                }
+            }
+        };
     }
 
-    const SHIM_TARGETS: &[ShimTarget] = &[
-        ShimTarget {
-            platform: "linux",
-            protocol: "ssh",
-            arch: "x86_64",
-            target: "x86_64-unknown-linux-musl",
-        },
-        ShimTarget {
-            platform: "linux",
-            protocol: "ssh",
-            arch: "aarch64",
-            target: "aarch64-unknown-linux-musl",
-        },
-    ];
+    shim_architectures! {
+        X86_64 => ("x86_64", "x86_64-unknown-linux-musl", 62),
+        Aarch64 => ("aarch64", "aarch64-unknown-linux-musl", 183),
+    }
 
     #[cfg(feature = "embed-shims")]
     const WORKER_ARG: &str = "--skyhook-private-build-shims";
 
-    impl ShimTarget {
-        fn bin(&self) -> String {
-            format!("{}-{}", self.platform, self.protocol)
-        }
+    /// Every architecture ships the same shim binary.
+    const SHIM_BIN: &str = "linux-ssh";
 
-        fn artifact(&self) -> String {
-            format!("{}-{}", self.bin(), self.arch)
+    impl ShimArchitecture {
+        fn artifact(self) -> String {
+            format!("{SHIM_BIN}-{}", self.arch())
         }
-
-        fn machine(&self) -> Result<u16, String> {
-            let parts: Vec<_> = self.target.split('-').collect();
-            if parts.len() != 4
-                || parts[0] != self.arch
-                || parts[2] != self.platform
-                || self.platform != "linux"
-                || parts[3] != "musl"
-            {
-                return Err(format!(
-                    "unsupported or inconsistent shim platform/architecture/target: {}/{}/{}",
-                    self.platform, self.arch, self.target
-                ));
-            }
-            match self.arch {
-                "x86_64" => Ok(62),
-                "aarch64" => Ok(183),
-                arch => Err(format!("unsupported shim ELF architecture: {arch}")),
-            }
-        }
-    }
-
-    fn validate_targets(targets: &[ShimTarget]) -> Result<(), String> {
-        let mut names = HashSet::new();
-        for target in targets {
-            for component in [target.platform, target.protocol, target.arch] {
-                if component.is_empty()
-                    || !component
-                        .bytes()
-                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-                {
-                    return Err(format!("invalid shim name component: {component:?}"));
-                }
-            }
-            target.machine()?;
-            if !names.insert(target.artifact()) {
-                return Err(format!("duplicate shim artifact: {}", target.artifact()));
-            }
-        }
-        Ok(())
     }
 
     struct ShimProfile {
@@ -305,7 +272,6 @@ mod shims {
 
     #[cfg(feature = "embed-shims")]
     pub(super) fn build() {
-        validate_targets(SHIM_TARGETS).expect("invalid embedded shim target configuration");
         let manifest_dir = required_path("CARGO_MANIFEST_DIR");
         let out_dir = required_path("OUT_DIR");
         // Capture the outer profile before removing Cargo state from the worker.
@@ -349,20 +315,21 @@ mod shims {
     #[cfg(feature = "embed-shims")]
     fn worker(manifest_dir: &Path, out_dir: &Path, outer_profile: &str) {
         let profile = ShimProfile::for_outer_profile(outer_profile);
-        validate_targets(SHIM_TARGETS).expect("invalid embedded shim target configuration");
         let nested_target = out_dir.join("zig-target");
-        for target in SHIM_TARGETS {
-            let bin = target.bin();
+        for &target in ShimArchitecture::ALL {
+            let bin = SHIM_BIN;
             eprintln!(
                 "building {} for {} with cargo-zigbuild (profile {})",
-                bin, target.target, profile.cargo_name
+                bin,
+                target.triple(),
+                profile.cargo_name
             );
             let mut build = cargo_zigbuild::Build::new(Some(manifest_dir.join("Cargo.toml")));
             build.packages = vec!["skyhook-agent".into()];
             build.locked = true;
             build.profile = Some(profile.cargo_name.into());
-            build.bin = vec![bin.clone()];
-            build.target = vec![target.target.into()];
+            build.bin = vec![bin.into()];
+            build.target = vec![target.triple().into()];
             build.target_dir = Some(nested_target.clone());
             build.no_default_features = true;
             build.features = vec!["shim-bin".into()];
@@ -377,16 +344,16 @@ mod shims {
             assert!(
                 status.success(),
                 "cargo-zigbuild failed for {} with {status}",
-                target.target
+                target.triple()
             );
 
             let source = nested_target
-                .join(target.target)
+                .join(target.triple())
                 .join(profile.output_directory)
                 .join(bin);
             let bytes = fs::read(&source)
                 .unwrap_or_else(|error| panic!("could not read {}: {error}", source.display()));
-            validate_static_elf(&bytes, target.machine().unwrap())
+            validate_static_elf(&bytes, target.machine())
                 .unwrap_or_else(|error| panic!("invalid shim {}: {error}", source.display()));
             let destination = manifest_dir.join(SHIM_DIRECTORY).join(target.artifact());
             write_if_changed(&destination, &bytes).unwrap_or_else(|error| {
@@ -539,43 +506,29 @@ mod shims {
         }
 
         #[test]
-        fn target_names_and_consistency() {
-            validate_targets(SHIM_TARGETS).unwrap();
-            assert_eq!(SHIM_TARGETS[0].bin(), "linux-ssh");
-            assert_eq!(SHIM_TARGETS[0].artifact(), "linux-ssh-x86_64");
-            assert_eq!(SHIM_TARGETS[1].artifact(), "linux-ssh-aarch64");
-            assert!(
-                validate_targets(&[
-                    ShimTarget { ..SHIM_TARGETS[0] },
-                    ShimTarget { ..SHIM_TARGETS[0] }
-                ])
-                .unwrap_err()
-                .contains("duplicate")
+        fn target_artifact_names_and_machine_contract() {
+            let actual: Vec<_> = ShimArchitecture::ALL
+                .iter()
+                .map(|&arch| (SHIM_BIN, arch.artifact(), arch.triple(), arch.machine()))
+                .collect();
+            // These are external artifact/ELF contracts, not a parallel build list.
+            assert_eq!(
+                actual,
+                vec![
+                    (
+                        "linux-ssh",
+                        "linux-ssh-x86_64".into(),
+                        "x86_64-unknown-linux-musl",
+                        62
+                    ),
+                    (
+                        "linux-ssh",
+                        "linux-ssh-aarch64".into(),
+                        "aarch64-unknown-linux-musl",
+                        183
+                    ),
+                ]
             );
-            for invalid in [
-                ShimTarget {
-                    arch: "aarch64",
-                    ..SHIM_TARGETS[0]
-                },
-                ShimTarget {
-                    platform: "windows",
-                    ..SHIM_TARGETS[0]
-                },
-                ShimTarget {
-                    protocol: "../ssh",
-                    ..SHIM_TARGETS[0]
-                },
-                ShimTarget {
-                    protocol: "SSH",
-                    ..SHIM_TARGETS[0]
-                },
-                ShimTarget {
-                    target: "x86_64-unknown-linux-gnu",
-                    ..SHIM_TARGETS[0]
-                },
-            ] {
-                assert!(validate_targets(&[invalid]).is_err());
-            }
         }
 
         #[test]

@@ -7,12 +7,9 @@ use crate::{
     identity::JobId,
     provider::{
         ProviderContext,
-        protocol::{Message, ModelRequest, ResponseSchema},
+        protocol::{HistoryLifetime, Message, ModelRequest, ResponseSchema},
     },
-    session::{
-        CompactionCheckpoint, ContextMessage, ModelCallOrigin, ModelPurpose, SessionEvent,
-        project_history,
-    },
+    session::{CompactionCheckpoint, ModelCallOrigin, ModelPurpose, SessionEvent, project_history},
 };
 use std::collections::BTreeSet;
 
@@ -53,32 +50,34 @@ impl SessionRuntime {
         }
         // Retry against current history and runtime state, including any todo
         // changes that invalidated an earlier attempt's snapshot.
+        let runtime = prompt::runtime_state_content(
+            &self.jobs,
+            &self.todos,
+            agent,
+            turn.capabilities,
+            turn.location,
+        )
+        .await;
         let mut input = ModelRequest {
             model: input.model.clone(),
             system: input.system.clone(),
-            messages: projected
+            history: projected
                 .iter()
                 .map(|(_, message)| message.clone())
                 .collect(),
+            tail: vec![Message::User(vec![runtime])],
+            history_lifetime: HistoryLifetime::Continuing,
             tools: input.tools.clone(),
             reasoning: input.reasoning.clone(),
             response_schema: input.response_schema.clone(),
             max_output_tokens: input.max_output_tokens,
             correlation: input.correlation.clone(),
+            blobs: Default::default(),
         };
-        input.messages.push(Message::User(vec![
-            prompt::runtime_state_content(
-                &self.jobs,
-                &self.todos,
-                agent,
-                turn.capabilities,
-                turn.location,
-            )
-            .await,
-        ]));
         let before_tokens = compaction::estimate_request(&input);
         // Keep only the original template for the post-compaction estimate.
-        let summary_messages = std::mem::take(&mut input.messages);
+        let summary_history = std::mem::take(&mut input.history);
+        let summary_tail = std::mem::take(&mut input.tail);
         let directive = compaction::directive();
         let mut summary_request = input.clone();
         // Summarization cannot execute tools. Keep their historical calls/results
@@ -89,20 +88,11 @@ impl SessionRuntime {
             schema: compaction::response_schema(),
         });
         let template = summary_request.clone();
-        summary_request.messages = summary_messages;
-        summary_request.messages.push(directive.clone());
-        let mut messages = context_sources(&projected);
-        // The penultimate message is the exact transient state for this attempt.
-        messages.push(ContextMessage::Inline {
-            message: summary_request
-                .messages
-                .iter()
-                .rev()
-                .nth(1)
-                .expect("runtime state is present")
-                .clone(),
-        });
-        messages.push(ContextMessage::Inline { message: directive });
+        summary_request.history = summary_history;
+        summary_request.tail = summary_tail;
+        summary_request.tail.push(directive);
+        // The checkpoint replaces this history once the summary completes.
+        summary_request.history_lifetime = HistoryLifetime::Ending;
         let provider_name = records
             .iter()
             .find_map(|record| {
@@ -132,16 +122,16 @@ impl SessionRuntime {
                 agent.clone(),
                 SessionEvent::ModelRequested {
                     context: summary_context.sequence,
-                    messages,
+                    history: context_sources(&projected),
+                    tail: summary_request.tail.clone(),
+                    history_lifetime: summary_request.history_lifetime,
                     purpose: ModelPurpose::Compaction,
                 },
             )
             .await?;
         *request_sequence = Some(requested.sequence);
         self.activity(agent, crate::agent::runtime::AgentActivity::Compacting);
-        self.store
-            .hydrate_model_request(&mut summary_request)
-            .await?;
+        self.store.load_blobs(&mut summary_request).await?;
         let continuation = self
             .summarize(
                 turn,
@@ -163,12 +153,8 @@ impl SessionRuntime {
             .collect();
         let retained = retained_sources(&records, agent, &projected, &origins)?;
         let mut included = BTreeSet::new();
-        for record in &records {
-            if retained.contains(&record.sequence)
-                && let SessionEvent::MessageCommitted { message } = &record.event
-            {
-                included_message_jobs(message, &mut included);
-            }
+        for source in &retained {
+            included_message_jobs(source.message(), &mut included);
         }
         let mut selected = BTreeSet::new();
         let mut handover = Vec::new();
@@ -191,12 +177,16 @@ impl SessionRuntime {
             }
             let mut view = self
                 .jobs
-                .inspect_output_for(
+                .present_output_with(
                     crate::job::output::OutputArgs::new(job),
                     turn.capabilities,
-                    turn.location,
+                    crate::job::output::OutputOptions::Host {
+                        viewer: Some(turn.location),
+                        presentation: crate::job::OutputPresentation::Full,
+                    },
                 )
                 .await
+                .map(crate::job::PresentedOutput::into_view)
                 .map_err(|error| HarnessError::Compaction(error.to_string()))?;
             view.as_object_mut()
                 .expect("job view is an object")
@@ -236,22 +226,10 @@ impl SessionRuntime {
             }
         }
         let mut compacted = input.clone();
-        compacted.messages = vec![message.clone()];
-        for sequence in &retained {
-            let message = records
-                .iter()
-                .find_map(|record| {
-                    if record.sequence != *sequence {
-                        return None;
-                    }
-                    match &record.event {
-                        SessionEvent::MessageCommitted { message } => Some(message.clone()),
-                        _ => None,
-                    }
-                })
-                .expect("retention references validated original messages");
-            compacted.messages.push(message);
-        }
+        compacted.history = vec![message.clone()];
+        compacted
+            .history
+            .extend(retained.iter().map(|source| source.message().clone()));
         let runtime = prompt::runtime_state_with_todos(
             &self.jobs,
             agent,
@@ -260,7 +238,7 @@ impl SessionRuntime {
             turn.location,
         )
         .await;
-        compacted.messages.push(Message::User(vec![runtime]));
+        compacted.tail = vec![Message::User(vec![runtime])];
         let after_tokens = compaction::estimate_request(&compacted);
         if after_tokens >= before_tokens {
             self.store.append(agent.clone(), SessionEvent::CompactionSkipped {
@@ -282,7 +260,10 @@ impl SessionRuntime {
                     frontier,
                     message,
                     todos: continuation.todos,
-                    retained,
+                    retained: retained
+                        .into_iter()
+                        .map(|source| source.into_sequence())
+                        .collect(),
                     request: requested.sequence,
                     before_tokens,
                     after_tokens,
@@ -311,97 +292,77 @@ impl SessionRuntime {
 mod tests {
     use super::super::tests::*;
     use crate::{
-        agent::{TodoItem, TodoStatus},
+        agent::TodoStatus,
         job::{JobOutcome, JobSpec},
-        provider::protocol::{AssistantContent, Message, UserContent},
-        session::{ModelPurpose, SessionEvent},
+        provider::protocol::{AssistantContent, Message, ToolCall, ToolResult, UserContent},
+        session::{EventRecord, ModelPurpose, SessionEvent},
         tool::ToolOutput,
     };
     use serde_json::{Value, json};
     use std::{sync::atomic::Ordering, time::Duration};
     use tokio_util::sync::CancellationToken;
 
+    fn checkpoint(records: &[EventRecord]) -> &crate::session::CompactionCheckpoint {
+        events!(records, SessionEvent::Compaction { checkpoint } => checkpoint)[0]
+    }
+
     #[tokio::test]
-    async fn compaction_hydrates_both_user_and_tool_image_blobs() {
+    async fn compaction_loads_both_user_and_tool_image_blobs() {
         let fixture = Fixture::new().await;
         let runtime = &fixture.session.runtime;
         let agent = &fixture.session.root;
-        let user_image = runtime
-            .store
-            .import_blob(b"user-image", "user.png".into(), "image/png".into())
+        let user_png = crate::tests::png(b"user-image");
+        let tool_png = crate::tests::png(b"tool-image");
+        let store = &runtime.store;
+        let user_image = store
+            .store_image(Some("user.png".into()), &user_png)
             .await
             .unwrap();
-        let tool_image = runtime
-            .store
-            .import_blob(b"tool-image", "tool.png".into(), "image/png".into())
+        let tool_image = store
+            .store_image(Some("tool.png".into()), &tool_png)
             .await
             .unwrap();
-        assert!(user_image.data_base64.is_none());
-        assert!(tool_image.data_base64.is_none());
-        runtime
-            .commit(
-                agent,
-                Message::User(vec![UserContent::Image {
-                    image: user_image.clone(),
-                }]),
-            )
-            .await
-            .unwrap();
-        runtime
-            .commit(
-                agent,
-                Message::Assistant(vec![AssistantContent::tool_call(
-                    "image-call",
-                    0,
-                    crate::provider::protocol::ToolCall {
-                        id: "image-call".into(),
-                        name: "read".into(),
-                        arguments: json!({"path":"tool.png"}),
-                    },
-                )]),
-            )
-            .await
-            .unwrap();
-        runtime
-            .commit(
-                agent,
-                Message::Tool(vec![crate::provider::protocol::ToolResult {
-                    call_id: "image-call".into(),
-                    name: "read".into(),
-                    result: json!({}),
-                    images: vec![tool_image.clone()],
-                    is_error: false,
-                }]),
-            )
-            .await
-            .unwrap();
+        let attachment = crate::media::AttachmentRef::Image(user_image.clone());
+        let call = ToolCall::new("image-call", "read", json!({"path":"tool.png"})).unwrap();
+        let result = ToolResult {
+            call_id: "image-call".into(),
+            name: "read".into(),
+            result: json!({}),
+            images: vec![tool_image.clone()],
+            is_error: false,
+        };
+        for message in [
+            Message::User(vec![UserContent::Attachment { attachment }]),
+            Message::Assistant(vec![AssistantContent::tool_call("image-call", 0, call)]),
+            Message::Tool(vec![result]),
+        ] {
+            runtime.commit(agent, message).await.unwrap();
+        }
         fixture.compact(&CancellationToken::new()).await.unwrap();
         {
             let requests = fixture.provider.requests.lock().unwrap();
-            let request = requests
-                .iter()
-                .find(|request| request.response_schema.is_some())
-                .unwrap();
-            let mut images = Vec::new();
-            for message in &request.messages {
-                match message {
-                    Message::User(parts) => {
-                        images.extend(parts.iter().filter_map(|part| match part {
-                            UserContent::Image { image } => Some(image),
-                            _ => None,
-                        }))
-                    }
-                    Message::Tool(results) => {
-                        images.extend(results.iter().flat_map(|result| &result.images))
-                    }
-                    _ => {}
+            let request = requests.iter().find(|r| r.response_schema.is_some());
+            let request = request.unwrap();
+            let images = request.messages().flat_map(|message| match message {
+                Message::User(parts) => parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        UserContent::Attachment {
+                            attachment: crate::media::AttachmentRef::Image(image),
+                        } => Some(image),
+                        _ => None,
+                    })
+                    .collect(),
+                Message::Tool(results) => {
+                    results.iter().flat_map(|result| &result.images).collect()
                 }
-            }
-            assert_eq!(images.len(), 2);
-            assert_eq!(images[0].sha256, user_image.sha256);
-            assert_eq!(images[0].data_base64.as_deref(), Some("dXNlci1pbWFnZQ=="));
-            assert_eq!(images[1].sha256, tool_image.sha256);
-            assert_eq!(images[1].data_base64.as_deref(), Some("dG9vbC1pbWFnZQ=="));
+                _ => Vec::new(),
+            });
+            assert_eq!(images.collect::<Vec<_>>(), [&user_image, &tool_image]);
+            let found = request.blobs.get(&user_image.blob).unwrap();
+            assert_eq!(found, user_png.bytes());
+            let found = request.blobs.get(&tool_image.blob).unwrap();
+            assert_eq!(found, tool_png.bytes());
         }
         fixture.session.shutdown().await.unwrap();
     }
@@ -412,123 +373,67 @@ mod tests {
         let runtime = &fixture.session.runtime;
         let agent = &fixture.session.root;
         fixture.add_history(20_000).await;
-        // Use a separate owner so the idle root command loop cannot consume this
+        // A separate owner keeps the idle root command loop from consuming this
         // notification independently of the compaction under test.
         let owner = agent.child(99);
-        let job = runtime
-            .jobs
-            .create(JobSpec {
-                background: true,
-                ..JobSpec::test(owner.clone(), "background-research")
-            })
-            .await
-            .unwrap();
-        let root_job = runtime
-            .jobs
-            .create(JobSpec::test(agent.clone(), "root-research"))
-            .await
-            .unwrap();
+        let spec = JobSpec {
+            background: true,
+            ..JobSpec::test(owner.clone(), "background-research")
+        };
+        let job = runtime.jobs.create(spec).await.unwrap().into_test_id();
+        let root_job = JobSpec::test(agent.clone(), "root-research");
+        let root_job = runtime.jobs.create(root_job).await.unwrap().into_test_id();
         fixture.provider.block.store(true, Ordering::SeqCst);
-        let updated = vec![TodoItem {
-            text: "Verify the fresh finding".into(),
-            status: TodoStatus::InProgress,
-        }];
+        let updated = vec![todo("Verify the fresh finding", TodoStatus::InProgress)];
         let cancellation = CancellationToken::new();
         let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(fixture.compact(&cancellation), async {
                 fixture.provider.started.notified().await;
                 runtime.todos.replace(agent, updated.clone()).await.unwrap();
-                runtime
-                    .jobs
-                    .finish(job.id, JobOutcome::Completed(ToolOutput::default()))
-                    .await
-                    .unwrap();
-                runtime
-                    .jobs
-                    .finish(root_job.id, JobOutcome::Completed(ToolOutput::default()))
-                    .await
-                    .unwrap();
-                fixture.provider.release.add_permits(1);
+                for job in [job, root_job] {
+                    let outcome = JobOutcome::Completed(ToolOutput::default());
+                    runtime.jobs.finish(job, outcome).await.unwrap();
+                }
+                fixture.provider.release.notify_one();
                 fixture.provider.started.notified().await;
-                let requests = fixture.provider.requests.lock().unwrap();
-                let retry = requests.last().unwrap();
-                assert!(
-                    serde_json::to_string(&retry.messages)
-                        .unwrap()
-                        .contains("Verify the fresh finding")
-                );
-                drop(requests);
-                let mut summary = summary_value();
+                let retry = fixture.provider.requests.lock().unwrap().last().cloned();
+                let retry =
+                    serde_json::to_string(&retry.unwrap().messages().collect::<Vec<_>>()).unwrap();
+                assert!(retry.contains("Verify the fresh finding"));
+                let mut summary = summary_json();
                 summary["todos"] = json!(updated);
-                *fixture.provider.summary.lock().unwrap() = summary.to_string();
-                fixture.provider.release.add_permits(1);
+                fixture.set_summary(summary);
+                fixture.provider.release.notify_one();
             })
         })
         .await
         .unwrap();
         result.unwrap();
-        let records = runtime.store.records().await;
-        let host_launch = records
-            .iter()
-            .find_map(|record| match &record.event {
-                SessionEvent::Compaction { checkpoint } => {
-                    Some(serde_json::to_string(&checkpoint.message).unwrap())
-                }
-                _ => None,
-            })
-            .unwrap();
+        let records = fixture.records().await;
+        let host_launch = serde_json::to_string(&checkpoint(&records).message).unwrap();
         assert!(host_launch.contains("Previously started host work"));
         assert!(host_launch.contains("root-research"));
         assert!(!host_launch.contains("background-research"));
-        assert!(!records.iter().any(|record| matches!(
-            record.event,
-            SessionEvent::JobClaimed { .. } | SessionEvent::JobInjected { .. }
-        )));
-        assert_eq!(
-            runtime.jobs.take_pending(&owner).await.unwrap()[0].id,
-            job.id
-        );
+        assert_eq!(count!(&records, SessionEvent::JobClaimed { .. }), 0);
+        assert_eq!(count!(&records, SessionEvent::JobInjected { .. }), 0);
+        assert_eq!(runtime.jobs.take_pending(&owner).await.unwrap()[0].id, job);
         assert!(runtime.jobs.take_pending(&owner).await.unwrap().is_empty());
-        fixture
-            .session
-            .prompt("Continue with the current state.")
-            .await
-            .unwrap();
-        let request = fixture
-            .provider
-            .requests
-            .lock()
-            .unwrap()
-            .last()
-            .unwrap()
-            .clone();
-        let Some(Message::User(content)) = request.messages.last() else {
+        let next = fixture.session.prompt("Continue with the current state.");
+        next.await.unwrap();
+        let requests = fixture.provider.requests.lock().unwrap().clone();
+        let request = requests.last().unwrap();
+        let Some(Message::User(content)) = request.tail.last() else {
             panic!("fresh state")
         };
         let UserContent::Runtime { text } = &content[0] else {
             panic!("runtime state")
         };
-        assert!(text.contains("Verify the fresh finding"));
-        assert!(text.contains("in_progress"));
+        assert!(text.contains("Verify the fresh finding") && text.contains("in_progress"));
         assert!(!text.contains("root-research"));
-        assert_eq!(
-            runtime.todos.inspect(agent, None).await.unwrap().items,
-            updated
-        );
-        assert_eq!(
-            records
-                .iter()
-                .filter(|record| matches!(
-                    record.event,
-                    SessionEvent::ModelRequested {
-                        purpose: ModelPurpose::Compaction,
-                        ..
-                    }
-                ))
-                .count(),
-            2
-        );
-
+        let found = runtime.todos.inspect(agent, None).await.unwrap().items;
+        assert_eq!(found, updated);
+        let summaries = count!(&records, SessionEvent::ModelRequested { purpose, .. } if *purpose == ModelPurpose::Compaction);
+        assert_eq!(summaries, 2);
         fixture.session.shutdown().await.unwrap();
     }
 
@@ -539,68 +444,37 @@ mod tests {
         let agent = &fixture.session.root;
         fixture.add_history(20_000).await;
         let markdown = "Next: inspect the queue.";
-        let original = vec![TodoItem {
-            text: "Investigate the queue".into(),
-            status: TodoStatus::InProgress,
-        }];
+        let original = vec![todo("Investigate the queue", TodoStatus::InProgress)];
         let reconciled = vec![
-            TodoItem {
-                text: "Investigate the queue".into(),
-                status: TodoStatus::Completed,
-            },
-            TodoItem {
-                text: "Verify the resulting fix".into(),
-                status: TodoStatus::Pending,
-            },
+            todo("Investigate the queue", TodoStatus::Completed),
+            todo("Verify the resulting fix", TodoStatus::Pending),
         ];
         runtime.todos.replace(agent, original).await.unwrap();
         let child = agent.child(1);
-        let child_todos = vec![TodoItem {
-            text: "Independent delegated work".into(),
-            status: TodoStatus::InProgress,
-        }];
-        runtime
-            .todos
-            .replace(&child, child_todos.clone())
-            .await
-            .unwrap();
-        let mut summary = summary_value();
+        let child_todos = vec![todo("Independent delegated work", TodoStatus::InProgress)];
+        let todos = &runtime.todos;
+        todos.replace(&child, child_todos.clone()).await.unwrap();
+        let mut summary = summary_json();
         summary["plan"] = json!([markdown]);
         summary["todos"] = json!(reconciled);
         summary["todo_reconciliation"] =
             json!(["Queue investigation finished; verification was committed but not recorded."]);
-        *fixture.provider.summary.lock().unwrap() = summary.to_string();
-        let before_sequence = runtime.store.records().await.last().unwrap().sequence;
+        fixture.set_summary(summary);
+        let before_sequence = fixture.records().await.last().unwrap().sequence;
         fixture.compact(&CancellationToken::new()).await.unwrap();
-        let records = runtime.store.records().await;
-        let checkpoint = records
-            .iter()
-            .find_map(|record| match &record.event {
-                SessionEvent::Compaction { checkpoint } => Some(checkpoint),
-                _ => None,
-            })
-            .unwrap();
-        let expected = checkpoint.message.clone();
+        let records = fixture.records().await;
+        let checkpoint = checkpoint(&records);
         assert!(
-            matches!(&expected, Message::User(blocks) if blocks.iter().any(|block| matches!(block, UserContent::Compaction { text } if text.contains(markdown) && !text.contains("Reasoning before the answer"))))
+            matches!(&checkpoint.message, Message::User(blocks) if blocks.iter().any(|block| matches!(block, UserContent::Compaction { text } if text.contains(markdown) && !text.contains("Reasoning before the answer"))))
         );
         assert_eq!(checkpoint.todos, reconciled);
-        assert_eq!(
-            runtime.todos.inspect(agent, None).await.unwrap().items,
-            reconciled
-        );
-        assert_eq!(
-            runtime.todos.inspect(&child, None).await.unwrap().items,
-            child_todos
-        );
-        assert!(
-            !records
-                .iter()
-                .any(|record| record.sequence > before_sequence
-                    && matches!(record.event, SessionEvent::TodosReplaced { .. }))
-        );
+        let found = runtime.todos.inspect(agent, None).await.unwrap().items;
+        assert_eq!(found, reconciled);
+        let found = runtime.todos.inspect(&child, None).await.unwrap().items;
+        assert_eq!(found, child_todos);
+        let later = records.iter().filter(|r| r.sequence > before_sequence);
+        assert_eq!(count!(later, SessionEvent::TodosReplaced { .. }), 0);
         fixture.assert_no_tool_execution().await;
-
         fixture.session.shutdown().await.unwrap();
     }
 
@@ -616,29 +490,16 @@ mod tests {
             output_schema: Some(json!({"type":"object","properties":{"content":{"type":"string","x-skyhook-truncatable":true}}})),
             background: true,
             ..JobSpec::test(agent.child(99), "read")
-        }).await.unwrap();
-        runtime
-            .jobs
-            .finish(
-                lease.id,
-                JobOutcome::Completed(ToolOutput::new(json!({"content":output}))),
-            )
-            .await
-            .unwrap();
+        }).await.unwrap().into_test_id();
+        let outcome = JobOutcome::Completed(ToolOutput::new(json!({"content":output})));
+        runtime.jobs.finish(lease, outcome).await.unwrap();
         fixture.add_history(20_000).await;
-        let mut summary = summary_value();
-        summary["jobs"] = json!([lease.id, lease.id]);
-        *fixture.provider.summary.lock().unwrap() = summary.to_string();
+        let mut summary = summary_json();
+        summary["jobs"] = json!([lease, lease]);
+        fixture.set_summary(summary);
         fixture.compact(&CancellationToken::new()).await.unwrap();
-        let records = runtime.store.records().await;
-        let checkpoint = records
-            .iter()
-            .find_map(|record| match &record.event {
-                SessionEvent::Compaction { checkpoint } => Some(checkpoint),
-                _ => None,
-            })
-            .unwrap();
-        let Message::User(blocks) = &checkpoint.message else {
+        let records = fixture.records().await;
+        let Message::User(blocks) = &checkpoint(&records).message else {
             panic!("continuation")
         };
         let snapshot: Value = blocks
@@ -655,25 +516,10 @@ mod tests {
         let view = &snapshot["jobs"][0];
         assert_eq!(view["arguments"], arguments);
         assert!(view["result"]["content"].as_str().unwrap().len() < output.len());
-        assert_eq!(
-            runtime
-                .jobs
-                .snapshot(lease.id)
-                .await
-                .unwrap()
-                .output
-                .unwrap()["content"],
-            output
-        );
-        assert!(
-            runtime
-                .jobs
-                .take_pending(&agent.child(99))
-                .await
-                .unwrap()
-                .iter()
-                .any(|job| job.id == lease.id)
-        );
+        let saved = runtime.jobs.snapshot(lease).await.unwrap().output.unwrap();
+        assert_eq!(saved["content"], output);
+        let pending = runtime.jobs.take_pending(&agent.child(99)).await.unwrap();
+        assert!(pending.iter().any(|job| job.id == lease));
         fixture.session.shutdown().await.unwrap();
     }
 }

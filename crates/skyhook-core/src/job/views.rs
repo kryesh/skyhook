@@ -7,6 +7,8 @@ pub struct JobEnvelope {
     pub id: JobId,
     pub parent: Option<JobId>,
     pub tool: String,
+    #[serde(default)]
+    pub role: JobRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub state: JobState,
@@ -31,7 +33,9 @@ struct PresentedJob<'a> {
     target: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace: Option<&'a std::path::Path>,
+    /// A waiting child agent returns a question batch; other jobs may return any output.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "question_or_output_schema")]
     output: Option<&'a Value>,
     /// Source sequence of the last visible child reply. Automatic completed-agent
     /// notifications reference that message instead of repeating the saved result.
@@ -41,6 +45,13 @@ struct PresentedJob<'a> {
     error: Option<&'a str>,
     #[serde(flatten)]
     denial: Option<crate::tool::Denial>,
+}
+
+// Keep question fields discoverable without classifying extensible tool names.
+fn question_or_output_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "anyOf": [generator.subschema_for::<crate::agent::QuestionOutput>(), true]
+    })
 }
 
 /// Minimal job information included in the model's current runtime snapshot.
@@ -81,10 +92,20 @@ impl JobEnvelope {
         viewer: Option<&ExecutionLocation>,
         detailed: bool,
     ) -> Result<Value, serde_json::Error> {
+        self.presented_with_reference(capabilities, viewer, detailed, None)
+    }
+
+    pub(super) fn presented_with_reference(
+        &self,
+        capabilities: &CapabilitySet,
+        viewer: Option<&ExecutionLocation>,
+        detailed: bool,
+        last_message: Option<u64>,
+    ) -> Result<Value, serde_json::Error> {
         serde_json::to_value(PresentedJob {
             id: self.id,
             state: self.state.presented(),
-            last_message: None,
+            last_message,
             parent: self.parent.filter(|_| detailed),
             tool: detailed.then_some(self.tool.as_str()),
             name: self
@@ -113,20 +134,6 @@ pub(crate) fn presented_job_schema(capabilities: &CapabilitySet, many: bool) -> 
             .unwrap()
             .remove("target");
     }
-    let settings = schemars::generate::SchemaSettings::default().with(|settings| {
-        settings.meta_schema = None;
-        settings.inline_subschemas = true;
-    });
-    let question = serde_json::to_value(
-        settings
-            .into_generator()
-            .into_root_schema_for::<crate::agent::QuestionOutput>(),
-    )
-    .expect("question schema serializes");
-    envelope["allOf"] = serde_json::json!([{
-        "if":{"properties":{"state":{"const":"waiting_input"},"tool":{"const":"agent"}},"required":["state","tool"]},
-        "then":{"properties":{"output":question}}
-    }]);
     if many {
         let definitions = envelope
             .as_object_mut()
@@ -290,7 +297,7 @@ impl JobManager {
             .ok_or(JobError::Unknown(id))
     }
 
-    pub async fn images(&self, id: JobId) -> Result<Vec<ImageReference>, JobError> {
+    pub async fn images(&self, id: JobId) -> Result<Vec<ImageRef>, JobError> {
         self.inner
             .jobs
             .lock()
@@ -305,60 +312,75 @@ impl JobManager {
 mod tests {
     use super::*;
 
+    #[test]
+    fn question_schema_documents_batches_without_classifying_tool_names() {
+        for many in [false, true] {
+            let schema = presented_job_schema(&CapabilitySet::default(), many);
+            assert!(
+                schema["$defs"]["QuestionOutput"]["properties"]
+                    .get("questions")
+                    .is_some()
+            );
+            let envelope = if many { &schema["items"] } else { &schema };
+            assert!(envelope["properties"].get("role").is_none());
+            for (tool, output) in [
+                (
+                    "delegate",
+                    serde_json::json!({"questions":[{"id":"choice", "prompt":"Choose"}]}),
+                ),
+                ("agent", serde_json::json!("custom prompt")),
+            ] {
+                let job = serde_json::json!({"id":1, "state":"waiting_input", "tool":tool, "output":output});
+                let value = if many { serde_json::json!([job]) } else { job };
+                assert!(jsonschema::is_valid(&schema, &value));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn active_launches_stop_at_agent_boundaries_and_prefer_the_nearest_call() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
+        let (_root, jobs, agent) = super::super::tests::runtime().await;
         let child_agent = agent.child(1);
-        let jobs = JobManager::new(store);
-        let root_origin = crate::session::ModelCallOrigin {
-            message: 1,
-            call_id: "delegate".into(),
+        let origin = |message, call_id: &str| crate::session::ModelCallOrigin {
+            message,
+            call_id: call_id.into(),
         };
-        let child_origin = crate::session::ModelCallOrigin {
-            message: 2,
-            call_id: "child-script".into(),
+        let (root_origin, child_origin) = (origin(1, "delegate"), origin(2, "child-script"));
+        let spec = |agent: &AgentId, tool, parent, origin| JobSpec {
+            parent,
+            origin,
+            ..JobSpec::test(agent.clone(), tool)
         };
         let owner = jobs
-            .test_lease(JobSpec {
-                origin: Some(root_origin.clone()),
-                ..JobSpec::test(agent.clone(), "agent")
-            })
+            .test_lease(spec(&agent, "agent", None, Some(root_origin.clone())))
             .await;
         let host = jobs
-            .test_lease(JobSpec {
-                parent: Some(owner.id),
-                ..JobSpec::test(child_agent.clone(), "host-started")
-            })
+            .test_lease(spec(&child_agent, "host-started", Some(owner.id()), None))
             .await;
         assert_eq!(
             jobs.active_launches(&child_agent).await,
-            vec![(host.id, None)]
+            vec![(host.id(), None)]
         );
-        let child = jobs
-            .test_lease(JobSpec {
-                parent: Some(owner.id),
-                origin: Some(child_origin.clone()),
-                ..JobSpec::test(child_agent.clone(), "script")
-            })
-            .await;
+        let script = spec(
+            &child_agent,
+            "script",
+            Some(owner.id()),
+            Some(child_origin.clone()),
+        );
+        let child = jobs.test_lease(script).await;
         let shell = jobs
-            .test_lease(JobSpec {
-                parent: Some(child.id),
-                ..JobSpec::test(child_agent.clone(), "shell")
-            })
+            .test_lease(spec(&child_agent, "shell", Some(child.id()), None))
             .await;
         assert_eq!(
             jobs.active_launches(&agent).await,
-            vec![(owner.id, Some(root_origin))]
+            vec![(owner.id(), Some(root_origin))]
         );
         assert_eq!(
             jobs.active_launches(&child_agent).await,
             vec![
-                (host.id, None),
-                (child.id, Some(child_origin.clone())),
-                (shell.id, Some(child_origin)),
+                (host.id(), None),
+                (child.id(), Some(child_origin.clone())),
+                (shell.id(), Some(child_origin))
             ]
         );
     }

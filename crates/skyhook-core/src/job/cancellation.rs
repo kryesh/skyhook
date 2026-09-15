@@ -86,6 +86,8 @@ impl JobManager {
                 })
                 .collect::<Vec<_>>();
             if ids.is_empty() {
+                // Terminal publication may precede supervisor cleanup.
+                self.drain_supervisors().await;
                 return Ok(());
             }
             for id in &ids {
@@ -129,55 +131,68 @@ mod tests {
     use crate::tests::TestRuntime;
     use crate::tool::{
         ToolError, ToolOptions, ToolRegistryBuilder,
-        executor::{ExecutionError, ToolExecutor},
-        policy::{AllowAll, AuthorizationRequest, Policy, PolicyFuture},
+        executor::ExecutionError,
+        policy::{AuthorizationRequest, Policy, PolicyFuture},
     };
     use std::sync::atomic::AtomicBool;
+
     #[derive(Deserialize, JsonSchema)]
     struct NoArgs {}
+
     struct NeverAuthorize;
+
     impl Policy for NeverAuthorize {
         fn authorize(&self, _request: AuthorizationRequest) -> PolicyFuture<'_> {
             Box::pin(std::future::pending())
         }
     }
 
+    fn child(parent: JobId, agent: AgentId, tool: &str) -> JobSpec {
+        JobSpec {
+            parent: Some(parent),
+            ..JobSpec::test(agent, tool)
+        }
+    }
+
+    async fn cancelled_within(jobs: &JobManager, id: JobId, seconds: u64) -> JobState {
+        let wait = tokio::time::timeout(Duration::from_secs(seconds), jobs.wait(id, None, true));
+        wait.await
+            .expect("cancellation did not terminate the job")
+            .unwrap()
+            .state
+    }
+
     #[tokio::test]
     async fn cancellation_drain_waits_for_terminal_questions_and_descendants() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
-        let jobs = JobManager::new(store.clone());
+        let (_root, jobs, agent) = crate::job::tests::runtime().await;
         let parent = jobs
             .test_lease(JobSpec::test(agent.clone(), "script"))
             .await;
-        jobs.transition(parent.id, JobState::Running).await.unwrap();
-        let question = jobs
-            .test_lease(JobSpec {
-                parent: Some(parent.id),
-                accepts_input: true,
-                background: true,
-                ..JobSpec::test(agent, "ask")
-            })
-            .await;
-        jobs.transition(question.id, JobState::Running)
+        jobs.transition(parent.id(), JobState::Running)
             .await
             .unwrap();
-        jobs.request_input(question.id, serde_json::json!({"prompt": "pending"}))
+        let spec = JobSpec {
+            accepts_input: true,
+            background: true,
+            ..child(parent.id(), agent, "ask")
+        };
+        let question = jobs.test_lease(spec).await;
+        jobs.transition(question.id(), JobState::Running)
             .await
             .unwrap();
+        let prompt = serde_json::json!({"prompt": "pending"});
+        jobs.request_input(question.id(), prompt).await.unwrap();
         assert_eq!(
-            jobs.snapshot(question.id).await.unwrap().state,
+            jobs.snapshot(question.id()).await.unwrap().state,
             JobState::WaitingInput
         );
-        tokio::time::timeout(Duration::from_secs(5), jobs.cancel_and_drain())
-            .await
-            .unwrap()
-            .unwrap();
-        for id in [parent.id, question.id] {
+        let drain = tokio::time::timeout(Duration::from_secs(5), jobs.cancel_and_drain());
+        drain.await.unwrap().unwrap();
+        let records = jobs.store().records().await;
+        for id in [parent.id(), question.id()] {
             assert_eq!(jobs.snapshot(id).await.unwrap().state, JobState::Cancelled);
             assert!(
-                store.records().await.iter().any(|record| {
+                records.iter().any(|record| {
                     matches!(&record.event, SessionEvent::JobFinished { job, .. } if *job == id)
                 }),
                 "terminal cancellation must be journaled before shutdown returns"
@@ -191,140 +206,103 @@ mod tests {
         let parent = jobs
             .test_lease(JobSpec::test(agent.clone(), "script"))
             .await;
-        let child = jobs
-            .test_lease(JobSpec {
-                parent: Some(parent.id),
-                ..JobSpec::test(agent.child(1), "agent")
-            })
+        let child_lease = jobs
+            .test_lease(child(parent.id(), agent.child(1), "agent"))
             .await;
         let grandchild = jobs
-            .test_lease(JobSpec {
-                parent: Some(child.id),
-                ..JobSpec::test(agent.child(1), "shell")
-            })
+            .test_lease(child(child_lease.id(), agent.child(1), "shell"))
             .await;
-        jobs.test_finish(parent.id, serde_json::Value::Null).await;
-        jobs.cancel(parent.id).await.unwrap();
-        assert!(child.cancellation.is_cancelled());
-        assert!(grandchild.cancellation.is_cancelled());
-        let late = jobs
-            .test_lease(JobSpec {
-                parent: Some(grandchild.id),
-                ..JobSpec::test(agent, "late")
-            })
-            .await;
-        assert!(late.cancellation.is_cancelled());
-        let terminal = jobs
-            .wait(late.id, Some(Duration::from_secs(2)), true)
-            .await
-            .unwrap();
-        assert_eq!(terminal.state, JobState::Cancelled);
+        jobs.test_finish(parent.id(), serde_json::Value::Null).await;
+        jobs.cancel(parent.id()).await.unwrap();
+        assert!(child_lease.cancellation_token().is_cancelled());
+        assert!(grandchild.cancellation_token().is_cancelled());
+        let late = jobs.test_lease(child(grandchild.id(), agent, "late")).await;
+        assert!(late.cancellation_token().is_cancelled());
+        assert_eq!(
+            cancelled_within(&jobs, late.id(), 2).await,
+            JobState::Cancelled
+        );
     }
 
     #[tokio::test]
-    async fn uncooperative_handlers_are_aborted_after_cancellation_grace() {
+    async fn uncooperative_and_cooperative_handlers_and_pending_authorization_observe_cancellation()
+    {
         let runtime = TestRuntime::new().await;
-        let agent = runtime.agent.clone();
+        let (agent, jobs) = (&runtime.agent, &runtime.jobs);
+        let observed = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Notify::new());
         let mut builder = ToolRegistryBuilder::default();
+        let options = ToolOptions::new(vec![Capability::Exec]).background();
         builder
             .register::<NoArgs, String, _, _>(
                 "stubborn",
                 "never completes",
-                ToolOptions::new(Vec::new()).background(),
-                |_context, _input| async move {
-                    std::future::pending::<Result<String, ToolError>>().await
-                },
+                options.clone(),
+                |_, _| std::future::pending::<Result<String, ToolError>>(),
             )
-            .unwrap();
-        let jobs = runtime.jobs.clone();
-        let executor = runtime.executor(builder);
-        let running = executor
-            .execute(agent, "stubborn", serde_json::json!({"bg": true}), None)
-            .await
-            .unwrap();
-
-        jobs.cancel(running.job).await.unwrap();
-        let cancelled =
-            tokio::time::timeout(Duration::from_secs(2), jobs.wait(running.job, None, true))
-                .await
-                .expect("forced cancellation did not terminate the job")
-                .unwrap();
-        assert_eq!(cancelled.state, JobState::Cancelled);
-    }
-
-    #[tokio::test]
-    async fn cooperative_handlers_and_pending_authorization_observe_cancellation() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
-        let observed = Arc::new(AtomicBool::new(false));
-        let started = Arc::new(Notify::new());
-        let mut builder = ToolRegistryBuilder::default();
-        builder
-            .register::<NoArgs, String, _, _>(
-                "cooperative",
-                "wait for cancellation",
-                ToolOptions::new(vec![Capability::Exec]).background(),
-                {
-                    let observed = observed.clone();
-                    let started = started.clone();
-                    move |context, _input| {
-                        let observed = observed.clone();
-                        let started = started.clone();
-                        async move {
-                            started.notify_one();
-                            context.cancelled().await;
-                            observed.store(true, Ordering::Relaxed);
-                            Err(ToolError::Cancelled)
-                        }
+            .unwrap()
+            .register::<NoArgs, String, _, _>("cooperative", "wait for cancellation", options, {
+                let (observed, started) = (observed.clone(), started.clone());
+                move |context, _input| {
+                    let (observed, started) = (observed.clone(), started.clone());
+                    async move {
+                        started.notify_one();
+                        context.cancelled().await;
+                        observed.store(true, Ordering::Relaxed);
+                        Err(ToolError::Cancelled)
                     }
-                },
-            )
+                }
+            })
             .unwrap();
         let registry = builder.build();
-        let jobs = JobManager::new(store);
-        let executor = ToolExecutor::new(
+        let executor = crate::tool::executor::ToolExecutor::new(
             registry.clone(),
-            Arc::new(AllowAll),
+            Arc::new(crate::tool::policy::AllowAll),
             jobs.clone(),
-            root.path().to_path_buf(),
+            runtime.root.path().to_path_buf(),
         );
-        let running = executor
-            .execute(
-                agent.clone(),
-                "cooperative",
-                serde_json::json!({"bg": true}),
-                None,
-            )
+        // Uncooperative handlers are aborted after the cancellation grace.
+        let background = serde_json::json!({"bg": true});
+        let stubborn = executor
+            .run_host(agent, "stubborn", background.clone())
+            .await
+            .unwrap();
+        jobs.cancel(stubborn.job).await.unwrap();
+        assert_eq!(
+            cancelled_within(jobs, stubborn.job, 2).await,
+            JobState::Cancelled
+        );
+        let cooperative = executor
+            .run_host(agent, "cooperative", background)
             .await
             .unwrap();
         started.notified().await;
-        jobs.cancel(running.job).await.unwrap();
-        let cancelled =
-            tokio::time::timeout(Duration::from_secs(1), jobs.wait(running.job, None, true))
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(cancelled.state, JobState::Cancelled);
+        jobs.cancel(cooperative.job).await.unwrap();
+        assert_eq!(
+            cancelled_within(jobs, cooperative.job, 1).await,
+            JobState::Cancelled
+        );
         assert!(observed.load(Ordering::Relaxed));
 
-        let executor = ToolExecutor::new(
+        let executor = crate::tool::executor::ToolExecutor::new(
             registry,
             Arc::new(NeverAuthorize),
             jobs.clone(),
-            root.path().to_path_buf(),
+            runtime.root.path().to_path_buf(),
         );
-        let execution = tokio::spawn(async move {
-            executor
-                .execute(agent, "cooperative", serde_json::json!({}), None)
-                .await
+        let execution = tokio::spawn({
+            let agent = agent.clone();
+            async move {
+                executor
+                    .run_host(&agent, "cooperative", serde_json::json!({}))
+                    .await
+            }
         });
         let awaiting = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if let Some(job) = jobs
-                    .list(&AgentId::root(jobs.store().id()))
-                    .await
-                    .into_iter()
+                let listed = jobs.list(agent).await;
+                if let Some(job) = listed
+                    .iter()
                     .find(|job| job.state == JobState::AwaitingApproval)
                 {
                     break job.id;
@@ -335,7 +313,8 @@ mod tests {
         .await
         .unwrap();
         jobs.cancel(awaiting).await.unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(1), execution)
+        let result = tokio::time::timeout(Duration::from_secs(1), execution);
+        let result = result
             .await
             .expect("authorization did not observe cancellation")
             .unwrap();

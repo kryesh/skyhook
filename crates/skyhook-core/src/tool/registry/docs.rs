@@ -12,15 +12,12 @@ use super::{ScriptBinding, ToolExposure, ToolSpec, ToolSurface};
 impl ToolSurface {
     #[must_use]
     pub fn definitions(&self) -> Vec<ProviderToolDefinition> {
-        let job_envelope = self
-            .tools
-            .get("job_cancel")
-            .and_then(|tool| tool.output_schema.as_ref());
+        let job_envelope = &self.job_envelope;
         self.tools
             .values()
             .filter(|tool| tool.exposure == ToolExposure::ModelVisible)
             .map(|tool| {
-                let description = if tool.name == "script" {
+                let description = if tool.job_role == crate::job::JobRole::Script {
                     let mut description = self.script_description(&tool.description);
                     if let Some(schema) = &tool.result_schema {
                         let result_type = output_type(schema, job_envelope);
@@ -32,7 +29,7 @@ impl ToolSurface {
                         .result_schema
                         .as_ref()
                         .map(|schema| output_type(schema, job_envelope));
-                    if tool.name == "job_output" {
+                    if tool.result_policy == super::ToolResultPolicy::JobView {
                         tool.description.clone()
                     } else {
                         format!(
@@ -52,17 +49,15 @@ impl ToolSurface {
     }
 
     fn script_description(&self, base: &str) -> String {
-        let job_envelope = self
-            .tools
-            .get("job_cancel")
-            .and_then(|tool| tool.output_schema.as_ref());
+        let job_envelope = &self.job_envelope;
         let documented = self
             .tools
             .values()
             .filter(|tool| match &tool.script_binding {
                 ScriptBinding::TopLevel => tool.exposure == ToolExposure::ScriptOnly,
                 ScriptBinding::JobMethod { .. } => {
-                    tool.exposure == ToolExposure::ScriptOnly || tool.name == "job_output"
+                    tool.exposure == ToolExposure::ScriptOnly
+                        || tool.result_policy == super::ToolResultPolicy::JobView
                 }
                 ScriptBinding::Unavailable => false,
             })
@@ -79,11 +74,7 @@ impl ToolSurface {
     }
 }
 
-fn describe_output(
-    description: &str,
-    schema: Option<&Value>,
-    job_envelope: Option<&Value>,
-) -> String {
+fn describe_output(description: &str, schema: Option<&Value>, job_envelope: &Value) -> String {
     schema.map_or_else(
         || description.to_owned(),
         |schema| {
@@ -95,19 +86,14 @@ fn describe_output(
     )
 }
 
-fn output_type(schema: &Value, job_envelope: Option<&Value>) -> String {
+fn output_type(schema: &Value, job_envelope: &Value) -> String {
     let rendered = schema_type(schema, schema);
-    job_envelope.map_or_else(
-        || rendered.clone(),
-        |envelope| {
-            let metadata = schema_type(envelope, envelope);
-            if rendered == format!("{metadata}[]") {
-                "job metadata array".to_owned()
-            } else {
-                rendered.replace(&metadata, "job metadata")
-            }
-        },
-    )
+    let metadata = schema_type(job_envelope, job_envelope);
+    if rendered == format!("{metadata}[]") {
+        "job metadata array".to_owned()
+    } else {
+        rendered.replace(&metadata, "job metadata")
+    }
 }
 
 pub(crate) fn job_view_type(capabilities: &CapabilitySet) -> String {
@@ -180,7 +166,7 @@ impl ScriptManifest {
     }
 }
 
-fn script_documentation(tool: &ToolSpec, job_envelope: Option<&Value>) -> String {
+fn script_documentation(tool: &ToolSpec, job_envelope: &Value) -> String {
     let schema = &tool.input_schema;
     let excluded = match &tool.script_binding {
         ScriptBinding::JobMethod { job_argument, .. } => Some(job_argument.as_str()),

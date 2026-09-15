@@ -39,19 +39,6 @@ pub(crate) async fn resolve_existing(
     Ok(fs::canonicalize(joined).await?)
 }
 
-pub(crate) async fn resolve_directory(
-    workspace: &Path,
-    relative: &str,
-) -> Result<PathBuf, ToolError> {
-    let path = resolve_existing(workspace, relative).await?;
-    if !fs::metadata(&path).await?.is_dir() {
-        return Err(ToolError::Failed(format!(
-            "working directory is not a directory: {relative}"
-        )));
-    }
-    Ok(path)
-}
-
 pub(crate) async fn resolve_writable(
     workspace: &Path,
     relative: &str,
@@ -195,7 +182,7 @@ mod tests {
             root.path().join("new")
         );
         assert_eq!(
-            resolve_directory(&workspace, "nested/..").await.unwrap(),
+            resolve_existing(&workspace, "nested/..").await.unwrap(),
             fs::canonicalize(&workspace).await.unwrap()
         );
         for path in [".", "nested/..", "../workspace"] {

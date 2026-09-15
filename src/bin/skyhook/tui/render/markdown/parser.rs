@@ -8,16 +8,31 @@ use ratatui::{
     text::{Line, Span},
 };
 
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct LineInfo {
     pub(super) prefix_spans: usize,
     pub(super) continuation: Line<'static>,
     pub(super) code: Option<usize>,
 }
 
+/// A rendered logical line travels with the metadata that describes it.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct ParsedLine {
+    pub(super) line: Line<'static>,
+    pub(super) info: LineInfo,
+}
+
+impl From<Line<'static>> for ParsedLine {
+    fn from(line: Line<'static>) -> Self {
+        Self {
+            line,
+            info: LineInfo::default(),
+        }
+    }
+}
+
 pub(super) struct Parsed {
-    pub(super) lines: Vec<Line<'static>>,
-    pub(super) info: std::collections::HashMap<usize, LineInfo>,
+    pub(super) lines: Vec<ParsedLine>,
 }
 
 pub(in super::super) fn options() -> Options {
@@ -35,39 +50,66 @@ struct List {
 
 enum Container {
     Quote,
-    List(usize),
+    List(List),
+}
+
+enum CodeSource {
+    Literal,
+    Named { language: String, source: String },
+}
+
+struct ActiveCodeBlock {
+    id: usize,
+    rows: usize,
+    source: CodeSource,
 }
 
 struct Renderer<'a> {
     palette: Palette,
     width: usize,
-    lines: Vec<Line<'static>>,
-    info: std::collections::HashMap<usize, LineInfo>,
+    lines: Vec<ParsedLine>,
     marker_spans: usize,
-    code_id: usize,
-    code_rows: usize,
+    next_code_id: usize,
     spans: Vec<Span<'static>>,
     gap: bool,
     heading: usize,
     bold: usize,
     italic: usize,
     strike: usize,
-    code: bool,
-    fence: Option<(String, String)>,
+    code: Option<ActiveCodeBlock>,
     highlights: Option<&'a tool_view::HighlightCache>,
     containers: Vec<Container>,
     marker_only: bool,
-    lists: Vec<List>,
     links: Vec<String>,
     table: Option<Table>,
 }
 
 impl Renderer<'_> {
+    fn list(&self) -> Option<&List> {
+        self.containers
+            .iter()
+            .rev()
+            .find_map(|container| match container {
+                Container::List(list) => Some(list),
+                Container::Quote => None,
+            })
+    }
+
+    fn list_mut(&mut self) -> Option<&mut List> {
+        self.containers
+            .iter_mut()
+            .rev()
+            .find_map(|container| match container {
+                Container::List(list) => Some(list),
+                Container::Quote => None,
+            })
+    }
+
     fn style(&self) -> Style {
         let content = self.palette.content;
         // Foreground precedence is independent of modifiers: code/link wins
         // over headings (including table headers), then strong, then prose.
-        let foreground = if self.code {
+        let foreground = if self.code.is_some() {
             content.inline_code
         } else if !self.links.is_empty() {
             content.accent
@@ -102,7 +144,7 @@ impl Renderer<'_> {
 
     fn begin(&mut self) {
         if self.gap && !self.lines.is_empty() {
-            self.lines.push(Line::default());
+            self.lines.push(ParsedLine::default());
         }
         self.gap = false;
     }
@@ -119,8 +161,8 @@ impl Renderer<'_> {
                     "│ ",
                     Style::default().fg(self.palette.content.muted),
                 )),
-                Container::List(index) => {
-                    let indent = self.lists[*index].indent;
+                Container::List(list) => {
+                    let indent = list.indent;
                     if indent > 0 {
                         spans.push(Span::raw(" ".repeat(indent)));
                     }
@@ -129,11 +171,9 @@ impl Renderer<'_> {
         }
         let prefix_spans = spans.len() + self.marker_spans;
         spans.append(&mut self.spans);
-        let index = self.lines.len();
-        self.lines.push(Line::from(spans));
         self.marker_spans = 0;
         self.marker_only = false;
-        if let Some(list) = self.lists.last_mut()
+        if let Some(list) = self.list_mut()
             && list.indent == 0
         {
             list.indent = list
@@ -147,8 +187,7 @@ impl Renderer<'_> {
                     "│ ",
                     Style::default().fg(self.palette.content.muted),
                 )),
-                Container::List(index) => {
-                    let list = &self.lists[*index];
+                Container::List(list) => {
                     // The checkbox hangs only the task's own paragraph. A
                     // descendant list/quote starts at the ordinary item indent,
                     // so its continuation must not inherit ancestor checkboxes.
@@ -161,16 +200,16 @@ impl Renderer<'_> {
                 }
             }
         }
-        self.info.insert(
-            index,
-            LineInfo {
+        self.lines.push(ParsedLine {
+            line: Line::from(spans),
+            info: LineInfo {
                 prefix_spans,
                 continuation: Line::from(continuation),
-                code: self.code.then_some(self.code_id),
+                code: self.code.as_ref().map(|code| code.id),
             },
-        );
-        if self.code {
-            self.code_rows += 1;
+        });
+        if let Some(code) = &mut self.code {
+            code.rows += 1;
         }
     }
 
@@ -215,17 +254,28 @@ impl Renderer<'_> {
                 if !self.marker_only {
                     self.flush(false);
                 }
-                self.code = true;
-                self.code_id += 1;
-                self.code_rows = 0;
-                if let CodeBlockKind::Fenced(info) = kind
-                    && let Some(language) = info.split_whitespace().next()
-                {
-                    self.fence = Some((language.to_owned(), String::new()));
-                }
+                self.next_code_id += 1;
+                let source = match kind {
+                    CodeBlockKind::Fenced(info) => {
+                        info.split_whitespace()
+                            .next()
+                            .map_or(CodeSource::Literal, |language| CodeSource::Named {
+                                language: language.to_owned(),
+                                source: String::new(),
+                            })
+                    }
+                    CodeBlockKind::Indented => CodeSource::Literal,
+                };
+                self.code = Some(ActiveCodeBlock {
+                    id: self.next_code_id,
+                    rows: 0,
+                    source,
+                });
             }
             Event::End(TagEnd::CodeBlock) => {
-                if let Some((language, source)) = self.fence.take()
+                let code = self.code.as_mut().expect("end inside code block");
+                if let CodeSource::Named { language, source } =
+                    std::mem::replace(&mut code.source, CodeSource::Literal)
                     && !source.is_empty()
                 {
                     let trailing_newline = source.ends_with('\n');
@@ -234,7 +284,7 @@ impl Renderer<'_> {
                             source: source.as_str().into(),
                             language,
                             indent: 0,
-                            gutters: Vec::new(),
+                            gutters: Default::default(),
                             role: tool_view::Role::Constant,
                         }],
                     };
@@ -249,11 +299,11 @@ impl Renderer<'_> {
                         self.flush(true);
                     }
                 }
-                if self.code_rows == 0 && self.spans.is_empty() {
+                if self.code.as_ref().unwrap().rows == 0 && self.spans.is_empty() {
                     self.flush(true);
                 }
                 self.block_end();
-                self.code = false;
+                self.code = None;
             }
             Event::Start(Tag::BlockQuote(_)) => {
                 self.flush(false);
@@ -266,35 +316,29 @@ impl Renderer<'_> {
             Event::Start(Tag::List(next)) => {
                 self.flush(false);
                 // Nested lists attach directly to their parent item.
-                if !self.lists.is_empty() {
+                if self.list().is_some() {
                     self.gap = false;
                 }
-                self.containers.push(Container::List(self.lists.len()));
-                self.lists.push(List {
+                self.containers.push(Container::List(List {
                     next,
                     indent: 0,
                     task_indent: 0,
                     loose: false,
                     started: false,
-                });
+                }));
             }
             Event::End(TagEnd::List(_)) => {
                 self.flush(false);
-                self.lists.pop();
                 self.containers.pop();
                 self.gap = true;
             }
             Event::Start(Tag::Item) => {
-                if self
-                    .lists
-                    .last()
-                    .is_some_and(|list| list.started && !list.loose)
-                {
+                if self.list().is_some_and(|list| list.started && !list.loose) {
                     self.gap = false;
                 }
                 self.begin();
                 self.marker_only = true;
-                let list = self.lists.last_mut().expect("item inside list");
+                let list = self.list_mut().expect("item inside list");
                 list.indent = 0;
                 list.task_indent = 0;
                 list.started = true;
@@ -314,7 +358,7 @@ impl Renderer<'_> {
             Event::End(TagEnd::Item) => self.flush(false),
             Event::Start(Tag::Paragraph) => {
                 if matches!(self.containers.last(), Some(Container::List(_))) {
-                    self.lists.last_mut().unwrap().loose = true;
+                    self.list_mut().unwrap().loose = true;
                 }
                 // A loose item's first paragraph follows its marker on the same row.
                 if self.spans.is_empty() {
@@ -336,15 +380,27 @@ impl Renderer<'_> {
                 }
             }
             Event::Text(value) | Event::Html(value) | Event::InlineHtml(value) => {
-                if self.fence.as_ref().is_some_and(|(_, source)| {
-                    value.len() > tool_view::MAX_SECTION.saturating_sub(source.len())
-                }) {
+                let overflow = self.code.as_ref().is_some_and(|code| match &code.source {
+                    CodeSource::Named { source, .. } => {
+                        value.len() > tool_view::MAX_SECTION.saturating_sub(source.len())
+                    }
+                    CodeSource::Literal => false,
+                });
+                if overflow {
                     // Oversized fences stay on the original streaming text
                     // path, without allocating/hashing a second huge source.
-                    let (_, source) = self.fence.take().unwrap();
-                    self.text(&source, self.style());
+                    let code = self.code.as_mut().unwrap();
+                    if let CodeSource::Named { source, .. } =
+                        std::mem::replace(&mut code.source, CodeSource::Literal)
+                    {
+                        self.text(&source, self.style());
+                    }
                 }
-                if let Some((_, source)) = &mut self.fence {
+                if let Some(ActiveCodeBlock {
+                    source: CodeSource::Named { source, .. },
+                    ..
+                }) = &mut self.code
+                {
                     source.push_str(&value);
                 } else {
                     self.text(&value, self.style());
@@ -369,7 +425,7 @@ impl Renderer<'_> {
                     Style::default().fg(self.palette.content.primary),
                 ));
                 self.marker_spans += 1;
-                if let Some(list) = self.lists.last_mut() {
+                if let Some(list) = self.list_mut() {
                     list.task_indent = 4;
                 }
             }
@@ -395,7 +451,7 @@ impl Renderer<'_> {
                     .iter()
                     .map(|container| match container {
                         Container::Quote => 2,
-                        Container::List(index) => self.lists[*index].indent,
+                        Container::List(list) => list.indent,
                     })
                     .sum();
                 let width = self.width.saturating_sub(indent).max(1);
@@ -421,22 +477,18 @@ pub(super) fn parse(
         palette,
         width,
         lines: Vec::new(),
-        info: std::collections::HashMap::new(),
         marker_spans: 0,
-        code_id: 0,
-        code_rows: 0,
+        next_code_id: 0,
         spans: Vec::new(),
         gap: false,
         heading: 0,
         bold: 0,
         italic: 0,
         strike: 0,
-        code: false,
-        fence: None,
+        code: None,
         highlights: cache,
         containers: Vec::new(),
         marker_only: false,
-        lists: Vec::new(),
         links: Vec::new(),
         table: None,
     };
@@ -445,17 +497,17 @@ pub(super) fn parse(
     }
     renderer.flush(false);
     if placeholder && renderer.lines.is_empty() {
-        renderer.lines.push(Line::default());
+        renderer.lines.push(ParsedLine::default());
     }
     Parsed {
         lines: renderer.lines,
-        info: renderer.info,
     }
 }
 
 #[cfg(test)]
 pub(in super::super) mod tests {
     use super::*;
+    use ratatui::style::Color;
 
     pub(in super::super::super) fn render(
         text: &str,
@@ -473,7 +525,8 @@ pub(in super::super) mod tests {
         width: usize,
         cache: Option<&tool_view::HighlightCache>,
     ) -> Vec<Line<'static>> {
-        parse(text, palette, placeholder, width, cache).lines
+        let lines = parse(text, palette, placeholder, width, cache).lines;
+        lines.into_iter().map(|parsed| parsed.line).collect()
     }
 
     fn rendered(text: &str, width: usize) -> Vec<Line<'static>> {
@@ -485,96 +538,101 @@ pub(in super::super) mod tests {
     }
 
     fn span_style(lines: &[Line<'_>], text: &str) -> Style {
-        lines
-            .iter()
-            .flat_map(|line| &line.spans)
-            .find(|span| span.content == text)
-            .unwrap_or_else(|| panic!("missing span {text:?} in {:?}", strings(lines)))
+        let mut spans = lines.iter().flat_map(|line| &line.spans);
+        let span = spans.find(|span| span.content == text);
+        span.unwrap_or_else(|| panic!("missing span {text:?} in {:?}", strings(lines)))
             .style
     }
+
+    /// Assert a span's foreground and that it carries at least `modifiers`.
+    fn assert_style(lines: &[Line<'_>], text: &str, fg: Color, modifiers: Modifier) {
+        let style = span_style(lines, text);
+        assert_eq!(style.fg, Some(fg), "{text}");
+        assert!(style.add_modifier.contains(modifiers), "{text}: {style:?}");
+    }
+
+    #[test]
+    fn empty_and_multiple_code_blocks_keep_distinct_ids() {
+        let source = "```rust\n```\n\nprose\n\n```\n\n```\n\n    indented\n\n```rust\nlast\n```";
+        let parsed = parse(source, Palette::new(), false, 80, None);
+        let lines: Vec<_> = parsed
+            .lines
+            .iter()
+            .map(|parsed| (parsed.info.code, parsed.line.to_string()))
+            .collect();
+        let code: Vec<_> = lines
+            .iter()
+            .filter_map(|(id, text)| id.map(|id| (id, text.as_str())))
+            .collect();
+        assert_eq!(code, [(1, ""), (2, ""), (3, "indented"), (4, "last")]);
+        let mut prose = lines.iter().filter(|(_, text)| text == "prose");
+        assert!(prose.all(|(id, _)| id.is_none()));
+    }
+
     #[test]
     fn nested_foregrounds_preserve_heading_and_inline_modifiers() {
         let p = Palette::new();
-        let lines = render(
+        let lines = rendered(
             "# head **strong** *italic* [link](https://example.com) **[*`code`*](https://code.example)**\n\n**bold *emphasis* [linked](https://strong.example) `inline`**\n\n*neutral* plain",
-            p,
-            false,
             200,
         );
-        for text in ["strong", "italic"] {
-            let style = span_style(&lines, text);
-            assert_eq!(style.fg, Some(p.content.heading));
-            assert!(style.add_modifier.contains(Modifier::BOLD));
-        }
-        assert!(
-            span_style(&lines, "italic")
-                .add_modifier
-                .contains(Modifier::ITALIC)
-        );
-        for text in [
-            "link",
-            " (https://example.com)",
-            "linked",
-            " (https://strong.example)",
+        let (bold, italic, underlined) = (Modifier::BOLD, Modifier::ITALIC, Modifier::UNDERLINED);
+        let content = p.content;
+        for (text, fg, modifiers) in [
+            ("strong", content.heading, bold),
+            ("italic", content.heading, bold | italic),
+            ("link", content.accent, bold | underlined),
+            (" (https://example.com)", content.accent, bold | underlined),
+            ("linked", content.accent, bold | underlined),
+            (
+                " (https://strong.example)",
+                content.accent,
+                bold | underlined,
+            ),
+            ("code", content.inline_code, bold | italic | underlined),
+            ("emphasis", content.strong, bold | italic),
+            ("inline", content.inline_code, bold),
         ] {
-            let style = span_style(&lines, text);
-            assert_eq!(style.fg, Some(p.content.accent));
-            assert!(
-                style
-                    .add_modifier
-                    .contains(Modifier::BOLD | Modifier::UNDERLINED)
-            );
+            assert_style(&lines, text, fg, modifiers);
         }
-        let code = span_style(&lines, "code");
-        assert_eq!(code.fg, Some(p.content.inline_code));
-        assert!(
-            code.add_modifier
-                .contains(Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED)
-        );
-        let emphasis = span_style(&lines, "emphasis");
-        assert_eq!(emphasis.fg, Some(p.content.strong));
-        assert!(
-            emphasis
-                .add_modifier
-                .contains(Modifier::BOLD | Modifier::ITALIC)
-        );
-        let inline = span_style(&lines, "inline");
-        assert_eq!(inline.fg, Some(p.content.inline_code));
-        assert!(inline.add_modifier.contains(Modifier::BOLD));
         let neutral = span_style(&lines, "neutral");
-        assert_eq!(neutral.fg, Some(p.content.fg));
-        assert_eq!(neutral.add_modifier, Modifier::ITALIC);
+        assert_eq!(
+            (neutral.fg, neutral.add_modifier),
+            (Some(content.fg), italic)
+        );
     }
 
     #[test]
     fn quote_and_list_markers_use_content_roles_without_changing_text() {
-        let p = Palette::new();
-        let lines = render(
+        let p = Palette::new().content;
+        let lines = rendered(
             "> quoted *quiet*\n\n- bullet\n- [x] done\n\n3. numbered",
-            p,
-            false,
             80,
         );
-        assert_eq!(
-            strings(&lines),
-            [
-                "│ quoted quiet",
-                "",
-                "• bullet",
-                "• [x] done",
-                "",
-                "3. numbered"
-            ]
-        );
-        assert_eq!(span_style(&lines, "│ ").fg, Some(p.content.muted));
-        assert_eq!(span_style(&lines, "quoted ").fg, Some(p.content.quote));
-        let quiet = span_style(&lines, "quiet");
-        assert_eq!(quiet.fg, Some(p.content.quote));
-        assert_eq!(quiet.add_modifier, Modifier::ITALIC);
-        for marker in ["• ", "[x] ", "3. "] {
-            assert_eq!(span_style(&lines, marker).fg, Some(p.content.primary));
+        let expected = [
+            "│ quoted quiet",
+            "",
+            "• bullet",
+            "• [x] done",
+            "",
+            "3. numbered",
+        ];
+        assert_eq!(strings(&lines), expected);
+        for (text, fg) in [
+            ("│ ", p.muted),
+            ("quoted ", p.quote),
+            ("• ", p.primary),
+            ("[x] ", p.primary),
+            ("3. ", p.primary),
+            ("bullet", p.fg),
+        ] {
+            assert_eq!(span_style(&lines, text).fg, Some(fg), "{text}");
         }
-        assert_eq!(span_style(&lines, "bullet").fg, Some(p.content.fg));
+        let quiet = span_style(&lines, "quiet");
+        assert_eq!(
+            (quiet.fg, quiet.add_modifier),
+            (Some(p.quote), Modifier::ITALIC)
+        );
     }
 
     #[test]
@@ -584,16 +642,10 @@ pub(in super::super) mod tests {
             let labelled = plain.replacen("```\n", "```rust extra-info\n", 1);
             for prefix in ["", "> "] {
                 let quote = |source: &str| {
-                    source
-                        .lines()
-                        .map(|line| format!("{prefix}{line}"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                    let lines = source.lines().map(|line| format!("{prefix}{line}"));
+                    strings(&rendered(&lines.collect::<Vec<_>>().join("\n"), 80))
                 };
-                assert_eq!(
-                    strings(&rendered(&quote(&labelled), 80)),
-                    strings(&rendered(&quote(&plain), 80))
-                );
+                assert_eq!(quote(&labelled), quote(&plain));
             }
         }
         let lines = rendered("- ```rust\n  let x = 1;  \n\n  ```", 80);
@@ -601,48 +653,36 @@ pub(in super::super) mod tests {
     }
 
     #[test]
-    fn oversized_fences_keep_plain_code_text_and_style() {
+    fn named_code_fallback_keeps_plain_text_and_the_code_role() {
         let body = format!("small\n{}  \n\nlast\n", "x".repeat(tool_view::MAX_SECTION));
-        let named = format!("```rust\n{body}```");
-        let unnamed = format!("```\n{body}```");
-        let p = Palette::new();
-        let named = render(&named, p, false, 80);
-        let unnamed = render(&unnamed, p, false, 80);
-        assert_eq!(named, unnamed);
+        let oversized = rendered(&format!("```rust\n{body}```"), 80);
+        assert_eq!(oversized, rendered(&format!("```\n{body}```"), 80));
+        let lines = rendered("```not-a-language\nplain\n```", 80);
+        assert_eq!(strings(&lines), ["plain"]);
+        assert_eq!(
+            span_style(&lines, "plain").fg,
+            Some(Palette::new().content.inline_code)
+        );
     }
 
     #[test]
-    fn named_code_fallback_uses_the_code_role() {
-        let p = Palette::new();
-        let lines = render("```not-a-language\nplain\n```", p, false, 80);
-        assert_eq!(strings(&lines), ["plain"]);
-        assert_eq!(span_style(&lines, "plain").fg, Some(p.content.inline_code));
-    }
-    #[test]
     fn table_headers_have_heading_precedence_even_in_borderless_fallback() {
-        let p = Palette::new();
+        let p = Palette::new().content;
+        let (bold, underlined) = (Modifier::BOLD, Modifier::UNDERLINED);
         for width in [1, 80] {
-            let lines = render(
+            let lines = rendered(
                 "| **H** | *I* | [L](u) | `C` |\n| --- | --- | --- | --- |\n| body | **B** | plain | plain |",
-                p,
-                false,
                 width,
             );
-            for text in ["H", "I"] {
-                let style = span_style(&lines, text);
-                assert_eq!(style.fg, Some(p.content.heading));
-                assert!(style.add_modifier.contains(Modifier::BOLD));
+            for (text, fg, modifiers) in [
+                ("H", p.heading, bold),
+                ("I", p.heading, bold),
+                ("L", p.accent, bold | underlined),
+                ("C", p.inline_code, bold),
+                ("B", p.strong, Modifier::empty()),
+            ] {
+                assert_style(&lines, text, fg, modifiers);
             }
-            let link = span_style(&lines, "L");
-            assert_eq!(link.fg, Some(p.content.accent));
-            assert!(
-                link.add_modifier
-                    .contains(Modifier::BOLD | Modifier::UNDERLINED)
-            );
-            let code = span_style(&lines, "C");
-            assert_eq!(code.fg, Some(p.content.inline_code));
-            assert!(code.add_modifier.contains(Modifier::BOLD));
-            assert_eq!(span_style(&lines, "B").fg, Some(p.content.strong));
         }
     }
 }

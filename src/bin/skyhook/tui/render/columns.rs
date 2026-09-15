@@ -4,6 +4,7 @@ use super::*;
 
 /// Numeric fields share their own right edge, not just the footer's right edge.
 /// Measure all agents, including off-screen rows, to keep columns stable on scroll.
+#[derive(Clone, Copy)]
 pub(super) struct AgentStatsColumns([usize; 3]);
 
 pub(super) const AGENT_STATS_HEADERS: [&str; 3] = ["Output", "Input (uncached)", "Context"];
@@ -72,12 +73,19 @@ impl AgentStatsColumns {
         for (value, width) in row.iter().zip(self.0) {
             text(
                 frame,
-                r(x, rect.y, width as u16, 1),
+                r(
+                    x,
+                    rect.y,
+                    width.min(usize::from(rect.right().saturating_sub(x))) as u16,
+                    1,
+                ),
                 format!("{}{value}", " ".repeat(width.saturating_sub(value.width()))),
                 fg,
                 bg,
             );
-            x += width as u16 + 3;
+            x = x
+                .saturating_add(width.min(u16::MAX as usize) as u16)
+                .saturating_add(3);
         }
     }
 
@@ -92,38 +100,44 @@ impl AgentStatsColumns {
     }
 
     pub(super) fn width(&self) -> u16 {
-        (self.0.iter().sum::<usize>() + 6) as u16
+        (self.0.iter().sum::<usize>() + 6).min(u16::MAX as usize) as u16
     }
 
+    /// A row outside the measured set is never truncated: it pads to the
+    /// shared width when it fits and otherwise prints at its own width.
     pub(super) fn format(&self, row: &[String; 3]) -> String {
         row.iter()
             .zip(self.0)
-            .map(|(value, width)| format!("{}{value}", " ".repeat(width - value.width())))
+            .map(|(value, width)| {
+                format!("{}{value}", " ".repeat(width.saturating_sub(value.width())))
+            })
             .collect::<Vec<_>>()
             .join(" · ")
     }
 }
 
-pub(super) const REQUEST_STATS_HEADERS: [&str; 4] = [
-    AGENT_STATS_HEADERS[0],
-    AGENT_STATS_HEADERS[1],
-    "Cached",
-    "Time",
-];
+pub(super) const REQUEST_STATS_HEADERS: [&str; 4] =
+    ["Output", "Input (uncached)", "Cached", "Time"];
 
 /// Like agent statistics, request fields use widths measured across the complete
 /// list, not the viewport. Metadata is left aligned and numeric fields are right aligned.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct RequestColumns {
-    pub(super) metadata: [usize; 4],
-    pub(super) statistics: [usize; 4],
+    metadata: [usize; 4],
+    statistics: [usize; 4],
+}
+
+impl Default for RequestColumns {
+    fn default() -> Self {
+        Self::new(std::iter::empty())
+    }
 }
 
 impl RequestColumns {
     pub(super) fn new<'a>(rows: impl IntoIterator<Item = &'a model::RequestRow>) -> Self {
         let mut columns = Self {
             statistics: REQUEST_STATS_HEADERS.map(UnicodeWidthStr::width),
-            ..Self::default()
+            metadata: [0; 4],
         };
         for row in rows {
             for (width, value) in columns.metadata.iter_mut().zip(row.metadata()) {
@@ -137,7 +151,7 @@ impl RequestColumns {
     }
 
     pub(super) fn update(&mut self, entries: &[model::Entry], dirty: &mut Vec<usize>) {
-        let columns = Self::new(entries.iter().filter_map(|entry| entry.request.as_ref()));
+        let columns = Self::new(entries.iter().filter_map(|entry| entry.request()));
         if *self != columns {
             *self = columns;
             // A wider token count or elapsed time changes even unchanged rows.
@@ -145,7 +159,7 @@ impl RequestColumns {
                 entries
                     .iter()
                     .enumerate()
-                    .filter_map(|(index, entry)| entry.request.as_ref().map(|_| index)),
+                    .filter_map(|(index, entry)| entry.request().map(|_| index)),
             );
         }
     }
@@ -162,7 +176,9 @@ impl RequestColumns {
         values
             .iter()
             .zip(self.statistics)
-            .map(|(value, width)| format!("{}{value}", " ".repeat(width - value.width())))
+            .map(|(value, width)| {
+                format!("{}{value}", " ".repeat(width.saturating_sub(value.width())))
+            })
             .collect::<Vec<_>>()
             .join(" · ")
     }
@@ -217,12 +233,11 @@ impl RequestColumns {
             ));
             if metadata.is_char_boundary(status_start) && status_start <= metadata.len() {
                 spans.push(Span::raw(metadata[title_end..status_start].to_owned()));
-                let color = match row.status {
-                    "Completed" => p.content.success,
-                    "Failed" => p.content.error,
-                    "Interrupted" => p.content.warning,
-                    "Running" => p.content.info,
-                    _ => p.content.muted,
+                let color: Color = match row.status {
+                    model::RequestStatus::Completed => p.content.success,
+                    model::RequestStatus::Failed => p.content.error,
+                    model::RequestStatus::Interrupted => p.content.warning,
+                    model::RequestStatus::Running => p.content.info,
                 };
                 spans.push(Span::styled(
                     metadata[status_start..].to_owned(),
@@ -253,41 +268,71 @@ mod tests {
     use super::*;
     use ratatui::widgets::Widget;
 
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn request(sequence: u64, status: model::RequestStatus, output: u64) -> model::RequestRow {
+        model::RequestRow {
+            sequence,
+            purpose: skyhook::session::ModelPurpose::Agent,
+            model: "model".into(),
+            status,
+            usage: Some(skyhook::provider::protocol::Usage {
+                input_tokens: 80,
+                cached_input_tokens: 20,
+                output_tokens: output,
+            }),
+            elapsed_tenths: Some(12),
+        }
+    }
+
     #[test]
-    fn agents_palette_stats_align_without_delimiters() {
+    fn agents_palette_stats_align_without_delimiters_and_narrow_viewports_are_safe() {
         let headers = AGENT_STATS_HEADERS.map(String::from);
         let values = ["123456789".into(), "56789(12345)".into(), "54321".into()];
         let columns = AgentStatsColumns::menu([&values]);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(columns.width(), 2)).unwrap();
+        let backend = ratatui::backend::TestBackend::new(columns.width(), 2);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let p = Palette::new();
+        let rows = [&headers, &values];
         terminal
             .draw(|frame| {
-                for (y, row) in [&headers, &values].iter().enumerate() {
-                    columns.draw(
-                        frame,
-                        r(0, y as u16, columns.width(), 1),
-                        row,
-                        p.muted,
-                        p.input,
-                    );
+                for (y, row) in rows.iter().enumerate() {
+                    let area = r(0, y as u16, columns.width(), 1);
+                    columns.draw(frame, area, row, p.muted, p.input);
                 }
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        for (y, row) in [&headers, &values].iter().enumerate() {
+        for (y, row) in rows.iter().enumerate() {
+            let symbol = |x| buffer[(x, y as u16)].symbol();
             let mut x = 0;
             for (index, width) in columns.0.iter().enumerate() {
                 let end = x + *width as u16;
-                let actual = (x..end)
-                    .map(|x| buffer[(x, y as u16)].symbol())
-                    .collect::<String>();
-                assert_eq!(actual.trim_start(), row[index]);
+                assert_eq!(
+                    (x..end).map(symbol).collect::<String>().trim_start(),
+                    row[index]
+                );
                 if index < 2 {
-                    assert!((end..end + 3).all(|x| buffer[(x, y as u16)].symbol() == " "));
+                    assert!((end..end + 3).all(|x| symbol(x) == " "));
                 }
                 x = end + 3;
             }
+        }
+        let small = ["1".into(), "2".into(), "3".into()];
+        let large = ["123456789".into(), "界界界".into(), "1000% (10k/1k)".into()];
+        for width in [0, 1, 2, 20, 60] {
+            let columns = AgentStatsColumns::new([&small]);
+            let backend = ratatui::backend::TestBackend::new(width.max(1), 1);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            let area = r(0, 0, width, 1);
+            terminal
+                .draw(|frame| columns.draw(frame, area, &large, p.fg, p.base))
+                .unwrap();
         }
     }
 
@@ -303,51 +348,32 @@ mod tests {
             (82, 16, 34, 28),
         ] {
             let columns = AgentColumnsLayout::new(width, 16, 34);
-            assert_eq!(columns.identity_width, identity);
-            assert_eq!(columns.stats_width, stats);
-            assert_eq!(columns.status_width, status);
+            let actual = (
+                columns.identity_width,
+                columns.stats_width,
+                columns.status_width,
+            );
+            assert_eq!(actual, (identity, stats, status), "width {width}");
         }
     }
 
     #[test]
     fn request_rows_reserve_spinner_gutter_and_align_with_statistics_headers() {
-        let running = model::RequestRow {
-            sequence: 7,
-            purpose: skyhook::session::ModelPurpose::Agent,
-            model: "qwen".into(),
-            status: "Running",
-            usage: Some(skyhook::provider::protocol::Usage {
-                input_tokens: 80,
-                cached_input_tokens: 20,
-                output_tokens: 84,
-            }),
-            elapsed_tenths: Some(12),
-        };
-        let mut completed = running.clone();
-        completed.sequence = 123;
-        completed.status = "Completed";
+        let running = request(7, model::RequestStatus::Running, 84);
+        let completed = request(123, model::RequestStatus::Completed, 84);
         let columns = RequestColumns::new([&running, &completed]);
+        let header = columns.header(100, Palette::new()).unwrap().to_string();
         for row in [&running, &completed] {
             let line = columns.line(row, 100, Palette::new());
-            let text: String = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect();
+            let text = line_text(&line);
             assert!(text.starts_with(&format!("  Request #{}", row.sequence)));
             assert!(text.ends_with(&columns.format_statistics(&row.statistics())));
-            let header = columns.header(100, Palette::new()).unwrap().to_string();
             assert_eq!(header.width(), text.width());
             for (label, value) in REQUEST_STATS_HEADERS.iter().zip(row.statistics()) {
                 let header_end = header.find(label).unwrap() + label.len();
                 let value_end = text.rfind(&value).unwrap() + value.len();
-                assert_eq!(
-                    header[..header_end].width(),
-                    text[..value_end].width(),
-                    "{label} is not aligned"
-                );
-            }
-            for label in REQUEST_STATS_HEADERS {
+                let aligned = header[..header_end].width() == text[..value_end].width();
+                assert!(aligned, "{label} is not aligned");
                 assert!(!text.contains(label));
             }
             let area = Rect::new(0, 0, 100, 1);
@@ -355,20 +381,15 @@ mod tests {
             Paragraph::new(line).render(area, &mut buffer);
             // This is the same overlay column used by the animated requests view.
             buffer[(0, 0)].set_symbol(spinner(0));
-            assert_eq!(buffer[(0, 0)].symbol(), spinner(0));
-            assert_eq!(buffer[(1, 0)].symbol(), " ");
-            assert_eq!(buffer[(2, 0)].symbol(), "R");
-            assert_eq!(buffer[(3, 0)].symbol(), "e");
+            let gutter: Vec<_> = (0..4).map(|x| buffer[(x, 0)].symbol()).collect();
+            assert_eq!(gutter, [spinner(0), " ", "R", "e"]);
         }
-    }
 
-    #[test]
-    fn request_rows_keep_the_gutter_within_narrow_viewports() {
         let row = model::RequestRow {
             sequence: 12345,
             purpose: skyhook::session::ModelPurpose::Compaction,
             model: "long model 界界 😀".into(),
-            status: "Running",
+            status: model::RequestStatus::Running,
             usage: None,
             elapsed_tenths: None,
         };
@@ -376,11 +397,7 @@ mod tests {
         for width in 0..100 {
             let line = columns.line(&row, width, Palette::new());
             assert!(line.width() <= width as usize, "overflow at width {width}");
-            let text: String = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect();
+            let text = line_text(&line);
             assert!(text.starts_with(&" ".repeat(width.min(2) as usize)));
             let header = columns.header(width, Palette::new());
             assert_eq!(header.is_some(), text.contains('—'));
@@ -389,6 +406,28 @@ mod tests {
                 assert!(header.to_string().contains("Input (uncached)"));
                 assert!(text.ends_with(&columns.format_statistics(&row.statistics())));
             }
+        }
+    }
+
+    #[test]
+    fn request_width_growth_shrink_and_reordering_fan_out_only_when_needed() {
+        let entries = |rows: &[&model::RequestRow]| {
+            let rows = rows.iter();
+            rows.map(|row| model::Entry::request_entry((*row).clone()))
+                .collect::<Vec<_>>()
+        };
+        let short = request(1, model::RequestStatus::Completed, 1);
+        let mut long = request(u64::MAX, model::RequestStatus::Completed, u64::MAX);
+        long.model = "a very long model name".into();
+        let small = entries(&[&short, &short]);
+        let large = entries(&[&short, &long]);
+        let reordered = entries(&[&long, &short]);
+        let mut columns = RequestColumns::new(small.iter().filter_map(|entry| entry.request()));
+        let mut dirty = Vec::new();
+        for (entries, expected) in [(&large, &[0, 1][..]), (&reordered, &[]), (&small, &[0, 1])] {
+            columns.update(entries, &mut dirty);
+            assert_eq!(dirty, expected);
+            dirty.clear();
         }
     }
 }

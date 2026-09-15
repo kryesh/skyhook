@@ -66,9 +66,6 @@ pub(super) async fn connect_one(
     if cancel.is_cancelled() {
         return None;
     }
-    if let Err(error) = config.validate() {
-        return Some((name.clone(), Err(McpError::Configuration(error))));
-    }
     let mut process = None;
     let mut client = None;
     let startup = async {
@@ -78,7 +75,7 @@ pub(super) async fn connect_one(
     let result = tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(McpError::Cancelled),
-        result = tokio::time::timeout(Duration::from_secs(config.startup_timeout_secs), startup) => {
+        result = tokio::time::timeout(config.startup_timeout(), startup) => {
             result.unwrap_or(Err(McpError::Timeout))
         }
     };
@@ -92,7 +89,7 @@ pub(super) async fn connect_one(
                     tools,
                     Server {
                         peer,
-                        timeout: Duration::from_secs(config.call_timeout_secs),
+                        timeout: config.call_timeout(),
                         resources: Mutex::new(ResourceState::Running(Box::new(Resources {
                             client,
                             process,
@@ -120,7 +117,7 @@ mod tests {
     use super::super::tests::assert_process_reaped;
     use super::super::tests::{Fixture, connect, fixture_call, shutdown, wait_for_file};
     use crate::mcp::{
-        config::{McpServerConfig, McpTransport},
+        config::{McpServerConfig, McpTransport, RawMcpServerConfig},
         manager::McpManager,
     };
     use std::{collections::BTreeMap, time::Duration};
@@ -181,21 +178,28 @@ os.replace(os.environ['MCP_TEST_READY'] + '.tmp', os.environ['MCP_TEST_READY'])
 server.serve_forever()
 "#;
 
-    fn http_fixture_config(fixture: &Fixture, port: u16) -> McpServerConfig {
+    fn with_env(mut config: RawMcpServerConfig, name: &str, value: String) -> RawMcpServerConfig {
+        config.env.insert(name.into(), value);
+        config
+    }
+
+    fn hanging(fixture: &Fixture) -> RawMcpServerConfig {
+        with_env(fixture.config(), "MCP_TEST_HANG_INITIALIZE", "1".into())
+    }
+
+    fn http_fixture_config(fixture: &Fixture, port: u16) -> RawMcpServerConfig {
         let mut config = fixture.config();
         config.transport = McpTransport::StreamableHttp;
         config.url = Some(format!("http://127.0.0.1:{port}/mcp"));
-        config.start_command = Some(vec![
-            "python3".into(),
-            "-u".into(),
-            "-c".into(),
-            HTTP_FIXTURE.into(),
-        ]);
-        config.env.insert("MCP_TEST_PORT".into(), port.to_string());
-        config
-            .env
-            .insert("MCP_TEST_READY".into(), fixture.path("ready"));
-        config
+        let command = ["python3", "-u", "-c", HTTP_FIXTURE];
+        config.start_command = Some(command.map(String::from).to_vec());
+        let config = with_env(config, "MCP_TEST_PORT", port.to_string());
+        with_env(config, "MCP_TEST_READY", fixture.path("ready"))
+    }
+
+    fn free_port() -> u16 {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        reservation.local_addr().unwrap().port()
     }
 
     #[cfg(unix)]
@@ -204,11 +208,8 @@ server.serve_forever()
         let Some(fixture) = Fixture::new() else {
             return;
         };
-        let mut config = fixture.config();
+        let mut config = hanging(&fixture);
         config.startup_timeout_secs = 1;
-        config
-            .env
-            .insert("MCP_TEST_HANG_INITIALIZE".into(), "1".into());
         let manager = connect(config).await;
         assert!(manager.catalog().is_empty());
         assert!(!manager.warnings().is_empty());
@@ -218,7 +219,8 @@ server.serve_forever()
 
     #[tokio::test]
     async fn reachable_http_errors_never_launch_a_configured_command() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use crate::provider::backends::transport::tests::{read_request, reply};
+        use tokio::io::AsyncWriteExt;
 
         let Some(fixture) = Fixture::new() else {
             return;
@@ -236,35 +238,16 @@ server.serve_forever()
             let server = tokio::spawn(async move {
                 tokio::time::timeout(Duration::from_secs(10), async {
                     let (mut stream, _) = listener.accept().await.unwrap();
-                    let mut request = Vec::new();
-                    let mut buffer = [0; 1024];
-                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        let count = stream.read(&mut buffer).await.unwrap();
-                        assert_ne!(count, 0, "client sent HTTP headers");
-                        request.extend_from_slice(&buffer[..count]);
-                        assert!(request.len() < 64 * 1024, "bounded request headers");
-                    }
-                    // Consume the request body before closing, avoiding a TCP reset
+                    // Consume the full request before closing, avoiding a TCP reset
                     // from unread bytes that could disguise an HTTP error as refusal.
-                    let header_end = request.windows(4).position(|window| window == b"\r\n\r\n").unwrap() + 4;
-                    let headers = std::str::from_utf8(&request[..header_end]).unwrap();
-                    let length: usize = headers.lines().find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
-                    }).unwrap_or(0);
-                    while request.len() < header_end + length {
-                        let count = stream.read(&mut buffer).await.unwrap();
-                        assert_ne!(count, 0, "client sent complete HTTP body");
-                        request.extend_from_slice(&buffer[..count]);
-                    }
+                    read_request(&mut stream).await;
                     let body = "{\"error\":\"private-server-diagnostic\"}";
-                    let response = format!(
-                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len(),
-                    );
+                    let response = reply(status, "Content-Type: application/json\r\n", body);
                     stream.write_all(response.as_bytes()).await.unwrap();
                     stream.shutdown().await.unwrap();
-                }).await.expect("HTTP fixture completes");
+                })
+                .await
+                .expect("HTTP fixture completes");
             });
             let mut config = fixture.config();
             config.transport = McpTransport::StreamableHttp;
@@ -277,12 +260,8 @@ server.serve_forever()
                 !fixture.directory.path().join("pid").exists(),
                 "{status} must not launch a process"
             );
-            assert!(
-                manager
-                    .warnings()
-                    .iter()
-                    .all(|warning| !warning.contains("private-server-diagnostic"))
-            );
+            let leaked = |warning: &String| warning.contains("private-server-diagnostic");
+            assert!(!manager.warnings().iter().any(leaked));
             shutdown(&manager).await;
         }
     }
@@ -293,13 +272,8 @@ server.serve_forever()
         let Some(fixture) = Fixture::new() else {
             return;
         };
-        // Release a kernel-selected port immediately before startup. No request can
-        // succeed until the manager launches the configured HTTP subprocess.
-        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = reservation.local_addr().unwrap().port();
-        let config = http_fixture_config(&fixture, port);
-        drop(reservation);
-        let manager = connect(config).await;
+        // No request can succeed until the manager launches the HTTP subprocess.
+        let manager = connect(http_fixture_config(&fixture, free_port())).await;
         assert!(manager.warnings().is_empty(), "{:?}", manager.warnings());
         assert_eq!(manager.catalog().len(), 1);
         assert_eq!(manager.catalog()[0].tool.name, "echo");
@@ -360,38 +334,28 @@ server.serve_forever()
     #[cfg(unix)]
     #[tokio::test]
     async fn startup_cancellation_reaps_child_and_does_not_launch_later_servers() {
-        let Some(first) = Fixture::new() else { return };
-        let Some(second) = Fixture::new() else { return };
-        let mut config = first.config();
-        config
-            .env
-            .insert("MCP_TEST_HANG_INITIALIZE".into(), "1".into());
+        let Some(queued) = Fixture::new() else { return };
         // Fill all four startup slots with hanging initialization, leaving the
         // fifth queued. Cancellation must drain/reap the started slots but never
         // launch the queued server.
-        let fixtures: Vec<_> = (0..3).map(|_| Fixture::new().unwrap()).collect();
-        let mut configs = BTreeMap::from([
-            ("a-first".into(), config),
-            ("z-queued".into(), second.config()),
-        ]);
-        for (index, fixture) in fixtures.iter().enumerate() {
-            let mut config = fixture.config();
-            config
-                .env
-                .insert("MCP_TEST_HANG_INITIALIZE".into(), "1".into());
-            configs.insert(format!("b-{index}"), config);
+        let started: Vec<_> = (0..4).map(|_| Fixture::new().unwrap()).collect();
+        let mut configs = BTreeMap::from([("z-queued".to_owned(), queued.config())]);
+        for (index, fixture) in started.iter().enumerate() {
+            configs.insert(format!("b-{index}"), hanging(fixture));
         }
+        let configs = configs
+            .into_iter()
+            .map(|(name, raw)| (name, raw.try_into().unwrap()))
+            .collect();
         let cancel = CancellationToken::new();
-        let connect = McpManager::connect(&configs, cancel.clone());
+        let capabilities = crate::tool::policy::CapabilitySet::default();
+        let connect = McpManager::connect(&configs, &capabilities, cancel.clone());
         let cancel_when_started = async {
-            wait_for_file(&first.directory.path().join("pid")).await;
-            for fixture in &fixtures {
+            for fixture in &started {
                 wait_for_file(&fixture.directory.path().join("pid")).await;
             }
-            assert!(
-                !second.directory.path().join("pid").exists(),
-                "only four startup slots"
-            );
+            let queued_pid = queued.directory.path().join("pid");
+            assert!(!queued_pid.exists(), "only four startup slots");
             cancel.cancel();
         };
         let (manager, ()) = tokio::time::timeout(Duration::from_secs(7), async {
@@ -402,28 +366,24 @@ server.serve_forever()
         assert!(manager.catalog().is_empty());
         assert!(!manager.warnings().is_empty());
         assert!(
-            !second.directory.path().join("pid").exists(),
+            !queued.directory.path().join("pid").exists(),
             "cancelled startup must not spawn later servers"
         );
-        assert_process_reaped(first.pid()).await;
-        for fixture in &fixtures {
+        for fixture in &started {
             assert_process_reaped(fixture.pid()).await;
         }
         shutdown(&manager).await;
     }
 
     #[tokio::test]
-    async fn invalid_direct_config_is_skipped_before_spawning_or_timer_creation() {
+    async fn invalid_direct_config_is_rejected_before_spawning_or_timer_creation() {
         let Some(fixture) = Fixture::new() else {
             return;
         };
         let mut config = fixture.config();
         config.startup_timeout_secs = u64::MAX;
-        let manager = connect(config).await;
-        assert!(manager.catalog().is_empty());
-        assert_eq!(manager.warnings().len(), 1);
+        assert!(McpServerConfig::try_from(config).is_err());
         assert!(!fixture.directory.path().join("pid").exists());
-        shutdown(&manager).await;
     }
 
     #[cfg(unix)]
@@ -448,34 +408,14 @@ server.serve_forever()
         let Some(fixture) = Fixture::new() else {
             return;
         };
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let mut config = http_fixture_config(&fixture, port);
-        config
-            .env
-            .insert("MCP_TEST_HTTP_COUNTS".into(), fixture.path("http-counts"));
-        config
-            .env
-            .insert("MCP_TEST_HTTP_EXPIRED".into(), "1".into());
-        let manager = connect(config).await;
+        let config = http_fixture_config(&fixture, free_port());
+        let config = with_env(config, "MCP_TEST_HTTP_COUNTS", fixture.path("http-counts"));
+        let manager = connect(with_env(config, "MCP_TEST_HTTP_EXPIRED", "1".into())).await;
         assert_eq!(manager.catalog().len(), 1, "{:?}", manager.warnings());
         assert!(fixture_call(&manager, "echo").await.is_err());
         let counts = std::fs::read_to_string(fixture.path("http-counts")).unwrap();
-        assert_eq!(
-            counts
-                .lines()
-                .filter(|method| *method == "initialize")
-                .count(),
-            1
-        );
-        assert_eq!(
-            counts
-                .lines()
-                .filter(|method| *method == "tools/call")
-                .count(),
-            1
-        );
+        let count = |name| counts.lines().filter(|method| *method == name).count();
+        assert_eq!((count("initialize"), count("tools/call")), (1, 1));
         shutdown(&manager).await;
     }
 
@@ -490,18 +430,15 @@ server.serve_forever()
         let pid = fixture.pid();
         // Join a test-owned child to the server group. Retaining its Child handle
         // lets the test reap it (real grandchildren are reaped by their new parent).
-        let mut member = tokio::process::Command::new("python3")
-            .args(["-c", "import time; time.sleep(60)"])
-            .process_group(pid)
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let mut unrelated = tokio::process::Command::new("python3")
-            .args(["-c", "import time; time.sleep(60)"])
-            .process_group(0)
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
+        let sleeper = |group| {
+            tokio::process::Command::new("python3")
+                .args(["-c", "import time; time.sleep(60)"])
+                .process_group(group)
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap()
+        };
+        let (mut member, mut unrelated) = (sleeper(pid), sleeper(0));
         shutdown(&manager).await;
         assert_process_reaped(pid).await;
         let status = tokio::time::timeout(Duration::from_secs(3), member.wait())
@@ -520,10 +457,7 @@ server.serve_forever()
         let Some(fixture) = Fixture::new() else {
             return;
         };
-        let mut config = fixture.config();
-        config
-            .env
-            .insert("MCP_TEST_OVERSIZED_FRAME".into(), "1".into());
+        let config = with_env(fixture.config(), "MCP_TEST_OVERSIZED_FRAME", "1".into());
         let manager = connect(config).await;
         assert!(manager.catalog().is_empty());
         assert_eq!(manager.warnings().len(), 1);

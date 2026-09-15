@@ -7,7 +7,7 @@ use crate::{
         ProviderContext,
         protocol::{Message, ModelRequest, Usage},
     },
-    session::{ContextMessage, EventRecord, ModelPurpose, SessionEvent},
+    session::{EventRecord, ModelPurpose, SessionEvent},
 };
 
 /// Context/validation recovery is bounded independently of transient retries.
@@ -94,13 +94,8 @@ impl TokenMeter {
     }
 }
 
-pub(super) fn context_sources(projected: &[(u64, Message)]) -> Vec<ContextMessage> {
-    projected
-        .iter()
-        .map(|(sequence, _)| ContextMessage::Source {
-            sequence: *sequence,
-        })
-        .collect()
+pub(super) fn context_sources(projected: &[(u64, Message)]) -> Vec<u64> {
+    projected.iter().map(|(sequence, _)| *sequence).collect()
 }
 
 impl SessionRuntime {
@@ -166,29 +161,30 @@ mod tests {
     use std::time::Duration;
 
     use futures_util::{StreamExt, stream};
-    use serde_json::{Value, json};
-    use tokio::sync::{Notify, Semaphore};
+    use serde_json::json;
+    use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
-    use crate::agent::runtime::{
-        HarnessBuilder, HarnessError, SessionHandle, TurnContext, compaction, prompt,
+    pub(super) use crate::agent::runtime::tests::{
+        count, events, summary_json, test_builder, todo,
     };
+    use crate::agent::runtime::{HarnessError, SessionHandle, TurnContext, compaction, prompt};
     use crate::{
-        agent::{TodoItem, TodoStatus},
+        agent::TodoStatus,
         execution::ExecutionLocation,
         provider::{
             Provider, ProviderContext, ProviderError, ProviderErrorKind, ProviderFuture,
             ResponseStream,
-            profile::ModelProfile,
             protocol::{
-                AssistantContent, Message, ModelRequest, ResponseChunk, StopReason, Usage,
-                UserContent, events_for_content,
+                AssistantContent, Message, ModelRequest, ResponseChunk, StopReason, ToolCall,
+                Usage, UserContent, events_for_content,
             },
         },
         session::{SessionEvent, project_history},
         tool::policy::CapabilitySet,
     };
 
+    #[derive(Default)]
     pub(super) struct ControlledProvider {
         pub(super) opened: AtomicUsize,
         pub(super) requests: StdMutex<Vec<ModelRequest>>,
@@ -204,79 +200,50 @@ mod tests {
         pub(super) observed_failure_usage: StdMutex<Option<Usage>>,
         pub(super) pause_stream_after_usage: AtomicBool,
         pub(super) started: Notify,
-        pub(super) release: Semaphore,
-    }
-
-    impl Default for ControlledProvider {
-        fn default() -> Self {
-            Self {
-                opened: AtomicUsize::new(0),
-                requests: StdMutex::new(Vec::new()),
-                summary: StdMutex::new(String::new()),
-                overflow: AtomicBool::new(false),
-                truncate: AtomicBool::new(false),
-                block: AtomicBool::new(false),
-                agent_immediate_failures: AtomicUsize::new(0),
-                agent_stream_failures: AtomicUsize::new(0),
-                summary_immediate_failures: AtomicUsize::new(0),
-                summary_stream_failures: AtomicUsize::new(0),
-                summary_tools: AtomicBool::new(false),
-                observed_failure_usage: StdMutex::new(None),
-                pause_stream_after_usage: AtomicBool::new(false),
-                started: Notify::new(),
-                release: Semaphore::new(0),
-            }
-        }
+        pub(super) release: Notify,
     }
 
     impl Provider for Arc<ControlledProvider> {
-        fn open_context(
-            &self,
-            _correlation: String,
-        ) -> Result<Box<dyn ProviderContext>, ProviderError> {
+        fn open_context(&self, _: String) -> Result<Box<dyn ProviderContext>, ProviderError> {
             self.opened.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(self.clone()))
         }
+    }
+
+    fn side_effect(id: &str) -> Vec<AssistantContent> {
+        let arguments = json!({"path":"must-not-exist", "content":"side effect"});
+        let call = ToolCall::new(id, "write", arguments).unwrap();
+        vec![AssistantContent::tool_call(id, 0, call)]
     }
 
     impl ProviderContext for Arc<ControlledProvider> {
         fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
             let provider = self.clone();
             Box::pin(async move {
-                let summary = request.messages.last() == Some(&compaction::directive());
+                let summary = request.tail.last() == Some(&compaction::directive());
                 provider.requests.lock().unwrap().push(request);
-                let (immediate, streaming) = if summary {
-                    (
-                        &provider.summary_immediate_failures,
-                        &provider.summary_stream_failures,
-                    )
-                } else {
+                let counters = [
                     (
                         &provider.agent_immediate_failures,
                         &provider.agent_stream_failures,
-                    )
-                };
+                    ),
+                    (
+                        &provider.summary_immediate_failures,
+                        &provider.summary_stream_failures,
+                    ),
+                ];
+                let (immediate, streaming) = counters[usize::from(summary)];
                 let error = || ProviderError {
                     retry_after: None,
                     kind: ProviderErrorKind::Transport,
                     message: "deterministic transient failure".into(),
                 };
+                let usage = *provider.observed_failure_usage.lock().unwrap();
+                let usage = usage.map(|usage| Ok(ResponseChunk::UsageUpdated { usage }));
                 if provider.pause_stream_after_usage.load(Ordering::SeqCst) {
-                    let usage = provider.observed_failure_usage.lock().unwrap().unwrap();
-                    let mut chunks = vec![Ok(ResponseChunk::UsageUpdated { usage })];
-                    chunks.extend(
-                        events_for_content(&[AssistantContent::tool_call(
-                            "interrupted-tool",
-                            0,
-                            crate::provider::protocol::ToolCall {
-                                id: "interrupted-tool".into(),
-                                name: "write".into(),
-                                arguments: json!({"path":"must-not-exist", "content":"side effect"}),
-                            },
-                        )])
-                        .into_iter()
-                        .map(Ok),
-                    );
+                    let mut chunks = vec![usage.unwrap()];
+                    let call = events_for_content(&side_effect("interrupted-tool"));
+                    chunks.extend(call.into_iter().map(Ok));
                     let tail = stream::once(async move {
                         provider.started.notify_one();
                         std::future::pending::<Result<ResponseChunk, ProviderError>>().await
@@ -287,52 +254,26 @@ mod tests {
                     return Err(error());
                 }
                 if consume_failure(streaming) {
-                    let mut chunks = Vec::new();
-                    if let Some(usage) = *provider.observed_failure_usage.lock().unwrap() {
-                        chunks.push(Ok(ResponseChunk::UsageUpdated { usage }));
-                    }
-                    chunks.push(Err(error()));
+                    let chunks = usage.into_iter().chain([Err(error())]);
                     return Ok(Box::pin(stream::iter(chunks)) as ResponseStream);
                 }
                 let chunks = if summary {
                     provider.started.notify_one();
                     if provider.block.load(Ordering::SeqCst) {
-                        provider.release.acquire().await.unwrap().forget();
+                        provider.release.notified().await;
                     }
                     if provider.summary_tools.load(Ordering::SeqCst) {
-                        response_chunks(
-                            vec![AssistantContent::tool_call(
-                                "never-execute",
-                                0,
-                                crate::provider::protocol::ToolCall {
-                                    id: "never-execute".into(),
-                                    name: "write".into(),
-                                    arguments: json!({"path":"must-not-exist", "content":"side effect"}),
-                                },
-                            )],
-                            StopReason::ToolUse,
-                        )
+                        response_chunks(side_effect("never-execute"), StopReason::ToolUse)
                     } else {
-                        response_chunks(
-                            vec![
-                                AssistantContent::reasoning(
-                                    "reasoning/0",
-                                    0,
-                                    "Reasoning before the answer is not JSON and must not enter the continuation.",
-                                    None,
-                                ),
-                                AssistantContent::text(
-                                    "text/1",
-                                    1,
-                                    provider.summary.lock().unwrap().clone(),
-                                ),
-                            ],
-                            if provider.truncate.load(Ordering::SeqCst) {
-                                StopReason::MaxTokens
-                            } else {
-                                StopReason::EndTurn
-                            },
-                        )
+                        let reasoning = "Reasoning before the answer is not JSON and must not enter the continuation.";
+                        let text = provider.summary.lock().unwrap().clone();
+                        let items = vec![
+                            AssistantContent::reasoning("reasoning/0", 0, reasoning, None),
+                            AssistantContent::text("text/1", 1, text),
+                        ];
+                        let truncate = usize::from(provider.truncate.load(Ordering::SeqCst));
+                        let stop = [StopReason::EndTurn, StopReason::MaxTokens][truncate].clone();
+                        response_chunks(items, stop)
                     }
                 } else if provider.overflow.swap(false, Ordering::SeqCst) {
                     vec![Err(ProviderError {
@@ -341,17 +282,15 @@ mod tests {
                         message: "prompt is too long".into(),
                     })]
                 } else {
-                    response_chunks(
-                        vec![AssistantContent::text("text/0", 0, "done")],
-                        StopReason::EndTurn,
-                    )
+                    let done = vec![AssistantContent::text("text/0", 0, "done")];
+                    response_chunks(done, StopReason::EndTurn)
                 };
                 Ok(Box::pin(stream::iter(chunks)) as ResponseStream)
             })
         }
     }
 
-    pub(super) fn response_chunks(
+    fn response_chunks(
         items: Vec<AssistantContent>,
         stop_reason: StopReason,
     ) -> Vec<Result<ResponseChunk, ProviderError>> {
@@ -360,57 +299,23 @@ mod tests {
         events.into_iter().map(Ok).collect()
     }
 
-    pub(super) fn consume_failure(counter: &AtomicUsize) -> bool {
-        let mut remaining = counter.load(Ordering::SeqCst);
-        while remaining > 0 {
-            match counter.compare_exchange_weak(
-                remaining,
-                remaining - 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => remaining = actual,
-            }
-        }
-        false
+    fn consume_failure(counter: &AtomicUsize) -> bool {
+        let decrement = |remaining: usize| remaining.checked_sub(1);
+        counter
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, decrement)
+            .is_ok()
     }
 
-    pub(super) fn summary_value() -> Value {
-        json!({
-            "objective": "Continue the existing task and preserve its constraints.",
-            "user_instructions": [],
-            "session_rules": [],
-            "plan": [],
-            "resumption_point": "Research is complete.",
-            "completed_work": [],
-            "findings": [],
-            "decisions": [],
-            "open_issues": [],
-            "next_actions": [],
-            "running_work": [],
-            "recovery_details": [],
-            "jobs": [],
-            "additional_context": [],
-            "todo_reconciliation": [],
-            "todos": []
-        })
-    }
-
-    pub(super) fn profile() -> ModelProfile {
-        ModelProfile {
-            provider: "test".into(),
-            model: "test".into(),
-            reasoning: None,
-            max_context: 128_000,
-            max_output: 16_384,
-            supports_images: false,
+    pub(super) fn usage(input_tokens: u64, cached_input_tokens: u64, output_tokens: u64) -> Usage {
+        Usage {
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
         }
     }
 
     pub(super) struct Fixture {
-        pub(super) _workspace: tempfile::TempDir,
-        pub(super) _sessions: tempfile::TempDir,
+        pub(super) workspace: tempfile::TempDir,
         pub(super) session: SessionHandle,
         pub(super) provider: Arc<ControlledProvider>,
         pub(super) template: ModelRequest,
@@ -419,66 +324,48 @@ mod tests {
     impl Fixture {
         pub(super) async fn new() -> Self {
             let workspace = tempfile::tempdir().unwrap();
-            let sessions = tempfile::tempdir().unwrap();
             let provider = Arc::new(ControlledProvider::default());
-            let harness = HarnessBuilder::new(workspace.path())
-                .session_root(sessions.path())
-                .provider("test", Arc::new(provider.clone()))
-                .model_profile("test", profile())
-                .default_model_profile("test")
-                .build()
-                .await
-                .unwrap();
-            let session = harness.new_session().await.unwrap();
-            session
-                .prompt("Research the existing task and preserve its constraints.")
-                .await
-                .unwrap();
+            let sessions = workspace.path().join("sessions");
+            let factory = Arc::new(provider.clone());
+            let builder = test_builder(workspace.path(), &sessions, factory, false);
+            let session = builder.build().await.unwrap().new_session().await.unwrap();
+            let research =
+                session.prompt("Research the existing task and preserve its constraints.");
+            research.await.unwrap();
             let mut template = provider.requests.lock().unwrap()[0].clone();
-            template.messages.clear();
-            *provider.summary.lock().unwrap() = summary_value().to_string();
+            (template.history, template.tail) = (Vec::new(), Vec::new());
+            template.history_lifetime = Default::default();
+            *provider.summary.lock().unwrap() = summary_json().to_string();
             Self {
-                _workspace: workspace,
-                _sessions: sessions,
+                workspace,
                 session,
                 provider,
                 template,
             }
         }
 
+        pub(super) fn set_summary(&self, summary: serde_json::Value) {
+            *self.provider.summary.lock().unwrap() = summary.to_string();
+        }
+
         pub(super) async fn add_history(&self, tokens: usize) {
-            self.session
-                .runtime
-                .commit(
-                    &self.session.root,
-                    Message::Assistant(vec![AssistantContent::text(
-                        "text/0",
-                        0,
-                        "research ".repeat(tokens * 4 / 9),
-                    )]),
-                )
-                .await
-                .unwrap();
-            self.session
-                .runtime
-                .commit(
-                    &self.session.root,
-                    Message::User(vec![UserContent::Text {
-                        text: "Continue the existing task.".into(),
-                    }]),
-                )
-                .await
-                .unwrap();
+            let (runtime, root) = (&self.session.runtime, &self.session.root);
+            let research = "research ".repeat(tokens * 4 / 9);
+            let research = Message::Assistant(vec![AssistantContent::text("text/0", 0, research)]);
+            runtime.commit(root, research).await.unwrap();
+            let text = "Continue the existing task.".into();
+            let next = Message::User(vec![UserContent::Text { text }]);
+            runtime.commit(root, next).await.unwrap();
         }
 
         pub(super) async fn assert_no_tool_execution(&self) {
             let records = self.session.runtime.store.records().await;
-            assert!(
-                !records
-                    .iter()
-                    .any(|record| matches!(record.event, SessionEvent::JobCreated { .. }))
-            );
-            assert!(!self._workspace.path().join("must-not-exist").exists());
+            assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 0);
+            assert!(!self.workspace.path().join("must-not-exist").exists());
+        }
+
+        pub(super) async fn records(&self) -> Vec<crate::session::EventRecord> {
+            self.session.runtime.store.records().await
         }
 
         pub(super) async fn compact(
@@ -487,50 +374,31 @@ mod tests {
         ) -> Result<(), HarnessError> {
             let runtime = &self.session.runtime;
             let agent = &self.session.root;
-            let context = runtime
-                .store
-                .append(
-                    agent.clone(),
-                    SessionEvent::ModelContext {
-                        provider: "test".into(),
-                        template: self.template.clone(),
-                    },
-                )
-                .await
-                .unwrap()
-                .sequence;
+            let context = SessionEvent::ModelContext {
+                provider: "test".into(),
+                template: self.template.clone(),
+            };
+            let store = &runtime.store;
+            let context = store.append(agent.clone(), context).await.unwrap().sequence;
             let mut input = self.template.clone();
-            input.messages = project_history(&runtime.store.records().await, agent)
-                .unwrap()
-                .into_iter()
-                .map(|(_, message)| message)
-                .collect();
+            let history = project_history(&runtime.store.records().await, agent).unwrap();
+            input.history = history.into_iter().map(|(_, message)| message).collect();
             let capabilities = CapabilitySet::default();
-            let location = ExecutionLocation::root(self._workspace.path().to_path_buf());
-            input.messages.push(Message::User(vec![
-                prompt::runtime_state_content(
-                    &runtime.jobs,
-                    &runtime.todos,
-                    agent,
-                    &capabilities,
-                    &location,
-                )
-                .await,
-            ]));
+            let location = ExecutionLocation::root(self.workspace.path().to_path_buf());
+            let (jobs, todos) = (&runtime.jobs, &runtime.todos);
+            let state =
+                prompt::runtime_state_content(jobs, todos, agent, &capabilities, &location).await;
+            input.tail = vec![Message::User(vec![state])];
+            let turn = TurnContext {
+                agent,
+                owner_job: None,
+                cancellation,
+                location: &location,
+                capabilities: &capabilities,
+            };
+            let mut provider = self.provider.open_context(agent.to_string())?;
             runtime
-                .compact_history(
-                    &TurnContext {
-                        agent,
-                        owner_job: None,
-                        cancellation,
-                        location: &location,
-                        capabilities: &capabilities,
-                    },
-                    self.provider.open_context(agent.to_string())?.as_mut(),
-                    context,
-                    &input,
-                    profile().max_context,
-                )
+                .compact_history(&turn, provider.as_mut(), context, &input, 128_000)
                 .await
         }
     }
@@ -538,27 +406,16 @@ mod tests {
     #[tokio::test]
     async fn stream_overflow_below_threshold_compacts_once() {
         let fixture = Fixture::new().await;
-        let runtime = &fixture.session.runtime;
         fixture.add_history(20_000).await;
         fixture.provider.overflow.store(true, Ordering::SeqCst);
         assert_eq!(fixture.session.prompt("Continue.").await.unwrap(), "done");
-        assert_eq!(
-            fixture.provider.opened.load(Ordering::SeqCst),
-            1,
-            "summarization and retry retain the agent's context"
-        );
-        let records = runtime.store.records().await;
+        // Summarization and retry retain the agent's context.
+        assert_eq!(fixture.provider.opened.load(Ordering::SeqCst), 1);
         let requests = fixture.provider.requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 4); // initial response, rejected stream, summary, retry
         assert!(compaction::estimate_request(&requests[1]) < 128_000 * 4 / 5);
-        assert_eq!(
-            records
-                .iter()
-                .filter(|record| matches!(record.event, SessionEvent::Compaction { .. }))
-                .count(),
-            1
-        );
-
+        let records = fixture.records().await;
+        assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 1);
         fixture.session.shutdown().await.unwrap();
     }
 
@@ -569,12 +426,9 @@ mod tests {
         let agent = &fixture.session.root;
         fixture.add_history(20_000).await;
         fixture.provider.block.store(true, Ordering::SeqCst);
-        let todos = vec![TodoItem {
-            text: "Do not discard this task on interruption".into(),
-            status: TodoStatus::InProgress,
-        }];
+        let todos = vec![todo("Keep on interruption", TodoStatus::InProgress)];
         runtime.todos.replace(agent, todos.clone()).await.unwrap();
-        let before = project_history(&runtime.store.records().await, agent).unwrap();
+        let before = project_history(&fixture.records().await, agent).unwrap();
         let cancellation = CancellationToken::new();
         let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(fixture.compact(&cancellation), async {
@@ -585,85 +439,47 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(result, Err(HarnessError::Interrupted)));
-        let records = runtime.store.records().await;
+        let records = fixture.records().await;
         assert_eq!(project_history(&records, agent).unwrap(), before);
-        assert!(
-            !records
-                .iter()
-                .any(|record| matches!(record.event, SessionEvent::Compaction { .. }))
-        );
-        assert_eq!(
-            runtime.todos.inspect(agent, None).await.unwrap().items,
-            todos
-        );
+        assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
+        let found = runtime.todos.inspect(agent, None).await.unwrap().items;
+        assert_eq!(found, todos);
         fixture.session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn exhausted_summary_failures_preserve_history_and_never_execute_tools() {
-        // Exhaustive malformed-field cases belong to the continuation parser tests.
-        // Here retain provider, truncation, tool-execution and semantic rollback contracts.
+        // Parser field cases live in compaction.rs; this covers rollback and tool contracts.
         for failure in ["truncated", "tool_call", "blank_todo"] {
             let fixture = Fixture::new().await;
-            let runtime = &fixture.session.runtime;
-            let agent = &fixture.session.root;
+            let (todos, agent) = (&fixture.session.runtime.todos, &fixture.session.root);
             fixture.add_history(20_000).await;
-            let old_todos = vec![TodoItem {
-                text: "Preserve unfinished work".into(),
-                status: TodoStatus::InProgress,
-            }];
-            runtime
-                .todos
-                .replace(agent, old_todos.clone())
-                .await
-                .unwrap();
-            let mut invalid = summary_value();
+            let old_todos = vec![todo("Preserve unfinished work", TodoStatus::InProgress)];
+            todos.replace(agent, old_todos.clone()).await.unwrap();
             match failure {
                 "truncated" => fixture.provider.truncate.store(true, Ordering::SeqCst),
                 "tool_call" => fixture.provider.summary_tools.store(true, Ordering::SeqCst),
-                "blank_todo" => invalid["todos"] = json!([{"text":" \t", "status":"pending"}]),
-                _ => unreachable!(),
+                _ => {
+                    let mut invalid = summary_json();
+                    invalid["todos"] = json!([{"text":" \t", "status":"pending"}]);
+                    fixture.set_summary(invalid);
+                }
             }
-            if failure == "blank_todo" {
-                *fixture.provider.summary.lock().unwrap() = invalid.to_string();
-            }
-            let before = project_history(&runtime.store.records().await, agent).unwrap();
-            let error = fixture
-                .compact(&CancellationToken::new())
-                .await
-                .unwrap_err();
-            let records = runtime.store.records().await;
+            let before = project_history(&fixture.records().await, agent).unwrap();
+            let cancellation = CancellationToken::new();
+            let error = fixture.compact(&cancellation).await.unwrap_err();
+            let records = fixture.records().await;
             if failure == "truncated" {
                 assert!(error.to_string().contains("truncated"));
-                assert!(records.iter().any(|record| matches!(
-                    record.event,
-                    SessionEvent::CompactionFailed {
-                        request: Some(_),
-                        ..
-                    }
-                )));
+                let failed = count!(&records, SessionEvent::CompactionFailed { request, .. } if request.is_some());
+                assert_ne!(failed, 0);
             }
-            assert_eq!(
-                fixture.provider.requests.lock().unwrap().len(),
-                4,
-                "{failure}"
-            );
-            assert_eq!(
-                project_history(&records, agent).unwrap(),
-                before,
-                "{failure}"
-            );
-            assert!(
-                !records
-                    .iter()
-                    .any(|record| matches!(record.event, SessionEvent::Compaction { .. })),
-                "{failure}"
-            );
-            assert_eq!(
-                runtime.todos.inspect(agent, None).await.unwrap().items,
-                old_todos,
-                "{failure}"
-            );
+            let requests = fixture.provider.requests.lock().unwrap().len();
+            let unchanged = project_history(&records, agent).unwrap() == before;
+            let compactions = count!(&records, SessionEvent::Compaction { .. });
+            let kept_todos = todos.inspect(agent, None).await.unwrap().items == old_todos;
+            let outcome = (requests, unchanged, compactions, kept_todos);
+            assert_eq!(outcome, (4, true, 0, true), "{failure}");
             fixture.assert_no_tool_execution().await;
             fixture.session.shutdown().await.unwrap();
         }
@@ -672,26 +488,14 @@ mod tests {
     #[tokio::test]
     async fn invalid_selected_job_retries_without_installing_compaction() {
         let fixture = Fixture::new().await;
-        let runtime = &fixture.session.runtime;
-
         fixture.add_history(20_000).await;
-        let mut summary = summary_value();
+        let mut summary = summary_json();
         summary["jobs"] = json!([99999]);
-        *fixture.provider.summary.lock().unwrap() = summary.to_string();
+        fixture.set_summary(summary);
         assert!(fixture.compact(&CancellationToken::new()).await.is_err());
-        let records = runtime.store.records().await;
-        assert!(
-            !records
-                .iter()
-                .any(|record| matches!(record.event, SessionEvent::Compaction { .. }))
-        );
-        assert_eq!(
-            records
-                .iter()
-                .filter(|record| matches!(record.event, SessionEvent::CompactionFailed { .. }))
-                .count(),
-            3
-        );
+        let records = fixture.records().await;
+        assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
+        assert_eq!(count!(&records, SessionEvent::CompactionFailed { .. }), 3);
         fixture.session.shutdown().await.unwrap();
     }
 }

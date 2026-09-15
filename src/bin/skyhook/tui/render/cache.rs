@@ -10,7 +10,8 @@ pub struct RenderState {
     pub width: u16,
     pub agent: skyhook::identity::AgentId,
     pub highlights: super::super::tool_view::HighlightCache,
-    pub entries: std::collections::HashMap<String, CachedEntry>,
+    /// Markdown fence metadata per entry, keyed independently of row storage.
+    pub(super) entries: std::collections::HashMap<model::EntryKey, code::Fences>,
     pub(super) request_columns: RequestColumns,
 }
 
@@ -48,15 +49,6 @@ impl RenderState {
     }
 }
 
-#[derive(Default)]
-pub struct CachedEntry {
-    pub(super) width: u16,
-    pub(super) stream: stream::StreamLayout,
-    pub(super) fences: code::Fences,
-    pub(super) body_offset: usize,
-    pub(super) title_rows: usize,
-}
-
 #[derive(Clone, Copy)]
 pub(super) struct EntryLayout<'a> {
     pub(super) width: u16,
@@ -68,37 +60,28 @@ pub(super) struct EntryLayout<'a> {
 
 /// Markdown layout and syntax metadata must see the same source: generated
 /// message/reasoning titles are not part of the Markdown body. Offsets are in
-/// the original UTF-8 entry text so append positions can be translated safely.
+/// the original UTF-8 entry text; both consumers use this one checked boundary.
 pub(super) fn markdown_body_offset(entry: &model::Entry) -> usize {
-    if matches!(entry.surface, Surface::User | Surface::Agent) || entry.expandable {
+    if matches!(entry.surface, Surface::User | Surface::Agent) || entry.expandable() {
         entry
-            .text
+            .text()
             .find('\n')
-            .map_or(entry.text.len(), |end| end + 1)
+            .map_or(entry.text().len(), |end| end + 1)
     } else {
         0
     }
 }
 
-pub(super) fn update_markdown_fences(
-    entry: &model::Entry,
-    fences: &mut code::Fences,
-    append_from: Option<usize>,
-) {
+pub(super) fn update_markdown_fences(entry: &model::Entry, fences: &mut code::Fences) {
     let offset = markdown_body_offset(entry);
-    fences.update(
-        &entry.text[offset..],
-        append_from.and_then(|from| from.checked_sub(offset)),
-    );
+    fences.update(&entry.text()[offset..]);
 }
 
 pub(super) fn update_entry_rows(
     rows: &mut Vec<Row>,
-    cached: &mut CachedEntry,
     entry: &model::Entry,
     index: usize,
     settings: EntryLayout<'_>,
-    append_from: Option<usize>,
 ) {
     let EntryLayout {
         width,
@@ -110,7 +93,7 @@ pub(super) fn update_entry_rows(
     if entry.surface == Surface::Reasoning {
         p.content.fg = p.content.muted;
     }
-    if let Some(request) = &entry.request {
+    if let Some(request) = entry.request() {
         let geometry = EntryGeometry::new(entry, width, index);
         rows.clear();
         rows.push(geometry.row(
@@ -121,66 +104,53 @@ pub(super) fn update_entry_rows(
         return;
     }
     let block = matches!(entry.surface, Surface::User | Surface::Agent);
-    if (entry.surface == Surface::Reasoning || block) && entry.document.is_none() {
+    if (entry.surface == Surface::Reasoning || block) && entry.document().is_none() {
         let geometry = EntryGeometry::new(entry, width, index);
         let body_width = geometry.body_width;
         let x = geometry.x;
         let block_width = geometry.block_width;
         let make_row = |line, header, continued| geometry.row(line, header, continued);
         let blank = |surface, x, width| geometry.blank(surface, x, width);
-        let has_title = block || entry.expandable;
+        let has_title = block || entry.expandable();
         let body_offset = markdown_body_offset(entry);
-        // A growing title (before its first newline) changes the body boundary;
-        // it cannot reuse the previously laid-out body as an append.
-        let append_from = append_from.filter(|_| cached.body_offset == body_offset);
-        if append_from.is_none() {
-            rows.clear();
-            if block {
-                rows.push(blank(entry.surface, x, block_width));
-            }
-            cached.body_offset = body_offset;
-            if has_title {
-                let (title, _) = entry.text.split_once('\n').unwrap_or((&entry.text, ""));
-                let title = if block {
-                    Line::from(Span::styled(
-                        model::clean(title),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ))
-                } else {
-                    Line::from(model::clean(title))
-                };
-                for (part, line) in wrap_words(title, body_width as usize)
-                    .into_iter()
-                    .enumerate()
-                {
-                    rows.push(make_row(line, part == 0, part > 0));
-                }
-            }
-            cached.title_rows = rows.len();
+        rows.clear();
+        if block {
+            rows.push(blank(entry.surface, x, block_width));
         }
-        let body = &entry.text[cached.body_offset..];
-        let prefix = if entry.surface == Surface::Reasoning && !entry.expandable && entry.running {
+        if has_title {
+            let (title, _) = entry.text().split_once('\n').unwrap_or((entry.text(), ""));
+            let title = if block {
+                Line::from(Span::styled(
+                    model::clean(title),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(model::clean(title))
+            };
+            for (part, line) in wrap_words(title, body_width as usize)
+                .into_iter()
+                .enumerate()
+            {
+                rows.push(make_row(line, part == 0, part > 0));
+            }
+        }
+        let body = &entry.text()[body_offset..];
+        let prefix = if entry.surface == Surface::Reasoning && !entry.expandable() && entry.running
+        {
             "  "
         } else {
             ""
         };
-        let body_append = append_from.and_then(|from| from.checked_sub(cached.body_offset));
-        let suffix = cached.stream.update_highlighted(
-            body,
-            body_width as usize,
-            p,
-            body_append,
-            prefix,
-            Some(highlights),
-        );
-        if let Some((truncate, suffix)) = suffix {
-            rows.truncate(cached.title_rows + truncate);
+        let suffix =
+            stream::layout_highlighted(body, body_width as usize, p, prefix, Some(highlights));
+        {
             // Expanded reasoning omits the empty body; response blocks retain it.
-            if !entry.expandable || !body.is_empty() || block {
+            if !entry.expandable() || !body.is_empty() || block {
                 for line in suffix {
                     let header = rows.is_empty();
-                    let mut row = make_row(line.line, header, line.continued);
-                    row.layout = line.layout;
+                    let continued = line.layout.continued();
+                    let mut row = make_row(line.line, header, continued);
+                    row.layout = line.layout.with_flow(row.layout.header(), continued);
                     rows.push(row);
                 }
             }
@@ -206,7 +176,6 @@ pub(super) fn update_entry_rows(
             rows.push(blank(Surface::Muted, 0, width));
         }
     } else {
-        cached.stream = stream::StreamLayout::default();
         *rows =
             layout_document_or_plain_with_expansion(entry, width, p, highlights, index, expanded);
     }
@@ -225,7 +194,7 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
                     let row = app.render.rows.get(scroll)?;
                     Some((
                         row.entry,
-                        app.entries.get(row.entry)?.key.clone(),
+                        app.content_cache.entries().get(row.entry)?.key().clone(),
                         scroll - app.render.rows.entry_start(row.entry)?,
                     ))
                 })
@@ -239,33 +208,31 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
     let mut dirty = std::mem::take(&mut app.render.changes.dirty);
     if reset {
         app.render.entries.clear();
-        dirty = (0..app.entries.len()).collect();
+        dirty = (0..app.content_cache.entries().len()).collect();
     }
     if tab == Tab::Requests
-        && (reset || !dirty.is_empty() || app.render.rows.entry_count() != app.entries.len())
+        && (reset
+            || !dirty.is_empty()
+            || app.render.rows.entry_count() != app.content_cache.entries().len())
     {
-        app.render.request_columns.update(&app.entries, &mut dirty);
+        app.render
+            .request_columns
+            .update(app.content_cache.entries(), &mut dirty);
     }
     // Fence sources join tool documents in the same bounded asynchronous cache.
-    // Retain committed blocks on appends rather than rehashing previous fences.
+    // Only authoritative dirty entries are rescanned; unchanged rows stay cached.
     for &index in &dirty {
-        let Some(entry) = app.entries.get(index) else {
+        let Some(entry) = app.content_cache.entries().get(index) else {
             continue;
         };
-        if entry.document.is_none()
+        if entry.document().is_none()
             && matches!(
                 entry.surface,
                 Surface::User | Surface::Agent | Surface::Reasoning
             )
         {
-            let cached = app.render.entries.entry(entry.key.clone()).or_default();
-            update_markdown_fences(
-                entry,
-                &mut cached.fences,
-                (!reset)
-                    .then(|| app.render.changes.appends.get(&index).copied())
-                    .flatten(),
-            );
+            let cached = app.render.entries.entry(entry.key().clone()).or_default();
+            update_markdown_fences(entry, cached);
         }
     }
     // Only changed documents are prepared on ordinary content updates.
@@ -273,13 +240,13 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
     if reset || content_changed || !dirty.is_empty() {
         let documents = std::iter::once(selected)
             .chain(dirty.iter().copied())
-            .filter_map(|i| app.entries.get(i));
+            .filter_map(|i| app.content_cache.entries().get(i));
         app.render.highlights.prepare(documents.flat_map(|entry| {
-            entry.document.iter().chain(
+            entry.document().into_iter().chain(
                 app.render
                     .entries
-                    .get(&entry.key)
-                    .map(|cached| &cached.fences.document),
+                    .get(entry.key())
+                    .map(|cached| &cached.document),
             )
         }));
     }
@@ -291,7 +258,7 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
     dirty.extend(highlighted_entries.iter().copied());
     dirty.sort_unstable();
     dirty.dedup();
-    let truncated = app.render.rows.entry_count() > app.entries.len();
+    let truncated = app.render.rows.entry_count() > app.content_cache.entries().len();
     let changed = reset || !dirty.is_empty() || truncated;
     // Selection validation visits just selected rows, never concatenates history.
     let selection_before = app
@@ -319,46 +286,33 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
         app.render.rows.clear();
     }
     for index in dirty {
-        let Some(entry) = app.entries.get(index) else {
+        let Some(entry) = app.content_cache.entries().get(index) else {
             continue;
         };
-        let cached = app.render.entries.entry(entry.key.clone()).or_default();
-        let append_from =
-            (!reset && !highlighted_entries.contains(&index) && cached.width == width)
-                .then(|| app.render.changes.appends.get(&index).copied())
-                .flatten();
-        let block = app.render.rows.block_mut(index);
-        update_entry_rows(
-            block,
-            cached,
-            entry,
-            index,
-            EntryLayout {
-                width,
-                palette: p,
-                highlights: &app.render.highlights,
-                request_columns: app.render.request_columns,
-                expanded: app
-                    .views
-                    .get(&app.selected)
-                    .is_some_and(|view| entry_expanded(entry, view, app.details)),
-            },
-            append_from,
-        );
-        cached.width = width;
-
-        app.render.rows.finish_update(index);
-        app.render.rows.register_sources(
-            index,
-            entry
-                .document
-                .iter()
-                .flat_map(|doc| doc.highlight_sources())
-                .chain(cached.fences.document.highlight_sources())
-                .collect(),
-        );
+        let cached = app.render.entries.entry(entry.key().clone()).or_default();
+        let sources = entry
+            .document()
+            .into_iter()
+            .flat_map(|doc| doc.highlight_sources())
+            .chain(cached.document.highlight_sources())
+            .collect();
+        let settings = EntryLayout {
+            width,
+            palette: p,
+            highlights: &app.render.highlights,
+            request_columns: app.render.request_columns,
+            expanded: app
+                .views
+                .get(&app.selected)
+                .is_some_and(|view| entry.is_expanded(view, app.details)),
+        };
+        app.render.rows.update_entry(index, sources, |block| {
+            update_entry_rows(block, entry, index, settings);
+        });
     }
-    app.render.rows.truncate_entries(app.entries.len());
+    app.render
+        .rows
+        .truncate_entries(app.content_cache.entries().len());
     if let (Some(selection), Some((start, before))) = (app.selection, selection_before) {
         let unchanged = selection_unchanged(&before, app.render.rows.iter().skip(start), selection);
         if !unchanged {
@@ -366,17 +320,21 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
         }
     }
     app.render.changes.dirty.clear();
-    app.render.changes.appends.clear();
     app.render.changes.reset = false;
     if changed {
         app.render.agent = app.selected.clone();
         if let Some((old_index, key, offset)) = anchor
             && let Some(index) = app
-                .entries
+                .entries()
                 .get(old_index)
-                .filter(|entry| entry.key == key)
+                .filter(|entry| *entry.key() == key)
                 .map(|_| old_index)
-                .or_else(|| app.entries.iter().position(|entry| entry.key == key))
+                .or_else(|| {
+                    app.content_cache
+                        .entries()
+                        .iter()
+                        .position(|entry| *entry.key() == key)
+                })
             && let Some(first) = app.render.rows.entry_start(index)
         {
             let count = app
@@ -396,28 +354,24 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
 mod tests {
     use super::*;
 
-    fn expandable_entry() -> model::Entry {
-        model::Entry {
-            key: "entry".into(),
-            text:
-                "first header with many wrapped fragments\nbody with many wrapped fragments\n  \n"
-                    .into(),
-            surface: Surface::Tool,
-            expandable: true,
-            default_open: false,
-            running: false,
-            footer: None,
-            request: None,
-            indent: 0,
-            job: None,
-            compact_after: false,
-            header: None,
-            document: None,
+    fn text_entry(text: String, surface: Surface, expandable: bool) -> model::Entry {
+        let key = model::EntryKey::Record(1);
+        if expandable {
+            model::Entry::expandable_text(key, text, surface)
+        } else {
+            model::Entry::new(key, text, surface)
         }
     }
 
+    fn fences(body: &str) -> code::Fences {
+        let mut fences = code::Fences::default();
+        fences.update(body);
+        fences
+    }
+
+    // Checks the shared entry-to-body translation at the title boundary.
     #[test]
-    fn fence_metadata_uses_body_offsets_for_every_stream_append() {
+    fn fence_metadata_uses_body_offsets_for_full_replacements() {
         let body = "2. ```rust\n   let café = 42;\n   ```\n\nTail";
         for (surface, expandable, title) in [
             (Surface::Agent, false, "Agent [worker] 🦀\n"),
@@ -426,111 +380,54 @@ mod tests {
             (Surface::Reasoning, false, ""),
         ] {
             let full = format!("{title}{body}");
-            let mut entry = expandable_entry();
-            entry.surface = surface;
-            entry.expandable = expandable;
-            entry.text.clear();
-            let mut fences = code::Fences::default();
-            let mut previous = 0;
-            for end in std::iter::once(0)
-                .chain(full.char_indices().map(|(start, ch)| start + ch.len_utf8()))
-            {
-                entry.text = full[..end].to_owned();
-                update_markdown_fences(&entry, &mut fences, Some(previous));
-                let expected_body = if title.is_empty() {
+            let mut actual = code::Fences::default();
+            let boundary = title.len();
+            for end in [
+                0,
+                boundary.saturating_sub(1),
+                boundary,
+                boundary + 1,
+                full.len(),
+            ] {
+                let entry = text_entry(full[..end].to_owned(), surface, expandable);
+                update_markdown_fences(&entry, &mut actual);
+                let expected = &full[boundary.min(end)..end];
+                let expected = if title.is_empty() {
                     &full[..end]
-                } else if end < title.len() {
-                    ""
                 } else {
-                    &full[title.len()..end]
+                    expected
                 };
-                let mut expected = code::Fences::default();
-                expected.update(expected_body, None);
                 assert_eq!(
-                    fences.document, expected.document,
-                    "title={title:?}, end={end}"
+                    actual.document,
+                    fences(expected).document,
+                    "{title:?}, end={end}"
                 );
-                previous = end;
             }
-            assert_eq!(fences.document.sections.len(), 1);
-            // Replacements are not appends, even if the body has the same length.
-            entry.text = full.replace("42", "43");
-            update_markdown_fences(&entry, &mut fences, None);
-            let mut expected = code::Fences::default();
-            expected.update(&body.replace("42", "43"), None);
-            assert_eq!(fences.document, expected.document);
+            assert_eq!(actual.document.sections.len(), 1);
+            // Preserve the authoritative equal-length replacement scenario.
+            let entry = text_entry(full.replace("42", "43"), surface, expandable);
+            update_markdown_fences(&entry, &mut actual);
+            assert_eq!(actual.document, fences(&body.replace("42", "43")).document);
         }
     }
 
     #[test]
-    fn appends_and_resize_match_fresh_layout() {
+    fn full_entry_replacements_preserve_unicode_on_resize() {
         let highlights = super::super::super::tool_view::HighlightCache::default();
         let source = "Title\nwords 界 👩‍💻\n\n```rust\nlet n = 4;\n```\n\n| A | B |\n| - | - |\n| x | long words |";
         for surface in [Surface::Reasoning, Surface::User, Surface::Agent] {
-            let mut entry = expandable_entry();
-            entry.surface = surface;
+            let mut entry = text_entry(source.to_owned(), surface, true);
             entry.default_open = true;
-            entry.text.clear();
-            let mut cached = CachedEntry::default();
             let mut rows = Vec::new();
-            for grapheme in source.graphemes(true) {
-                let from = entry.text.len();
-                entry.text.push_str(grapheme);
-                update_entry_rows(
-                    &mut rows,
-                    &mut cached,
-                    &entry,
-                    0,
-                    EntryLayout {
-                        width: 24,
-                        palette: Palette::new(),
-                        highlights: &highlights,
-                        request_columns: RequestColumns::default(),
-                        expanded: true,
-                    },
-                    (from > 0).then_some(from),
-                );
-                let mut fresh = Vec::new();
-                update_entry_rows(
-                    &mut fresh,
-                    &mut CachedEntry::default(),
-                    &entry,
-                    0,
-                    EntryLayout {
-                        width: 24,
-                        palette: Palette::new(),
-                        highlights: &highlights,
-                        request_columns: RequestColumns::default(),
-                        expanded: true,
-                    },
-                    None,
-                );
-                assert_eq!(rows.len(), fresh.len(), "{surface:?}: {}", entry.text);
-                for (actual, expected) in rows.iter().zip(&fresh) {
-                    assert_eq!(actual.line, expected.line);
-                    assert_eq!(actual.layout, expected.layout);
-                    assert_eq!(
-                        (actual.x, actual.width, actual.continued),
-                        (expected.x, expected.width, expected.continued)
-                    );
-                }
-            }
-            // A non-append reflow must reset retained stream state on width changes.
-            for width in [8, 40] {
-                update_entry_rows(
-                    &mut rows,
-                    &mut cached,
-                    &entry,
-                    0,
-                    EntryLayout {
-                        width,
-                        palette: Palette::new(),
-                        highlights: &highlights,
-                        request_columns: RequestColumns::default(),
-                        expanded: true,
-                    },
-                    None,
-                );
+            for width in [24, 8, 40] {
+                let options = EntryLayout {
+                    width,
+                    palette: Palette::new(),
+                    highlights: &highlights,
+                    request_columns: RequestColumns::default(),
+                    expanded: true,
+                };
+                update_entry_rows(&mut rows, &entry, 0, options);
                 assert!(rows.iter().any(|row| row.text().contains('界')));
                 assert!(rows.iter().all(|row| row.width <= width));
             }

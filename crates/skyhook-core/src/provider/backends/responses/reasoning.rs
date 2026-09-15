@@ -95,7 +95,7 @@ impl Decoder {
     ) -> Result<(), ProviderError> {
         let supplied = reasoning_parts(native)?;
         let item = &self.items[&id];
-        if let Some(previous) = &item.ended
+        if let Some(previous) = item.snapshot()
             && !native_enrichment(previous, native)
         {
             return Err(protocol("conflicting final reasoning state"));
@@ -108,27 +108,30 @@ impl Decoder {
         self.items
             .get_mut(&id)
             .expect("checked item")
-            .reasoning_aliases
+            .reasoning_mut()?
+            .aliases
             .retain(|position, _| {
                 !(supplied.contains_key(position) && supplied.contains_key(&(position ^ 1)))
             });
         for (position, content) in &supplied {
             let item = &self.items[&id];
             let mut target = item
-                .reasoning_aliases
+                .reasoning()?
+                .aliases
                 .get(position)
                 .copied()
                 .unwrap_or(*position);
-            if !item.parts.contains_key(&target) && !supplied.contains_key(&(position ^ 1)) {
+            if !item.reasoning()?.parts.contains_key(&target)
+                && !supplied.contains_key(&(position ^ 1))
+            {
                 // A snapshot can move the same readable text from summary to
                 // content (or vice versa). Reuse its live block, but do not
                 // collapse independently supplied summary/content namespaces.
-                if let Some(other) = item.parts.get(&(position ^ 1)) {
+                if let Some(other) = item.reasoning()?.parts.get(&(position ^ 1)) {
                     let text_matches = match content {
                         BlockContent::Reasoning { text } => other
-                            .ended
-                            .as_ref()
-                            .map_or(other.streamed == *text, |old| old == content),
+                            .ended()
+                            .map_or(other.streamed() == text, |old| old == content),
                         _ => false,
                     };
                     if text_matches {
@@ -136,7 +139,8 @@ impl Decoder {
                         self.items
                             .get_mut(&id)
                             .expect("checked item")
-                            .reasoning_aliases
+                            .reasoning_mut()?
+                            .aliases
                             .insert(*position, target);
                     }
                 }
@@ -146,16 +150,17 @@ impl Decoder {
         // Missing final plaintext is not evidence that live display was wrong.
         // Close received display locally without adding it to the native replay.
         let remaining: Vec<_> = self.items[&id]
+            .reasoning()?
             .parts
             .iter()
-            .filter(|(_, part)| part.ended.is_none())
-            .map(|(position, part)| (*position, part.streamed.clone()))
+            .filter(|(_, part)| part.ended().is_none())
+            .map(|(position, part)| (*position, part.streamed().to_owned()))
             .collect();
         for (position, text) in remaining {
             self.close_part(id, position, BlockContent::Reasoning { text }, chunks)?;
         }
         let item = self.items.get_mut(&id).expect("checked item");
-        item.ended = Some(native.clone());
+        item.reasoning_mut()?.snapshot = Some(native.clone());
         // Keep the display item open until the terminal snapshot: it may supply
         // additional readable content absent from output_item.done.
         if terminal {
@@ -171,24 +176,22 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::protocol::{AssistantItem, ResponseAssembler};
-
-    fn assemble(events: Vec<Value>) -> Vec<AssistantItem> {
-        let mut decoder = Decoder::new("model".into());
-        let mut assembler = ResponseAssembler::default();
-        for event in events {
-            for chunk in decoder.feed(event).unwrap() {
-                assembler.push(&chunk).unwrap();
-            }
-        }
-        assembler.finish().unwrap().0
-    }
+    use crate::provider::protocol::ResponseAssembler;
 
     fn event(name: &str, index_key: &str, value_key: &str, value: Value) -> Value {
         let mut event = json!({"type":format!("response.{name}"), "output_index":0, "item_id":"r"});
         event[index_key] = json!(0);
         event[value_key] = value;
         event
+    }
+
+    fn content_delta(text: &str) -> Value {
+        event(
+            "reasoning_text.delta",
+            "content_index",
+            "delta",
+            json!(text),
+        )
     }
 
     fn terminal(native: Value) -> Value {
@@ -204,26 +207,33 @@ mod tests {
     }
 
     fn readable(summary: Option<&str>, content: Option<&str>) -> Value {
+        let parts = |kind, text: Option<&str>| {
+            text.map_or(Value::Null, |text| json!([{"type":kind, "text":text}]))
+        };
         item(
-            summary.map_or(
-                Value::Null,
-                |text| json!([{"type":"summary_text", "text":text}]),
-            ),
-            content.map_or(
-                Value::Null,
-                |text| json!([{"type":"reasoning_text", "text":text}]),
-            ),
+            parts("summary_text", summary),
+            parts("reasoning_text", content),
         )
     }
 
-    fn namespace(content: bool) -> (&'static str, &'static str, &'static str) {
+    fn empty() -> Value {
+        readable(None, None)
+    }
+
+    fn namespace(content: bool) -> Value {
         if content {
-            ("reasoning_text.delta", "content_index", "content_0")
+            content_delta("original")
         } else {
-            ("reasoning_summary_text.delta", "summary_index", "summary_0")
+            event(
+                "reasoning_summary_text.delta",
+                "summary_index",
+                "delta",
+                json!("original"),
+            )
         }
     }
 
+    /// The done snapshot after streaming into one namespace moves text to the other.
     fn migrated(content: bool, text: &str) -> Value {
         if content {
             readable(Some(text), None)
@@ -232,56 +242,70 @@ mod tests {
         }
     }
 
+    fn feed(decoder: &mut Decoder, events: Vec<Value>) -> Result<(), ProviderError> {
+        events
+            .into_iter()
+            .try_for_each(|event| decoder.feed(event).map(drop))
+    }
+
+    /// Asserts the single item's exact replay payload and its (block id, text) display.
+    fn assert_display(events: Vec<Value>, native: &Value, expected: &[(&str, &str)]) {
+        let items = super::fixtures::assemble(events).unwrap().0;
+        assert_eq!(items[0].replay.as_ref().unwrap().payload, *native);
+        let display: Vec<_> = items[0]
+            .blocks
+            .iter()
+            .map(|block| {
+                (
+                    block.id.as_str(),
+                    block.content.reasoning_content().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(display, expected);
+    }
+
     #[test]
     fn native_text_is_live_and_independent_of_summary() {
         let mut decoder = Decoder::new("model".into());
         let mut assembler = ResponseAssembler::default();
-        for chunk in decoder
-            .feed(snapshot("added", item(json!([]), Value::Null)))
-            .unwrap()
-        {
-            assembler.push(&chunk).unwrap();
-        }
-        let chunks = decoder
-            .feed(event(
-                "reasoning_text.delta",
-                "content_index",
-                "delta",
-                json!("raw"),
-            ))
-            .unwrap();
+        let mut push = |event| {
+            let chunks = decoder.feed(event).unwrap();
+            chunks
+                .iter()
+                .for_each(|chunk| assembler.push(chunk).unwrap());
+            chunks
+        };
+        push(snapshot("added", item(json!([]), Value::Null)));
+        let chunks = push(content_delta("raw"));
         assert!(chunks.iter().any(|chunk| matches!(chunk,
             ResponseChunk::BlockStarted { id, kind: BlockKind::Reasoning, .. } if id == "content_0")));
         assert!(chunks.iter().any(|chunk| matches!(chunk,
             ResponseChunk::BlockDelta { block, delta: ContentDelta::Text(text), .. }
                 if block == "content_0" && text == "raw")));
-        for chunk in chunks {
-            assembler.push(&chunk).unwrap();
-        }
-        let native = item(
-            json!([{"type":"summary_text", "text":"brief"}]),
-            json!([{"type":"reasoning_text", "text":"raw"}]),
-        );
-        for value in [
-            event(
-                "reasoning_summary_text.delta",
-                "summary_index",
-                "delta",
-                json!("brief"),
-            ),
-            event("reasoning_text.done", "content_index", "text", json!("raw")),
-            snapshot("done", native.clone()),
-            snapshot("done", native.clone()),
-            terminal(native.clone()),
-        ] {
-            for chunk in decoder.feed(value).unwrap() {
-                assembler.push(&chunk).unwrap();
-            }
-        }
+        let native = readable(Some("brief"), Some("raw"));
+        push(event(
+            "reasoning_summary_text.delta",
+            "summary_index",
+            "delta",
+            json!("brief"),
+        ));
+        push(event(
+            "reasoning_text.done",
+            "content_index",
+            "text",
+            json!("raw"),
+        ));
+        push(snapshot("done", native.clone()));
+        push(snapshot("done", native.clone()));
+        push(terminal(native.clone()));
         let items = assembler.finish().unwrap().0;
-        assert_eq!(items[0].blocks.len(), 2);
-        assert_eq!(items[0].blocks[0].id, "summary_0");
-        assert_eq!(items[0].blocks[1].id, "content_0");
+        let ids: Vec<_> = items[0]
+            .blocks
+            .iter()
+            .map(|block| block.id.as_str())
+            .collect();
+        assert_eq!(ids, ["summary_0", "content_0"]);
         assert_eq!(items[0].replay.as_ref().unwrap().payload, native);
     }
 
@@ -295,71 +319,69 @@ mod tests {
                 if let Some(summary) = summary {
                     native["summary"] = summary;
                 }
-                let items = assemble(vec![terminal(native.clone())]);
-                assert_eq!(items[0].blocks.len(), 1);
-                assert_eq!(items[0].blocks[0].id, "content_0");
-                assert_eq!(
-                    items[0].blocks[0].content,
-                    BlockContent::Reasoning {
-                        text: "visible".into()
-                    }
+                assert_display(
+                    vec![terminal(native.clone())],
+                    &native,
+                    &[("content_0", "visible")],
                 );
-                assert_eq!(items[0].replay.as_ref().unwrap().payload, native);
             }
         }
-        for native in [json!({"type":"reasoning", "id":"r"}), readable(None, None)] {
-            let items = assemble(vec![terminal(native.clone())]);
-            assert!(items[0].blocks.is_empty());
-            assert_eq!(items[0].replay.as_ref().unwrap().payload, native);
+        for native in [json!({"type":"reasoning", "id":"r"}), empty()] {
+            assert_display(vec![terminal(native.clone())], &native, &[]);
         }
+        // Explicitly supplied namespaces remain distinct even for equal text.
+        let native = item(
+            json!([{"type":"summary_text", "text":"same"}, {"type":"summary_text", "text":"brief"}]),
+            json!([{"type":"reasoning_text", "text":"same"}, {"type":"output_text", "text":"details"}]),
+        );
+        assert_display(
+            vec![terminal(native.clone())],
+            &native,
+            &[
+                ("summary_0", "same"),
+                ("content_0", "same"),
+                ("summary_1", "brief"),
+                ("content_1", "details"),
+            ],
+        );
     }
 
     #[test]
     fn namespace_migration_reuses_live_block_and_preserves_exact_replay() {
-        for stream_content in [false, true] {
-            let (name, index_key, block) = namespace(stream_content);
-            let native = migrated(stream_content, "same");
-            let items = assemble(vec![
-                snapshot("added", readable(None, None)),
-                event(name, index_key, "delta", json!("same")),
+        for (content, block) in [(false, "summary_0"), (true, "content_0")] {
+            let native = migrated(content, "original");
+            let events = vec![
+                snapshot("added", empty()),
+                namespace(content),
                 snapshot("done", native.clone()),
                 terminal(native.clone()),
-            ]);
-            assert_eq!(items[0].blocks.len(), 1);
-            assert_eq!(items[0].blocks[0].id, block);
-            assert_eq!(items[0].replay.as_ref().unwrap().payload, native);
+            ];
+            assert_display(events, &native, &[(block, "original")]);
         }
+        // A done summary can move to terminal content without duplicate display.
+        let done = readable(Some("same"), None);
+        let native = readable(None, Some("same"));
+        let events = vec![
+            snapshot("added", empty()),
+            snapshot("done", done.clone()),
+            snapshot("done", done),
+            terminal(native.clone()),
+        ];
+        assert_display(events, &native, &[("summary_0", "same")]);
     }
 
     #[test]
     fn terminal_can_add_plaintext_after_done_or_omit_received_display() {
         for final_has_text in [false, true] {
             let mut native = json!({"type":"reasoning", "id":"r", "encrypted_content":"cipher"});
+            let mut events = vec![snapshot("added", empty())];
             if final_has_text {
                 native["content"] = json!([{"type":"reasoning_text", "text":"visible"}]);
+            } else {
+                events.push(content_delta("visible"));
             }
-            let mut events = vec![snapshot("added", readable(None, None))];
-            if !final_has_text {
-                events.push(event(
-                    "reasoning_text.delta",
-                    "content_index",
-                    "delta",
-                    json!("visible"),
-                ));
-            }
-            events.extend([
-                snapshot("done", readable(None, None)),
-                terminal(native.clone()),
-            ]);
-            let items = assemble(events);
-            assert_eq!(items[0].blocks.len(), 1);
-            assert_eq!(
-                items[0].blocks[0].content,
-                BlockContent::Reasoning {
-                    text: "visible".into()
-                }
-            );
-            assert_eq!(items[0].replay.as_ref().unwrap().payload, native);
+            events.extend([snapshot("done", empty()), terminal(native.clone())]);
+            assert_display(events, &native, &[("content_0", "visible")]);
         }
     }
 
@@ -371,43 +393,22 @@ mod tests {
                     Value::Null,
                     json!([{"type":part_type,"reasoning":"visible"}]),
                 );
-                let items = assemble(vec![
-                    snapshot("added", readable(None, None)),
-                    event(
-                        &format!("{family}.added"),
-                        "content_index",
-                        "part",
-                        json!({"type":part_type,"reasoning":"vis"}),
-                    ),
-                    event(
-                        "reasoning_text.delta",
-                        "content_index",
-                        "delta",
-                        json!("ible"),
-                    ),
-                    event(
-                        &format!("{family}.done"),
-                        "content_index",
-                        "part",
-                        json!({"type":part_type,"reasoning":"visible"}),
-                    ),
-                    event(
-                        &format!("{family}.done"),
-                        "content_index",
-                        "part",
+                let part = |phase: &str, part: Value| {
+                    event(&format!("{family}.{phase}"), "content_index", "part", part)
+                };
+                let events = vec![
+                    snapshot("added", empty()),
+                    part("added", json!({"type":part_type,"reasoning":"vis"})),
+                    content_delta("ible"),
+                    part("done", json!({"type":part_type,"reasoning":"visible"})),
+                    part(
+                        "done",
                         json!({"type":part_type,"text":"visible","reasoning":"visible"}),
                     ),
                     snapshot("done", native.clone()),
                     terminal(native.clone()),
-                ]);
-                assert_eq!(items[0].blocks.len(), 1);
-                assert_eq!(
-                    items[0].blocks[0].content,
-                    BlockContent::Reasoning {
-                        text: "visible".into()
-                    }
-                );
-                assert_eq!(items[0].replay.as_ref().unwrap().payload, native);
+                ];
+                assert_display(events, &native, &[("content_0", "visible")]);
             }
         }
     }
@@ -420,17 +421,11 @@ mod tests {
             json!({"type":"reasoning_text", "text":7}),
         ] {
             let mut decoder = Decoder::new("model".into());
-            decoder
-                .feed(snapshot("added", readable(None, None)))
-                .unwrap();
-            decoder
-                .feed(event(
-                    "reasoning_text.delta",
-                    "content_index",
-                    "delta",
-                    json!("visible"),
-                ))
-                .unwrap();
+            feed(
+                &mut decoder,
+                vec![snapshot("added", empty()), content_delta("visible")],
+            )
+            .unwrap();
             assert!(
                 decoder
                     .feed(terminal(item(Value::Null, json!([conflicting]))))
@@ -440,43 +435,8 @@ mod tests {
     }
 
     #[test]
-    fn done_summary_can_move_to_terminal_content_without_duplicate_display() {
-        let done = item(json!([{"type":"summary_text", "text":"same"}]), Value::Null);
-        let terminal_item = item(
-            Value::Null,
-            json!([{"type":"reasoning_text", "text":"same"}]),
-        );
-        let items = assemble(vec![
-            snapshot("added", readable(None, None)),
-            snapshot("done", done.clone()),
-            snapshot("done", done),
-            terminal(terminal_item.clone()),
-        ]);
-        assert_eq!(items[0].blocks.len(), 1);
-        assert_eq!(items[0].blocks[0].id, "summary_0");
-        assert_eq!(items[0].replay.as_ref().unwrap().payload, terminal_item);
-    }
-
-    #[test]
-    fn explicitly_supplied_namespaces_remain_distinct_even_for_equal_text() {
-        let native = item(
-            json!([{"type":"summary_text", "text":"same"}, {"type":"summary_text", "text":"brief"}]),
-            json!([{"type":"reasoning_text", "text":"same"}, {"type":"output_text", "text":"details"}]),
-        );
-        let items = assemble(vec![terminal(native.clone())]);
-        let ids: Vec<_> = items[0]
-            .blocks
-            .iter()
-            .map(|block| block.id.as_str())
-            .collect();
-        assert_eq!(ids, ["summary_0", "content_0", "summary_1", "content_1"]);
-        assert_eq!(items[0].replay.as_ref().unwrap().payload, native);
-    }
-
-    #[test]
     fn migrated_namespace_splits_when_both_namespaces_become_explicit() {
-        for stream_content in [false, true] {
-            let (name, index_key, _) = namespace(stream_content);
+        for content in [false, true] {
             // Equal and distinct text both create a second namespace, at either
             // item.done or terminal; repeated snapshots must stay idempotent.
             for (new_text, split_at_done) in [
@@ -485,16 +445,16 @@ mod tests {
                 ("original", true),
                 ("new namespace", true),
             ] {
-                let (summary, content) = if stream_content {
+                let (summary, text) = if content {
                     (new_text, "original")
                 } else {
                     ("original", new_text)
                 };
-                let native = readable(Some(summary), Some(content));
-                let prior = migrated(stream_content, "original");
+                let native = readable(Some(summary), Some(text));
+                let prior = migrated(content, "original");
                 let mut events = vec![
-                    snapshot("added", readable(None, None)),
-                    event(name, index_key, "delta", json!("original")),
+                    snapshot("added", empty()),
+                    namespace(content),
                     snapshot("done", prior.clone()),
                     snapshot("done", prior),
                 ];
@@ -505,43 +465,28 @@ mod tests {
                     ]);
                 }
                 events.push(terminal(native.clone()));
-                let items = assemble(events);
-                let display: Vec<_> = items[0]
-                    .blocks
-                    .iter()
-                    .map(|block| {
-                        (
-                            block.id.as_str(),
-                            block.content.reasoning_content().unwrap(),
-                        )
-                    })
-                    .collect();
-                assert_eq!(display, [("summary_0", summary), ("content_0", content)]);
-                assert_eq!(items[0].replay.as_ref().unwrap().payload, native);
+                assert_display(
+                    events,
+                    &native,
+                    &[("summary_0", summary), ("content_0", text)],
+                );
             }
-        }
-    }
-
-    #[test]
-    fn splitting_migrated_namespaces_cannot_rewrite_original_streamed_text() {
-        for stream_content in [false, true] {
-            let (name, index_key, _) = namespace(stream_content);
-            let (summary, content) = if stream_content {
+            // Splitting cannot rewrite the original streamed text.
+            let (summary, text) = if content {
                 ("original", "conflicting")
             } else {
                 ("conflicting", "original")
             };
             let mut decoder = Decoder::new("model".into());
-            for value in [
-                snapshot("added", readable(None, None)),
-                event(name, index_key, "delta", json!("original")),
-                snapshot("done", migrated(stream_content, "original")),
-            ] {
-                decoder.feed(value).unwrap();
-            }
+            let events = vec![
+                snapshot("added", empty()),
+                namespace(content),
+                snapshot("done", migrated(content, "original")),
+            ];
+            feed(&mut decoder, events).unwrap();
             assert!(
                 decoder
-                    .feed(terminal(readable(Some(summary), Some(content))))
+                    .feed(terminal(readable(Some(summary), Some(text))))
                     .is_err()
             );
         }
@@ -549,8 +494,7 @@ mod tests {
 
     #[test]
     fn codex_omitted_output_uses_done_plaintext_without_accepting_conflicts() {
-        // Normal terminal snapshots and live text are covered above. Codex may
-        // omit output entirely, but received done text must still agree.
+        // Codex may omit terminal output entirely, but received done text must agree.
         for (content, done_text, valid) in [
             (None, "native", true),
             (Some("native"), "native", true),
@@ -558,20 +502,21 @@ mod tests {
             (None, "changed", false),
         ] {
             let mut decoder = Decoder::codex("model".into());
-            decoder
-                .feed(snapshot("added", readable(None, None)))
-                .unwrap();
-            decoder
-                .feed(event(
-                    "reasoning_text.delta",
-                    "content_index",
-                    "delta",
-                    json!("native"),
-                ))
-                .unwrap();
-            let result = decoder.feed(event("reasoning_text.done", "content_index", "text", json!(done_text)))
-                .and_then(|_| decoder.feed(snapshot("done", readable(None, content))))
-                .and_then(|_| decoder.feed(json!({"type":"response.completed", "response":{"status":"completed", "output":[]}})));
+            let result = feed(
+                &mut decoder,
+                vec![
+                    snapshot("added", empty()),
+                    content_delta("native"),
+                    event(
+                        "reasoning_text.done",
+                        "content_index",
+                        "text",
+                        json!(done_text),
+                    ),
+                    snapshot("done", readable(None, content)),
+                    json!({"type":"response.completed", "response":{"status":"completed", "output":[]}}),
+                ],
+            );
             assert_eq!(
                 result.is_ok(),
                 valid,
@@ -586,34 +531,34 @@ mod tests {
             let old = json!({"type":"reasoning", "id":"r", "summary":[], "encrypted_content":placeholder});
             let final_item = json!({"type":"reasoning", "id":"r", "summary":[], "encrypted_content":"ciphertext"});
             let mut decoder = Decoder::new("gpt-5".into());
-            decoder.feed(snapshot("added", old.clone())).unwrap();
-            decoder.feed(snapshot("done", old)).unwrap();
+            feed(
+                &mut decoder,
+                vec![snapshot("added", old.clone()), snapshot("done", old)],
+            )
+            .unwrap();
             let chunks = decoder.feed(terminal(final_item.clone())).unwrap();
             assert!(chunks.iter().any(|chunk| matches!(chunk,
                 ResponseChunk::ItemEnded { replay: Some(replay), .. } if replay.payload == final_item)));
         }
         let mut old = readable(Some("first"), None);
         old["encrypted_content"] = json!("secret");
-        for final_item in [
-            {
-                let mut v = old.clone();
-                v["encrypted_content"] = json!("different");
-                v
-            },
-            {
-                let mut v = old.clone();
-                v.as_object_mut().unwrap().remove("encrypted_content");
-                v
-            },
-            {
-                let mut v = old.clone();
-                v["summary"][0]["text"] = json!("different");
-                v
-            },
-        ] {
+        let changes: [fn(&mut Value); 3] = [
+            |item| item["encrypted_content"] = json!("different"),
+            |item| drop(item.as_object_mut().unwrap().remove("encrypted_content")),
+            |item| item["summary"][0]["text"] = json!("different"),
+        ];
+        for change in changes {
+            let mut final_item = old.clone();
+            change(&mut final_item);
             let mut decoder = Decoder::new("gpt-5".into());
-            decoder.feed(snapshot("added", old.clone())).unwrap();
-            decoder.feed(snapshot("done", old.clone())).unwrap();
+            feed(
+                &mut decoder,
+                vec![
+                    snapshot("added", old.clone()),
+                    snapshot("done", old.clone()),
+                ],
+            )
+            .unwrap();
             assert!(decoder.feed(terminal(final_item)).is_err());
         }
     }

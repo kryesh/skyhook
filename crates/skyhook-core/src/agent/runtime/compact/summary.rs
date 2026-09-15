@@ -146,11 +146,7 @@ impl SessionRuntime {
 #[cfg(test)]
 mod tests {
     use super::super::tests::*;
-    use crate::{
-        agent::runtime::HarnessError,
-        provider::protocol::{Message, Usage},
-        session::SessionEvent,
-    };
+    use crate::{agent::runtime::HarnessError, provider::protocol::Message, session::SessionEvent};
     use std::{sync::atomic::Ordering, time::Duration};
     use tokio_util::sync::CancellationToken;
 
@@ -173,22 +169,10 @@ mod tests {
                 assert_eq!(summaries.len(), failures + 1);
                 assert!(summaries.windows(2).all(|pair| pair[0] == pair[1]));
                 assert_eq!(counter.load(Ordering::SeqCst), 0);
-                let records = fixture.session.runtime.store.records().await;
-                assert!(
-                    records
-                        .iter()
-                        .any(|record| matches!(record.event, SessionEvent::Compaction { .. }))
-                );
-                assert_eq!(
-                    records
-                        .iter()
-                        .filter(|record| matches!(
-                            record.event,
-                            SessionEvent::ModelRecoveryScheduled { .. }
-                        ))
-                        .count(),
-                    failures
-                );
+                let records = fixture.records().await;
+                assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 1);
+                let retries = count!(&records, SessionEvent::ModelRecoveryScheduled { .. });
+                assert_eq!(retries, failures);
                 fixture.assert_no_tool_execution().await;
                 fixture.session.shutdown().await.unwrap();
             }
@@ -200,10 +184,8 @@ mod tests {
         let fixture = Fixture::new().await;
         fixture.add_history(20_000).await;
         let before = fixture.provider.requests.lock().unwrap().len();
-        fixture
-            .provider
-            .summary_immediate_failures
-            .store(4, Ordering::SeqCst);
+        let failures = &fixture.provider.summary_immediate_failures;
+        failures.store(4, Ordering::SeqCst);
         *fixture.provider.summary.lock().unwrap() = "not a valid continuation".into();
         assert!(fixture.compact(&CancellationToken::new()).await.is_err());
         assert_eq!(fixture.provider.requests.lock().unwrap().len() - before, 7);
@@ -214,55 +196,27 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn observed_usage_is_counted_once_for_each_failed_agent_and_summary_attempt() {
         let fixture = Fixture::new().await;
-        let observed = Usage {
-            input_tokens: 11,
-            cached_input_tokens: 7,
-            output_tokens: 3,
-        };
+        let observed = usage(11, 7, 3);
         *fixture.provider.observed_failure_usage.lock().unwrap() = Some(observed);
-        fixture
-            .provider
-            .agent_stream_failures
-            .store(4, Ordering::SeqCst);
-        assert!(
-            fixture
-                .session
-                .prompt("Preserve failed usage.")
-                .await
-                .is_ok()
-        );
-        assert_eq!(
-            fixture.session.usage().await,
-            Usage {
-                input_tokens: 44,
-                cached_input_tokens: 28,
-                output_tokens: 12
-            }
-        );
+        let provider = &fixture.provider;
+        provider.agent_stream_failures.store(4, Ordering::SeqCst);
+        assert!(fixture.session.prompt("Preserve usage.").await.is_ok());
+        assert_eq!(fixture.session.usage().await, usage(44, 28, 12));
         fixture.add_history(20_000).await;
         let before = fixture.session.usage().await;
-        fixture
-            .provider
-            .summary_stream_failures
-            .store(4, Ordering::SeqCst);
+        provider.summary_stream_failures.store(4, Ordering::SeqCst);
         assert!(fixture.compact(&CancellationToken::new()).await.is_ok());
-        assert_eq!(
-            fixture.session.usage().await,
-            Usage {
-                input_tokens: before.input_tokens + 44,
-                cached_input_tokens: before.cached_input_tokens + 28,
-                output_tokens: before.output_tokens + 12,
-            }
+        let expected = usage(
+            before.input_tokens + 44,
+            before.cached_input_tokens + 28,
+            before.output_tokens + 12,
         );
-        let records = fixture.session.runtime.store.records().await;
-        assert_eq!(
-            records
-                .iter()
-                .filter(|record| matches!(record.event, SessionEvent::ModelFailed { .. }))
-                .count(),
-            8
-        );
-        assert_eq!(records.iter().filter(|record| matches!(record.event, SessionEvent::Usage { usage, .. } if usage == observed)).count(), 8);
+        assert_eq!(fixture.session.usage().await, expected);
+        let records = fixture.records().await;
+        assert_eq!(count!(&records, SessionEvent::ModelFailed { .. }), 8);
+        let observed_usage =
+            count!(&records, SessionEvent::Usage { usage, .. } if *usage == observed);
+        assert_eq!(observed_usage, 8);
         fixture.assert_no_tool_execution().await;
         fixture.session.shutdown().await.unwrap();
     }
@@ -271,54 +225,32 @@ mod tests {
     async fn cancellation_after_four_summary_failures_preserves_history() {
         let fixture = Fixture::new().await;
         fixture.add_history(20_000).await;
-        fixture
-            .provider
-            .summary_stream_failures
-            .store(5, Ordering::SeqCst);
-        let before = crate::session::project_history(
-            &fixture.session.runtime.store.records().await,
-            &fixture.session.root,
-        )
-        .unwrap();
+        let failures = &fixture.provider.summary_stream_failures;
+        failures.store(5, Ordering::SeqCst);
+        let root = &fixture.session.root;
+        let before = crate::session::project_history(&fixture.records().await, root).unwrap();
         let cancellation = CancellationToken::new();
         let mut events = fixture.session.subscribe();
         let (result, ()) = tokio::time::timeout(Duration::from_secs(60), async {
             tokio::join!(fixture.compact(&cancellation), async {
-                let mut retries = 0;
-                loop {
-                    if let crate::agent::runtime::RuntimeEvent::Record(record) =
-                        events.recv().await.unwrap()
-                        && matches!(record.event, SessionEvent::ModelRecoveryScheduled { .. })
+                for _ in 0..4 {
+                    while !matches!(events.recv().await.unwrap(),
+                        crate::agent::runtime::RuntimeEvent::Record(record)
+                            if matches!(record.event, SessionEvent::ModelRecoveryScheduled { .. }))
                     {
-                        retries += 1;
-                        if retries == 4 {
-                            cancellation.cancel();
-                            break;
-                        }
                     }
                 }
+                cancellation.cancel();
             })
         })
         .await
         .unwrap();
         assert!(matches!(result, Err(HarnessError::Interrupted)));
-        assert_eq!(
-            fixture
-                .provider
-                .summary_stream_failures
-                .load(Ordering::SeqCst),
-            1
-        );
-        let records = fixture.session.runtime.store.records().await;
-        assert_eq!(
-            crate::session::project_history(&records, &fixture.session.root).unwrap(),
-            before
-        );
-        assert!(
-            !records
-                .iter()
-                .any(|record| matches!(record.event, SessionEvent::Compaction { .. }))
-        );
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+        let records = fixture.records().await;
+        let found = crate::session::project_history(&records, root).unwrap();
+        assert_eq!(found, before);
+        assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
         fixture.assert_no_tool_execution().await;
         fixture.session.shutdown().await.unwrap();
     }
@@ -327,24 +259,17 @@ mod tests {
     async fn cancellation_journals_observed_usage_once_without_committing_or_executing_tools() {
         for summary in [false, true] {
             let fixture = Fixture::new().await;
-            let runtime = &fixture.session.runtime;
-
-            let observed = Usage {
-                input_tokens: 11,
-                cached_input_tokens: 7,
-                output_tokens: 3,
-            };
+            let observed = usage(11, 7, 3);
             *fixture.provider.observed_failure_usage.lock().unwrap() = Some(observed);
-            fixture
-                .provider
-                .pause_stream_after_usage
-                .store(true, Ordering::SeqCst);
+            let pause = &fixture.provider.pause_stream_after_usage;
+            pause.store(true, Ordering::SeqCst);
+            let started = fixture.provider.started.notified();
             if summary {
                 fixture.add_history(20_000).await;
                 let cancellation = CancellationToken::new();
                 let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
                     tokio::join!(fixture.compact(&cancellation), async {
-                        fixture.provider.started.notified().await;
+                        started.await;
                         cancellation.cancel();
                     })
                 })
@@ -354,7 +279,7 @@ mod tests {
             } else {
                 let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
                     tokio::join!(fixture.session.prompt("Interrupt this turn."), async {
-                        fixture.provider.started.notified().await;
+                        started.await;
                         fixture.session.interrupt().await;
                     })
                 })
@@ -362,28 +287,17 @@ mod tests {
                 .unwrap();
                 assert!(result.is_err());
             }
-            let records = runtime.store.records().await;
-            let requested = records
-                .iter()
-                .rev()
-                .find(|r| matches!(r.event, SessionEvent::ModelRequested { .. }))
-                .unwrap()
-                .sequence;
-            let observed_events: Vec<_> = records
-                .iter()
-                .filter_map(|r| match r.event {
-                    SessionEvent::Usage {
-                        request: Some(request),
-                        usage,
-                    } if request == requested => Some(usage),
-                    _ => None,
-                })
-                .collect();
+            let records = fixture.records().await;
+            let mut requested = records.iter().rev();
+            let requested =
+                requested.find(|r| matches!(r.event, SessionEvent::ModelRequested { .. }));
+            let requested = requested.unwrap().sequence;
+            let observed_events = events!(&records, SessionEvent::Usage { request: Some(request), usage } if *request == requested => *usage);
             assert_eq!(observed_events, vec![observed]);
             assert_eq!(fixture.session.usage().await, observed);
-            assert!(!records.iter().any(|r| matches!(&r.event,
-                SessionEvent::MessageCommitted { message: Message::Assistant(items) }
-                    if items.iter().any(|item| item.id == "interrupted-tool"))));
+            let committed = count!(&records, SessionEvent::MessageCommitted { message: Message::Assistant(items) }
+                if items.iter().any(|item| item.id == "interrupted-tool"));
+            assert_eq!(committed, 0);
             fixture.assert_no_tool_execution().await;
             fixture.session.shutdown().await.unwrap();
         }

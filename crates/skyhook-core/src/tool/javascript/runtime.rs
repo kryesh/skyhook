@@ -11,10 +11,13 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use super::console::ConsoleOutput;
+use super::{
+    bridge::{HostResponse, SourceProvenance},
+    console::ConsoleOutput,
+};
 
 use crate::{
-    media::ImageReference,
+    media::ImageRef,
     tool::executor::ToolExecutor,
     tool::{ToolContext, ToolOutput},
 };
@@ -44,29 +47,48 @@ pub enum JsError {
     InvalidOutput(String),
 }
 
+/// Evaluation errors retain finalized console evidence until the builtin projects
+/// its failure result. This is private artifact ownership, not a public JS error shape.
+#[derive(Debug, Error)]
+#[error("{error}")]
+pub(crate) struct CapturedJsError {
+    pub(crate) error: JsError,
+    pub(crate) console: Option<Box<crate::job::output::CompletedCapture>>,
+}
+
 /// Execute into the owning job's capture; native callers hydrate only when collecting the job.
 pub(crate) async fn evaluate_captured(
     source: String,
     executor: ToolExecutor,
     context: ToolContext,
-) -> Result<ToolOutput, JsError> {
-    let path = context
-        .capture_path("/result/console")
+) -> Result<ToolOutput, CapturedJsError> {
+    let uncaptured = |error| CapturedJsError {
+        error,
+        console: None,
+    };
+    let capture = context
+        .text_capture(crate::job::output::TextCaptureField::Console)
         .await
-        .map_err(|e| JsError::Execution(e.to_string()))?;
-    let console = Arc::new(std::sync::Mutex::new(
-        ConsoleOutput::new(&path).map_err(|e| JsError::Execution(e.to_string()))?,
-    ));
+        .map_err(|error| uncaptured(JsError::Execution(error.to_string())))?;
+    let console = Arc::new(std::sync::Mutex::new(ConsoleOutput::new(capture.open())));
     let result = evaluate_inner(source, executor, context, console.clone()).await;
-    console
+    let console = console
         .lock()
         .expect("console lock poisoned")
         .finish()
-        .map_err(|e| JsError::Execution(e.to_string()))?;
-    result.map(|mut output| {
-        output.value = serde_json::json!({"value": output.value, "console": ""});
-        output
-    })
+        .map_err(|error| uncaptured(JsError::Execution(error.to_string())))?;
+    match result {
+        Ok(mut output) => {
+            let result = super::result::script_output(output.value, None, console);
+            output.value = result.value;
+            output.captures.extend(result.captures);
+            Ok(output)
+        }
+        Err(error) => Err(CapturedJsError {
+            error,
+            console: console.map(Box::new),
+        }),
+    }
 }
 
 async fn evaluate_inner(
@@ -98,7 +120,7 @@ async fn evaluate_inner(
         .build_async(&runtime)
         .await
         .map_err(|error| JsError::Initialization(error.to_string()))?;
-    let surface = Arc::new(executor.surface_for_agent(&context.agent));
+    let surface = Arc::new(executor.surface_for_agent(context.agent()));
     let builders = surface.script_manifests();
     let builders = serde_json::to_string(&builders)
         .map_err(|error| JsError::Initialization(error.to_string()))?;
@@ -114,11 +136,11 @@ async fn evaluate_inner(
         .count()
         + 1;
     let user_line_count = source.lines().count().max(1);
-    let images = Arc::new(Mutex::new(Vec::<ImageReference>::new()));
+    let images = Arc::new(Mutex::new(Vec::<ImageRef>::new()));
     let returned_images = images.clone();
     let cancelled = context.clone();
     let presentation_jobs = executor.jobs().clone();
-    let script_job = context.job;
+    let script_job = context.job();
     let execution = js_context.async_with(async move |js| {
         let sleep_context = context.clone();
         let sleep = Function::new(js.clone(), Async(move |milliseconds: f64| {
@@ -160,78 +182,53 @@ async fn evaluate_inner(
                 async move {
                     let request: HostRequest =
                         serde_json::from_str(&request).map_err(|error| bridge_error(&error))?;
-                    let mut failure_output = None;
-                    let mut denial = None;
-                    let mut source_job = None;
-                    let mut annotations = Default::default();
-                    let result = match request {
+                    let response = match request {
                         HostRequest::Call { name, arguments } => {
-                            let schema = surface.get(&name).and_then(|tool| tool.result_schema.as_ref());
+                            let tool = surface.get(&name);
+                            let schema = tool.and_then(|tool| tool.result_schema.as_ref());
                             match host_executor
                                 .execute_script(
-                                    host_context.agent.clone(),
+                                    host_context.agent().clone(),
                                     &name,
                                     arguments,
-                                    Some(host_context.job),
+                                    Some(host_context.job()),
                                 )
                                 .await
                             {
                                 Ok(result) => {
                                     // Job output queries already return views; background
                                     // calls return handles rather than completed tool data.
-                                    if !result.background && name != "job_output" {
-                                        source_job = Some(result.job);
-                                        if let Some(schema) = schema {
-                                            annotations = crate::job::output::annotated_fields(&result.output.value, schema);
-                                        }
-                                    }
-                                    host_images
-                                        .lock()
-                                        .await
-                                        .extend(result.output.images.iter().cloned());
-                                    Ok(result.output.value)
+                                    let native = tool.is_none_or(|tool| tool.result_policy != crate::tool::ToolResultPolicy::JobView);
+                                    let provenance = (!result.background && native).then(|| SourceProvenance {
+                                        source_job: result.job,
+                                        annotations: schema.map(|schema| crate::job::output::annotated_fields(&result.output.value, schema)).unwrap_or_default(),
+                                    });
+                                    host_images.lock().await.extend(result.output.images);
+                                    HostResponse::Success { value: result.output.value, provenance }
                                 }
                                 Err(error) => {
                                     let failure = error.into_failure();
-                                    denial = failure.denial;
-                                    if let Some(output) = failure.output {
+                                    let output = if let Some(output) = failure.output {
                                         host_images.lock().await.extend(output.images);
-                                        failure_output = Some(output.value);
-                                    }
-                                    Err(failure.message)
+                                        Some(output.value)
+                                    } else { None };
+                                    HostResponse::Failure { message: failure.message, denial: failure.denial, output }
                                 }
                             }
                         }
                         HostRequest::Receive => {
-                            match host_executor.jobs().is_background(host_context.job).await {
-                                Ok(true) => host_context
-                                    .receive()
-                                    .await
-                                    .map_err(|error| error.to_string()),
-                                Ok(false) => Err(
-                                    "receive() requires the script tool to be invoked with bg: true"
-                                        .to_owned(),
-                                ),
+                            let result = match host_executor.jobs().is_background(host_context.job()).await {
+                                Ok(true) => host_context.receive().await.map_err(|error| error.to_string()),
+                                Ok(false) => Err("receive() requires the script tool to be invoked with bg: true".to_owned()),
                                 Err(error) => Err(error.to_string()),
+                            };
+                            match result {
+                                Ok(value) => HostResponse::Success { value, provenance: None },
+                                Err(message) => HostResponse::failure(message),
                             }
                         }
                     };
-                    let mut response = match result {
-                        Ok(value) => serde_json::json!({"ok": true, "value": value}),
-                        Err(error) => serde_json::json!({"ok": false, "error": error}),
-                    };
-                    if let Some(job) = source_job {
-                        response["source_job"] = serde_json::json!(job);
-                        response["annotations"] = serde_json::json!(annotations);
-                    }
-                    if let Some(denial) = denial {
-                        response["code"] = serde_json::json!(denial.code);
-                        response["executed"] = serde_json::json!(denial.executed);
-                    }
-                    if let Some(output) = failure_output {
-                        response["output"] = output;
-                    }
-                    serde_json::to_string(&response).map_err(|error| bridge_error(&error))
+                    response.encode().map_err(|error| bridge_error(&error))
                 }
             }),
         )
@@ -256,27 +253,30 @@ async fn evaluate_inner(
     let encoded = result.map_err(|error| {
         JsError::Execution(map_script_lines(&error, user_start_line, user_line_count))
     })?;
-    let result: Value = serde_json::from_str(&encoded)
+    let envelope: super::outcome::Envelope = serde_json::from_str(&encoded)
         .map_err(|error| JsError::InvalidOutput(error.to_string()))?;
-    if result["ok"] == false {
-        let details = result["error"].clone();
+    if !envelope.ok {
+        let details = envelope.error;
         let message = details.get("message").and_then(Value::as_str).map_or_else(
             || details.to_string(),
-            |message| format!("{message}\n{}", details["stack"].as_str().unwrap_or("")),
+            |message| {
+                format!(
+                    "{message}\n{}",
+                    details.get("stack").and_then(Value::as_str).unwrap_or("")
+                )
+            },
         );
         return Err(JsError::Failure {
             message: map_script_lines(&message, user_start_line, user_line_count),
             details,
         });
     }
-    let value = result["value"].clone();
-    let presentation = serde_json::from_value(result["presentation"].clone())
-        .map_err(|error| JsError::InvalidOutput(error.to_string()))?;
+    let (value, presentation) = (envelope.value, envelope.presentation);
     presentation_jobs
         .save_script_presentation(script_job, presentation)
         .await
         .map_err(|error| JsError::Execution(error.to_string()))?;
-    let mut images = returned_images.lock().await.clone();
+    let mut images = std::mem::take(&mut *returned_images.lock().await);
     images.sort();
     images.dedup();
     Ok(ToolOutput::new(value).with_images(images))
@@ -309,7 +309,7 @@ fn map_script_lines(error: &str, user_start: usize, user_lines: usize) -> String
     output
 }
 
-fn wrapper_script(source: &str, builders: &str) -> String {
+pub(super) fn wrapper_script(source: &str, builders: &str) -> String {
     let runtime = include_str!("runtime.js");
     format!(
         "const __builders = {builders};\n{runtime}\n\
@@ -332,19 +332,27 @@ mod tests {
     use crate::tests::TestRuntime;
     use schemars::JsonSchema;
     use serde::Deserialize;
+    use serde_json::json;
 
     use super::*;
     use crate::tool::{ToolOptions, ToolRegistryBuilder, executor::ToolExecutor};
 
     // Tests may eagerly inspect the console; production hydrates job captures on collection.
     async fn evaluate(
-        source: String,
+        source: impl Into<String>,
         executor: ToolExecutor,
         context: ToolContext,
     ) -> Result<ToolOutput, JsError> {
-        let path = context.capture_path("/result/console").await.unwrap();
-        let mut output = evaluate_captured(source, executor, context).await?;
-        output.value["console"] = Value::String(tokio::fs::read_to_string(path).await.unwrap());
+        let directory = executor.jobs().output_directory(context.job());
+        let path = crate::job::output::field_file(&directory, "/result/console");
+        let captured = evaluate_captured(source.into(), executor, context).await;
+        let mut output = captured.map_err(|captured| captured.error)?;
+        let console = match tokio::fs::read_to_string(path).await {
+            Ok(console) => console,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => panic!("read finalized console: {error}"),
+        };
+        output.value["console"] = Value::String(console);
         Ok(output)
     }
 
@@ -354,75 +362,72 @@ mod tests {
         value: String,
     }
 
-    #[derive(Deserialize, JsonSchema)]
-    #[serde(deny_unknown_fields)]
-    struct NestedScript {
-        source: String,
+    struct TestScope {
+        // Keep startup alive while the test drives evaluation directly.
+        _lease: crate::job::JobLease,
+        _root: tempfile::TempDir,
     }
 
-    async fn test_runtime(
-        builder: ToolRegistryBuilder,
-    ) -> (tempfile::TempDir, ToolExecutor, ToolContext) {
+    async fn test_runtime(builder: ToolRegistryBuilder) -> (TestScope, ToolExecutor, ToolContext) {
         let runtime = TestRuntime::new().await;
-        let agent = runtime.agent.clone();
-        let jobs = runtime.jobs.clone();
-        let lease = jobs
-            .create(crate::job::JobSpec::test(agent.clone(), "script"))
-            .await
-            .unwrap();
+        let spec = crate::job::JobSpec::test(runtime.agent.clone(), "script");
+        let mut lease = runtime.jobs.create(spec).await.unwrap();
         let executor = runtime.executor(builder);
-        let context = ToolContext::new(
-            crate::tool::authorization::AuthorizationSubject {
-                agent,
-                job: lease.id,
-                parent: None,
-                scope: None,
-                capabilities: crate::tool::policy::CapabilitySet::default(),
-                cancellation: lease.cancellation.clone(),
+        let context = runtime.tool_context(&mut lease);
+        (
+            TestScope {
+                _lease: lease,
+                _root: runtime.root,
             },
-            crate::execution::ExecutionLocation::root(runtime.root.path().to_path_buf()),
-            crate::execution::ExecutionLocation::root(runtime.root.path().to_path_buf()),
-            lease.input,
-            jobs.clone(),
-        );
-        (runtime.root, executor, context)
+            executor,
+            context,
+        )
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn sleep_stops_on_script_cancellation() {
-        let (_root, executor, context) = test_runtime(ToolRegistryBuilder::default()).await;
-        let cancellation = context.authorization.cancellation.clone();
-        let started = tokio::time::Instant::now();
-        let (result, ()) = tokio::join!(
-            evaluate(
-                "await sleep(60000); return 'finished';".to_owned(),
-                executor,
-                context
-            ),
-            async {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                cancellation.cancel();
+    /// Evaluates `source` against an executor with no registered tools.
+    async fn plain(source: &str) -> Result<ToolOutput, JsError> {
+        let (_scope, executor, context) = test_runtime(ToolRegistryBuilder::default()).await;
+        evaluate(source, executor, context).await
+    }
+
+    #[tokio::test]
+    async fn local_source_and_sleep_limits_fail_before_user_effects() {
+        let oversized = " ".repeat(MAX_SOURCE_BYTES + 1);
+        assert!(matches!(
+            plain(&oversized).await,
+            Err(JsError::SourceTooLarge)
+        ));
+        let output = plain(
+            r#"
+            const errors = [];
+            for (const milliseconds of [-1, NaN, Infinity, Number.MAX_VALUE]) {
+                try { await sleep(milliseconds); throw new Error("invalid sleep admitted"); }
+                catch (error) { errors.push(String(error).includes("sleep(ms)")); }
             }
-        );
-        assert!(matches!(result, Err(JsError::Cancelled)));
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn unawaited_sleep_does_not_keep_a_script_alive() {
-        let (_root, executor, context) = test_runtime(ToolRegistryBuilder::default()).await;
-        let output = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            evaluate(
-                "sleep(60000); return 'finished';".to_owned(),
-                executor,
-                context,
-            ),
+            await sleep(0);
+            return errors;
+        "#,
         )
         .await
-        .unwrap()
         .unwrap();
-        assert_eq!(output.value["value"], "finished");
+        assert_eq!(output.value["value"], json!([true, true, true, true]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sleep_stops_on_cancellation_and_unawaited_sleep_does_not_keep_a_script_alive() {
+        let (_scope, executor, context) = test_runtime(ToolRegistryBuilder::default()).await;
+        let cancellation = context.cancellation_token();
+        let started = tokio::time::Instant::now();
+        let source = "await sleep(60000); return 'finished';";
+        let (result, ()) = tokio::join!(evaluate(source, executor, context), async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            cancellation.cancel();
+        });
+        assert!(matches!(result, Err(JsError::Cancelled)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let unawaited = plain("sleep(60000); return 'finished';");
+        let output = tokio::time::timeout(std::time::Duration::from_millis(100), unawaited);
+        assert_eq!(output.await.unwrap().unwrap().value["value"], "finished");
     }
 
     #[tokio::test]
@@ -444,101 +449,93 @@ mod tests {
                 }
             })
             .unwrap();
-        let (_root, executor, context) = test_runtime(builder).await;
+        let (_scope, executor, context) = test_runtime(builder).await;
         // Two equivalent builders must execute independently; reusing one must not execute again.
+        let source = "const x=tool.echo({value:'a'}); return [x,x,tool.echo({value:'a'})];";
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            evaluate(
-                "const x=tool.echo({value:'a'}); return [x,x,tool.echo({value:'a'})];".to_owned(),
-                executor,
-                context,
-            ),
-        )
-        .await
-        .expect("independent builders did not run concurrently")
-        .unwrap();
-        assert_eq!(output.value["value"], serde_json::json!(["a", "a", "a"]));
+            evaluate(source, executor, context),
+        );
+        let output = output
+            .await
+            .expect("independent builders did not run concurrently")
+            .unwrap();
+        assert_eq!(output.value["value"], json!(["a", "a", "a"]));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    /// The script tool is hidden and rejected inside scripts, and denied
+    /// operations keep their metadata in exceptions and uncaught details.
     #[tokio::test]
-    async fn script_tool_is_hidden_and_rejected_inside_scripts() {
+    async fn hidden_script_tool_and_denials_surface_structured_failures() {
+        #[derive(Deserialize, JsonSchema)]
+        struct NestedScript {
+            source: String,
+        }
         let mut builder = ToolRegistryBuilder::default();
         builder
             .register::<NestedScript, Value, _, _>(
                 "script",
                 "script",
                 ToolOptions::default().script_unavailable(),
-                |_context, input| async move { Ok(serde_json::json!({"source": input.source})) },
+                |_context, input| async move { Ok(json!({"source": input.source})) },
+            )
+            .unwrap()
+            .register::<Echo, String, _, _>(
+                "deny",
+                "test denial",
+                ToolOptions::default(),
+                |_, _| async { Err(crate::tool::ToolError::Denied("user reason".to_owned())) },
             )
             .unwrap();
-        let (_root, executor, context) = test_runtime(builder).await;
-        let output = evaluate(
-            r#"
+        let (_scope, executor, context) = test_runtime(builder).await;
+        let source = r#"
 const direct = JSON.parse(await __skyhookHostCall(JSON.stringify({
   type: "call",
   name: "script",
   arguments: {source: "return null;"},
 })));
-return {visible: typeof tool.script, direct};
-"#
-            .to_owned(),
-            executor,
-            context,
-        )
-        .await
-        .unwrap();
-        assert_eq!(output.value["value"]["visible"], "undefined");
-        assert_eq!(output.value["value"]["direct"]["ok"], false);
+let denied;
+try { await tool.deny({value:"x"}); } catch (error) { denied = {code:error.code, executed:error.executed, message:error.message}; }
+return {visible: typeof tool.script, direct, denied};
+"#;
+        let output = evaluate(source, executor.clone(), context.clone())
+            .await
+            .unwrap();
+        let value = &output.value["value"];
+        assert_eq!(value["visible"], "undefined");
+        assert_eq!(value["direct"]["ok"], false);
         assert!(
-            output.value["value"]["direct"]["error"]
+            value["direct"]["error"]
                 .as_str()
                 .unwrap()
                 .contains("not available in scripts")
         );
-    }
-
-    #[tokio::test]
-    async fn denied_operations_keep_metadata_in_exceptions_and_uncaught_details() {
-        let mut builder = ToolRegistryBuilder::default();
-        builder
-            .register::<Echo, String, _, _>(
-                "deny",
-                "test denial",
-                ToolOptions::default(),
-                |_context, _input| async {
-                    Err(crate::tool::ToolError::Denied("user reason".to_owned()))
-                },
-            )
-            .unwrap();
-        let (_root, executor, context) = test_runtime(builder).await;
-        let caught = evaluate(r#"try { await tool.deny({value:"x"}); } catch (error) { return {code:error.code, executed:error.executed, message:error.message}; }"#.to_owned(), executor.clone(), context.clone()).await.unwrap();
-        assert_eq!(caught.value["value"]["code"], "permission_denied");
-        assert_eq!(caught.value["value"]["executed"], false);
+        assert_eq!(
+            (&value["denied"]["code"], &value["denied"]["executed"]),
+            (&json!("permission_denied"), &json!(false))
+        );
         assert!(
-            caught.value["value"]["message"]
+            value["denied"]["message"]
                 .as_str()
                 .unwrap()
                 .contains("user reason")
         );
-        let error = evaluate(
-            "await tool.deny({value:'x'});".to_owned(),
-            executor,
-            context,
-        )
-        .await
-        .unwrap_err();
+        let error = evaluate("await tool.deny({value:'x'});", executor, context)
+            .await
+            .unwrap_err();
         let JsError::Failure { details, .. } = error else {
             panic!("expected nested failure details")
         };
-        assert_eq!(details["code"], "permission_denied");
-        assert_eq!(details["executed"], false);
+        assert_eq!(
+            (&details["code"], &details["executed"]),
+            (&json!("permission_denied"), &json!(false))
+        );
     }
 
     #[tokio::test]
-    async fn work_pool_accepts_native_arrays() {
-        let (_root, executor, context) = test_runtime(ToolRegistryBuilder::default()).await;
-        let output = evaluate(
+    async fn work_pool_accepts_native_arrays_completion_order_and_early_close() {
+        let output = plain(
             r#"
 const values = [2, 3];
 const pooled = [], settled = [];
@@ -549,28 +546,19 @@ const tasks = values.map(value => async () => {
 });
 for await (const result of new WorkPool(2).run(tasks)) settled.push(result);
 return {values, pooled, settled};
-"#
-            .to_owned(),
-            executor,
-            context,
+"#,
         )
         .await
         .unwrap();
-        assert_eq!(output.value["value"]["values"], serde_json::json!([2, 3]));
         assert_eq!(
-            output.value["value"]["pooled"],
-            serde_json::json!([{ "index":0, "value":4 }, { "index":1, "value":6 }])
+            output.value["value"],
+            json!({
+                "values": [2, 3],
+                "pooled": [{ "index":0, "value":4 }, { "index":1, "value":6 }],
+                "settled": [{"index":0,"value":6}]
+            })
         );
-        assert_eq!(
-            output.value["value"]["settled"],
-            serde_json::json!([{"index":0,"value":6}])
-        );
-    }
-
-    #[tokio::test]
-    async fn work_pool_completion_order_and_early_close() {
-        let (_root, executor, context) = test_runtime(ToolRegistryBuilder::default()).await;
-        let output = evaluate(
+        let output = plain(
             r#"
 const gates = Array.from({length:4}, () => {
   let resolve; const promise = new Promise(done => { resolve = done; });
@@ -589,21 +577,16 @@ const second = await next;
 const closing = iterator.return(); gates[0].resolve("fail");
 await closing;
 return {first, second, started};
-"#
-            .to_owned(),
-            executor,
-            context,
+"#,
         )
         .await
         .unwrap();
-        assert_eq!(output.value["value"]["first"]["value"]["index"], 1);
-        assert_eq!(output.value["value"]["second"]["value"]["index"], 2);
+        let value = &output.value["value"];
+        assert_eq!(value["first"]["value"]["index"], 1);
+        assert_eq!(value["second"]["value"]["index"], 2);
+        assert_eq!(value["started"], json!([0, 1, 2]));
         assert_eq!(
-            output.value["value"]["started"],
-            serde_json::json!([0, 1, 2])
-        );
-        assert_eq!(
-            output.value["console"].as_str().unwrap(),
+            output.value["console"],
             "WorkPool item 0 failed: late failure\n"
         );
     }
@@ -616,32 +599,26 @@ return {first, second, started};
         crate::tool::builtins::install_script_tool(&mut builder, Arc::downgrade(&slot)).unwrap();
         let executor = runtime.executor(builder);
         slot.set(executor.clone()).ok().unwrap();
-        for source in [
-            "console.log('before error'); throw new Error('boom');",
-            "console.log('before error'); return {nested:undefined};",
+        for (source, expected) in [
+            (
+                "console.log('before error'); throw new Error('boom');",
+                "boom",
+            ),
+            (
+                "console.log('before error'); return {nested:undefined};",
+                "undefined at $.nested",
+            ),
         ] {
-            let error = executor
-                .execute(
-                    runtime.agent.clone(),
-                    "script",
-                    serde_json::json!({"source": source}),
-                    None,
-                )
-                .await
-                .unwrap_err();
+            let error = executor.run_host(&runtime.agent, "script", json!({"source": source}));
             let crate::tool::executor::ExecutionError::Failed {
                 message,
                 output: Some(output),
-            } = error
+            } = error.await.unwrap_err()
             else {
                 panic!("expected script failure with captured output");
             };
             assert_eq!(output.value["console"], "before error\n");
-            assert!(message.contains(if source.contains("boom") {
-                "boom"
-            } else {
-                "undefined at $.nested"
-            }));
+            assert!(message.contains(expected));
         }
     }
 }

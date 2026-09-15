@@ -85,6 +85,17 @@ impl SessionHandle {
             .await
     }
 
+    /// Inspect output and hydrate eligible automatic capture text.
+    pub async fn inspect_output_with_captures(
+        &self,
+        query: crate::job::JobOutputQuery,
+    ) -> Result<crate::job::PresentedOutput, crate::tool::ToolError> {
+        self.runtime
+            .jobs
+            .inspect_output_with_captures(query, &self.runtime.harness.capabilities)
+            .await
+    }
+
     /// Selectable saved-output pointers, unaffected by presentation-only wrappers.
     pub async fn inspect_output_fields(
         &self,
@@ -134,7 +145,7 @@ impl SessionHandle {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .filter(|(_, agent)| agent.retryable_interrupt.load(Ordering::Acquire))
+            .filter(|(_, agent)| agent.control.retryable_interrupt.load(Ordering::Acquire))
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         self.runtime
@@ -186,155 +197,52 @@ impl SessionHandle {
         Ok(result.output)
     }
 
-    pub async fn prompt_with_images(
-        &self,
-        text: impl Into<String>,
-        paths: &[PathBuf],
-    ) -> Result<String, HarnessError> {
-        self.prompt_with_options(text, paths, PromptOptions::default())
-            .await
-    }
-
     /// Submit a user message and wait for the resulting turn to finish.
     /// Explicit request-boundary enqueues may change the model during that turn.
     pub async fn prompt_with_options(
         &self,
         text: impl Into<String>,
-        paths: &[PathBuf],
+        attachments: &[crate::media::Attachment],
         options: PromptOptions,
     ) -> Result<String, HarnessError> {
-        let content = self.prepare_prompt(text.into(), paths, &options).await?;
+        let content = self
+            .prepare_prompt(text.into(), attachments, &options)
+            .await?;
         self.submit(content, options.model).await
     }
 
-    /// Queue a message for the next safe model-request boundary, including while a
-    /// request or tool is running. Images and the selected model are captured at
-    /// submission. Returns after history commit, NOT after the model finishes.
-    ///
-    /// Retain a clone of `token` to cancel an unclaimed submission. A successful
-    /// cancellation guarantees that its message will not enter history. Cancelled
-    /// submissions return [`HarnessError::Interrupted`]. Once claimed, await this
-    /// receipt before editing or retrying the message. A dropped receipt does not
-    /// cancel the input. Errors mean the user message was not committed.
-    ///
-    /// Concurrent preparations are serialized in polling order. All available
-    /// messages are committed FIFO before compaction and the next provider request;
-    /// the last explicit model selection governs that request. Ordinary `prompt`
-    /// calls retain their turn-completion semantics.
-    pub async fn enqueue_prompt_with_options(
-        &self,
-        text: impl Into<String>,
-        paths: &[PathBuf],
-        options: PromptOptions,
-        token: QueuedPromptToken,
-    ) -> Result<(), HarnessError> {
-        self.enqueue_prompts_with_options(vec![QueuedPrompt {
-            text: text.into(),
-            paths: paths.to_vec(),
-            options,
-            token,
-        }])
-        .await
-        .pop()
-        .expect("one queued prompt has one receipt")
-    }
-
-    /// Prepare and enqueue a group atomically at a model-request boundary.
-    /// Results correspond to input order and acknowledge history commits, not
-    /// turn completion. Invalid or cancelled items do not prevent the remaining
-    /// items from committing FIFO. The whole group is prepared before it becomes
-    /// visible to the runtime, even when preparing attachments yields.
-    pub async fn enqueue_prompts_with_options(
-        &self,
-        inputs: Vec<QueuedPrompt>,
-    ) -> Vec<Result<(), HarnessError>> {
-        let preparation = self.enqueue_preparation.lock().await;
-        let mut batch = Vec::with_capacity(inputs.len());
-        let mut receipts = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            if input.token.is_cancelled() {
-                receipts.push(Err(HarnessError::Interrupted));
-                continue;
-            }
-            match self
-                .prepare_prompt(input.text, &input.paths, &input.options)
-                .await
-            {
-                Ok(content) => {
-                    let (committed, receipt) = oneshot::channel();
-                    batch.push(queue::QueuedInput {
-                        content,
-                        model: input.options.model,
-                        token: input.token,
-                        committed,
-                    });
-                    receipts.push(Ok(receipt));
-                }
-                Err(error) => receipts.push(Err(error)),
-            }
-        }
-        if !batch.is_empty()
-            && !self
-                .runtime
-                .shutting_down
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
-            // A failed send drops every sender, resolving each receipt as stopped.
-            let _ = self.root_tx.send(AgentCommand::QueuedInputs(batch)).await;
-        } else {
-            drop(batch);
-        }
-        drop(preparation);
-        let mut results = Vec::with_capacity(receipts.len());
-        for receipt in receipts {
-            results.push(match receipt {
-                Ok(receipt) => receipt.await.unwrap_or(Err(HarnessError::AgentStopped)),
-                Err(error) => Err(error),
-            });
-        }
-        results
-    }
-
-    async fn prepare_prompt(
+    pub(super) async fn prepare_prompt(
         &self,
         text: String,
-        paths: &[PathBuf],
+        attachments: &[crate::media::Attachment],
         options: &PromptOptions,
     ) -> Result<Vec<UserContent>, HarnessError> {
+        use crate::media::Attachment;
         if let Some(model) = &options.model
             && !self.runtime.harness.model_profiles.contains_key(model)
         {
             return Err(HarnessError::UnknownModelProfile(model.clone()));
         }
-        if paths.len() > MAX_IMAGES_PER_SUBMISSION {
-            return Err(HarnessError::ImageLimit);
+        // Check every limit before storing any blob.
+        let mut images = 0;
+        let mut total = 0_u64;
+        for attachment in attachments {
+            if let Attachment::Image { image, .. } = attachment {
+                let bytes = image.bytes().len() as u64;
+                images += 1;
+                total = total.saturating_add(bytes);
+                if bytes > MAX_IMAGE_BYTES
+                    || images > MAX_IMAGES_PER_SUBMISSION
+                    || total > MAX_IMAGE_BYTES_PER_SUBMISSION
+                {
+                    return Err(HarnessError::ImageLimit);
+                }
+            }
         }
         let mut content = vec![UserContent::Text { text }];
-        let mut total = 0_u64;
-        for path in paths {
-            let absolute = contained_path(&self.runtime.harness.workspace, path).await?;
-            let bytes = fs::read(&absolute).await?;
-            let length = u64::try_from(bytes.len()).map_err(|_| HarnessError::ImageLimit)?;
-            if length > MAX_IMAGE_BYTES {
-                return Err(HarnessError::ImageLimit);
-            }
-            total = total.saturating_add(length);
-            if total > MAX_IMAGE_BYTES_PER_SUBMISSION {
-                return Err(HarnessError::ImageLimit);
-            }
-            let media_type = image_media_type(&absolute).ok_or(HarnessError::UnsupportedImage)?;
-            let image = self
-                .runtime
-                .store
-                .import_blob(
-                    &bytes,
-                    absolute
-                        .file_name()
-                        .map_or_else(|| "image".to_owned(), |name| name.to_string_lossy().into()),
-                    media_type.to_owned(),
-                )
-                .await?;
-            content.push(UserContent::Image { image });
+        for attachment in attachments {
+            let attachment = self.runtime.store.store_attachment(attachment).await?;
+            content.push(UserContent::Attachment { attachment });
         }
         Ok(content)
     }
@@ -356,14 +264,24 @@ impl SessionHandle {
         done_rx
             .await
             .map_err(|_| HarnessError::AgentStopped)?
-            .map_err(HarnessError::Agent)
+            .map_err(|failure| HarnessError::Agent(failure.to_string()))
     }
 
+    /// Stop runtime producers and drain their accepted work. The journal stays
+    /// open so a host can record its final status after observing shutdown errors.
+    /// Await that status append before dropping the session/store owner.
     pub async fn shutdown(&self) -> Result<(), HarnessError> {
         self.runtime
             .shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
+        // Wake provider-held mailbox consumers before waiting for intake: a
+        // bounded mailbox send may currently hold the admission gate.
         self.runtime.interrupt_tree(&self.root).await;
+        // Passing through the gate once is the admission barrier: an operation
+        // already holding it finishes its send or write, and every later one
+        // observes `shutting_down`. Holding it any longer would stall abandon,
+        // acknowledgement and reclaim for the whole drain.
+        drop(self.runtime.queue_state.gate.lock().await);
         // Completed children retain idle loops for resumption, and must also stop.
         let senders = self
             .runtime
@@ -385,6 +303,8 @@ impl SessionHandle {
         self.runtime.jobs.cancel_and_drain().await?;
         self.runtime.mcp.shutdown().await;
         self.runtime.router.shutdown().await;
+        self.runtime.jobs.drain_creations().await;
+        self.runtime.store.drain().await?;
         Ok(())
     }
 
@@ -395,152 +315,83 @@ impl SessionHandle {
     }
 }
 
-async fn contained_path(workspace: &Path, requested: &Path) -> Result<PathBuf, HarnessError> {
-    let candidate = if requested.is_absolute() {
-        requested.to_path_buf()
-    } else {
-        workspace.join(requested)
-    };
-    let canonical = fs::canonicalize(candidate).await?;
-    if !canonical.starts_with(workspace) {
-        return Err(HarnessError::OutsideWorkspace);
-    }
-    Ok(canonical)
-}
-
-fn image_media_type(path: &Path) -> Option<&'static str> {
-    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::TodoStatus;
     use crate::agent::runtime::tests::*;
 
     #[tokio::test]
-    async fn compaction_resume_restores_todos_and_the_first_provider_request() {
-        use crate::agent::TodoStatus;
+    async fn shutdown_drains_before_final_host_status_without_closing_journal() {
+        let (root, _, session) = scripted_session([]).await;
+        let result = session.run_script("console.log('completed'); return 42;");
+        assert_eq!(result.await.unwrap().value["value"], 42);
+        session.shutdown().await.unwrap();
+        // Hosts record final status after shutdown so drain errors are not hidden.
+        let status = session.record_status(session.root.clone(), "Completed".into());
+        status.await.unwrap();
+        let sessions = root.path().join("sessions");
+        let durable = SessionStore::read_records(&sessions, session.id()).await;
+        let durable = durable.unwrap();
+        assert!(matches!(&durable.last().unwrap().event,
+            SessionEvent::Status { message } if message == "Completed"));
+        assert_eq!(session.runtime.store.records().await, durable);
+    }
 
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
+    #[tokio::test]
+    async fn compaction_resume_restores_todos_and_the_first_provider_request() {
+        let root = tempfile::tempdir().unwrap();
+        let requests = Requests::default();
         let reconciled = vec![
-            TodoItem {
-                text: "Inspect queue".into(),
-                status: TodoStatus::Completed,
-            },
-            TodoItem {
-                text: "Verify queue fix".into(),
-                status: TodoStatus::Pending,
-            },
+            todo("Inspect queue", TodoStatus::Completed),
+            todo("Verify queue fix", TodoStatus::Pending),
         ];
-        let summary = json!({
-            "objective":"Preserve the queue investigation", "user_instructions":[],
-            "session_rules":[], "plan":["Verify the queue fix"], "findings":[],
-            "open_issues":[], "running_work":[], "completed_work":[], "decisions":[],
-            "recovery_details":[], "jobs":[], "additional_context":[],
-            "todo_reconciliation":["Inspection finished"], "todos":reconciled,
-            "resumption_point":"Run the focused verification", "next_actions":[]
-        });
+        let mut summary = summary_json();
+        summary["todo_reconciliation"] = json!(["Inspection finished"]);
+        summary["todos"] = json!(reconciled);
         let mut completed = answer("checkpoint installed");
-        completed.insert(
-            completed.len() - 1,
-            ResponseChunk::UsageUpdated {
-                usage: Usage {
-                    input_tokens: 48_000,
-                    cached_input_tokens: 2_000,
-                    output_tokens: 1_200,
-                },
-            },
-        );
-        let harness = test_builder(
-            workspace.path(),
-            sessions.path(),
-            scripted_provider(
-                &requests,
-                [completed, answer(summary.to_string()), answer("resumed")],
-            ),
-        )
-        .model_profile(
-            "test",
-            ModelProfile {
-                provider: "test".into(),
-                model: "test".into(),
-                reasoning: None,
-                max_context: 64_000,
-                max_output: 4096,
-                supports_images: false,
-            },
-        )
-        .build()
-        .await
-        .unwrap();
+        let usage = Usage {
+            input_tokens: 48_000,
+            cached_input_tokens: 2_000,
+            output_tokens: 1_200,
+        };
+        completed.insert(completed.len() - 1, ResponseChunk::UsageUpdated { usage });
+        let responses = [completed, answer(summary.to_string()), answer("resumed")];
+        let provider = scripted_provider(&requests, responses);
+        let profile = ModelProfile::new("test", "test", None, 64_000, 4096, false);
+        let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
+            .model_profile("test", profile)
+            .build()
+            .await
+            .unwrap();
         let session = harness.new_session().await.unwrap();
-        session
-            .runtime
-            .todos
-            .replace(
-                &session.root,
-                vec![TodoItem {
-                    text: "Inspect queue".into(),
-                    status: TodoStatus::InProgress,
-                }],
-            )
-            .await
-            .unwrap();
+        let todos = &session.runtime.todos;
+        let root_todos = vec![todo("Inspect queue", TodoStatus::InProgress)];
+        todos.replace(&session.root, root_todos).await.unwrap();
         let child = session.root.child(1);
-        let child_todos = vec![TodoItem {
-            text: "Independent child work".into(),
-            status: TodoStatus::InProgress,
-        }];
+        let child_todos = vec![todo("Independent child work", TodoStatus::InProgress)];
+        todos.replace(&child, child_todos.clone()).await.unwrap();
+        // Exceed the retention tail; only the high-usage response triggers the checkpoint.
+        let history = AssistantContent::text("history", 0, "research ".repeat(40_000));
+        let history = Message::Assistant(vec![history]);
         session
             .runtime
-            .todos
-            .replace(&child, child_todos.clone())
+            .commit(&session.root, history)
             .await
             .unwrap();
-        // Exceed the verbatim retention tail so the high-usage final response
-        // can install a checkpoint. History size alone must not trigger it.
-        session
-            .runtime
-            .commit(
-                &session.root,
-                Message::Assistant(vec![AssistantContent::text(
-                    "history",
-                    0,
-                    "research ".repeat(40_000),
-                )]),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            session.prompt("Compact this investigation.").await.unwrap(),
-            "checkpoint installed"
-        );
-        let checkpoint = session
-            .runtime
-            .store
-            .records()
-            .await
-            .into_iter()
-            .find_map(|record| match record.event {
-                SessionEvent::Compaction { checkpoint } => Some(checkpoint),
-                _ => None,
-            })
-            .expect("the real turn installed a checkpoint");
+        let answer = session.prompt("Compact this investigation.").await.unwrap();
+        assert_eq!(answer, "checkpoint installed");
+        let records = session.runtime.store.records().await;
+        let checkpoints =
+            events!(records, SessionEvent::Compaction { checkpoint } => checkpoint.clone());
+        let checkpoint = checkpoints.into_iter().next().unwrap();
         assert_eq!(checkpoint.todos, reconciled);
         let prior_request = {
             let captured = requests.lock().unwrap();
             assert_eq!(captured.len(), 2);
             assert!(captured[0].response_schema.is_none());
             assert!(captured[1].response_schema.is_some());
-            assert!(captured[1].messages.iter().any(|message| matches!(message,
+            assert!(captured[1].messages().any(|message| matches!(message,
                 Message::Assistant(items) if items == &vec![AssistantContent::text("answer", 0, "checkpoint installed")])));
             captured[0].clone()
         };
@@ -548,45 +399,22 @@ mod tests {
         shutdown_session(session).await;
 
         let resumed = harness.resume_session(id).await.unwrap();
-        assert_eq!(
-            resumed
-                .runtime
-                .todos
-                .inspect(&resumed.root, None)
-                .await
-                .unwrap()
-                .items,
-            reconciled
-        );
-        assert_eq!(
-            resumed
-                .runtime
-                .todos
-                .inspect(&child, None)
-                .await
-                .unwrap()
-                .items,
-            child_todos
-        );
-        assert_eq!(
-            resumed
-                .prompt("Continue the preserved task.")
-                .await
-                .unwrap(),
-            "resumed"
-        );
+        let todos = &resumed.runtime.todos;
+        let found = todos.inspect(&resumed.root, None).await.unwrap().items;
+        assert_eq!(found, reconciled);
+        let found = todos.inspect(&child, None).await.unwrap().items;
+        assert_eq!(found, child_todos);
+        assert_eq!(resumed.prompt("Continue.").await.unwrap(), "resumed");
         {
             let captured = requests.lock().unwrap();
             assert_eq!(captured.len(), 3, "exactly one resumed provider invocation");
             let first = &captured[2];
-            assert_eq!(first.messages.first(), Some(&checkpoint.message));
+            assert_eq!(first.history.first(), Some(&checkpoint.message));
             assert_eq!(first.system, prior_request.system);
             assert_eq!(first.tools, prior_request.tools);
             assert_eq!(first.model, prior_request.model);
-            assert!(
-                first.response_schema.is_none(),
-                "do not leak the summary schema"
-            );
+            // do not leak the summary schema
+            assert!(first.response_schema.is_none());
             let runtime = request_runtime_state(first);
             assert!(runtime.contains("Inspect queue") && runtime.contains("completed"));
             assert!(runtime.contains("Verify queue fix") && runtime.contains("pending"));
@@ -596,137 +424,78 @@ mod tests {
 
     #[tokio::test]
     async fn switching_models_preserves_image_history_and_reports_unsupported_images() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let image = workspace.path().join("sample.png");
-        fs::write(&image, b"image fixture").await.unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
-        let provider = scripted_provider(
-            &requests,
-            [
-                response(vec![AssistantContent::text("answer", 0, "Image received")]),
-                response(vec![AssistantContent::text(
-                    "answer",
-                    0,
-                    "Image still present",
-                )]),
-            ],
-        );
-        let harness = test_builder(workspace.path(), sessions.path(), provider)
-            .model_profile(
-                "vision",
-                ModelProfile {
-                    provider: "test".into(),
-                    model: "vision-model".into(),
-                    reasoning: None,
-                    max_context: 128_000,
-                    max_output: 4096,
-                    supports_images: true,
-                },
-            )
+        let root = tempfile::tempdir().unwrap();
+        let image = crate::media::Attachment::Image {
+            file: Some(root.path().join("sample.png")),
+            image: crate::tests::png(b"image fixture"),
+        };
+        let requests = Requests::default();
+        let responses = [answer("Image received"), answer("Image still present")];
+        let provider = scripted_provider(&requests, responses);
+        let vision = ModelProfile::new("test", "vision-model", None, 128_000, 4096, true);
+        let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
+            .model_profile("vision", vision)
             .build()
             .await
             .unwrap();
         let session = harness.new_session().await.unwrap();
         let before = session.runtime.store.records().await.len();
-        assert!(
-            session
-                .prompt_with_options(
-                    "Missing image",
-                    &[workspace.path().join("missing.png")],
-                    PromptOptions {
-                        model: Some("vision".into())
-                    }
-                )
-                .await
-                .is_err()
-        );
+        let oversized = crate::media::Attachment::Image {
+            file: None,
+            image: crate::tests::png(&vec![0; MAX_IMAGE_BYTES as usize]),
+        };
+        let oversized = [oversized];
+        let rejected = session.prompt_with_options("Oversized image", &oversized, model("vision"));
+        assert!(matches!(rejected.await, Err(HarnessError::ImageLimit)));
         assert_eq!(session.runtime.store.records().await.len(), before);
-        session
-            .prompt_with_options(
-                "Look at this",
-                &[image],
-                PromptOptions {
-                    model: Some("vision".into()),
-                },
-            )
-            .await
-            .unwrap();
-        let error = session
-            .prompt_with_options(
-                "Keep going",
-                &[],
-                PromptOptions {
-                    model: Some("test".into()),
-                },
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("does not support image"),
-            "{error}"
-        );
+        let images = [image];
+        let with_image = session.prompt_with_options("Look at this", &images, model("vision"));
+        with_image.await.unwrap();
+        let error = session.prompt_with_options("Go on", &[], model("test"));
+        let error = error.await.unwrap_err().to_string();
+        assert!(error.contains("does not support image"), "{error}");
         assert_eq!(requests.lock().unwrap().len(), 1);
-        session
-            .prompt_with_options(
-                "Use vision again",
-                &[],
-                PromptOptions {
-                    model: Some("vision".into()),
-                },
-            )
-            .await
-            .unwrap();
-        {
-            let requests = requests.lock().unwrap();
-            assert!(contains_images(&requests[1].messages));
-        }
+        let again = session.prompt_with_options("Use vision again", &[], model("vision"));
+        again.await.unwrap();
+        assert!(contains_images(&requests.lock().unwrap()[1].history));
         session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn continuing_interrupted_turn_retains_input_once_and_shutdown_is_idempotent() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            Arc::new(BlockingFirstProvider {
-                calls: Arc::new(AtomicUsize::new(0)),
-                requests: requests.clone(),
-                release: Arc::new(tokio::sync::Semaphore::new(0)),
-            }),
-        )
-        .await;
+        let root = tempfile::tempdir().unwrap();
+        let requests = Requests::default();
+        let provider = Arc::new(BlockingFirstProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            requests: requests.clone(),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        });
+        let harness = test_harness(root.path(), &root.path().join("sessions"), provider).await;
         let session = harness.new_session().await.unwrap();
         let task = tokio::spawn({
             let session = session.clone();
             async move { session.prompt("retained input").await }
         });
-        tokio::time::timeout(Duration::from_secs(2), async {
+        bounded(async {
             while requests.lock().unwrap().is_empty() {
                 tokio::task::yield_now().await;
             }
         })
-        .await
-        .unwrap();
+        .await;
         session.interrupt().await;
         assert!(task.await.unwrap().is_err());
-        session
-            .record_status(session.root.clone(), "Interrupted".into())
-            .await
-            .unwrap();
+        let status = session.record_status(session.root.clone(), "Interrupted".into());
+        status.await.unwrap();
         assert_eq!(session.continue_turn().await.unwrap(), "jobs handled");
         let records = session.runtime.store.records().await;
-        assert_eq!(records.iter().filter(|record| matches!(&record.event,
-            SessionEvent::MessageCommitted { message: Message::User(blocks) }
-                if blocks.iter().any(|block| matches!(block, UserContent::Text { text } if text == "retained input"))
-        )).count(), 1);
-        assert!(records.iter().any(|record| matches!(&record.event, SessionEvent::Status { message } if message == "Interrupted")));
+        let retained = count!(&records, SessionEvent::MessageCommitted { message: Message::User(blocks) }
+            if blocks.iter().any(|block| matches!(block, UserContent::Text { text } if text == "retained input")));
+        let interrupted =
+            count!(&records, SessionEvent::Status { message } if message == "Interrupted");
+        assert_eq!((retained, interrupted), (1, 1));
         let captured = requests.lock().unwrap().clone();
         assert_eq!(captured.len(), 2);
-        assert_eq!(captured[0].messages, captured[1].messages);
+        assert!(captured[0].messages().eq(captured[1].messages()));
         session.shutdown().await.unwrap();
         tokio::task::yield_now().await;
         session.shutdown().await.unwrap();
@@ -734,17 +503,19 @@ mod tests {
 
     #[tokio::test]
     async fn script_messages_preserve_order_across_calls_and_cancel_waiting_receivers() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let harness =
-            test_harness(workspace.path(), sessions.path(), Arc::new(HangingProvider)).await;
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, Arc::new(HangingProvider)).await;
         let session = harness.new_session().await.unwrap();
-        let running = session.runtime.executor.execute(
-            session.root.clone(), "script",
-            json!({"source": "const messages=[]; for(let i=0;i<4;i++) messages.push(await receive()); return {messages, notifyType:typeof notify};", "bg":true}),
-            None,
-        ).await.unwrap();
-        let id = running.job.get();
+        let executor = &session.runtime.executor;
+        let jobs = &session.runtime.jobs;
+        let background = async |source: &str| {
+            let arguments = json!({"source": source, "bg":true});
+            let running = executor.execute(session.root.clone(), "script", arguments, None);
+            running.await.unwrap().job
+        };
+        let running = background("const messages=[]; for(let i=0;i<4;i++) messages.push(await receive()); return {messages, notifyType:typeof notify};").await;
+        let id = running.get();
         let queued = session
             .run_script(format!(
                 r#"
@@ -758,25 +529,14 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(
-            queued.value["value"]["accepted"],
-            json!(vec![json!({"accepted":true}); 3])
-        );
+        let accepted = json!(vec![json!({"accepted":true}); 3]);
+        assert_eq!(queued.value["value"]["accepted"], accepted);
         assert_eq!(queued.value["value"]["state"], "running");
-        session
-            .run_script(format!("return tool.job({id}).send({{value:\"last\"}});"))
-            .await
-            .unwrap();
-        session
-            .runtime
-            .jobs
-            .wait(running.job, None, true)
-            .await
-            .unwrap();
-        let completed = session
-            .run_script(format!("return tool.job({id}).output();"))
-            .await
-            .unwrap();
+        let last = format!("return tool.job({id}).send({{value:\"last\"}});");
+        session.run_script(last).await.unwrap();
+        jobs.wait(running, None, true).await.unwrap();
+        let output = format!("return tool.job({id}).output();");
+        let completed = session.run_script(output).await.unwrap();
         assert_eq!(completed.value["value"]["state"], "completed");
         assert_eq!(
             completed.value["value"]["result"]["value"],
@@ -786,34 +546,13 @@ mod tests {
             })
         );
 
-        let waiting = session
-            .runtime
-            .executor
-            .execute(
-                session.root.clone(),
-                "script",
-                json!({"source":"return await receive();", "bg":true}),
-                None,
-            )
-            .await
-            .unwrap();
-        let id = waiting.job.get();
-        session
-            .run_script(format!(
-                "await tool.job({id}).output(); return tool.job({id}).cancel();"
-            ))
-            .await
-            .unwrap();
-        session
-            .runtime
-            .jobs
-            .wait(waiting.job, None, true)
-            .await
-            .unwrap();
-        let cancelled = session
-            .run_script(format!("return tool.job({id}).output();"))
-            .await
-            .unwrap();
+        let waiting = background("return await receive();").await;
+        let id = waiting.get();
+        let cancel = format!("await tool.job({id}).output(); return tool.job({id}).cancel();");
+        session.run_script(cancel).await.unwrap();
+        jobs.wait(waiting, None, true).await.unwrap();
+        let output = format!("return tool.job({id}).output();");
+        let cancelled = session.run_script(output).await.unwrap();
         assert_eq!(cancelled.value["value"]["state"], "cancelled");
     }
 }

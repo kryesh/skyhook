@@ -1,3 +1,4 @@
+mod cli;
 mod dotenv;
 mod dump;
 mod embedded_shims;
@@ -5,123 +6,12 @@ mod headless;
 mod interaction;
 mod launch;
 mod tui;
-use clap::{Parser, Subcommand, ValueEnum};
-use skyhook::{identity::SessionId, tool::policy::Capability};
+use cli::{AuthCommand, AuthProvider, Invocation};
+#[cfg(test)]
 use std::path::PathBuf;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[derive(Parser)]
-#[command(name = "skyhook", version, about = "Programmable coding-agent harness")]
-struct Args {
-    #[command(subcommand)]
-    command: Option<Command>,
-    /// Inspect effective config (default) or loaded skills without starting a session.
-    #[arg(
-        long,
-        value_enum,
-        num_args = 0..=1,
-        default_missing_value = "config",
-        value_name = "WHAT",
-        conflicts_with_all = ["input", "resume", "images", "non_interactive", "model"]
-    )]
-    dump: Option<DumpKind>,
-    /// Use only this TOML config; disable user/workspace config discovery and merging.
-    #[arg(long)]
-    config: Option<PathBuf>,
-    /// Workspace visible to coding tools.
-    #[arg(long, default_value = ".")]
-    workspace: PathBuf,
-    /// Resume an existing session id.
-    #[arg(long)]
-    resume: Option<SessionId>,
-    /// Select and remember the root model for a new session.
-    #[arg(short = 'm', long = "model")]
-    model: Option<String>,
-    /// Approve every tool invocation without prompting.
-    #[arg(long)]
-    approve_all: bool,
-    /// Run without terminal interaction; requires --prompt or --script.
-    #[arg(long, requires = "input")]
-    non_interactive: bool,
-    /// Exact comma-separated policy capabilities; interaction follows the runtime mode.
-    #[arg(long, value_name = "LIST", value_parser = parse_capabilities)]
-    capabilities: Option<Capabilities>,
-    /// Attach images to the first prompt.
-    #[arg(long = "image", requires = "prompt", conflicts_with = "script")]
-    images: Vec<PathBuf>,
-    /// Submit this initial prompt.
-    #[arg(short, long, conflicts_with = "script", group = "input")]
-    prompt: Option<String>,
-    /// Run this JavaScript workflow.
-    #[arg(
-        short,
-        long,
-        value_name = "PATH",
-        conflicts_with = "prompt",
-        group = "input"
-    )]
-    script: Option<PathBuf>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum DumpKind {
-    Config,
-    Skills,
-}
-
-#[derive(Clone, Debug)]
-struct Capabilities(Vec<Capability>);
-
-fn parse_capabilities(value: &str) -> Result<Capabilities, String> {
-    if value.is_empty() {
-        return Ok(Capabilities(Vec::new()));
-    }
-    value
-        .split(',')
-        .map(|name| {
-            let capability = name.trim().parse::<Capability>().map_err(|error| error.to_string())?;
-            if capability == Capability::Interactive {
-                return Err("interactive is controlled by the runtime mode; use --non-interactive to disable it".into());
-            }
-            Ok(capability)
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Capabilities)
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Manage Skyhook-owned provider credentials.
-    Auth {
-        #[command(subcommand)]
-        command: AuthCommand,
-    },
-}
-#[derive(Clone, Copy, ValueEnum)]
-enum AuthProvider {
-    Codex,
-}
-#[derive(Subcommand)]
-enum AuthCommand {
-    /// Sign in using a browser, or the public device flow on a headless machine.
-    Login {
-        #[arg(value_enum, default_value = "codex")]
-        provider: AuthProvider,
-        #[arg(long)]
-        headless: bool,
-    },
-    /// Inspect Skyhook's credentials without displaying tokens.
-    Status {
-        #[arg(value_enum, default_value = "codex")]
-        provider: AuthProvider,
-    },
-    /// Delete only Skyhook's locally stored credentials.
-    Logout {
-        #[arg(value_enum, default_value = "codex")]
-        provider: AuthProvider,
-    },
-}
 async fn run_auth(
     command: AuthCommand,
 ) -> Result<(), skyhook::provider::backends::codex::auth::AuthError> {
@@ -189,8 +79,8 @@ fn main() {
                         .to_str()
                         .is_some_and(|arg| arg.starts_with("--non-interactive="))
             });
-    let args = match Args::try_parse_from(cli) {
-        Ok(args) => args,
+    let invocation = match cli::parse_from(cli) {
+        Ok(invocation) => invocation,
         Err(error) => {
             if !silent
                 || matches!(
@@ -203,17 +93,11 @@ fn main() {
             std::process::exit(2);
         }
     };
-    if let Err(error) = dump::validate_options(&args) {
-        error.exit();
-    }
-    if args.non_interactive && args.command.is_some() {
-        std::process::exit(2);
-    }
     // SAFETY: startup is still single-threaded: no Tokio runtime, terminal,
     // tracing subscriber, provider, or background worker has been started.
     // Parse Clap first so help/version do not depend on a valid .env file.
     if let Err(error) = unsafe { dotenv::load_invocation_env() } {
-        if !args.non_interactive {
+        if !silent {
             eprintln!("skyhook: {error}");
         }
         std::process::exit(1);
@@ -224,40 +108,41 @@ fn main() {
     {
         Ok(runtime) => runtime,
         Err(_) => {
-            if !args.non_interactive {
+            if !silent {
                 eprintln!("skyhook: could not start async runtime");
             }
             std::process::exit(1);
         }
     };
-    runtime.block_on(run(args));
+    runtime.block_on(run(invocation));
 }
 
-async fn run(mut args: Args) {
-    if let Some(kind) = args.dump {
-        if let Err(error) = dump::run(&args, kind).await {
-            eprintln!("skyhook dump: {}", dump::diagnostic_text(error));
-            std::process::exit(1);
+async fn run(invocation: Invocation) {
+    match invocation {
+        Invocation::Inspect(request) => {
+            if let Err(error) = dump::run(request).await {
+                eprintln!("skyhook dump: {}", dump::diagnostic_text(error));
+                std::process::exit(1);
+            }
         }
-        return;
-    }
-    if let Some(Command::Auth { command }) = args.command.take() {
-        if let Err(error) = run_auth(command).await {
-            eprintln!("skyhook auth: {error}");
-            std::process::exit(1);
+        Invocation::Auth(command) => {
+            if let Err(error) = run_auth(command).await {
+                eprintln!("skyhook auth: {error}");
+                std::process::exit(1);
+            }
         }
-        return;
-    }
-    if args.non_interactive {
-        // Do not install any terminal, renderer, or tracing subscriber here.
-        if headless::run(args).await.is_err() {
-            std::process::exit(1);
+        Invocation::Headless(request, input) => {
+            // Do not install any terminal, renderer, or tracing subscriber here.
+            if headless::run(request, input).await.is_err() {
+                std::process::exit(1);
+            }
         }
-        return;
-    }
-    if let Err(error) = tui::run(args).await {
-        eprintln!("skyhook: {error}");
-        std::process::exit(1);
+        Invocation::Interactive(request, input) => {
+            if let Err(error) = tui::run(request, input).await {
+                eprintln!("skyhook: {error}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -272,75 +157,6 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
-    #[test]
-    fn auth_commands_parse_without_starting_tui() {
-        assert!(matches!(
-            Args::try_parse_from(["skyhook", "auth", "login", "--headless"])
-                .unwrap()
-                .command,
-            Some(Command::Auth {
-                command: AuthCommand::Login { headless: true, .. }
-            })
-        ));
-        assert!(matches!(
-            Args::try_parse_from(["skyhook", "auth", "status", "codex"])
-                .unwrap()
-                .command,
-            Some(Command::Auth {
-                command: AuthCommand::Status { .. }
-            })
-        ));
-        assert!(matches!(
-            Args::try_parse_from(["skyhook", "auth", "logout"])
-                .unwrap()
-                .command,
-            Some(Command::Auth {
-                command: AuthCommand::Logout { .. }
-            })
-        ));
-        assert!(
-            Args::try_parse_from(["skyhook", "--prompt", "hello"])
-                .unwrap()
-                .command
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn headless_requires_exactly_one_input() {
-        assert!(Args::try_parse_from(["skyhook", "--non-interactive"]).is_err());
-        assert!(
-            Args::try_parse_from(["skyhook", "--non-interactive", "-p", "hello"])
-                .unwrap()
-                .non_interactive
-        );
-        assert!(Args::try_parse_from(["skyhook", "--non-interactive", "-s", "run.js"]).is_ok());
-        assert!(
-            Args::try_parse_from([
-                "skyhook",
-                "--non-interactive",
-                "-p",
-                "hello",
-                "-s",
-                "run.js"
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn capability_allowlist_accepts_empty_and_rejects_unknown_names() {
-        let empty = Args::try_parse_from(["skyhook", "--capabilities="]).unwrap();
-        assert!(empty.capabilities.unwrap().0.is_empty());
-        let selected =
-            Args::try_parse_from(["skyhook", "--capabilities", "read,exec,targets"]).unwrap();
-        assert_eq!(
-            selected.capabilities.unwrap().0,
-            vec![Capability::Read, Capability::Exec, Capability::Targets]
-        );
-        assert!(Args::try_parse_from(["skyhook", "--capabilities", "read,typo"]).is_err());
-        assert!(Args::try_parse_from(["skyhook", "--capabilities", "read,"]).is_err());
-    }
     // Unit tests do not receive CARGO_BIN_EXE. Build the real CLI explicitly once,
     // and use Cargo's artifact message rather than guessing a profile/target path.
     fn cli_binary() -> &'static std::path::Path {
@@ -400,9 +216,6 @@ mod tests {
             };
             fs::create_dir_all(fixture.path("config/skyhook")).unwrap();
             fixture.config("http://127.0.0.1:1/v1", "");
-            // Bad terminal settings must not prevent headless execution.
-            fs::create_dir_all(fixture.path("config/skyhook")).unwrap();
-            fs::write(fixture.path("config/skyhook/tui.toml"), "not valid TOML [").unwrap();
             fixture
         }
         pub(crate) fn path(&self, name: &str) -> PathBuf {
@@ -572,34 +385,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_and_early_runtime_failures_are_silent() {
+    fn parse_early_runtime_and_redirected_terminal_failures_are_reported_correctly() {
         let f = Fixture::new();
+        let run = |args: &[&str]| f.command().args(args).output().unwrap();
         for args in [
-            vec!["--non-interactive", "--unknown"],
-            vec!["--non-interactive=true", "-p", "x"],
-            vec!["--non-interactive", "-p", "x", "-m", "missing"],
+            &["--non-interactive", "--unknown"][..],
+            &["--non-interactive=true", "-p", "x"],
+            &["--non-interactive", "-p", "x", "-m", "missing"],
         ] {
-            let out = f.command().args(&args).output().unwrap();
+            let out = run(args);
             assert!(!out.status.success(), "{args:?}");
-            assert!(out.stdout.is_empty(), "{args:?}: {:?}", out.stdout);
-            assert!(out.stderr.is_empty(), "{args:?}: {:?}", out.stderr);
+            assert!(
+                out.stdout.is_empty() && out.stderr.is_empty(),
+                "{args:?}: {out:?}"
+            );
         }
+        // Terminal mode still rejects redirected IO.
+        let out = run(&["-p", "hello"]);
+        assert!(!out.status.success() && out.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("interactive terminal"));
         fs::write(f.path("config/skyhook/config.toml"), "invalid [").unwrap();
-        let out = f
-            .command()
-            .args(["--non-interactive", "-p", "x"])
-            .output()
-            .unwrap();
+        let out = run(&["--non-interactive", "-p", "x"]);
         assert!(!out.status.success());
         assert!(out.stdout.is_empty() && out.stderr.is_empty());
-    }
-
-    #[test]
-    fn terminal_mode_still_rejects_redirected_io() {
-        let f = Fixture::new();
-        let out = f.command().args(["-p", "hello"]).output().unwrap();
-        assert!(!out.status.success());
-        assert!(out.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&out.stderr).contains("interactive terminal"));
     }
 }

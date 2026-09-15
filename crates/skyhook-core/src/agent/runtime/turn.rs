@@ -47,13 +47,13 @@ impl SessionRuntime {
                 .pending_event_content(agent, capabilities, location)
                 .await?;
             if !content.is_empty() {
-                messages.commit(self, agent, Message::User(content)).await?;
+                messages.commit().await?;
             }
             let profile = agent_context.profile.clone();
             if !profile.supports_images && agent_context.contains_images() {
                 return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
             }
-            let template = agent_context.template.clone();
+            let template = agent_context.template.to_request();
             let context = match context_sequence {
                 Some(sequence) => sequence,
                 None => {
@@ -95,28 +95,22 @@ impl SessionRuntime {
                 // normal request, rather than delaying it by another request.
                 continue 'requests;
             }
-            let mut messages = compact::context_sources(&agent_context.projected);
-            messages.push(crate::session::ContextMessage::Inline {
-                message: request
-                    .messages
-                    .last()
-                    .expect("runtime state is present")
-                    .clone(),
-            });
             // Freeze the request across provider recovery. Input/notifications and
             // model changes remain queued until the next normal request boundary.
             // Partial streamed output is display-only: only a fully assembled response
             // below is committed and allowed to execute Skyhook tools.
             let input_estimate = compaction::estimate_request(&request);
             let context_tokens = agent_context.meter.estimate(&request);
-            self.store.hydrate_model_request(&mut request).await?;
+            self.store.load_blobs(&mut request).await?;
             let requested = self
                 .store
                 .append(
                     agent.clone(),
                     SessionEvent::ModelRequested {
                         context,
-                        messages: messages.clone(),
+                        history: compact::context_sources(&agent_context.projected),
+                        tail: request.tail.clone(),
+                        history_lifetime: request.history_lifetime,
                         purpose: crate::session::ModelPurpose::Agent,
                     },
                 )
@@ -336,7 +330,7 @@ impl SessionRuntime {
             });
             if !response.calls.is_empty() {
                 self.questions
-                    .prepare_question_batch(agent, &response.calls)
+                    .prepare_question_batch(agent, &response.calls, self.executor.registry())
                     .await;
                 self.activity(agent, AgentActivity::Tools);
                 let results = join_all(response.calls.iter().map(|call| {
@@ -373,7 +367,7 @@ impl SessionRuntime {
                     .pending_event_content(agent, capabilities, location)
                     .await?;
                 if !content.is_empty() {
-                    messages.commit(self, agent, Message::User(content)).await?;
+                    messages.commit().await?;
                     final_text.clear();
                     continue 'requests;
                 }
@@ -458,93 +452,47 @@ mod tests {
 
     #[tokio::test]
     async fn incomplete_native_response_is_not_retried_or_committed() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            Arc::new(ScriptedProvider {
-                requests: Arc::new(StdMutex::new(Vec::new())),
-                responses: StdMutex::new(VecDeque::from([
-                    vec![
-                        ResponseChunk::ItemStarted {
-                            id: "answer".into(),
-                            position: 0,
-                            kind: ItemKind::Text,
-                        },
-                        ResponseChunk::BlockStarted {
-                            item: "answer".into(),
-                            id: "answer:0".into(),
-                            position: 0,
-                            kind: crate::provider::protocol::BlockKind::Text,
-                        },
-                        ResponseChunk::BlockDelta {
-                            item: "answer".into(),
-                            block: "answer:0".into(),
-                            delta: ContentDelta::Text("must not persist".into()),
-                        },
-                    ],
-                    answer("Recovered"),
-                ]))
-                .into(),
-            }),
-        )
-        .await;
-        let session = harness.new_session().await.unwrap();
+        let mut incomplete = answer("must not persist");
+        incomplete.truncate(3); // item and block started, item never ended
+        let (root, _, session) = scripted_session([incomplete, answer("Recovered")]).await;
         assert!(session.prompt("Question").await.is_err());
         session.shutdown().await.unwrap();
-        let records = SessionStore::read_records(sessions.path(), session.id())
+        let sessions = root.path().join("sessions");
+        let records = SessionStore::read_records(&sessions, session.id())
             .await
             .unwrap();
         assert!(records.iter().any(|record| matches!(&record.event,
             SessionEvent::ModelFailed { error, .. } if error.contains("response ended before all items ended"))));
-        let assistants: Vec<_> = records
-            .iter()
-            .filter_map(|record| match &record.event {
-                SessionEvent::MessageCommitted {
-                    message: Message::Assistant(blocks),
-                } => Some(blocks),
-                _ => None,
-            })
-            .collect();
-        assert!(assistants.is_empty());
         assert_eq!(
-            records
-                .iter()
-                .filter(|record| matches!(record.event, SessionEvent::ModelRequested { .. }))
-                .count(),
-            1
+            count!(
+                &records,
+                SessionEvent::MessageCommitted {
+                    message: Message::Assistant(_)
+                }
+            ),
+            0
         );
+        assert_eq!(count!(&records, SessionEvent::ModelRequested { .. }), 1);
     }
 
     #[test]
     fn abnormal_termination_never_executes_even_completed_tool_calls() {
-        for reason in [
+        let reasons = [
             StopReason::MaxTokens,
             StopReason::ContentFilter,
             StopReason::Aborted,
-        ] {
+        ];
+        for stop_reason in reasons {
             let mut assembler = ResponseAssembler::default();
             let items = vec![
                 AssistantContent::text("answer", 0, "Visible response"),
-                AssistantContent::tool_call(
-                    "tool",
-                    1,
-                    ToolCall {
-                        id: "call".into(),
-                        name: "shell".into(),
-                        arguments: json!({"command":"unsafe"}),
-                    },
-                ),
+                tool_call(1, "call", "shell", json!({"command":"unsafe"})),
             ];
-            for event in crate::provider::protocol::events_for_content(&items) {
+            for event in events_for_content(&items) {
                 assembler.push(&event).unwrap();
             }
-            assembler
-                .push(&ResponseChunk::ResponseEnded {
-                    stop_reason: reason,
-                })
-                .unwrap();
+            let ended = ResponseChunk::ResponseEnded { stop_reason };
+            assembler.push(&ended).unwrap();
             let folded = finish_response(assembler, Usage::default()).unwrap();
             assert_eq!(folded.text, "Visible response");
             assert!(folded.calls.is_empty());
@@ -554,28 +502,20 @@ mod tests {
 
     #[tokio::test]
     async fn aborted_response_preserves_visible_content_and_usage_but_fails() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let replay = ReplayEnvelope {
+            version: 1,
+            protocol: "responses".into(),
+            model: "native".into(),
+            scope: "reasoning".into(),
+            payload: json!({"encrypted_content":"retained"}),
+        };
         let retained = vec![
-            AssistantContent::reasoning(
-                "reason",
-                0,
-                "completed reasoning",
-                Some(replay(json!({"encrypted_content":"retained"}))),
-            ),
+            AssistantContent::reasoning("reason", 0, "completed reasoning", Some(replay)),
             AssistantContent::text("answer", 1, "partial visible answer"),
         ];
         let mut items = retained.clone();
-        items.push(AssistantContent::tool_call(
-            "tool",
-            2,
-            ToolCall {
-                id: "call".into(),
-                name: "write".into(),
-                arguments: json!({"path":"must-not-exist", "content":"unsafe"}),
-            },
-        ));
+        let unsafe_write = json!({"path":"must-not-exist", "content":"unsafe"});
+        items.push(tool_call(2, "call", "write", unsafe_write));
         let observed = Usage {
             input_tokens: 11,
             cached_input_tokens: 7,
@@ -586,13 +526,7 @@ mod tests {
         chunks.push(ResponseChunk::ResponseEnded {
             stop_reason: StopReason::Aborted,
         });
-        let harness = test_harness(
-            workspace.path(),
-            sessions.path(),
-            scripted_provider(&requests, [chunks]),
-        )
-        .await;
-        let session = harness.new_session().await.unwrap();
+        let (root, requests, session) = scripted_session([chunks]).await;
         let mut events = session.runtime.events.subscribe();
         let error = session.prompt("Abort this turn.").await.unwrap_err();
         assert!(
@@ -605,30 +539,15 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert_eq!(session.usage().await, observed);
         let records = session.runtime.store.records().await;
-        let assistants: Vec<_> = records
-            .iter()
-            .filter_map(|record| match &record.event {
-                SessionEvent::MessageCommitted {
-                    message: Message::Assistant(items),
-                } => Some(items.clone()),
-                _ => None,
-            })
-            .collect();
+        let assistants = events!(&records, SessionEvent::MessageCommitted { message: Message::Assistant(items) } => items.clone());
         assert_eq!(assistants, vec![retained]);
+        assert_eq!(count!(&records, SessionEvent::Usage { .. }), 1);
         assert_eq!(
-            records
-                .iter()
-                .filter(|record| matches!(record.event, SessionEvent::Usage { .. }))
-                .count(),
+            count!(&records, SessionEvent::ModelFailed { error, .. } if error == "provider aborted response"),
             1
         );
-        assert!(records.iter().any(|record| matches!(&record.event, SessionEvent::ModelFailed { error, .. } if error == "provider aborted response")));
-        assert!(
-            !records
-                .iter()
-                .any(|record| matches!(record.event, SessionEvent::JobCreated { .. }))
-        );
-        assert!(!workspace.path().join("must-not-exist").exists());
+        assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 0);
+        assert!(!root.path().join("must-not-exist").exists());
         let mut settled = false;
         while let Ok(event) = events.try_recv() {
             match event {

@@ -1,6 +1,10 @@
 //! Presentation-only tool documents. Nothing here writes to session or tool state.
 mod document;
 mod highlighting;
+mod output;
+mod preview;
+
+pub use output::OutputView;
 
 use super::{format::push_clean, model, theme::ContentTheme};
 use highlighting::CodeKey;
@@ -95,7 +99,8 @@ pub enum Section {
         source: CodeSource,
         language: String,
         indent: usize,
-        gutters: Vec<String>,
+        /// No gutter or one shared marker, never a marker per source line.
+        gutters: Option<String>,
         role: Role,
     },
 }
@@ -131,13 +136,13 @@ impl Document {
                     gutters,
                     ..
                 } => {
-                    for (index, line) in source.split('\n').enumerate() {
+                    for line in source.split('\n') {
                         if !first {
                             text.push('\n');
                         }
                         first = false;
                         text.extend(std::iter::repeat_n(' ', *indent));
-                        if let Some(gutter) = gutters.get(index) {
+                        if let Some(gutter) = gutters.as_deref() {
                             push_clean(&mut text, gutter);
                         }
                         push_clean(&mut text, line);
@@ -168,12 +173,15 @@ impl Document {
                     gutters,
                     role,
                 } => {
-                    let highlighted = cache
-                        .and_then(|cache| cache.ready(&CodeKey::new(source.clone(), language)));
+                    let key = CodeKey::admit(source, language);
+                    let highlighted = key
+                        .as_ref()
+                        .and_then(|key| cache.and_then(|cache| cache.ready(key)))
+                        .and_then(Option::as_deref);
                     // Split without trimming: empty lines and trailing whitespace are significant.
                     for (index, text) in source.split('\n').enumerate() {
                         let mut spans = vec![Span::raw(" ".repeat(*indent))];
-                        if let Some(gutter) = gutters.get(index) {
+                        if let Some(gutter) = gutters.as_deref() {
                             spans.push(Span::styled(
                                 model::clean(gutter),
                                 if matches!(role, Role::Added | Role::Removed) {
@@ -184,15 +192,7 @@ impl Document {
                             ));
                         }
                         if let Some(line) = highlighted.and_then(|lines| lines.get(index)) {
-                            spans.extend(line.spans.iter().cloned().map(|mut span| {
-                                // Unsupported syntax completes with raw spans. Keep that
-                                // cached completion, but inherit this caller's fallback role
-                                // rather than turning coloured pending text neutral.
-                                if span.style.fg.is_none() {
-                                    span.style = role.style(p).patch(span.style);
-                                }
-                                span
-                            }));
+                            spans.extend(line.spans.iter().cloned());
                         } else {
                             spans.push(Span::styled(model::clean(text), role.style(p)));
                         }
@@ -231,10 +231,11 @@ mod tests {
             "a  \n\t界\r\n",
             "js",
             2,
-            vec!["+\t".into(), "\u{1b}− ".into()],
+            Some("\u{1b}− ".into()),
             Role::Added,
         );
-        document.code("", "", 0, vec![], Role::Plain);
+        document.code("x\n", "", 2, None, Role::Plain);
+        document.code("", "", 0, None, Role::Plain);
         assert_eq!(document.plain_text(), text(&document.lines(None)));
         assert!(document.plain_text().ends_with("\n  \n"));
     }

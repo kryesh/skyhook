@@ -157,6 +157,14 @@ impl Arguments {
 mod tests {
     use super::*;
 
+    fn surface(schema: &Value) -> impl Fn(&Value) -> bool {
+        let validator = jsonschema::options()
+            .with_retriever(NoExternalSchemas)
+            .build(schema)
+            .unwrap_or_else(|error| panic!("{error}: {schema}"));
+        move |instance| validator.is_valid(instance)
+    }
+
     #[test]
     fn reserved_and_open_ended_inputs_are_wrapped_without_losing_bg() {
         for schema in [
@@ -165,20 +173,25 @@ mod tests {
             json!({"type":"object","additionalProperties":{"type":"string"}}),
             json!({"type":"object","properties":{"bg":{"type":"string"}},"additionalProperties":false}),
             json!({"type":"object","patternProperties":{"^b":{"type":"string"}},"additionalProperties":false}),
+            // Reference siblings cannot hide an upstream bg either.
+            json!({"$schema":"http://json-schema.org/draft-07/schema#", "type":"object",
+                "additionalProperties":false, "definitions":{"open":{"type":"object"}},
+                "$ref":"#/definitions/open"}),
         ] {
             let arguments = Arguments::new(schema).unwrap();
             let value = json!({"arguments":{"bg":"upstream"}});
             arguments.validate(&value).unwrap();
+            assert!(surface(&arguments.schema)(&value));
             assert_eq!(arguments.extract(&value).unwrap()["bg"], "upstream");
         }
         let arguments = Arguments::new(json!({"type":"object"})).unwrap();
-        assert!(arguments.validate(&json!({})).is_err());
-        assert!(arguments.validate(&json!({"arguments":null})).is_err());
-        assert!(
-            arguments
-                .validate(&json!({"arguments":{},"other":1}))
-                .is_err()
-        );
+        for invalid in [
+            json!({}),
+            json!({"arguments":null}),
+            json!({"arguments":{},"other":1}),
+        ] {
+            assert!(arguments.validate(&invalid).is_err());
+        }
     }
 
     #[test]
@@ -193,93 +206,70 @@ mod tests {
                 "type":"object", "properties":{"count":{"type":"integer"}},
                 "required":["count"], "additionalProperties":false
             });
-            original
-                .as_object_mut()
-                .unwrap()
-                .extend(constraint.as_object().unwrap().clone());
+            let constraint = constraint.as_object().unwrap().clone();
+            original.as_object_mut().unwrap().extend(constraint);
             let arguments = Arguments::new(original).unwrap();
             arguments
                 .validate(&json!({"arguments":{"count":1}}))
                 .unwrap();
             let mut schema = arguments.schema.clone();
             schema["properties"]["bg"] = json!({"type":"boolean"});
-            let surface = jsonschema::options()
-                .with_retriever(NoExternalSchemas)
-                .build(&schema)
-                .unwrap();
-            assert!(surface.is_valid(&json!({"arguments":{"count":1},"bg":true})));
+            assert!(surface(&schema)(
+                &json!({"arguments":{"count":1},"bg":true})
+            ));
         }
     }
 
     #[test]
-    fn local_references_keep_their_meaning_in_wrapped_schema() {
-        for dialect in [
-            "http://json-schema.org/draft-04/schema#",
-            "http://json-schema.org/draft-07/schema#",
-            "https://json-schema.org/draft/2019-09/schema",
-            "https://json-schema.org/draft/2020-12/schema",
-        ] {
-            let arguments = Arguments::new(json!({
-                "$schema":dialect,
-                "type":"object", "definitions":{"number":{"type":"integer","minimum":1}},
-                "properties":{"count":{"$ref":"#/definitions/number"}},"required":["count"]
-            }))
-            .unwrap();
-            let surface_validator = jsonschema::options()
-                .with_retriever(NoExternalSchemas)
-                .build(&arguments.schema)
-                .unwrap_or_else(|error| panic!("{dialect}: {error}"));
-            let valid = json!({"arguments":{"count":2}});
-            let invalid = json!({"arguments":{"count":0}});
-            assert!(arguments.validate(&valid).is_ok(), "{dialect}");
-            assert!(surface_validator.is_valid(&valid), "{dialect}");
-            assert!(arguments.validate(&invalid).is_err(), "{dialect}");
-            assert!(!surface_validator.is_valid(&invalid), "{dialect}");
-        }
-    }
-
-    #[test]
-    fn reference_siblings_cannot_hide_upstream_bg() {
-        let arguments = Arguments::new(json!({
-            "$schema":"http://json-schema.org/draft-07/schema#",
-            "type":"object", "additionalProperties":false,
-            "definitions":{"open":{"type":"object"}}, "$ref":"#/definitions/open"
-        }))
-        .unwrap();
-        let input = json!({"arguments":{"bg":"upstream"}});
-        arguments.validate(&input).unwrap();
-        let surface = jsonschema::options()
-            .with_retriever(NoExternalSchemas)
-            .build(&arguments.schema)
-            .unwrap_or_else(|error| panic!("{error}: {}", arguments.schema));
-        assert!(surface.is_valid(&input));
-    }
-
-    #[test]
-    fn legacy_recursive_root_aliases_retain_their_constraints() {
-        for dialect in [
-            "http://json-schema.org/draft-04/schema#",
-            "http://json-schema.org/draft-07/schema#",
-        ] {
-            let arguments = Arguments::new(json!({
-                "$schema":dialect, "type":"object", "additionalProperties":false,
+    fn local_and_recursive_references_keep_their_meaning_in_wrapped_schema() {
+        let local = |dialect| {
+            json!({"$schema":dialect, "type":"object",
+                "definitions":{"number":{"type":"integer","minimum":1}},
+                "properties":{"count":{"$ref":"#/definitions/number"}},"required":["count"]})
+        };
+        // Legacy recursive root aliases retain their constraints.
+        let recursive = |dialect| {
+            json!({"$schema":dialect, "type":"object", "additionalProperties":false,
                 "$ref":"#/definitions/node", "definitions":{"node":{
                     "type":"object", "required":["count"],
                     "properties":{"count":{"type":"integer","minimum":1},
-                                  "child":{"$ref":"#/definitions/node"}}
-                }}
-            }))
-            .unwrap();
-            let surface = jsonschema::options()
-                .with_retriever(NoExternalSchemas)
-                .build(&arguments.schema)
-                .unwrap();
+                                  "child":{"$ref":"#/definitions/node"}}}}})
+        };
+        let (draft4, draft7) = (
+            "http://json-schema.org/draft-04/schema#",
+            "http://json-schema.org/draft-07/schema#",
+        );
+        let mut cases = Vec::new();
+        for dialect in [
+            draft4,
+            draft7,
+            "https://json-schema.org/draft/2019-09/schema",
+            "https://json-schema.org/draft/2020-12/schema",
+        ] {
+            let valid = json!({"arguments":{"count":2}});
+            cases.push((
+                dialect,
+                local(dialect),
+                valid,
+                json!({"arguments":{"count":0}}),
+            ));
+        }
+        for dialect in [draft4, draft7] {
             let valid = json!({"arguments":{"count":1,"child":{"count":2},"bg":"upstream"}});
             let invalid = json!({"arguments":{"count":1,"child":{"count":0}}});
-            assert!(arguments.validate(&valid).is_ok(), "{dialect}");
-            assert!(surface.is_valid(&valid), "{dialect}");
-            assert!(arguments.validate(&invalid).is_err(), "{dialect}");
-            assert!(!surface.is_valid(&invalid), "{dialect}");
+            cases.push((dialect, recursive(dialect), valid, invalid));
+        }
+        for (dialect, schema, valid, invalid) in cases {
+            let arguments = Arguments::new(schema).unwrap();
+            let surface = surface(&arguments.schema);
+            assert!(
+                arguments.validate(&valid).is_ok() && surface(&valid),
+                "{dialect}"
+            );
+            assert!(
+                arguments.validate(&invalid).is_err() && !surface(&invalid),
+                "{dialect}"
+            );
         }
     }
 

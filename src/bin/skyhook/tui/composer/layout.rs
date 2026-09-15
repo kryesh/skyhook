@@ -10,14 +10,14 @@ use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Debug)]
 pub struct ComposerSpan {
-    pub text: String,
-    pub paste: bool,
-    pub selected: bool,
+    pub(crate) text: String,
+    pub(crate) paste: bool,
+    pub(crate) selected: bool,
 }
 #[derive(Clone, Debug, Default)]
 pub struct ComposerRow {
-    pub spans: Vec<ComposerSpan>,
-    pub width: usize,
+    pub(crate) spans: Vec<ComposerSpan>,
+    pub(crate) width: usize,
 }
 impl ComposerRow {
     pub fn line(&self, base: Style, paste: Style, selection: Style) -> Line<'static> {
@@ -41,17 +41,14 @@ impl ComposerRow {
 }
 #[derive(Clone, Debug)]
 pub struct ComposerLayout {
-    pub rows: Vec<ComposerRow>,
+    pub(crate) rows: Vec<ComposerRow>,
     /// (visual row, terminal-cell column). Before a newline terminating an
     /// exactly full row, column equals width; renderers must reserve one padding
     /// cell for that exclusive edge rather than clamp onto the final character.
-    pub cursor: (usize, usize),
+    pub(crate) cursor: (usize, usize),
     positions: BTreeMap<usize, (usize, usize)>,
 }
 impl ComposerLayout {
-    pub fn row_count(&self) -> usize {
-        self.rows.len()
-    }
     pub fn cursor_position(&self, offset: usize) -> (usize, usize) {
         self.positions
             .range(..=offset)
@@ -112,6 +109,7 @@ impl ComposerLayout {
             let a = Token::boundary(&tokens, text_len, a);
             a.min(cursor)..a.max(cursor)
         });
+        // Construction always has exactly one current (last) row.
         let mut rows = vec![ComposerRow::default()];
         let mut positions = BTreeMap::new();
         positions.insert(0, (0, 0));
@@ -161,10 +159,8 @@ impl ComposerLayout {
             }
             let raw_width = UnicodeWidthStr::width(token.text.as_str());
             let token_width = raw_width.min(width);
-            if rows.last().unwrap().width >= width
-                || (rows.last().unwrap().width > 0
-                    && rows.last().unwrap().width + token_width > width)
-            {
+            let current = rows.last().unwrap().width;
+            if current >= width || (current > 0 && current + token_width > width) {
                 rows.push(ComposerRow::default());
             }
             let row_index = rows.len() - 1;
@@ -192,6 +188,7 @@ impl ComposerLayout {
             positions,
         };
         layout.cursor = layout.cursor_position(cursor);
+        debug_assert!(layout.cursor.1 <= width);
         layout
     }
 }
@@ -220,42 +217,30 @@ fn clip(text: &str, width: usize) -> (String, usize) {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
+    use ratatui::style::Color;
 
     fn rows(editor: &Composer, width: usize) -> Vec<String> {
         let layout = editor.layout(width);
         if !editor.has_pastes() {
             let mut plain = crate::tui::editor::Editor::default();
             plain.set(editor.text.clone());
-            plain.cursor = editor.cursor;
-            plain.anchor = editor.anchor;
-            let plain_layout = plain.layout(width);
-            assert_eq!(plain_layout.cursor, layout.cursor);
-            assert_eq!(plain_layout.positions, layout.positions);
+            plain.set_selection(plain.anchor(), editor.cursor);
+            plain.set_selection(editor.anchor, plain.cursor());
+            let plain = plain.layout(width);
             assert_eq!(
-                plain_layout
-                    .rows
-                    .iter()
-                    .map(|r| r.width)
-                    .collect::<Vec<_>>(),
-                layout.rows.iter().map(|r| r.width).collect::<Vec<_>>()
+                (plain.cursor, &plain.positions),
+                (layout.cursor, &layout.positions)
             );
-            assert_eq!(
-                plain_layout
-                    .rows
-                    .iter()
-                    .map(|r| r.line(Style::default(), Style::default(), Style::default()))
-                    .collect::<Vec<_>>(),
-                layout
-                    .rows
-                    .iter()
-                    .map(|r| r.line(Style::default(), Style::default(), Style::default()))
+            let style = Style::default();
+            let shape = |rows: &[ComposerRow]| {
+                let rows = rows.iter();
+                rows.map(|r: &ComposerRow| (r.width, r.line(style, style, style)))
                     .collect::<Vec<_>>()
-            );
+            };
+            assert_eq!(shape(&plain.rows), shape(&layout.rows));
         }
-        layout
-            .rows
-            .iter()
-            .map(|r| r.spans.iter().map(|s| s.text.as_str()).collect())
+        let rows = layout.rows.iter();
+        rows.map(|r| r.spans.iter().map(|s| s.text.as_str()).collect())
             .collect()
     }
 
@@ -266,31 +251,31 @@ mod tests {
     }
 
     #[test]
-    fn word_wrapping_preserves_whitespace_and_explicit_empty_lines() {
-        let editor = plain("one two   three\n\nlast\n");
-        assert_eq!(rows(&editor, 8), ["one two ", "  three", "", "last", ""]);
-        assert_eq!(editor.expanded_text(), "one two   three\n\nlast\n");
-        assert_eq!(rows(&plain("hello world"), 8), ["hello ", "world"]);
-        assert_eq!(rows(&plain("abcdefghijk"), 4), ["abcd", "efgh", "ijk"]);
-    }
-
-    #[test]
-    fn cursor_uses_full_word_layout_not_prefix_wrapping() {
+    fn word_wrapping_preserves_whitespace_empty_lines_and_a_visible_caret_row() {
+        for (text, width, expected) in [
+            (
+                "one two   three\n\nlast\n",
+                8,
+                &["one two ", "  three", "", "last", ""][..],
+            ),
+            ("hello world", 8, &["hello ", "world"]),
+            ("abcdefghijk", 4, &["abcd", "efgh", "ijk"]),
+            ("abcd", 4, &["abcd", ""]),
+            ("abcd\n", 4, &["abcd", ""]),
+            ("", 0, &[""]),
+            ("a\tb", 6, &["a    b", ""]),
+            ("\u{1b}[31m", 80, &["�[31m"]),
+            ("界", 1, &["�", ""]),
+            ("a\r\nb", 4, &["a", "b"]),
+        ] {
+            assert_eq!(rows(&plain(text), width), expected, "{text:?}");
+        }
+        assert_eq!(plain("abcd").layout(4).cursor, (1, 0));
+        // The cursor uses the full word layout, not prefix wrapping.
         let mut editor = plain("hello world");
-        editor.cursor = "hello w".len();
+        editor.set_selection(editor.anchor(), "hello w".len());
         let layout = editor.layout(8);
-        assert_eq!(layout.cursor, (1, 1));
-        assert_eq!(layout.cursor_position(6), (1, 0));
-    }
-
-    #[test]
-    fn full_width_end_gets_visible_caret_row() {
-        let editor = plain("abcd");
-        let layout = editor.layout(4);
-        assert_eq!(rows(&editor, 4), ["abcd", ""]);
-        assert_eq!(layout.cursor, (1, 0));
-        assert_eq!(rows(&plain("abcd\n"), 4), ["abcd", ""]);
-        assert_eq!(rows(&plain(""), 0), [""]);
+        assert_eq!((layout.cursor, layout.cursor_position(6)), ((1, 1), (1, 0)));
     }
 
     #[test]
@@ -303,18 +288,13 @@ mod tests {
             [5, 4]
         );
         assert_eq!(layout.cursor, (1, 4));
-        assert_eq!(rows(&plain("a\tb"), 6), ["a    b", ""]);
-        assert_eq!(rows(&plain("\u{1b}[31m"), 80), ["�[31m"]);
-        assert_eq!(rows(&plain("界"), 1), ["�", ""]);
-        assert_eq!(rows(&plain("a\r\nb"), 4), ["a", "b"]);
         // A literal object marker stays ordinary text in a plain editor.
         assert!(!ComposerLayout::plain_text("\u{fffc}", 3, None, 4).rows[0].spans[0].paste);
         let layout = ComposerLayout::plain_text("界e\u{301}\tq", 5, Some(3), 8);
         assert_eq!(layout.cursor, (0, 2)); // Inside the combining grapheme.
         assert_eq!(layout.cursor_position(2), (0, 0)); // Inside the wide UTF-8 glyph.
-        assert_eq!(layout.cursor_position(6), (0, 3));
-        assert_eq!(layout.cursor_position(7), (0, 7));
-        assert_eq!(layout.cursor_position(8), (1, 0));
+        let positions = [6, 7, 8].map(|byte| layout.cursor_position(byte));
+        assert_eq!(positions, [(0, 3), (0, 7), (1, 0)]);
     }
 
     #[test]
@@ -327,57 +307,45 @@ mod tests {
             ["prefix ".to_string(), label.clone()]
         );
         let narrow = editor.layout(5);
-        let paste_spans: Vec<_> = narrow
-            .rows
-            .iter()
-            .flat_map(|r| &r.spans)
-            .filter(|s| s.paste)
-            .collect();
-        assert_eq!(paste_spans.len(), 1);
-        assert_eq!(paste_spans[0].text, "[Past");
-        assert_eq!(narrow.cursor_position(7).1, 0);
-        assert_eq!(narrow.cursor_position(10).1, 0);
+        let spans = narrow.rows.iter().flat_map(|r| &r.spans);
+        let pastes: Vec<_> = spans.filter(|s| s.paste).map(|s| s.text.as_str()).collect();
+        assert_eq!(pastes, ["[Past"]);
+        assert_eq!(
+            (narrow.cursor_position(7).1, narrow.cursor_position(10).1),
+            (0, 0)
+        );
         assert_eq!(editor.expanded_text(), "prefix one\ntwo\n");
     }
 
     #[test]
     fn selection_styling_tracks_wrapped_source_and_atomic_paste() {
-        use ratatui::style::Color;
         let plain_layout = ComposerLayout::plain_text("a\t界\nx", 6, Some(1), 8);
         assert_eq!(plain_layout.cursor, (1, 0));
+        let spans = plain_layout.rows[0].spans.iter();
+        let selected: Vec<_> = spans.map(|s| (s.text.as_str(), s.selected)).collect();
         assert_eq!(
-            plain_layout.rows[0]
-                .spans
-                .iter()
-                .map(|s| (s.text.as_str(), s.selected))
-                .collect::<Vec<_>>(),
+            selected,
             [("a", false), ("    ", true), ("界", true), (" ", true)]
         );
         assert!(!plain_layout.rows[1].spans[0].selected);
         let mut editor = plain("hello ");
         editor.insert_paste("contents".into());
         editor.insert(" end");
-        editor.anchor = Some(6);
-        editor.cursor = 10;
+        editor.set_selection(Some(6), editor.cursor());
+        editor.set_selection(editor.anchor(), 10);
         let layout = editor.layout(10);
         let spans: Vec<_> = layout.rows.iter().flat_map(|r| &r.spans).collect();
         assert!(spans.iter().find(|s| s.paste).unwrap().selected);
         assert!(!spans[0].selected);
+        let (text, paste, selection) = (Color::White, Color::Blue, Color::Gray);
         for row in &layout.rows {
-            let line = row.line(
-                Style::default().fg(Color::White),
-                Style::default().fg(Color::Blue),
-                Style::default().bg(Color::Gray),
-            );
+            let style = Style::default();
+            let line = row.line(style.fg(text), style.fg(paste), style.bg(selection));
             for (source, rendered) in row.spans.iter().zip(line.spans) {
-                assert_eq!(rendered.style.bg, source.selected.then_some(Color::Gray));
+                assert_eq!(rendered.style.bg, source.selected.then_some(selection));
                 assert_eq!(
                     rendered.style.fg,
-                    Some(if source.paste {
-                        Color::Blue
-                    } else {
-                        Color::White
-                    })
+                    Some(if source.paste { paste } else { text })
                 );
             }
         }
@@ -387,22 +355,23 @@ mod tests {
     fn full_width_newline_caret_uses_exclusive_edge_not_last_character() {
         for (text, last_start, newline) in [("abcd\nx", 3, 4), ("ab界\nx", 2, 5)] {
             let mut editor = plain(text);
-            editor.cursor = last_start;
+            editor.set_selection(editor.anchor(), last_start);
             let before = editor.layout(4).cursor;
-            editor.cursor = newline;
+            editor.set_selection(editor.anchor(), newline);
             let layout = editor.layout(4);
             assert_eq!(layout.cursor, (0, 4));
             assert_ne!(before, layout.cursor);
             assert_eq!(layout.cursor_position(newline + 1), (1, 0));
             assert_eq!(
-                layout.row_count(),
+                layout.rows.len(),
                 2,
                 "full explicit lines are not double-spaced"
             );
             assert_eq!(rows(&editor, 4), [text.split('\n').next().unwrap(), "x"]);
             editor.set_width(4);
-            assert!(editor.handle(KeyEvent::new(KeyCode::Down, M::NONE)));
-            assert!(editor.handle(KeyEvent::new(KeyCode::Up, M::NONE)));
+            for code in [KeyCode::Down, KeyCode::Up] {
+                assert!(editor.handle(KeyEvent::new(code, M::NONE)).handled);
+            }
             assert_eq!(
                 editor.cursor, newline,
                 "vertical movement preserves edge column"

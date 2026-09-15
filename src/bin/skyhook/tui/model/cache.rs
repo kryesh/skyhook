@@ -1,20 +1,18 @@
 use super::entries::entries_inner;
 use super::jobs::job_entry;
-use super::live::{response_entries, working_entry, working_label};
-use super::requests::{request_elapsed, request_entry, request_running};
-use super::{Entry, EntryView, Projection, Tab};
-use serde_json::Value;
+use super::live::{response_entries, working_entry};
+use super::requests::{refresh_request_entry, request_running};
+use super::{Entry, EntryKey, EntryView, Projection, Tab};
+use crate::tui::app::OutputStore;
 use skyhook::agent::ObservationSnapshot;
 use skyhook::identity::{AgentId, JobId};
-use skyhook::session::SessionEvent;
 use std::collections::{HashMap, HashSet};
 
-/// Indices refer to the caller-owned entry vector. `appends` maps a subset of
-/// `dirty` to their previous text byte lengths; their prefixes are unchanged.
+/// Dirty replacement indices refer to the retained owner's entries.
+/// No append witness is inferred from lengths or invalidation revisions.
 #[derive(Default, Debug)]
 pub struct ContentChanges {
     pub dirty: Vec<usize>,
-    pub appends: HashMap<usize, usize>,
     pub reset: bool,
 }
 
@@ -23,10 +21,12 @@ pub struct ContentChanges {
 /// `observe_response` so authoritative replacements rebuild only the live tail.
 /// Journal progress, selected agent, tab and defaults are also checked here.
 ///
-/// Entries remain caller-owned: neither historical strings nor tool documents
-/// are cloned to hand the cache's result to the renderer.
+/// Entries and all indices share one owner. Render/export borrow the entries;
+/// historical strings and documents are never cloned at the update boundary.
 #[derive(Default)]
 pub struct ContentCache {
+    entries: Vec<Entry>,
+    overlay_len: usize,
     identity: Option<(AgentId, Tab, bool, bool, u64, u64)>,
     history_len: usize,
     history_running: bool,
@@ -65,7 +65,7 @@ impl ContentCache {
     ) {
         self.job_indices.clear();
         for (index, entry) in entries.iter().enumerate() {
-            if let Some(job) = entry.job {
+            if let Some(job) = entry.job_id() {
                 self.job_indices.insert(job, index);
             }
         }
@@ -76,7 +76,6 @@ impl ContentCache {
         changes.reset =
             old.is_empty() || old.iter().zip(entries.iter()).any(|(a, b)| a.key != b.key);
         changes.dirty.clear();
-        changes.appends.clear();
         if !changes.reset {
             let old_len = old.len();
             for (index, previous) in old.into_iter().enumerate().take(entries.len()) {
@@ -90,13 +89,53 @@ impl ContentCache {
         }
     }
 
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// Move-owned UI-only tail is never included in history/live/job indices.
     pub fn update(
+        &mut self,
+        snapshot: &ObservationSnapshot,
+        projection: &Projection,
+        presentation: EntryView<'_>,
+        outputs: &OutputStore,
+        revision: u64,
+        overlay: Vec<Entry>,
+    ) -> ContentChanges {
+        let mut entries = std::mem::take(&mut self.entries);
+        let old_overlay_start = entries.len().saturating_sub(self.overlay_len);
+        let old_overlay = entries.split_off(old_overlay_start);
+        let mut changes = self.update_retained(
+            &mut entries,
+            snapshot,
+            projection,
+            presentation,
+            outputs,
+            revision,
+        );
+        let start = entries.len();
+        self.overlay_len = overlay.len();
+        for (offset, entry) in overlay.into_iter().enumerate() {
+            if start != old_overlay_start || old_overlay.get(offset) != Some(&entry) {
+                changes.dirty.push(start + offset);
+            }
+            entries.push(entry);
+        }
+        changes.dirty.retain(|index| *index < entries.len());
+        changes.dirty.sort_unstable();
+        changes.dirty.dedup();
+        self.entries = entries;
+        changes
+    }
+
+    fn update_retained(
         &mut self,
         entries: &mut Vec<Entry>,
         snapshot: &ObservationSnapshot,
         projection: &Projection,
         presentation: EntryView<'_>,
-        outputs: &HashMap<JobId, Value>,
+        outputs: &OutputStore,
         revision: u64,
     ) -> ContentChanges {
         let EntryView {
@@ -144,7 +183,7 @@ impl ContentCache {
                     super::retry::retry_entry(snapshot, projection, agent, *request, thinking)
                     && let Some(index) = entries[..self.history_len]
                         .iter()
-                        .position(|old| old.key == entry.key)
+                        .position(|old| old.key() == entry.key())
                     && entries[index] != entry
                 {
                     entries[index] = entry;
@@ -173,22 +212,10 @@ impl ContentCache {
                 && let Some(info) = projection.requests.get(&request)
                 && let Some(index) = entries
                     .iter()
-                    .position(|entry| entry.key == format!("r{request}"))
+                    .position(|entry| entry.key() == &EntryKey::Request(request))
             {
                 let running = request_running(info, snapshot, projection, agent, request);
-                let entry = &mut entries[index];
-                let elapsed_tenths = request_elapsed(info, running);
-                if entry.running != running {
-                    if let Some(record) = snapshot.records.get(&request)
-                        && let SessionEvent::ModelRequested { purpose, .. } = &record.event
-                    {
-                        *entry = request_entry(request, purpose, info, running);
-                        changes.dirty.push(index);
-                    }
-                } else if let Some(row) = &mut entry.request
-                    && row.elapsed_tenths != elapsed_tenths
-                {
-                    row.elapsed_tenths = elapsed_tenths;
+                if refresh_request_entry(&mut entries[index], info, running) {
                     changes.dirty.push(index);
                 }
             }
@@ -200,27 +227,14 @@ impl ContentCache {
             return changes;
         }
         if reset {
-            let mut responses: Vec<_> = snapshot
-                .responses
-                .iter()
-                .filter(|((owner, request), response)| {
-                    owner == agent
-                        && projection.live_response(*request, response)
-                        && !projection.requests.get(request).is_some_and(|info| {
-                            info.retry
-                                .as_ref()
-                                .is_some_and(super::retry::RetryState::has_error)
-                        })
-                })
-                .collect();
-            responses.sort_by_key(|((_, request), _)| *request);
-            for ((_, request), response) in responses {
+            let responses = super::live::live_tail_responses(snapshot, projection, agent);
+            for (request, response) in responses {
                 let start = entries.len();
                 entries.extend(response_entries(
-                    *request, response, view, thinking, agent_name,
+                    request, response, view, thinking, agent_name,
                 ));
                 self.live.push(LiveContent {
-                    request: *request,
+                    request,
                     start,
                     count: entries.len() - start,
                 });
@@ -240,13 +254,8 @@ impl ContentCache {
             requests.dedup();
             self.live.clear();
             for request in requests {
-                if let Some(response) = snapshot.responses.get(&(agent.clone(), request))
-                    && projection.live_response(request, response)
-                    && !projection.requests.get(&request).is_some_and(|info| {
-                        info.retry
-                            .as_ref()
-                            .is_some_and(super::retry::RetryState::has_error)
-                    })
+                if let Some(response) =
+                    super::live::live_tail_response(snapshot, projection, agent, request)
                 {
                     let start = entries.len();
                     entries.extend(response_entries(
@@ -264,7 +273,7 @@ impl ContentCache {
             let reordered = previous
                 .iter()
                 .zip(&entries[self.history_len..])
-                .any(|(old, new)| old.key != new.key);
+                .any(|(old, new)| old.key() != new.key());
             changes.reset |= reordered;
             let previous_len = previous.len();
             for (offset, old) in previous.into_iter().enumerate() {
@@ -286,14 +295,13 @@ impl ContentCache {
             .live
             .last()
             .map_or(self.history_len, |l| l.start + l.count);
-        let working_key = format!("working-{agent}");
+        let working_key = EntryKey::Working(agent.clone());
         let running = self.history_running
             || entries[self.history_len..end]
                 .iter()
                 .any(|entry| entry.running);
-        let has_working = entries.get(end).is_some_and(|e| e.key == working_key);
-        if let Some(label) = working_label(snapshot, projection, agent, running) {
-            let entry = working_entry(agent, &label);
+        let has_working = entries.get(end).is_some_and(|e| e.key() == &working_key);
+        if let Some(entry) = working_entry(snapshot, projection, agent, running) {
             if !has_working {
                 entries.insert(end, entry);
                 changes.dirty.extend(end..entries.len());
@@ -310,289 +318,116 @@ impl ContentCache {
         }
         changes.dirty.sort_unstable();
         changes.dirty.dedup();
-        changes.appends.retain(|index, _| *index < entries.len());
         changes
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::entries;
-    use super::super::{JobInfo, Surface, View};
-    use super::*;
-    use skyhook::agent::AgentActivity;
-    use skyhook::agent::{ObservedEvent, RuntimeEvent};
-    use skyhook::identity::SessionId;
-    use skyhook::job::JobState;
-    use skyhook::provider::protocol::{
-        AssistantItem, BlockContent, BlockKind, ContentDelta, ItemKind, ModelRequest,
-        ReplayEnvelope, ResponseEvent,
+    use super::super::tests::{
+        call_record, delta, job_info, record, replay, request, response, result_record, root,
+        update,
     };
-    use skyhook::provider::protocol::{Message, ToolResult, UserContent};
-    use skyhook::session::ModelPurpose;
-    use skyhook::session::{ContextMessage, EventRecord};
+    use super::super::{Surface, View};
+    use super::*;
+    use skyhook::agent::{AgentActivity, RuntimeEvent};
+    use skyhook::job::{JobRole, JobState};
+    use skyhook::provider::protocol::{
+        AssistantItem, BlockContent, Message, ResponseEvent, UserContent,
+    };
+    use skyhook::session::SessionEvent;
 
-    fn call_record(snapshot: &mut ObservationSnapshot, agent: &AgentId, id: &str) -> u64 {
-        record(
-            snapshot,
+    fn show<'a>(agent: &'a AgentId, view: &'a View, all_details: bool) -> EntryView<'a> {
+        EntryView {
             agent,
-            SessionEvent::MessageCommitted {
-                message: Message::Assistant(vec![AssistantItem::tool_call(
-                    "tool",
-                    0,
-                    skyhook::provider::protocol::ToolCall {
-                        id: id.into(),
-                        name: "exec".into(),
-                        arguments: serde_json::json!({"argv": ["echo", "  original\ttext\n"]}),
-                    },
-                )]),
-            },
-        )
-    }
-
-    fn context(snapshot: &mut ObservationSnapshot, agent: &AgentId) -> u64 {
-        record(
-            snapshot,
-            agent,
-            SessionEvent::ModelContext {
-                provider: "fixture".into(),
-                template: ModelRequest {
-                    model: "fixture-model".into(),
-                    system: vec![],
-                    messages: vec![],
-                    tools: vec![],
-                    response_schema: None,
-                    reasoning: None,
-                    max_output_tokens: Some(100),
-                    correlation: None,
-                },
-            },
-        )
-    }
-
-    fn delta_event(agent: AgentId, request: u64, kind: BlockKind, text: String) -> RuntimeEvent {
-        let item = match kind {
-            BlockKind::Text => "text",
-            BlockKind::Reasoning => "reasoning",
-            _ => unreachable!(),
-        };
-        RuntimeEvent::ResponseEvent {
-            agent,
-            request,
-            event: ResponseEvent::BlockDelta {
-                item: item.into(),
-                block: format!("{item}:0"),
-                delta: ContentDelta::Text(text),
-            },
+            view,
+            thinking: false,
+            all_details,
         }
     }
 
-    fn record(snapshot: &mut ObservationSnapshot, agent: &AgentId, event: SessionEvent) -> u64 {
-        let sequence = snapshot
-            .records
-            .last_key_value()
-            .map_or(1, |(sequence, _)| sequence + 1);
-        snapshot.apply(ObservedEvent {
-            revision: snapshot.revision + 1,
-            event: RuntimeEvent::Record(Box::new(EventRecord {
-                version: 1,
-                sequence,
-                timestamp_millis: 0,
-                agent: agent.clone(),
-                event,
-            })),
-        });
-        sequence
-    }
-
-    fn replay() -> ReplayEnvelope {
-        ReplayEnvelope {
-            version: 1,
-            protocol: "fixture".into(),
-            model: "fixture".into(),
-            scope: "reasoning".into(),
-            payload: serde_json::json!({"signature": "opaque"}),
-        }
-    }
-
-    fn request(snapshot: &mut ObservationSnapshot, agent: &AgentId, context: u64) -> u64 {
-        record(
+    /// Refresh the cache and check it matches a fresh uncached projection.
+    fn refresh(
+        cache: &mut ContentCache,
+        (snapshot, projection): (&ObservationSnapshot, &Projection),
+        presentation: EntryView,
+        outputs: &OutputStore,
+        revision: u64,
+    ) -> ContentChanges {
+        let changes = cache.update(
             snapshot,
-            agent,
-            SessionEvent::ModelRequested {
-                context,
-                messages: vec![ContextMessage::Inline {
-                    message: Message::User(vec![UserContent::Text {
-                        text: "original request".into(),
-                    }]),
-                }],
-                purpose: ModelPurpose::Agent,
-            },
-        )
-    }
-
-    fn response_event(
-        snapshot: &mut ObservationSnapshot,
-        agent: &AgentId,
-        request: u64,
-        event: ResponseEvent,
-    ) {
-        update(
-            snapshot,
-            RuntimeEvent::ResponseEvent {
-                agent: agent.clone(),
-                request,
-                event,
-            },
+            projection,
+            presentation,
+            outputs,
+            revision,
+            Vec::new(),
         );
-    }
-
-    fn result_record(snapshot: &mut ObservationSnapshot, agent: &AgentId, id: &str, error: bool) {
-        record(
-            snapshot,
-            agent,
-            SessionEvent::MessageCommitted {
-                message: Message::Tool(vec![ToolResult {
-                    call_id: id.into(),
-                    name: "exec".into(),
-                    result: if error {
-                        serde_json::json!({"error": "Permission was denied", "code": "permission_denied", "executed": false})
-                    } else {
-                        serde_json::json!({"stdout": "  original\ttext\n"})
-                    },
-                    images: vec![],
-                    is_error: error,
-                }]),
-            },
+        assert!(
+            cache.entries() == entries_inner(snapshot, projection, presentation, outputs, true)
         );
-    }
-
-    fn update(snapshot: &mut ObservationSnapshot, event: RuntimeEvent) {
-        // Delta fixtures start their native item/block once; production receives only full protocol events.
-        if let RuntimeEvent::ResponseEvent {
-            agent,
-            request,
-            event: ResponseEvent::BlockDelta { item, block, .. },
-        } = &event
-        {
-            let exists = snapshot
-                .responses
-                .get(&(agent.clone(), *request))
-                .is_some_and(|live| live.snapshot().items.iter().any(|entry| entry.id == *item));
-            if !exists {
-                let (position, kind, block_kind) = if item == "reasoning" {
-                    (0, ItemKind::Reasoning, BlockKind::Reasoning)
-                } else {
-                    (1, ItemKind::Text, BlockKind::Text)
-                };
-                response_event(
-                    snapshot,
-                    agent,
-                    *request,
-                    ResponseEvent::ItemStarted {
-                        id: item.clone(),
-                        position,
-                        kind,
-                    },
-                );
-                response_event(
-                    snapshot,
-                    agent,
-                    *request,
-                    ResponseEvent::BlockStarted {
-                        item: item.clone(),
-                        id: block.clone(),
-                        position: 0,
-                        kind: block_kind,
-                    },
-                );
-            }
-        }
-        snapshot.apply(ObservedEvent {
-            revision: snapshot.revision + 1,
-            event,
-        });
+        changes
     }
 
     #[test]
     fn synchronous_failure_refreshes_the_existing_call_after_interleaved_user_input() {
-        let root = AgentId::root(SessionId::from_bytes([71; 16]));
+        let agent = root(71);
         let mut snapshot = ObservationSnapshot::default();
-        call_record(&mut snapshot, &root, "call");
+        call_record(&mut snapshot, &agent, "call");
         let mut projection = Projection::default();
         projection.rebuild(&snapshot);
-        let mut cache = ContentCache::default();
-        let mut cards = vec![];
-        let outputs = HashMap::new();
-        let mut view = View::default();
-        cache.update(
-            &mut cards,
-            &snapshot,
-            &projection,
-            EntryView {
-                agent: &root,
-                view: &view,
-                thinking: false,
-                all_details: false,
-            },
+        let (mut cache, outputs, mut view) = Default::default();
+        refresh(
+            &mut cache,
+            (&snapshot, &projection),
+            show(&agent, &view, false),
             &outputs,
             0,
         );
-        assert_eq!(cards.len(), 1);
-        let key = cards[0].key.clone();
-        assert!(!cards[0].text.contains("Failed"));
+        let key = cache.entries()[0].key().clone();
+        assert!(!cache.entries()[0].text().contains("Failed"));
+        let text = "Continue after permission".into();
+        let message = Message::User(vec![UserContent::Text { text }]);
         record(
             &mut snapshot,
-            &root,
-            SessionEvent::MessageCommitted {
-                message: Message::User(vec![UserContent::Text {
-                    text: "Continue after permission".into(),
-                }]),
-            },
+            &agent,
+            SessionEvent::MessageCommitted { message },
         );
-        result_record(&mut snapshot, &root, "call", true);
+        result_record(&mut snapshot, &agent, "call", true);
         let records_before = serde_json::to_value(&snapshot.records).unwrap();
         projection.rebuild(&snapshot);
-        let changes = cache.update(
-            &mut cards,
-            &snapshot,
-            &projection,
-            EntryView {
-                agent: &root,
-                view: &view,
-                thinking: false,
-                all_details: false,
-            },
+        let changes = refresh(
+            &mut cache,
+            (&snapshot, &projection),
+            show(&agent, &view, false),
             &outputs,
             0,
         );
-        assert!(!changes.reset);
-        assert!(changes.dirty.contains(&0));
-        assert_eq!(cards.len(), 2);
-        assert_eq!(cards[0].key, key);
-        assert_eq!(cards[0].surface, Surface::Tool);
-        assert!(cards[0].job.is_none());
-        assert_eq!(cards[0].text, "▸ × exec · Failed");
-        assert!(!cards[0].text.contains("Permission"));
-        view.expanded.insert(key.clone());
-        cache.update(
-            &mut cards,
-            &snapshot,
-            &projection,
-            EntryView {
-                agent: &root,
-                view: &view,
-                thinking: false,
-                all_details: false,
-            },
+        assert!(!changes.reset && changes.dirty.contains(&0));
+        let entry = &cache.entries()[0];
+        assert_eq!(cache.entries().len(), 2);
+        assert_eq!(
+            (entry.key(), entry.surface, entry.job_id()),
+            (&key, Surface::Tool, None)
+        );
+        assert_eq!(entry.text(), "▸ × exec · Failed");
+        view.set_expanded(key.clone(), true);
+        refresh(
+            &mut cache,
+            (&snapshot, &projection),
+            show(&agent, &view, false),
             &outputs,
             1,
         );
-        assert_eq!(cards[0].key, key);
-        assert!(cards[0].text.contains("Arguments"));
-        assert!(cards[0].text.contains("Output\n  Permission was denied"));
-        assert!(cards[0].text.contains("permission_denied"));
-        assert_eq!(cards[0].text.matches("Permission was denied").count(), 1);
+        let text = cache.entries()[0].text();
+        assert_eq!(cache.entries()[0].key(), &key);
+        for part in [
+            "Arguments",
+            "Output\n  Permission was denied",
+            "permission_denied",
+        ] {
+            assert!(text.contains(part), "{text}");
+        }
+        assert_eq!(text.matches("Permission was denied").count(), 1);
         assert_eq!(
             records_before,
             serde_json::to_value(&snapshot.records).unwrap()
@@ -601,163 +436,60 @@ mod tests {
 
     #[test]
     fn content_cache_refreshes_only_invalidated_tool_output() {
-        let agent = AgentId::root(SessionId::from_bytes([34; 16]));
+        let agent = root(34);
         let snapshot = ObservationSnapshot::default();
         let mut projection = Projection::default();
         for id in 1..=2 {
-            let id = JobId::new(id).unwrap();
-            projection.jobs.insert(
-                id,
-                JobInfo {
-                    id,
-                    agent: agent.clone(),
-                    name: None,
-                    tool: "exec".into(),
-                    args: serde_json::json!({"argv": ["echo", "hi"]}),
-                    parent: None,
-                    state: JobState::Completed,
-                    target: "root".into(),
-                    location: "/tmp".into(),
-                    remote: false,
-                    error: None,
-                },
-            );
+            let job = job_info(&agent, id, JobRole::Tool, JobState::Completed);
+            projection.jobs.insert(job.id, job);
         }
         let view = View {
             tab: Tab::Jobs,
             ..View::default()
         };
-        let mut outputs = HashMap::new();
-        let mut cache = ContentCache::default();
-        let mut rows = Vec::new();
-        cache.update(
-            &mut rows,
-            &snapshot,
-            &projection,
-            EntryView {
-                agent: &agent,
-                view: &view,
-                thinking: false,
-                all_details: true,
-            },
-            &outputs,
-            0,
-        );
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|entry| entry.compact_after));
-        let unchanged = rows[1].clone();
+        let (mut outputs, mut cache) = (OutputStore::default(), ContentCache::default());
+        let state = (&snapshot, &projection);
+        refresh(&mut cache, state, show(&agent, &view, true), &outputs, 0);
+        assert_eq!(cache.entries().len(), 2);
+        let unchanged = cache.entries()[1].clone();
         let job = JobId::new(1).unwrap();
-        outputs.insert(
-            job,
-            serde_json::json!({"stdout": "new output", "exit_code": 0}),
-        );
+        let output = serde_json::json!({"stdout": "new output", "exit_code": 0});
+        outputs.insert_product(job, crate::tui::tool_view::OutputView::historical(output));
         cache.invalidate_job(job);
-        let changes = cache.update(
-            &mut rows,
-            &snapshot,
-            &projection,
-            EntryView {
-                agent: &agent,
-                view: &view,
-                thinking: false,
-                all_details: true,
-            },
-            &outputs,
-            0,
-        );
+        let changes = refresh(&mut cache, state, show(&agent, &view, true), &outputs, 0);
         assert!(!changes.reset);
         assert_eq!(changes.dirty, vec![0]);
-        assert!(rows[0].text.contains("new output"));
-        assert!(rows.iter().all(|entry| entry.compact_after));
-        assert!(rows[1] == unchanged);
-        assert!(rows == entries(&snapshot, &projection, &agent, &view, &outputs, false, true,));
+        assert!(cache.entries()[0].text().contains("new output"));
+        assert!(cache.entries().iter().all(|entry| entry.compact_after));
+        assert!(cache.entries()[1] == unchanged);
     }
 
     #[test]
     fn content_cache_reasoning_matches_uncached_across_shape_changes() {
-        let agent = AgentId::root(SessionId::from_bytes([32; 16]));
+        let agent = root(32);
         let mut snapshot = ObservationSnapshot::default();
-        let context = context(&mut snapshot, &agent);
-        let request = request(&mut snapshot, &agent, context);
+        let request = request(&mut snapshot, &agent, None);
         let mut projection = Projection::default();
         projection.rebuild(&snapshot);
-        let view = View::default();
-        let outputs = HashMap::new();
-        let mut cache = ContentCache::default();
-        let mut rows = Vec::new();
-        cache.observe_response(&agent, request);
-        cache.update(
-            &mut rows,
-            &snapshot,
-            &projection,
-            EntryView {
-                agent: &agent,
-                view: &view,
-                thinking: false,
-                all_details: false,
-            },
-            &outputs,
-            0,
-        );
-        for text in ["\n", "first", "\n", "second", "\r\n", "third", "\n\n"] {
-            update(
-                &mut snapshot,
-                delta_event(agent.clone(), request, BlockKind::Reasoning, text.into()),
-            );
+        let (view, outputs, mut cache) = Default::default();
+        let sync = |cache: &mut ContentCache, snapshot: &_, projection: &_| {
             cache.observe_response(&agent, request);
-            cache.update(
-                &mut rows,
-                &snapshot,
-                &projection,
-                EntryView {
-                    agent: &agent,
-                    view: &view,
-                    thinking: false,
-                    all_details: false,
-                },
+            refresh(
+                cache,
+                (snapshot, projection),
+                show(&agent, &view, false),
                 &outputs,
                 0,
             );
-            let expected = entries(
-                &snapshot,
-                &projection,
-                &agent,
-                &view,
-                &outputs,
-                false,
-                false,
-            );
-            assert!(rows == expected);
+        };
+        sync(&mut cache, &snapshot, &projection);
+        for text in ["\n", "first", "\n", "second", "\r\n", "third", "\n\n"] {
+            delta(&mut snapshot, &agent, request, "reasoning", text);
+            sync(&mut cache, &snapshot, &projection);
         }
-        update(
-            &mut snapshot,
-            delta_event(agent.clone(), request, BlockKind::Text, "answer".into()),
-        );
-        cache.observe_response(&agent, request);
-        cache.update(
-            &mut rows,
-            &snapshot,
-            &projection,
-            EntryView {
-                agent: &agent,
-                view: &view,
-                thinking: false,
-                all_details: false,
-            },
-            &outputs,
-            0,
-        );
-        let expected = entries(
-            &snapshot,
-            &projection,
-            &agent,
-            &view,
-            &outputs,
-            false,
-            false,
-        );
-        assert!(rows == expected);
-        // Equal-length authoritative replacement and block-only closure must invalidate cards.
+        delta(&mut snapshot, &agent, request, "text", "answer");
+        sync(&mut cache, &snapshot, &projection);
+        // Equal-length authoritative replacement and block-only closure must invalidate entries.
         let provisional = snapshot.responses[&(agent.clone(), request)]
             .snapshot()
             .items[0]
@@ -766,307 +498,246 @@ mod tests {
             .clone();
         let replacement = provisional.replace("first", "FIRST");
         assert_eq!(replacement.len(), provisional.len());
-        response_event(
-            &mut snapshot,
-            &agent,
-            request,
+        let (item, block) = (String::from("reasoning"), String::from("reasoning:0"));
+        let text = replacement.clone();
+        for event in [
             ResponseEvent::BlockEnded {
-                item: "reasoning".into(),
-                block: "reasoning:0".into(),
-                content: BlockContent::Reasoning { text: replacement },
+                item: item.clone(),
+                block: block.clone(),
+                content: BlockContent::Reasoning { text },
             },
-        );
-        response_event(
-            &mut snapshot,
-            &agent,
-            request,
             ResponseEvent::ItemEnded {
-                id: "reasoning".into(),
+                id: item.clone(),
                 replay: Some(replay()),
             },
-        );
-        cache.observe_response(&agent, request);
-        cache.update(
-            &mut rows,
-            &snapshot,
-            &projection,
-            EntryView {
-                agent: &agent,
-                view: &view,
-                thinking: false,
-                all_details: false,
+        ] {
+            response(&mut snapshot, &agent, request, event);
+        }
+        sync(&mut cache, &snapshot, &projection);
+        assert!(!cache.entries()[0].running);
+        assert!(cache.entries()[0].text().starts_with("▸ Reasoning"));
+        let keys = vec![
+            EntryKey::ReasoningBlock {
+                request,
+                item,
+                block,
             },
-            &outputs,
-            0,
-        );
-        let expected = entries(
-            &snapshot,
-            &projection,
+            EntryKey::ResponseBlock {
+                request,
+                item: "text".into(),
+                block: "text:0".into(),
+            },
+        ];
+        let cached = |cache: &ContentCache| {
+            let keys = cache.entries().iter().map(|entry| entry.key().clone());
+            keys.collect::<Vec<_>>()
+        };
+        assert_eq!(cached(&cache), keys);
+        let message = Message::Assistant(vec![
+            AssistantItem::reasoning("reasoning", 0, replacement, Some(replay())),
+            AssistantItem::text("text", 1, "answer"),
+        ]);
+        record(
+            &mut snapshot,
             &agent,
-            &view,
-            &outputs,
-            false,
-            false,
+            SessionEvent::MessageCommitted { message },
         );
-        assert!(rows == expected);
-        assert!(
-            rows.iter()
-                .filter(|entry| entry.surface == Surface::Reasoning)
-                .all(|entry| !entry.running)
-        );
+        projection.rebuild(&snapshot);
+        sync(&mut cache, &snapshot, &projection);
+        assert_eq!(cached(&cache), keys);
     }
 
     #[test]
     fn cached_reconnecting_indicator_tracks_activity_changes() {
-        let root = AgentId::root(SessionId::from_bytes([1; 16]));
+        let agent = root(1);
         let mut snapshot = ObservationSnapshot::default();
-        let projection = Projection::default();
-        let view = View::default();
-        let outputs = HashMap::new();
-        let mut cache = ContentCache::default();
-        let mut rows = Vec::new();
+        let (projection, view, outputs, mut cache) = Default::default();
+        let reconnecting = |attempt| AgentActivity::Reconnecting {
+            attempt,
+            max_attempts: Some(3),
+        };
         for activity in [
             AgentActivity::Working,
-            AgentActivity::Reconnecting {
-                attempt: 2,
-                max_attempts: Some(3),
-            },
-            AgentActivity::Reconnecting {
-                attempt: 3,
-                max_attempts: Some(3),
-            },
+            reconnecting(2),
+            reconnecting(3),
             AgentActivity::Interrupted,
         ] {
-            update(
-                &mut snapshot,
-                RuntimeEvent::Activity {
-                    agent: root.clone(),
-                    activity,
-                },
-            );
-            cache.update(
-                &mut rows,
-                &snapshot,
-                &projection,
-                EntryView {
-                    agent: &root,
-                    view: &view,
-                    thinking: false,
-                    all_details: false,
-                },
+            let event = RuntimeEvent::Activity {
+                agent: agent.clone(),
+                activity,
+            };
+            update(&mut snapshot, event);
+            refresh(
+                &mut cache,
+                (&snapshot, &projection),
+                show(&agent, &view, false),
                 &outputs,
                 0,
             );
-            let expected = entries(&snapshot, &projection, &root, &view, &outputs, false, false);
-            assert!(rows == expected);
         }
-        assert!(rows.is_empty());
+        assert!(cache.entries().is_empty());
     }
+
     #[test]
     fn retry_error_lifecycle_matches_fresh_rendering_and_replay() {
-        let agent = AgentId::root(SessionId::from_bytes([41; 16]));
+        let agent = root(41);
         let mut snapshot = ObservationSnapshot::default();
-        let context = context(&mut snapshot, &agent);
-        let request = request(&mut snapshot, &agent, context);
-        let view = super::super::View::default();
-        let outputs = HashMap::new();
-        let presentation = EntryView {
-            agent: &agent,
-            view: &view,
-            thinking: false,
-            all_details: false,
+        let request = request(&mut snapshot, &agent, None);
+        let (view, outputs, mut cache, mut projection) = Default::default();
+        let presentation = show(&agent, &view, false);
+        let commit = |state: (&mut ObservationSnapshot, &mut Projection),
+                      cache: &mut ContentCache,
+                      event| {
+            record(state.0, &agent, event);
+            state.1.rebuild(state.0);
+            refresh(cache, (state.0, state.1), presentation, &outputs, 0)
         };
-        let mut cache = ContentCache::default();
-        let mut projection = Projection::default();
-        let mut cards = Vec::new();
+        let replayed = |snapshot: &ObservationSnapshot| {
+            let mut replay = ObservationSnapshot::default();
+            for event in snapshot.records.values() {
+                update(&mut replay, RuntimeEvent::Record(Box::new(event.clone())));
+            }
+            let mut projection = Projection::default();
+            projection.rebuild(&replay);
+            entries_inner(&replay, &projection, presentation, &outputs, true)
+        };
         for attempt in 1..=3 {
-            record(
-                &mut snapshot,
-                &agent,
-                SessionEvent::ModelAttemptStarted { request, attempt },
+            let started = SessionEvent::ModelAttemptStarted { request, attempt };
+            commit((&mut snapshot, &mut projection), &mut cache, started);
+            assert_eq!(cache.entries().len(), 1);
+            assert_ne!(cache.entries()[0].key(), &EntryKey::Retry(request));
+            let text = cache.entries()[0].text();
+            assert!(
+                ["attempt", "partial", "HTTP"]
+                    .iter()
+                    .all(|part| !text.contains(part))
             );
-            projection.rebuild(&snapshot);
-            cache.update(
-                &mut cards,
-                &snapshot,
-                &projection,
-                presentation,
-                &outputs,
-                0,
-            );
-            assert_eq!(cards.len(), 1);
-            assert_ne!(cards[0].key, format!("failed{request}"));
-            assert!(!cards[0].text.contains("attempt"));
-            assert!(!cards[0].text.contains("partial"));
-            assert!(!cards[0].text.contains("HTTP"));
             for (index, suffix) in [format!("partial {attempt}"), " updated".into()]
                 .into_iter()
                 .enumerate()
             {
-                update(
-                    &mut snapshot,
-                    delta_event(agent.clone(), request, BlockKind::Text, suffix),
-                );
+                delta(&mut snapshot, &agent, request, "text", &suffix);
                 cache.observe_response(&agent, request);
-                let changes = cache.update(
-                    &mut cards,
-                    &snapshot,
-                    &projection,
+                let changes = refresh(
+                    &mut cache,
+                    (&snapshot, &projection),
                     presentation,
                     &outputs,
                     0,
                 );
-                if index > 0 {
-                    assert!(!changes.reset);
-                }
-                let fresh = entries_inner(&snapshot, &projection, presentation, &outputs, true);
-                assert!(cards == fresh);
-                assert!(cards.iter().all(|entry| !entry.text.contains("attempt")));
+                assert!(index == 0 || !changes.reset);
+                assert!(
+                    cache
+                        .entries()
+                        .iter()
+                        .all(|entry| !entry.text().contains("attempt"))
+                );
             }
             if attempt == 3 {
                 break;
             }
-            record(
-                &mut snapshot,
-                &agent,
-                SessionEvent::ModelFailed {
-                    request,
-                    attempt,
-                    error: "HTTP 503 [code=overloaded]".into(),
-                },
-            );
-            projection.rebuild(&snapshot);
-            let failed = cache.update(
-                &mut cards,
-                &snapshot,
-                &projection,
-                presentation,
-                &outputs,
-                0,
-            );
-            assert!(failed.reset);
-            assert_eq!(cards.len(), 1);
-            assert_eq!(cards[0].key, format!("failed{request}"));
-            record(
-                &mut snapshot,
-                &agent,
-                SessionEvent::ModelRecoveryScheduled {
-                    request,
-                    attempt: attempt + 1,
-                    max_attempts: None,
-                    delay_millis: 1000,
-                    error: "HTTP 503 [code=overloaded]".into(),
-                },
-            );
-            projection.rebuild(&snapshot);
-            let changes = cache.update(
-                &mut cards,
-                &snapshot,
-                &projection,
-                presentation,
-                &outputs,
-                0,
-            );
-            assert!(!changes.reset);
-            assert_eq!(cards.len(), 1);
-            assert!(
-                cards[0]
-                    .text
-                    .contains(&format!("Retrying · attempt {}", attempt + 1))
-            );
-            assert!(cards[0].text.contains("HTTP 503"));
-            assert!(cards[0].text.contains("retry delay 1000 ms"));
-            assert!(
-                cards[0]
-                    .text
-                    .ends_with(&format!("partial {attempt} updated"))
-            );
-            assert!(cards == entries_inner(&snapshot, &projection, presentation, &outputs, true));
-        }
-        record(
-            &mut snapshot,
-            &agent,
-            SessionEvent::MessageCommitted {
-                message: Message::Assistant(vec![
-                    skyhook::provider::protocol::AssistantContent::text(
-                        "answer",
-                        0,
-                        "final answer",
-                    ),
-                ]),
-            },
-        );
-        projection.rebuild(&snapshot);
-        cache.update(
-            &mut cards,
-            &snapshot,
-            &projection,
-            presentation,
-            &outputs,
-            0,
-        );
-        assert_eq!(cards.len(), 1);
-        assert!(cards[0].text.ends_with("final answer"));
-        assert!(!cards[0].text.contains("attempt") && !cards[0].text.contains("partial"));
-        assert!(cards[0].footer.is_some());
-        let mut replay = ObservationSnapshot::default();
-        for event in snapshot.records.values() {
-            update(&mut replay, RuntimeEvent::Record(Box::new(event.clone())));
-        }
-        projection.rebuild(&replay);
-        assert!(cards == entries_inner(&replay, &projection, presentation, &outputs, true));
-
-        // A provider abort commits its visible text before publishing ModelFailed.
-        // Keep the normal message intact and add diagnostics, including on replay.
-        let committed = cards[0].clone();
-        record(
-            &mut snapshot,
-            &agent,
-            SessionEvent::ModelFailed {
+            let error = String::from("HTTP 503 [code=overloaded]");
+            let failed = SessionEvent::ModelFailed {
                 request,
-                attempt: 3,
-                error: "provider aborted response".into(),
-            },
+                attempt,
+                error: error.clone(),
+            };
+            assert!(commit((&mut snapshot, &mut projection), &mut cache, failed).reset);
+            assert_eq!(cache.entries().len(), 1);
+            assert_eq!(cache.entries()[0].key(), &EntryKey::Retry(request));
+            let scheduled = SessionEvent::ModelRecoveryScheduled {
+                request,
+                attempt: attempt + 1,
+                max_attempts: None,
+                delay_millis: 1000,
+                error,
+            };
+            assert!(!commit((&mut snapshot, &mut projection), &mut cache, scheduled).reset);
+            assert_eq!(cache.entries().len(), 1);
+            let text = cache.entries()[0].text();
+            let retrying = format!("Retrying · attempt {}", attempt + 1);
+            for part in [retrying.as_str(), "HTTP 503", "retry delay 1000 ms"] {
+                assert!(text.contains(part), "{text}");
+            }
+            assert!(text.ends_with(&format!("partial {attempt} updated")));
+        }
+        let message = Message::Assistant(vec![AssistantItem::text("answer", 0, "final answer")]);
+        let committed = SessionEvent::MessageCommitted { message };
+        commit((&mut snapshot, &mut projection), &mut cache, committed);
+        assert_eq!(cache.entries().len(), 1);
+        let committed = cache.entries()[0].clone();
+        let text = committed.text();
+        assert!(
+            text.ends_with("final answer")
+                && !text.contains("attempt")
+                && !text.contains("partial")
         );
+        assert!(committed.footer.is_some());
+        assert!(cache.entries() == replayed(&snapshot));
+
+        // A provider abort commits its visible text before publishing ModelFailed:
+        // the message stays intact beside the diagnostics, including on replay.
+        let error = "provider aborted response".into();
+        let failed = SessionEvent::ModelFailed {
+            request,
+            attempt: 3,
+            error,
+        };
+        commit((&mut snapshot, &mut projection), &mut cache, failed);
+        assert_eq!(cache.entries().len(), 2);
+        assert!(cache.entries().contains(&committed));
+        let failures: Vec<_> = cache
+            .entries()
+            .iter()
+            .filter(|card| card.key() == &EntryKey::Retry(request))
+            .map(Entry::text)
+            .collect();
+        assert_eq!(
+            failures,
+            ["Request failed · attempt 3\nprovider aborted response"]
+        );
+        assert!(cache.entries() == replayed(&snapshot));
+    }
+
+    #[test]
+    fn retained_owner_separates_overlay_and_keeps_replacement_indices_valid() {
+        let agent = root(99);
+        let mut snapshot = ObservationSnapshot::default();
+        let (mut projection, view, outputs, mut cache) = Default::default();
+        let presentation = show(&agent, &view, false);
+        let sync = |cache: &mut ContentCache, snapshot: &_, projection: &_, text: Option<&str>| {
+            let overlay = text
+                .map(|text| Entry::new(EntryKey::UnsavedStatus(0), text.into(), Surface::Status));
+            let overlay = overlay.into_iter().collect();
+            cache.update(snapshot, projection, presentation, &outputs, 0, overlay)
+        };
+        assert!(sync(&mut cache, &snapshot, &projection, Some("first")).reset);
+        assert_eq!(cache.entries().len(), 1);
+        let changes = sync(&mut cache, &snapshot, &projection, Some("other"));
+        assert!(!changes.reset);
+        assert_eq!(changes.dirty, vec![0]);
+        assert_eq!(cache.entries()[0].text(), "other");
+        call_record(&mut snapshot, &agent, "call");
         projection.rebuild(&snapshot);
+        sync(&mut cache, &snapshot, &projection, Some("other"));
+        assert_eq!(cache.entries().len(), 2);
+        assert_eq!(cache.entries()[1].key(), &EntryKey::UnsavedStatus(0));
+        sync(&mut cache, &snapshot, &projection, None);
+        assert_eq!(cache.entries().len(), 1);
+        // Switching to an empty tab invalidates retained history and old overlay.
+        let view = View {
+            tab: Tab::Requests,
+            ..View::default()
+        };
+        let presentation = show(&agent, &view, false);
         cache.update(
-            &mut cards,
             &snapshot,
             &projection,
             presentation,
             &outputs,
-            0,
+            1,
+            Vec::new(),
         );
-        assert_eq!(cards.len(), 2);
-        assert_eq!(
-            cards
-                .iter()
-                .filter(|card| card.key == format!("failed{request}"))
-                .count(),
-            1
-        );
-        let failure = cards
-            .iter()
-            .find(|card| card.key == format!("failed{request}"))
-            .unwrap();
-        assert_eq!(
-            failure.text,
-            "Request failed · attempt 3\nprovider aborted response"
-        );
-        assert!(cards.iter().any(|card| card == &committed));
-        assert_eq!(
-            cards
-                .iter()
-                .map(|card| card.text.matches("final answer").count())
-                .sum::<usize>(),
-            1
-        );
-        assert!(cards == entries_inner(&snapshot, &projection, presentation, &outputs, true));
-        let mut replay = ObservationSnapshot::default();
-        for event in snapshot.records.values() {
-            update(&mut replay, RuntimeEvent::Record(Box::new(event.clone())));
-        }
-        projection.rebuild(&replay);
-        assert!(cards == entries_inner(&replay, &projection, presentation, &outputs, true));
+        assert!(cache.entries().is_empty());
     }
 }

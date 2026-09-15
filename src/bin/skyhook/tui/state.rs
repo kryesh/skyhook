@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
     io::Write,
     path::{Path, PathBuf},
 };
@@ -10,11 +9,6 @@ use std::{
 pub struct SavedState {
     pub model: Option<String>,
 }
-#[derive(Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Settings {
-    pub keybinds: BTreeMap<String, String>,
-}
 pub fn state_path() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .filter(|s| !s.is_empty())
@@ -23,15 +17,6 @@ pub fn state_path() -> PathBuf {
             PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
         })
         .join("skyhook/ui.json")
-}
-pub fn config_path() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
-        })
-        .join("skyhook/tui.toml")
 }
 pub fn load() -> (SavedState, Option<String>) {
     match std::fs::read(state_path()) {
@@ -47,13 +32,6 @@ pub fn load() -> (SavedState, Option<String>) {
             SavedState::default(),
             Some(format!("Could not read UI state: {e}")),
         ),
-    }
-}
-pub fn settings() -> Result<Settings, String> {
-    match std::fs::read_to_string(config_path()) {
-        Ok(text) => toml::from_str(&text).map_err(|e| format!("Invalid tui.toml: {e}")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
-        Err(e) => Err(e.to_string()),
     }
 }
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -76,4 +54,18 @@ fn update(edit: impl FnOnce(&mut SavedState)) -> std::io::Result<()> {
     let (mut state, _) = load();
     edit(&mut state);
     atomic_write(&state_path(), &serde_json::to_vec(&state)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_write_failure_preserves_existing_path() {
+        let root = tempfile::tempdir().unwrap();
+        let blocker = root.path().join("not-a-directory");
+        std::fs::write(&blocker, b"preserved").unwrap();
+        assert!(atomic_write(&blocker.join("ui.json"), b"replacement").is_err());
+        assert_eq!(std::fs::read(blocker).unwrap(), b"preserved");
+    }
 }

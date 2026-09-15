@@ -194,7 +194,7 @@ impl SessionRuntime {
             })
             .transpose()?;
         let sender = self
-            .agent_sender(&context.agent)
+            .agent_sender(context.agent())
             .ok_or_else(|| ToolError::Failed("calling agent is not active".into()))?;
         let mut revision = sender.wake.revision.subscribe();
         loop {
@@ -207,7 +207,7 @@ impl SessionRuntime {
             if sender.wake.ready_input_revision.load(Ordering::Acquire)
                 != sender.wake.observed_input.load(Ordering::Acquire)
                 || (released != sender.wake.observed.load(Ordering::Acquire)
-                    && self.jobs.has_pending(&context.agent).await)
+                    && self.jobs.has_pending(context.agent()).await)
             {
                 return Ok(WaitOutput {
                     reason: WakeReason::Event,
@@ -232,16 +232,13 @@ impl SessionRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        future::Future,
-        sync::{Arc, Mutex as StdMutex},
-        time::Duration,
-    };
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use serde_json::Value;
     use tokio::sync::{Notify, Semaphore};
 
     use super::super::*;
+    pub(super) use crate::agent::runtime::tests::{bounded, enqueue_prompts};
     use crate::{
         job::{JobOutcome, JobSpec, JobState},
         provider::{
@@ -265,24 +262,18 @@ mod tests {
 
     impl Tracking {
         pub(super) fn new(steps: Vec<(&'static str, AssistantContent)>) -> Arc<Self> {
-            Self::responses(
-                steps
-                    .into_iter()
-                    .map(|(model, content)| (model, vec![content]))
-                    .collect(),
-            )
+            let steps = steps.into_iter().map(|(m, c)| (m, vec![c]));
+            Self::responses(steps.collect())
         }
 
         pub(super) fn responses(steps: Vec<(&'static str, Vec<AssistantContent>)>) -> Arc<Self> {
+            let steps = steps.into_iter().map(|(model, content)| Step {
+                model,
+                content,
+                gate: Semaphore::new(0),
+            });
             Arc::new(Self {
-                steps: steps
-                    .into_iter()
-                    .map(|(model, content)| Step {
-                        model,
-                        content,
-                        gate: Semaphore::new(0),
-                    })
-                    .collect(),
+                steps: steps.collect(),
                 requests: StdMutex::new(Vec::new()),
                 changed: Notify::new(),
             })
@@ -309,6 +300,19 @@ mod tests {
 
         pub(super) fn release(&self, step: usize) {
             self.steps[step].gate.add_permits(1);
+        }
+
+        /// Waits for a step's request, then lets its response through.
+        pub(super) async fn pass(&self, step: usize) -> ModelRequest {
+            let request = self.request(step).await;
+            self.release(step);
+            request
+        }
+
+        /// Whether any step at or after `step` has been requested.
+        pub(super) fn requested_from(&self, step: usize) -> bool {
+            let requests = self.requests.lock().unwrap();
+            requests.iter().any(|(seen, _)| *seen >= step)
         }
     }
 
@@ -349,54 +353,35 @@ mod tests {
                 };
                 let mut events = events_for_content(&content);
                 events.push(ResponseChunk::ResponseEnded { stop_reason });
-                Ok(
-                    Box::pin(futures_util::stream::iter(events.into_iter().map(Ok)))
-                        as ResponseStream,
-                )
+                let events = futures_util::stream::iter(events.into_iter().map(Ok));
+                Ok(Box::pin(events) as ResponseStream)
             })
         }
     }
 
     pub(super) fn call(id: &str, name: &str, arguments: Value) -> AssistantContent {
-        AssistantContent::tool_call(
-            id,
-            0,
-            ToolCall {
-                id: id.into(),
-                name: name.into(),
-                arguments,
-            },
-        )
+        AssistantContent::tool_call(id, 0, ToolCall::new(id, name, arguments).unwrap())
     }
 
     pub(super) fn answer() -> AssistantContent {
         AssistantContent::text("answer", 0, "done".to_owned())
     }
 
-    pub(super) async fn bounded<T>(future: impl Future<Output = T>) -> T {
-        tokio::time::timeout(Duration::from_secs(10), future)
-            .await
-            .expect("wait test synchronization timed out")
-    }
-
-    pub(super) async fn harness(root: &Path, tracking: Arc<Tracking>) -> Harness {
-        let profile = |model: &str| ModelProfile {
-            provider: "wait-test".into(),
-            model: model.into(),
-            reasoning: None,
-            max_context: 128_000,
-            max_output: 4096,
-            supports_images: true,
-        };
-        HarnessBuilder::new(root)
-            .session_root(root.join("sessions"))
-            .provider("wait-test", Arc::new(Factory(tracking)))
+    /// A session whose "root" and "child" profiles are answered by `tracking`.
+    pub(super) async fn start(tracking: &Arc<Tracking>) -> (tempfile::TempDir, Arc<SessionHandle>) {
+        let root = tempfile::tempdir().unwrap();
+        let profile =
+            |model: &str| ModelProfile::new("wait-test", model, None, 128_000, 4096, true);
+        let harness = HarnessBuilder::new(root.path())
+            .session_root(root.path().join("sessions"))
+            .provider("wait-test", Arc::new(Factory(tracking.clone())))
             .model_profile("root", profile("root"))
             .model_profile("child", profile("child"))
             .default_model_profile("root")
             .build()
             .await
-            .unwrap()
+            .unwrap();
+        (root, Arc::new(harness.new_session().await.unwrap()))
     }
 
     pub(super) fn prompt(
@@ -406,16 +391,12 @@ mod tests {
         tokio::spawn(async move { session.prompt("start").await })
     }
 
-    pub(super) async fn running_job(session: &SessionHandle, tool: &str) -> JobId {
-        let runtime = &session.runtime;
+    pub(super) async fn running_job(session: &SessionHandle, owner: &AgentId, tool: &str) -> JobId {
         bounded(async {
             loop {
-                if let Some(job) = runtime
-                    .jobs
-                    .list(&session.root)
-                    .await
-                    .into_iter()
-                    .find(|job| job.tool == tool && job.state == JobState::Running)
+                let mut jobs = session.runtime.jobs.list(owner).await.into_iter();
+                if let Some(job) =
+                    jobs.find(|job| job.tool == tool && job.state == JobState::Running)
                 {
                     return job.id;
                 }
@@ -425,115 +406,74 @@ mod tests {
         .await
     }
 
-    pub(super) async fn complete_background(session: &SessionHandle, value: &str) -> JobId {
-        complete_background_for(session, &session.root, value).await
+    /// The only non-root agent and its command sender.
+    pub(super) fn only_child(session: &SessionHandle) -> (AgentId, AgentSender) {
+        let agents = session.runtime.agents.read().unwrap();
+        let (child, slot) = agents.iter().find(|(id, _)| **id != session.root).unwrap();
+        (child.clone(), slot.sender.clone())
     }
-
-    pub(super) async fn complete_background_for(
+    pub(super) async fn complete_background(
         session: &SessionHandle,
         owner: &AgentId,
         value: &str,
     ) -> JobId {
-        let runtime = &session.runtime;
-        let lease = runtime
-            .jobs
-            .create(JobSpec {
-                background: true,
-                ..JobSpec::test(owner.clone(), "wait-fixture")
-            })
-            .await
-            .unwrap();
-        runtime
-            .jobs
-            .transition(lease.id, JobState::Running)
-            .await
-            .unwrap();
-        runtime
-            .jobs
-            .finish(
-                lease.id,
-                JobOutcome::Completed(ToolOutput::new(json!({"value":value}))),
-            )
-            .await
-            .unwrap();
-        lease.id
+        let jobs = &session.runtime.jobs;
+        let spec = JobSpec {
+            background: true,
+            ..JobSpec::test(owner.clone(), "wait-fixture")
+        };
+        let lease = jobs.create(spec).await.unwrap();
+        let id = lease.id();
+        jobs.transition(id, JobState::Running).await.unwrap();
+        let outcome = JobOutcome::Completed(ToolOutput::new(json!({"value":value})));
+        jobs.finish(id, outcome).await.unwrap();
+        lease.into_test_id()
     }
 
     pub(super) fn events(request: &ModelRequest) -> Vec<Value> {
-        runtime_entries(request, "skyhook_job_events")
-            .into_iter()
-            .filter(|entry| entry["kind"] != "message")
-            .collect()
+        job_entries(request, false)
     }
 
     pub(super) fn agent_messages(request: &ModelRequest) -> Vec<Value> {
-        runtime_entries(request, "skyhook_job_events")
-            .into_iter()
-            .filter(|entry| entry["kind"] == "message")
-            .collect()
+        job_entries(request, true)
     }
 
-    pub(super) fn runtime_entries(request: &ModelRequest, tag: &str) -> Vec<Value> {
-        let prefix = format!("<{tag}>\n");
-        let suffix = format!("\n</{tag}>");
-        request
-            .messages
-            .iter()
-            .flat_map(|message| match message {
-                Message::User(content) => content
-                    .iter()
-                    .filter_map(|block| match block {
-                        UserContent::Runtime { text } => text
-                            .strip_prefix(&prefix)
-                            .and_then(|text| text.strip_suffix(&suffix))
-                            .map(|text| serde_json::from_str::<Vec<Value>>(text).unwrap()),
-                        _ => None,
-                    })
-                    .flatten()
-                    .collect::<Vec<_>>(),
-                _ => Vec::new(),
-            })
+    fn job_entries(request: &ModelRequest, messages: bool) -> Vec<Value> {
+        let (prefix, suffix) = ("<skyhook_job_events>\n", "\n</skyhook_job_events>");
+        let blocks = request.messages().flat_map(|message| match message {
+            Message::User(content) => content.as_slice(),
+            _ => &[],
+        });
+        let entries = blocks.filter_map(|block| match block {
+            UserContent::Runtime { text } => text.strip_prefix(prefix)?.strip_suffix(suffix),
+            _ => None,
+        });
+        let entries = entries.flat_map(|text| serde_json::from_str::<Vec<Value>>(text).unwrap());
+        entries
+            .filter(|entry| (entry["kind"] == "message") == messages)
             .collect()
     }
 
     pub(super) async fn child_completed(session: &SessionHandle, job: JobId) {
-        let runtime = &session.runtime;
-        bounded(async {
-            loop {
-                let state = runtime.jobs.snapshot(job).await.unwrap().state;
-                if state.is_terminal() {
-                    assert_eq!(state, JobState::Completed);
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
+        let snapshot =
+            crate::agent::runtime::tests::until(session, job, |job| job.state.is_terminal());
+        assert_eq!(snapshot.await.state, JobState::Completed);
     }
-
+    /// A completion references the child's last message rather than copying its text.
     pub(super) fn assert_child_completion(event: &Value, message: &Value) {
         assert_eq!(event["id"], message["id"]);
         assert_eq!(event["state"], "completed");
         assert_eq!(event["last_message"], message["message"]);
-        assert!(
-            event.get("result").is_none(),
-            "completion must not repeat child text: {event}"
-        );
-        assert!(
-            event.get("text").is_none(),
-            "completion must reference the message, not copy it"
-        );
+        assert!(event.get("result").is_none(), "{event}");
+        assert!(event.get("text").is_none(), "{event}");
     }
 
     pub(super) fn assert_reason(request: &ModelRequest, id: &str, reason: &str) {
-        let results = request
-            .messages
-            .iter()
-            .filter_map(|message| match message {
-                Message::Tool(results) => Some(results),
-                _ => None,
-            })
-            .flatten()
+        let results = request.messages().flat_map(|message| match message {
+            Message::Tool(results) => results.as_slice(),
+            _ => &[],
+        });
+        let results = results
             .filter(|result| result.call_id == id)
             .collect::<Vec<_>>();
         assert_eq!(results.len(), 1, "wait must have exactly one result");
@@ -541,293 +481,181 @@ mod tests {
         assert_eq!(results[0].result["result"], json!({"reason":reason}));
     }
 
+    /// Completions share one request and each carries its saved output.
+    fn assert_notifications(notifications: &[Value], expected: &[(JobId, &str)]) {
+        assert_eq!(notifications.len(), expected.len());
+        for (id, value) in expected {
+            let notification = notifications.iter().find(|event| event["id"] == id.get());
+            let notification = serde_json::to_string(notification.unwrap()).unwrap();
+            assert!(notification.contains(value));
+        }
+    }
+
     #[tokio::test]
     async fn positive_timeouts_do_not_wake_on_their_own_jobs() {
-        let workspace = tempfile::tempdir().unwrap();
         let tracking = Tracking::new(vec![
             ("root", call("first", "wait", json!({"timeout":1}))),
             ("root", call("second", "wait", json!({"timeout":1}))),
             ("root", answer()),
         ]);
-        let harness = harness(workspace.path(), tracking.clone()).await;
-        let session = Arc::new(harness.new_session().await.unwrap());
-
+        let (_root, session) = start(&tracking).await;
         let turn = prompt(&session);
-        tracking.request(0).await;
-        tracking.release(0);
-        assert_reason(&tracking.request(1).await, "first", "timeout");
-        tracking.release(1);
-        let request = tracking.request(2).await;
+        tracking.pass(0).await;
+        assert_reason(&tracking.pass(1).await, "first", "timeout");
+        let request = tracking.pass(2).await;
         assert_reason(&request, "second", "timeout");
-        assert!(
-            events(&request).is_empty(),
-            "foreground wait completion must not notify its owner"
-        );
-        tracking.release(2);
+        let notifications = events(&request);
+        // foreground wait completion must not notify its owner
+        assert!(notifications.is_empty());
         assert_eq!(bounded(turn).await.unwrap().unwrap(), "done");
         session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn clustered_background_completions_wake_and_inject_saved_output_once() {
-        let workspace = tempfile::tempdir().unwrap();
         let tracking = Tracking::new(vec![
             ("root", call("waiting", "wait", json!({}))),
             ("root", call("again", "wait", json!({"timeout":1}))),
             ("root", answer()),
         ]);
-        let harness = harness(workspace.path(), tracking.clone()).await;
-        let session = Arc::new(harness.new_session().await.unwrap());
-
+        let (_root, session) = start(&tracking).await;
+        let root = &session.root;
         let turn = prompt(&session);
-        tracking.request(0).await;
-        tracking.release(0);
-        running_job(&session, "wait").await;
-        let first = complete_background(&session, "first-output").await;
-        let second = complete_background(&session, "second-output").await;
-        let request = tracking.request(1).await;
+        tracking.pass(0).await;
+        running_job(&session, root, "wait").await;
+        let first = complete_background(&session, root, "first-output").await;
+        let second = complete_background(&session, root, "second-output").await;
+        let request = tracking.pass(1).await;
         assert_reason(&request, "waiting", "event");
         let notifications = events(&request);
-        assert_eq!(
-            notifications.len(),
-            2,
-            "clustered completions should share the next request"
+        assert_notifications(
+            &notifications,
+            &[(first, "first-output"), (second, "second-output")],
         );
-        for (id, value) in [(first, "first-output"), (second, "second-output")] {
-            let notification = notifications
-                .iter()
-                .find(|event| event["id"] == id.get())
-                .unwrap();
-            assert!(serde_json::to_string(notification).unwrap().contains(value));
-        }
-        tracking.release(1);
-        let next = tracking.request(2).await;
+        let next = tracking.pass(2).await;
         assert_reason(&next, "again", "timeout");
-        assert_eq!(
-            events(&next),
-            notifications,
-            "retained history must not get another copy"
-        );
-        tracking.release(2);
+        // retained history must not get another copy
+        assert_eq!(events(&next), notifications);
         bounded(turn).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn completion_before_wait_registration_is_not_lost() {
-        let workspace = tempfile::tempdir().unwrap();
         let tracking = Tracking::new(vec![
             ("root", call("waiting", "wait", json!({"timeout":1}))),
             ("root", answer()),
         ]);
-        let harness = harness(workspace.path(), tracking.clone()).await;
-        let session = Arc::new(harness.new_session().await.unwrap());
-
+        let (_root, session) = start(&tracking).await;
         let turn = prompt(&session);
         tracking.request(0).await;
-        let job = complete_background(&session, "already-ready").await;
+        let job = complete_background(&session, &session.root, "already-ready").await;
         tracking.release(0);
-        let next = tracking.request(1).await;
+        let next = tracking.pass(1).await;
         assert_reason(&next, "waiting", "event");
-        assert_eq!(
-            events(&next)
-                .iter()
-                .filter(|event| event["id"] == job.get())
-                .count(),
-            1
-        );
-        tracking.release(1);
+        assert_notifications(&events(&next), &[(job, "already-ready")]);
         bounded(turn).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn queued_user_input_wakes_wait_without_consuming_the_input() {
-        let workspace = tempfile::tempdir().unwrap();
         let tracking = Tracking::new(vec![
             ("root", call("waiting", "wait", json!({"timeout":null}))),
             ("root", call("again", "wait", json!({"timeout":1}))),
             ("root", answer()),
         ]);
-        let harness = harness(workspace.path(), tracking.clone()).await;
-        let session = Arc::new(harness.new_session().await.unwrap());
-
+        let (_root, session) = start(&tracking).await;
         let turn = prompt(&session);
-        tracking.request(0).await;
-        tracking.release(0);
-        running_job(&session, "wait").await;
-        let token = QueuedPromptToken::new();
+        tracking.pass(0).await;
+        running_job(&session, &session.root, "wait").await;
+        let prompt = QueuedPrompt {
+            text: "queued-wake-marker".into(),
+            attachments: vec![],
+            options: PromptOptions::default(),
+            token: QueuedPromptToken::new().unwrap(),
+        };
         let queued = tokio::spawn({
             let session = session.clone();
-            async move {
-                session
-                    .enqueue_prompt_with_options(
-                        "queued-wake-marker",
-                        &[],
-                        PromptOptions::default(),
-                        token,
-                    )
-                    .await
-            }
+            async move { enqueue_prompts(&session, vec![prompt]).await.pop().unwrap() }
         });
         let request = tracking.request(1).await;
         bounded(queued).await.unwrap().unwrap();
         assert_reason(&request, "waiting", "event");
-        assert!(
-            serde_json::to_string(&request.messages)
-                .unwrap()
-                .contains("queued-wake-marker")
-        );
+        let messages = serde_json::to_string(&request.messages().collect::<Vec<_>>()).unwrap();
+        assert!(messages.contains("queued-wake-marker"));
         tracking.release(1);
-        let next = tracking.request(2).await;
-        assert_reason(&next, "again", "timeout");
-        tracking.release(2);
+        assert_reason(&tracking.pass(2).await, "again", "timeout");
         bounded(turn).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn parent_input_wakes_wait_and_is_in_the_next_model_request() {
-        let workspace = tempfile::tempdir().unwrap();
+        let launch = json!({"prompt":"child task", "model":"child", "bg":true});
         let tracking = Tracking::new(vec![
-            (
-                "root",
-                call(
-                    "child",
-                    "agent",
-                    json!({"prompt":"child task", "model":"child", "bg":true}),
-                ),
-            ),
+            ("root", call("child", "agent", launch)),
             ("child", call("child-wait", "wait", json!({}))),
             ("root", call("parent-wait", "wait", json!({}))),
             ("child", answer()),
             ("root", answer()),
         ]);
-        let harness = harness(workspace.path(), tracking.clone()).await;
-        let session = Arc::new(harness.new_session().await.unwrap());
-        let runtime = &session.runtime;
+        let (_root, session) = start(&tracking).await;
         let turn = prompt(&session);
-        tracking.request(0).await;
-        tracking.release(0);
+        tracking.pass(0).await;
         tracking.request(1).await;
         tracking.request(2).await;
-        let child_job = running_job(&session, "agent").await;
-        let child = runtime
-            .agents
-            .read()
-            .unwrap()
-            .keys()
-            .find(|agent| **agent != session.root)
-            .unwrap()
-            .clone();
+        let child_job = running_job(&session, &session.root, "agent").await;
+        let (child, _) = only_child(&session);
         tracking.release(1);
-        bounded(async {
-            loop {
-                if runtime
-                    .jobs
-                    .list(&child)
-                    .await
-                    .iter()
-                    .any(|job| job.tool == "wait" && job.state == JobState::Running)
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        runtime
-            .jobs
-            .send(child_job, json!("parent-wake-marker"))
+        running_job(&session, &child, "wait").await;
+        let jobs = &session.runtime.jobs;
+        jobs.send(child_job, json!("parent-wake-marker"))
             .await
             .unwrap();
-        let next = tracking.request(3).await;
+        let next = tracking.pass(3).await;
         assert_reason(&next, "child-wait", "event");
-        assert_eq!(
-            serde_json::to_string(&next.messages)
-                .unwrap()
-                .matches("parent-wake-marker")
-                .count(),
-            1
-        );
-        tracking.release(3);
+        let messages = serde_json::to_string(&next.messages().collect::<Vec<_>>()).unwrap();
+        assert_eq!(messages.matches("parent-wake-marker").count(), 1);
         child_completed(&session, child_job).await;
         tracking.release(2);
-        tracking.request(4).await;
-        tracking.release(4);
+        tracking.pass(4).await;
         bounded(turn).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn wait_rejects_invalid_timeouts_and_unknown_arguments() {
-        let workspace = tempfile::tempdir().unwrap();
-        let harness = harness(workspace.path(), Tracking::new(vec![])).await;
-        let session = Arc::new(harness.new_session().await.unwrap());
-        let runtime = &session.runtime;
-        for invalid in [
-            json!({"timeout":0}),
-            json!({"timeout":0.125}),
-            json!({"timeout":-1}),
-            json!({"timeout":1e300}),
-            json!({"timeout":"1"}),
-            json!({"timeout":true}),
-            json!({"bg":true}),
-            json!({"bg":false}),
-            json!({"job":1}),
-            json!({"wait":1}),
-        ] {
-            let result = bounded(runtime.executor.execute(
-                session.root.clone(),
-                "wait",
-                invalid.clone(),
-                None,
-            ))
-            .await;
-            assert!(result.is_err(), "accepted {invalid}");
+    async fn wait_rejects_invalid_arguments_and_script_waits_do_not_self_wake() {
+        let (_root, session) = start(&Tracking::new(vec![])).await;
+        let invalid = json!([{"timeout":0}, {"timeout":0.125}, {"timeout":-1}, {"timeout":1e300}, {"timeout":"1"}, {"timeout":true}, {"bg":true}, {"bg":false}, {"job":1}, {"wait":1}]);
+        for invalid in invalid.as_array().unwrap() {
+            let executor = &session.runtime.executor;
+            let result = executor.execute(session.root.clone(), "wait", invalid.clone(), None);
+            assert!(bounded(result).await.is_err(), "accepted {invalid}");
         }
-        session.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn native_script_wait_supports_direct_and_builder_calls_without_self_wake() {
-        let workspace = tempfile::tempdir().unwrap();
-        let harness = harness(workspace.path(), Tracking::new(vec![])).await;
-        let session = harness.new_session().await.unwrap();
-        let output = bounded(session.run_script(
-            "const direct = await tool.wait({timeout:1}); const builder = await tool.wait().timeout(1); return [direct, builder];",
-        ))
-        .await
-        .unwrap();
-        assert_eq!(
-            output.value,
-            json!({"value":[{"reason":"timeout"}, {"reason":"timeout"}], "console":""})
-        );
+        let source = "const direct = await tool.wait({timeout:1}); const builder = await tool.wait().timeout(1); return [direct, builder];";
+        let output = bounded(session.run_script(source)).await.unwrap();
+        let timeouts = json!([{"reason":"timeout"}, {"reason":"timeout"}]);
+        assert_eq!(output.value, json!({"value":timeouts, "console":""}));
         session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn cancelling_an_indefinite_wait_unblocks_the_agent() {
-        let workspace = tempfile::tempdir().unwrap();
         let tracking = Tracking::new(vec![
             ("root", call("waiting", "wait", json!({}))),
             ("root", answer()),
         ]);
-        let harness = harness(workspace.path(), tracking.clone()).await;
-        let session = Arc::new(harness.new_session().await.unwrap());
-        let runtime = &session.runtime;
+        let (_root, session) = start(&tracking).await;
         let turn = prompt(&session);
-        tracking.request(0).await;
-        tracking.release(0);
-        let job = running_job(&session, "wait").await;
+        tracking.pass(0).await;
+        let job = running_job(&session, &session.root, "wait").await;
         session.cancel_job(job).await.unwrap();
         let next = tracking.request(1).await;
-        let text = serde_json::to_string(&next.messages).unwrap();
+        let text = serde_json::to_string(&next.messages().collect::<Vec<_>>()).unwrap();
         assert!(text.contains("cancel"), "{text}");
-        assert_eq!(
-            runtime.jobs.snapshot(job).await.unwrap().state,
-            JobState::Cancelled
-        );
+        let state = session.runtime.jobs.snapshot(job).await.unwrap().state;
+        assert_eq!(state, JobState::Cancelled);
         tracking.release(1);
         bounded(turn).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
@@ -835,54 +663,31 @@ mod tests {
 
     #[tokio::test]
     async fn idle_agent_batches_background_notifications_without_a_wait_call() {
-        let workspace = tempfile::tempdir().unwrap();
-        let tracking = Tracking::new(vec![
-            ("root", answer()),
-            ("root", answer()),
-            ("root", answer()),
-        ]);
-        let harness = harness(workspace.path(), tracking.clone()).await;
-        let session = Arc::new(harness.new_session().await.unwrap());
-
+        let tracking = Tracking::new(vec![("root", answer()); 3]);
+        let (_root, session) = start(&tracking).await;
+        let root = &session.root;
         let initial = prompt(&session);
-        tracking.request(0).await;
-        tracking.release(0);
+        tracking.pass(0).await;
         bounded(initial).await.unwrap().unwrap();
 
-        let first = complete_background(&session, "idle-first-output").await;
-        let second = complete_background(&session, "idle-second-output").await;
+        let first = complete_background(&session, root, "idle-first-output").await;
+        let second = complete_background(&session, root, "idle-second-output").await;
         let next = tracking.request(1).await;
         let notifications = events(&next);
-        assert_eq!(
-            notifications.len(),
-            2,
-            "idle completion batching must not require calling wait"
-        );
-        for (id, value) in [(first, "idle-first-output"), (second, "idle-second-output")] {
-            let notification = notifications
-                .iter()
-                .find(|event| event["id"] == id.get())
-                .unwrap();
-            assert!(serde_json::to_string(notification).unwrap().contains(value));
-        }
+        let expected = [(first, "idle-first-output"), (second, "idle-second-output")];
+        assert_notifications(&notifications, &expected);
 
         let barrier = tokio::spawn({
             let session = session.clone();
             async move { session.prompt("idle-batch-barrier").await }
         });
         tracking.release(1);
-        let final_request = tracking.request(2).await;
-        assert!(
-            serde_json::to_string(&final_request.messages)
-                .unwrap()
-                .contains("idle-batch-barrier")
-        );
-        assert_eq!(
-            events(&final_request),
-            notifications,
-            "completed output must not be injected twice"
-        );
-        tracking.release(2);
+        let final_request = tracking.pass(2).await;
+        let messages =
+            serde_json::to_string(&final_request.messages().collect::<Vec<_>>()).unwrap();
+        assert!(messages.contains("idle-batch-barrier"));
+        // completed output must not be injected twice
+        assert_eq!(events(&final_request), notifications);
         bounded(barrier).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
     }

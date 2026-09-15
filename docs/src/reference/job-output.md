@@ -139,5 +139,5 @@ generated from the result object and available capture descriptors.
 
 The journal stores the exact model-visible previews, pages, and notifications. Full artifacts
 are separate; provider-neutral request reconstruction reuses committed content rather than
-regenerating it from current files or settings. Session format 2 has no migration layer;
-version-1 journals are rejected.
+regenerating it from current files or settings. Session format 3 has no migration layer;
+earlier journals are rejected.

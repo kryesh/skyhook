@@ -245,43 +245,71 @@ pub(super) mod tests {
         packets
     }
 
+    pub(super) const USAGE: Usage = Usage {
+        input_tokens: 20,
+        cached_input_tokens: 80,
+        output_tokens: 10,
+    };
+
+    pub(super) fn contents(items: &[AssistantItem]) -> Vec<&BlockContent> {
+        items.iter().map(|item| &item.blocks[0].content).collect()
+    }
+
+    pub(super) fn text(text: &str) -> BlockContent {
+        BlockContent::Text { text: text.into() }
+    }
+
     #[test]
-    fn post_finish_rejects_substantive_and_malformed_known_delta_fields() {
-        for field in [
-            "role",
-            "content",
-            "refusal",
-            "reasoning_content",
-            "reasoning",
-        ] {
-            let values = if field == "role" {
-                vec![
-                    json!(""),
-                    json!("user"),
-                    json!("system"),
-                    json!(false),
-                    json!({}),
-                ]
-            } else {
-                vec![json!("late"), json!(0), json!(false), json!([]), json!({})]
-            };
-            for value in values {
-                let mut packet = phantom_usage_chunk();
-                packet["choices"][0]["delta"][field] = value;
-                assert_post_finish_rejected(packet);
+    fn post_finish_rejects_substantive_malformed_or_conflicting_packets() {
+        let mut packets = Vec::new();
+        let mut with_delta = |field: &str, value: Value, finish: Option<&str>| {
+            let mut packet = phantom_usage_chunk();
+            packet["choices"][0]["delta"][field] = value;
+            if let Some(finish) = finish {
+                packet["choices"][0]["finish_reason"] = json!(finish);
             }
+            packets.push(packet);
+        };
+        for field in ["content", "refusal", "reasoning_content", "reasoning"] {
+            for value in [json!("late"), json!(0), json!(false), json!([]), json!({})] {
+                with_delta(field, value, None);
+            }
+            // A repeated finish cannot carry substantive output either.
+            with_delta(field, json!("late"), Some("stop"));
         }
+        for role in [
+            json!(""),
+            json!("user"),
+            json!("system"),
+            json!(false),
+            json!({}),
+        ] {
+            with_delta("role", role, None);
+        }
+        let call = json!([{"index":0,"id":"call","function":{"name":"inspect","arguments":"{}"}}]);
         for calls in [
             json!({}),
             json!(""),
             json!([{}]),
             json!([{"index":0}]),
-            json!([{"index":0,"id":"call","function":{"name":"inspect","arguments":"{}"}}]),
+            call.clone(),
+        ] {
+            with_delta("tool_calls", calls, None);
+        }
+        with_delta("tool_calls", call, Some("stop"));
+        for finish in [
+            "length",
+            "abort",
+            "content_filter",
+            "tool_calls",
+            "function_call",
+            "",
         ] {
             let mut packet = phantom_usage_chunk();
-            packet["choices"][0]["delta"]["tool_calls"] = calls;
-            assert_post_finish_rejected(packet);
+            packet["choices"][0]["finish_reason"] = json!(finish);
+            packets.push(packet);
         }
+        packets.into_iter().for_each(assert_post_finish_rejected);
     }
 
     #[test]
@@ -305,6 +333,10 @@ pub(super) mod tests {
                 if let Some(usage) = &usage {
                     packet["usage"] = usage.clone();
                 }
+                let expected_usage = match usage {
+                    Some(usage) if !usage.is_null() => USAGE,
+                    _ => Usage::default(),
+                };
                 for (finish, expected_stop) in [
                     ("stop", StopReason::EndTurn),
                     ("length", StopReason::MaxTokens),
@@ -320,35 +352,15 @@ pub(super) mod tests {
                             end(finish),
                             event(packet.clone()),
                         ];
-                        if with_done {
-                            frames.push(done());
-                        }
+                        frames.extend(with_done.then(done));
                         let (items, actual_usage, stop) = decode(frames);
-                        assert_eq!(stop, expected_stop, "{packet}");
-                        assert_eq!(items.len(), 2, "{packet}");
+                        let reasoning = BlockContent::Reasoning {
+                            text: "think".into(),
+                        };
+                        assert_eq!(contents(&items), [&reasoning, &text("answer")], "{packet}");
                         assert_eq!(
-                            items[0].blocks[0].content,
-                            BlockContent::Reasoning {
-                                text: "think".into()
-                            }
-                        );
-                        assert_eq!(
-                            items[1].blocks[0].content,
-                            BlockContent::Text {
-                                text: "answer".into()
-                            }
-                        );
-                        assert_eq!(
-                            actual_usage,
-                            if usage.as_ref().is_some_and(|usage| !usage.is_null()) {
-                                Usage {
-                                    input_tokens: 20,
-                                    cached_input_tokens: 80,
-                                    output_tokens: 10,
-                                }
-                            } else {
-                                Usage::default()
-                            }
+                            (stop, actual_usage),
+                            (expected_stop.clone(), expected_usage)
                         );
                     }
                 }
@@ -373,12 +385,10 @@ pub(super) mod tests {
                             packet["usage"] = phantom_usage_chunk()["usage"].clone();
                         }
                         let chunks = decoder.decode(&event(packet.clone())).unwrap();
-                        assert!(
-                            !chunks
-                                .iter()
-                                .any(|chunk| matches!(chunk, ResponseChunk::ResponseEnded { .. })),
-                            "{packet}"
-                        );
+                        let ended = |chunk: &ResponseChunk| {
+                            matches!(chunk, ResponseChunk::ResponseEnded { .. })
+                        };
+                        assert!(!chunks.iter().any(ended), "{packet}");
                         if with_done {
                             assert!(decoder.decode(&done()).is_err(), "{packet}");
                         }
@@ -396,9 +406,9 @@ pub(super) mod tests {
         packets.push(json!({"choices":[{"finish_reason":"stop"}]}));
         for packet in packets {
             let mut decoder = Decoder::new("test-model".into());
-            decoder.decode(&delta(json!({"content":"answer"}))).unwrap();
-            decoder.decode(&end("stop")).unwrap();
-            decoder.decode(&done()).unwrap();
+            for frame in [delta(json!({"content":"answer"})), end("stop"), done()] {
+                decoder.decode(&frame).unwrap();
+            }
             assert!(decoder.decode(&event(packet.clone())).is_err(), "{packet}");
             assert!(decoder.finish().is_err(), "{packet}");
         }
@@ -412,11 +422,12 @@ pub(super) mod tests {
             ("abort", StopReason::Aborted),
             ("content_filter", StopReason::ContentFilter),
         ] {
-            for mut packet in noop_packets().into_iter().filter(|packet| {
+            let with_choice = |packet: &Value| {
                 packet["choices"]
                     .as_array()
                     .is_some_and(|choices| !choices.is_empty())
-            }) {
+            };
+            for mut packet in noop_packets().into_iter().filter(with_choice) {
                 packet["choices"][0]["finish_reason"] = json!(finish);
                 for with_usage in [false, true] {
                     for with_done in [false, true] {
@@ -431,57 +442,13 @@ pub(super) mod tests {
                             event(repeated.clone()),
                             event(repeated),
                         ];
-                        if with_done {
-                            frames.push(done());
-                        }
+                        frames.extend(with_done.then(done));
                         let (items, usage, stop) = decode(frames);
-                        assert_eq!(stop, expected_stop);
-                        assert_eq!(items.len(), 1);
-                        assert_eq!(
-                            items[0].blocks[0].content,
-                            BlockContent::Text {
-                                text: "answer".into()
-                            }
-                        );
-                        assert_eq!(
-                            usage,
-                            Usage {
-                                input_tokens: 20,
-                                cached_input_tokens: 80,
-                                output_tokens: 10
-                            }
-                        );
+                        assert_eq!(contents(&items), [&text("answer")]);
+                        assert_eq!((stop, usage), (expected_stop.clone(), USAGE));
                     }
                 }
             }
-        }
-    }
-
-    #[test]
-    fn repeated_finish_rejects_conflicts_and_substantive_deltas() {
-        for finish in [
-            "length",
-            "abort",
-            "content_filter",
-            "tool_calls",
-            "function_call",
-            "",
-        ] {
-            let mut packet = phantom_usage_chunk();
-            packet["choices"][0]["finish_reason"] = json!(finish);
-            assert_post_finish_rejected(packet);
-        }
-        for value in [
-            json!({"content":"late"}),
-            json!({"refusal":"late"}),
-            json!({"reasoning":"late"}),
-            json!({"reasoning_content":"late"}),
-            json!({"tool_calls":[{"index":0,"id":"call","function":{"name":"inspect","arguments":"{}"}}]}),
-        ] {
-            let mut packet = phantom_usage_chunk();
-            packet["choices"][0]["finish_reason"] = json!("stop");
-            packet["choices"][0]["delta"] = value;
-            assert_post_finish_rejected(packet);
         }
     }
 
@@ -491,20 +458,13 @@ pub(super) mod tests {
             packet["choices"][0]["finish_reason"] = json!("stop");
             let (items, _, stop) = decode(vec![delta(json!({"content":"answer"})), event(packet)]);
             assert_eq!(stop, StopReason::EndTurn);
-            assert_eq!(items.len(), 1);
-            assert_eq!(
-                items[0].blocks[0].content,
-                BlockContent::Text {
-                    text: "answer".into()
-                }
-            );
+            assert_eq!(contents(&items), [&text("answer")]);
         }
     }
 
     #[test]
     fn rejects_premature_eof_done_and_post_terminal_data() {
-        let mut decoder = Decoder::new("gpt-5".into());
-        assert!(decoder.finish().is_err());
+        assert!(Decoder::new("gpt-5".into()).finish().is_err());
         let mut decoder = Decoder::new("gpt-5".into());
         decoder
             .decode(&delta(json!({"content":"partial"})))

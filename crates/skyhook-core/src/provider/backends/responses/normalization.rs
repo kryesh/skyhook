@@ -1,6 +1,65 @@
 //! Shape-based normalization for omitted Responses bookkeeping. Never infer a
 //! tool call identity or resolve an ambiguous reference from array position.
+use super::native::NativeItem;
 use super::*;
+
+/// Local item/part indices are produced only by this module's resolution
+/// algorithm; they are not interchangeable with provider-supplied wire indices.
+#[derive(Clone, Copy)]
+struct ResolvedReference {
+    item: usize,
+    kind: ItemKind,
+    part: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum TerminalOutcome {
+    Completed,
+    MaxTokens,
+    ContentFilter,
+}
+
+/// Only consumed fields are interpreted here. Native snapshots stay borrowed
+/// whole, including unknown vendor extensions used by replay and reconciliation.
+#[derive(Debug)]
+pub(super) enum NormalizedEvent<'a> {
+    Ignored,
+    ItemAdded {
+        index: usize,
+        wire: Option<usize>,
+        native: NativeItem<'a>,
+    },
+    ItemDone {
+        index: usize,
+        native: NativeItem<'a>,
+    },
+    /// `part` is the local `(item, position)` pair.
+    Delta {
+        part: (usize, usize),
+        text: &'a str,
+    },
+    ArgumentsDelta {
+        item: usize,
+        text: &'a str,
+    },
+    ArgumentsDone {
+        item: usize,
+        text: &'a str,
+    },
+    PartAdded {
+        part: (usize, usize),
+        text: &'a str,
+    },
+    PartEnded {
+        part: (usize, usize),
+        content: BlockContent,
+    },
+    Terminal {
+        output: &'a [Value],
+        usage: Option<Usage>,
+        outcome: TerminalOutcome,
+    },
+}
 
 fn optional_index(value: &Value, key: &str) -> Result<Option<usize>, ProviderError> {
     value.get(key).map(|_| index(value, key)).transpose()
@@ -68,62 +127,71 @@ impl Decoder {
 
     /// Only completed, semantically equivalent content can establish an alias
     /// for an output-item ID. Executable call IDs are never aliases.
-    fn equivalent_snapshot(&self, item: &Item, native: &Value) -> bool {
-        if kind(native).ok() != Some(item.kind) {
+    fn equivalent_snapshot(&self, item: &Item, header: NativeItem<'_>) -> bool {
+        let native = header.raw;
+        if header.kind != item.kind() {
             return false;
         }
-        if item.kind == Kind::Function {
-            let call = item
-                .call_id
-                .as_deref()
-                .or_else(|| item.ended.as_ref()?.get("call_id")?.as_str());
+        if let ItemBody::Function(state) = &item.body {
+            let streaming = state.streaming().ok();
+            let call = streaming
+                .and_then(|state| state.call_id.as_deref())
+                .or_else(|| state.snapshot()?.get("call_id")?.as_str());
             if call.is_none() || call != native.get("call_id").and_then(Value::as_str) {
                 return false;
             }
-            if item
-                .name
-                .as_deref()
+            if streaming
+                .and_then(|state| state.name.as_deref())
                 .is_some_and(|name| Some(name) != native.get("name").and_then(Value::as_str))
             {
                 return false;
             }
         }
-        let Ok(parts) = final_parts(native) else {
+        let Ok(parts) = header.final_parts() else {
             return false;
         };
-        if let Some(old) = &item.ended {
+        if let ItemBody::Function(state) = &item.body
+            && let FunctionPhase::Completed { call, .. } = &state.phase
+        {
+            return parts.as_slice() == [BlockContent::ToolCall(call.clone())];
+        }
+        if let Some(old) = item.snapshot() {
             return final_parts(old).ok().as_ref() == Some(&parts);
         }
-        if item.kind == Kind::Function {
-            let Some(text) = item
-                .final_arguments
-                .as_deref()
-                .or_else(|| item.parts.get(&0).map(|p| p.streamed.as_str()))
-            else {
+        if let ItemBody::Function(state) = &item.body {
+            let Ok(streaming) = state.streaming() else {
                 return false;
             };
-            return arguments(text).ok().as_ref()
-                == native
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .and_then(|s| arguments(s).ok())
-                    .as_ref();
+            let observed = match &streaming.final_arguments {
+                Some(FinalArguments::Object(arguments)) => Some(arguments.clone()),
+                Some(FinalArguments::Incomplete(text)) => arguments(text).ok(),
+                None => state
+                    .part
+                    .as_ref()
+                    .and_then(|part| arguments(part.streamed()).ok()),
+            };
+            return observed.is_some()
+                && observed
+                    == native
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .and_then(|text| arguments(text).ok());
         }
-        if item.parts.is_empty() {
+        if item.parts().next().is_none() {
             return false;
         }
         let observed: Vec<_> = item
-            .parts
-            .values()
+            .parts()
+            .map(|(_, part)| part)
             .map(|part| {
-                part.ended.clone().unwrap_or_else(|| {
-                    if item.kind == Kind::Reasoning {
+                part.ended().cloned().unwrap_or_else(|| {
+                    if item.kind() == ItemKind::Reasoning {
                         BlockContent::Reasoning {
-                            text: part.streamed.clone(),
+                            text: part.streamed().to_owned(),
                         }
                     } else {
                         BlockContent::Text {
-                            text: part.streamed.clone(),
+                            text: part.streamed().to_owned(),
                         }
                     }
                 })
@@ -134,15 +202,12 @@ impl Decoder {
 
     pub(super) fn snapshot_index(
         &mut self,
-        native: &Value,
+        native: NativeItem<'_>,
         wire_index: Option<usize>,
         alias_candidates: Option<&BTreeSet<usize>>,
         chunks: &mut Vec<ResponseChunk>,
     ) -> Result<usize, ProviderError> {
-        let native_id = string(native, "id")?;
-        if native_id.is_empty() {
-            return Err(protocol("empty item ID"));
-        }
+        let native_id = native.id;
         if let Some(id) = self.item_by_id(native_id) {
             self.bind_wire_index(id, wire_index)?;
             return Ok(id);
@@ -176,85 +241,289 @@ impl Decoder {
         Ok(id)
     }
 
-    /// Fill omitted indices/headers before the strict event handlers run.
-    /// Internal positions are not evidence of provider-supplied wire indices.
-    pub(super) fn normalize_event(
+    /// Admit raw wire fields and resolve references exactly once. The resulting
+    /// event contains no synthetic JSON bookkeeping for dispatch to re-read.
+    pub(super) fn normalize_event<'a>(
         &mut self,
-        event: &mut Value,
+        event: &'a Value,
         chunks: &mut Vec<ResponseChunk>,
-    ) -> Result<(), ProviderError> {
-        let name = string(event, "type")?.to_owned();
+    ) -> Result<NormalizedEvent<'a>, ProviderError> {
+        let wire = optional_index(event, "output_index")?;
+        let name = string(event, "type")?;
         if name == "response.output_item.added" {
-            let wire = optional_index(event, "output_index")?;
-            let id = self.vacant_index(wire)?;
-            event["output_index"] = json!(id);
-            return Ok(());
+            let index = self.vacant_index(wire)?;
+            let native =
+                NativeItem::parse(event.get("item").ok_or_else(|| protocol("missing item"))?)?;
+            return Ok(NormalizedEvent::ItemAdded {
+                index,
+                wire,
+                native,
+            });
         }
         if name == "response.output_item.done" {
-            let wire = optional_index(event, "output_index")?;
-            let native = event
-                .get("item")
-                .ok_or_else(|| protocol("missing item"))?
-                .clone();
-            let id = self.snapshot_index(&native, wire, None, chunks)?;
-            event["output_index"] = json!(id);
-            return Ok(());
+            let native =
+                NativeItem::parse(event.get("item").ok_or_else(|| protocol("missing item"))?)?;
+            let index = self.snapshot_index(native, wire, None, chunks)?;
+            return Ok(NormalizedEvent::ItemDone { index, native });
         }
-        let wire = optional_index(event, "output_index")?;
+        let reference = self.resolve_reference(event, name, wire, chunks)?;
+        // The resolver checks identities and wire/local-index contradictions.
+        // This final state check is shared by every consumed live-item event.
+        let active = |expected| -> Result<(usize, usize), ProviderError> {
+            let reference = reference.ok_or_else(|| protocol("missing resolved item reference"))?;
+            let item = &self.items[&reference.item];
+            if item.snapshot().is_some() {
+                return Err(protocol("event after output item ended"));
+            }
+            if reference.kind != expected {
+                return Err(protocol("event does not match output item kind"));
+            }
+            Ok((reference.item, reference.part))
+        };
+        let text_content = |kind, text: &str| {
+            if kind == ItemKind::Reasoning {
+                BlockContent::Reasoning { text: text.into() }
+            } else {
+                BlockContent::Text { text: text.into() }
+            }
+        };
+        match name {
+            "response.created" | "response.in_progress" | "response.queued" => {
+                if !event.get("response").is_some_and(Value::is_object) {
+                    return Err(protocol("missing response object"));
+                }
+                Ok(NormalizedEvent::Ignored)
+            }
+            "response.output_text.delta" | "response.refusal.delta" => Ok(NormalizedEvent::Delta {
+                part: active(ItemKind::Text)?,
+                text: string(event, "delta")?,
+            }),
+            "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+                Ok(NormalizedEvent::Delta {
+                    part: active(ItemKind::Reasoning)?,
+                    text: string(event, "delta")?,
+                })
+            }
+            "response.function_call_arguments.delta" => Ok(NormalizedEvent::ArgumentsDelta {
+                item: active(ItemKind::ToolCall)?.0,
+                text: string(event, "delta")?,
+            }),
+            "response.function_call_arguments.done" => Ok(NormalizedEvent::ArgumentsDone {
+                item: active(ItemKind::ToolCall)?.0,
+                text: string(event, "arguments")?,
+            }),
+            "response.output_text.done"
+            | "response.refusal.done"
+            | "response.reasoning_text.done"
+            | "response.reasoning_summary_text.done" => {
+                let kind = if name.starts_with("response.reasoning_") {
+                    ItemKind::Reasoning
+                } else {
+                    ItemKind::Text
+                };
+                let part = active(kind)?;
+                let text = if name == "response.reasoning_text.done" {
+                    reasoning_text(event)?
+                } else {
+                    string(
+                        event,
+                        if name == "response.refusal.done" {
+                            "refusal"
+                        } else {
+                            "text"
+                        },
+                    )?
+                };
+                Ok(NormalizedEvent::PartEnded {
+                    part,
+                    content: text_content(kind, text),
+                })
+            }
+            "response.content_part.added"
+            | "response.content_part.done"
+            | "response.reasoning_part.added"
+            | "response.reasoning_part.done"
+            | "response.reasoning_summary_part.added"
+            | "response.reasoning_summary_part.done" => {
+                let reference =
+                    reference.ok_or_else(|| protocol("missing resolved item reference"))?;
+                let kind = reference.kind;
+                if kind == ItemKind::ToolCall {
+                    return Err(protocol("content part on function item"));
+                }
+                let resolved = active(kind)?;
+                let part = event
+                    .get("part")
+                    .ok_or_else(|| protocol("missing content part"))?;
+                let text = if kind == ItemKind::Reasoning {
+                    readable_reasoning(part, name.starts_with("response.reasoning_summary_part."))?
+                } else {
+                    match string(part, "type")? {
+                        "output_text" => string(part, "text")?,
+                        "refusal" => string(part, "refusal")?,
+                        _ => return Err(protocol("unsupported content part")),
+                    }
+                };
+                if name.ends_with(".done") {
+                    Ok(NormalizedEvent::PartEnded {
+                        part: resolved,
+                        content: text_content(kind, text),
+                    })
+                } else {
+                    Ok(NormalizedEvent::PartAdded {
+                        part: resolved,
+                        text,
+                    })
+                }
+            }
+            "response.output_text.annotation.added" => {
+                active(ItemKind::Text)?;
+                index(event, "annotation_index")?;
+                if !event.get("annotation").is_some_and(Value::is_object) {
+                    return Err(protocol("missing annotation object"));
+                }
+                Ok(NormalizedEvent::Ignored)
+            }
+            "response.completed" | "response.incomplete" => self.normalize_terminal(event, name),
+            "response.failed" => {
+                let response = event
+                    .get("response")
+                    .ok_or_else(|| protocol("missing failed response"))?;
+                Err(api_error(
+                    response
+                        .get("error")
+                        .ok_or_else(|| protocol("missing response error"))?,
+                ))
+            }
+            "error" => Err(api_error(event.get("error").unwrap_or(event))),
+            other => {
+                let name: String = other
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_'))
+                    .take(96)
+                    .collect();
+                Err(protocol(format!("unsupported event: {name}")))
+            }
+        }
+    }
+
+    fn normalize_terminal<'a>(
+        &self,
+        event: &'a Value,
+        name: &str,
+    ) -> Result<NormalizedEvent<'a>, ProviderError> {
+        let response = event
+            .get("response")
+            .ok_or_else(|| protocol("missing final response"))?;
+        let outcome = match string(response, "status")? {
+            "incomplete" => {
+                let details = response
+                    .get("incomplete_details")
+                    .ok_or_else(|| protocol("missing incomplete details"))?;
+                match string(details, "reason")? {
+                    "max_output_tokens" => TerminalOutcome::MaxTokens,
+                    "content_filter" => TerminalOutcome::ContentFilter,
+                    _ => return Err(protocol("unsupported incomplete reason")),
+                }
+            }
+            "completed" if name == "response.completed" => TerminalOutcome::Completed,
+            _ => return Err(protocol("terminal response status disagrees with event")),
+        };
+        let output = if self.allow_omitted_terminal_output && response.get("output").is_none() {
+            &[][..]
+        } else {
+            array(response, "output")?.as_slice()
+        };
+        let usage = response
+            .get("usage")
+            .filter(|u| !u.is_null())
+            .map(|usage| {
+                let count = |key: &str| {
+                    usage
+                        .get(key)
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| protocol(format!("missing or invalid usage.{key}")))
+                };
+                let cached = match usage.get("input_tokens_details").filter(|v| !v.is_null()) {
+                    Some(details) => details
+                        .get("cached_tokens")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| protocol("invalid cached input token usage"))?,
+                    None => 0,
+                };
+                let input = count("input_tokens")?
+                    .checked_sub(cached)
+                    .ok_or_else(|| protocol("cached tokens exceed input tokens"))?;
+                Ok(Usage {
+                    input_tokens: input,
+                    cached_input_tokens: cached,
+                    output_tokens: count("output_tokens")?,
+                })
+            })
+            .transpose()?;
+        Ok(NormalizedEvent::Terminal {
+            output,
+            usage,
+            outcome,
+        })
+    }
+
+    /// Resolve omitted wire references once without mutating the vendor event.
+    /// Local indices are never treated as evidence of provider wire indices.
+    fn resolve_reference(
+        &mut self,
+        event: &Value,
+        name: &str,
+        wire: Option<usize>,
+        chunks: &mut Vec<ResponseChunk>,
+    ) -> Result<Option<ResolvedReference>, ProviderError> {
         let wire_owner = wire.and_then(|wire| {
             self.items
                 .iter()
                 .find_map(|(id, item)| (item.wire_index == Some(wire)).then_some(*id))
         });
-        let expected = if name.starts_with("response.reasoning_") {
-            Some(Kind::Reasoning)
+        let fixed = if name.starts_with("response.reasoning_") {
+            Some(ItemKind::Reasoning)
         } else if name.starts_with("response.function_call_arguments.") {
-            Some(Kind::Function)
+            Some(ItemKind::ToolCall)
         } else if name.starts_with("response.output_text.") || name.starts_with("response.refusal.")
         {
-            Some(Kind::Text)
+            Some(ItemKind::Text)
         } else if name.starts_with("response.content_part.") {
-            // Generic part events can also address reasoning items. Identity,
-            // not a provider label, disambiguates output_text inside reasoning.
-            optional_id(event, "item_id")?
+            None
+        } else {
+            return Ok(None);
+        };
+        let native_id = optional_id(event, "item_id")?;
+        // Generic part events can also address reasoning items. Identity,
+        // not a provider label, disambiguates output_text inside reasoning.
+        let expected = fixed.unwrap_or_else(|| {
+            native_id
                 .and_then(|id| self.item_by_id(id))
                 .or(wire_owner)
-                .map(|id| self.items[&id].kind)
-                .or_else(
+                .map_or_else(
                     || match event.pointer("/part/type").and_then(Value::as_str) {
-                        Some("reasoning_text" | "summary_text") => Some(Kind::Reasoning),
-                        _ => Some(Kind::Text),
+                        Some("reasoning_text" | "summary_text") => ItemKind::Reasoning,
+                        _ => ItemKind::Text,
                     },
+                    |id| self.items[&id].kind(),
                 )
-        } else {
-            None
-        };
-        let Some(expected) = expected else {
-            return Ok(());
-        };
-        let native_id = optional_id(event, "item_id")?.map(str::to_owned);
-        let known = native_id.as_deref().and_then(|id| self.item_by_id(id));
+        });
+        let known = native_id.and_then(|id| self.item_by_id(id));
         let id = if let Some(id) = known {
             let item = &self.items[&id];
-            if item.kind != expected {
+            if item.kind() != expected {
                 return Err(protocol("event does not match output item kind"));
             }
             self.bind_wire_index(id, wire)?;
             id
-        } else if let Some(native_id) = native_id.as_deref() {
+        } else if let Some(native_id) = native_id {
             let id = self.vacant_index(wire)?;
-            let native = match expected {
-                Kind::Text => {
-                    json!({"id":native_id,"type":"message","role":"assistant","content":[]})
-                }
-                Kind::Reasoning => json!({"id":native_id,"type":"reasoning","summary":[]}),
-                Kind::Function => json!({"id":native_id,"type":"function_call"}),
-            };
-            self.start(id, &native, chunks)?;
+            self.start_item(id, native_id, expected, (None, None), chunks)?;
             self.items.get_mut(&id).expect("started item").wire_index = wire;
             id
         } else if let Some(id) = wire_owner {
-            if self.items[&id].kind != expected {
+            if self.items[&id].kind() != expected {
                 return Err(protocol("event does not match output item kind"));
             }
             id
@@ -263,8 +532,8 @@ impl Decoder {
                 .items
                 .iter()
                 .filter_map(|(id, item)| {
-                    (item.kind == expected
-                        && item.ended.is_none()
+                    (item.kind() == expected
+                        && item.snapshot().is_none()
                         && wire.is_none_or(|wire| item.wire_index.is_none_or(|old| old == wire)))
                     .then_some(*id)
                 })
@@ -275,10 +544,12 @@ impl Decoder {
             self.bind_wire_index(candidates[0], wire)?;
             candidates[0]
         };
-        event["output_index"] = json!(id);
-        event["item_id"] = json!(self.items[&id].native_id);
-        if expected == Kind::Function {
-            return Ok(());
+        if expected == ItemKind::ToolCall {
+            return Ok(Some(ResolvedReference {
+                item: id,
+                kind: expected,
+                part: 0,
+            }));
         }
         let summary = name.starts_with("response.reasoning_summary_");
         let key = if summary {
@@ -286,134 +557,235 @@ impl Decoder {
         } else {
             "content_index"
         };
-        if optional_index(event, key)?.is_none() {
-            let item = &self.items[&id];
-            let positions: Vec<_> = item
-                .parts
-                .keys()
-                .filter_map(|position| {
-                    if expected == Kind::Reasoning {
-                        ((position.is_multiple_of(2)) == summary).then_some(*position / 2)
-                    } else {
-                        Some(*position)
-                    }
-                })
-                .collect();
-            let position = match positions.as_slice() {
-                [] => 0,
-                [only] => *only,
-                _ => return Err(protocol("ambiguous missing content index")),
-            };
-            event[key] = json!(position);
-        }
-        Ok(())
+        let position = match optional_index(event, key)? {
+            Some(position) => position,
+            None => {
+                let item = &self.items[&id];
+                let positions: Vec<_> = item
+                    .parts()
+                    .map(|(position, _)| position)
+                    .filter_map(|position| {
+                        if expected == ItemKind::Reasoning {
+                            ((position.is_multiple_of(2)) == summary).then_some(*position / 2)
+                        } else {
+                            Some(*position)
+                        }
+                    })
+                    .collect();
+                match positions.as_slice() {
+                    [] => 0,
+                    [only] => *only,
+                    _ => return Err(protocol("ambiguous missing content index")),
+                }
+            }
+        };
+        let position = if expected == ItemKind::Reasoning {
+            reasoning_position(position, !summary)?
+        } else {
+            position
+        };
+        Ok(Some(ResolvedReference {
+            item: id,
+            kind: expected,
+            part: position,
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::fixtures::*;
     use super::*;
-    use crate::provider::protocol::{AssistantItem, ResponseAssembler};
 
-    fn assert_protocol_error(events: Vec<Value>) {
-        let mut decoder = Decoder::new("test-model".into());
-        for event in events {
-            if let Err(error) = decoder.feed(event) {
-                assert_eq!(error.kind, ProviderErrorKind::Protocol, "{error:?}");
-                return;
-            }
+    #[test]
+    fn lifecycle_events_require_a_response_and_unknown_or_failed_events_are_errors() {
+        for tag in ["response.queued", "response.in_progress"] {
+            let mut decoder = Decoder::new("model".into());
+            let event = json!({"type":tag, "response":{"x-vendor":true}});
+            assert!(decoder.feed(event).unwrap().is_empty());
+            assert!(decoder.feed(json!({"type":tag})).is_err());
         }
-        // Do not call finish here: an unrelated missing-terminal error could mask
-        // accidental acceptance of the invalid reference this test is exercising.
-        panic!("unsafe compatibility normalization must fail while feeding events");
-    }
-
-    fn assemble(
-        events: Vec<Value>,
-    ) -> Result<(Vec<AssistantItem>, Usage, StopReason), ProviderError> {
-        let mut decoder = Decoder::new("test-model".into());
-        let mut assembler = ResponseAssembler::default();
-        for event in events {
-            for chunk in decoder.feed(event)? {
-                assembler.push(&chunk)?;
-            }
+        for event in [
+            json!({"type":"response.failed", "response":{"error":{"code":"invalid_request_error"}}}),
+            json!({"type":"response.future_unknown"}),
+        ] {
+            assert!(Decoder::new("model".into()).feed(event).is_err());
         }
-        for chunk in decoder.finish()? {
-            assembler.push(&chunk)?;
-        }
-        assembler.finish()
-    }
-
-    fn completed(output: Vec<Value>) -> Value {
-        json!({"type":"response.completed", "response":{"status":"completed", "output":output,
-            "usage":{"input_tokens":12, "output_tokens":3,
-                "input_tokens_details":{"cached_tokens":4}}}})
-    }
-
-    fn done(position: usize, item: Value) -> Value {
-        json!({"type":"response.output_item.done", "output_index":position, "item":item})
-    }
-
-    fn added(position: usize, item: Value) -> Value {
-        json!({"type":"response.output_item.added", "output_index":position, "item":item})
-    }
-
-    fn function(id: &str, call_id: &str, arguments: &str) -> Value {
-        json!({"type":"function_call", "id":id, "call_id":call_id,
-            "name":"lookup", "arguments":arguments, "status":"completed"})
-    }
-
-    fn reasoning(id: &str, text: &str) -> Value {
-        json!({"type":"reasoning", "id":id,
-            "summary":[{"type":"summary_text", "text":text}]})
-    }
-
-    fn message(id: &str, text: &str) -> Value {
-        json!({"type":"message", "id":id, "role":"assistant", "status":"completed",
-            "content":[{"type":"output_text", "text":text, "annotations":[]}]})
     }
 
     #[test]
-    fn missing_output_indices_preserve_distinct_item_identity_and_order() {
-        let first = message("message-a", "first");
-        let second = message("message-b", "second");
-        let (items, _, reason) = assemble(vec![
-            json!({"type":"response.output_item.added", "item":message("message-a", "")}),
-            json!({"type":"response.output_item.added", "item":message("message-b", "")}),
-            json!({"type":"response.output_text.delta", "item_id":"message-b", "delta":"second"}),
-            json!({"type":"response.output_text.delta", "item_id":"message-a", "delta":"first"}),
-            json!({"type":"response.output_item.done", "item":second.clone()}),
-            json!({"type":"response.output_item.done", "item":first.clone()}),
-            completed(vec![first, second]),
-        ])
-        .unwrap();
-        assert_eq!(reason, StopReason::EndTurn);
-        assert_eq!(items.len(), 2);
-        assert_eq!((&*items[0].id, items[0].position), ("message-a", 0));
-        assert_eq!((&*items[1].id, items[1].position), ("message-b", 1));
-        assert_eq!(items[0].text_content().as_deref(), Some("first"));
-        assert_eq!(items[1].text_content().as_deref(), Some("second"));
+    fn normalized_references_distinguish_local_wire_and_reasoning_positions() {
+        let mut decoder = Decoder::new("model".into());
+        decoder
+            .feed(unindexed_added(json!({"id":"first","type":"message"})))
+            .unwrap();
+        decoder
+            .feed(added(0, json!({"id":"second","type":"reasoning"})))
+            .unwrap();
+        for (tag, key, position) in [
+            ("response.reasoning_text.delta", "content_index", 7),
+            ("response.reasoning_summary_text.delta", "summary_index", 6),
+        ] {
+            let mut event = json!({"type":tag,"item_id":"second","output_index":0,"delta":"text"});
+            event[key] = json!(3);
+            match decoder.normalize_event(&event, &mut vec![]).unwrap() {
+                NormalizedEvent::Delta { part, .. } => assert_eq!(part, (1, position)),
+                other => panic!("unexpected semantic event: {other:?}"),
+            }
+        }
+    }
+
+    fn delta(item_id: &str, text: &str) -> Value {
+        json!({"type":"response.output_text.delta", "item_id":item_id, "delta":text})
+    }
+
+    fn unindexed_added(item: Value) -> Value {
+        json!({"type":"response.output_item.added", "item":item})
+    }
+
+    fn unindexed_done(item: Value) -> Value {
+        json!({"type":"response.output_item.done", "item":item})
+    }
+
+    #[test]
+    fn compatible_references_assemble_distinct_items_in_order() {
+        let same = |id| message(id, "same");
+        let pair = |a, b| vec![same(a), same(b)];
+        let (first, second) = (
+            message("message-a", "first"),
+            message("message-b", "second"),
+        );
+        let (retained, fresh) = (same("retained"), same("fresh"));
+        // Expected (id, position when asserted, text).
+        let cases = vec![
+            // Missing output indices preserve distinct identity and order.
+            (
+                vec![
+                    unindexed_added(message("message-a", "")),
+                    unindexed_added(message("message-b", "")),
+                    delta("message-b", "second"),
+                    delta("message-a", "first"),
+                    unindexed_done(second.clone()),
+                    unindexed_done(first.clone()),
+                    completed(vec![first, second]),
+                ],
+                vec![
+                    ("message-a", Some(0), "first"),
+                    ("message-b", Some(1), "second"),
+                ],
+            ),
+            // A lazy text start from a delta needs no added event.
+            (
+                vec![
+                    json!({"type":"response.output_text.delta", "output_index":0,
+                        "item_id":"lazy-message", "delta":"hello "}),
+                    delta("lazy-message", "world"),
+                    completed(vec![message("lazy-message", "hello world")]),
+                ],
+                vec![("lazy-message", None, "hello world")],
+            ),
+            // An omitted output index can be established later by identity.
+            (
+                vec![
+                    unindexed_added(message("msg", "")),
+                    json!({"type":"response.output_text.delta","item_id":"msg","output_index":7,"delta":"hello"}),
+                    done(7, message("msg", "hello")),
+                    completed(vec![message("msg", "hello")]),
+                ],
+                vec![("msg", Some(0), "hello")],
+            ),
+            // An explicit wire owner precedes unbound items.
+            (
+                vec![
+                    added(0, message("first", "")),
+                    unindexed_added(message("second", "")),
+                    json!({"type":"response.output_text.delta","output_index":0,"delta":"hello"}),
+                    done(0, message("first", "hello")),
+                    unindexed_done(message("second", "world")),
+                    completed(vec![message("first", "hello"), message("second", "world")]),
+                ],
+                vec![("first", None, "hello"), ("second", None, "world")],
+            ),
+            // Equal terminal-only, done-only (with or without indices) and
+            // unchanged streamed items remain distinct.
+            (
+                vec![completed(pair("first", "second"))],
+                vec![("first", None, "same"), ("second", None, "same")],
+            ),
+            (
+                vec![
+                    done(0, same("first")),
+                    done(1, same("second")),
+                    completed(pair("first", "second")),
+                ],
+                vec![("first", None, "same"), ("second", None, "same")],
+            ),
+            (
+                vec![
+                    unindexed_done(same("first")),
+                    unindexed_done(same("second")),
+                    completed(pair("first", "second")),
+                ],
+                vec![("first", None, "same"), ("second", None, "same")],
+            ),
+            (
+                vec![
+                    added(0, same("first")),
+                    done(0, same("first")),
+                    added(1, same("second")),
+                    done(1, same("second")),
+                    completed(pair("first", "second")),
+                ],
+                vec![("first", None, "same"), ("second", None, "same")],
+            ),
+            // Stable terminal ids are reserved before semantic alias matching.
+            (
+                vec![
+                    added(0, retained.clone()),
+                    done(0, retained.clone()),
+                    completed(vec![fresh.clone(), retained.clone()]),
+                ],
+                vec![("retained", None, "same"), ("fresh", None, "same")],
+            ),
+            (
+                vec![
+                    added(0, retained.clone()),
+                    done(0, retained.clone()),
+                    completed(vec![retained, fresh]),
+                ],
+                vec![("retained", None, "same"), ("fresh", None, "same")],
+            ),
+        ];
+        for (index, (events, expected)) in cases.into_iter().enumerate() {
+            let (items, _, reason) = assemble(events).unwrap();
+            assert_eq!(reason, StopReason::EndTurn);
+            assert_eq!(items.len(), expected.len(), "case {index}");
+            for (item, (id, position, text)) in items.iter().zip(expected) {
+                assert_eq!(item.id, id, "case {index}");
+                assert_eq!(item.text_content().as_deref(), Some(text), "case {index}");
+                if let Some(position) = position {
+                    assert_eq!(item.position, position, "case {index}");
+                }
+            }
+        }
     }
 
     #[test]
     fn missing_single_part_indices_work_for_text_and_reasoning_summaries() {
-        for (native, family, part) in [
+        for (native, family, part_family, part) in [
             (
                 message("item", "visible"),
                 "output_text",
+                "content_part",
                 json!({"type":"output_text", "text":"visible"}),
             ),
             (
                 reasoning("item", "visible"),
                 "reasoning_summary_text",
+                "reasoning_summary_part",
                 json!({"type":"summary_text", "text":"visible"}),
             ),
         ] {
-            let part_family = if family == "output_text" {
-                "content_part"
-            } else {
-                "reasoning_summary_part"
-            };
             let (items, _, _) = assemble(vec![
                 added(0, native.clone()),
                 json!({"type":format!("response.{part_family}.added"), "item_id":"item",
@@ -421,19 +793,16 @@ mod tests {
                 json!({"type":format!("response.{family}.delta"), "item_id":"item", "delta":"visible"}),
                 json!({"type":format!("response.{family}.done"), "item_id":"item", "text":"visible"}),
                 json!({"type":format!("response.{part_family}.done"), "item_id":"item", "part":part}),
-                json!({"type":"response.output_item.done", "item":native.clone()}),
+                unindexed_done(native.clone()),
                 completed(vec![native]),
             ])
             .unwrap();
-            assert_eq!(items.len(), 1);
-            assert_eq!(items[0].blocks.len(), 1);
+            assert_eq!((items.len(), items[0].blocks.len()), (1, 1));
             let content = &items[0].blocks[0].content;
-            assert_eq!(
-                content
-                    .text_content()
-                    .or_else(|| content.reasoning_content()),
-                Some("visible")
-            );
+            let text = content
+                .text_content()
+                .or_else(|| content.reasoning_content());
+            assert_eq!(text, Some("visible"));
         }
     }
 
@@ -448,28 +817,16 @@ mod tests {
             added(0, message("message", "")),
             json!({"type":"response.output_text.delta", "output_index":0, "item_id":"message",
                 "content_index":1, "delta":"sec"}),
-            json!({"type":"response.output_text.delta", "item_id":"message", "delta":"ond"}),
+            delta("message", "ond"),
             completed(vec![native]),
         ])
         .unwrap();
-        assert_eq!(items[0].blocks.len(), 2);
-        assert_eq!(items[0].blocks[0].content.text_content(), Some("first"));
-        assert_eq!(items[0].blocks[1].content.text_content(), Some("second"));
-    }
-
-    #[test]
-    fn lazy_text_start_from_delta_does_not_require_added_events() {
-        let (items, _, reason) = assemble(vec![
-            json!({"type":"response.output_text.delta", "output_index":0,
-                "item_id":"lazy-message", "delta":"hello "}),
-            json!({"type":"response.output_text.delta", "item_id":"lazy-message", "delta":"world"}),
-            completed(vec![message("lazy-message", "hello world")]),
-        ])
-        .unwrap();
-        assert_eq!(reason, StopReason::EndTurn);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].id, "lazy-message");
-        assert_eq!(items[0].text_content().as_deref(), Some("hello world"));
+        let texts: Vec<_> = items[0]
+            .blocks
+            .iter()
+            .map(|block| block.content.text_content())
+            .collect();
+        assert_eq!(texts, [Some("first"), Some("second")]);
     }
 
     #[test]
@@ -479,34 +836,36 @@ mod tests {
             message("text", "checking"),
             function("function", "call-stable", r#"{"key":"value"}"#),
         ];
-        let mut events = output
-            .iter()
-            .map(|item| json!({"type":"response.output_item.done", "item":item}))
-            .collect::<Vec<_>>();
+        let mut events: Vec<_> = output.iter().cloned().map(unindexed_done).collect();
         events.push(completed(output));
         let (items, _, reason) = assemble(events).unwrap();
         assert_eq!(reason, StopReason::ToolUse);
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].reasoning_content().as_deref(), Some("plan"));
         assert_eq!(items[1].text_content().as_deref(), Some("checking"));
-        assert_eq!(items[2].tool_call_ref().unwrap().id, "call-stable");
+        assert_eq!(items[2].tool_call_ref().unwrap().id(), "call-stable");
     }
 
     #[test]
     fn tool_argument_events_resolve_by_native_item_id() {
         let call = function("function", "call-stable", r#"{"key":"value"}"#);
+        let arguments = |kind: &str, field: &str, value: Value| json!({"type":format!("response.function_call_arguments.{kind}"), "item_id":"function", field:value});
         let (items, _, reason) = assemble(vec![
             added(0, function("function", "call-stable", "")),
-            json!({"type":"response.function_call_arguments.delta", "item_id":"function", "delta":"{\"key\":"}),
-            json!({"type":"response.function_call_arguments.delta", "item_id":"function", "delta":"\"value\"}"}),
-            json!({"type":"response.function_call_arguments.done", "item_id":"function", "arguments":call["arguments"]}),
-            json!({"type":"response.output_item.done", "item":call.clone()}),
+            arguments("delta", "delta", json!("{\"key\":")),
+            arguments("delta", "delta", json!("\"value\"}")),
+            arguments("done", "arguments", call["arguments"].clone()),
+            unindexed_done(call.clone()),
             completed(vec![call]),
-        ]).unwrap();
+        ])
+        .unwrap();
         assert_eq!(reason, StopReason::ToolUse);
         let call = items[0].tool_call_ref().unwrap();
-        assert_eq!(call.id, "call-stable");
-        assert_eq!(call.arguments, json!({"key":"value"}));
+        assert_eq!(call.id(), "call-stable");
+        assert_eq!(
+            Value::Object(call.arguments().clone()),
+            json!({"key":"value"})
+        );
     }
 
     #[test]
@@ -531,167 +890,112 @@ mod tests {
         events.push(completed(terminal));
         let (items, _, reason) = assemble(events).unwrap();
         assert_eq!(reason, StopReason::ToolUse);
+        let ids: Vec<_> = items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["reason-stream", "text-stream", "function-stream"]);
+        let call = items[2].tool_call_ref().unwrap();
+        assert_eq!(call.id(), "call-stable");
         assert_eq!(
-            items
-                .iter()
-                .map(|item| item.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["reason-stream", "text-stream", "function-stream"]
-        );
-        assert_eq!(items[2].tool_call_ref().unwrap().id, "call-stable");
-        assert_eq!(
-            items[2].tool_call_ref().unwrap().arguments,
+            Value::Object(call.arguments().clone()),
             json!({"a":1, "b":2})
         );
     }
 
-    #[test]
-    fn regenerated_terminal_id_cannot_replace_changed_text() {
-        assert_protocol_error(vec![
-            added(0, message("stream", "original")),
-            done(0, message("stream", "original")),
-            completed(vec![message("terminal", "replacement")]),
-        ]);
-    }
-
-    #[test]
-    fn regenerated_terminal_ids_reject_ambiguous_equivalent_items() {
-        assert_protocol_error(vec![
-            added(0, message("first", "same")),
-            done(0, message("first", "same")),
-            added(1, message("second", "same")),
-            done(1, message("second", "same")),
-            completed(vec![
-                message("new-first", "same"),
-                message("new-second", "same"),
-            ]),
-        ]);
-    }
-
-    #[test]
-    fn unchanged_terminal_ids_allow_identical_content() {
-        let output = vec![message("first", "same"), message("second", "same")];
-        let (items, _, _) = assemble(vec![
-            added(0, output[0].clone()),
-            done(0, output[0].clone()),
-            added(1, output[1].clone()),
-            done(1, output[1].clone()),
-            completed(output),
-        ])
-        .unwrap();
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].id, "first");
-        assert_eq!(items[1].id, "second");
-    }
-
-    #[test]
-    fn tool_call_id_conflicts_fail_for_done_and_terminal_snapshots() {
-        for change_output_id in [false, true] {
-            for at_terminal in [false, true] {
-                let original = function("function", "call-original", r#"{"key":"value"}"#);
-                let changed = function(
-                    if change_output_id {
-                        "regenerated"
-                    } else {
-                        "function"
-                    },
-                    "call-changed",
-                    r#"{"key":"value"}"#,
-                );
-                let mut events = vec![added(0, original.clone())];
-                if at_terminal {
-                    events.push(done(0, original));
-                    events.push(completed(vec![changed]));
-                } else {
-                    events.push(done(0, changed.clone()));
-                    events.push(completed(vec![changed]));
-                }
-                assert_protocol_error(events);
+    /// Feeds events without calling finish: an unrelated missing-terminal error could
+    /// mask accidental acceptance of the invalid reference under test.
+    fn fails_while_feeding(events: Vec<Value>) -> bool {
+        let mut decoder = Decoder::new("test-model".into());
+        events.into_iter().any(|event| match decoder.feed(event) {
+            Err(error) => {
+                assert_eq!(error.kind, ProviderErrorKind::Protocol, "{error:?}");
+                true
             }
-        }
+            Ok(_) => false,
+        })
     }
 
     #[test]
-    fn regenerated_tool_output_id_requires_equivalent_name_and_arguments() {
-        for field in ["name", "arguments"] {
-            let original = function("function", "call-stable", r#"{"key":"value"}"#);
-            let mut changed = function("regenerated", "call-stable", r#"{"key":"value"}"#);
-            changed[field] = if field == "name" {
-                json!("different_tool")
+    fn unsafe_compatibility_normalization_is_a_protocol_error() {
+        let streamed = |items: &[Value]| -> Vec<Value> {
+            items
+                .iter()
+                .enumerate()
+                .flat_map(|(position, item)| {
+                    [added(position, item.clone()), done(position, item.clone())]
+                })
+                .collect()
+        };
+        let with = |mut events: Vec<Value>, terminal: Vec<Value>| {
+            events.push(completed(terminal));
+            events
+        };
+        let mut cases = vec![
+            // Regenerated terminal ids cannot replace changed text, disambiguate
+            // equivalent items, or take an id owned by another item kind.
+            with(
+                streamed(&[message("stream", "original")]),
+                vec![message("terminal", "replacement")],
+            ),
+            with(
+                streamed(&[message("first", "same"), message("second", "same")]),
+                vec![message("new-first", "same"), message("new-second", "same")],
+            ),
+            with(
+                streamed(&[
+                    message("text", "checking"),
+                    function("function", "call-stable", "{}"),
+                ]),
+                vec![
+                    message("function", "checking"),
+                    function("text", "call-stable", "{}"),
+                ],
+            ),
+            // Explicit index and item id conflict.
+            vec![
+                added(0, message("first", "")),
+                added(1, message("second", "")),
+                json!({"type":"response.output_text.delta", "output_index":0,
+                    "item_id":"second", "content_index":0, "delta":"wrong target"}),
+            ],
+            // Omitted item references, or invented positions, cannot pick among items.
+            vec![
+                added(0, message("first", "")),
+                added(1, message("second", "")),
+                json!({"type":"response.output_text.delta", "content_index":0, "delta":"ambiguous"}),
+            ],
+            vec![
+                unindexed_added(message("first", "")),
+                unindexed_added(message("second", "")),
+                json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"ambiguous"}),
+            ],
+        ];
+        let original = function("function", "call-original", r#"{"key":"value"}"#);
+        for (output_id, at_terminal) in [
+            ("function", false),
+            ("function", true),
+            ("regenerated", false),
+            ("regenerated", true),
+        ] {
+            let changed = function(output_id, "call-changed", r#"{"key":"value"}"#);
+            let done_item = if at_terminal {
+                original.clone()
             } else {
-                json!(r#"{"key":"other"}"#)
+                changed.clone()
             };
-            assert_protocol_error(vec![
+            cases.push(vec![
                 added(0, original.clone()),
-                done(0, original),
+                done(0, done_item),
                 completed(vec![changed]),
             ]);
         }
-    }
-
-    #[test]
-    fn terminal_id_owned_by_another_kind_is_not_repaired() {
-        let text = message("text", "checking");
-        let call = function("function", "call-stable", "{}");
-        assert_protocol_error(vec![
-            added(0, text.clone()),
-            done(0, text),
-            added(1, call.clone()),
-            done(1, call),
-            completed(vec![
-                message("function", "checking"),
-                function("text", "call-stable", "{}"),
-            ]),
-        ]);
-    }
-
-    #[test]
-    fn invalid_explicit_indices_are_never_treated_as_missing() {
-        for invalid in [
-            Value::Null,
-            json!("0"),
-            json!(-1),
-            json!(0.5),
-            json!(true),
-            json!({}),
-            json!([]),
+        for (field, value) in [
+            ("name", json!("different_tool")),
+            ("arguments", json!(r#"{"key":"other"}"#)),
         ] {
-            for key in ["output_index", "content_index"] {
-                let mut delta = json!({"type":"response.output_text.delta", "output_index":0,
-                    "content_index":0, "item_id":"text", "delta":"x"});
-                delta[key] = invalid.clone();
-                assert_protocol_error(vec![
-                    added(0, message("text", "")),
-                    delta,
-                    completed(vec![message("text", "x")]),
-                ]);
-            }
-            let mut summary = json!({"type":"response.reasoning_summary_text.delta", "output_index":0,
-                "summary_index":0, "item_id":"reason", "delta":"x"});
-            summary["summary_index"] = invalid.clone();
-            assert_protocol_error(vec![
-                added(0, reasoning("reason", "")),
-                summary,
-                completed(vec![reasoning("reason", "x")]),
-            ]);
-            let mut start = added(0, message("text", "x"));
-            start["output_index"] = invalid;
-            assert_protocol_error(vec![start, completed(vec![message("text", "x")])]);
+            let stable = function("function", "call-stable", r#"{"key":"value"}"#);
+            let mut changed = function("regenerated", "call-stable", r#"{"key":"value"}"#);
+            changed[field] = value;
+            cases.push(with(streamed(&[stable]), vec![changed]));
         }
-    }
-
-    #[test]
-    fn explicit_index_and_item_id_conflicts_are_errors() {
-        assert_protocol_error(vec![
-            added(0, message("first", "")),
-            added(1, message("second", "")),
-            json!({"type":"response.output_text.delta", "output_index":0,
-                "item_id":"second", "content_index":0, "delta":"wrong target"}),
-        ]);
-    }
-
-    #[test]
-    fn omitted_part_index_rejects_multiple_candidate_parts() {
         for (native, family, index_key) in [
             (message("item", ""), "output_text", "content_index"),
             (
@@ -708,121 +1012,61 @@ mod tests {
                 events.push(delta);
             }
             events.push(json!({"type":format!("response.{family}.delta"), "item_id":"item", "delta":"ambiguous"}));
-            assert_protocol_error(events);
+            cases.push(events);
         }
-    }
-
-    #[test]
-    fn omitted_item_reference_rejects_multiple_candidate_items() {
-        assert_protocol_error(vec![
-            added(0, message("first", "")),
-            added(1, message("second", "")),
-            json!({"type":"response.output_text.delta", "content_index":0, "delta":"ambiguous"}),
-        ]);
-    }
-
-    #[test]
-    fn equal_terminal_only_items_remain_distinct() {
-        let (items, _, _) = assemble(vec![completed(vec![
-            message("first", "same"),
-            message("second", "same"),
-        ])])
-        .unwrap();
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].id, "first");
-        assert_eq!(items[1].id, "second");
-    }
-
-    #[test]
-    fn equal_done_only_items_remain_distinct_with_or_without_indices() {
-        for indexed in [false, true] {
-            let first = message("first", "same");
-            let second = message("second", "same");
-            let mut events = vec![done(0, first.clone()), done(1, second.clone())];
-            if !indexed {
-                for event in &mut events {
-                    event.as_object_mut().unwrap().remove("output_index");
-                }
+        // Invalid explicit indices are never treated as missing.
+        for invalid in [
+            Value::Null,
+            json!("0"),
+            json!(-1),
+            json!(0.5),
+            json!(true),
+            json!({}),
+            json!([]),
+        ] {
+            for key in ["output_index", "content_index"] {
+                let mut delta = json!({"type":"response.output_text.delta", "output_index":0,
+                    "content_index":0, "item_id":"text", "delta":"x"});
+                delta[key] = invalid.clone();
+                cases.push(vec![
+                    added(0, message("text", "")),
+                    delta,
+                    completed(vec![message("text", "x")]),
+                ]);
             }
-            events.push(completed(vec![first, second]));
-            let (items, _, _) = assemble(events).unwrap();
-            assert_eq!(items.len(), 2);
+            let mut summary = json!({"type":"response.reasoning_summary_text.delta", "output_index":0,
+                "summary_index":0, "item_id":"reason", "delta":"x"});
+            summary["summary_index"] = invalid.clone();
+            cases.push(vec![
+                added(0, reasoning("reason", "")),
+                summary,
+                completed(vec![reasoning("reason", "x")]),
+            ]);
+            let mut start = added(0, message("text", "x"));
+            start["output_index"] = invalid;
+            cases.push(vec![start, completed(vec![message("text", "x")])]);
         }
-    }
-
-    #[test]
-    fn omitted_output_index_can_be_established_later_by_identity() {
-        let output = message("msg", "hello");
-        let (items, _, _) = assemble(vec![
-            json!({"type":"response.output_item.added","item":message("msg", "")}),
-            json!({"type":"response.output_text.delta","item_id":"msg","output_index":7,"delta":"hello"}),
-            done(7, output.clone()),
-            completed(vec![output]),
-        ]).unwrap();
-        assert_eq!(items[0].position, 0);
-        assert_eq!(items[0].text_content().as_deref(), Some("hello"));
-    }
-
-    #[test]
-    fn invented_output_position_does_not_disambiguate_missing_identity() {
-        assert_protocol_error(vec![
-            json!({"type":"response.output_item.added","item":message("first", "")}),
-            json!({"type":"response.output_item.added","item":message("second", "")}),
-            json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"ambiguous"}),
-        ]);
-    }
-
-    #[test]
-    fn explicit_wire_owner_precedes_unbound_items() {
-        let first = message("first", "hello");
-        let second = message("second", "world");
-        let (items, _, _) = assemble(vec![
-            added(0, message("first", "")),
-            json!({"type":"response.output_item.added","item":message("second", "")}),
-            json!({"type":"response.output_text.delta","output_index":0,"delta":"hello"}),
-            done(0, first.clone()),
-            json!({"type":"response.output_item.done","item":second.clone()}),
-            completed(vec![first, second]),
-        ])
-        .unwrap();
-        assert_eq!(items[0].text_content().as_deref(), Some("hello"));
-        assert_eq!(items[1].text_content().as_deref(), Some("world"));
+        for (index, events) in cases.into_iter().enumerate() {
+            assert!(fails_while_feeding(events), "case {index} was accepted");
+        }
     }
 
     #[test]
     fn generic_reasoning_parts_infer_kind_from_explicit_wire_owner() {
         let output = json!({"type":"reasoning","id":"r","content":[{"type":"output_text","text":"thinking"}]});
+        let part = |kind: &str| {
+            json!({"type":format!("response.content_part.{kind}"),"output_index":0,"content_index":0,
+                "part":{"type":"output_text","text":"thinking"}})
+        };
         let (items, _, _) = assemble(vec![
             added(0, json!({"type":"reasoning","id":"r"})),
-            json!({"type":"response.content_part.added","output_index":0,"content_index":0,
-                "part":{"type":"output_text","text":"thinking"}}),
-            json!({"type":"response.content_part.done","output_index":0,"content_index":0,
-                "part":{"type":"output_text","text":"thinking"}}),
+            part("added"),
+            part("done"),
             done(0, output.clone()),
             completed(vec![output.clone()]),
         ])
         .unwrap();
         assert_eq!(items[0].reasoning_content().as_deref(), Some("thinking"));
         assert_eq!(items[0].replay.as_ref().unwrap().payload, output);
-    }
-
-    #[test]
-    fn stable_terminal_ids_are_reserved_before_semantic_alias_matching() {
-        let retained = message("retained", "same");
-        let fresh = message("fresh", "same");
-        for output in [
-            vec![fresh.clone(), retained.clone()],
-            vec![retained.clone(), fresh.clone()],
-        ] {
-            let (items, _, _) = assemble(vec![
-                added(0, retained.clone()),
-                done(0, retained.clone()),
-                completed(output),
-            ])
-            .unwrap();
-            assert_eq!(items.len(), 2);
-            assert_eq!(items[0].id, "retained");
-            assert_eq!(items[1].id, "fresh");
-        }
     }
 }

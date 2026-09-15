@@ -5,7 +5,7 @@ use serde_json::Value;
 use crate::{
     identity::JobId,
     job::{JobManager, presented_job_schema},
-    tool::{RegistryError, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder},
+    tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder},
 };
 
 pub(crate) fn register(
@@ -23,7 +23,7 @@ pub(crate) fn register(
             let jobs = list.clone();
             async move {
                 let current = jobs
-                    .snapshot(context.job)
+                    .snapshot(context.job())
                     .await
                     .map_err(|error| job_error(&error))?;
                 let containing_script = if let Some(parent) = current.parent {
@@ -31,59 +31,47 @@ pub(crate) fn register(
                         .snapshot(parent)
                         .await
                         .map_err(|error| job_error(&error))?;
-                    (parent.tool == "script").then_some(parent.id)
+                    (parent.role == crate::job::JobRole::Script).then_some(parent.id)
                 } else {
                     None
                 };
                 let envelopes = jobs
-                    .list(&context.agent)
+                    .list(context.agent())
                     .await
                     .into_iter()
-                    .filter(|job| job.id != context.job && Some(job.id) != containing_script)
+                    .filter(|job| job.id != context.job() && Some(job.id) != containing_script)
                     .filter(|job| args.all || !job.state.is_terminal())
                     .collect::<Vec<_>>();
                 Ok(Value::Array(
                     envelopes
                         .iter()
-                        .map(|job| job.presented_for(&context.capabilities, Some(&context.caller_location), true))
+                        .map(|job| {
+                            job.presented_for(
+                                context.capabilities(),
+                                Some(context.caller_location()),
+                                true,
+                            )
+                        })
                         .collect::<Result<_, _>>()?,
                 ))
             }
         },
     )?;
     let output = jobs.clone();
-    builder.register_dynamic(
+    builder.register_presented::<crate::job::output::OutputArgs, _, _>(
         "job_output",
         "Read or search saved job output and status on job completion. Whole-output reads attach saved images; filtered or paginated reads return text in preview.lines without images.",
-        serde_json::to_value(schemars::schema_for!(crate::job::output::OutputArgs))
-            .map_err(|error| RegistryError::Schema(error.to_string()))?,
-        ToolOptions::default().generated_output_schema(crate::job::output::view_schema).job_method("output", "job"),
-        move |context, arguments| {
+        ToolOptions::default().job_method("output", "job"),
+        move |context, mut args| {
             let jobs = output.clone();
             async move {
-                let mut args: crate::job::output::OutputArgs = serde_json::from_value(arguments)
-                    .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
-                // Any explicit text selection, even its default value, opts out
-                // of potentially large image payloads.
-                let attach_images = args.field.is_none()
-                    && args.start.is_none()
-                    && args.limit.is_none()
-                    && args.pattern.is_none()
-                    && args.context.is_none()
-                    && args.offset.is_none();
-                let job = args.job;
                 args.cancellation = Some(context.cancellation_token());
-                // Preserve validation, cancellation, capability projection, and
-                // acknowledgment before retrieving any attachment side channel.
-                let value = jobs.present_output_for(
-                    args, &context.capabilities, &context.caller_location, false,
-                ).await?;
-                let images = if attach_images {
-                    jobs.images(job).await.map_err(|error| job_error(&error))?
-                } else {
-                    Vec::new()
-                };
-                Ok(ToolOutput::new(value).with_images(images))
+                jobs.present_output_with(
+                    args,
+                    context.capabilities(),
+                    crate::job::output::OutputOptions::Model { viewer: Some(context.caller_location()), detailed: false, presentation: crate::job::OutputPresentation::Full },
+                )
+                .await
             }
         },
     )?;
@@ -120,8 +108,8 @@ pub(crate) fn register(
                     .map_err(|error| job_error(&error))
                     .and_then(|job| {
                         job.presented_for(
-                            &context.capabilities,
-                            Some(&context.caller_location),
+                            context.capabilities(),
+                            Some(context.caller_location()),
                             false,
                         )
                         .map_err(ToolError::from)
@@ -161,149 +149,99 @@ struct JobSendArgs {
 
 #[cfg(test)]
 mod tests {
-    use crate::job::{JobOutcome, JobState};
-    use crate::tests::TestRuntime;
-    use crate::tool::policy::{Capability, CapabilitySet};
     use std::sync::{Arc, OnceLock};
 
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde_json::json;
 
     use super::*;
     use crate::{
         identity::AgentId,
-        job::JobSpec,
-        media::ImageReference,
+        job::{JobOutcome, JobRole, JobSpec, JobState},
+        media::ImageRef,
         provider::protocol::{Message, ModelRequest, ToolResult},
         session::SessionStore,
-        tool::{ToolOutput, ToolRegistryBuilder, executor::ToolExecutor, policy::AllowAll},
+        tests::TestRuntime,
+        tool::{
+            ToolOutput, ToolRegistryBuilder,
+            executor::{ExecutionResult, ToolExecutor},
+            policy::{AllowAll, Capability, CapabilitySet},
+        },
     };
 
-    #[tokio::test]
-    async fn every_job_api_projects_pending_authorization_as_queued() {
-        let runtime = TestRuntime::new().await;
-        let agent = runtime.agent.clone();
-        let jobs = runtime.jobs.clone();
-        let pending = jobs
-            .create(JobSpec::test(agent.clone(), "pending"))
-            .await
+    fn ids(listing: &Value) -> Vec<Value> {
+        listing
+            .as_array()
             .unwrap()
-            .id;
-        jobs.transition(pending, JobState::AwaitingApproval)
-            .await
-            .unwrap();
-        let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder, jobs.clone()).unwrap();
-        let executor = runtime.executor(builder);
-        for (tool, args) in [
-            ("jobs", serde_json::json!({})),
-            ("job_output", serde_json::json!({"job":pending})),
-        ] {
-            let result = executor
-                .execute(agent.clone(), tool, args, None)
-                .await
-                .unwrap()
-                .output
-                .value;
-            assert!(!result.to_string().contains("awaiting_approval"));
-            assert_eq!(
-                if tool == "jobs" {
-                    &result[0]["state"]
-                } else {
-                    &result["state"]
-                },
-                "queued"
-            );
-        }
+            .iter()
+            .map(|job| job["id"].clone())
+            .collect()
     }
 
     #[tokio::test]
-    async fn jobs_defaults_to_other_active_jobs_and_all_includes_history() {
+    async fn job_listing_projects_approval_and_defaults_to_other_active_jobs() {
         let runtime = TestRuntime::new().await;
-        let agent = runtime.agent.clone();
-        let jobs = &runtime.jobs;
-        let active = jobs
-            .create(JobSpec {
-                background: true,
-                ..JobSpec::test(agent.clone(), "active")
-            })
+        let (agent, jobs) = (&runtime.agent, &runtime.jobs);
+        // Leases stay alive: dropping startup ownership cancels a job.
+        let spec = |tool: &str| JobSpec {
+            background: true,
+            ..JobSpec::test(agent.clone(), tool)
+        };
+        let pending_lease = jobs
+            .create(JobSpec::test(agent.clone(), "pending"))
             .await
-            .unwrap()
-            .id;
-        let completed = jobs
-            .create(JobSpec {
-                background: true,
-                ..JobSpec::test(agent.clone(), "completed")
-            })
+            .unwrap();
+        let pending = pending_lease.id();
+        jobs.transition(pending, JobState::AwaitingApproval)
             .await
-            .unwrap()
-            .id;
-        jobs.finish(
-            completed,
-            crate::job::JobOutcome::Completed(ToolOutput::new(Value::Null)),
-        )
-        .await
-        .unwrap();
+            .unwrap();
+        let completed_lease = jobs.create(spec("completed")).await.unwrap();
+        let completed = completed_lease.id();
+        let finished = JobOutcome::Completed(ToolOutput::new(Value::Null));
+        jobs.finish(completed, finished).await.unwrap();
         let mut builder = ToolRegistryBuilder::default();
         register(&mut builder, jobs.clone()).unwrap();
         let executor = runtime.executor(builder);
-
+        // Every job API projects pending authorization as queued.
         let current = executor
-            .execute(agent.clone(), "jobs", serde_json::json!({}), None)
-            .await
-            .unwrap();
-        let current = current.output.value.as_array().unwrap();
-        assert_eq!(
-            current
-                .iter()
-                .map(
-                    |job| serde_json::from_value::<crate::identity::JobId>(job["id"].clone())
-                        .unwrap()
-                )
-                .collect::<Vec<_>>(),
-            [active]
-        );
-
-        let script = jobs
-            .create(JobSpec {
-                accepts_input: true,
-                background: true,
-                ..JobSpec::test(agent.clone(), "script")
-            })
+            .run_host(agent, "jobs", json!({}))
             .await
             .unwrap()
-            .id;
+            .output
+            .value;
+        let output = executor
+            .run_host(agent, "job_output", json!({"job":pending}))
+            .await;
+        let output = output.unwrap().output.value;
+        for (value, state) in [
+            (&current, &current[0]["state"]),
+            (&output, &output["state"]),
+        ] {
+            assert!(!value.to_string().contains("awaiting_approval"));
+            assert_eq!(state, "queued");
+        }
+        assert_eq!(ids(&current), [json!(pending)]);
+
+        let spec = JobSpec {
+            accepts_input: true,
+            background: true,
+            role: JobRole::Script,
+            ..JobSpec::test(agent.clone(), "container")
+        };
+        let script_lease = jobs.create(spec).await.unwrap();
+        let script = script_lease.id();
         let nested = executor
-            .execute(agent.clone(), "jobs", serde_json::json!({}), Some(script))
-            .await
-            .unwrap();
-        let nested = nested.output.value.as_array().unwrap();
-        assert!(
-            nested
-                .iter()
-                .any(|job| job["id"] == serde_json::json!(active))
-        );
-        assert!(
-            nested
-                .iter()
-                .all(|job| job["id"] != serde_json::json!(script))
-        );
+            .execute(agent.clone(), "jobs", json!({}), Some(script))
+            .await;
+        let nested = ids(&nested.unwrap().output.value);
+        assert!(nested.contains(&json!(pending)) && !nested.contains(&json!(script)));
 
         let all = executor
-            .execute(agent, "jobs", serde_json::json!({"all": true}), None)
+            .run_host(agent, "jobs", json!({"all": true}))
             .await
             .unwrap();
-        let listing_job = all.job;
-        let all = all.output.value.as_array().unwrap();
-        assert!(all.iter().any(|job| job["id"] == serde_json::json!(active)));
-        assert!(
-            all.iter()
-                .any(|job| job["id"] == serde_json::json!(completed))
-        );
-        assert!(
-            all.iter()
-                .all(|job| job["id"] != serde_json::json!(listing_job))
-        );
+        let listed = ids(&all.output.value);
+        assert!(listed.contains(&json!(pending)) && listed.contains(&json!(completed)));
+        assert!(!listed.contains(&json!(all.job)));
     }
 
     // End-to-end attachments through the tool executor and JavaScript bridge.
@@ -324,12 +262,36 @@ mod tests {
         (executor, slot)
     }
 
-    async fn assert_hydrated(store: &SessionStore, images: Vec<ImageReference>) {
-        assert_eq!(images.len(), 1);
-        assert!(
-            images[0].data_base64.is_none(),
-            "journal references stay payload-free"
+    async fn image_runtime() -> (TestRuntime, ToolExecutor, Arc<OnceLock<ToolExecutor>>) {
+        let runtime = TestRuntime::new().await;
+        tokio::fs::write(runtime.root.path().join("image.png"), IMAGE)
+            .await
+            .unwrap();
+        let (executor, slot) = executor(
+            runtime.store.clone(),
+            runtime.jobs.clone(),
+            runtime.root.path(),
         );
+        (runtime, executor, slot)
+    }
+
+    async fn script(
+        executor: &ToolExecutor,
+        agent: &AgentId,
+        source: String,
+        bg: bool,
+    ) -> ExecutionResult {
+        let arguments = json!({"source":source, "bg":bg});
+        executor
+            .run_model(agent, "script", arguments)
+            .await
+            .unwrap()
+    }
+
+    async fn assert_loaded(store: &SessionStore, images: Vec<ImageRef>) {
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, crate::media::ImageFormat::Png);
+        let blob = images[0].blob;
         let mut request = ModelRequest {
             model: "image-test".into(),
             system: vec![],
@@ -338,7 +300,10 @@ mod tests {
             reasoning: None,
             max_output_tokens: None,
             correlation: None,
-            messages: vec![Message::Tool(vec![ToolResult {
+            blobs: Default::default(),
+            tail: Vec::new(),
+            history_lifetime: Default::default(),
+            history: vec![Message::Tool(vec![ToolResult {
                 call_id: "output".into(),
                 name: "job_output".into(),
                 result: json!({}),
@@ -346,121 +311,92 @@ mod tests {
                 is_error: false,
             }])],
         };
-        store.hydrate_model_request(&mut request).await.unwrap();
-        let Message::Tool(results) = &request.messages[0] else {
-            panic!("tool results")
-        };
+        assert!(request.blobs.get(&blob).is_err());
+        store.load_blobs(&mut request).await.unwrap();
+        assert_eq!(request.blobs.get(&blob).unwrap(), IMAGE);
+    }
+
+    #[tokio::test]
+    async fn failed_script_discards_collected_images_but_retains_console_and_source() {
+        let (runtime, executor, _slot) = image_runtime().await;
+        let source = r#"
+            await tool.read({path:"image.png"});
+            console.log("console survives the deliberate image-discard policy");
+            throw new Error("failed after receiving an image");
+        "#;
+        let failed = script(&executor, &runtime.agent, source.into(), false).await;
+        assert!(failed.is_error);
+        let value = &failed.output.value;
         assert_eq!(
-            results[0].images[0].data_base64.as_deref(),
-            Some(STANDARD.encode(IMAGE).as_str())
+            (&value["state"], &value["result"]["value"]),
+            (&json!("failed"), &Value::Null)
         );
+        assert_eq!(
+            value["result"]["console"],
+            "console survives the deliberate image-discard policy\n"
+        );
+        assert!(failed.output.images.is_empty());
+        assert!(runtime.jobs.images(failed.job).await.unwrap().is_empty());
+        let jobs = runtime.jobs.list(&runtime.agent).await;
+        let source = jobs.into_iter().find(|job| job.tool == "read");
+        let source = source.expect("owning read result survives script failure");
+        assert_eq!(source.state, JobState::Completed);
+        assert_loaded(
+            &runtime.store,
+            runtime.jobs.images(source.id).await.unwrap(),
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn background_image_output_attaches_directly_and_through_javascript() {
-        let runtime = TestRuntime::new().await;
-        tokio::fs::write(runtime.root.path().join("image.png"), IMAGE)
-            .await
-            .unwrap();
-        let (executor, _slot) = executor(
-            runtime.store.clone(),
-            runtime.jobs.clone(),
-            runtime.root.path(),
-        );
+        let (runtime, executor, _slot) = image_runtime().await;
+        let agent = &runtime.agent;
         // read itself is foreground-only; a background script is the supported way
         // to read an image asynchronously and retrieve its saved output later.
-        let launched = executor
-            .execute_model(
-                runtime.agent.clone(),
-                "script",
-                json!({"source":"return await tool.read({path:'image.png'});","bg":true}),
-                None,
-            )
-            .await
-            .unwrap();
+        let source = "return await tool.read({path:'image.png'});";
+        let launched = script(&executor, agent, source.into(), true).await;
         assert!(launched.background);
         runtime.jobs.wait(launched.job, None, true).await.unwrap();
         for _ in 0..2 {
             let output = executor
-                .execute_model(
-                    runtime.agent.clone(),
-                    "job_output",
-                    json!({"job":launched.job}),
-                    None,
-                )
-                .await
-                .unwrap();
-            assert_eq!(output.output.value["state"], "completed");
+                .run_model(agent, "job_output", json!({"job":launched.job}))
+                .await;
+            let output = output.unwrap().output;
+            assert_eq!(output.value["state"], "completed");
             // Returning a tool result preserves its originating read job view.
-            assert_eq!(output.output.value["result"]["value"]["tool"], "read");
-            assert_eq!(output.output.value["result"]["console"], "");
-            assert!(output.output.value.get("console").is_none());
-            assert_hydrated(&runtime.store, output.output.images).await;
+            assert_eq!(output.value["result"]["value"]["tool"], "read");
+            assert_eq!(output.value["result"]["console"], "");
+            assert!(output.value.get("console").is_none());
+            assert_loaded(&runtime.store, output.images).await;
         }
         let source = format!("return await tool.job({}).output();", launched.job);
-        let output = executor
-            .execute_model(
-                runtime.agent.clone(),
-                "script",
-                json!({"source":source}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(output.output.value["result"]["console"], "");
-        assert_eq!(
-            output.output.value["result"]["value"]["id"],
-            launched.job.get()
-        );
-        assert_hydrated(&runtime.store, output.output.images).await;
-
+        let output = script(&executor, agent, source.clone(), false).await.output;
+        assert_eq!(output.value["result"]["console"], "");
+        assert_eq!(output.value["result"]["value"]["id"], launched.job.get());
+        assert_loaded(&runtime.store, output.images).await;
         // A background script that retrieves an existing image must itself retain
         // the attachment, not merely the nested job's JSON metadata.
-        let script = executor
-            .execute_model(
-                runtime.agent.clone(),
-                "script",
-                json!({"source":format!("return await tool.job({}).output();", launched.job), "bg":true}),
-                None,
-            )
-            .await
-            .unwrap();
-        runtime.jobs.wait(script.job, None, true).await.unwrap();
+        let background = script(&executor, agent, source, true).await;
+        runtime.jobs.wait(background.job, None, true).await.unwrap();
         let output = executor
-            .execute_model(
-                runtime.agent.clone(),
-                "job_output",
-                json!({"job":script.job}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(output.output.value["state"], "completed");
-        assert_hydrated(&runtime.store, output.output.images).await;
+            .run_model(agent, "job_output", json!({"job":background.job}))
+            .await;
+        let output = output.unwrap().output;
+        assert_eq!(output.value["state"], "completed");
+        assert_loaded(&runtime.store, output.images).await;
     }
 
     #[tokio::test]
     async fn image_output_text_selections_do_not_attach_and_invalid_queries_fail() {
-        let runtime = TestRuntime::new().await;
-        tokio::fs::write(runtime.root.path().join("image.png"), IMAGE)
-            .await
-            .unwrap();
-        let (executor, _slot) = executor(
-            runtime.store.clone(),
-            runtime.jobs.clone(),
-            runtime.root.path(),
-        );
+        let (runtime, executor, _slot) = image_runtime().await;
+        let agent = &runtime.agent;
         let read = executor
-            .execute_model(
-                runtime.agent.clone(),
-                "read",
-                json!({"path":"image.png"}),
-                None,
-            )
+            .run_model(agent, "read", json!({"path":"image.png"}))
             .await
             .unwrap();
-        assert_hydrated(&runtime.store, read.output.images).await;
-        for selection in [
+        assert_loaded(&runtime.store, read.output.images).await;
+        for options in [
             json!({"field":"/result"}),
             json!({"field":""}),
             json!({"start":1}),
@@ -470,27 +406,17 @@ mod tests {
             json!({"pattern":"image"}),
             json!({"pattern":"image", "context":1}),
         ] {
-            let mut query = selection;
+            let mut query = options.clone();
             query["job"] = json!(read.job);
             let output = executor
-                .execute_model(runtime.agent.clone(), "job_output", query.clone(), None)
+                .run_model(agent, "job_output", query)
                 .await
                 .unwrap();
-            assert!(output.output.images.is_empty(), "{query}");
+            assert!(output.output.images.is_empty(), "{options}");
             // The job binding supplies the ID; the object form accepts only options.
-            let mut options = query.clone();
-            options.as_object_mut().unwrap().remove("job");
             let source = format!("return await tool.job({}).output({options});", read.job);
-            let output = executor
-                .execute_model(
-                    runtime.agent.clone(),
-                    "script",
-                    json!({"source":source}),
-                    None,
-                )
-                .await
-                .unwrap();
-            assert!(output.output.images.is_empty(), "{query}");
+            let output = script(&executor, agent, source, false).await;
+            assert!(output.output.images.is_empty(), "{options}");
         }
         for query in [
             json!({"job":read.job,"limit":0}),
@@ -499,7 +425,7 @@ mod tests {
         ] {
             assert!(
                 executor
-                    .execute_model(runtime.agent.clone(), "job_output", query, None)
+                    .run_model(agent, "job_output", query)
                     .await
                     .is_err()
             );
@@ -507,16 +433,10 @@ mod tests {
         // A denied image-producing call never creates a retrievable attachment.
         let mut capabilities = CapabilitySet::default();
         capabilities.remove(Capability::Read);
+        let denied = executor.clone().with_capabilities(capabilities);
         assert!(
-            executor
-                .clone()
-                .with_capabilities(capabilities)
-                .execute_model(
-                    runtime.agent.clone(),
-                    "read",
-                    json!({"path":"image.png"}),
-                    None
-                )
+            denied
+                .run_model(agent, "read", json!({"path":"image.png"}))
                 .await
                 .is_err()
         );
@@ -525,49 +445,44 @@ mod tests {
     #[tokio::test]
     async fn retrieved_images_survive_resume_including_failed_tool_output() {
         let runtime = TestRuntime::new().await;
+        let image = crate::media::Image::new(IMAGE.to_vec()).unwrap();
         let image = runtime
             .store
-            .import_blob(IMAGE, "image.png".into(), "image/png".into())
+            .store_image(Some("image.png".into()), &image)
             .await
             .unwrap();
-        let job = runtime
-            .jobs
-            .create(JobSpec::test(runtime.agent.clone(), "partial-image"))
-            .await
-            .unwrap()
-            .id;
-        runtime
-            .jobs
-            .finish(
-                job,
-                JobOutcome::Failed {
-                    message: "failed after producing an image".into(),
-                    output: Some(ToolOutput::new(json!({"image":image})).with_images(vec![image])),
-                    denial: None,
-                },
-            )
-            .await
-            .unwrap();
+        let spec = JobSpec::test(runtime.agent.clone(), "partial-image");
+        let job_lease = runtime.jobs.create(spec).await.unwrap();
+        let job = job_lease.id();
+        // Complete and consume startup ownership before reopening the session;
+        // retaining the lease would retain its JobManager and journal lock.
+        let output = ToolOutput::new(json!({"image":image})).with_images(vec![image]);
+        job_lease
+            .fail(JobOutcome::Failed {
+                message: "failed after producing an image".into(),
+                output: Some(output),
+                denial: None,
+            })
+            .await;
+        assert_eq!(
+            runtime.jobs.snapshot(job).await.unwrap().state,
+            JobState::Failed
+        );
         let id = runtime.store.id();
-        drop(runtime.jobs);
-        drop(runtime.store);
-        let (store, records) = SessionStore::open(&runtime.root.path().join("sessions"), id)
-            .await
-            .unwrap();
+        drop((runtime.jobs, runtime.store));
+        let sessions = runtime.root.path().join("sessions");
+        let (store, records) = SessionStore::open(&sessions, id).await.unwrap();
         let jobs = JobManager::restore(store.clone(), &records).await.unwrap();
         let agent = AgentId::root(id);
         let (executor, _slot) = executor(store.clone(), jobs, runtime.root.path());
         let output = executor
-            .execute_model(agent.clone(), "job_output", json!({"job":job}), None)
+            .run_model(&agent, "job_output", json!({"job":job}))
             .await
             .unwrap();
         assert_eq!(output.output.value["state"], "failed");
-        assert_hydrated(&store, output.output.images).await;
+        assert_loaded(&store, output.output.images).await;
         let source = format!("return await tool.job({job}).output();");
-        let output = executor
-            .execute_model(agent, "script", json!({"source":source}), None)
-            .await
-            .unwrap();
-        assert_hydrated(&store, output.output.images).await;
+        let output = script(&executor, &agent, source, false).await;
+        assert_loaded(&store, output.output.images).await;
     }
 }

@@ -2,10 +2,10 @@
 
 use crate::{
     identity::AgentId,
-    provider::protocol::{BlockContent, Message, ModelRequest},
+    provider::protocol::{BlockContent, HistoryLifetime, Message, ModelRequest},
 };
 
-use super::{ContextMessage, EventRecord, ModelPurpose, SessionError, SessionEvent};
+use super::{EventRecord, ModelPurpose, SessionError, SessionEvent};
 
 /// Project the latest committed compaction and subsequent messages for one agent.
 /// Sequence IDs refer to original message events or the compaction event itself.
@@ -204,14 +204,14 @@ fn valid_tool_pair(assistant: &Message, tool: &Message) -> bool {
         .iter()
         .flat_map(|item| &item.blocks)
         .filter_map(|block| match &block.content {
-            BlockContent::ToolCall(call) => Some((&call.id, &call.name)),
+            BlockContent::ToolCall(call) => Some((call.id(), call.name())),
             _ => None,
         })
         .collect();
     let call_set: std::collections::HashSet<_> = calls.iter().copied().collect();
     let result_set: std::collections::HashSet<_> = results
         .iter()
-        .map(|result| (&result.call_id, &result.name))
+        .map(|result| (result.call_id.as_str(), result.name.as_str()))
         .collect();
     !calls.is_empty()
         && calls.len() == call_set.len()
@@ -221,8 +221,8 @@ fn valid_tool_pair(assistant: &Message, tool: &Message) -> bool {
 
 /// Return the configured provider name and exact request at a `ModelRequested` event.
 /// Records must be ordered by sequence, as returned by `SessionStore`.
-/// Image references retain their journaled blob metadata; use
-/// `SessionStore::hydrate_model_request` to restore request-local payloads.
+/// Attachment and image references keep their blob digests; use
+/// `SessionStore::load_blobs` to load their contents for provider encoding.
 pub fn reconstruct_model_request(
     records: &[EventRecord],
     sequence: u64,
@@ -233,8 +233,8 @@ pub fn reconstruct_model_request(
             sequence,
             reason: "event not found",
         })?;
-    let mut messages = Vec::new();
-    let (provider, template) = visit_request(
+    let mut history = Vec::new();
+    let (provider, template, tail, history_lifetime) = visit_request(
         &records[index],
         |source| {
             records[..index]
@@ -242,10 +242,14 @@ pub fn reconstruct_model_request(
                 .ok()
                 .map(|position| &records[position])
         },
-        |message| messages.push(message.clone()),
+        |message| history.push(message.clone()),
     )?;
-    let mut request = template.clone();
-    request.messages = messages;
+    let request = ModelRequest {
+        history,
+        tail: tail.to_vec(),
+        history_lifetime,
+        ..super::ModelRequestTemplate::try_from(template.clone())?.into_request()
+    };
     Ok((provider.to_owned(), request))
 }
 
@@ -267,13 +271,17 @@ fn visit_request<'a>(
     call: &'a EventRecord,
     mut lookup: impl FnMut(u64) -> Option<&'a EventRecord>,
     mut visit: impl FnMut(&'a Message),
-) -> Result<(&'a str, &'a ModelRequest), SessionError> {
+) -> Result<(&'a str, &'a ModelRequest, &'a [Message], HistoryLifetime), SessionError> {
     let invalid = |reason| SessionError::ModelRequestReplay {
         sequence: call.sequence,
         reason,
     };
     let SessionEvent::ModelRequested {
-        context, messages, ..
+        context,
+        history,
+        tail,
+        history_lifetime,
+        ..
     } = &call.event
     else {
         return Err(invalid("event is not a model request"));
@@ -284,33 +292,28 @@ fn visit_request<'a>(
     let SessionEvent::ModelContext { provider, template } = &context.event else {
         return Err(invalid("referenced event is not a model context"));
     };
-    if !template.messages.is_empty() {
+    if !template.history.is_empty() || !template.tail.is_empty() {
         return Err(invalid(
             "model context must not duplicate conversation history",
         ));
     }
-    for message in messages {
-        visit(match message {
-            ContextMessage::Inline { message } => message,
-            ContextMessage::Source { sequence } => {
-                let source = lookup(*sequence)
-                    .filter(|record| record.agent == call.agent)
-                    .ok_or_else(|| {
-                        invalid("message source must precede the call and belong to the same agent")
-                    })?;
-                match &source.event {
-                    SessionEvent::MessageCommitted { message } => message,
-                    SessionEvent::Compaction { checkpoint } => &checkpoint.message,
-                    _ => {
-                        return Err(invalid(
-                            "referenced event does not contain a conversation message",
-                        ));
-                    }
-                }
+    for sequence in history {
+        let source = lookup(*sequence)
+            .filter(|record| record.agent == call.agent)
+            .ok_or_else(|| {
+                invalid("message source must precede the call and belong to the same agent")
+            })?;
+        visit(match &source.event {
+            SessionEvent::MessageCommitted { message } => message,
+            SessionEvent::Compaction { checkpoint } => &checkpoint.message,
+            _ => {
+                return Err(invalid(
+                    "referenced event does not contain a conversation message",
+                ));
             }
         });
     }
-    Ok((provider, template))
+    Ok((provider, template, tail, *history_lifetime))
 }
 
 #[cfg(test)]
@@ -325,53 +328,77 @@ mod tests {
     };
     use serde_json::json;
 
+    fn text_message(text: &str) -> Message {
+        Message::User(vec![UserContent::Text { text: text.into() }])
+    }
+
+    fn committed(message: Message) -> SessionEvent {
+        SessionEvent::MessageCommitted { message }
+    }
+
+    fn requested(
+        context: u64,
+        purpose: ModelPurpose,
+        history: &[u64],
+        tail: &str,
+        history_lifetime: HistoryLifetime,
+    ) -> SessionEvent {
+        SessionEvent::ModelRequested {
+            context,
+            history: history.to_vec(),
+            tail: vec![text_message(tail)],
+            history_lifetime,
+            purpose,
+        }
+    }
+
     #[tokio::test]
     async fn replay_preserves_context_boundaries_and_image_payloads() {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::create(directory.path()).await.unwrap();
         let agent = AgentId::root(store.id());
         let child = agent.child(1);
+        let png = crate::tests::png(b"image payload");
         let image = store
-            .import_blob(b"image payload", "test.png".into(), "image/png".into())
+            .store_image(Some("test.png".into()), &png)
             .await
             .unwrap();
+        let text = crate::media::Attachment::Text {
+            file: Some("notes.txt".into()),
+            content: "notes".into(),
+        };
+        let notes = store.store_attachment(&text).await.unwrap();
         let user = Message::User(vec![
             UserContent::Text {
                 text: "inspect".into(),
             },
-            UserContent::Image {
-                image: image.clone(),
+            UserContent::Attachment {
+                attachment: crate::media::AttachmentRef::Image(image.clone()),
+            },
+            UserContent::Attachment {
+                attachment: notes.clone(),
             },
         ]);
-        let assistant = Message::Assistant(vec![AssistantItem::reasoning(
-            "reasoning-item",
-            0,
-            "reasoning",
-            Some(ReplayEnvelope {
-                version: 1,
-                protocol: "test".into(),
-                model: "original-model".into(),
-                scope: "reasoning".into(),
-                payload: json!({"signature":"preserve"}),
-            }),
-        )]);
+        let envelope = ReplayEnvelope {
+            version: 1,
+            protocol: "test".into(),
+            model: "original-model".into(),
+            scope: "reasoning".into(),
+            payload: json!({"signature":"preserve"}),
+        };
+        let reasoning = AssistantItem::reasoning("reasoning-item", 0, "reasoning", Some(envelope));
+        let assistant = Message::Assistant(vec![reasoning]);
         let tool = Message::Tool(vec![ToolResult {
             call_id: "read-1".into(),
             name: "read".into(),
             result: json!({"ok":true}),
-            images: vec![image],
+            images: vec![image.clone()],
             is_error: false,
         }]);
+        let append =
+            async |agent: &AgentId, event| store.append(agent.clone(), event).await.unwrap();
         for message in [&user, &assistant, &tool] {
-            store
-                .append(
-                    agent.clone(),
-                    SessionEvent::MessageCommitted {
-                        message: message.clone(),
-                    },
-                )
-                .await
-                .unwrap();
+            append(&agent, committed(message.clone())).await;
         }
         let template = ModelRequest {
             model: "original-model".into(),
@@ -379,7 +406,9 @@ mod tests {
                 text: "original instructions".into(),
                 cache: true,
             }],
-            messages: vec![],
+            history: vec![],
+            tail: vec![],
+            history_lifetime: HistoryLifetime::Continuing,
             tools: vec![ToolDefinition {
                 name: "read".into(),
                 description: "original description".into(),
@@ -392,131 +421,73 @@ mod tests {
             }),
             max_output_tokens: Some(4096),
             correlation: Some(agent.to_string()),
+            blobs: Default::default(),
         };
-        let context = store
-            .append(
-                agent.clone(),
-                SessionEvent::ModelContext {
-                    provider: "original-provider".into(),
-                    template: template.clone(),
-                },
-            )
-            .await
-            .unwrap();
-        let child_context = store
-            .append(
-                child.clone(),
-                SessionEvent::ModelContext {
-                    provider: "child-provider".into(),
-                    template: template.clone(),
-                },
-            )
-            .await
-            .unwrap();
-        store
-            .append(
-                child,
-                SessionEvent::MessageCommitted {
-                    message: Message::User(vec![UserContent::Text {
-                        text: "child only".into(),
-                    }]),
-                },
-            )
-            .await
-            .unwrap();
-        let runtime = UserContent::Runtime {
-            text: "exact call-time state".into(),
+        let context_event = |provider: &str, template: &ModelRequest| SessionEvent::ModelContext {
+            provider: provider.into(),
+            template: template.clone(),
         };
-        let call = store
-            .append(
-                agent.clone(),
-                SessionEvent::ModelRequested {
-                    context: context.sequence,
-                    purpose: super::super::ModelPurpose::Agent,
-                    messages: vec![
-                        ContextMessage::Source { sequence: 1 },
-                        ContextMessage::Source { sequence: 2 },
-                        ContextMessage::Source { sequence: 3 },
-                        ContextMessage::Inline {
-                            message: Message::User(vec![runtime.clone()]),
-                        },
-                    ],
-                },
-            )
-            .await
-            .unwrap();
+        let context = append(&agent, context_event("original-provider", &template)).await;
+        let child_context = append(&child, context_event("child-provider", &template)).await;
+        append(&child, committed(text_message("child only"))).await;
+        let history_lifetime = HistoryLifetime::Ending;
+        let request = requested(
+            context.sequence,
+            ModelPurpose::Agent,
+            &[1, 2, 3],
+            "exact call-time state",
+            history_lifetime,
+        );
+        let call = append(&agent, request).await;
         let mut changed = template.clone();
         changed.model = "new-model".into();
         changed.system[0].text = "new instructions".into();
-        store
-            .append(
-                agent.clone(),
-                SessionEvent::ModelContext {
-                    provider: "new-provider".into(),
-                    template: changed,
-                },
-            )
-            .await
-            .unwrap();
-        store
-            .append(
-                agent,
-                SessionEvent::MessageCommitted {
-                    message: Message::User(vec![UserContent::Text {
-                        text: "future message".into(),
-                    }]),
-                },
-            )
-            .await
-            .unwrap();
+        append(&agent, context_event("new-provider", &changed)).await;
+        append(&agent, committed(text_message("future message"))).await;
         let id = store.id();
         drop(store);
         let (store, records) = SessionStore::open(directory.path(), id).await.unwrap();
         let (provider, mut restored) = reconstruct_model_request(&records, call.sequence).unwrap();
         assert_eq!(provider, "original-provider");
         let mut expected = template;
-        expected.messages = vec![user, assistant, tool, Message::User(vec![runtime])];
+        (expected.history, expected.history_lifetime) =
+            (vec![user, assistant, tool], history_lifetime);
+        expected.tail = vec![text_message("exact call-time state")];
         assert_eq!(restored, expected);
-        store.hydrate_model_request(&mut restored).await.unwrap();
-        store.hydrate_model_request(&mut expected).await.unwrap();
+        store.load_blobs(&mut restored).await.unwrap();
+        store.load_blobs(&mut expected).await.unwrap();
         assert_eq!(restored, expected);
-        let Message::User(content) = &restored.messages[0] else {
-            panic!("user message")
+        assert_eq!(restored.blobs.get(&image.blob).unwrap(), png.bytes());
+        let crate::media::AttachmentRef::Text(notes) = notes else {
+            panic!("text attachment")
         };
-        let UserContent::Image { image } = &content[1] else {
-            panic!("image")
-        };
-        assert!(image.data_base64.is_some());
+        assert_eq!(restored.blobs.text(&notes).unwrap(), "notes");
 
         let index = records
             .iter()
             .position(|r| r.sequence == call.sequence)
             .unwrap();
-        let mut invalid = records.clone();
-        let SessionEvent::ModelRequested { context, .. } = &mut invalid[index].event else {
-            unreachable!()
-        };
-        *context = child_context.sequence;
-        assert!(reconstruct_model_request(&invalid, call.sequence).is_err());
-        invalid = records.clone();
-        let SessionEvent::ModelRequested { messages, .. } = &mut invalid[index].event else {
-            unreachable!()
-        };
-        messages[0] = ContextMessage::Source {
-            sequence: child_context.sequence,
-        };
-        assert!(reconstruct_model_request(&invalid, call.sequence).is_err());
+        for mutation in 0..2 {
+            let mut invalid = records.clone();
+            let SessionEvent::ModelRequested {
+                context, history, ..
+            } = &mut invalid[index].event
+            else {
+                unreachable!()
+            };
+            match mutation {
+                0 => history[0] = child_context.sequence,
+                _ => *context = child_context.sequence,
+            }
+            assert!(reconstruct_model_request(&invalid, call.sequence).is_err());
+            assert!(validate_request(&invalid[..index], &invalid[index]).is_err());
+        }
         assert!(reconstruct_model_request(&records, 0).is_err());
         assert!(reconstruct_model_request(&records, child_context.sequence).is_err());
     }
 
-    fn text_message(text: &str) -> Message {
-        Message::User(vec![UserContent::Text { text: text.into() }])
-    }
-
     fn projection_fixture() -> (AgentId, Vec<EventRecord>) {
-        let id = crate::identity::SessionId::generate().unwrap();
-        let agent = AgentId::root(id);
+        let agent = AgentId::root(crate::identity::SessionId::generate().unwrap());
         let checkpoint = super::super::CompactionCheckpoint {
             schema_version: 1,
             todos: Vec::new(),
@@ -529,62 +500,45 @@ mod tests {
             before_tokens: 100_000,
             after_tokens: 10_000,
         };
+        let compaction = |history: &[u64], tail| {
+            requested(
+                3,
+                ModelPurpose::Compaction,
+                history,
+                tail,
+                HistoryLifetime::Ending,
+            )
+        };
+        let template = ModelRequest {
+            model: "model".into(),
+            system: vec![SystemSegment {
+                text: "system".into(),
+                cache: false,
+            }],
+            tools: vec![],
+            history: vec![],
+            tail: vec![],
+            history_lifetime: HistoryLifetime::Continuing,
+            reasoning: None,
+            response_schema: None,
+            max_output_tokens: Some(4096),
+            correlation: None,
+            blobs: Default::default(),
+        };
         let events = vec![
-            SessionEvent::MessageCommitted {
-                message: text_message("verbatim plan"),
-            },
-            SessionEvent::MessageCommitted {
-                message: text_message("research"),
-            },
+            committed(text_message("verbatim plan")),
+            committed(text_message("research")),
             SessionEvent::ModelContext {
                 provider: "provider".into(),
-                template: ModelRequest {
-                    model: "model".into(),
-                    system: vec![SystemSegment {
-                        text: "system".into(),
-                        cache: false,
-                    }],
-                    tools: vec![],
-                    messages: vec![],
-                    reasoning: None,
-                    response_schema: None,
-                    max_output_tokens: Some(4096),
-                    correlation: None,
-                },
+                template,
             },
-            SessionEvent::ModelRequested {
-                context: 3,
-                purpose: super::super::ModelPurpose::Compaction,
-                messages: vec![
-                    ContextMessage::Source { sequence: 1 },
-                    ContextMessage::Source { sequence: 2 },
-                    ContextMessage::Inline {
-                        message: text_message("summarize"),
-                    },
-                ],
-            },
-            SessionEvent::MessageCommitted {
-                message: text_message("concurrent steering"),
-            },
+            compaction(&[1, 2], "summarize"),
+            committed(text_message("concurrent steering")),
             SessionEvent::Compaction {
                 checkpoint: checkpoint.clone(),
             },
-            SessionEvent::MessageCommitted {
-                message: text_message("continued work"),
-            },
-            SessionEvent::ModelRequested {
-                context: 3,
-                purpose: super::super::ModelPurpose::Compaction,
-                messages: vec![
-                    ContextMessage::Source { sequence: 6 },
-                    ContextMessage::Source { sequence: 1 },
-                    ContextMessage::Source { sequence: 5 },
-                    ContextMessage::Source { sequence: 7 },
-                    ContextMessage::Inline {
-                        message: text_message("state at request time"),
-                    },
-                ],
-            },
+            committed(text_message("continued work")),
+            compaction(&[6, 1, 5, 7], "state at request time"),
             SessionEvent::Compaction {
                 checkpoint: super::super::CompactionCheckpoint {
                     previous: Some(6),
@@ -600,6 +554,8 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, event)| EventRecord {
+                id: crate::identity::EventId::generate().unwrap(),
+                queue_attempt: None,
                 version: super::super::SESSION_FORMAT_VERSION,
                 sequence: index as u64 + 1,
                 timestamp_millis: 0,
@@ -610,26 +566,42 @@ mod tests {
         (agent, records)
     }
 
+    /// A copy of `records` whose checkpoint at `index` has been edited.
+    fn with_checkpoint(
+        records: &[EventRecord],
+        index: usize,
+        edit: impl FnOnce(&mut super::super::CompactionCheckpoint),
+    ) -> Vec<EventRecord> {
+        let mut records = records.to_vec();
+        let SessionEvent::Compaction { checkpoint } = &mut records[index].event else {
+            unreachable!()
+        };
+        edit(checkpoint);
+        records
+    }
+
+    fn sequences(projection: &[(u64, Message)]) -> Vec<u64> {
+        projection.iter().map(|(sequence, _)| *sequence).collect()
+    }
+
     #[test]
     fn projection_preserves_concurrent_messages_and_repeated_compaction() {
         let (agent, records) = projection_fixture();
-        let before = project_history(&records[..5], &agent).unwrap();
         assert_eq!(
-            before.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
-            vec![1, 2, 5]
+            sequences(&project_history(&records[..5], &agent).unwrap()),
+            [1, 2, 5]
         );
         let first = project_history(&records[..8], &agent).unwrap();
+        assert_eq!(sequences(&first), [6, 1, 5, 7]);
         assert_eq!(
-            first.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
-            vec![6, 1, 5, 7]
+            (&first[1].1, &first[2].1),
+            (
+                &text_message("verbatim plan"),
+                &text_message("concurrent steering")
+            )
         );
-        assert_eq!(first[1].1, text_message("verbatim plan"));
-        assert_eq!(first[2].1, text_message("concurrent steering"));
         let second = project_history(&records, &agent).unwrap();
-        assert_eq!(
-            second.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
-            vec![9, 1, 5]
-        );
+        assert_eq!(sequences(&second), [9, 1, 5]);
         assert_eq!(second[1].1, text_message("verbatim plan"));
         assert!(
             project_history(&records, &agent.child(1))
@@ -643,11 +615,7 @@ mod tests {
     fn invalid_compaction_and_request_references_are_rejected() {
         let (agent, records) = projection_fixture();
         for retained in [vec![1, 1], vec![5, 1], vec![8], vec![3], vec![6]] {
-            let mut invalid = records.clone();
-            let SessionEvent::Compaction { checkpoint } = &mut invalid[8].event else {
-                unreachable!()
-            };
-            checkpoint.retained = retained;
+            let invalid = with_checkpoint(&records, 8, |checkpoint| checkpoint.retained = retained);
             assert!(project_history(&invalid, &agent).is_err());
         }
         let mut invalid = records.clone();
@@ -666,22 +634,18 @@ mod tests {
             (Some(6), 7, 7, text_message("summary")),
             (Some(6), 7, 8, Message::Assistant(vec![])),
         ] {
-            let mut invalid = records.clone();
-            let SessionEvent::Compaction { checkpoint } = &mut invalid[8].event else {
-                unreachable!()
-            };
-            checkpoint.previous = previous;
-            checkpoint.frontier = frontier;
-            checkpoint.request = request;
-            checkpoint.message = message;
+            let invalid = with_checkpoint(&records, 8, |checkpoint| {
+                (checkpoint.previous, checkpoint.frontier) = (previous, frontier);
+                (checkpoint.request, checkpoint.message) = (request, message);
+            });
             assert!(project_history(&invalid, &agent).is_err());
         }
         for sequence in [0, 3, 8, 9] {
             let mut invalid = records.clone();
-            let SessionEvent::ModelRequested { messages, .. } = &mut invalid[7].event else {
+            let SessionEvent::ModelRequested { history, .. } = &mut invalid[7].event else {
                 unreachable!()
             };
-            messages[0] = ContextMessage::Source { sequence };
+            history[0] = sequence;
             assert!(reconstruct_model_request(&invalid, 8).is_err());
             assert!(validate_request(&invalid[..7], &invalid[7]).is_err());
         }
@@ -689,75 +653,52 @@ mod tests {
 
     #[test]
     fn checkpoint_cannot_cut_or_mismatch_parallel_tool_exchanges() {
-        let (agent, mut records) = projection_fixture();
+        let (agent, records) = projection_fixture();
         let calls = ["a", "b"];
-        records[0].event = SessionEvent::MessageCommitted {
-            message: Message::Assistant(
-                calls
-                    .iter()
-                    .enumerate()
-                    .map(|(position, id)| {
-                        AssistantItem::tool_call(
-                            format!("item-{id}"),
-                            position,
-                            crate::provider::protocol::ToolCall {
-                                id: (*id).into(),
-                                name: "shell".into(),
-                                arguments: json!({}),
-                            },
-                        )
-                    })
-                    .collect(),
-            ),
+        let call = |(position, id): (usize, &&str)| {
+            let call = crate::provider::protocol::ToolCall::new(*id, "shell", json!({})).unwrap();
+            AssistantItem::tool_call(format!("item-{id}"), position, call)
         };
-        records[1].event = SessionEvent::MessageCommitted {
-            message: Message::Tool(
-                calls
-                    .iter()
-                    .rev()
-                    .map(|id| ToolResult {
-                        call_id: (*id).into(),
-                        name: "shell".into(),
-                        result: json!({}),
-                        images: vec![],
-                        is_error: false,
-                    })
-                    .collect(),
-            ),
+        let result = |id: &&str| ToolResult {
+            call_id: (*id).into(),
+            name: "shell".into(),
+            result: json!({}),
+            images: vec![],
+            is_error: false,
         };
-        let SessionEvent::Compaction { checkpoint } = &mut records[5].event else {
-            unreachable!()
-        };
-        checkpoint.retained = vec![1, 2];
-        assert!(project_history(&records[..6], &agent).is_ok());
+        let mut records =
+            with_checkpoint(&records, 5, |checkpoint| checkpoint.retained = vec![1, 2]);
+        records[0].event = committed(Message::Assistant(
+            calls.iter().enumerate().map(call).collect(),
+        ));
+        records[1].event = committed(Message::Tool(calls.iter().rev().map(result).collect()));
+        let records = &records[..6];
+        assert!(project_history(records, &agent).is_ok());
         for retained in [vec![1], vec![2]] {
-            let mut invalid = records.clone();
-            let SessionEvent::Compaction { checkpoint } = &mut invalid[5].event else {
-                unreachable!()
-            };
-            checkpoint.retained = retained;
-            assert!(project_history(&invalid[..6], &agent).is_err());
+            let invalid = with_checkpoint(records, 5, |checkpoint| checkpoint.retained = retained);
+            assert!(project_history(&invalid, &agent).is_err());
         }
-        let mut invalid = records.clone();
-        let SessionEvent::MessageCommitted {
-            message: Message::Tool(results),
-        } = &mut invalid[1].event
-        else {
-            unreachable!()
-        };
-        results.pop();
-        assert!(project_history(&invalid[..6], &agent).is_err());
-        let mut invalid = records.clone();
-        let SessionEvent::MessageCommitted {
-            message: Message::Tool(results),
-        } = &mut invalid[1].event
-        else {
-            unreachable!()
-        };
-        results[0].call_id = "unrelated".into();
-        assert!(project_history(&invalid[..6], &agent).is_err());
-        let mut invalid = records.clone();
-        invalid[1].agent = agent.child(1);
-        assert!(project_history(&invalid[..6], &agent).is_err());
+        for mutation in 0..3 {
+            let mut invalid = records.to_vec();
+            if mutation == 2 {
+                invalid[1].agent = agent.child(1);
+            } else {
+                let SessionEvent::MessageCommitted {
+                    message: Message::Tool(results),
+                } = &mut invalid[1].event
+                else {
+                    unreachable!()
+                };
+                if mutation == 0 {
+                    results.pop();
+                } else {
+                    results[0].call_id = "unrelated".into();
+                }
+            }
+            assert!(
+                project_history(&invalid, &agent).is_err(),
+                "mutation {mutation}"
+            );
+        }
     }
 }

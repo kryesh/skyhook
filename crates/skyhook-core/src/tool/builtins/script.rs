@@ -1,6 +1,6 @@
 use std::sync::{OnceLock, Weak};
 
-use schemars::{JsonSchema, schema_for};
+use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::tool::{
@@ -11,40 +11,25 @@ pub(crate) fn install_script_tool(
     builder: &mut ToolRegistryBuilder,
     executor: Weak<OnceLock<ToolExecutor>>,
 ) -> Result<(), RegistryError> {
-    let schema = serde_json::to_value(schema_for!(ScriptArgs))
-        .map_err(|error| RegistryError::Schema(error.to_string()))?;
-    let output_schema = serde_json::json!({
-        "type": "object",
-        "properties": {
-            "value": {},
-            "console": {"type": "string", "x-skyhook-truncatable": true},
-            "failure": {}
-        },
-        "required": ["value", "console"],
-        "additionalProperties": false
-    });
-    builder.register_dynamic(
+    builder.register_product::<ScriptArgs, crate::tool::javascript::ScriptResult, _, _>(
         "script",
         SCRIPT_DESCRIPTION,
-        schema,
         ToolOptions::default()
-            .output_schema(output_schema)
+            .job_role(crate::job::JobRole::Script)
             .background()
             .input()
             .script_unavailable(),
-        move |context, arguments| {
+        move |context, args| {
             let executor = executor.clone();
             async move {
-                let args: ScriptArgs = serde_json::from_value(arguments)
-                    .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
                 let executor = executor
                     .upgrade()
                     .and_then(|slot| slot.get().cloned())
                     .ok_or_else(|| {
                         ToolError::Failed("script executor is not initialized".to_owned())
                     })?
-                    .with_location(context.caller_location.clone())
-                    .with_capabilities(context.capabilities.clone());
+                    .with_location(context.caller_location().clone())
+                    .with_capabilities(context.capabilities().clone());
                 crate::tool::javascript::evaluate_captured(args.source, executor, context)
                     .await
                     .map_err(script_error)
@@ -54,19 +39,18 @@ pub(crate) fn install_script_tool(
     Ok(())
 }
 
-fn script_error(error: crate::tool::javascript::JsError) -> ToolError {
-    use crate::tool::{ToolOutput, javascript::JsError};
-    match error {
-        JsError::Cancelled => ToolError::Cancelled,
-        JsError::Failure { message, details } => ToolError::with_output(
-            message,
-            ToolOutput::new(serde_json::json!({"value": null, "console": "", "failure": details})),
-        ),
-        error => ToolError::with_output(
-            error.to_string(),
-            ToolOutput::new(serde_json::json!({"value": null, "console": ""})),
-        ),
-    }
+fn script_error(captured: crate::tool::javascript::CapturedJsError) -> ToolError {
+    use crate::tool::javascript::{JsError, script_output};
+    let crate::tool::javascript::CapturedJsError { error, console } = captured;
+    let (message, details) = match error {
+        JsError::Cancelled => return ToolError::Cancelled,
+        JsError::Failure { message, details } => (message, Some(details)),
+        error => (error.to_string(), None),
+    };
+    ToolError::with_output(
+        message,
+        script_output(serde_json::Value::Null, details, console.map(|c| *c)),
+    )
 }
 
 #[derive(Deserialize, JsonSchema)]

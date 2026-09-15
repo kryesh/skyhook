@@ -8,7 +8,7 @@ skyhook --non-interactive -s workflow.js --approve-all
 skyhook --non-interactive --resume "$session_id" -p "Summarize the findings"
 ```
 
-Headless mode does not require a terminal, read answers from stdin, or load TUI keybindings.
+Headless mode does not require a terminal or read answers from stdin.
 It creates or opens the session, prints **only its session ID followed by a newline to stdout**, and
 flushes that line before executing the prompt or workflow. It then exits automatically. The ID lets
 external programs locate and follow the normal session logs under `<workspace>/.skyhook/sessions`.

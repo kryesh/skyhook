@@ -1,8 +1,11 @@
+use std::num::NonZeroU64;
+
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::{
-    media::ImageReference,
+    media::{Image, MAX_IMAGE_BYTES, decode_base64_bounded},
+    session::SessionStore,
     tool::{
         ToolOutput,
         policy::{Capability, PermissionUse},
@@ -10,55 +13,91 @@ use crate::{
 };
 use serde_json::Value;
 
-// Version 2 requires exact originating capabilities on every tool request.
-pub(crate) const PROTOCOL_VERSION: u32 = 2;
+// Version 3 sends tool images as source-format bytes with their file provenance.
+pub(crate) const PROTOCOL_VERSION: u32 = 3;
 
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Request and SSH channel IDs share one connection-local allocator. Zero is invalid.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub(crate) struct RequestId(NonZeroU64);
+
+impl RequestId {
+    pub const FIRST: Self = Self(NonZeroU64::MIN);
+
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    pub fn next(self) -> Option<Self> {
+        self.get().checked_add(1).and_then(Self::new)
+    }
+}
+
+/// Authorization IDs are scoped to requests; zero is a valid wire value.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub(crate) struct AuthorizationId(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub(crate) struct PromptId(pub u64);
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum Request {
     ResolveSsh {
-        request_id: u64,
+        request_id: RequestId,
         target: Box<crate::target::TargetDefinition>,
     },
     OpenSsh {
-        channel: u64,
+        channel: RequestId,
         route: Vec<crate::target::TargetDefinition>,
         command: String,
     },
     StreamData {
-        channel: u64,
+        channel: RequestId,
         data: Vec<u8>,
     },
     StreamEnd {
-        channel: u64,
+        channel: RequestId,
     },
     StreamAck {
-        channel: u64,
+        channel: RequestId,
     },
     StreamClose {
-        channel: u64,
+        channel: RequestId,
     },
     SensitiveAnswer {
-        prompt_id: u64,
+        prompt_id: PromptId,
         answer: super::prompt::PromptAnswer,
     },
     Hello {
         version: u32,
     },
     Tool {
-        request_id: u64,
+        request_id: RequestId,
         name: String,
         arguments: Value,
         capabilities: Vec<Capability>,
     },
+    // Best effort only: the protocol has no cancel acknowledgment. The host keeps the
+    // request registered for late artifacts/chunks until its terminal Tool reply
+    // (or connection failure); local abandonment is not a wire terminal event.
     Cancel {
-        request_id: u64,
+        request_id: RequestId,
     },
     AuthorizationDecision {
-        request_id: u64,
-        authorization_id: u64,
+        request_id: RequestId,
+        authorization_id: AuthorizationId,
         allowed: bool,
         reason: Option<String>,
     },
@@ -68,7 +107,7 @@ pub(crate) enum Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum Response {
     ToolArtifact {
-        request_id: u64,
+        request_id: RequestId,
         field: String,
         #[serde(default)]
         kind: crate::job::output::CaptureKind,
@@ -77,43 +116,43 @@ pub(crate) enum Response {
         finished: bool,
     },
     ToolChunk {
-        request_id: u64,
+        request_id: RequestId,
         offset: u64,
         data: Vec<u8>,
         finished: bool,
     },
     SensitiveCancelled {
-        prompt_id: u64,
+        prompt_id: PromptId,
     },
     ResolvedSsh {
-        request_id: u64,
+        request_id: RequestId,
         result: Result<super::ssh::ResolvedSsh, String>,
     },
     StreamData {
-        channel: u64,
+        channel: RequestId,
         data: Vec<u8>,
     },
     StreamClosed {
-        channel: u64,
+        channel: RequestId,
         error: Option<String>,
     },
     StreamAck {
-        channel: u64,
+        channel: RequestId,
     },
     SensitivePrompt {
-        prompt_id: u64,
+        prompt_id: PromptId,
         prompt: super::SensitivePrompt,
     },
     Ready {
         version: u32,
     },
     Tool {
-        request_id: u64,
+        request_id: RequestId,
         result: Result<RemoteToolOutput, RemoteToolError>,
     },
     Authorization {
-        request_id: u64,
-        authorization_id: u64,
+        request_id: RequestId,
+        authorization_id: AuthorizationId,
         tool: String,
         permissions: Vec<PermissionUse>,
         arguments: Value,
@@ -124,6 +163,8 @@ pub(crate) enum Response {
 pub(crate) struct RemoteToolOutput {
     pub value: Value,
     pub images: Vec<RemoteImage>,
+    // Required: a peer that omits it must not have cut output recorded as finished.
+    pub streams: crate::tool::StreamEnd,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -136,25 +177,33 @@ pub(crate) struct RemoteToolError {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct RemoteImage {
-    pub reference: ImageReference,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
     pub data_base64: String,
 }
 
-impl From<RemoteToolOutput> for ToolOutput {
-    fn from(value: RemoteToolOutput) -> Self {
-        let images = value
-            .images
-            .into_iter()
-            .map(|image| {
-                let mut reference = image.reference;
-                reference.data_base64 = Some(image.data_base64);
-                reference
-            })
-            .collect();
-        Self {
-            value: value.value,
-            images,
+impl RemoteToolOutput {
+    /// Decode each bounded wire image and store it, yielding a local tool output.
+    /// The value, stream-end marker and every valid image survive: an image that
+    /// fails to decode or store is dropped on its own rather than costing the
+    /// call its textual result.
+    pub(crate) async fn store(self, store: &SessionStore) -> ToolOutput {
+        let mut images = Vec::with_capacity(self.images.len());
+        for image in self.images {
+            let Ok(bytes) = decode_base64_bounded(&image.data_base64, MAX_IMAGE_BYTES as usize)
+            else {
+                continue;
+            };
+            let Ok(decoded) = Image::new(bytes) else {
+                continue;
+            };
+            if let Ok(stored) = store.store_image(image.file, &decoded).await {
+                images.push(stored);
+            }
         }
+        let mut output = ToolOutput::new(self.value).with_images(images);
+        output.streams = self.streams;
+        output
     }
 }
 
@@ -176,6 +225,20 @@ where
     writer.write_all(&length.to_be_bytes()).await?;
     writer.write_all(&bytes).await?;
     writer.flush().await
+}
+
+/// Write one whole frame on its own task: dropping the caller mid-write would
+/// otherwise leave a partial frame on the wire. The guard travels with the task
+/// so the writer stays exclusively owned until the frame is finished.
+pub(crate) async fn spawn_owned_write<G, W, T>(mut writer: G, frame: T) -> std::io::Result<()>
+where
+    G: std::ops::DerefMut<Target = W> + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+    T: Serialize + Send + Sync + 'static,
+{
+    tokio::spawn(async move { write_frame(&mut *writer, &frame).await })
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?
 }
 
 pub(crate) async fn read_frame<R, T>(reader: &mut R) -> Result<Option<T>, std::io::Error>
@@ -208,7 +271,7 @@ where
 /// Send completed results as bounded frames, never one unbounded RPC message.
 pub(crate) async fn write_tool_result<W: AsyncWrite + Unpin>(
     writer: &tokio::sync::Mutex<W>,
-    request_id: u64,
+    request_id: RequestId,
     result: &Result<RemoteToolOutput, RemoteToolError>,
 ) -> std::io::Result<()> {
     use std::io::{Seek as _, Write as _};
@@ -225,7 +288,7 @@ pub(crate) async fn write_tool_result<W: AsyncWrite + Unpin>(
         #[serde(tag = "type", rename_all = "snake_case")]
         enum BorrowedResponse<'a> {
             Tool {
-                request_id: u64,
+                request_id: RequestId,
                 result: &'a Result<RemoteToolOutput, RemoteToolError>,
             },
         }
@@ -259,7 +322,7 @@ pub(crate) async fn write_tool_result<W: AsyncWrite + Unpin>(
 
 pub(crate) async fn write_artifact<W: AsyncWrite + Unpin>(
     writer: &tokio::sync::Mutex<W>,
-    request_id: u64,
+    request_id: RequestId,
     field: String,
     kind: crate::job::output::CaptureKind,
     path: &std::path::Path,
@@ -290,49 +353,99 @@ pub(crate) async fn write_artifact<W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn tool_capabilities_are_required_and_empty_is_exact() {
-        let mut request = serde_json::json!({
-            "type": "tool", "request_id": 1, "name": "exec", "arguments": {}
-        });
-        assert!(serde_json::from_value::<super::Request>(request.clone()).is_err());
-        request["capabilities"] = serde_json::json!([]);
-        let decoded = serde_json::from_value::<super::Request>(request.clone()).unwrap();
-        assert!(
-            matches!(&decoded, super::Request::Tool { capabilities, .. } if capabilities.is_empty())
-        );
-        assert_eq!(serde_json::to_value(decoded).unwrap(), request);
-    }
-
-    #[test]
-    fn unversioned_handshakes_are_rejected() {
-        assert!(
-            serde_json::from_value::<super::Request>(serde_json::json!({"type":"hello"})).is_err()
-        );
-        assert!(
-            serde_json::from_value::<super::Response>(serde_json::json!({"type":"ready"})).is_err()
-        );
-    }
-
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn remote_images_are_bounded_decoded_images_before_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(directory.path()).await.unwrap();
+        let png = crate::tests::png(b"remote image");
+        let output = |data_base64| RemoteToolOutput {
+            streams: Default::default(),
+            value: json!({}),
+            images: vec![RemoteImage {
+                file: Some("fixture.png".into()),
+                data_base64,
+            }],
+        };
+        let stored = output(STANDARD.encode(png.bytes())).store(&store).await;
+        let [stored] = stored.images.as_slice() else {
+            panic!("expected one stored image")
+        };
+        assert_eq!(stored.file.as_deref(), Some("fixture.png"));
+        assert_eq!(stored.format, png.format());
+        assert_eq!(stored.blob, crate::media::BlobRef::of(png.bytes()));
+        let bytes = store
+            .read_blob(&stored.blob, MAX_IMAGE_BYTES as usize)
+            .await;
+        assert_eq!(bytes.unwrap(), png.bytes());
+        let oversized = STANDARD.encode(vec![0; MAX_IMAGE_BYTES as usize + 1]);
+        for invalid in [
+            "%%%".to_owned(),
+            STANDARD.encode(b"not an image"),
+            oversized,
+        ] {
+            assert!(output(invalid).store(&store).await.images.is_empty());
+        }
+    }
+
+    #[test]
+    fn wire_ids_capabilities_and_handshakes_are_exact() {
+        // IDs remain numbers and only request IDs reject zero.
+        let wire = json!({"type":"cancel", "request_id":1});
+        let request: Request = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), wire);
+        assert!(serde_json::from_value::<RequestId>(json!(0)).is_err());
+        assert_eq!(serde_json::to_value(AuthorizationId(0)).unwrap(), 0);
+        // Tool capabilities are required and an empty list is exact.
+        let mut request = json!({"type": "tool", "request_id": 1, "name": "exec", "arguments": {}});
+        assert!(serde_json::from_value::<Request>(request.clone()).is_err());
+        request["capabilities"] = json!([]);
+        let decoded = serde_json::from_value::<Request>(request.clone()).unwrap();
+        assert!(matches!(&decoded, Request::Tool { capabilities, .. } if capabilities.is_empty()));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), request);
+        // Tool outputs must state whether their streams ran to the end.
+        let mut output =
+            json!({"type":"tool","request_id":1,"result":{"Ok":{"value":{},"images":[]}}});
+        assert!(serde_json::from_value::<Response>(output.clone()).is_err());
+        output["result"]["Ok"]["streams"] = json!("cut");
+        let decoded = serde_json::from_value::<Response>(output.clone()).unwrap();
+        assert!(matches!(
+            &decoded,
+            Response::Tool {
+                result: Ok(RemoteToolOutput {
+                    streams: crate::tool::StreamEnd::Cut,
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), output);
+        // Unversioned handshakes are rejected.
+        assert!(serde_json::from_value::<Request>(json!({"type":"hello"})).is_err());
+        assert!(serde_json::from_value::<Response>(json!({"type":"ready"})).is_err());
+    }
 
     #[tokio::test]
     async fn tool_results_round_trip_in_small_and_spilled_forms() {
+        const ID: RequestId = RequestId::new(7).unwrap();
         for length in [0, 70 * 1024] {
             let value = "x".repeat(length);
             let result = Err(RemoteToolError {
                 message: "timed out".into(),
                 denial: None,
                 output: Some(Box::new(RemoteToolOutput {
-                    value: serde_json::json!({"stdout":value}),
+                    streams: Default::default(),
+                    value: json!({ "stdout": value }),
                     images: Vec::new(),
                 })),
             });
             let (writer, mut reader) = tokio::io::duplex(4096);
             let send = tokio::spawn(async move {
-                write_tool_result(&tokio::sync::Mutex::new(writer), 7, &result)
-                    .await
-                    .unwrap();
+                let writer = tokio::sync::Mutex::new(writer);
+                write_tool_result(&writer, ID, &result).await.unwrap();
             });
             let mut bytes = Vec::new();
             let received = loop {
@@ -342,14 +455,14 @@ mod tests {
                     .unwrap()
                 {
                     Response::Tool {
-                        request_id: 7,
+                        request_id: ID,
                         result,
                     } => {
                         assert!(length < 64 * 1024);
                         break result;
                     }
                     Response::ToolChunk {
-                        request_id: 7,
+                        request_id: ID,
                         offset,
                         data,
                         finished,

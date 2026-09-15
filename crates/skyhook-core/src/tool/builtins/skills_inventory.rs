@@ -242,9 +242,34 @@ mod tests {
         path
     }
 
+    fn names(inventory: &SkillInventory) -> Vec<&str> {
+        inventory
+            .skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect()
+    }
+
+    fn has_diagnostic(inventory: &SkillInventory, path: &Path, message: &str) -> bool {
+        let path = path.display().to_string();
+        inventory
+            .diagnostics
+            .iter()
+            .any(|error| error.contains(&path) && error.contains(message))
+    }
+
     #[tokio::test]
     async fn inventory_retains_full_metadata_and_runtime_names_and_summaries() {
         let temp = tempfile::tempdir().unwrap();
+        // Absent optional roots and empty collections succeed.
+        let absent = temp.path().join("absent");
+        let empty = HostSkills::discover_from(temp.path(), Some(&absent))
+            .await
+            .inventory()
+            .await;
+        assert!(!empty.has_errors() && empty.skills.is_empty());
+        assert_eq!(empty.render_tree(), "skills (empty)\n");
+
         let root = temp.path().join(".agents/skills");
         let yaml = "name: frontmatter-name\ndescription: '  A useful summary  '\nextra:\n  enabled: true\n  count: 7\n  ratio: 1.25\n  missing: null\n  sequence: [one, {two: [3, false]}]\n  tagged: !custom value\n  ? [complex, key]\n  : retained\n";
         let instructions = format!("---\n{yaml}---\n# Body\n\nOriginal instructions\n");
@@ -252,9 +277,8 @@ mod tests {
         let skills = HostSkills::discover_from(temp.path(), None).await;
         let inventory = skills.inventory().await;
         assert!(!inventory.has_errors(), "{:?}", inventory.diagnostics);
-        assert_eq!(inventory.skills.len(), 1);
+        assert_eq!(names(&inventory), ["effective-name"]);
         let skill = &inventory.skills[0];
-        assert_eq!(skill.name, "effective-name");
         assert_eq!(skill.source, std::fs::canonicalize(path).unwrap());
         assert_eq!(skill.description, "A useful summary");
         assert_eq!(
@@ -267,9 +291,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(skills.summaries()).unwrap(),
-            serde_json::json!([
-                {"name": "effective-name", "description": "A useful summary"}
-            ])
+            serde_json::json!([{"name": "effective-name", "description": "A useful summary"}])
         );
         let tree = inventory.render_tree();
         for expected in [
@@ -316,30 +338,22 @@ mod tests {
                 Err(_) => assert!(parsed.is_err(), "{yaml}"),
             }
         }
+        let summary = |text: &str| parse_instructions(text).map(|parsed| parsed.0);
         assert_eq!(
             parse_instructions("# Heading\r\n\r\nProse here").unwrap(),
             ("Prose here".to_owned(), serde_yaml::Value::Null)
         );
         assert_eq!(
-            parse_instructions("---\r\ndescription: summary\r\n---\r\nBody")
-                .unwrap()
-                .0,
+            summary("---\r\ndescription: summary\r\n---\r\nBody").unwrap(),
             "summary"
         );
-        assert!(parse_instructions("---\ndescription: unterminated").is_err());
-        assert!(parse_instructions("# Heading only").is_err());
-        assert_eq!(
-            parse_instructions(&"é".repeat(600))
-                .unwrap()
-                .0
-                .chars()
-                .count(),
-            512
-        );
+        assert!(summary("---\ndescription: unterminated").is_err());
+        assert!(summary("# Heading only").is_err());
+        assert_eq!(summary(&"é".repeat(600)).unwrap().chars().count(), 512);
     }
 
     #[tokio::test]
-    async fn malformed_yaml_and_description_keep_valid_entries_and_context() {
+    async fn malformed_metadata_and_discovery_errors_keep_valid_entries_and_context() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join(".agents/skills");
         let malformed = write_skill(&root, "bad-yaml", "---\ndescription: [broken\n---\nBody");
@@ -352,26 +366,39 @@ mod tests {
         let skills = HostSkills::discover_from(temp.path(), None).await;
         let inventory = skills.inventory().await;
         assert!(inventory.has_errors());
-        assert_eq!(
-            inventory
-                .skills
-                .iter()
-                .map(|skill| skill.name.as_str())
-                .collect::<Vec<_>>(),
-            ["valid"]
-        );
+        assert_eq!(names(&inventory), ["valid"]);
         assert_eq!(inventory.diagnostics.len(), 2);
         for path in [malformed, bad_description] {
-            assert!(
-                inventory
-                    .diagnostics
-                    .iter()
-                    .any(|error| error.contains(&path.display().to_string())
-                        && error.contains("invalid YAML frontmatter"))
-            );
+            assert!(has_diagnostic(
+                &inventory,
+                &path,
+                "invalid YAML frontmatter"
+            ));
         }
         assert!(inventory.render_tree().contains("Valid prose"));
         assert_eq!(inventory.diagnostics, skills.warnings());
+
+        // Unscannable roots and vanished asset directories are also diagnostics.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(".agents/skills");
+        let removed = write_skill(&root, "removed", "Removed assets");
+        write_skill(&root, "valid", "Valid assets");
+        let bad_root = temp.path().join("not-directory");
+        std::fs::write(&bad_root, "not a directory").unwrap();
+        let skills = HostSkills::discover_from(temp.path(), Some(&bad_root)).await;
+        std::fs::remove_dir_all(&removed).unwrap();
+        let inventory = skills.inventory().await;
+        assert_eq!(
+            (inventory.skills.len(), inventory.diagnostics.len()),
+            (2, 2)
+        );
+        assert!(has_diagnostic(&inventory, &bad_root, "Cannot scan"));
+        assert!(has_diagnostic(
+            &inventory,
+            &removed,
+            "Cannot inspect assets"
+        ));
+        assert!(inventory.render_tree().contains("Valid assets"));
     }
 
     #[tokio::test]
@@ -386,11 +413,8 @@ mod tests {
             (outer.join(".agents/skills"), "outer"),
             (workspace.join(".agents/skills"), "nearest"),
         ] {
-            let skill = write_skill(
-                &root,
-                "common",
-                &format!("---\ndescription: {label}\nmarker: {label}\n---\nBody"),
-            );
+            let text = format!("---\ndescription: {label}\nmarker: {label}\n---\nBody");
+            let skill = write_skill(&root, "common", &text);
             std::fs::write(skill.join(format!("{label}.txt")), label).unwrap();
         }
         write_skill(&user, "user-only", "User skill");
@@ -399,81 +423,23 @@ mod tests {
             "fallback",
             "Valid outer skill",
         );
-        write_skill(
-            &workspace.join(".agents/skills"),
-            "fallback",
-            "---\ndescription: [bad]\n---\nBody",
-        );
+        let invalid = "---\ndescription: [bad]\n---\nBody";
+        write_skill(&workspace.join(".agents/skills"), "fallback", invalid);
         let skills = HostSkills::discover_from(&workspace, Some(&user)).await;
         // Inventory works from the loaded SKILL.md snapshot, not a second read.
         std::fs::remove_file(workspace.join(".agents/skills/common/SKILL.md")).unwrap();
         let inventory = skills.inventory().await;
         assert!(inventory.has_errors());
-        let winner = inventory
-            .skills
-            .iter()
-            .find(|skill| skill.name == "common")
-            .unwrap();
+        assert_eq!(names(&inventory), ["common", "fallback", "user-only"]);
+        let winner = &inventory.skills[0];
         assert_eq!(winner.description, "nearest");
         assert_eq!(winner.frontmatter["marker"].as_str(), Some("nearest"));
-        assert_eq!(
-            winner.assets,
-            [SkillAsset {
-                path: "nearest.txt".into(),
-                kind: SkillAssetKind::File
-            }]
-        );
-        assert_eq!(
-            inventory
-                .skills
-                .iter()
-                .map(|skill| skill.name.as_str())
-                .collect::<Vec<_>>(),
-            ["common", "fallback", "user-only"]
-        );
+        let asset = SkillAsset {
+            path: "nearest.txt".into(),
+            kind: SkillAssetKind::File,
+        };
+        assert_eq!(winner.assets, [asset]);
         assert_eq!(inventory.skills[1].description, "Valid outer skill");
-    }
-
-    #[tokio::test]
-    async fn absent_optional_roots_and_empty_collections_succeed() {
-        let temp = tempfile::tempdir().unwrap();
-        let inventory = HostSkills::discover_from(temp.path(), Some(&temp.path().join("absent")))
-            .await
-            .inventory()
-            .await;
-        assert!(!inventory.has_errors(), "{:?}", inventory.diagnostics);
-        assert!(inventory.skills.is_empty());
-        assert_eq!(inventory.render_tree(), "skills (empty)\n");
-    }
-
-    #[tokio::test]
-    async fn discovery_and_asset_errors_retain_valid_entries() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join(".agents/skills");
-        let removed = write_skill(&root, "removed", "Removed assets");
-        write_skill(&root, "valid", "Valid assets");
-        let bad_root = temp.path().join("not-directory");
-        std::fs::write(&bad_root, "not a directory").unwrap();
-        let skills = HostSkills::discover_from(temp.path(), Some(&bad_root)).await;
-        std::fs::remove_dir_all(&removed).unwrap();
-        let inventory = skills.inventory().await;
-        assert_eq!(inventory.skills.len(), 2);
-        assert_eq!(inventory.diagnostics.len(), 2);
-        assert!(
-            inventory
-                .diagnostics
-                .iter()
-                .any(|error| error.contains(&bad_root.display().to_string())
-                    && error.contains("Cannot scan"))
-        );
-        assert!(
-            inventory
-                .diagnostics
-                .iter()
-                .any(|error| error.contains(&removed.display().to_string())
-                    && error.contains("Cannot inspect assets"))
-        );
-        assert!(inventory.render_tree().contains("Valid assets"));
     }
 
     #[cfg(unix)]
@@ -506,36 +472,26 @@ mod tests {
             .await;
         assert!(!inventory.has_errors(), "{:?}", inventory.diagnostics);
         let assets = &inventory.skills[0].assets;
-        assert_eq!(
-            assets
-                .iter()
-                .map(|asset| asset.path.to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-            [
-                "a.txt",
-                "line\nbreak",
-                "link-broken",
-                "link-dir",
-                "loop",
-                "nested",
-                "nested/SKILL.md",
-                "nested/deeper",
-                "nested/deeper/asset.bin",
-                "outside",
-                "socket",
-                "z.txt"
-            ]
-        );
-        assert_eq!(
-            assets
-                .iter()
-                .filter(|asset| asset.kind == SkillAssetKind::Symlink)
-                .count(),
-            4
-        );
-        assert!(assets.iter().any(
-            |asset| asset.path == Path::new("socket") && asset.kind == SkillAssetKind::Special
-        ));
+        let kinds: Vec<_> = assets
+            .iter()
+            .map(|asset| (asset.path.to_string_lossy().into_owned(), asset.kind))
+            .collect();
+        use SkillAssetKind::{Directory as D, File as F, Special as P, Symlink as S};
+        let expected = [
+            ("a.txt", F),
+            ("line\nbreak", F),
+            ("link-broken", S),
+            ("link-dir", S),
+            ("loop", S),
+            ("nested", D),
+            ("nested/SKILL.md", F),
+            ("nested/deeper", D),
+            ("nested/deeper/asset.bin", F),
+            ("outside", S),
+            ("socket", P),
+            ("z.txt", F),
+        ];
+        assert_eq!(kinds, expected.map(|(path, kind)| (path.to_owned(), kind)));
         let tree = inventory.render_tree();
         assert!(tree.contains("link-dir [symlink]"));
         assert!(tree.contains("socket [special]"));

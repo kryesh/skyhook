@@ -1,7 +1,13 @@
 //! Rich editing is deliberately confined to the message composer. `text` contains
-//! one object-replacement character per paste; use `expanded_text`/`take` to send
-//! or copy it, and `set` rather than assigning to `text` to replace the document.
-use std::{collections::BTreeMap, ops::Range};
+//! one object-replacement character per paste; use `expanded_text` to copy it and
+//! `take` to send it with its attachments. Use `set` rather than assigning to `text`.
+use std::{
+    collections::{BTreeMap, VecDeque},
+    ops::Range,
+};
+
+use super::editor::{EditOutcome, push_history};
+use skyhook::media::Attachment;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
 use unicode_segmentation::UnicodeSegmentation;
@@ -13,9 +19,8 @@ mod layout;
 pub use layout::{ComposerLayout, ComposerRow, ComposerSpan};
 
 const OBJECT: &str = "\u{fffc}";
-const HISTORY_LIMIT: usize = 100;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Paste {
     id: usize,
     content: String,
@@ -39,10 +44,32 @@ impl Paste {
     }
 }
 
+/// What the composer sends: typed text with pastes expanded, plus attachments.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Submission {
+    pub text: String,
+    pub attachments: Vec<Attachment>,
+}
+impl Submission {
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.attachments.is_empty()
+    }
+}
+#[cfg(test)]
+impl From<&str> for Submission {
+    fn from(text: &str) -> Self {
+        Self {
+            text: text.into(),
+            attachments: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct Snapshot {
     text: String,
     pastes: BTreeMap<usize, Paste>,
+    attachments: Vec<Attachment>,
     cursor: usize,
     anchor: Option<usize>,
 }
@@ -54,13 +81,14 @@ impl Drop for Snapshot {
 
 #[derive(Clone)]
 pub struct Composer {
-    pub text: String,
-    pub cursor: usize,
-    pub anchor: Option<usize>,
+    text: String,
+    cursor: usize,
+    anchor: Option<usize>,
     pastes: BTreeMap<usize, Paste>,
+    attachments: Vec<Attachment>,
     next_id: usize,
-    undo: Vec<Snapshot>,
-    redo: Vec<Snapshot>,
+    undo: VecDeque<Snapshot>,
+    redo: VecDeque<Snapshot>,
     width: usize,
     preferred_column: Option<usize>,
 }
@@ -71,9 +99,10 @@ impl Default for Composer {
             cursor: 0,
             anchor: None,
             pastes: BTreeMap::new(),
+            attachments: Vec::new(),
             next_id: 1,
-            undo: Vec::new(),
-            redo: Vec::new(),
+            undo: VecDeque::new(),
+            redo: VecDeque::new(),
             width: 80,
             preferred_column: None,
         }
@@ -91,10 +120,12 @@ impl Drop for Composer {
 struct Token {
     source: Range<usize>,
     text: String,
-    paste: bool,
+    /// Newlines count as whitespace; a paste is an atomic non-whitespace item.
     whitespace: bool,
     newline: bool,
+    paste: bool,
 }
+
 impl Token {
     fn plain(text: &str, offset: usize) -> impl Iterator<Item = Self> + '_ {
         text.grapheme_indices(true).map(move |(i, g)| {
@@ -111,9 +142,9 @@ impl Token {
             Self {
                 source: offset + i..offset + i + g.len(),
                 text,
-                paste: false,
-                whitespace: g.chars().all(char::is_whitespace),
+                whitespace: newline || g.chars().all(char::is_whitespace),
                 newline,
+                paste: false,
             }
         })
     }
@@ -127,8 +158,54 @@ impl Token {
     }
 }
 impl Composer {
+    /// Raw document text; inline pastes occupy one object-replacement grapheme.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+    pub fn anchor(&self) -> Option<usize> {
+        self.anchor
+    }
+
+    /// Move to a source-byte offset, snapping inside graphemes/pastes to the start.
+    #[cfg(test)]
+    pub fn set_cursor(&mut self, cursor: usize) {
+        self.set_selection(None, cursor);
+    }
+    #[cfg(test)]
+    pub fn set_selection(&mut self, anchor: Option<usize>, cursor: usize) {
+        self.cursor = self.boundary(cursor);
+        self.anchor = anchor.map(|a| self.boundary(a));
+        self.preferred_column = None;
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
+        self.text.is_empty() && self.attachments.is_empty()
+    }
+    pub fn attachments(&self) -> &[Attachment] {
+        &self.attachments
+    }
+    pub fn attach(&mut self, attachment: Attachment) -> EditOutcome {
+        self.save();
+        self.attachments.push(attachment);
+        EditOutcome::CHANGED
+    }
+    pub fn remove_attachment(&mut self, index: usize) -> EditOutcome {
+        if index >= self.attachments.len() {
+            return EditOutcome::default();
+        }
+        self.save();
+        self.attachments.remove(index);
+        EditOutcome::CHANGED
+    }
+    /// Delete a source range as one undoable edit.
+    pub fn delete(&mut self, range: Range<usize>) {
+        self.normalize();
+        self.save();
+        self.anchor = None;
+        self.delete_range(range);
     }
     pub fn has_pastes(&self) -> bool {
         !self.pastes.is_empty()
@@ -143,14 +220,14 @@ impl Composer {
             .find(|p| p.id == id)
             .map(|p| p.content.as_str())
     }
-    pub fn remove_paste(&mut self, id: usize) -> bool {
+    pub fn remove_paste(&mut self, id: usize) -> EditOutcome {
         let Some(offset) = self
             .pastes
             .iter()
             .find(|(_, p)| p.id == id)
             .map(|(&offset, _)| offset)
         else {
-            return false;
+            return EditOutcome::default();
         };
         self.normalize();
         self.save();
@@ -163,7 +240,7 @@ impl Composer {
         };
         self.anchor = None;
         self.normalize();
-        true
+        EditOutcome::CHANGED
     }
     pub fn set_width(&mut self, width: usize) {
         let width = width.max(1);
@@ -177,7 +254,7 @@ impl Composer {
     }
     pub fn is_last_visual_row(&self) -> bool {
         let layout = self.layout(self.width);
-        layout.cursor.0 + 1 == layout.row_count()
+        layout.cursor.0 + 1 == layout.rows.len()
     }
     pub fn expanded_text(&self) -> String {
         self.expand(0..self.text.len())
@@ -201,6 +278,7 @@ impl Composer {
     pub fn clear_sensitive(&mut self) {
         self.text.zeroize();
         self.pastes.clear();
+        self.attachments.clear();
         self.undo.clear();
         self.redo.clear();
         self.cursor = 0;
@@ -209,15 +287,18 @@ impl Composer {
         self.next_id = 1;
     }
     /// Replace the whole document as plain text (history/menu recall).
-    pub fn set(&mut self, text: String) {
+    pub fn set(&mut self, text: String) -> EditOutcome {
+        let text_changed = self.text != text || self.has_pastes() || !self.attachments.is_empty();
         self.clear_sensitive();
         self.text = text;
         self.cursor = self.text.len();
+        EditOutcome::handled(text_changed)
     }
     fn snapshot(&self) -> Snapshot {
         Snapshot {
             text: self.text.clone(),
             pastes: self.pastes.clone(),
+            attachments: self.attachments.clone(),
             cursor: self.cursor,
             anchor: self.anchor,
         }
@@ -226,17 +307,27 @@ impl Composer {
         self.text.zeroize();
         self.text = std::mem::take(&mut snapshot.text);
         self.pastes = std::mem::take(&mut snapshot.pastes);
+        self.attachments = std::mem::take(&mut snapshot.attachments);
         self.cursor = snapshot.cursor;
         self.anchor = snapshot.anchor;
         self.preferred_column = None;
     }
     fn save(&mut self) {
-        if self.undo.len() >= HISTORY_LIMIT {
-            self.undo.remove(0);
-        }
-        self.undo.push(self.snapshot());
+        let snapshot = self.snapshot();
+        push_history(&mut self.undo, snapshot);
         self.redo.clear();
         self.preferred_column = None;
+    }
+    /// Undo (or redo) one edit, moving the current state onto the opposite stack.
+    fn step_history(&mut self, redo: bool) -> bool {
+        let Some(snapshot) = (if redo { &mut self.redo } else { &mut self.undo }).pop_back() else {
+            return false;
+        };
+        let current = self.snapshot();
+        push_history(if redo { &mut self.undo } else { &mut self.redo }, current);
+        let changed = self.text != snapshot.text || self.pastes != snapshot.pastes;
+        self.restore(snapshot);
+        changed
     }
     fn tokens(&self) -> Vec<Token> {
         let mut tokens = Vec::new();
@@ -246,9 +337,9 @@ impl Composer {
                 tokens.push(Token {
                     source: offset..offset + OBJECT.len(),
                     text: paste.label(),
-                    paste: true,
                     whitespace: false,
                     newline: false,
+                    paste: true,
                 });
                 offset += OBJECT.len();
             } else {
@@ -270,10 +361,10 @@ impl Composer {
         self.cursor = self.boundary(self.cursor);
         self.anchor = self.anchor.map(|a| self.boundary(a));
     }
-    fn selection_range(&self) -> Option<Range<usize>> {
-        self.anchor.map(|a| {
+    pub fn selection_range(&self) -> Option<Range<usize>> {
+        self.anchor().map(|a| {
             let a = self.boundary(a);
-            let c = self.boundary(self.cursor);
+            let c = self.boundary(self.cursor());
             a.min(c)..a.max(c)
         })
     }
@@ -315,12 +406,17 @@ impl Composer {
         self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
     }
-    pub fn insert(&mut self, text: &str) {
+    pub fn insert(&mut self, text: &str) -> EditOutcome {
         if text.is_empty() {
-            return;
+            return EditOutcome::HANDLED;
         }
         self.normalize();
-        self.save();
+        let text_changed = self.selection_range().is_none_or(|range| {
+            self.text[range.clone()] != *text || self.pastes.range(range).next().is_some()
+        });
+        if text_changed {
+            self.save();
+        }
         self.delete_selection();
         self.insert_raw(text);
         // Inserting a combining mark can merge with its neighbor. Never leave
@@ -332,10 +428,11 @@ impl Composer {
         {
             self.cursor = token.source.end;
         }
+        EditOutcome::handled(text_changed)
     }
-    pub fn insert_paste(&mut self, content: String) {
+    pub fn insert_paste(&mut self, content: String) -> EditOutcome {
         if content.is_empty() {
-            return;
+            return EditOutcome::HANDLED;
         }
         self.normalize();
         self.save();
@@ -346,26 +443,36 @@ impl Composer {
         self.next_id += 1;
         let lines = content.lines().count().max(1);
         self.pastes.insert(offset, Paste { id, content, lines });
+        EditOutcome::CHANGED
     }
     /// Clear a local draft as one undoable edit (for Ctrl+C). Unlike sending or
     /// clearing sensitive data, this intentionally retains an undo snapshot.
-    pub fn clear(&mut self) {
+    pub fn clear(&mut self) -> EditOutcome {
         self.normalize();
-        if !self.is_empty() {
+        let text_changed = !self.is_empty();
+        if text_changed {
             self.save();
         }
         self.text.zeroize();
         self.pastes.clear();
+        self.attachments.clear();
         self.cursor = 0;
         self.anchor = None;
         self.preferred_column = None;
+        EditOutcome::handled(text_changed)
     }
 
-    /// Expand inline items in document order. Sending starts a fresh undo history.
-    pub fn take(&mut self) -> String {
+    /// Expand pastes and take the attachments. Sending starts a fresh undo history.
+    pub fn take(&mut self) -> Submission {
         let text = self.expanded_text();
+        let attachments = std::mem::take(&mut self.attachments);
         self.clear_sensitive();
-        text
+        Submission { text, attachments }
+    }
+    /// Replace the draft with a submission taken back for editing.
+    pub fn set_submission(&mut self, submission: Submission) {
+        self.set(submission.text);
+        self.attachments = submission.attachments;
     }
     fn previous(&self) -> usize {
         self.tokens()
@@ -390,13 +497,14 @@ impl Composer {
             Box::new(tokens.iter().rev().filter(|t| t.source.end <= self.cursor))
         };
         for token in iter {
+            let edge = if forward {
+                token.source.end
+            } else {
+                token.source.start
+            };
             if token.paste {
                 if !seen_word {
-                    end = if forward {
-                        token.source.end
-                    } else {
-                        token.source.start
-                    };
+                    end = edge;
                 }
                 break;
             }
@@ -404,16 +512,12 @@ impl Composer {
                 break;
             }
             seen_word |= !token.whitespace;
-            end = if forward {
-                token.source.end
-            } else {
-                token.source.start
-            };
+            end = edge;
         }
         end
     }
 
-    pub fn handle(&mut self, key: KeyEvent) -> bool {
+    pub fn handle(&mut self, key: KeyEvent) -> EditOutcome {
         self.normalize();
         let ctrl = key.modifiers.contains(M::CONTROL);
         let alt = key.modifiers.contains(M::ALT);
@@ -455,7 +559,7 @@ impl Composer {
                 let target = if key.code == KeyCode::Up {
                     row.saturating_sub(1)
                 } else {
-                    (row + 1).min(layout.row_count() - 1)
+                    (row + 1).min(layout.rows.len() - 1)
                 };
                 Some(if target == row {
                     self.cursor
@@ -475,74 +579,74 @@ impl Composer {
             if !vertical {
                 self.preferred_column = None;
             }
-            return true;
+            return EditOutcome::HANDLED;
         }
-        match key.code {
-            KeyCode::Char('-') if ctrl => {
-                if let Some(snapshot) = self.undo.pop() {
-                    self.redo.push(self.snapshot());
-                    self.restore(snapshot);
-                }
-            }
-            KeyCode::Char('.') if ctrl => {
-                if let Some(snapshot) = self.redo.pop() {
-                    self.undo.push(self.snapshot());
-                    self.restore(snapshot);
-                }
-            }
+        let text_changed = match key.code {
+            KeyCode::Char('-') if ctrl => self.step_history(false),
+            KeyCode::Char('.') if ctrl => self.step_history(true),
             KeyCode::Backspace | KeyCode::Char('w') if key.code == KeyCode::Backspace || ctrl => {
-                self.save();
-                if !self.delete_selection() {
-                    let from = if ctrl || alt {
-                        self.word(false)
-                    } else {
-                        self.previous()
-                    };
-                    self.delete_range(from..self.cursor);
-                }
+                let range = self
+                    .selection_range()
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or_else(|| {
+                        let from = if ctrl || alt {
+                            self.word(false)
+                        } else {
+                            self.previous()
+                        };
+                        from..self.cursor
+                    });
+                self.erase(range)
             }
             KeyCode::Delete | KeyCode::Char('d') if key.code == KeyCode::Delete || ctrl || alt => {
-                self.save();
-                if !self.delete_selection() {
-                    let to = if ctrl || alt {
-                        self.word(true)
-                    } else {
-                        self.next()
-                    };
-                    self.delete_range(self.cursor..to);
-                }
+                let range = self
+                    .selection_range()
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or_else(|| {
+                        let to = if ctrl || alt {
+                            self.word(true)
+                        } else {
+                            self.next()
+                        };
+                        self.cursor..to
+                    });
+                self.erase(range)
             }
-            KeyCode::Char('u') if ctrl => {
-                self.save();
-                self.anchor = None;
-                self.delete_range(start..self.cursor);
-            }
-            KeyCode::Char('k') if ctrl => {
-                self.save();
-                self.anchor = None;
-                self.delete_range(
-                    self.cursor..if self.cursor == end && end < self.text.len() {
-                        self.next()
-                    } else {
-                        end
-                    },
-                );
-            }
-            KeyCode::Char(c) if !ctrl && !alt => self.insert(&c.to_string()),
-            KeyCode::Enter if shift || alt => self.insert("\n"),
-            _ => return false,
-        }
+            KeyCode::Char('u') if ctrl => self.erase(start..self.cursor),
+            KeyCode::Char('k') if ctrl => self.erase(
+                self.cursor..if self.cursor == end && end < self.text.len() {
+                    self.next()
+                } else {
+                    end
+                },
+            ),
+            KeyCode::Char(c) if !ctrl && !alt => return self.insert(&c.to_string()),
+            KeyCode::Enter if shift || alt => return self.insert("\n"),
+            _ => return EditOutcome::default(),
+        };
         self.normalize();
-        true
+        EditOutcome::handled(text_changed)
+    }
+
+    /// Only actual deletions enter history or invalidate redo.
+    fn erase(&mut self, range: Range<usize>) -> bool {
+        let changed = !range.is_empty();
+        if changed {
+            self.save();
+        }
+        self.anchor = None;
+        self.delete_range(range);
+        changed
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::editor::HISTORY_LIMIT;
 
     fn key(editor: &mut Composer, code: KeyCode, modifiers: M) {
-        assert!(editor.handle(KeyEvent::new(code, modifiers)));
+        assert!(editor.handle(KeyEvent::new(code, modifiers)).handled);
     }
 
     fn plain(text: &str) -> Composer {
@@ -559,6 +663,29 @@ mod tests {
         key(editor, KeyCode::Char('.'), M::CONTROL);
     }
 
+    /// Press `code` and check the resulting caret.
+    fn step(editor: &mut Composer, code: KeyCode, modifiers: M, cursor: usize) {
+        key(editor, code, modifiers);
+        assert_eq!(editor.cursor, cursor, "after {code:?}");
+    }
+
+    fn assert_document_invariants(editor: &Composer) {
+        let tokens = editor.tokens();
+        let len = editor.text().len();
+        for position in [Some(editor.cursor()), editor.anchor()]
+            .into_iter()
+            .flatten()
+        {
+            assert_eq!(Token::boundary(&tokens, len, position), position);
+        }
+        for (&offset, paste) in &editor.pastes {
+            assert_eq!(&editor.text()[offset..offset + OBJECT.len()], OBJECT);
+            assert!(paste.id < editor.next_id);
+            let mut tokens = tokens.iter();
+            assert!(tokens.any(|token| token.source.start == offset && token.paste));
+        }
+    }
+
     #[test]
     fn ordered_verbatim_expansion_and_literal_object_character() {
         let mut editor = plain("before ");
@@ -566,18 +693,14 @@ mod tests {
         editor.insert(" middle ");
         editor.insert_paste("末尾\n".into());
         editor.insert(OBJECT);
-        assert_eq!(
-            editor.expanded_text(),
-            "before a\n\n b\r\n middle 末尾\n\u{fffc}"
-        );
+        let expected = "before a\n\n b\r\n middle 末尾\n\u{fffc}";
+        assert_eq!(editor.expanded_text(), expected);
         assert_eq!(
             editor.pastes().map(|(id, _)| id).collect::<Vec<_>>(),
             [1, 2]
         );
-        let text = editor.take();
-        assert_eq!(text, "before a\n\n b\r\n middle 末尾\n\u{fffc}");
-        assert!(editor.is_empty());
-        assert!(!editor.has_pastes());
+        assert_eq!(editor.take().text, expected);
+        assert!(editor.is_empty() && !editor.has_pastes());
         undo(&mut editor);
         assert!(editor.is_empty(), "sent documents cannot reappear via undo");
     }
@@ -586,7 +709,7 @@ mod tests {
     fn inserting_before_paste_tracks_positions_and_stable_ids() {
         let mut editor = plain("abc");
         editor.insert_paste("first".into());
-        editor.cursor = 0;
+        editor.set_selection(editor.anchor(), 0);
         editor.insert_paste("second".into());
         editor.insert(" ");
         assert_eq!(editor.expanded_text(), "second abcfirst");
@@ -595,28 +718,27 @@ mod tests {
             [(2, "second"), (1, "first")]
         );
         assert_eq!(editor.paste(1), Some("first"));
-        assert!(editor.remove_paste(2));
-        assert_eq!(editor.expanded_text(), " abcfirst");
-        assert_eq!(editor.cursor, 1);
+        assert!(editor.remove_paste(2).handled);
+        assert_eq!(
+            (editor.expanded_text().as_str(), editor.cursor),
+            (" abcfirst", 1)
+        );
         undo(&mut editor);
         assert_eq!(editor.expanded_text(), "second abcfirst");
         assert_eq!(editor.paste(2), Some("second"));
         redo(&mut editor);
         assert_eq!(editor.expanded_text(), " abcfirst");
-        assert!(!editor.remove_paste(99));
+        assert!(!editor.remove_paste(99).handled);
     }
 
     #[test]
-    fn paste_cursor_and_deletion_are_atomic() {
+    fn paste_cursor_word_movement_and_deletion_are_atomic() {
         let mut editor = plain("L");
         editor.insert_paste("not individually editable".into());
         editor.insert("R");
-        key(&mut editor, KeyCode::Left, M::NONE);
-        assert_eq!(editor.cursor, 1 + OBJECT.len());
-        key(&mut editor, KeyCode::Left, M::NONE);
-        assert_eq!(editor.cursor, 1);
-        key(&mut editor, KeyCode::Right, M::NONE);
-        assert_eq!(editor.cursor, 1 + OBJECT.len());
+        step(&mut editor, KeyCode::Left, M::NONE, 1 + OBJECT.len());
+        step(&mut editor, KeyCode::Left, M::NONE, 1);
+        step(&mut editor, KeyCode::Right, M::NONE, 1 + OBJECT.len());
         key(&mut editor, KeyCode::Backspace, M::NONE);
         assert_eq!(editor.text, "LR");
         assert!(!editor.has_pastes());
@@ -627,6 +749,21 @@ mod tests {
         assert_eq!(editor.text, "LR");
         undo(&mut editor);
         assert_eq!(editor.paste(1), Some("not individually editable"));
+
+        let mut editor = plain("first");
+        editor.insert_paste("paste".into());
+        editor.insert("second");
+        step(
+            &mut editor,
+            KeyCode::Left,
+            M::CONTROL,
+            "first".len() + OBJECT.len(),
+        );
+        step(&mut editor, KeyCode::Left, M::CONTROL, "first".len());
+        step(&mut editor, KeyCode::Left, M::CONTROL, 0);
+        step(&mut editor, KeyCode::Right, M::CONTROL, "first".len());
+        key(&mut editor, KeyCode::Delete, M::CONTROL);
+        assert_eq!(editor.text, "firstsecond");
     }
 
     #[test]
@@ -634,7 +771,7 @@ mod tests {
         let mut editor = plain("head");
         editor.insert_paste("\nx\ny\n".into());
         editor.insert("tail");
-        editor.cursor = 4;
+        editor.set_selection(editor.anchor(), 4);
         key(&mut editor, KeyCode::Right, M::SHIFT);
         assert_eq!(editor.selected_text().as_deref(), Some("\nx\ny\n"));
         editor.insert("new");
@@ -644,17 +781,15 @@ mod tests {
         assert_eq!(editor.selected_text().as_deref(), Some("\nx\ny\n"));
         redo(&mut editor);
         assert_eq!(editor.expanded_text(), "headnewtail");
-    }
 
-    #[test]
-    fn backward_selection_across_multiple_pastes() {
+        // Backward selections span several pastes.
         let mut editor = plain("A");
-        editor.insert_paste("111".into());
-        editor.insert("B");
-        editor.insert_paste("222".into());
-        editor.insert("C");
-        editor.anchor = Some(editor.text.len());
-        editor.cursor = 1;
+        for (paste, text) in [("111", "B"), ("222", "C")] {
+            editor.insert_paste(paste.into());
+            editor.insert(text);
+        }
+        editor.set_selection(Some(editor.text.len()), editor.cursor());
+        editor.set_selection(editor.anchor(), 1);
         assert_eq!(editor.selected_text().as_deref(), Some("111B222C"));
         key(&mut editor, KeyCode::Delete, M::NONE);
         assert_eq!(editor.text, "A");
@@ -665,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn unicode_graphemes_are_atomic_even_adjacent_to_pastes() {
+    fn unicode_graphemes_and_crlf_are_atomic_even_adjacent_to_pastes() {
         let mut editor = plain("e\u{301}👩‍💻界");
         key(&mut editor, KeyCode::Backspace, M::NONE);
         assert_eq!(editor.text, "e\u{301}👩‍💻");
@@ -673,29 +808,26 @@ mod tests {
         assert_eq!(editor.text, "e\u{301}");
         editor.insert_paste("paste".into());
         editor.insert("\u{301}");
-        key(&mut editor, KeyCode::Left, M::NONE);
-        assert_eq!(editor.cursor, "e\u{301}".len() + OBJECT.len());
+        step(
+            &mut editor,
+            KeyCode::Left,
+            M::NONE,
+            "e\u{301}".len() + OBJECT.len(),
+        );
         key(&mut editor, KeyCode::Backspace, M::NONE);
         assert!(!editor.has_pastes());
         assert_eq!(editor.text, "e\u{301}\u{301}");
         assert_eq!(editor.cursor, 0, "joining graphemes normalizes the caret");
-    }
 
-    #[test]
-    fn word_movement_stops_at_atomic_pastes() {
-        let mut editor = plain("first");
-        editor.insert_paste("paste".into());
-        editor.insert("second");
-        key(&mut editor, KeyCode::Left, M::CONTROL);
-        assert_eq!(editor.cursor, "first".len() + OBJECT.len());
-        key(&mut editor, KeyCode::Left, M::CONTROL);
-        assert_eq!(editor.cursor, "first".len());
-        key(&mut editor, KeyCode::Left, M::CONTROL);
-        assert_eq!(editor.cursor, 0);
-        key(&mut editor, KeyCode::Right, M::CONTROL);
-        assert_eq!(editor.cursor, "first".len());
-        key(&mut editor, KeyCode::Delete, M::CONTROL);
-        assert_eq!(editor.text, "firstsecond");
+        let mut editor = plain("a\r\nb");
+        editor.set_selection(editor.anchor(), 0);
+        step(&mut editor, KeyCode::Char('e'), M::CONTROL, 1);
+        key(&mut editor, KeyCode::Char('k'), M::CONTROL);
+        assert_eq!(editor.text, "ab");
+        undo(&mut editor);
+        step(&mut editor, KeyCode::Right, M::NONE, 3);
+        key(&mut editor, KeyCode::Backspace, M::NONE);
+        assert_eq!(editor.text, "ab");
     }
 
     #[test]
@@ -709,18 +841,15 @@ mod tests {
         editor.insert("x");
         undo(&mut editor);
         editor.clear_sensitive();
-        assert!(editor.text.is_empty());
-        assert!(editor.undo.is_empty());
-        assert!(editor.redo.is_empty());
-        assert_eq!(editor.cursor, 0);
-        assert!(editor.anchor.is_none());
+        assert!(editor.text.is_empty() && editor.undo.is_empty() && editor.redo.is_empty());
+        assert_eq!((editor.cursor, editor.anchor), (0, None));
     }
 
     #[test]
-    fn vertical_navigation_preserves_display_column_through_short_rows() {
+    fn vertical_navigation_preserves_display_column_through_short_soft_and_wide_rows() {
         let mut editor = plain("abcdef\nx\nabcdef");
         editor.set_width(20);
-        editor.cursor = 5;
+        editor.set_selection(editor.anchor(), 5);
         assert!(editor.is_first_visual_row());
         key(&mut editor, KeyCode::Down, M::NONE);
         assert_eq!(editor.layout(20).cursor, (1, 1));
@@ -729,20 +858,15 @@ mod tests {
         assert!(editor.is_last_visual_row());
         assert_eq!(editor.selected_text().as_deref(), Some("\nabcde"));
         key(&mut editor, KeyCode::Up, M::NONE);
-        key(&mut editor, KeyCode::Up, M::NONE);
-        assert_eq!(editor.cursor, 5);
-    }
+        step(&mut editor, KeyCode::Up, M::NONE, 5);
 
-    #[test]
-    fn vertical_navigation_follows_soft_rows_and_wide_characters() {
         let mut editor = plain("界界 abc def ghi");
         editor.set_width(8);
-        editor.cursor = "界".len();
+        editor.set_selection(editor.anchor(), "界".len());
         key(&mut editor, KeyCode::Down, M::NONE);
         assert_eq!(editor.layout(8).cursor, (1, 2));
         assert!(!editor.is_first_visual_row());
-        key(&mut editor, KeyCode::Up, M::NONE);
-        assert_eq!(editor.cursor, "界".len());
+        step(&mut editor, KeyCode::Up, M::NONE, "界".len());
     }
 
     #[test]
@@ -750,17 +874,15 @@ mod tests {
         let mut editor = plain("before ");
         editor.insert_paste("private\ncontents".into());
         editor.insert(" after");
-        editor.anchor = Some(7);
-        editor.cursor = 7 + OBJECT.len();
+        editor.set_selection(Some(7), editor.cursor());
+        editor.set_selection(editor.anchor(), 7 + OBJECT.len());
         let expected = editor.expanded_text();
         editor.clear();
-        assert!(editor.is_empty());
-        assert!(!editor.has_pastes());
+        assert!(editor.is_empty() && !editor.has_pastes());
         undo(&mut editor);
         assert_eq!(editor.expanded_text(), expected);
         assert_eq!(editor.paste(1), Some("private\ncontents"));
-        assert_eq!(editor.cursor, 7 + OBJECT.len());
-        assert_eq!(editor.anchor, Some(7));
+        assert_eq!((editor.cursor, editor.anchor), (7 + OBJECT.len(), Some(7)));
         assert_eq!(editor.selected_text().as_deref(), Some("private\ncontents"));
         redo(&mut editor);
         assert!(editor.is_empty());
@@ -769,17 +891,68 @@ mod tests {
     }
 
     #[test]
-    fn crlf_editing_is_grapheme_atomic() {
-        let mut editor = plain("a\r\nb");
-        editor.cursor = 0;
-        key(&mut editor, KeyCode::Char('e'), M::CONTROL);
-        assert_eq!(editor.cursor, 1);
-        key(&mut editor, KeyCode::Char('k'), M::CONTROL);
-        assert_eq!(editor.text, "ab");
+    fn outcomes_distinguish_noops_navigation_and_actual_rich_edits() {
+        let mut editor = Composer::default();
+        let outcome = editor.handle(KeyEvent::new(KeyCode::Esc, M::NONE));
+        assert!(!outcome.handled && !outcome.text_changed);
+        let outcome = editor.handle(KeyEvent::new(KeyCode::Backspace, M::NONE));
+        assert!(outcome.handled && !outcome.text_changed);
+        assert!(!editor.insert("").text_changed);
+        assert!(editor.insert("same").text_changed);
+        editor.set_selection(Some(0), editor.text().len());
+        assert!(!editor.insert("same").text_changed);
+        assert!(!editor.set("same".into()).text_changed);
+        assert!(editor.insert_paste("paste".into()).text_changed);
+        editor.set_selection(Some(4), editor.text().len());
+        // Identical raw object character, different rich document.
+        assert!(editor.insert(OBJECT).text_changed);
+        assert!(!editor.has_pastes());
+        let undo = KeyEvent::new(KeyCode::Char('-'), M::CONTROL);
+        assert!(editor.handle(undo).text_changed);
+        assert_eq!(editor.paste(1), Some("paste"));
+        assert_document_invariants(&editor);
+    }
+
+    #[test]
+    fn rich_history_evicts_oldest_at_local_bound_and_restores_atomically() {
+        let mut editor = Composer::default();
+        editor.insert_paste("kept attachment".into());
+        for _ in 0..HISTORY_LIMIT + 7 {
+            editor.insert("x");
+            assert!(editor.undo.len() <= HISTORY_LIMIT);
+        }
+        for _ in 0..HISTORY_LIMIT {
+            undo(&mut editor);
+            assert_document_invariants(&editor);
+        }
+        assert_eq!(editor.expanded_text(), "kept attachmentxxxxxxx");
+        assert_eq!(editor.redo.len(), HISTORY_LIMIT);
+        for _ in 0..HISTORY_LIMIT {
+            redo(&mut editor);
+            assert_document_invariants(&editor);
+        }
+        assert_eq!(editor.undo.len(), HISTORY_LIMIT);
         undo(&mut editor);
-        key(&mut editor, KeyCode::Right, M::NONE);
-        assert_eq!(editor.cursor, 3);
-        key(&mut editor, KeyCode::Backspace, M::NONE);
-        assert_eq!(editor.text, "ab");
+        editor.insert_paste("new attachment".into());
+        assert!(editor.redo.is_empty());
+        assert_eq!(editor.paste(1), Some("kept attachment"));
+        assert_eq!(editor.paste(2), Some("new attachment"));
+        assert_document_invariants(&editor);
+    }
+
+    #[test]
+    fn attachments_are_taken_with_the_draft() {
+        let mut editor = Composer::default();
+        editor.insert("look");
+        let file = Attachment::Text {
+            file: Some("a.rs".into()),
+            content: "fn a() {}".into(),
+        };
+        editor.attach(file.clone());
+        let submission = editor.take();
+        assert!(editor.is_empty());
+        let attachments = vec![file];
+        let text = "look".into();
+        assert_eq!(submission, Submission { text, attachments });
     }
 }

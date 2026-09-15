@@ -17,7 +17,8 @@ use crate::{
     identity::AgentId,
     job::JobManager,
     remote::protocol::{
-        PROTOCOL_VERSION, RemoteToolError, Request, Response, read_frame, write_frame,
+        AuthorizationId, PROTOCOL_VERSION, RemoteToolError, Request, RequestId, Response,
+        read_frame, write_frame,
     },
     session::SessionStore,
     tool::{
@@ -108,9 +109,9 @@ where
                 };
                 match request {
                     Request::Tool { request_id, name, arguments, capabilities } => {
-                        if request_id == 0 || active.insert(request_id, None).is_some() {
+                        if active.insert(request_id, None).is_some() {
                             reader.abort();
-                            return Err(format!("invalid or duplicate request ID {request_id}").into());
+                            return Err(format!("duplicate request ID {}", request_id.get()).into());
                         }
                         // Collect an exact set: defaults would restore capabilities the caller lacks.
                         let executor = executor.clone().with_capabilities(capabilities.into_iter().collect());
@@ -121,7 +122,7 @@ where
                         tasks.spawn(async move {
                             let mut captured_job = None;
                             let result = match executor
-                                .start_scoped(worker_agent, &name, arguments, None, request_id)
+                                .start_scoped(worker_agent, &name, arguments, None, request_id.get())
                                 .await
                             {
                                 Ok(started) => {
@@ -247,14 +248,15 @@ struct ForwardPolicy<W> {
     next_id: AtomicU64,
 }
 
-type PendingAuthorizations = Arc<Mutex<HashMap<(u64, u64), oneshot::Sender<PolicyDecision>>>>;
+type PendingAuthorizations =
+    Arc<Mutex<HashMap<(RequestId, AuthorizationId), oneshot::Sender<PolicyDecision>>>>;
 
 impl<W> Policy for ForwardPolicy<W>
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     fn authorize(&self, mut request: AuthorizationRequest) -> PolicyFuture<'_> {
-        let Some(request_id) = request.scope else {
+        let Some(request_id) = request.scope.and_then(RequestId::new) else {
             return Box::pin(async {
                 PolicyDecision::Deny {
                     reason: "remote authorization scope is unavailable".to_owned(),
@@ -267,19 +269,21 @@ where
             // (network origins, paths, and other namespaces), including redirects
             // from a top-level worker invocation whose parent remains None.
             request.permissions.retain(|permission| {
-                !(permission.resource.namespace == "workspace"
-                    && matches!(
-                        permission.capability,
-                        crate::tool::policy::Capability::Read
-                            | crate::tool::policy::Capability::Write
-                            | crate::tool::policy::Capability::Exec
-                    ))
+                !(matches!(
+                    permission.resource,
+                    crate::tool::policy::ResourceId::Workspace { .. }
+                ) && matches!(
+                    permission.capability,
+                    crate::tool::policy::Capability::Read
+                        | crate::tool::policy::Capability::Write
+                        | crate::tool::policy::Capability::Exec
+                ))
             });
             if request.permissions.is_empty() {
                 return Box::pin(async { PolicyDecision::allow() });
             }
         }
-        let authorization_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let authorization_id = AuthorizationId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let output = self.output.clone();
         let authorizations = self.authorizations.clone();
         Box::pin(async move {
@@ -366,20 +370,19 @@ async fn externalize_images(
     store: &SessionStore,
 ) -> Result<crate::remote::protocol::RemoteToolOutput, Box<dyn std::error::Error>> {
     let mut images = Vec::new();
-    for mut image in output.images {
-        let data_base64 = if let Some(data) = image.data_base64.take() {
-            data
-        } else {
-            base64::engine::general_purpose::STANDARD.encode(store.read_blob(&image).await?)
-        };
+    for image in output.images {
+        let bytes = store
+            .read_blob(&image.blob, crate::media::MAX_IMAGE_BYTES as usize)
+            .await?;
         images.push(crate::remote::protocol::RemoteImage {
-            reference: image,
-            data_base64,
+            file: image.file,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
         });
     }
     Ok(crate::remote::protocol::RemoteToolOutput {
         value: output.value,
         images,
+        streams: output.streams,
     })
 }
 
@@ -395,9 +398,122 @@ pub async fn self_check(expected: &str) -> Result<(), Box<dyn std::error::Error>
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+    use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
 
     use super::*;
     use crate::remote::protocol::RemoteToolOutput;
+    use crate::tool::policy::{Capability, CapabilitySet};
+
+    fn id(value: u64) -> RequestId {
+        RequestId::new(value).unwrap()
+    }
+
+    /// A handshaken client connection to a worker serving over an in-memory duplex.
+    struct Harness {
+        input: ReadHalf<DuplexStream>,
+        output: WriteHalf<DuplexStream>,
+        worker: tokio::task::JoinHandle<Result<(), String>>,
+    }
+
+    impl Harness {
+        async fn start(root: std::path::PathBuf) -> Self {
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (input, output) = tokio::io::split(client);
+            let (server_input, server_output) = tokio::io::split(server);
+            let worker = tokio::spawn(async move {
+                serve_io_at(server_input, server_output, root)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+            let mut harness = Self {
+                input,
+                output,
+                worker,
+            };
+            harness
+                .send(Request::Hello {
+                    version: PROTOCOL_VERSION,
+                })
+                .await;
+            assert!(matches!(
+                harness.recv().await,
+                Response::Ready {
+                    version: PROTOCOL_VERSION
+                }
+            ));
+            harness
+        }
+
+        async fn send(&mut self, request: Request) {
+            write_frame(&mut self.output, &request).await.unwrap();
+        }
+
+        async fn tool(
+            &mut self,
+            request_id: u64,
+            capabilities: Vec<Capability>,
+            name: &str,
+            arguments: serde_json::Value,
+        ) {
+            self.send(Request::Tool {
+                request_id: id(request_id),
+                capabilities,
+                name: name.to_owned(),
+                arguments,
+            })
+            .await;
+        }
+
+        async fn recv(&mut self) -> Response {
+            tokio::time::timeout(Duration::from_secs(10), read_frame(&mut self.input))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn finish(self) {
+            drop((self.input, self.output));
+            tokio::time::timeout(Duration::from_secs(2), self.worker)
+                .await
+                .expect("worker should stop on EOF")
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    fn defaults() -> Vec<Capability> {
+        CapabilitySet::default().iter().collect()
+    }
+
+    #[tokio::test]
+    async fn tool_image_externalization_reads_verified_bounded_blobs() {
+        use crate::{media::MAX_IMAGE_BYTES, tool::ToolOutput};
+        use base64::engine::general_purpose::STANDARD;
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(directory.path()).await.unwrap();
+        let png = crate::tests::png(b"image bytes");
+        let image = store
+            .store_image(Some("image.png".into()), &png)
+            .await
+            .unwrap();
+        let output = |image| ToolOutput::default().with_images(vec![image]);
+        let result = externalize_images(output(image.clone()), &store)
+            .await
+            .unwrap();
+        assert_eq!(result.images[0].data_base64, STANDARD.encode(png.bytes()));
+        assert_eq!(result.images[0].file.as_deref(), Some("image.png"));
+        let corruptions: [fn(&mut crate::media::ImageRef); 3] = [
+            |image| image.blob.sha256 = crate::media::BlobDigest::of(b"wrong bytes"),
+            |image| image.blob.bytes += 1,
+            |image| image.blob.bytes = MAX_IMAGE_BYTES + 1,
+        ];
+        for corrupt in corruptions {
+            let mut corrupted = image.clone();
+            corrupt(&mut corrupted);
+            assert!(externalize_images(output(corrupted), &store).await.is_err());
+        }
+    }
 
     #[tokio::test]
     async fn incompatible_client_handshakes_are_rejected() {
@@ -408,49 +524,17 @@ mod tests {
             let (mut client, server) = tokio::io::duplex(4096);
             write_frame(&mut client, &hello).await.unwrap();
             let (input, output) = tokio::io::split(server);
-            assert!(
-                serve_io_at(input, output, std::fs::canonicalize(".").unwrap())
-                    .await
-                    .is_err()
-            );
-            assert!(
-                read_frame::<_, Response>(&mut client)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
+            let root = std::fs::canonicalize(".").unwrap();
+            assert!(serve_io_at(input, output, root).await.is_err());
+            let response = read_frame::<_, Response>(&mut client).await.unwrap();
+            assert!(response.is_none());
         }
     }
 
     #[tokio::test]
-    async fn worker_enforces_exact_capabilities_without_restoring_defaults() {
-        use crate::tool::policy::Capability;
-        let (client, server) = tokio::io::duplex(64 * 1024);
-        let (mut client_input, mut client_output) = tokio::io::split(client);
-        let (server_input, server_output) = tokio::io::split(server);
-        let worker = tokio::spawn(async move {
-            serve_io_at(
-                server_input,
-                server_output,
-                std::fs::canonicalize(".").unwrap(),
-            )
-            .await
-            .map_err(|error| error.to_string())
-        });
-        write_frame(
-            &mut client_output,
-            &Request::Hello {
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            read_frame::<_, Response>(&mut client_input).await.unwrap(),
-            Some(Response::Ready {
-                version: PROTOCOL_VERSION
-            })
-        ));
+    async fn worker_enforces_exact_capabilities_and_noninteractive_exec_sessions() {
+        let mut worker = Harness::start(std::fs::canonicalize(".").unwrap()).await;
+        let exact = serde_json::json!({"argv":["/bin/sh", "-c", "printf exact"]});
         for (index, capabilities) in [
             vec![],
             vec![Capability::Read],
@@ -460,35 +544,15 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let request_id = index as u64 + 1;
             let allowed = capabilities.contains(&Capability::Exec);
-            write_frame(
-                &mut client_output,
-                &Request::Tool {
-                    request_id,
-                    capabilities,
-                    name: "exec".into(),
-                    arguments: serde_json::json!({"argv":["/bin/sh", "-c", "printf exact"]}),
-                },
-            )
-            .await
-            .unwrap();
-            let response = tokio::time::timeout(
-                Duration::from_secs(10),
-                read_frame::<_, Response>(&mut client_input),
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-            let Response::Tool {
-                request_id: actual,
-                result,
-            } = response
-            else {
+            worker
+                .tool(index as u64 + 1, capabilities, "exec", exact.clone())
+                .await;
+            let response = worker.recv().await;
+            let Response::Tool { request_id, result } = response else {
                 panic!("expected tool result, got {response:?}")
             };
-            assert_eq!(actual, request_id);
+            assert_eq!(request_id, id(index as u64 + 1));
             if allowed {
                 assert_eq!(result.unwrap().value["stdout"], "exact");
             } else {
@@ -499,64 +563,19 @@ mod tests {
                 );
             }
         }
-        drop(client_output);
-        drop(client_input);
-        tokio::time::timeout(Duration::from_secs(2), worker)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn noninteractive_remote_exec_starts_a_new_process_session() {
-        use crate::tool::policy::Capability;
-        let (client, server) = tokio::io::duplex(64 * 1024);
-        let (mut client_input, mut client_output) = tokio::io::split(client);
-        let (server_input, server_output) = tokio::io::split(server);
-        let worker = tokio::spawn(async move {
-            serve_io_at(
-                server_input,
-                server_output,
-                std::fs::canonicalize(".").unwrap(),
-            )
-            .await
-            .map_err(|error| error.to_string())
-        });
-        write_frame(
-            &mut client_output,
-            &Request::Hello {
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            read_frame::<_, Response>(&mut client_input).await.unwrap(),
-            Some(Response::Ready {
-                version: PROTOCOL_VERSION
-            })
-        ));
+        #[cfg(target_os = "linux")]
         for (index, interactive) in [false, true, false].into_iter().enumerate() {
             let mut capabilities = vec![Capability::Exec];
             if interactive {
                 capabilities.push(Capability::Interactive);
             }
-            write_frame(&mut client_output, &Request::Tool {
-                request_id: index as u64 + 1, capabilities, name: "exec".into(),
-                arguments: serde_json::json!({"argv":["/bin/sh", "-c", "read pid comm state ppid pgrp sid rest < /proc/self/stat; printf '%s %s' \"$pid\" \"$sid\""]}),
-            }).await.unwrap();
-            let response = tokio::time::timeout(
-                Duration::from_secs(10),
-                read_frame::<_, Response>(&mut client_input),
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-            let Response::Tool { result, .. } = response else {
-                panic!("expected tool result, got {response:?}")
+            let stat = "read pid comm state ppid pgrp sid rest < /proc/self/stat; printf '%s %s' \"$pid\" \"$sid\"";
+            let argv = serde_json::json!({"argv":["/bin/sh", "-c", stat]});
+            worker
+                .tool(index as u64 + 10, capabilities, "exec", argv)
+                .await;
+            let Response::Tool { result, .. } = worker.recv().await else {
+                panic!("expected tool result")
             };
             let result = result.unwrap();
             let ids: Vec<_> = result.value["stdout"]
@@ -571,20 +590,14 @@ mod tests {
                 "only noninteractive exec should be a session leader: {ids:?}"
             );
         }
-        drop(client_output);
-        drop(client_input);
-        tokio::time::timeout(Duration::from_secs(2), worker)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        worker.finish().await;
     }
 
     #[tokio::test]
-    async fn top_level_network_and_redirect_permissions_are_forwarded() {
+    async fn workspace_suppression_preserves_dynamic_and_nested_permissions() {
         use crate::{
             identity::{JobId, SessionId},
-            tool::policy::{Capability, PermissionUse, ResourceId},
+            tool::policy::{PermissionUse, ResourceId},
         };
         let (mut host, worker) = tokio::io::duplex(16 * 1024);
         let pending = Arc::new(Mutex::new(HashMap::new()));
@@ -593,26 +606,44 @@ mod tests {
             authorizations: pending.clone(),
             next_id: AtomicU64::new(0),
         });
-        for (origin, allow) in [
-            ("https://initial.test", true),
-            ("https://redirect.test:8443", false),
+        for (origin, allow, parent) in [
+            ("https://initial.test", true, None),
+            ("https://redirect.test:8443", false, None),
+            ("https://nested.test", true, Some(JobId::new(2).unwrap())),
         ] {
-            let network =
-                PermissionUse::new(Capability::Network, ResourceId::network("root", origin));
+            let workspace = ResourceId::workspace("root", std::path::Path::new("/workspace"));
+            let mut permissions: Vec<_> = [Capability::Read, Capability::Write, Capability::Exec]
+                .into_iter()
+                .map(|capability| PermissionUse::new(capability, workspace.clone()))
+                .collect();
+            // Workspace permissions are suppressed only for top-level jobs.
+            let mut expected_permissions = if parent.is_some() {
+                permissions.clone()
+            } else {
+                vec![]
+            };
+            let dynamic = vec![
+                PermissionUse::new(Capability::Network, ResourceId::network("root", origin)),
+                PermissionUse::new(Capability::Interactive, workspace),
+                PermissionUse::new(
+                    Capability::Read,
+                    ResourceId::path("root", "/outside".as_ref()),
+                ),
+                PermissionUse::new(
+                    Capability::Read,
+                    ResourceId::custom("extension", ["root", "opaque"]).unwrap(),
+                ),
+            ];
+            permissions.extend(dynamic.clone());
+            expected_permissions.extend(dynamic);
             let arguments = serde_json::json!({"url":"https://initial.test", "network_origin":origin, "insecure":true});
             let request = AuthorizationRequest {
                 agent: crate::identity::AgentId::root(SessionId::from_bytes([1; 16])),
                 job: JobId::new(1).unwrap(),
-                parent: None,
+                parent,
                 scope: Some(7),
                 tool: "fetch".to_owned(),
-                permissions: vec![
-                    PermissionUse::new(
-                        Capability::Exec,
-                        ResourceId::new("workspace", ["root", "/workspace"]),
-                    ),
-                    network.clone(),
-                ],
+                permissions,
                 arguments: arguments.clone(),
             };
             let policy = policy.clone();
@@ -633,10 +664,10 @@ mod tests {
             else {
                 panic!("expected network authorization");
             };
-            assert_eq!(request_id, 7);
-            assert_eq!(tool, "fetch");
-            assert_eq!(permissions, vec![network]);
-            assert_eq!(forwarded, arguments);
+            assert_eq!(
+                (request_id.get(), tool.as_str(), &permissions, &forwarded),
+                (7, "fetch", &expected_permissions, &arguments)
+            );
             let expected = if allow {
                 PolicyDecision::allow()
             } else {
@@ -644,184 +675,59 @@ mod tests {
                     reason: "redirect denied".to_owned(),
                 }
             };
-            pending
-                .lock()
-                .await
-                .remove(&(request_id, authorization_id))
-                .unwrap()
-                .send(expected.clone())
-                .unwrap();
+            let sender = pending.lock().await.remove(&(request_id, authorization_id));
+            sender.unwrap().send(expected.clone()).unwrap();
             assert_eq!(decision.await.unwrap(), expected);
         }
         assert!(pending.lock().await.is_empty());
     }
 
+    fn stdout(response: &Response) -> (u64, Result<&str, &str>) {
+        match response {
+            Response::Tool { request_id, result } => (
+                request_id.get(),
+                result
+                    .as_ref()
+                    .map(|RemoteToolOutput { value, .. }| value["stdout"].as_str().unwrap())
+                    .map_err(|RemoteToolError { message, .. }| message.as_str()),
+            ),
+            response => panic!("unexpected response: {response:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn tool_requests_execute_concurrently_and_reply_on_completion() {
-        let (client, server) = tokio::io::duplex(64 * 1024);
-        let (mut client_input, mut client_output) = tokio::io::split(client);
-        let (server_input, server_output) = tokio::io::split(server);
-        let worker = tokio::spawn(async move {
-            serve_io_at(
-                server_input,
-                server_output,
-                std::fs::canonicalize(".").unwrap(),
-            )
-            .await
-            .map_err(|error| error.to_string())
-        });
+        let mut worker = Harness::start(std::fs::canonicalize(".").unwrap()).await;
+        let shell = |command: &str| serde_json::json!({ "command": command });
+        worker
+            .tool(1, defaults(), "shell", shell("sleep 1; printf slow"))
+            .await;
+        worker
+            .tool(2, defaults(), "shell", shell("printf fast"))
+            .await;
+        assert_eq!(stdout(&worker.recv().await), (2, Ok("fast")));
+        assert_eq!(stdout(&worker.recv().await), (1, Ok("slow")));
 
-        write_frame(
-            &mut client_output,
-            &Request::Hello {
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            read_frame::<_, Response>(&mut client_input).await.unwrap(),
-            Some(Response::Ready {
-                version: PROTOCOL_VERSION
-            })
-        ));
-        write_frame(
-            &mut client_output,
-            &Request::Tool {
-                capabilities: crate::tool::policy::CapabilitySet::default()
-                    .iter()
-                    .collect(),
-                request_id: 1,
-                name: "shell".to_owned(),
-                arguments: serde_json::json!({"command":"sleep 1; printf slow"}),
-            },
-        )
-        .await
-        .unwrap();
-        write_frame(
-            &mut client_output,
-            &Request::Tool {
-                capabilities: crate::tool::policy::CapabilitySet::default()
-                    .iter()
-                    .collect(),
-                request_id: 2,
-                name: "shell".to_owned(),
-                arguments: serde_json::json!({"command":"printf fast"}),
-            },
-        )
-        .await
-        .unwrap();
-
-        let first = read_frame::<_, Response>(&mut client_input)
-            .await
-            .unwrap()
-            .unwrap();
-        let second = read_frame::<_, Response>(&mut client_input)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            first,
-            Response::Tool {
-                request_id: 2,
-                result: Ok(RemoteToolOutput { value, .. }),
-            } if value["stdout"] == "fast"
-        ));
-        assert!(matches!(
-            second,
-            Response::Tool {
-                request_id: 1,
-                result: Ok(RemoteToolOutput { value, .. }),
-            } if value["stdout"] == "slow"
-        ));
-
-        write_frame(
-            &mut client_output,
-            &Request::Tool {
-                capabilities: crate::tool::policy::CapabilitySet::default()
-                    .iter()
-                    .collect(),
-                request_id: 3,
-                name: "shell".to_owned(),
-                arguments: serde_json::json!({"command":"sleep 10; printf cancelled"}),
-            },
-        )
-        .await
-        .unwrap();
-        write_frame(
-            &mut client_output,
-            &Request::Tool {
-                capabilities: crate::tool::policy::CapabilitySet::default()
-                    .iter()
-                    .collect(),
-                request_id: 4,
-                name: "shell".to_owned(),
-                arguments: serde_json::json!({"command":"sleep 0.1; printf sibling"}),
-            },
-        )
-        .await
-        .unwrap();
+        worker
+            .tool(3, defaults(), "shell", shell("sleep 10; printf cancelled"))
+            .await;
+        worker
+            .tool(4, defaults(), "shell", shell("sleep 0.1; printf sibling"))
+            .await;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        write_frame(&mut client_output, &Request::Cancel { request_id: 3 })
-            .await
-            .unwrap();
+        worker.send(Request::Cancel { request_id: id(3) }).await;
+        let mut responses = [worker.recv().await, worker.recv().await];
+        responses.sort_by_key(|response| stdout(response).0);
+        assert!(
+            matches!(stdout(&responses[0]), (3, Err(message)) if message.contains("cancelled"))
+        );
+        assert_eq!(stdout(&responses[1]), (4, Ok("sibling")));
 
-        let mut cancelled = None;
-        let mut sibling = None;
-        for _ in 0..2 {
-            let response = read_frame::<_, Response>(&mut client_input)
-                .await
-                .unwrap()
-                .unwrap();
-            match response {
-                Response::Tool {
-                    request_id: 3,
-                    result,
-                } => cancelled = Some(result),
-                Response::Tool {
-                    request_id: 4,
-                    result,
-                } => sibling = Some(result),
-                response => panic!("unexpected response: {response:?}"),
-            }
-        }
-        assert!(matches!(
-            cancelled,
-            Some(Err(RemoteToolError { message, .. })) if message.contains("cancelled")
-        ));
-        assert!(matches!(
-            sibling,
-            Some(Ok(RemoteToolOutput { value, .. })) if value["stdout"] == "sibling"
-        ));
-
-        write_frame(
-            &mut client_output,
-            &Request::Tool {
-                capabilities: crate::tool::policy::CapabilitySet::default()
-                    .iter()
-                    .collect(),
-                request_id: 5,
-                name: "shell".to_owned(),
-                arguments: serde_json::json!({"command":"printf reusable"}),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            read_frame::<_, Response>(&mut client_input).await.unwrap(),
-            Some(Response::Tool {
-                request_id: 5,
-                result: Ok(RemoteToolOutput { value, .. }),
-            }) if value["stdout"] == "reusable"
-        ));
-
-        drop(client_output);
-        drop(client_input);
-        tokio::time::timeout(Duration::from_secs(2), worker)
-            .await
-            .expect("worker should stop on EOF")
-            .unwrap()
-            .unwrap();
+        worker
+            .tool(5, defaults(), "shell", shell("printf reusable"))
+            .await;
+        assert_eq!(stdout(&worker.recv().await), (5, Ok("reusable")));
+        worker.finish().await;
     }
 
     #[tokio::test]
@@ -830,94 +736,45 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let path = outside.path().join("outside.txt");
         std::fs::write(&path, "visible after approval").unwrap();
-        let authorization_root = std::fs::canonicalize(authorization_root.path()).unwrap();
         let path = std::fs::canonicalize(path).unwrap();
-        let (client, server) = tokio::io::duplex(64 * 1024);
-        let (mut client_input, mut client_output) = tokio::io::split(client);
-        let (server_input, server_output) = tokio::io::split(server);
-        let worker = tokio::spawn(async move {
-            serve_io_at(server_input, server_output, authorization_root)
-                .await
-                .map_err(|error| error.to_string())
-        });
-
-        write_frame(
-            &mut client_output,
-            &Request::Hello {
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            read_frame::<_, Response>(&mut client_input).await.unwrap(),
-            Some(Response::Ready {
-                version: PROTOCOL_VERSION
-            })
-        ));
-        write_frame(
-            &mut client_output,
-            &Request::Tool {
-                capabilities: crate::tool::policy::CapabilitySet::default()
-                    .iter()
-                    .collect(),
-                request_id: 10,
-                name: "read".to_owned(),
-                arguments: serde_json::json!({"path": path}),
-            },
-        )
-        .await
-        .unwrap();
-
-        let authorization = read_frame::<_, Response>(&mut client_input)
-            .await
-            .unwrap()
-            .unwrap();
-        let authorization_id = match authorization {
-            Response::Authorization {
-                request_id: 10,
-                authorization_id,
-                permissions,
-                ..
-            } => {
-                assert_eq!(permissions.len(), 1);
-                assert_eq!(
-                    permissions[0].capability,
-                    crate::tool::policy::Capability::Read
-                );
-                assert_eq!(
-                    permissions[0].resource,
-                    crate::tool::policy::ResourceId::path("root", &path),
-                );
-                authorization_id
-            }
-            response => panic!("unexpected response: {response:?}"),
+        let mut worker =
+            Harness::start(std::fs::canonicalize(authorization_root.path()).unwrap()).await;
+        worker
+            .tool(10, defaults(), "read", serde_json::json!({"path": path}))
+            .await;
+        let Response::Authorization {
+            request_id,
+            authorization_id,
+            permissions,
+            ..
+        } = worker.recv().await
+        else {
+            panic!("expected authorization request");
         };
-        write_frame(
-            &mut client_output,
-            &Request::AuthorizationDecision {
-                request_id: 10,
+        assert_eq!(request_id, id(10));
+        let resource = crate::tool::policy::ResourceId::path("root", &path);
+        assert_eq!(
+            permissions
+                .iter()
+                .map(|permission| (permission.capability, &permission.resource))
+                .collect::<Vec<_>>(),
+            [(Capability::Read, &resource)]
+        );
+        worker
+            .send(Request::AuthorizationDecision {
+                request_id,
                 authorization_id,
                 allowed: true,
                 reason: None,
-            },
-        )
-        .await
-        .unwrap();
+            })
+            .await;
         assert!(matches!(
-            read_frame::<_, Response>(&mut client_input).await.unwrap(),
-            Some(Response::Tool {
-                request_id: 10,
+            worker.recv().await,
+            Response::Tool {
                 result: Ok(RemoteToolOutput { value, .. }),
-            }) if value["content"] == "visible after approval"
+                ..
+            } if value["content"] == "visible after approval"
         ));
-
-        drop(client_output);
-        drop(client_input);
-        tokio::time::timeout(Duration::from_secs(2), worker)
-            .await
-            .expect("worker should stop on EOF")
-            .unwrap()
-            .unwrap();
+        worker.finish().await;
     }
 }

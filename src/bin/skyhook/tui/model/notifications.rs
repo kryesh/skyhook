@@ -1,9 +1,11 @@
 //! Historical job notifications, independent of the latest job state.
 
 use super::super::format::brief;
-use super::super::tool_view::{Document, Role, Run, Section};
-use super::jobs::{header_text, state_role};
-use super::{Entry, Projection, Surface, View, clean};
+use super::super::tool_view::{Document, Role, Run};
+#[cfg(test)]
+use super::jobs::header_text;
+use super::jobs::state_role;
+use super::{Entry, EntryKey, Projection, Surface, View, clean};
 use serde_json::Value;
 use skyhook::identity::JobId;
 use skyhook::job::JobState;
@@ -37,7 +39,8 @@ pub(super) fn job_notification_kind(text: &str) -> Option<JobNotificationKind> {
 /// rather than the job's latest output (the same job may have since resumed).
 /// Both runtime envelopes describe historical job notifications, not user text.
 pub(super) fn job_event_entries(
-    key: &str,
+    record: u64,
+    block: usize,
     text: &str,
     projection: &Projection,
     view: &View,
@@ -54,7 +57,11 @@ pub(super) fn job_event_entries(
     });
     let Some(events) = events.filter(|events| !events.is_empty()) else {
         return vec![Entry::new(
-            format!("{key}/events"),
+            EntryKey::Notification {
+                record,
+                block,
+                event: None,
+            },
             "Job event · notification received by model · details unavailable".into(),
             Surface::Tool,
         )];
@@ -67,7 +74,11 @@ pub(super) fn job_event_entries(
             // remains message-only for historical sessions without a kind field.
             let agent_message = legacy_agent_messages
                 || event.get("kind").and_then(Value::as_str) == Some("message");
-            let key = format!("{key}/event{index}");
+            let key = EntryKey::Notification {
+                record,
+                block,
+                event: Some(index),
+            };
             let open = view.is_expanded(&key, all);
             let id = event
                 .get("id")
@@ -96,10 +107,9 @@ pub(super) fn job_event_entries(
                     .get("name")
                     .and_then(Value::as_str)
                     .or_else(|| job.and_then(|job| job.name.as_deref()))
-                    .map(|name| format!(" · {}", brief(&clean(name), 80)))
-                    .unwrap_or_default()
+                    .map(|name| brief(&clean(name), 80))
             } else {
-                String::new()
+                None
             };
             let mut header = vec![
                 Run::new(if open { "▾" } else { "▸" }, Role::Indicator),
@@ -111,7 +121,7 @@ pub(super) fn job_event_entries(
                     Role::Muted,
                 ),
             ];
-            if let Some(name) = name.strip_prefix(" · ") {
+            if let Some(name) = name {
                 header.push(Run::new(" · ", Role::Muted));
                 header.push(Run::new(name, Role::Plain));
             }
@@ -126,14 +136,10 @@ pub(super) fn job_event_entries(
                     .unwrap_or(Role::Plain)
             };
             header.push(Run::new(state, role));
-            let mut entry = Entry::new(key, header_text(&header), Surface::Tool);
-            entry.header = Some(header.clone());
-            entry.expandable = true;
-            // Deliberately not Entry.job: output refresh must not replace this
-            // historical notification with a live job card or discard its key.
-            if open {
+            // A notification key is never a job key: output refresh must not
+            // replace historical content with a live job card.
+            let body = if open {
                 let mut body = Document::default();
-                body.sections.push(Section::Line(header));
                 if agent_message {
                     body.line("Agent message received by model", Role::Muted);
                     if let Some(text) = event.get("text").and_then(Value::as_str) {
@@ -145,10 +151,11 @@ pub(super) fn job_event_entries(
                     body.line("Notification received by model", Role::Muted);
                     body.output(tool, job.map_or(&Value::Null, |job| &job.args), event);
                 }
-                entry.text = body.plain_text();
-                entry.document = Some(body);
-            }
-            entry
+                Some(body)
+            } else {
+                None
+            };
+            Entry::card(key, header, body)
         })
         .collect()
 }
@@ -159,8 +166,12 @@ pub(super) fn job_event_entries(
 #[cfg(test)]
 mod tests {
     use super::super::JobInfo;
+    use super::super::tests::{job_info, root};
     use super::*;
-    use skyhook::identity::{AgentId, SessionId};
+
+    fn events(text: &str, projection: &Projection, view: &View, all: bool) -> Vec<Entry> {
+        job_event_entries(42, 0, text, projection, view, all)
+    }
 
     #[test]
     fn notification_headers_use_only_historical_typed_states() {
@@ -172,7 +183,7 @@ mod tests {
                 {"id": 3, "tool": "agent", "kind": "message", "name": "Failed", "message": 4, "state": "failed", "text": "Completed"}
             ])
         );
-        let cards = job_event_entries("m1", &text, &Projection::default(), &View::default(), true);
+        let cards = events(&text, &Projection::default(), &View::default(), true);
         let expected = [
             ("▾ Job event · exec #1 · failed", Role::Error),
             (
@@ -181,17 +192,12 @@ mod tests {
             ),
             ("▾ Job event · agent #3 · Failed · message #4", Role::Plain),
         ];
+        assert_eq!(cards.len(), expected.len());
         for (card, (text, role)) in cards.iter().zip(expected) {
-            let runs = card.header.as_ref().unwrap();
+            let runs = card.header().unwrap();
             assert_eq!(header_text(runs), text);
-            assert_eq!(
-                runs.last().unwrap(),
-                &Run::new(text.rsplit(" · ").next().unwrap(), role)
-            );
-            assert_eq!(
-                card.document.as_ref().unwrap().sections[0],
-                Section::Line(runs.clone())
-            );
+            let state = text.rsplit(" · ").next().unwrap();
+            assert_eq!(runs.last().unwrap(), &Run::new(state, role));
         }
     }
 
@@ -205,52 +211,50 @@ mod tests {
             }]),
         );
         let mut projection = Projection::default();
-        let collapsed = job_event_entries("m42/0", &text, &projection, &View::default(), false);
+        let mut view = View::default();
+        let collapsed = events(&text, &projection, &view, false);
         assert_eq!(collapsed.len(), 1);
         let card = &collapsed[0];
-        assert_eq!(card.surface, Surface::Tool);
-        assert!(card.expandable);
-        assert!(card.job.is_none());
-        assert_eq!(card.key, "m42/0/event0");
-        assert!(
-            card.text
-                .contains("Job event · agent #253 · implement-native-replay · message #6577")
+        assert_eq!(
+            (card.surface, card.expandable(), card.job_id()),
+            (Surface::Tool, true, None)
         );
-        assert!(!card.text.contains("skyhook_agent_messages"));
-        assert!(!card.text.contains(message));
-        let mut view = View::default();
-        view.expanded.insert(card.key.clone());
-        let expanded = job_event_entries("m42/0", &text, &projection, &view, false);
-        assert!(expanded[0].document.is_some());
-        assert!(expanded[0].text.contains(message));
-        assert!(!expanded[0].text.contains("<skyhook_"));
-        assert!(!expanded[0].text.contains("\\\"text\\\""));
+        let key = EntryKey::Notification {
+            record: 42,
+            block: 0,
+            event: Some(0),
+        };
+        assert_eq!(card.key(), &key);
+        let header = "Job event · agent #253 · implement-native-replay · message #6577";
+        assert!(card.text().contains(header));
+        assert!(!card.text().contains("skyhook_agent_messages") && !card.text().contains(message));
+        view.set_expanded(key.clone(), true);
+        let expanded = events(&text, &projection, &view, false);
+        assert!(expanded[0].document().is_some());
+        let expanded = expanded[0].text();
+        assert!(expanded.contains(message));
+        assert!(!expanded.contains("<skyhook_") && !expanded.contains("\\\"text\\\""));
 
         // A later terminal job snapshot must not relabel or replace the historical message.
-        let id = JobId::new(253).unwrap();
-        projection.jobs.insert(
-            id,
-            JobInfo {
-                id,
-                agent: AgentId::root(SessionId::from_bytes([1; 16])),
-                name: Some("current name".into()),
-                tool: "agent".into(),
-                args: Value::Null,
-                parent: None,
-                state: JobState::Completed,
-                target: "host".into(),
-                location: ".".into(),
-                remote: false,
-                error: None,
-            },
-        );
-        let after_completion = job_event_entries("m42/0", &text, &projection, &view, false);
-        assert_eq!(after_completion[0].text, expanded[0].text);
-        assert!(after_completion[0].job.is_none());
-        view.collapsed.insert(card.key.clone());
+        let job = JobInfo {
+            name: Some("current name".into()),
+            tool: "agent".into(),
+            location: skyhook::execution::ExecutionLocation::named("host", ".".into()),
+            ..job_info(
+                &root(1),
+                253,
+                skyhook::job::JobRole::Agent,
+                JobState::Completed,
+            )
+        };
+        projection.jobs.insert(job.id, job);
+        let after_completion = events(&text, &projection, &view, false);
+        assert_eq!(after_completion[0].text(), expanded);
+        assert!(after_completion[0].job_id().is_none());
+        view.set_expanded(key, false);
         assert!(
-            job_event_entries("m42/0", &text, &projection, &view, true)[0]
-                .document
+            events(&text, &projection, &view, true)[0]
+                .document()
                 .is_none()
         );
     }
@@ -261,14 +265,13 @@ mod tests {
             {"id":253,"name":"reviewer","message":6577,"text":"Historical reply.\nNext line."},
         ]);
         let legacy = format!("<skyhook_agent_messages>\n{payload}\n</skyhook_agent_messages>");
-        let mut unified_payload = payload;
-        unified_payload[0]["kind"] = serde_json::json!("message");
-        let unified = format!("<skyhook_job_events>\n{unified_payload}\n</skyhook_job_events>");
-        let projection = Projection::default();
+        let mut unified = payload;
+        unified[0]["kind"] = serde_json::json!("message");
+        let unified = format!("<skyhook_job_events>\n{unified}\n</skyhook_job_events>");
+        let (projection, view) = (Projection::default(), View::default());
         for expanded in [false, true] {
-            let view = View::default();
-            let legacy = job_event_entries("m42/0", &legacy, &projection, &view, expanded);
-            let unified = job_event_entries("m42/0", &unified, &projection, &view, expanded);
+            let legacy = events(&legacy, &projection, &view, expanded);
+            let unified = events(&unified, &projection, &view, expanded);
             assert!(
                 unified == legacy,
                 "envelope migration changed message presentation"
@@ -284,13 +287,11 @@ mod tests {
             "<skyhook_agent_messages>[{}]",
         ] {
             assert!(job_notification_kind(text).is_some());
-            let entries =
-                job_event_entries("m1/0", text, &Projection::default(), &View::default(), true);
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].surface, Surface::Tool);
-            assert!(entries[0].text.contains("Job event"));
-            assert!(entries[0].text.contains("details unavailable"));
-            assert!(!entries[0].text.contains("<skyhook_"));
+            let entries = events(text, &Projection::default(), &View::default(), true);
+            assert_eq!((entries.len(), entries[0].surface), (1, Surface::Tool));
+            let text = entries[0].text();
+            assert!(text.contains("Job event") && text.contains("details unavailable"));
+            assert!(!text.contains("<skyhook_"));
         }
     }
 }

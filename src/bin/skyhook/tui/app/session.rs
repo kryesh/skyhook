@@ -2,15 +2,14 @@ use super::*;
 
 impl App {
     pub fn session_id(&self) -> Option<SessionId> {
-        self.session.as_ref().map(SessionHandle::id)
+        self.session().map(SessionHandle::id)
     }
     pub fn root_agent(&self) -> &AgentId {
-        self.session
-            .as_ref()
+        self.session()
             .map_or(&self.selected, SessionHandle::root_agent)
     }
     pub(super) fn show_warnings(&mut self) {
-        if let Some(session) = &self.session {
+        if let Some(session) = self.session().cloned() {
             for warning in session.warnings() {
                 self.notice(format!("Startup warning: {warning}"));
             }
@@ -30,17 +29,16 @@ impl App {
             }
         }
     }
-    pub fn set_session(&mut self, session: Option<SessionHandle>, snapshot: ObservationSnapshot) {
+    pub(super) fn set_session(&mut self, observation: Option<PreparedObservation>) {
         self.cancel_queue_delivery();
         self.queue_sender = None;
         self.queue_activity_revision = 0;
-        self.awaiting_initial_input = false;
+        self.initial_input = None;
         self.attached_draft = None;
-        self.session = session;
-        self.snapshot = snapshot;
+        self.queue.clear();
+        self.install_observation(observation);
         self.selected = self
-            .session
-            .as_ref()
+            .session()
             .map(|s| s.root_agent().clone())
             .unwrap_or_else(draft_root);
         self.toast = None;
@@ -48,23 +46,14 @@ impl App {
         self.content_cache = model::ContentCache::default();
         self.render.reset_session();
         self.outputs.clear();
-        self.pending_outputs.clear();
-        self.final_outputs.clear();
-        self.output_versions.clear();
-        self.output_queries.clear();
         self.prompts.clear();
-        self.suspended_prompt = None;
         self.reset_prompt();
         self.prompt_active = false;
-        self.editor = Composer::default();
-        self.draft_revision = self.draft_revision.wrapping_add(1);
-        self.images.clear();
-        self.queue.clear();
-        self.switch_restore = None;
-        self.creating = false;
-        self.pending_start = None;
+        self.reset_session_draft();
+        self.switching = None;
+        self.start = StartState::Idle;
         self.deferred_switch = None;
-        self.paused = false;
+        self.paused = !self.queue.is_empty() || self.queue_scan == queue::QueueScan::Failed;
         self.operation = false;
         self.menu = None;
         self.unsaved_status.clear();
@@ -86,7 +75,7 @@ impl App {
         }
     }
     pub(super) fn set_title(&self, title: &str) {
-        let Some(session) = &self.session else {
+        let Some(session) = self.session() else {
             return;
         };
         let path = session.directory().join("ui.json");
@@ -103,11 +92,14 @@ impl App {
             });
         }
     }
+    /// Invariant: at most one creation or switch is in flight. A switch never
+    /// starts while another switch or a creation is pending (the latter defers
+    /// it), so a `SessionReady` completion is always the current one.
     pub(super) fn switch(&mut self, id: Option<SessionId>) {
-        if self.stopping || self.switch_restore.is_some() {
+        if self.stopping || self.switching.is_some() {
             return;
         }
-        if self.creating {
+        if self.start.is_creating() {
             self.deferred_switch = Some(id);
             self.paused = true;
             return;
@@ -116,15 +108,25 @@ impl App {
             self.select(self.root_agent().clone());
             return;
         }
-        self.switch_restore = Some(self.paused);
+        let was_paused = self.paused;
         self.paused = true;
         self.cancel_queue_delivery();
+        // Every saved row stays in this session's journal. The old runtime's
+        // shutdown drains a claimed dispatch before it returns, so its commit is
+        // durable, and reopening the session resolves unresolved rows.
+        let unsettled = self.queue.iter().any(|input| input.state.unsettled());
+        self.switching = Some(was_paused);
         self.notice(if id.is_some() {
             "Opening session…"
         } else {
             "New session"
         });
-        let old = self.session.clone();
+        if unsettled {
+            self.notice(
+                "Queued input awaiting acknowledgement or recovery stays saved in the previous session; reopen it to resolve",
+            );
+        }
+        let old = self.session().cloned();
         let launch = self.launch.clone();
         let tx = self.tx.clone();
         let status = self.status.clone();
@@ -146,8 +148,11 @@ impl App {
                 Ok(destination)
             }
             .await;
-            if let Err(error) = tx.send(Work::SessionReady(result))
-                && let Work::SessionReady(Ok(Some(session))) = error.0
+            if let Err(error) = tx.send(Work::SessionReady { result })
+                && let Work::SessionReady {
+                    result: Ok(Some(session)),
+                    ..
+                } = error.0
             {
                 let _ = session.shutdown().await;
             }

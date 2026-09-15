@@ -44,18 +44,25 @@ impl Fixture {
     }
 }
 
+fn write(path: &Path, contents: impl AsRef<[u8]>) {
+    std::fs::write(path, contents).unwrap();
+}
+
 #[tokio::test]
 async fn xdg_wins_without_even_reading_home_and_workspace_merges() {
     let f = Fixture::new();
-    std::fs::write(&f.xdg, format!("approve_all = true\n{MODEL}{PROVIDER}")).unwrap();
+    write(&f.xdg, format!("approve_all = true\n{MODEL}{PROVIDER}"));
     std::fs::create_dir(&f.home).unwrap(); // Would be a read error if probed.
-    std::fs::write(&f.local, "[models.main]\nmodel = 'workspace-model'\n").unwrap();
+    write(&f.local, "[models.main]\nmodel = 'workspace-model'\n");
     let resolved = f.resolve().await.unwrap();
     assert_eq!(resolved.report.sources, [f.xdg.clone(), f.local.clone()]);
     assert!(resolved.report.diagnostics.is_empty());
     assert!(resolved.config.approve_all);
-    assert_eq!(resolved.config.models["main"].model, "workspace-model");
-    assert_eq!(resolved.config.models["main"].max_output, 512);
+    let main = &resolved.config.models["main"];
+    assert_eq!(
+        (main.model.as_str(), main.max_output),
+        ("workspace-model", 512)
+    );
 }
 
 #[tokio::test]
@@ -80,22 +87,17 @@ async fn every_failed_candidate_class_falls_back_without_leaking_fields() {
     ];
     for bytes in invalid {
         let f = Fixture::new();
-        if let Some(bytes) = bytes {
-            if *bytes == b"DIRECTORY" {
-                std::fs::create_dir(&f.xdg).unwrap();
-            } else {
-                std::fs::write(&f.xdg, bytes).unwrap();
-            }
+        match bytes {
+            Some(b"DIRECTORY") => std::fs::create_dir(&f.xdg).unwrap(),
+            Some(bytes) => write(&f.xdg, bytes),
+            None => {}
         }
-        std::fs::write(&f.home, MODEL).unwrap();
+        write(&f.home, MODEL);
         let resolved = f
             .resolve()
             .await
             .unwrap_or_else(|error| panic!("{bytes:?}: {error}"));
-        assert_eq!(
-            resolved.report.sources.as_slice(),
-            std::slice::from_ref(&f.home)
-        );
+        assert_eq!(resolved.report.sources, std::slice::from_ref(&f.home));
         assert_eq!(resolved.report.diagnostics.len(), 1, "{bytes:?}");
         assert_eq!(resolved.report.diagnostics[0].path, f.xdg);
         assert!(
@@ -109,15 +111,14 @@ async fn every_failed_candidate_class_falls_back_without_leaking_fields() {
 #[tokio::test]
 async fn failed_candidates_are_reported_if_no_usable_config_exists() {
     let f = Fixture::new();
-    std::fs::write(&f.xdg, "approve_all = 'not-a-bool'").unwrap();
-    std::fs::write(&f.home, "[broken").unwrap();
+    write(&f.xdg, "approve_all = 'not-a-bool'");
+    write(&f.home, "[broken");
     let error = f.resolve().await.unwrap_err();
     assert_eq!(error.report().unwrap().diagnostics.len(), 2);
     let message = error.to_string();
     assert!(message.contains(f.xdg.to_str().unwrap()));
     assert!(message.contains(f.home.to_str().unwrap()));
-    assert!(!message.contains("approve_all ="));
-    assert!(!message.contains("[broken"));
+    assert!(!message.contains("approve_all =") && !message.contains("[broken"));
 }
 
 #[tokio::test]
@@ -125,14 +126,11 @@ async fn workspace_only_is_allowed_after_missing_or_invalid_users() {
     for invalid_user in [false, true] {
         let f = Fixture::new();
         if invalid_user {
-            std::fs::write(&f.xdg, "[bad").unwrap();
+            write(&f.xdg, "[bad");
         }
-        std::fs::write(&f.local, format!("{MODEL}{PROVIDER}")).unwrap();
+        write(&f.local, format!("{MODEL}{PROVIDER}"));
         let resolved = f.resolve().await.unwrap();
-        assert_eq!(
-            resolved.report.sources.as_slice(),
-            std::slice::from_ref(&f.local)
-        );
+        assert_eq!(resolved.report.sources, std::slice::from_ref(&f.local));
         assert_eq!(resolved.report.diagnostics.len(), 2);
         assert_eq!(resolved.config.models.len(), 1);
     }
@@ -148,15 +146,15 @@ async fn invalid_workspace_is_always_fatal_and_retains_fallback_diagnostics() {
         b"[targets.bad]\ntype = 'ssh'", // Atomic/incomplete target.
     ] {
         let f = Fixture::new();
-        std::fs::write(&f.home, MODEL).unwrap();
-        std::fs::write(&f.local, bytes).unwrap();
+        write(&f.home, MODEL);
+        write(&f.local, bytes);
         let error = f.resolve().await.unwrap_err();
         assert_eq!(error.report().unwrap().diagnostics.len(), 2);
         assert!(error.to_string().contains(f.local.to_str().unwrap()));
         assert!(error.to_string().contains(f.xdg.to_str().unwrap()));
     }
     let f = Fixture::new();
-    std::fs::write(&f.home, MODEL).unwrap();
+    write(&f.home, MODEL);
     std::fs::create_dir(&f.local).unwrap();
     assert!(f.resolve().await.is_err());
 }
@@ -164,19 +162,16 @@ async fn invalid_workspace_is_always_fatal_and_retains_fallback_diagnostics() {
 #[tokio::test]
 async fn explicit_file_is_isolated_even_from_nonexistent_workspace() {
     let f = Fixture::new();
-    std::fs::write(&f.xdg, "[broken").unwrap();
-    std::fs::write(&f.local, "[broken").unwrap();
-    std::fs::write(&f.home, MODEL).unwrap();
+    write(&f.xdg, "[broken");
+    write(&f.local, "[broken");
+    write(&f.home, MODEL);
     let resolved = Config::resolve(&f.workspace.join("does-not-exist"), Some(&f.home))
         .await
         .unwrap();
-    assert_eq!(
-        resolved.report.sources.as_slice(),
-        std::slice::from_ref(&f.home)
-    );
+    assert_eq!(resolved.report.sources, std::slice::from_ref(&f.home));
     assert!(resolved.report.diagnostics.is_empty());
     assert_eq!(resolved.config.models.len(), 1);
-    std::fs::write(&f.home, "[broken").unwrap();
+    write(&f.home, "[broken");
     let error = f.resolve().await.unwrap_err();
     assert!(error.to_string().contains(f.local.to_str().unwrap()));
     let error = Config::resolve(&f.workspace, Some(&f.home))
@@ -191,24 +186,29 @@ async fn explicit_file_is_isolated_even_from_nonexistent_workspace() {
 #[tokio::test]
 async fn named_targets_replace_whole_definition_but_other_names_survive() {
     let f = Fixture::new();
-    std::fs::write(&f.xdg, format!("{MODEL}\n[targets]\nimport_ssh_config = true\n[targets.changed]\ntype = 'ssh'\nhost = 'old'\nworkspace = '/old'\nvia = 'retained'\nssh.user = 'old-user'\nssh.port = 2222\nssh.auth = {{ kind = 'key', path = '/old-key' }}\n[targets.retained]\ntype = 'ssh'\nhost = 'other'\n")).unwrap();
-    std::fs::write(
+    write(
+        &f.xdg,
+        format!(
+            "{MODEL}\n[targets]\nimport_ssh_config = true\n[targets.changed]\ntype = 'ssh'\nhost = 'old'\nworkspace = '/old'\nvia = 'retained'\nssh.user = 'old-user'\nssh.port = 2222\nssh.auth = {{ kind = 'key', path = '/old-key' }}\n[targets.retained]\ntype = 'ssh'\nhost = 'other'\n"
+        ),
+    );
+    write(
         &f.local,
         "[targets]\nimport_ssh_config = false\n[targets.changed]\ntype = 'ssh'\nhost = 'new'\n",
-    )
-    .unwrap();
-    let resolved = f.resolve().await.unwrap();
-    let targets = resolved.config.targets;
+    );
+    let targets = f.resolve().await.unwrap().config.targets;
     assert!(!targets.import_ssh_config);
     assert!(targets.entries.contains_key("retained"));
     let changed = &targets.entries["changed"];
-    assert_eq!(changed.host, "new");
-    assert_eq!(changed.workspace, PathBuf::from("."));
-    assert_eq!(changed.via, None);
-    assert_eq!(changed.ssh.user, None);
-    assert_eq!(changed.ssh.port, None);
-    assert_eq!(changed.ssh.auth, TargetAuth::Openssh);
-    std::fs::write(&f.local, "[targets.changed]\nhost = 'incomplete'\n").unwrap();
+    assert_eq!(
+        (&*changed.host, &changed.workspace, &changed.via),
+        ("new", &PathBuf::from("."), &None)
+    );
+    assert_eq!(
+        (&changed.ssh.user, changed.ssh.port, &changed.ssh.auth),
+        (&None, None, &TargetAuth::Openssh)
+    );
+    write(&f.local, "[targets.changed]\nhost = 'incomplete'\n");
     assert!(
         f.resolve().await.is_err(),
         "target must not inherit required type"
@@ -218,21 +218,34 @@ async fn named_targets_replace_whole_definition_but_other_names_survive() {
 #[tokio::test]
 async fn arrays_replace_and_defaults_are_applied_only_after_merge() {
     let f = Fixture::new();
-    std::fs::write(&f.xdg, format!("capabilities = ['exec']\nmax_child_depth = 8\n{MODEL}\n[mcp.test]\ntransport = 'stdio'\nstart_command = ['old', 'arg']\ncapabilities = ['read']\nstartup_timeout_secs = 77\nenv = {{ A = 'a', B = 'b' }}\n")).unwrap();
-    std::fs::write(&f.local, "capabilities = []\n[mcp.test]\nstart_command = ['new']\ncapabilities = []\nenv = { B = 'changed', C = 'c' }\n").unwrap();
+    write(
+        &f.xdg,
+        format!(
+            "capabilities = ['exec']\nmax_child_depth = 8\n{MODEL}\n[mcp.test]\ntransport = 'stdio'\nstart_command = ['old', 'arg']\ncapabilities = ['read']\nstartup_timeout_secs = 77\nenv = {{ A = 'a', B = 'b' }}\n"
+        ),
+    );
+    write(
+        &f.local,
+        "capabilities = []\n[mcp.test]\nstart_command = ['new']\ncapabilities = []\nenv = { B = 'changed', C = 'c' }\n",
+    );
     let resolved = f.resolve().await.unwrap();
     assert!(resolved.config.capabilities.is_empty());
     assert_eq!(resolved.config.max_child_depth, 8);
     let server = &resolved.config.mcp["test"];
-    assert_eq!(server.start_command.as_ref().unwrap(), &["new"]);
-    assert!(server.capabilities.is_empty());
-    assert_eq!(server.startup_timeout_secs, 77);
-    assert_eq!(server.call_timeout_secs, 120);
-    assert_eq!(server.env["A"], "a");
-    assert_eq!(server.env["B"], "changed");
-    assert_eq!(server.env["C"], "c");
+    let raw = crate::mcp::RawMcpServerConfig::from(server.clone());
+    assert_eq!(raw.start_command.unwrap(), ["new"]);
+    assert!(server.capabilities().is_empty());
+    assert_eq!(
+        (
+            server.startup_timeout().as_secs(),
+            server.call_timeout().as_secs()
+        ),
+        (77, 120)
+    );
+    let env = raw.env;
+    assert_eq!((&*env["A"], &*env["B"], &*env["C"]), ("a", "changed", "c"));
     let round_trip: Config = toml::from_str(&resolved.normalized_toml).unwrap();
-    assert_eq!(round_trip.mcp["test"].startup_timeout_secs, 77);
+    assert_eq!(round_trip.mcp["test"].startup_timeout().as_secs(), 77);
     assert!(round_trip.capabilities.is_empty());
     assert!(resolved.normalized_toml.contains("call_timeout_secs = 120"));
 }
@@ -240,72 +253,66 @@ async fn arrays_replace_and_defaults_are_applied_only_after_merge() {
 #[tokio::test]
 async fn cwd_origins_follow_values_not_overridden_siblings() {
     let f = Fixture::new();
-    std::fs::write(&f.xdg, format!("session_root = 'sessions'\n{MODEL}\n[mcp.inherited]\ntransport = 'stdio'\nstart_command = ['old']\ncwd = 'user-work'\n[mcp.changed]\ntransport = 'stdio'\nstart_command = ['old']\ncwd = 'old-work'\n[targets.remote]\ntype = 'ssh'\nhost = 'host'\nworkspace = 'remote-work'\nssh.auth = {{ kind = 'key', path = 'origin-key' }}\n")).unwrap();
-    std::fs::write(
+    write(
+        &f.xdg,
+        format!(
+            "session_root = 'sessions'\n{MODEL}\n[mcp.inherited]\ntransport = 'stdio'\nstart_command = ['old']\ncwd = 'user-work'\n[mcp.changed]\ntransport = 'stdio'\nstart_command = ['old']\ncwd = 'old-work'\n[targets.remote]\ntype = 'ssh'\nhost = 'host'\nworkspace = 'remote-work'\nssh.auth = {{ kind = 'key', path = 'origin-key' }}\n"
+        ),
+    );
+    write(
         &f.local,
         "[mcp.inherited]\nstart_command = ['new']\n[mcp.changed]\ncwd = 'workspace-work'\n",
-    )
-    .unwrap();
-    let resolved = f.resolve().await.unwrap();
-    assert_eq!(
-        resolved.config.mcp["inherited"].cwd,
-        Some(f.xdg.parent().unwrap().join("user-work"))
     );
-    assert_eq!(
-        resolved.config.mcp["changed"].cwd,
-        Some(f.local.parent().unwrap().join("workspace-work"))
-    );
-    assert_eq!(
-        resolved.config.session_root,
-        Some(PathBuf::from("sessions"))
-    );
-    assert_eq!(
-        resolved.config.targets.entries["remote"].workspace,
-        PathBuf::from("remote-work")
-    );
-    assert_eq!(
-        resolved.config.targets.entries["remote"].ssh.auth,
-        TargetAuth::Key {
-            path: "origin-key".into()
-        }
-    );
+    let config = f.resolve().await.unwrap().config;
+    let user_work = f.xdg.parent().unwrap().join("user-work");
+    let workspace_work = f.local.parent().unwrap().join("workspace-work");
+    let cwd = |name: &str| crate::mcp::RawMcpServerConfig::from(config.mcp[name].clone()).cwd;
+    assert_eq!(cwd("inherited"), Some(user_work));
+    assert_eq!(cwd("changed"), Some(workspace_work));
+    assert_eq!(config.session_root, Some(PathBuf::from("sessions")));
+    let remote = &config.targets.entries["remote"];
+    assert_eq!(remote.workspace, PathBuf::from("remote-work"));
+    let origin_key = TargetAuth::Key {
+        path: "origin-key".into(),
+    };
+    assert_eq!(remote.ssh.auth, origin_key);
 }
 
 #[tokio::test]
 async fn resolution_neither_requires_secrets_nor_runs_commands_and_dump_tracks_overrides() {
     let f = Fixture::new();
     let marker = f.workspace.join("command-ran");
-    std::fs::write(&f.xdg, format!("{MODEL}{PROVIDER}\napi_key_env = 'SKYHOOK_NONEXISTENT_TEST_RESOLUTION_KEY'\n[providers.command]\nkind = 'anthropic'\nbase_url = 'https://example.com'\napi_key_command = 'touch {}'\n[providers.subscription]\nkind = 'codex'\n", marker.display())).unwrap();
+    write(
+        &f.xdg,
+        format!(
+            "{MODEL}{PROVIDER}\napi_key_env = 'SKYHOOK_NONEXISTENT_TEST_RESOLUTION_KEY'\n[providers.command]\nkind = 'anthropic'\nbase_url = 'https://example.com'\napi_key_command = 'touch {}'\n[providers.subscription]\nkind = 'codex'\n",
+            marker.display()
+        ),
+    );
     let mut resolved = f.resolve().await.unwrap();
-    assert!(!marker.exists());
     assert!(resolved.report.diagnostics.is_empty());
     assert!(resolved.normalized_toml.contains("api_key_env"));
     resolved.config.approve_all = true;
     resolved.config.capabilities.clear();
-    let updated = resolved.config.to_toml().unwrap();
-    let config: Config = toml::from_str(&updated).unwrap();
+    let config: Config = toml::from_str(&resolved.config.to_toml().unwrap()).unwrap();
     assert!(config.approve_all);
     assert!(config.capabilities.is_empty());
     assert!(!marker.exists());
 }
 
 #[tokio::test]
-async fn duplicate_candidates_attempted_once() {
+async fn candidate_list_edge_cases() {
     let f = Fixture::new();
-    std::fs::write(&f.local, MODEL).unwrap();
+    // No roots or files is missing config, but a workspace needs no roots.
+    assert!(resolve_paths(&f.workspace, None, vec![]).await.is_err());
+    write(&f.local, MODEL);
+    let config = resolve_paths(&f.workspace, None, vec![]).await.unwrap();
+    assert!(config.report.diagnostics.is_empty());
+    // Duplicate candidates are attempted once.
     let resolved = resolve_paths(&f.workspace, None, vec![f.xdg.clone(), f.xdg.clone()])
         .await
         .unwrap();
     assert_eq!(resolved.report.diagnostics.len(), 1);
-}
-
-#[tokio::test]
-async fn no_roots_or_files_returns_missing_but_workspace_needs_no_roots() {
-    let f = Fixture::new();
-    assert!(resolve_paths(&f.workspace, None, vec![]).await.is_err());
-    std::fs::write(&f.local, MODEL).unwrap();
-    let config = resolve_paths(&f.workspace, None, vec![]).await.unwrap();
-    assert!(config.report.diagnostics.is_empty());
 }
 
 fn target(name: &str, via: Option<&str>) -> String {
@@ -315,67 +322,60 @@ fn target(name: &str, via: Option<&str>) -> String {
     format!("[targets.{name}]\ntype = 'ssh'\nhost = '{name}'\n{via}")
 }
 
+const CYCLE: &str = "target route contains a cycle";
+
 #[tokio::test]
 async fn cyclic_xdg_targets_fall_back_without_leaking_fields() {
     let f = Fixture::new();
-    std::fs::write(
+    write(
         &f.xdg,
         format!(
             "approve_all = true\n{}{}",
             target("a", Some("b")),
             target("b", Some("a"))
         ),
-    )
-    .unwrap();
-    std::fs::write(&f.home, target("home", None)).unwrap();
+    );
+    write(&f.home, target("home", None));
     let resolved = f.resolve().await.unwrap();
     assert_eq!(resolved.report.sources, [f.home]);
     assert_eq!(resolved.report.diagnostics.len(), 1);
     assert_eq!(resolved.report.diagnostics[0].path, f.xdg);
-    assert!(
-        resolved.report.diagnostics[0]
-            .message
-            .contains("target route contains a cycle")
-    );
+    assert!(resolved.report.diagnostics[0].message.contains(CYCLE));
     assert!(!resolved.config.approve_all);
-    assert_eq!(
-        resolved.config.targets.entries.keys().collect::<Vec<_>>(),
-        ["home"]
-    );
+    let names: Vec<_> = resolved.config.targets.entries.keys().collect();
+    assert_eq!(names, ["home"]);
 }
 
 #[tokio::test]
-async fn explicit_target_cycles_including_self_cycles_are_rejected() {
+async fn explicit_and_merged_target_cycles_are_rejected() {
+    // Explicit files, including self cycles, report only the explicit file.
     for config in [
         target("a", Some("a")),
         format!("{}{}", target("a", Some("b")), target("b", Some("a"))),
     ] {
         let f = Fixture::new();
-        std::fs::write(&f.xdg, config).unwrap();
-        std::fs::write(&f.home, MODEL).unwrap();
+        write(&f.xdg, config);
+        write(&f.home, MODEL);
         let error = Config::resolve(&f.workspace, Some(&f.xdg))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("target route contains a cycle"));
+        assert!(error.to_string().contains(CYCLE));
         let report = error.report().unwrap();
         assert!(report.sources.is_empty());
         assert_eq!(report.diagnostics.len(), 1);
         assert_eq!(report.diagnostics[0].path, f.xdg);
     }
-}
-
-#[tokio::test]
-async fn merged_target_cycles_are_fatal_including_replaced_definitions() {
+    // Merged cycles are fatal, including when a workspace replaces a definition.
     for user in [
-        target("a", Some("b")), // Workspace completes an unresolved route.
+        target("a", Some("b")),
         format!("{}{}", target("a", Some("b")), target("b", None)),
     ] {
         let f = Fixture::new();
-        std::fs::write(&f.xdg, user).unwrap();
-        std::fs::write(&f.local, target("b", Some("a"))).unwrap();
+        write(&f.xdg, user);
+        write(&f.local, target("b", Some("a")));
         let error = f.resolve().await.unwrap_err();
         assert!(error.to_string().contains("effective configuration failed"));
-        assert!(error.to_string().contains("target route contains a cycle"));
+        assert!(error.to_string().contains(CYCLE));
         let report = error.report().unwrap();
         assert_eq!(report.sources, [f.xdg, f.local.clone()]);
         assert_eq!(report.diagnostics.len(), 1);
@@ -389,46 +389,33 @@ async fn acyclic_targets_and_unresolved_references_are_valid_config() {
 
     for import in [false, true] {
         let f = Fixture::new();
-        std::fs::write(
+        write(
             &f.xdg,
             format!(
                 "[targets]\nimport_ssh_config = {import}\n{}",
                 target("a", Some("b"))
             ),
-        )
-        .unwrap();
-        // The candidate and final config must allow a name supplied later by
-        // workspace configuration, imported SSH aliases, or runtime resolution.
-        let partial = f.resolve().await.unwrap();
-        assert_eq!(
-            partial.report.sources.as_slice(),
-            std::slice::from_ref(&f.xdg)
         );
+        // Names may be supplied later by workspace config, SSH imports or runtime.
+        let partial = f.resolve().await.unwrap();
+        assert_eq!(partial.report.sources, std::slice::from_ref(&f.xdg));
         assert!(partial.report.diagnostics.is_empty());
         assert!(matches!(
             TargetRegistry::from_definitions(partial.config.targets.definitions().unwrap()),
             Err(TargetError::UnknownJump(name)) if name == "b"
         ));
-        std::fs::write(
+        write(
             &f.local,
             format!("{}{}", target("b", Some("c")), target("c", None)),
-        )
-        .unwrap();
+        );
         let resolved = f.resolve().await.unwrap();
         assert!(resolved.report.diagnostics.is_empty());
         let registry =
             TargetRegistry::from_definitions(resolved.config.targets.definitions().unwrap())
                 .unwrap();
-        assert_eq!(
-            registry
-                .route("a")
-                .await
-                .unwrap()
-                .iter()
-                .map(|target| target.name.as_str())
-                .collect::<Vec<_>>(),
-            ["c", "b", "a"]
-        );
+        let route = registry.route("a").await.unwrap();
+        let names: Vec<_> = route.iter().map(|target| target.name.as_str()).collect();
+        assert_eq!(names, ["c", "b", "a"]);
     }
 }
 
@@ -440,9 +427,9 @@ async fn root_is_implicit_and_local_named_targets_remain_invalid() {
         target("a", Some("root")),
         "[targets.a]\ntype = 'local'\nhost = 'localhost'\n".to_owned(),
     ] {
-        std::fs::write(&f.xdg, config).unwrap();
+        write(&f.xdg, config);
         assert!(Config::resolve(&f.workspace, Some(&f.xdg)).await.is_err());
     }
-    std::fs::write(&f.xdg, target("a", None)).unwrap();
+    write(&f.xdg, target("a", None));
     assert!(Config::resolve(&f.workspace, Some(&f.xdg)).await.is_ok());
 }

@@ -9,6 +9,16 @@ use tokio::fs;
 
 use super::{Config, ConfigError};
 
+#[derive(Debug, thiserror::Error)]
+enum LayerError {
+    #[error("file not found")]
+    Missing,
+    #[error("could not read configuration: {0}")]
+    Read(std::io::Error),
+    #[error("{0}")]
+    Invalid(String),
+}
+
 /// A rejected candidate or fatal layer error. Never includes TOML source excerpts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigDiagnostic {
@@ -64,8 +74,12 @@ async fn resolve_paths(
 ) -> Result<ResolvedConfig, ConfigError> {
     let mut report = ConfigReport::default();
     if let Some(path) = explicit {
-        let value = read_layer(path).await.map_err(|diagnostic| {
-            failure(&mut report, "explicit configuration failed", diagnostic)
+        let value = read_layer(path).await.map_err(|error| {
+            failure(
+                &mut report,
+                "explicit configuration failed",
+                diagnostic(path, error.to_string()),
+            )
         })?;
         let config = deserialize(&value).map_err(|message| {
             failure(
@@ -92,7 +106,7 @@ async fn resolve_paths(
             Ok(value) => deserialize(&value)
                 .map(|_| value)
                 .map_err(|message| diagnostic(&path, message)),
-            Err(error) => Err(error),
+            Err(error) => Err(diagnostic(&path, error.to_string())),
         };
         match loaded {
             Ok(value) => {
@@ -119,12 +133,12 @@ async fn resolve_paths(
             merge(&mut merged, value, &mut Vec::new());
             report.sources.push(workspace_path.clone());
         }
-        Err(error) if error.message == "file not found" => {}
+        Err(LayerError::Missing) => {}
         Err(error) => {
             return Err(failure(
                 &mut report,
                 "workspace configuration failed",
-                error,
+                diagnostic(&workspace_path, error.to_string()),
             ));
         }
     }
@@ -186,15 +200,13 @@ fn deserialize(value: &toml::Value) -> Result<Config, String> {
     Ok(config)
 }
 
-async fn read_layer(path: &Path) -> Result<toml::Value, ConfigDiagnostic> {
-    let text = fs::read_to_string(path).await.map_err(|error| {
-        let message = if error.kind() == std::io::ErrorKind::NotFound {
-            "file not found".to_owned()
-        } else {
-            format!("could not read configuration: {error}")
-        };
-        diagnostic(path, message)
-    })?;
+async fn read_layer(path: &Path) -> Result<toml::Value, LayerError> {
+    let text = fs::read_to_string(path)
+        .await
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => LayerError::Missing,
+            _ => LayerError::Read(error),
+        })?;
     let mut value: toml::Value = toml::from_str(&text).map_err(|error: toml::de::Error| {
         let location = error
             .span()
@@ -207,7 +219,7 @@ async fn read_layer(path: &Path) -> Result<toml::Value, ConfigDiagnostic> {
                 format!(" at line {line}")
             })
             .unwrap_or_default();
-        diagnostic(path, format!("invalid TOML{location}: {}", error.message()))
+        LayerError::Invalid(format!("invalid TOML{location}: {}", error.message()))
     })?;
     // Convert only source-file-relative values before merging. Thus an inherited
     // cwd retains its own layer's directory even if sibling fields are overridden.
@@ -215,7 +227,7 @@ async fn read_layer(path: &Path) -> Result<toml::Value, ConfigDiagnostic> {
     // target workspace and SSH key paths belong to another host, not this file.
     if let Some(servers) = value.get_mut("mcp").and_then(toml::Value::as_table_mut) {
         let absolute =
-            std::path::absolute(path).map_err(|error| diagnostic(path, error.to_string()))?;
+            std::path::absolute(path).map_err(|error| LayerError::Invalid(error.to_string()))?;
         let directory = absolute
             .parent()
             .expect("absolute config path has a parent");
@@ -228,7 +240,9 @@ async fn read_layer(path: &Path) -> Result<toml::Value, ConfigDiagnostic> {
                     directory
                         .join(relative)
                         .to_str()
-                        .ok_or_else(|| diagnostic(path, "MCP cwd cannot be represented as UTF-8"))?
+                        .ok_or_else(|| {
+                            LayerError::Invalid("MCP cwd cannot be represented as UTF-8".into())
+                        })?
                         .to_owned(),
                 );
             }

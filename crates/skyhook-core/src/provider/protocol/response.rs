@@ -236,7 +236,7 @@ impl ResponseAssembler {
                                 .content
                                 .as_ref()
                                 .and_then(BlockContent::tool_call_ref)
-                                .is_some_and(|previous| previous.id == call.id)
+                                .is_some_and(|previous| previous.id() == call.id())
                         })
                 {
                     return Err(ProviderError::protocol("duplicate tool call ID"));
@@ -249,19 +249,8 @@ impl ResponseAssembler {
                 }
                 let text = match content {
                     BlockContent::Text { text } | BlockContent::Reasoning { text } => text.clone(),
-                    BlockContent::ToolCall(call) => {
-                        if call.id.trim().is_empty() || call.name.trim().is_empty() {
-                            return Err(ProviderError::protocol(
-                                "tool call ID and name must be nonempty",
-                            ));
-                        }
-                        if !call.arguments.is_object() {
-                            return Err(ProviderError::protocol(
-                                "tool call arguments must be an object",
-                            ));
-                        }
-                        call.arguments.to_string()
-                    }
+                    BlockContent::ToolCall(call) => serde_json::to_string(call.arguments())
+                        .expect("JSON object serialization cannot fail"),
                 };
                 pending.text = text;
                 pending.content = Some(content.clone());
@@ -359,6 +348,7 @@ impl ResponseAssembler {
         Ok(())
     }
 
+    /// Complete the response into validated conversation items.
     pub fn finish(self) -> Result<(Vec<AssistantItem>, Usage, StopReason), ProviderError> {
         self.validate_closed()?;
         let stop_reason = self
@@ -423,83 +413,9 @@ pub fn events_for_content(items: &[AssistantItem]) -> Vec<ResponseEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ToolCall;
+    use super::super::{ToolCall, replay};
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn discarded_partial_tools_cannot_reappear_or_execute() {
-        let mut assembler = ResponseAssembler::default();
-        assembler
-            .push(&start("tool", 0, ItemKind::ToolCall))
-            .unwrap();
-        assembler
-            .push(&ResponseEvent::BlockStarted {
-                item: "tool".into(),
-                id: "args".into(),
-                position: 0,
-                kind: BlockKind::ToolCallArguments,
-            })
-            .unwrap();
-        assembler
-            .push(&ResponseEvent::BlockDelta {
-                item: "tool".into(),
-                block: "args".into(),
-                delta: ContentDelta::JsonFragment("{\"incomplete\":".into()),
-            })
-            .unwrap();
-        assembler
-            .push(&ResponseEvent::ItemDiscarded { id: "tool".into() })
-            .unwrap();
-        assert!(
-            assembler
-                .push(&start("tool", 0, ItemKind::ToolCall))
-                .is_err()
-        );
-        assembler
-            .push(&ResponseEvent::ResponseEnded {
-                stop_reason: StopReason::Aborted,
-            })
-            .unwrap();
-        let (items, _, reason) = assembler.finish().unwrap();
-        assert!(items.is_empty());
-        assert_eq!(reason, StopReason::Aborted);
-    }
-
-    #[test]
-    fn replay_enrichment_requires_completed_item_and_preserves_content() {
-        let mut assembler = ResponseAssembler::default();
-        let replay = ReplayEnvelope {
-            version: 1,
-            protocol: "responses".into(),
-            model: "m".into(),
-            scope: "s".into(),
-            payload: json!({"encrypted_content":"cipher"}),
-        };
-        assembler
-            .push(&start("reason", 0, ItemKind::Reasoning))
-            .unwrap();
-        let update = ResponseEvent::ItemReplayUpdated {
-            id: "reason".into(),
-            replay: replay.clone(),
-        };
-        assert!(assembler.push(&update).is_err());
-        assembler
-            .push(&ResponseEvent::ItemEnded {
-                id: "reason".into(),
-                replay: None,
-            })
-            .unwrap();
-        assembler.push(&update).unwrap();
-        assembler
-            .push(&ResponseEvent::ResponseEnded {
-                stop_reason: StopReason::EndTurn,
-            })
-            .unwrap();
-        assert!(assembler.push(&update).is_err());
-        let (items, _, _) = assembler.finish().unwrap();
-        assert_eq!(items[0].replay, Some(replay));
-    }
 
     fn start(id: &str, position: usize, kind: ItemKind) -> ResponseEvent {
         ResponseEvent::ItemStarted {
@@ -541,20 +457,73 @@ mod tests {
         }
     }
 
+    fn end_with(stop_reason: StopReason) -> ResponseEvent {
+        ResponseEvent::ResponseEnded { stop_reason }
+    }
+
     fn end() -> ResponseEvent {
-        ResponseEvent::ResponseEnded {
-            stop_reason: StopReason::EndTurn,
-        }
+        end_with(StopReason::EndTurn)
+    }
+
+    fn discard(id: &str) -> ResponseEvent {
+        ResponseEvent::ItemDiscarded { id: id.into() }
     }
 
     fn text(text: &str) -> BlockContent {
         BlockContent::Text { text: text.into() }
     }
 
+    fn assembled(events: impl IntoIterator<Item = ResponseEvent>) -> ResponseAssembler {
+        let mut assembler = ResponseAssembler::default();
+        for event in events {
+            assembler.push(&event).unwrap();
+        }
+        assembler
+    }
+
+    #[test]
+    fn discarded_partial_tools_cannot_reappear_or_execute() {
+        let mut assembler = assembled([
+            start("tool", 0, ItemKind::ToolCall),
+            block("tool", "args", 0, BlockKind::ToolCallArguments),
+            delta(
+                "tool",
+                "args",
+                ContentDelta::JsonFragment("{\"incomplete\":".into()),
+            ),
+            discard("tool"),
+        ]);
+        assert!(
+            assembler
+                .push(&start("tool", 0, ItemKind::ToolCall))
+                .is_err()
+        );
+        assembler.push(&end_with(StopReason::Aborted)).unwrap();
+        let (items, _, reason) = assembler.finish().unwrap();
+        assert!(items.is_empty());
+        assert_eq!(reason, StopReason::Aborted);
+    }
+
+    #[test]
+    fn replay_enrichment_requires_completed_item_and_preserves_content() {
+        let replay = replay();
+        let update = ResponseEvent::ItemReplayUpdated {
+            id: "reason".into(),
+            replay: replay.clone(),
+        };
+        let mut assembler = assembled([start("reason", 0, ItemKind::Reasoning)]);
+        assert!(assembler.push(&update).is_err());
+        for event in [end_item("reason"), update.clone(), end()] {
+            assembler.push(&event).unwrap();
+        }
+        assert!(assembler.push(&update).is_err());
+        let (items, _, _) = assembler.finish().unwrap();
+        assert_eq!(items[0].replay, Some(replay));
+    }
+
     #[test]
     fn interleaving_orders_items_and_blocks_by_position_not_arrival() {
-        let mut assembler = ResponseAssembler::default();
-        for event in [
+        let assembler = assembled([
             start("later", 7, ItemKind::Text),
             start("earlier", 2, ItemKind::Text),
             block("later", "b", 8, BlockKind::Text),
@@ -567,63 +536,48 @@ mod tests {
             end_block("later", "b", text("B")),
             end_item("later"),
             end(),
-        ] {
-            assembler.push(&event).unwrap();
-        }
+        ]);
         let (items, _, _) = assembler.finish().unwrap();
-        assert_eq!(
-            items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
-            ["earlier", "later"]
-        );
-        assert_eq!(
-            items[1]
-                .blocks
-                .iter()
-                .map(|b| b.id.as_str())
-                .collect::<Vec<_>>(),
-            ["a", "b"]
-        );
+        let ids: Vec<_> = items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["earlier", "later"]);
+        let blocks: Vec<_> = items[1]
+            .blocks
+            .iter()
+            .map(|block| block.id.as_str())
+            .collect();
+        assert_eq!(blocks, ["a", "b"]);
         assert_eq!(items[1].text_content().as_deref(), Some("AB"));
     }
 
     #[test]
     fn final_only_and_authoritative_replacement_with_usage_snapshots() {
-        let mut assembler = ResponseAssembler::default();
-        assembler.push(&start("i", 0, ItemKind::Text)).unwrap();
-        assembler
-            .push(&block("i", "b", 0, BlockKind::Text))
-            .unwrap();
-        assembler
-            .push(&delta("i", "b", ContentDelta::Text("draft".into())))
-            .unwrap();
+        let mut assembler = assembled([
+            start("i", 0, ItemKind::Text),
+            block("i", "b", 0, BlockKind::Text),
+            delta("i", "b", ContentDelta::Text("draft".into())),
+        ]);
         let partial = assembler.snapshot();
-        assert_eq!(partial.items[0].blocks[0].text, "draft");
-        assert_eq!(partial.items[0].blocks[0].content, None);
-        assert!(!partial.items[0].blocks[0].ended);
+        let draft = &partial.items[0].blocks[0];
+        assert_eq!(
+            (draft.text.as_str(), &draft.content, draft.ended),
+            ("draft", &None, false)
+        );
         assembler.push(&end_block("i", "b", text(""))).unwrap();
         assert_eq!(assembler.snapshot().items[0].blocks[0].text, "");
         assert_eq!(partial.items[0].blocks[0].text, "draft");
         assembler.push(&end_item("i")).unwrap();
-        let call = ToolCall {
-            id: "call".into(),
-            name: "run".into(),
-            arguments: json!({"a": 1}),
-        };
+        let call = ToolCall::new("call", "run", json!({"a": 1})).unwrap();
         let tool = AssistantItem::tool_call("tool", 1, call.clone());
         for event in events_for_content(std::slice::from_ref(&tool)) {
             assembler.push(&event).unwrap();
         }
         assert_eq!(tool.tool_call_ref(), Some(&call));
-        let first = Usage {
-            input_tokens: 100,
-            cached_input_tokens: 50,
-            output_tokens: 3,
+        let usage = |input_tokens, cached_input_tokens, output_tokens| Usage {
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
         };
-        let last = Usage {
-            input_tokens: 10,
-            cached_input_tokens: 5,
-            output_tokens: 6,
-        };
+        let (first, last) = (usage(100, 50, 3), usage(10, 5, 6));
         assembler
             .push(&ResponseEvent::UsageUpdated { usage: first })
             .unwrap();
@@ -631,39 +585,136 @@ mod tests {
         assembler
             .push(&ResponseEvent::UsageUpdated { usage: last })
             .unwrap();
-        assert_eq!(snapshot.usage, first);
-        assert_eq!(assembler.snapshot().usage, last);
+        assert_eq!((snapshot.usage, assembler.snapshot().usage), (first, last));
         assert_eq!(assembler.snapshot().stop_reason, None);
-        assembler
-            .push(&ResponseEvent::ResponseEnded {
-                stop_reason: StopReason::MaxTokens,
-            })
-            .unwrap();
+        assembler.push(&end_with(StopReason::MaxTokens)).unwrap();
         assert!(assembler.truncated());
         assert_eq!(
             assembler.snapshot().stop_reason,
             Some(StopReason::MaxTokens)
         );
         let (items, usage, reason) = assembler.finish().unwrap();
-        assert_eq!(items[0].blocks[0].content, text(""));
-        assert_eq!(items[1], tool);
-        assert_eq!(usage, last);
-        assert_eq!(reason, StopReason::MaxTokens);
+        assert_eq!((&items[0].blocks[0].content, &items[1]), (&text(""), &tool));
+        assert_eq!((usage, reason), (last, StopReason::MaxTokens));
+    }
+
+    // A literal DTO fixture pins the observation/journal snapshot shape
+    // independently of the private live representation.
+    #[test]
+    fn rejected_transitions_preserve_live_state_and_snapshot() {
+        let replay_update = ResponseEvent::ItemReplayUpdated {
+            id: "i".into(),
+            replay: replay(),
+        };
+        let open = || {
+            vec![
+                start("i", 0, ItemKind::Text),
+                block("i", "b", 0, BlockKind::Text),
+            ]
+        };
+        let with = |event| {
+            let mut events = open();
+            events.push(event);
+            events
+        };
+        let phases = [
+            vec![],
+            vec![start("i", 0, ItemKind::Text)],
+            open(),
+            with(delta("i", "b", ContentDelta::Text("draft".into()))),
+            with(end_block("i", "b", text("final"))),
+            events_for_content(&[AssistantItem::text("i", 0, "final")]),
+            vec![start("i", 0, ItemKind::Text), discard("i")],
+            vec![end()],
+        ];
+        let candidates = [
+            start("", 1, ItemKind::Text),
+            start("i", 0, ItemKind::Text),
+            start("other", 0, ItemKind::Text),
+            block("missing", "b", 0, BlockKind::Text),
+            block("i", "", 1, BlockKind::Text),
+            block("i", "b", 1, BlockKind::Text),
+            block("i", "other", 0, BlockKind::Text),
+            block("i", "reason", 1, BlockKind::Reasoning),
+            delta("i", "missing", ContentDelta::Text("bad".into())),
+            delta("i", "b", ContentDelta::Text("next".into())),
+            delta("i", "b", ContentDelta::JsonFragment("{}".into())),
+            end_block("i", "b", BlockContent::Reasoning { text: "bad".into() }),
+            end_block("i", "b", text("next")),
+            end_item("i"),
+            end_item("missing"),
+            replay_update,
+            discard("missing"),
+            end(),
+        ];
+        let mut rejections = 0;
+        for events in phases {
+            let original = assembled(events);
+            for event in &candidates {
+                let mut assembler = original.clone();
+                if assembler.push(event).is_err() {
+                    rejections += 1;
+                    assert_eq!(assembler.snapshot(), original.snapshot(), "{event:?}");
+                    // Includes the discarded-ID tombstones and private live phases.
+                    assert_eq!(
+                        format!("{assembler:?}"),
+                        format!("{original:?}"),
+                        "{event:?}"
+                    );
+                }
+            }
+        }
+        assert!(rejections > 100);
+    }
+
+    #[test]
+    fn duplicate_tool_ids_and_tool_item_cardinality_are_rejected_atomically() {
+        let mut assembler = ResponseAssembler::default();
+        let call = ToolCall::new("same", "tool", json!({})).unwrap();
+        let items = vec![
+            AssistantItem::tool_call("first", 0, call.clone()),
+            AssistantItem::tool_call("second", 1, call),
+        ];
+        let error = events_for_content(&items)
+            .iter()
+            .try_for_each(|event| assembler.push(event))
+            .unwrap_err();
+        assert_eq!(error.message, "duplicate tool call ID");
+        let call = |id| BlockContent::ToolCall(ToolCall::new(id, "run", json!({})).unwrap());
+        let mut assembler = assembled([
+            start("i", 0, ItemKind::ToolCall),
+            block("i", "a", 0, BlockKind::ToolCallArguments),
+            block("i", "b", 1, BlockKind::ToolCallArguments),
+            end_block("i", "a", call("call")),
+        ]);
+        let before = assembler.snapshot();
+        for rejected in [end_item("i"), end_block("i", "b", call("call"))] {
+            assert!(assembler.push(&rejected).is_err());
+            assert_eq!(assembler.snapshot(), before);
+        }
+        assembler.push(&end_block("i", "b", call("other"))).unwrap();
+        let before = assembler.snapshot();
+        let error = assembler.push(&end_item("i")).unwrap_err();
+        assert_eq!(
+            error.message,
+            "tool call item must have exactly one arguments block"
+        );
+        assert_eq!(assembler.snapshot(), before);
+        assembler.push(&discard("i")).unwrap();
+        assert!(assembler.snapshot().items.is_empty());
+        assembler.push(&end()).unwrap();
+        assert!(assembler.finish().unwrap().0.is_empty());
     }
 
     #[test]
     fn finish_requires_response_end_and_complete_items() {
-        assert!(ResponseAssembler::default().finish().is_err());
-        let mut assembler = ResponseAssembler::default();
-        assembler.push(&start("i", 0, ItemKind::Reasoning)).unwrap();
-        assert!(assembler.finish().is_err());
-        let mut assembler = ResponseAssembler::default();
-        for event in events_for_content(&[AssistantItem::text("i", 0, "done")]) {
-            assembler.push(&event).unwrap();
+        for events in [
+            vec![],
+            vec![start("i", 0, ItemKind::Reasoning)],
+            events_for_content(&[AssistantItem::text("i", 0, "done")]),
+        ] {
+            assert!(assembled(events).finish().is_err());
         }
-        assert!(assembler.finish().is_err());
-        let mut assembler = ResponseAssembler::default();
-        assembler.push(&end()).unwrap();
-        assert!(assembler.finish().unwrap().0.is_empty());
+        assert!(assembled([end()]).finish().unwrap().0.is_empty());
     }
 }

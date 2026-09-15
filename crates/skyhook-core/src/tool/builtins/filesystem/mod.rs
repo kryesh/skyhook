@@ -3,8 +3,6 @@
 mod mutations;
 mod read;
 
-pub(super) use read::detect_image;
-
 use crate::{
     session::SessionStore,
     tool::{RegistryError, ToolRegistryBuilder},
@@ -20,114 +18,72 @@ pub(super) fn register(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
-    use crate::tool::{
-        executor::ToolExecutor,
-        policy::{AuthorizationRequest, Capability, Policy, PolicyDecision, PolicyFuture},
+    use crate::{
+        tests::RecordingPolicy,
+        tool::{
+            executor::ToolExecutor,
+            policy::{Capability, ResourceId},
+        },
     };
-    use tokio::sync::Mutex;
-
-    #[derive(Default)]
-    struct RecordingPolicy {
-        requests: Mutex<Vec<AuthorizationRequest>>,
-    }
-
-    impl Policy for RecordingPolicy {
-        fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
-            Box::pin(async move {
-                self.requests.lock().await.push(request);
-                PolicyDecision::allow()
-            })
-        }
-    }
+    use serde_json::json;
 
     #[tokio::test]
     async fn absolute_and_child_workspace_paths_are_authorized_against_the_root() {
         let runtime = crate::tests::TestRuntime::new().await;
-        let workspace = runtime.root.path().join("workspace");
-        let child_workspace = runtime.root.path().join("child");
-        std::fs::create_dir_all(&workspace).unwrap();
+        let (root, agent) = (runtime.root.path(), &runtime.agent);
+        let child_workspace = root.join("child");
+        std::fs::create_dir_all(root.join("workspace")).unwrap();
         std::fs::create_dir_all(&child_workspace).unwrap();
         std::fs::write(child_workspace.join("input.txt"), "child").unwrap();
-        let outside = runtime.root.path().join("outside.txt");
-        std::fs::write(&outside, "outside").unwrap();
+        std::fs::write(root.join("outside.txt"), "outside").unwrap();
         let mut builder = ToolRegistryBuilder::default();
         register(&mut builder, runtime.store.clone()).unwrap();
-        let policy = Arc::new(RecordingPolicy::default());
-        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let policy = RecordingPolicy::allowing();
+        let workspace = std::fs::canonicalize(root.join("workspace")).unwrap();
         let executor = ToolExecutor::new(
             builder.build(),
             policy.clone(),
-            runtime.jobs,
-            workspace.clone(),
+            runtime.jobs.clone(),
+            workspace,
         );
+        let last_permission =
+            || policy.requests.lock().unwrap().last().unwrap().permissions[0].clone();
 
+        let outside = std::fs::canonicalize(root.join("outside.txt")).unwrap();
         let read = executor
-            .execute(
-                runtime.agent.clone(),
-                "read",
-                serde_json::json!({"path": outside}),
-                None,
-            )
-            .await
-            .unwrap();
-        let outside = std::fs::canonicalize(runtime.root.path().join("outside.txt")).unwrap();
+            .run_host(agent, "read", json!({"path": root.join("outside.txt")}))
+            .await;
         assert_eq!(
-            read.output.value["path"],
+            read.unwrap().output.value["path"],
             outside.to_string_lossy().as_ref()
         );
-        let requests = policy.requests.lock().await;
-        let permission = &requests.last().unwrap().permissions[0];
+        let permission = last_permission();
         assert_eq!(permission.capability, Capability::Read);
-        assert_eq!(
-            permission.resource,
-            crate::tool::policy::ResourceId::path("root", &outside)
-        );
-        drop(requests);
+        assert_eq!(permission.resource, ResourceId::path("root", &outside));
 
-        let destination = runtime.root.path().join("new-outside.txt");
-        executor
-            .execute(
-                runtime.agent.clone(),
-                "write",
-                serde_json::json!({"path": destination, "content": "new"}),
-                None,
-            )
-            .await
-            .unwrap();
-        let requests = policy.requests.lock().await;
-        let permission = &requests.last().unwrap().permissions[0];
+        let destination = root.join("new-outside.txt");
+        let write = json!({"path": destination, "content": "new"});
+        executor.run_host(agent, "write", write).await.unwrap();
+        let permission = last_permission();
         assert_eq!(permission.capability, Capability::Write);
-        assert_eq!(permission.resource.namespace, "path");
-        drop(requests);
+        assert!(matches!(permission.resource, ResourceId::Path { .. }));
 
         let child_workspace = std::fs::canonicalize(child_workspace).unwrap();
-        let child_executor =
-            executor
-                .clone()
-                .with_location(crate::execution::ExecutionLocation::root(
-                    child_workspace.clone(),
-                ));
+        let location = crate::execution::ExecutionLocation::root(child_workspace.clone());
+        let child_executor = executor.clone().with_location(location);
         let read = child_executor
-            .execute(
-                runtime.agent,
-                "read",
-                serde_json::json!({"path": "input.txt"}),
-                None,
-            )
+            .run_host(agent, "read", json!({"path": "input.txt"}))
             .await
             .unwrap();
         assert_eq!(read.output.value["path"], "input.txt");
-        let requests = policy.requests.lock().await;
-        assert!(requests.last().unwrap().permissions.iter().any(
-            |permission| permission.capability == Capability::Read
-                && permission.resource
-                    == crate::tool::policy::ResourceId::path(
-                        "root",
-                        &child_workspace.join("input.txt"),
-                    )
-        ));
+        let expected = ResourceId::path("root", &child_workspace.join("input.txt"));
+        let requests = policy.requests.lock().unwrap();
+        let permissions = &requests.last().unwrap().permissions;
+        assert!(
+            permissions
+                .iter()
+                .any(|p| p.capability == Capability::Read && p.resource == expected)
+        );
     }
 }

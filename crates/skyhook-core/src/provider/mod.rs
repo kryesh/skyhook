@@ -8,8 +8,10 @@ pub mod backends;
 pub mod profile;
 pub mod protocol;
 
+/// An owned, movable response; consuming or dropping it releases invocation state.
 pub type ResponseStream =
     futures_util::stream::BoxStream<'static, Result<ResponseChunk, ProviderError>>;
+/// Owned startup work. Its successful response stream owns the remaining invocation.
 pub type ProviderFuture =
     Pin<Box<dyn Future<Output = Result<ResponseStream, ProviderError>> + Send>>;
 
@@ -20,17 +22,26 @@ pub trait Provider: Send + Sync {
     fn open_context(&self, correlation: String) -> Result<Box<dyn ProviderContext>, ProviderError>;
 }
 
-/// A single conversation's provider state. The owner consumes or drops each response
-/// before invoking again, and releases the context when the conversation ends.
+/// A single conversation's provider state. Startup futures and response streams are
+/// owned and movable, not exclusive borrows of this context, and may outlive reset.
+/// This API does not statically prohibit overlapping invocations or guarantee FIFO
+/// execution of separately polled futures. Callers requiring conversation order
+/// consume or drop each response before awaiting the next startup. Stateful Codex
+/// contexts serialize the same session through the response stream's owned guard;
+/// awaiting a later startup while retaining an unconsumed earlier stream can wait
+/// indefinitely. Stateless contexts need not serialize independent invocations.
 pub trait ProviderContext: Send {
     /// Streams reasoning independently of the final answer. When `response_schema`
     /// is supplied, transmit it as a structured-output constraint or return
     /// `InvalidRequest`; do not silently ignore it or replace it with a prompt.
     fn invoke(&mut self, request: ModelRequest) -> ProviderFuture;
 
-    /// Retire connection/continuation state before a runtime-owned retry. The
-    /// previous invocation and stream must have been dropped. Stateless providers
-    /// need no reset; stateful providers must replay the next request in full.
+    /// Retire connection/continuation state for subsequently created invocations.
+    /// Outstanding owned futures/streams may still exist: reset must not wait for
+    /// their locks or let their completion repopulate replacement state. Reset is
+    /// not cancellation; those invocations retain their detached prior state.
+    /// Runtime retries normally drop failed work first, and stateful providers
+    /// replay the next request in full. Stateless providers need no reset.
     fn reset(&mut self) {}
 }
 
@@ -120,46 +131,6 @@ impl Default for ProviderTimeouts {
         Self {
             startup: std::time::Duration::from_secs(600),
             read_idle: std::time::Duration::from_secs(600),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn retry_eligibility_is_category_based_and_provider_independent() {
-        for (kind, eligible) in [
-            (ProviderErrorKind::Response, true),
-            (ProviderErrorKind::Transport, true),
-            (ProviderErrorKind::Timeout, true),
-            (ProviderErrorKind::RateLimited, true),
-            (
-                ProviderErrorKind::CodexWebSocket(CodexWebSocketError::Read),
-                true,
-            ),
-            (ProviderErrorKind::Authentication, false),
-            (ProviderErrorKind::InvalidRequest, false),
-            (ProviderErrorKind::Protocol, false),
-            (ProviderErrorKind::ContextWindowExceeded, false),
-        ] {
-            for message in [
-                "provider error",
-                "retry reconnect timeout previous_response_not_found",
-            ] {
-                assert_eq!(
-                    ProviderError {
-                        retry_after: None,
-                        kind,
-                        message: message.into()
-                    }
-                    .recovery()
-                    .is_some(),
-                    eligible,
-                    "{kind:?}"
-                );
-            }
         }
     }
 }

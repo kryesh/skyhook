@@ -6,7 +6,7 @@ use serde_json::{Map, Value};
 
 use crate::tool::policy::CapabilitySet;
 
-use super::{GeneratedToolDefinition, OutputSchema, RegistryError, ToolSpec};
+use super::{GeneratedToolDefinition, OutputSchema, RegistryError, ToolExecution, ToolSpec};
 
 impl OutputSchema {
     pub(super) fn generate(&self, capabilities: &CapabilitySet) -> Value {
@@ -18,13 +18,10 @@ impl OutputSchema {
 }
 
 impl GeneratedToolDefinition {
-    pub(super) fn generate(&self, capabilities: &CapabilitySet) -> Option<ToolSpec> {
-        self.generate_scoped(capabilities, false)
-    }
-
     pub(super) fn generate_scoped(
         &self,
         capabilities: &CapabilitySet,
+        execution: &ToolExecution,
         child: bool,
     ) -> Option<ToolSpec> {
         self.required
@@ -57,6 +54,9 @@ impl GeneratedToolDefinition {
                     schema
                 });
                 ToolSpec {
+                    supports_background: self.supports_background,
+                    job_role: execution.job_role,
+                    result_policy: execution.result_policy,
                     name: self.name.clone(),
                     description: self.description.clone(),
                     input_schema,

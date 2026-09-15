@@ -9,7 +9,7 @@ use crate::provider::{
 };
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::{HeaderMap, HeaderValue};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::Mutex, time::Instant};
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
@@ -19,42 +19,51 @@ const MAX_IDLE: Duration = Duration::from_secs(240);
 const REUSE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_PROBE_FRAMES: usize = 32;
 
+/// Only a drained successful response can install a reusable connection. The
+/// session lock is retained by startup/stream work, never by a return-on-Drop hook.
 #[derive(Default)]
-pub(super) struct Session {
-    pub(super) socket: Option<Socket>,
-    pub(super) reusable_since: Option<Instant>,
-    pub(super) continuation: Option<Continuation>,
-    pub(super) affinity: Option<HeaderValue>,
-    pub(super) http_only: bool,
+pub(super) enum Session {
+    #[default]
+    Disconnected,
+    HttpOnly,
+    Reusable(Box<ReusableConnection>),
 }
-/// A socket retained between turns is unpolled and may have a queued close,
-/// ping, or EOF. Probe it before a model request, never by replaying a request.
-/// Take all connection-bound state first: cancellation cannot leave a partially
-/// probed socket or its continuation available to a subsequent invocation.
+
+/// Freshly connected or request-owned routing state has no idle timestamp or
+/// continuation. Those belong only to a successfully completed reusable bundle.
+pub(super) struct Connection {
+    pub(super) socket: Socket,
+    pub(super) affinity: Option<HeaderValue>,
+}
+pub(super) struct ReusableConnection {
+    pub(super) connection: Connection,
+    pub(super) since: Instant,
+    pub(super) continuation: Option<Continuation>,
+}
+
+/// Take the entire connection before awaiting the probe. Cancellation, timeout,
+/// stale sockets and malformed trailing frames leave the session disconnected.
 async fn prepare_reuse(session: &mut Session) {
-    let Some(mut socket) = session.socket.take() else {
-        session.reusable_since = None;
-        session.continuation = None;
-        session.affinity = None;
+    let previous = std::mem::take(session);
+    let Session::Reusable(mut reusable) = previous else {
+        *session = previous;
         return;
     };
-    let since = session.reusable_since.take();
-    let continuation = session.continuation.take();
-    let affinity = session.affinity.take();
-    if since.is_none_or(|since| since.elapsed() >= MAX_IDLE) {
+    if reusable.since.elapsed() >= MAX_IDLE {
         return;
     }
     if matches!(
-        tokio::time::timeout(REUSE_PROBE_TIMEOUT, probe_socket(&mut socket)).await,
+        tokio::time::timeout(
+            REUSE_PROBE_TIMEOUT,
+            probe_socket(&mut reusable.connection.socket)
+        )
+        .await,
         Ok(true)
     ) {
-        session.socket = Some(socket);
-        session.reusable_since = Some(Instant::now());
-        session.continuation = continuation;
-        session.affinity = affinity;
+        reusable.since = Instant::now();
+        *session = Session::Reusable(reusable);
     }
-    // A failed probe retires the connection. The caller establishes a fresh
-    // socket (or safely falls back to HTTP), sending full history exactly once.
+    // Failed probes cause a fresh connection/full-history request, never replay.
 }
 
 async fn probe_socket(socket: &mut Socket) -> bool {
@@ -96,7 +105,7 @@ async fn probe_socket(socket: &mut Socket) -> bool {
 pub(super) struct Continuation {
     pub(super) id: String,
     pub(super) input: Vec<Value>,
-    pub(super) settings: Value,
+    pub(super) settings: Map<String, Value>,
 }
 pub(super) struct Context {
     provider: CodexProvider,
@@ -128,17 +137,7 @@ impl ProviderContext for Context {
             let scope = provider.replay_scope();
             filter_reasoning_scope(&mut request, &scope);
             let mut body = responses::encode(&request)?;
-            // Subscription wire constraints; no second request/response codec.
-            body["store"] = json!(false);
-            if body.get("instructions").is_none() {
-                body["instructions"] = json!("");
-            }
-            body["include"] = json!(["reasoning.encrypted_content"]);
-            // The subscription service does not accept an output-token limit;
-            // the profile value remains a local context budget only.
-            body.as_object_mut()
-                .expect("Responses encoder returns object")
-                .remove("max_output_tokens");
+            adapt_subscription_request(&mut body);
             if request
                 .correlation
                 .as_ref()
@@ -157,17 +156,26 @@ impl ProviderContext for Context {
             )?;
             let mut session = session.lock_owned().await;
             prepare_reuse(&mut session).await;
-            if let Some(affinity) = &session.affinity {
-                headers.insert("x-codex-turn-state", affinity.clone());
-            }
-            if !session.http_only && session.socket.is_none() {
-                match connect(&provider.ws_endpoint, &headers).await {
-                    Ok((socket, affinity)) => {
-                        session.socket = Some(socket);
-                        session.affinity = affinity;
+            let (connection, continuation) = match std::mem::take(&mut *session) {
+                Session::Reusable(reusable) => {
+                    let ReusableConnection {
+                        connection,
+                        continuation,
+                        ..
+                    } = *reusable;
+                    if let Some(affinity) = &connection.affinity {
+                        headers.insert("x-codex-turn-state", affinity.clone());
                     }
-                    // A throttle is not a WebSocket capability rejection. Let the
-                    // runtime honor its delay instead of immediately trying HTTP.
+                    (Some(connection), continuation)
+                }
+                Session::HttpOnly => {
+                    *session = Session::HttpOnly;
+                    (None, None)
+                }
+                Session::Disconnected => match connect(&provider.ws_endpoint, &headers).await {
+                    Ok((socket, affinity)) => (Some(Connection { socket, affinity }), None),
+                    // A throttle is not a capability rejection. Do not immediately
+                    // retry through HTTP or replay after a request write.
                     Err(error)
                         if error.retry_after.is_some()
                             || matches!(
@@ -179,39 +187,36 @@ impl ProviderContext for Context {
                     {
                         return Err(error);
                     }
-                    // No response.create has been sent, so full-history fallback is safe.
+                    // No response.create has been sent: full-history fallback is safe.
                     Err(_) => {
-                        session.http_only = true;
-                        session.continuation = None;
+                        *session = Session::HttpOnly;
+                        (None, None)
                     }
-                }
-            }
-            if let Some(mut socket) = session.socket.take() {
-                // Keep affinity out of the shared session while a request is in
-                // flight. Failed writes and cancellation drop all routing state.
-                session.reusable_since = None;
-                let affinity = session.affinity.take();
-                let (wire, settings, input) =
-                    websocket_request(&body, session.continuation.take().as_ref());
-                // Removing continuation before writing invalidates it on cancellation.
+                },
+            };
+            if let Some(mut connection) = connection {
+                let prepared = websocket_request(body, continuation.as_ref());
+                // Routing and continuation are request-owned before the write;
+                // failed or cancelled writes cannot restore any connection state.
                 tokio::time::timeout(
                     DEADLINE,
-                    socket.send(Message::Text(wire.to_string().into())),
+                    connection.socket.send(Message::Text(
+                        prepared.wire_request.into_wire().to_string().into(),
+                    )),
                 )
                 .await
                 .map_err(|_| websocket_error(CodexWebSocketError::WriteTimeout))?
                 .map_err(|error| socket_error(error, CodexWebSocketError::Write))?;
-                session.affinity = affinity;
                 return Ok(ws_stream(
-                    socket,
+                    connection,
                     session,
                     responses::Decoder::codex(request.model),
-                    settings,
-                    input,
+                    prepared.settings,
+                    prepared.full_input,
                     scope,
                 ));
             }
-            session.continuation = None;
+            let body = body.into_wire();
             let events =
                 transport::post_sse_once(&provider.client, &provider.endpoint, headers, &body)
                     .await?;
@@ -304,29 +309,51 @@ async fn connect(
         response.headers().get("x-codex-turn-state").cloned(),
     ))
 }
+/// Subscription wire constraints; no second request/response codec. All other
+/// settings (including opaque vendor metadata) survive without reconstruction.
+fn adapt_subscription_request(body: &mut responses::EncodedRequest) {
+    body.settings.insert("store".into(), json!(false));
+    body.settings
+        .entry("instructions")
+        .or_insert_with(|| json!(""));
+    body.settings
+        .insert("include".into(), json!(["reasoning.encrypted_content"]));
+    // The subscription service does not accept an output-token limit; the
+    // profile value remains a local context budget only.
+    body.settings.remove("max_output_tokens");
+}
+
+pub(super) struct PreparedWebSocketRequest {
+    pub(super) wire_request: responses::EncodedRequest,
+    pub(super) settings: Map<String, Value>,
+    pub(super) full_input: Vec<Value>,
+}
+
 pub(super) fn websocket_request(
-    body: &Value,
+    body: responses::EncodedRequest,
     previous: Option<&Continuation>,
-) -> (Value, Value, Vec<Value>) {
-    let mut wire = body.clone();
-    let input = body
-        .get("input")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut settings = body.clone();
-    settings
-        .as_object_mut()
-        .expect("Responses encoder returns object")
-        .remove("input");
+) -> PreparedWebSocketRequest {
+    let responses::EncodedRequest { input, settings } = body;
+    let mut wire_request = responses::EncodedRequest {
+        input: input.clone(),
+        settings: settings.clone(),
+    };
     if let Some(previous) = previous
         .filter(|previous| previous.settings == settings && input.starts_with(&previous.input))
     {
-        wire["previous_response_id"] = json!(previous.id);
-        wire["input"] = json!(&input[previous.input.len()..]);
+        wire_request
+            .settings
+            .insert("previous_response_id".into(), json!(previous.id));
+        wire_request.input = input[previous.input.len()..].to_vec();
     }
-    wire["type"] = json!("response.create");
-    (wire, settings, input)
+    wire_request
+        .settings
+        .insert("type".into(), json!("response.create"));
+    PreparedWebSocketRequest {
+        wire_request,
+        settings,
+        full_input: input,
+    }
 }
 
 #[cfg(test)]
@@ -334,18 +361,86 @@ mod tests {
     use super::super::super::common::tests::request as base_request;
     use super::super::auth;
     use super::super::transport::tests::{
-        mock_socket, reasoning_tool_output, reasoning_tool_request,
+        mock_socket, reasoning_tool_output, reasoning_tool_request, serve_socket,
     };
     use super::*;
-    use crate::provider::backends::transport::tests::read_request as read_http_request;
+    use crate::provider::backends::transport::tests::{read_request as read_http_request, reply};
     use crate::provider::{Provider, ProviderRecovery, ResponseChunk};
+    use tokio::io::AsyncWriteExt;
     use tokio_tungstenite::WebSocketStream;
 
     fn request() -> ModelRequest {
         ModelRequest {
             correlation: Some("context".into()),
+            blobs: Default::default(),
             ..base_request("gpt-5")
         }
+    }
+
+    #[test]
+    fn subscription_adaptation_preserves_opaque_settings_and_explicit_history() {
+        let mut body = responses::encode(&request()).unwrap();
+        for (key, value) in [
+            ("store", json!(true)),
+            ("include", json!(["other"])),
+            ("max_output_tokens", json!(100)),
+            (
+                "vendor_options",
+                json!({"nested":[null, false, {"opaque":"keep"}]}),
+            ),
+            ("instructions", json!("keep instructions")),
+        ] {
+            body.settings.insert(key.into(), value);
+        }
+        let input = body.input.clone();
+        let mut expected = body.settings.clone();
+        expected.insert("store".into(), json!(false));
+        expected.insert("include".into(), json!(["reasoning.encrypted_content"]));
+        expected.remove("max_output_tokens");
+        adapt_subscription_request(&mut body);
+        assert_eq!(body.settings, expected);
+        assert_eq!(body.input, input);
+
+        body.settings.remove("instructions");
+        adapt_subscription_request(&mut body);
+        assert_eq!(body.settings["instructions"], "");
+    }
+
+    #[test]
+    fn prepared_websocket_request_separates_wire_suffix_from_full_history() {
+        let prefix =
+            json!({"type":"reasoning", "encrypted_content":"opaque", "vendor":{"keep":[1,null]}});
+        let next = json!({"role":"user", "content":[{"type":"input_text", "text":"next"}]});
+        let settings = Map::from_iter([
+            ("model".into(), json!("gpt-5")),
+            ("vendor".into(), json!({"nested":[false,null]})),
+        ]);
+        let body = responses::EncodedRequest {
+            input: vec![prefix.clone(), next.clone()],
+            settings: settings.clone(),
+        };
+        let previous = Continuation {
+            id: "r1".into(),
+            input: vec![prefix.clone()],
+            settings: settings.clone(),
+        };
+        let prepared = websocket_request(body.clone(), Some(&previous));
+        assert_eq!(prepared.full_input, body.input);
+        assert_eq!(prepared.settings, settings);
+        assert_eq!(
+            prepared.wire_request.into_wire(),
+            json!({
+                "model":"gpt-5", "vendor":{"nested":[false,null]},
+                "previous_response_id":"r1", "type":"response.create", "input":[next]
+            })
+        );
+        assert_eq!(
+            websocket_request(body, None).wire_request.into_wire(),
+            json!({
+                "model":"gpt-5", "vendor":{"nested":[false,null]},
+                "type":"response.create", "input":[prefix,next]
+            })
+        );
     }
 
     fn provider(address: std::net::SocketAddr, directory: &std::path::Path) -> CodexProvider {
@@ -371,11 +466,18 @@ mod tests {
         }
     }
 
-    async fn completed<S>(socket: &mut WebSocketStream<S>, id: &str)
+    fn completed(id: &str) -> Value {
+        json!({"type":"response.completed", "response":{"id":id,"status":"completed","output":[]}})
+    }
+
+    async fn send<S>(socket: &mut WebSocketStream<S>, event: Value)
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        socket.send(Message::Text(json!({"type":"response.completed", "response":{"id":id,"status":"completed","output":[]}}).to_string().into())).await.unwrap();
+        socket
+            .send(Message::Text(event.to_string().into()))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -405,16 +507,15 @@ mod tests {
                 .await
                 .unwrap();
                 let first = read_request(&mut socket).await;
-                completed(&mut socket, "committed-response").await;
+                send(&mut socket, completed("committed-response")).await;
                 let second = read_request(&mut socket).await;
                 assert_eq!(second["previous_response_id"], "committed-response");
                 assert_eq!(second["input"], json!([]));
                 // Start an uncommitted response, then lose the connection abruptly.
-                socket.send(Message::Text(json!({"type":"response.output_item.added", "output_index":0,
-                    "item":{"id":"partial","type":"function_call","call_id":"not-executed","name":"local_tool","arguments":""}}).to_string().into())).await.unwrap();
+                send(&mut socket, json!({"type":"response.output_item.added", "output_index":0,
+                    "item":{"id":"partial","type":"function_call","call_id":"not-executed","name":"local_tool","arguments":""}})).await;
                 drop(socket);
-                // There must be no provider-owned request replay while the runtime
-                // is deciding whether this response is safe to retry.
+                // No provider-owned replay while the runtime decides whether to retry.
                 assert!(
                     tokio::time::timeout(Duration::from_millis(30), listener.accept())
                         .await
@@ -436,7 +537,7 @@ mod tests {
                 assert!(third.get("previous_response_id").is_none());
                 assert_eq!(third["input"], first["input"]);
                 assert!(!third.to_string().contains("not-executed"));
-                completed(&mut socket, "retried-response").await;
+                send(&mut socket, completed("retried-response")).await;
             });
             let directory = tempfile::tempdir().unwrap();
             let provider = provider(address, directory.path());
@@ -461,13 +562,13 @@ mod tests {
                 context.reset();
             }
             retry_tx.send(()).unwrap();
-            let final_chunks = context
+            let last = context
                 .invoke(request())
                 .await
                 .unwrap()
                 .collect::<Vec<_>>()
                 .await;
-            assert!(final_chunks.iter().all(Result::is_ok), "{final_chunks:?}");
+            assert!(last.iter().all(Result::is_ok), "{last:?}");
             server.await.unwrap();
         }
     }
@@ -476,16 +577,7 @@ mod tests {
     async fn reset_detaches_even_a_locked_session_and_clears_http_fallback() {
         let directory = tempfile::tempdir().unwrap();
         let provider = provider("127.0.0.1:1".parse().unwrap(), directory.path());
-        let old = Arc::new(Mutex::new(Session {
-            continuation: Some(Continuation {
-                id: "old".into(),
-                input: vec![],
-                settings: json!({}),
-            }),
-            affinity: Some(HeaderValue::from_static("old-affinity")),
-            http_only: true,
-            ..Session::default()
-        }));
+        let old = Arc::new(Mutex::new(Session::HttpOnly));
         let mut context = Context {
             provider,
             correlation: "context".into(),
@@ -494,12 +586,10 @@ mod tests {
         let _old_guard = old.lock().await;
         context.reset();
         assert!(!Arc::ptr_eq(&context.session, &old));
-        let session = context.session.try_lock().unwrap();
-        assert!(session.socket.is_none());
-        assert!(session.reusable_since.is_none());
-        assert!(session.continuation.is_none());
-        assert!(session.affinity.is_none());
-        assert!(!session.http_only);
+        assert!(matches!(
+            *context.session.try_lock().unwrap(),
+            Session::Disconnected
+        ));
     }
 
     #[test]
@@ -512,13 +602,13 @@ mod tests {
 
     #[tokio::test]
     async fn throttled_handshake_preserves_retry_after_without_http_fallback() {
-        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             assert!(read_http_request(&mut socket).await.starts_with("GET "));
-            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            let throttled = reply("429 Too Many Requests", "Retry-After: 120\r\n", "");
+            socket.write_all(throttled.as_bytes()).await.unwrap();
             drop(socket);
             assert!(
                 tokio::time::timeout(Duration::from_millis(100), listener.accept())
@@ -530,9 +620,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let provider = provider(address, directory.path());
         let mut context = provider.open_context("context".into()).unwrap();
-        let error = match context.invoke(request()).await {
-            Err(error) => error,
-            Ok(_) => panic!("expected throttled handshake"),
+        let Err(error) = context.invoke(request()).await else {
+            panic!("expected throttled handshake")
         };
         assert_eq!(error.kind, ProviderErrorKind::RateLimited);
         assert_eq!(error.retry_after, Some(Duration::from_secs(120)));
@@ -542,40 +631,29 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_handshake_falls_back_once_with_full_http_history() {
-        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
+            let body = format!("data: {}\n\n", completed("r1"));
             let mut requests = Vec::new();
-            for index in 0..2 {
+            for wire in [
+                reply("426 Upgrade Required", "", ""),
+                reply("200 OK", "Content-Type: text/event-stream\r\n", &body),
+            ] {
                 let (mut tcp, _) = listener.accept().await.unwrap();
                 requests.push(read_http_request(&mut tcp).await);
-                if index == 0 {
-                    tcp.write_all(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
-                } else {
-                    let body = format!(
-                        "data: {}\n\n",
-                        json!({"type":"response.completed","response":{"id":"r1","status":"completed","output":[]}})
-                    );
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    tcp.write_all(response.as_bytes()).await.unwrap();
-                }
+                tcp.write_all(wire.as_bytes()).await.unwrap();
             }
             requests
         });
         let directory = tempfile::tempdir().unwrap();
         let provider = provider(address, directory.path());
         let mut context = provider.open_context("context".into()).unwrap();
-        let scope = provider.replay_scope();
-        let mut request = reasoning_tool_request(&scope);
+        let mut request = reasoning_tool_request(&provider.replay_scope());
         request.max_output_tokens = Some(100);
         request.correlation = Some("context".into());
         let request = super::super::super::common::tests::resume_request(&request).await;
-        let expected_input = responses::encode(&request).unwrap()["input"].clone();
+        let expected_input = json!(responses::encode(&request).unwrap().input);
         let events = context
             .invoke(request)
             .await
@@ -598,17 +676,58 @@ mod tests {
     }
 
     fn retained_session(socket: Socket) -> Session {
-        Session {
-            socket: Some(socket),
-            reusable_since: Some(Instant::now()),
+        Session::Reusable(Box::new(ReusableConnection {
+            connection: Connection {
+                socket,
+                affinity: Some(HeaderValue::from_static("stale-affinity")),
+            },
+            since: Instant::now(),
             continuation: Some(Continuation {
                 id: "stale-response".into(),
                 input: vec![],
-                settings: json!({}),
+                settings: Map::new(),
             }),
-            affinity: Some(HeaderValue::from_static("stale-affinity")),
-            http_only: false,
+        }))
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_reuse_probe_retires_the_entire_bundle() {
+        let (ping_tx, ping_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (socket, server) = serve_socket(|mut socket| async move {
+            let frame = socket.next().await.unwrap().unwrap();
+            assert!(matches!(frame, Message::Ping(_)));
+            ping_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+        })
+        .await;
+        let mut session = retained_session(socket);
+        let mut probe = Box::pin(prepare_reuse(&mut session));
+        tokio::select! {
+            _ = &mut probe => panic!("probe cannot finish without pong"),
+            result = ping_rx => result.unwrap(),
         }
+        drop(probe);
+        assert!(matches!(session, Session::Disconnected));
+        release_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_expiry_retires_the_bundle_without_a_probe_or_request() {
+        // Retirement closes the socket without sending ping/model content.
+        let (socket, server) = serve_socket(|mut socket| async move {
+            assert!(!matches!(socket.next().await, Some(Ok(_))));
+        })
+        .await;
+        let mut session = retained_session(socket);
+        let Session::Reusable(reusable) = &mut session else {
+            unreachable!()
+        };
+        reusable.since = Instant::now() - MAX_IDLE;
+        prepare_reuse(&mut session).await;
+        assert!(matches!(session, Session::Disconnected));
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -620,13 +739,12 @@ mod tests {
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-            let wire = ws.next().await.unwrap().unwrap().into_text().unwrap();
-            let wire: Value = serde_json::from_str(&wire).unwrap();
+            let wire = read_request(&mut ws).await;
             assert_eq!(wire["type"], "response.create");
             assert_eq!(wire["reasoning"], json!({"summary":"auto"}));
             assert!(wire.get("previous_response_id").is_none());
             assert_eq!(wire["input"].as_array().unwrap().len(), 1);
-            ws.send(Message::Text(json!({"type":"response.completed","response":{"id":"fresh","status":"completed","output":[]}}).to_string().into())).await.unwrap();
+            send(&mut ws, completed("fresh")).await;
         });
         let directory = tempfile::tempdir().unwrap();
         let session = Arc::new(Mutex::new(retained_session(socket)));
@@ -637,25 +755,33 @@ mod tests {
         };
         let request = ModelRequest {
             correlation: Some("test".into()),
+            blobs: Default::default(),
             ..base_request("fixture")
         };
-        let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let invoke = async {
             context
                 .invoke(request)
                 .await
                 .unwrap()
                 .collect::<Vec<_>>()
                 .await
-        })
-        .await
-        .unwrap();
+        };
+        let result = tokio::time::timeout(Duration::from_secs(5), invoke)
+            .await
+            .unwrap();
         assert!(result.iter().all(Result::is_ok), "{result:?}");
         assert!(
             result
                 .iter()
-                .any(|event| matches!(event, Ok(ResponseChunk::ResponseEnded { .. })))
+                .flatten()
+                .any(|event| matches!(event, ResponseChunk::ResponseEnded { .. }))
         );
-        assert!(session.lock().await.affinity.is_none());
+        let session = session.lock().await;
+        let Session::Reusable(reusable) = &*session else {
+            panic!("successful fresh response must restore a reusable connection");
+        };
+        assert!(reusable.connection.affinity.is_none());
+        assert_eq!(reusable.continuation.as_ref().unwrap().id, "fresh");
         server.await.unwrap();
     }
 }

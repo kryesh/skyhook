@@ -86,17 +86,17 @@ mod tests {
         let mut same = original.clone();
         filter_reasoning_scope(&mut same, &a.replay_scope());
         assert_eq!(
-            responses::encode(&same).unwrap()["input"][0],
+            responses::encode(&same).unwrap().input[0],
             reasoning_tool_output()[0]
         );
         let mut foreign = original.clone();
         filter_reasoning_scope(&mut foreign, &b.replay_scope());
-        let wire = responses::encode(&foreign).unwrap();
+        let wire = responses::encode(&foreign).unwrap().into_wire();
         assert_eq!(wire["input"].as_array().unwrap().len(), 2);
         assert_eq!(wire["input"][0]["type"], "function_call");
         assert_eq!(wire["input"][1]["type"], "function_call_output");
         assert_eq!(
-            responses::encode(&original).unwrap()["input"][0],
+            responses::encode(&original).unwrap().input[0],
             reasoning_tool_output()[0]
         );
     }

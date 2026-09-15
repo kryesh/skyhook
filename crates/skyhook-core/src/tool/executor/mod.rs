@@ -48,7 +48,6 @@ struct InvocationPlan {
     tool: Arc<crate::tool::RegisteredTool>,
     original_arguments: Value,
     authorization_arguments: Value,
-    handler_arguments: Value,
     caller_location: ExecutionLocation,
     execution_location: ExecutionLocation,
     permissions: Vec<PermissionUse>,
@@ -56,13 +55,24 @@ struct InvocationPlan {
     authorization_scope: Option<u64>,
     background: bool,
     job_name: Option<String>,
-    dispatch: InvocationDispatch,
+    dispatch: InvocationDispatch<PlannedRemote>,
 }
 
-enum InvocationDispatch {
-    Local,
+/// The remote payload is a planned route before authorization and a prepared
+/// connection afterwards; local dispatch is unchanged by that transition.
+enum InvocationDispatch<R> {
+    /// Admission failures are reported by the job, after approval, as a handler would.
+    Local(Result<super::registry::AdmittedInvocation, ToolError>),
     ReadError(ToolOutput),
-    Remote(ResolvedRoute),
+    Remote {
+        remote: R,
+        arguments: Value,
+    },
+}
+
+struct PlannedRemote {
+    route: ResolvedRoute,
+    router: TargetRouter,
 }
 
 #[derive(Clone)]
@@ -227,9 +237,12 @@ impl ToolExecutor {
         let plan = self
             .plan_registered(kind, agent, name, arguments, parent, None)
             .await?;
+        let result_policy = plan.tool.result_policy();
         let started = self.start(plan).await?;
-        if matches!(kind, InvocationKind::Model) && name != "job_output" {
-            return self.collect_model_started(name, started).await;
+        if matches!(kind, InvocationKind::Model)
+            && result_policy != super::ToolResultPolicy::JobView
+        {
+            return self.collect_model_started(started).await;
         }
         self.collect_started(started).await
     }

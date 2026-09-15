@@ -3,7 +3,7 @@ use super::{
     SensitivePrompt, SensitivePromptError, SensitivePromptFuture, SensitivePromptHandler,
     backend::{ProcessEnvironment, WorkerBackends},
     prompt::PromptAnswer,
-    protocol::{Request, Response, write_frame},
+    protocol::{PromptId, Request, RequestId, Response, spawn_owned_write, write_frame},
 };
 use std::{
     collections::HashMap,
@@ -17,20 +17,32 @@ use tokio::{
     sync::{Mutex, mpsc, oneshot},
 };
 
-type Answers = Arc<Mutex<HashMap<u64, oneshot::Sender<PromptAnswer>>>>;
+// Prompt registration cleanup must work even when dropped outside a runtime.
+type Answers = Arc<std::sync::Mutex<HashMap<PromptId, oneshot::Sender<PromptAnswer>>>>;
 struct PromptRegistration<W: AsyncWrite + Unpin + Send + 'static> {
     output: Arc<Mutex<W>>,
     answers: Answers,
-    id: u64,
+    id: Option<PromptId>,
+}
+impl<W: AsyncWrite + Unpin + Send + 'static> PromptRegistration<W> {
+    fn unregister(&mut self) -> Option<PromptId> {
+        let id = self.id.take()?;
+        let mut answers = self.answers.lock().expect("prompt answers poisoned");
+        answers.remove(&id);
+        Some(id)
+    }
+    fn complete(mut self) {
+        self.unregister();
+    }
 }
 impl<W: AsyncWrite + Unpin + Send + 'static> Drop for PromptRegistration<W> {
     fn drop(&mut self) {
+        let Some(prompt_id) = self.unregister() else {
+            return;
+        };
         let output = self.output.clone();
-        let answers = self.answers.clone();
-        let prompt_id = self.id;
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                answers.lock().await.remove(&prompt_id);
                 let _ = write_frame(
                     &mut *output.lock().await,
                     &Response::SensitiveCancelled { prompt_id },
@@ -47,31 +59,35 @@ struct ForwardPrompts<W> {
 }
 impl<W: AsyncWrite + Unpin + Send + 'static> SensitivePromptHandler for ForwardPrompts<W> {
     fn prompt(&self, prompt: SensitivePrompt) -> SensitivePromptFuture {
-        let prompt_id = self.next.fetch_add(1, Ordering::Relaxed);
+        let prompt_id = PromptId(self.next.fetch_add(1, Ordering::Relaxed));
         let output = self.output.clone();
         let answers = self.answers.clone();
         Box::pin(async move {
             let (sender, receiver) = oneshot::channel();
-            answers.lock().await.insert(prompt_id, sender);
-            let _registration = PromptRegistration {
+            answers
+                .lock()
+                .expect("prompt answers poisoned")
+                .insert(prompt_id, sender);
+            let registration = PromptRegistration {
                 output: output.clone(),
-                answers: answers.clone(),
-                id: prompt_id,
+                answers,
+                id: Some(prompt_id),
             };
-            if write_frame(
-                &mut *output.lock().await,
-                &Response::SensitivePrompt { prompt_id, prompt },
-            )
-            .await
-            .is_err()
+            // Dropping this caller cannot interrupt a partially written frame.
+            let frame = Response::SensitivePrompt { prompt_id, prompt };
+            if spawn_owned_write(output.lock_owned().await, frame)
+                .await
+                .is_err()
             {
-                answers.lock().await.remove(&prompt_id);
+                registration.complete();
                 return Err(SensitivePromptError::Unavailable);
             }
-            match receiver.await {
+            let result = match receiver.await {
                 Ok(PromptAnswer::Accepted(value)) => Ok(value),
                 _ => Err(SensitivePromptError::Cancelled),
-            }
+            };
+            registration.complete();
+            result
         })
     }
 }
@@ -90,7 +106,7 @@ impl Drop for WorkerStream {
 pub(super) struct WorkerServices<W> {
     output: Arc<Mutex<W>>,
     answers: Answers,
-    streams: HashMap<u64, WorkerStream>,
+    streams: HashMap<RequestId, WorkerStream>,
     pub tasks: tokio::task::JoinSet<std::io::Result<()>>,
     prompts: Arc<dyn SensitivePromptHandler>,
     pub environment: ProcessEnvironment,
@@ -119,7 +135,12 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
     pub async fn handle(&mut self, request: Request) -> Result<(), std::io::Error> {
         match request {
             Request::SensitiveAnswer { prompt_id, answer } => {
-                if let Some(sender) = self.answers.lock().await.remove(&prompt_id) {
+                if let Some(sender) = self
+                    .answers
+                    .lock()
+                    .expect("prompt answers poisoned")
+                    .remove(&prompt_id)
+                {
                     let _ = sender.send(answer);
                 }
             }
@@ -141,7 +162,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
                 route,
                 command,
             } => {
-                if channel == 0 || self.streams.contains_key(&channel) {
+                if self.streams.contains_key(&channel) {
                     return Err(std::io::Error::other("duplicate SSH stream"));
                 }
                 let (sender, mut input) = mpsc::channel(128);
@@ -231,5 +252,81 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
             _ => return Err(std::io::Error::other("unexpected control request")),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote::protocol::read_frame;
+
+    fn prompts<W>(output: W, next: u64) -> ForwardPrompts<W> {
+        ForwardPrompts {
+            output: Arc::new(Mutex::new(output)),
+            answers: Answers::default(),
+            next: AtomicU64::new(next),
+        }
+    }
+
+    fn password() -> SensitivePrompt {
+        SensitivePrompt {
+            kind: crate::remote::SensitivePromptKind::Password,
+            message: "password".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoned_partial_prompt_frame_is_finished_before_cancellation() {
+        let (client, mut peer) = tokio::io::duplex(1);
+        let prompts = prompts(client, 1);
+        let mut future = prompts.prompt(password());
+        assert!(futures_util::poll!(&mut future).is_pending());
+        tokio::task::yield_now().await;
+        drop(future);
+        assert!(prompts.answers.lock().unwrap().is_empty());
+        assert!(matches!(
+            read_frame::<_, Response>(&mut peer).await.unwrap(),
+            Some(Response::SensitivePrompt {
+                prompt_id: PromptId(1),
+                ..
+            })
+        ));
+        assert!(matches!(
+            read_frame::<_, Response>(&mut peer).await.unwrap(),
+            Some(Response::SensitiveCancelled {
+                prompt_id: PromptId(1)
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn successful_forwarded_answer_does_not_emit_late_cancellation() {
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let prompts = prompts(client, 1);
+        let mut future = prompts.prompt(password());
+        assert!(futures_util::poll!(&mut future).is_pending());
+        let Some(Response::SensitivePrompt { prompt_id, .. }) =
+            read_frame::<_, Response>(&mut peer).await.unwrap()
+        else {
+            panic!("expected submission")
+        };
+        prompts
+            .answers
+            .lock()
+            .unwrap()
+            .remove(&prompt_id)
+            .unwrap()
+            .send(PromptAnswer::Accepted(crate::remote::SecretValue::new(
+                "secret".into(),
+            )))
+            .unwrap();
+        assert_eq!(future.await.unwrap().expose(), "secret");
+        assert!(prompts.answers.lock().unwrap().is_empty());
+        // A pending cancellation task would hold the writer open and emit a frame.
+        drop(prompts);
+        assert!(matches!(
+            read_frame::<_, Response>(&mut peer).await,
+            Ok(None)
+        ));
     }
 }

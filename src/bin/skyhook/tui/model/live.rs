@@ -1,16 +1,23 @@
 //! Live response cards, reasoning expansion, and stable native block identities.
 
-use super::{Entry, Projection, Surface, View};
+use super::{AgentDisplayState, Entry, EntryKey, Projection, Surface, View};
 use skyhook::agent::{AgentActivity, LiveResponse, ObservationSnapshot};
 use skyhook::identity::AgentId;
 use skyhook::provider::protocol::BlockKind;
 
-pub(super) fn working_label(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReasoningStatus {
+    Running,
+    Complete,
+    Incomplete,
+}
+
+pub(super) fn working_entry(
     snapshot: &ObservationSnapshot,
     projection: &Projection,
     agent: &AgentId,
     running: bool,
-) -> Option<String> {
+) -> Option<Entry> {
     if running {
         return None;
     }
@@ -25,54 +32,59 @@ pub(super) fn working_label(
     }) {
         return None;
     }
-    let label = match snapshot.activity.get(agent) {
+    let state = match snapshot.activity.get(agent) {
         Some(AgentActivity::Working)
             if !projection
                 .active_request
                 .get(agent)
                 .is_some_and(|request| projection.response_committed(*request)) =>
         {
-            "Working".into()
+            AgentDisplayState::Working
         }
         Some(AgentActivity::Reconnecting {
             attempt,
             max_attempts,
-        }) => match max_attempts {
-            Some(max) => format!("Reconnecting · attempt {attempt} of {max}"),
-            None => format!("Retrying · attempt {attempt}"),
+        }) => AgentDisplayState::Reconnecting {
+            attempt: *attempt,
+            max_attempts: *max_attempts,
         },
-        Some(AgentActivity::Compacting) => "Compacting".into(),
+        Some(AgentActivity::Compacting) => AgentDisplayState::Compacting,
         _ => return None,
     };
-    Some(label)
-}
 
-pub(super) fn working_entry(agent: &AgentId, label: &str) -> Entry {
     let mut entry = Entry::new(
-        format!("working-{agent}"),
-        format!("  {label}"),
+        EntryKey::Working(agent.clone()),
+        format!("  {}", state.label()),
         Surface::Muted,
     );
     entry.running = true;
-    entry
+    Some(entry)
 }
 
 pub(super) fn reasoning_entry(
-    key: String,
+    key: EntryKey,
     text: &str,
     view: &View,
-    default_open: bool,
-    title: &str,
+    thinking: bool,
+    status: ReasoningStatus,
 ) -> Entry {
+    let title = match status {
+        ReasoningStatus::Running => "  Reasoning",
+        ReasoningStatus::Complete => "Reasoning",
+        ReasoningStatus::Incomplete => "Reasoning · incomplete",
+    };
+    let running = status == ReasoningStatus::Running;
+    let default_open = running || thinking;
     // Source lines determine collapsibility; terminal wrapping must not change interaction.
     let text = text.trim_matches(['\r', '\n']);
     if text.lines().count() <= 1 {
         let mut entry = Entry::new(key, text.to_owned(), Surface::Reasoning);
         entry.default_open = default_open;
+        entry.running = running;
         return entry;
     }
     let open = view.is_expanded(&key, default_open);
-    let mut entry = Entry::new(
+    let mut entry = Entry::expandable_text(
         key,
         if open {
             format!("▾ {title}\n{text}")
@@ -81,22 +93,65 @@ pub(super) fn reasoning_entry(
         },
         Surface::Reasoning,
     );
-    entry.expandable = true;
     entry.default_open = default_open;
+    entry.running = running;
     entry
 }
 
-/// Length-prefixed native IDs avoid collisions even when IDs contain separators.
-pub(super) fn response_block_key(request: u64, item: &str, block: &str) -> String {
-    format!(
-        "response{request}/{}:{item}/{}:{block}",
-        item.len(),
-        block.len()
-    )
+/// Native block identity remains stable from live response through journal commit.
+pub(super) fn response_block_key(request: u64, item: &str, block: &str) -> EntryKey {
+    EntryKey::ResponseBlock {
+        request,
+        item: item.to_owned(),
+        block: block.to_owned(),
+    }
 }
 
-pub(super) fn reasoning_key(request: u64, item: &str, block: &str) -> String {
-    format!("reasoning-{}", response_block_key(request, item, block))
+pub(super) fn reasoning_key(request: u64, item: &str, block: &str) -> EntryKey {
+    EntryKey::ReasoningBlock {
+        request,
+        item: item.to_owned(),
+        block: block.to_owned(),
+    }
+}
+
+/// Complete live-tail eligibility shared by fresh, reset, and dirty-tail paths.
+/// This deliberately does not broaden Projection::live_response's narrower API.
+pub(super) fn live_tail_response<'a>(
+    snapshot: &'a ObservationSnapshot,
+    projection: &Projection,
+    agent: &AgentId,
+    request: u64,
+) -> Option<&'a LiveResponse> {
+    snapshot
+        .responses
+        .get(&(agent.clone(), request))
+        .filter(|response| {
+            projection.live_response(request, response)
+                && !projection.requests.get(&request).is_some_and(|info| {
+                    info.retry
+                        .as_ref()
+                        .is_some_and(super::retry::RetryState::has_error)
+                })
+        })
+}
+
+pub(super) fn live_tail_responses<'a>(
+    snapshot: &'a ObservationSnapshot,
+    projection: &Projection,
+    agent: &AgentId,
+) -> Vec<(u64, &'a LiveResponse)> {
+    let mut responses: Vec<_> = snapshot
+        .responses
+        .keys()
+        .filter(|(owner, _)| owner == agent)
+        .filter_map(|(_, request)| {
+            live_tail_response(snapshot, projection, agent, *request)
+                .map(|response| (*request, response))
+        })
+        .collect();
+    responses.sort_by_key(|(request, _)| *request);
+    responses
 }
 
 pub(super) fn response_entries(
@@ -113,21 +168,19 @@ pub(super) fn response_entries(
                 BlockKind::Reasoning if !block.text.trim().is_empty() => {
                     // A block ends independently of its item and of answer text.
                     let running = !response.settled && !block.ended;
-                    let mut entry = reasoning_entry(
+                    let entry = reasoning_entry(
                         reasoning_key(request, &item.id, &block.id),
                         &block.text,
                         view,
-                        running || thinking,
+                        thinking,
                         if running {
-                            "  Reasoning"
+                            ReasoningStatus::Running
                         } else if response.error.is_some() {
-                            "Reasoning · incomplete"
+                            ReasoningStatus::Incomplete
                         } else {
-                            "Reasoning"
+                            ReasoningStatus::Complete
                         },
                     );
-                    entry.running = running;
-                    entry.default_open = running || thinking;
                     entries.push(entry);
                 }
                 BlockKind::Text if !block.text.trim().is_empty() => {
@@ -158,99 +211,83 @@ pub(super) fn response_entries(
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::{response as apply, root};
     use super::*;
-    use skyhook::{
-        agent::{ObservedEvent, RuntimeEvent},
-        identity::SessionId,
-        provider::protocol::{BlockContent, ItemKind, ResponseEvent},
-    };
+    use skyhook::provider::protocol::{BlockContent, ItemKind, ResponseEvent};
 
     fn response(text: &str) -> LiveResponse {
-        let agent = AgentId::root(SessionId::from_bytes([1; 16]));
+        let agent = root(1);
         let mut snapshot = ObservationSnapshot::default();
+        let (item, block) = (String::from("text"), String::from("block"));
         for event in [
             ResponseEvent::ItemStarted {
-                id: "text".into(),
+                id: item.clone(),
                 position: 0,
                 kind: ItemKind::Text,
             },
             ResponseEvent::BlockStarted {
-                item: "text".into(),
-                id: "block".into(),
+                item: item.clone(),
+                id: block.clone(),
                 position: 0,
                 kind: BlockKind::Text,
             },
             ResponseEvent::BlockEnded {
-                item: "text".into(),
-                block: "block".into(),
+                item,
+                block,
                 content: BlockContent::Text { text: text.into() },
             },
         ] {
-            snapshot.apply(ObservedEvent {
-                revision: snapshot.revision + 1,
-                event: RuntimeEvent::ResponseEvent {
-                    agent: agent.clone(),
-                    request: 4,
-                    event,
-                },
-            });
+            apply(&mut snapshot, &agent, 4, event);
         }
         snapshot.responses.remove(&(agent, 4)).unwrap()
     }
 
     #[test]
     fn reasoning_expansion_respects_defaults_and_explicit_overrides() {
+        use ReasoningStatus::{Complete, Running};
         let mut view = View::default();
         let key = reasoning_key(4, "item", "block");
-        let active = reasoning_entry(
-            key.clone(),
-            "\nFirst\nSecond\r\n",
-            &view,
-            true,
-            "  Reasoning",
-        );
-        assert_eq!(active.text, "▾   Reasoning\nFirst\nSecond");
-        assert!(active.expandable && active.default_open);
-        view.collapsed.insert(key.clone());
+        let entry = |view: &View, text: &str, open: bool, status| {
+            reasoning_entry(key.clone(), text, view, open, status)
+        };
+        let active = entry(&view, "\nFirst\nSecond\r\n", true, Running);
+        assert_eq!(active.text(), "▾   Reasoning\nFirst\nSecond");
+        assert!(active.expandable() && active.default_open);
+        view.set_expanded(key.clone(), false);
         assert_eq!(
-            reasoning_entry(key.clone(), "First\nSecond", &view, true, "  Reasoning").text,
+            entry(&view, "First\nSecond", true, Running).text(),
             "▸   Reasoning"
         );
-        view.collapsed.clear();
+        view.clear_collapsed();
         assert_eq!(
-            reasoning_entry(key.clone(), "First\nSecond", &view, false, "Reasoning").text,
+            entry(&view, "First\nSecond", false, Complete).text(),
             "▸ Reasoning"
         );
-        view.expanded.insert(key.clone());
+        view.set_expanded(key.clone(), true);
         assert!(
-            reasoning_entry(key.clone(), "First\nSecond", &view, false, "Reasoning")
-                .text
+            entry(&view, "First\nSecond", false, Complete)
+                .text()
                 .contains("Second")
         );
-        assert!(!reasoning_entry(key, "single line", &view, false, "Reasoning").expandable);
+        assert!(!entry(&view, "single line", false, Complete).expandable());
     }
 
     #[test]
     fn text_visibility_preserves_whitespace_and_failed_response_attribution() {
+        let rows =
+            |live: &LiveResponse| response_entries(4, live, &View::default(), false, "Agent");
         for text in ["", "\n\n", "  "] {
-            let live = response(text);
-            assert!(response_entries(4, &live, &View::default(), false, "Agent").is_empty());
+            assert!(rows(&response(text)).is_empty());
         }
         let mut live = response("\n\n  Actual answer.\n");
-        let rows = response_entries(4, &live, &View::default(), false, "Agent");
-        assert_eq!(rows[0].text, "Agent\n\n\n  Actual answer.\n");
-        assert_eq!(rows[0].surface, Surface::Agent);
-        live.error = Some("disconnected".into());
-        let rows = response_entries(4, &live, &View::default(), false, "Agent");
-        assert_eq!(rows[0].text, "Incomplete response\n\n\n  Actual answer.\n");
-        assert_eq!(rows[0].surface, Surface::Error);
-    }
-
-    #[test]
-    fn native_block_keys_cannot_collide_at_id_separators() {
-        assert_ne!(
-            response_block_key(4, "a/b", "c"),
-            response_block_key(4, "a", "b/c")
-        );
+        for (error, label, surface) in [
+            (None, "Agent", Surface::Agent),
+            (Some("disconnected"), "Incomplete response", Surface::Error),
+        ] {
+            live.error = error.map(Into::into);
+            let rows = rows(&live);
+            assert_eq!(rows[0].text(), format!("{label}\n\n\n  Actual answer.\n"));
+            assert_eq!(rows[0].surface, surface);
+        }
     }
 }

@@ -2,9 +2,11 @@ use crate::remote::{
     SecretValue, SensitivePrompt, SensitivePromptHandler, SensitivePromptKind, prompt::PromptAnswer,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::path::PathBuf;
 use std::{
     io::{Read as _, Write as _},
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
 use tokio::{
@@ -14,8 +16,11 @@ use tokio::{
 use zeroize::Zeroizing;
 
 pub(crate) struct AskpassServer {
+    #[cfg(test)]
     pub socket: PathBuf,
+    #[cfg(test)]
     pub executable: PathBuf,
+    environment: std::collections::BTreeMap<String, String>,
     _directory: tempfile::TempDir,
     task: tokio::task::JoinHandle<()>,
 }
@@ -39,6 +44,18 @@ impl AskpassServer {
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
         let socket = directory.path().join("askpass.sock");
         let executable = directory.path().join("askpass");
+        let environment = std::collections::BTreeMap::from([
+            (
+                "SSH_ASKPASS".into(),
+                super::config::wire_path(&executable)?.to_owned(),
+            ),
+            ("SSH_ASKPASS_REQUIRE".into(), "force".into()),
+            (
+                "SKYHOOK_ASKPASS_SOCKET".into(),
+                super::config::wire_path(&socket)?.to_owned(),
+            ),
+            ("DISPLAY".into(), "skyhook".into()),
+        ]);
         let helper = std::env::current_exe()?;
         let mut helper_file = std::fs::OpenOptions::new()
             .write(true)
@@ -48,7 +65,7 @@ impl AskpassServer {
         helper_file.write_all(
             format!(
                 "#!/bin/sh\nexec {} --askpass \"$@\"\n",
-                super::config::shell_quote(&helper.to_string_lossy())
+                super::config::shell_quote(super::config::wire_path(&helper)?)
             )
             .as_bytes(),
         )?;
@@ -70,26 +87,18 @@ impl AskpassServer {
             }
         });
         Ok(Self {
+            #[cfg(test)]
             socket,
+            #[cfg(test)]
             executable,
+            environment,
             _directory: directory,
             task,
         })
     }
 
     pub fn environment(&self) -> std::collections::BTreeMap<String, String> {
-        std::collections::BTreeMap::from([
-            (
-                "SSH_ASKPASS".into(),
-                self.executable.to_string_lossy().into_owned(),
-            ),
-            ("SSH_ASKPASS_REQUIRE".into(), "force".into()),
-            (
-                "SKYHOOK_ASKPASS_SOCKET".into(),
-                self.socket.to_string_lossy().into_owned(),
-            ),
-            ("DISPLAY".into(), "skyhook".into()),
-        ])
+        self.environment.clone()
     }
 }
 
@@ -225,23 +234,31 @@ mod tests {
         }
     }
 
-    async fn request_password(socket: &Path) -> SecretValue {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let mut client = UnixStream::connect(socket).await.unwrap();
-            client
-                .write_all(br#"{"prompt":"Password:","hint":null}"#)
-                .await
-                .unwrap();
-            client.shutdown().await.unwrap();
-            let mut bytes = Zeroizing::new(Vec::new());
-            client.read_to_end(&mut bytes).await.unwrap();
-            match serde_json::from_slice::<PromptAnswer>(&bytes).unwrap() {
-                PromptAnswer::Accepted(value) => value,
-                PromptAnswer::Rejected => panic!("password request unexpectedly rejected"),
-            }
+    fn fixed(value: &'static str) -> Arc<FixedAnswer> {
+        Arc::new(FixedAnswer {
+            value,
+            calls: AtomicUsize::new(0),
         })
-        .await
-        .expect("askpass request timed out")
+    }
+
+    async fn ask(mut client: UnixStream) -> PromptAnswer {
+        let request = br#"{"prompt":"Password:","hint":null}"#;
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut bytes = Zeroizing::new(Vec::new());
+        client.read_to_end(&mut bytes).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn request_password(socket: &Path) -> SecretValue {
+        let request = async { ask(UnixStream::connect(socket).await.unwrap()).await };
+        match tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .expect("askpass request timed out")
+        {
+            PromptAnswer::Accepted(value) => value,
+            PromptAnswer::Rejected => panic!("password request unexpectedly rejected"),
+        }
     }
 
     #[test]
@@ -264,102 +281,68 @@ mod tests {
                     .env("SKYHOOK_ASKPASS_SOCKET", "/unused-inherited-askpass.sock")
                     .output()
                     .unwrap();
-                assert!(
-                    output.status.success(),
-                    "umask {mask}: {}\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(output.status.success(), "umask {mask}: {stdout}\n{stderr}");
+                assert!(stdout.contains("1 passed"));
             }
             return;
         }
 
         use std::os::unix::fs::PermissionsExt as _;
-        tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .unwrap()
-            .block_on(async {
-                let handler = Arc::new(FixedAnswer {
-                    value: "private-answer",
-                    calls: AtomicUsize::new(0),
-                });
-                let server = AskpassServer::start(handler).unwrap();
-                for (path, mode) in [
-                    (server._directory.path(), 0o700),
-                    (server.executable.as_path(), 0o700),
-                    (server.socket.as_path(), 0o600),
-                ] {
-                    assert_eq!(
-                        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777,
-                        mode,
-                        "incorrect permissions on {}",
-                        path.display()
-                    );
-                }
-                let environment = server.environment();
-                assert_eq!(
-                    environment["SKYHOOK_ASKPASS_SOCKET"],
-                    server.socket.to_string_lossy()
-                );
-                assert_ne!(
-                    environment["SKYHOOK_ASKPASS_SOCKET"],
-                    std::env::var("SKYHOOK_ASKPASS_SOCKET").unwrap()
-                );
-                assert_eq!(
-                    request_password(&server.socket).await.expose(),
-                    "private-answer"
-                );
-            });
+            .unwrap();
+        runtime.block_on(async {
+            let server = AskpassServer::start(fixed("private-answer")).unwrap();
+            for (path, mode) in [
+                (server._directory.path(), 0o700),
+                (server.executable.as_path(), 0o700),
+                (server.socket.as_path(), 0o600),
+            ] {
+                let actual = std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+                assert_eq!(actual, mode, "incorrect permissions on {}", path.display());
+            }
+            let socket = &server.environment()["SKYHOOK_ASKPASS_SOCKET"];
+            assert_eq!(*socket, server.socket.to_string_lossy());
+            assert_ne!(*socket, std::env::var("SKYHOOK_ASKPASS_SOCKET").unwrap());
+            let answer = request_password(&server.socket).await;
+            assert_eq!(answer.expose(), "private-answer");
+        });
     }
 
     #[tokio::test]
     async fn concurrent_servers_have_independent_handlers_and_cleanup() {
-        let first_handler = Arc::new(FixedAnswer {
-            value: "first-answer",
-            calls: AtomicUsize::new(0),
-        });
-        let second_handler = Arc::new(FixedAnswer {
-            value: "second-answer",
-            calls: AtomicUsize::new(0),
-        });
+        let (first_handler, second_handler) = (fixed("first-answer"), fixed("second-answer"));
         let first = AskpassServer::start(first_handler.clone()).unwrap();
         let second = AskpassServer::start(second_handler.clone()).unwrap();
         assert_ne!(first._directory.path(), second._directory.path());
         assert_ne!(first.socket, second.socket);
         assert_ne!(first.executable, second.executable);
-        assert_ne!(
-            first.environment()["SSH_ASKPASS"],
-            second.environment()["SSH_ASKPASS"]
-        );
-        assert_ne!(
-            first.environment()["SKYHOOK_ASKPASS_SOCKET"],
-            second.environment()["SKYHOOK_ASKPASS_SOCKET"]
-        );
+        for key in ["SSH_ASKPASS", "SKYHOOK_ASKPASS_SOCKET"] {
+            assert_ne!(first.environment()[key], second.environment()[key]);
+        }
         let (first_answer, second_answer) = tokio::join!(
             request_password(&first.socket),
             request_password(&second.socket)
         );
         assert_eq!(first_answer.expose(), "first-answer");
         assert_eq!(second_answer.expose(), "second-answer");
-        assert_eq!(first_handler.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(second_handler.calls.load(Ordering::SeqCst), 1);
+        let calls = |handler: &FixedAnswer| handler.calls.load(Ordering::SeqCst);
+        assert_eq!((calls(&first_handler), calls(&second_handler)), (1, 1));
 
-        let first_directory = first._directory.path().to_path_buf();
-        let first_socket = first.socket.clone();
-        let first_executable = first.executable.clone();
+        let first_paths = [
+            first._directory.path().to_path_buf(),
+            first.socket.clone(),
+            first.executable.clone(),
+        ];
         drop(first);
-        assert!(!first_directory.exists());
-        assert!(!first_socket.exists());
-        assert!(!first_executable.exists());
-        assert!(second.socket.exists());
-        assert!(second.executable.exists());
-        assert_eq!(
-            request_password(&second.socket).await.expose(),
-            "second-answer"
-        );
-        assert_eq!(second_handler.calls.load(Ordering::SeqCst), 2);
+        assert!(first_paths.iter().all(|path| !path.exists()));
+        assert!(second.socket.exists() && second.executable.exists());
+        let answer = request_password(&second.socket).await;
+        assert_eq!(answer.expose(), "second-answer");
+        assert_eq!(calls(&second_handler), 2);
         let second_directory = second._directory.path().to_path_buf();
         drop(second);
         assert!(!second_directory.exists());
@@ -370,72 +353,53 @@ mod tests {
         assert!(authorize_peer_uid(1000, 1000).is_ok());
         assert!(authorize_peer_uid(0, 0).is_ok());
         for (peer, effective) in [(1001, 1000), (0, 1000), (1000, 0)] {
-            assert_eq!(
-                authorize_peer_uid(peer, effective).unwrap_err().kind(),
-                std::io::ErrorKind::PermissionDenied
-            );
+            let error = authorize_peer_uid(peer, effective).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         }
     }
 
     #[test]
     fn classifies_openssh_prompts_and_confirmation_hints() {
-        assert_eq!(classify("Password:", None), SensitivePromptKind::Password);
-        assert_eq!(
-            classify("Enter passphrase for key", None),
-            SensitivePromptKind::KeyPassphrase
-        );
-        assert_eq!(
-            classify("Are you sure (yes/no)?", None),
-            SensitivePromptKind::HostConfirmation
-        );
-        assert_eq!(
-            classify("Allow use of key?", Some("confirm")),
-            SensitivePromptKind::AgentConfirmation
-        );
+        for (prompt, hint, kind) in [
+            ("Password:", None, SensitivePromptKind::Password),
+            (
+                "Enter passphrase for key",
+                None,
+                SensitivePromptKind::KeyPassphrase,
+            ),
+            (
+                "Are you sure (yes/no)?",
+                None,
+                SensitivePromptKind::HostConfirmation,
+            ),
+            (
+                "Allow use of key?",
+                Some("confirm"),
+                SensitivePromptKind::AgentConfirmation,
+            ),
+        ] {
+            assert_eq!(classify(prompt, hint), kind);
+        }
     }
+
     #[tokio::test]
     async fn rejected_prompts_are_distinct_from_empty_secrets() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let task = tokio::spawn(serve_one(
-            server,
-            Arc::new(crate::remote::RejectSensitivePrompts),
-        ));
-        client
-            .write_all(br#"{"prompt":"Password:","hint":null}"#)
-            .await
-            .unwrap();
-        client.shutdown().await.unwrap();
-        let mut bytes = Vec::new();
-        client.read_to_end(&mut bytes).await.unwrap();
-        assert!(matches!(
-            serde_json::from_slice::<PromptAnswer>(&bytes).unwrap(),
-            PromptAnswer::Rejected
-        ));
+        let (client, server) = UnixStream::pair().unwrap();
+        let rejecting = Arc::new(crate::remote::RejectSensitivePrompts);
+        let task = tokio::spawn(serve_one(server, rejecting));
+        assert!(matches!(ask(client).await, PromptAnswer::Rejected));
         task.await.unwrap().unwrap();
-        assert!(matches!(
-            serde_json::from_str::<PromptAnswer>(r#"{"Accepted":""}"#).unwrap(),
-            PromptAnswer::Accepted(_)
-        ));
+        let empty = serde_json::from_str::<PromptAnswer>(r#"{"Accepted":""}"#).unwrap();
+        assert!(matches!(empty, PromptAnswer::Accepted(_)));
     }
+
     #[test]
     fn confirmation_denial_is_failure_and_empty_password_is_success() {
-        assert!(answer_value(PromptAnswer::Accepted(SecretValue::new("no".into())), true).is_err());
-        assert!(
-            answer_value(PromptAnswer::Accepted(SecretValue::new("yes".into())), true)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            answer_value(
-                PromptAnswer::Accepted(SecretValue::new(String::new())),
-                false
-            )
-            .unwrap()
-            .unwrap()
-            .expose(),
-            ""
-        );
-        let answer = PromptAnswer::Accepted(SecretValue::new("never-print-this".into()));
-        assert!(!format!("{answer:?}").contains("never-print-this"));
+        let accepted = |value: &str| PromptAnswer::Accepted(SecretValue::new(value.into()));
+        assert!(answer_value(accepted("no"), true).is_err());
+        assert!(answer_value(accepted("yes"), true).unwrap().is_none());
+        let empty = answer_value(accepted(""), false).unwrap().unwrap();
+        assert_eq!(empty.expose(), "");
+        assert!(!format!("{:?}", accepted("never-print-this")).contains("never-print-this"));
     }
 }

@@ -1,16 +1,39 @@
 //! Encode conversation history and request options as native Responses input.
 use super::*;
-use crate::provider::backends::common::{image_url, invalid, opaque_payload, tool_text};
-use crate::provider::protocol::{Message, ModelRequest, UserContent};
+use crate::media::AttachmentRef;
+use crate::provider::backends::common::{
+    attachment_text, image_url, invalid, opaque_payload, tool_text,
+};
+use crate::provider::protocol::{BlockContent, Message, ModelRequest, UserContent};
 
-pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
+/// Backend-private request envelope. Input is always an explicit array, including
+/// an intentionally empty conversation; vendor items and settings remain opaque.
+/// There is no raw-JSON constructor or deserializer that can omit this history.
+#[derive(Clone, Debug)]
+pub(crate) struct EncodedRequest {
+    pub(crate) input: Vec<Value>,
+    pub(crate) settings: serde_json::Map<String, Value>,
+}
+
+impl EncodedRequest {
+    /// Lower the envelope only when handing a request to an HTTP/WS transport.
+    pub(crate) fn into_wire(self) -> Value {
+        let mut body = self.settings;
+        // Keep the encoder's established key order (model, input, settings)
+        // as well as its JSON semantics when preserve_order is enabled.
+        body.shift_insert(1.min(body.len()), "input".into(), Value::Array(self.input));
+        Value::Object(body)
+    }
+}
+
+pub(crate) fn encode(request: &ModelRequest) -> Result<EncodedRequest, ProviderError> {
     if request.model.trim().is_empty() {
         return Err(invalid("Responses requires a nonempty model"));
     }
     // System cache flags are cross-provider hints. OpenAI automatically caches
     // matching prefixes and has no per-segment cache-control field.
     let mut input = Vec::new();
-    for message in &request.messages {
+    for message in request.messages() {
         match message {
             Message::User(parts) => {
                 let content = parts
@@ -22,9 +45,14 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
                         | UserContent::Compaction { text } => {
                             Ok(json!({"type":"input_text", "text":text}))
                         }
-                        UserContent::Image { image } => {
-                            Ok(json!({"type":"input_image", "image_url":image_url(image)?}))
-                        }
+                        UserContent::Attachment { attachment } => match attachment {
+                            AttachmentRef::Image(image) => {
+                                Ok(json!({"type":"input_image", "image_url":image_url(request, image)?}))
+                            }
+                            AttachmentRef::Text(text) => {
+                                Ok(json!({"type":"input_text", "text":attachment_text(request, text)?}))
+                            }
+                        },
                     })
                     .collect::<Result<Vec<_>, ProviderError>>()?;
                 input.push(json!({"role":"user", "content":content}));
@@ -37,7 +65,7 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
                             opaque_payload(&item.replay, "responses", &request.model)
                         {
                             if kind(native).map_err(|error| invalid(error.message))?
-                                != Kind::Reasoning
+                                != ItemKind::Reasoning
                             {
                                 return Err(invalid(
                                     "Responses reasoning envelope contains a non-reasoning item",
@@ -54,16 +82,8 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
                                 "role":"assistant", "content":[{"type":"output_text", "text":text}]
                             })),
                             BlockContent::ToolCall(call) => {
-                                if call.id.is_empty()
-                                    || call.name.is_empty()
-                                    || !call.arguments.is_object()
-                                {
-                                    return Err(invalid(
-                                        "Responses function calls require call ID, name and object arguments",
-                                    ));
-                                }
-                                input.push(json!({"type":"function_call", "call_id":call.id,
-                                    "name":call.name, "arguments":call.arguments.to_string()}));
+                                input.push(json!({"type":"function_call", "call_id":call.id(),
+                                    "name":call.name(), "arguments":serde_json::to_string(call.arguments()).expect("JSON object serialization cannot fail")}));
                             }
                             BlockContent::Reasoning { .. } => {}
                         }
@@ -84,7 +104,7 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
                             "Images from tool {} (call_id: {}):", result.name, result.call_id)})];
                         for image in &result.images {
                             content
-                                .push(json!({"type":"input_image", "image_url":image_url(image)?}));
+                                .push(json!({"type":"input_image", "image_url":image_url(request, image)?}));
                         }
                         input.push(json!({"role":"user", "content":content}));
                     }
@@ -92,17 +112,24 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
             }
         }
     }
-    let mut body = json!({"model":request.model, "input":input, "stream":true,
-        "store":false, "include":["reasoning.encrypted_content"],
-        "reasoning":{"summary":"auto"}});
+    let mut settings = serde_json::Map::from_iter([
+        ("model".into(), json!(request.model)),
+        ("stream".into(), json!(true)),
+        ("store".into(), json!(false)),
+        ("include".into(), json!(["reasoning.encrypted_content"])),
+        ("reasoning".into(), json!({"summary":"auto"})),
+    ]);
     if !request.system.is_empty() {
-        body["instructions"] = Value::String(
-            request
-                .system
-                .iter()
-                .map(|s| s.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n"),
+        settings.insert(
+            "instructions".into(),
+            Value::String(
+                request
+                    .system
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            ),
         );
     }
     if !request.tools.is_empty() {
@@ -116,7 +143,7 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
             tools.push(json!({"type":"function", "name":tool.name,
                 "description":tool.description, "parameters":tool.input_schema, "strict":false}));
         }
-        body["tools"] = Value::Array(tools);
+        settings.insert("tools".into(), Value::Array(tools));
     }
     if let Some(schema) = &request.response_schema {
         if schema.name.is_empty() || !schema.schema.is_object() {
@@ -124,8 +151,11 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
                 "Responses structured output requires a name and object JSON Schema",
             ));
         }
-        body["text"] = json!({"format":{"type":"json_schema", "name":schema.name,
-            "schema":schema.schema, "strict":true}});
+        settings.insert(
+            "text".into(),
+            json!({"format":{"type":"json_schema", "name":schema.name,
+            "schema":schema.schema, "strict":true}}),
+        );
     }
     if let Some(effort) = &request.reasoning {
         if !matches!(
@@ -136,33 +166,38 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
                 "Unsupported Responses reasoning effort: {effort}"
             )));
         }
-        body["reasoning"]["effort"] = json!(effort);
+        settings.insert(
+            "reasoning".into(),
+            json!({"summary":"auto", "effort":effort}),
+        );
     }
     if let Some(max) = request.max_output_tokens {
         if max == 0 {
             return Err(invalid("Responses max_output_tokens must be positive"));
         }
-        body["max_output_tokens"] = json!(max);
+        settings.insert("max_output_tokens".into(), json!(max));
     }
     if let Some(correlation) = &request.correlation {
-        body["prompt_cache_key"] = json!(correlation);
+        settings.insert("prompt_cache_key".into(), json!(correlation));
     }
-    Ok(body)
+    Ok(EncodedRequest { input, settings })
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::fixtures::{call_item, completed, reasoning_item};
     use super::*;
     use crate::provider::backends::common::tests::request;
     use crate::{
-        media::ImageReference,
+        media::{AttachmentRef, BlobRef, ImageFormat, ImageRef, TextRef},
         provider::protocol::{
-            AssistantItem, ResponseSchema, SystemSegment, ToolDefinition, ToolResult,
+            AssistantItem, ResponseAssembler, ResponseSchema, SystemSegment, ToolDefinition,
+            ToolResult,
         },
     };
 
     fn assemble(output: Vec<Value>) -> Vec<AssistantItem> {
-        let mut assembler = crate::provider::protocol::ResponseAssembler::default();
+        let mut assembler = ResponseAssembler::default();
         for event in Decoder::new("gpt-5".into())
             .feed(completed(output))
             .unwrap()
@@ -172,34 +207,56 @@ mod tests {
         assembler.finish().unwrap().0
     }
 
-    fn completed(output: Vec<Value>) -> Value {
-        json!({"type":"response.completed", "response":{"status":"completed", "output":output,
-            "usage":{"input_tokens":20, "output_tokens":7, "input_tokens_details":{"cached_tokens":12}}}})
-    }
-
     fn text_item(id: &str, text: &str) -> Value {
         json!({"type":"message", "id":id, "role":"assistant",
             "content":[{"type":"output_text", "text":text}]})
     }
 
-    fn call_item() -> Value {
-        json!({"type":"function_call", "id":"fc_1", "call_id":"call_1", "name":"search",
-            "arguments":"{\"query\":\"rust\"}", "status":"completed"})
-    }
-
-    fn reasoning_item() -> Value {
-        json!({"type":"reasoning", "id":"rs_1", "encrypted_content":"secret",
-            "summary":[{"type":"summary_text", "text":"first"}, {"type":"summary_text", "text":"second"}]})
-    }
-
-    fn image() -> ImageReference {
-        ImageReference {
-            sha256: "hash".into(),
-            media_type: "image/png".into(),
-            name: "image.png".into(),
-            bytes: 1,
-            data_base64: Some("YQ==".into()),
+    fn image() -> ImageRef {
+        ImageRef {
+            file: Some("image.png".into()),
+            format: ImageFormat::Png,
+            blob: BlobRef::of(b"a"),
         }
+    }
+
+    fn notes() -> TextRef {
+        TextRef {
+            file: Some("notes.txt".into()),
+            blob: BlobRef::of(b"notes"),
+        }
+    }
+
+    fn user(text: &str) -> Message {
+        Message::User(vec![UserContent::Text { text: text.into() }])
+    }
+
+    fn tool_result(result: Value, images: Vec<ImageRef>, is_error: bool) -> Message {
+        Message::Tool(vec![ToolResult {
+            call_id: "call_1".into(),
+            name: "search".into(),
+            result,
+            images,
+            is_error,
+        }])
+    }
+
+    #[test]
+    fn empty_history_is_explicit_and_http_envelope_is_unchanged() {
+        let mut req = request("gpt-5");
+        req.history.clear();
+        req.max_output_tokens = None;
+        let encoded = encode(&req).unwrap();
+        assert!(encoded.input.is_empty());
+        assert!(!encoded.settings.contains_key("input"));
+        assert_eq!(
+            encoded.into_wire(),
+            json!({
+                "model":"gpt-5", "input":[], "stream":true, "store":false,
+                "include":["reasoning.encrypted_content"],
+                "reasoning":{"summary":"auto"}
+            })
+        );
     }
 
     #[test]
@@ -214,65 +271,61 @@ mod tests {
             description: "Search".into(),
             input_schema: json!({"type":"object"}),
         }];
+        let schema = json!({"type":"object", "properties":{}, "additionalProperties":false});
         req.response_schema = Some(ResponseSchema {
             name: "answer".into(),
-            schema: json!({"type":"object", "properties":{}, "additionalProperties":false}),
+            schema: schema.clone(),
         });
         req.reasoning = Some("high".into());
         req.correlation = Some("session".into());
-        req.messages = vec![
-            Message::User(vec![
-                UserContent::Text {
-                    text: "look".into(),
-                },
-                UserContent::Image { image: image() },
-            ]),
-            Message::Tool(vec![ToolResult {
-                call_id: "call_1".into(),
-                name: "search".into(),
-                result: json!({"answer":42, "error":null}),
-                images: vec![image()],
-                is_error: true,
-            }]),
+        let attach = |attachment| UserContent::Attachment { attachment };
+        let Message::User(mut content) = user("look") else {
+            unreachable!()
+        };
+        content.extend([
+            attach(AttachmentRef::Image(image())),
+            attach(AttachmentRef::Text(notes())),
+        ]);
+        req.history = vec![
+            Message::User(content),
+            tool_result(json!({"answer":42, "error":null}), vec![image()], true),
         ];
-        let body = encode(&req).unwrap();
+        assert!(encode(&req).is_err());
+        // Load the fixture blobs as the session store would.
+        req.blobs.insert(image().blob, b"a".to_vec());
+        req.blobs.insert(notes().blob, b"notes".to_vec());
+        let body = encode(&req).unwrap().into_wire();
+        let image_url = "data:image/png;base64,YQ==";
         assert_eq!(body["instructions"], "system");
         assert_eq!(body["tools"][0]["name"], "search");
-        assert_eq!(
-            body["text"]["format"]["schema"],
-            req.response_schema.unwrap().schema
-        );
+        assert_eq!(body["text"]["format"]["schema"], schema);
         assert_eq!(
             body["reasoning"],
             json!({"effort":"high", "summary":"auto"})
         );
         assert_eq!(body["prompt_cache_key"], "session");
-        assert_eq!(body["input"][0]["content"][0]["text"], "look");
+        let content = &body["input"][0]["content"];
+        assert_eq!(content[0]["text"], "look");
+        assert_eq!(content[1]["image_url"], image_url);
         assert_eq!(
-            body["input"][0]["content"][1]["image_url"],
-            "data:image/png;base64,YQ=="
+            content[2],
+            json!({"type":"input_text", "text":"File: notes.txt\nnotes"})
         );
         assert_eq!(body["input"][1]["call_id"], "call_1");
         let result: Value =
             serde_json::from_str(body["input"][1]["output"].as_str().unwrap()).unwrap();
         assert_eq!(result, json!({"result":{"answer":42},"is_error":true}));
-        assert_eq!(
-            body["input"][2]["content"][1]["image_url"],
-            "data:image/png;base64,YQ=="
-        );
+        assert_eq!(body["input"][2]["content"][1]["image_url"], image_url);
     }
 
     #[test]
     fn reasoning_from_other_providers_or_models_is_not_replayed() {
         for (provider, model) in [("anthropic", "gpt-5"), ("responses", "other-model")] {
             let mut req = request("gpt-5");
-            req.messages = vec![Message::Assistant(vec![AssistantItem::reasoning(
-                "r",
-                0,
-                "private",
-                Some(reasoning_envelope(provider, model, reasoning_item())),
-            )])];
-            assert_eq!(encode(&req).unwrap()["input"], json!([]));
+            let envelope = reasoning_envelope(provider, model, reasoning_item());
+            let reasoning = AssistantItem::reasoning("r", 0, "private", Some(envelope));
+            req.history = vec![Message::Assistant(vec![reasoning])];
+            assert_eq!(encode(&req).unwrap().into_wire()["input"], json!([]));
         }
     }
 
@@ -287,35 +340,31 @@ mod tests {
         let native = json!({"type":"reasoning", "id":"rs_opaque", "summary":[],
             "encrypted_content":"opaque+/=", "future_state":{"signature":"unchanged"},
             "content":[{"type":"reasoning_text", "text":"native reasoning text"}]});
-        let mut assembler = crate::provider::protocol::ResponseAssembler::default();
-        for mut chunk in Decoder::new(req.model.clone())
+        let mut assembler = ResponseAssembler::default();
+        let chunks = Decoder::new(req.model.clone())
             .feed(completed(vec![native.clone(), call_item()]))
-            .unwrap()
-        {
+            .unwrap();
+        for mut chunk in chunks {
             bind_reasoning_scope(&mut chunk, &scope);
             assembler.push(&chunk).unwrap();
         }
         let (items, _, reason) = assembler.finish().unwrap();
-        assert_eq!(reason, StopReason::ToolUse);
-        assert_eq!(items[0].blocks.len(), 1);
-        req.messages = vec![
+        assert_eq!((reason, items[0].blocks.len()), (StopReason::ToolUse, 1));
+        req.history = vec![
             Message::Assistant(items),
-            Message::Tool(vec![ToolResult {
-                call_id: "call_1".into(),
-                name: "search".into(),
-                result: json!({"found":true}),
-                images: vec![],
-                is_error: false,
-            }]),
+            tool_result(json!({"found":true}), vec![], false),
         ];
         let original = resume_request(&req).await;
         let mut matching = original.clone();
         filter_reasoning_scope(&mut matching, &scope);
-        let body = encode(&matching).unwrap();
-        assert_eq!(body["input"][0], native);
-        assert_eq!(body["input"][1]["type"], "function_call");
-        assert_eq!(body["input"][2]["type"], "function_call_output");
-        assert_eq!(body["input"][1]["call_id"], body["input"][2]["call_id"]);
+        let body = encode(&matching).unwrap().into_wire();
+        let input = &body["input"];
+        assert_eq!(input[0], native);
+        assert_eq!(
+            (&input[1]["type"], &input[2]["type"]),
+            (&json!("function_call"), &json!("function_call_output"))
+        );
+        assert_eq!(input[1]["call_id"], input[2]["call_id"]);
 
         for foreign_scope in [
             reasoning_scope("other-provider", "https://api.example/v1/responses"),
@@ -323,36 +372,25 @@ mod tests {
         ] {
             let mut foreign = original.clone();
             filter_reasoning_scope(&mut foreign, &foreign_scope);
-            let Message::Assistant(items) = &foreign.messages[0] else {
+            let Message::Assistant(items) = &foreign.history[0] else {
                 unreachable!()
             };
-            assert_eq!(items.len(), 2);
-            assert_eq!(items[0].blocks.len(), 1);
+            assert_eq!((items.len(), items[0].blocks.len()), (2, 1));
             assert!(items[0].replay.is_none());
-            assert_eq!(
-                encode(&foreign).unwrap()["input"],
-                json!([body["input"][1].clone(), body["input"][2].clone()])
-            );
+            let wire = encode(&foreign).unwrap().into_wire();
+            assert_eq!(wire["input"], json!([input[1].clone(), input[2].clone()]));
         }
         // Filtering a call-time clone must never destroy resumable journal state.
-        assert_eq!(encode(&original).unwrap()["input"][0], native);
+        assert_eq!(encode(&original).unwrap().into_wire()["input"][0], native);
     }
 
     #[test]
     fn reasoning_summary_and_effort_options() {
         let mut req = request("gpt-5");
-        for effort in [
-            None,
-            Some("none"),
-            Some("minimal"),
-            Some("low"),
-            Some("medium"),
-            Some("high"),
-            Some("xhigh"),
-            Some("max"),
-        ] {
+        let efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+        for effort in std::iter::once(None).chain(efforts.map(Some)) {
             req.reasoning = effort.map(str::to_owned);
-            let body = encode(&req).unwrap();
+            let body = encode(&req).unwrap().into_wire();
             assert_eq!(body["reasoning"]["summary"], "auto");
             assert_eq!(
                 body["reasoning"].get("effort"),
@@ -374,28 +412,15 @@ mod tests {
             call_item(),
         ]);
         let mut req = request("gpt-5");
-        req.messages = vec![
-            Message::User(vec![UserContent::Text {
-                text: "look it up".into(),
-            }]),
+        req.history = vec![
+            user("look it up"),
             Message::Assistant(items),
-            Message::Tool(vec![ToolResult {
-                call_id: "call_1".into(),
-                name: "search".into(),
-                result: json!({"value":42}),
-                images: vec![],
-                is_error: false,
-            }]),
+            tool_result(json!({"value":42}), vec![], false),
         ];
-        let encoded = encode(&req).unwrap();
+        let encoded = encode(&req).unwrap().into_wire();
         let input = encoded["input"].as_array().unwrap();
-        assert_eq!(
-            input
-                .iter()
-                .filter(|item| item["type"] == "reasoning")
-                .count(),
-            1
-        );
+        let reasoning = input.iter().filter(|item| item["type"] == "reasoning");
+        assert_eq!(reasoning.count(), 1);
         assert_eq!(input[1], native_reasoning);
         assert_eq!(
             input[2]["content"][0],
@@ -405,15 +430,16 @@ mod tests {
             input[3],
             json!({"type":"function_call", "call_id":"call_1", "name":"search", "arguments":"{\"query\":\"rust\"}"})
         );
-        assert_eq!(input[4]["type"], "function_call_output");
-        assert_eq!(input[4]["call_id"], "call_1");
+        assert_eq!(
+            (&input[4]["type"], &input[4]["call_id"]),
+            (&json!("function_call_output"), &json!("call_1"))
+        );
 
-        let followup = assemble(vec![text_item("answer", "42")]);
-        req.messages.push(Message::Assistant(followup));
-        req.messages.push(Message::User(vec![UserContent::Text {
-            text: "thanks".into(),
-        }]));
-        let replayed = encode(&req).unwrap();
+        req.history.push(Message::Assistant(assemble(vec![text_item(
+            "answer", "42",
+        )])));
+        req.history.push(user("thanks"));
+        let replayed = encode(&req).unwrap().into_wire();
         let replayed = replayed["input"].as_array().unwrap();
         assert_eq!(&replayed[..input.len()], input.as_slice());
         assert_eq!(replayed[5]["content"][0]["text"], "42");

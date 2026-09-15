@@ -1,6 +1,4 @@
-use super::*;
 use crate::tests::Fixture;
-use clap::Parser;
 use std::{fs, path::Path, process::Output};
 
 fn write(path: &Path, text: &str) {
@@ -23,42 +21,6 @@ fn no_session(f: &Fixture) {
     assert!(!f.path(".skyhook/sessions").exists());
     assert!(!f.path("project/.skyhook/sessions").exists());
     assert!(!f.path("state/skyhook/ui.json").exists());
-}
-
-#[test]
-fn dump_selectors_and_execution_conflicts() {
-    for args in [
-        vec!["skyhook", "--dump"],
-        vec!["skyhook", "--dump", "config"],
-    ] {
-        assert_eq!(
-            Args::try_parse_from(args).unwrap().dump,
-            Some(DumpKind::Config)
-        );
-    }
-    assert_eq!(
-        Args::try_parse_from(["skyhook", "--dump", "skills"])
-            .unwrap()
-            .dump,
-        Some(DumpKind::Skills)
-    );
-    for extra in [
-        vec!["--prompt", "hello"],
-        vec!["--script", "run.js"],
-        vec!["--model", "first"],
-        vec!["--non-interactive"],
-        vec!["--resume", "00000000000000000000000000000001"],
-    ] {
-        let mut args = vec!["skyhook", "--dump=config"];
-        args.extend(extra);
-        assert!(Args::try_parse_from(args).is_err());
-    }
-    assert!(Args::try_parse_from(["skyhook", "--dump", "unknown"]).is_err());
-    let auth = Args::try_parse_from(["skyhook", "--dump=config", "auth", "status"]).unwrap();
-    assert!(validate_options(&auth).is_err());
-    let irrelevant =
-        Args::try_parse_from(["skyhook", "--dump", "skills", "--config", "other.toml"]).unwrap();
-    assert!(validate_options(&irrelevant).is_err());
 }
 
 #[test]

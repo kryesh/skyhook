@@ -4,25 +4,82 @@ use std::{
     sync::Arc,
 };
 
+use super::skill_transfer::MAX_COPY_BYTES;
+use crate::bounded_io::{BoundedReadError, read_bounded};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::{fs, io::AsyncReadExt};
+use tokio::fs;
 
-use super::filesystem::detect_image;
 use crate::tool::{
     RegistryError, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder, policy::Capability,
 };
 use crate::{
-    media::{ImageReference, MAX_IMAGE_BYTES},
+    media::{ImageRef, MAX_IMAGE_BYTES},
     session::SessionStore,
 };
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SkillArgs {
+    name: String,
+    /// Relative file or directory within the skill; `.` lists its root. Omitted or null loads instructions.
+    #[serde(default)]
+    path: Option<String>,
+    /// Destination file path for copying an asset; requires path. Omitted or null reads without copying.
+    #[serde(default)]
+    to: Option<String>,
+}
+
+struct SkillRequest {
+    name: String,
+    operation: SkillOperation,
+}
+
+enum SkillOperation {
+    Instructions,
+    Inspect { asset: String },
+    Copy { asset: String, destination: String },
+}
+
+impl TryFrom<SkillArgs> for SkillRequest {
+    type Error = ToolError;
+
+    fn try_from(args: SkillArgs) -> Result<Self, Self::Error> {
+        // Check blank fields in the existing order, but never trim the retained
+        // name, asset or destination: spaces may be meaningful filename bytes.
+        for (name, value) in [
+            ("name", Some(args.name.as_str())),
+            ("path", args.path.as_deref()),
+            ("to", args.to.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                return Err(ToolError::InvalidArguments(format!(
+                    "{name} must not be empty"
+                )));
+            }
+        }
+        let operation = match (args.path, args.to) {
+            (None, None) => SkillOperation::Instructions,
+            (None, Some(_)) => {
+                return Err(ToolError::InvalidArguments("to requires path".to_owned()));
+            }
+            (Some(asset), None) => SkillOperation::Inspect { asset },
+            // Destination is an ordinary authorized workspace path, NOT a
+            // confined skill source: absolute paths and `..` remain valid.
+            (Some(asset), Some(destination)) => SkillOperation::Copy { asset, destination },
+        };
+        Ok(Self {
+            name: args.name,
+            operation,
+        })
+    }
+}
 
 #[path = "skills_inventory.rs"]
 mod inventory;
 pub use inventory::{SkillAsset, SkillAssetKind, SkillInventory, SkillInventoryEntry};
 
 const MAX_INLINE_BYTES: u64 = 1024 * 1024;
-const MAX_COPY_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DESCRIPTION_CHARS: usize = 512;
 
 #[derive(Clone, Default)]
@@ -181,17 +238,17 @@ async fn load_skill(path: &Path) -> Result<SkillEntry, String> {
     if metadata.len() > MAX_INLINE_BYTES {
         return Err(format!("SKILL.md exceeds {MAX_INLINE_BYTES} bytes"));
     }
-    let mut bytes = Vec::new();
-    fs::File::open(&instruction_path)
-        .await
-        .map_err(|error| error.to_string())?
-        .take(MAX_INLINE_BYTES + 1)
-        .read_to_end(&mut bytes)
+    let mut input = fs::File::open(&instruction_path)
         .await
         .map_err(|error| error.to_string())?;
-    if bytes.len() as u64 > MAX_INLINE_BYTES {
-        return Err(format!("SKILL.md exceeds {MAX_INLINE_BYTES} bytes"));
-    }
+    let bytes = read_bounded(&mut input, MAX_INLINE_BYTES as usize)
+        .await
+        .map_err(|error| match error {
+            BoundedReadError::TooLarge { .. } => {
+                format!("SKILL.md exceeds {MAX_INLINE_BYTES} bytes")
+            }
+            BoundedReadError::Io(error) => error.to_string(),
+        })?;
     let instructions = String::from_utf8(bytes).map_err(|error| error.to_string())?;
     let (description, frontmatter) = parse_instructions(&instructions)?;
     Ok(SkillEntry {
@@ -265,98 +322,121 @@ pub(super) fn register(
         },
     )?;
 
-    let schema = serde_json::to_value(schemars::schema_for!(SkillArgs))
-        .map_err(|error| RegistryError::Schema(error.to_string()))?;
-    let output_schema = serde_json::to_value(schemars::schema_for!(SkillOutput))
-        .map_err(|error| RegistryError::Schema(error.to_string()))?;
-    builder.register_dynamic(
+    builder.register_product::<SkillArgs, SkillOutput, _, _>(
         "skill",
         "Load complete skill instructions and discover assets. Select a relative path to list a directory (use `.` for the root), read text, attach a supported image, or inspect binary metadata. Supply `to` to copy a file into the workspace.",
-        schema,
-        ToolOptions::new(vec![Capability::Read])
-            .output_schema(output_schema)
-            .argument_validator(|arguments| {
-                let args: SkillArgs = serde_json::from_value(arguments.clone())
-                    .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
-                // Copy permissions are scoped to the caller by skill_transfer, not this host tool.
-                args.validate()
-            }),
-        move |context, arguments| {
+        // Copy permissions are scoped to the caller by skill_transfer, not this host tool.
+        ToolOptions::new(vec![Capability::Read]).argument_validator(|arguments| {
+            let args: SkillArgs = serde_json::from_value(arguments.clone())
+                .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+            SkillRequest::try_from(args).map(drop)
+        }),
+        move |context, args| {
             let skills = skills.clone();
             let store = store.clone();
             let router = router.clone();
             async move {
-                let args: SkillArgs = serde_json::from_value(arguments)
-                    .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
-                args.validate()?;
-                let entry = skills.get(&args.name)?;
-                let Some(asset) = args.path else {
-                    return skill_output(SkillOutput::Skill {
+                let SkillRequest { name, operation } = SkillRequest::try_from(args)?;
+                let entry = skills.get(&name)?;
+                match operation {
+                    SkillOperation::Instructions => skill_output(SkillOutput::Skill {
                         name: entry.name.clone(),
                         description: entry.description.clone(),
                         content: entry.instructions.clone(),
                         assets: asset_tree(&entry.root, true).await?,
-                    });
-                };
-                let source = resolve_asset(entry, &asset).await?;
-                let metadata = fs::metadata(&source).await?;
-                if metadata.is_dir() && args.to.is_none() {
-                    return skill_output(SkillOutput::Directory {
-                        name: entry.name.clone(),
-                        path: asset,
-                        assets: asset_tree(&source, false).await?,
-                    });
-                }
-                if !metadata.is_file() {
-                    return Err(ToolError::Failed("skill asset is not a file; directories cannot be copied".to_owned()));
-                }
-                let maximum = if args.to.is_some() { MAX_COPY_BYTES } else { MAX_COPY_BYTES.max(MAX_IMAGE_BYTES) };
-                if metadata.len() > maximum {
-                    return Err(ToolError::Failed(format!("skill asset exceeds {maximum} bytes")));
-                }
-                // Bound the actual read too, in case the asset grows after the metadata check.
-                let mut bytes = Vec::new();
-                fs::File::open(&source).await?.take(maximum + 1).read_to_end(&mut bytes).await?;
-                if bytes.len() as u64 > maximum {
-                    return Err(ToolError::Failed(format!("skill asset exceeds {maximum} bytes")));
-                }
-                if let Some(destination) = args.to {
-                    let destination = super::skill_transfer::copy(&router, &context, &destination, &bytes).await?;
-                    return skill_output(SkillOutput::Copied {
-                        name: entry.name.clone(), path: asset, to: destination,
-                        bytes: bytes.len(), sha256: crate::sha256_hex(&bytes),
-                    });
-                }
-                if let Some(media_type) = detect_image(&bytes) {
-                    if bytes.len() as u64 > MAX_IMAGE_BYTES {
-                        return Err(ToolError::Failed(format!("image exceeds {MAX_IMAGE_BYTES} bytes")));
+                    }),
+                    SkillOperation::Inspect { asset } => inspect_asset(entry, asset, &store).await,
+                    SkillOperation::Copy { asset, destination } => {
+                        let source = resolve_asset(entry, &asset).await?;
+                        let metadata = fs::metadata(&source).await?;
+                        let bytes = read_asset(&source, &metadata, MAX_COPY_BYTES).await?;
+                        let destination = super::skill_transfer::copy(&router, &context, &destination, &bytes).await?;
+                        skill_output(SkillOutput::Copied {
+                            name: entry.name.clone(), path: asset, to: destination,
+                            bytes: bytes.len(), sha256: crate::sha256_hex(&bytes),
+                        })
                     }
-                    let name = Path::new(&asset).file_name().and_then(|name| name.to_str())
-                        .ok_or_else(|| ToolError::Failed("image filename is not UTF-8".to_owned()))?;
-                    let image = store.import_blob(&bytes, name.to_owned(), media_type.to_owned()).await
-                        .map_err(|error| ToolError::Failed(error.to_string()))?;
-                    return Ok(skill_output(SkillOutput::Image {
-                        name: entry.name.clone(), path: asset, image: image.clone(),
-                    })?.with_images(vec![image]));
                 }
-                if let Some(content) = text_content(&bytes) {
-                    if bytes.len() as u64 > MAX_INLINE_BYTES {
-                        return Err(ToolError::Failed(format!("text skill asset exceeds {MAX_INLINE_BYTES} bytes; use `to` to copy it")));
-                    }
-                    return skill_output(SkillOutput::Text {
-                        name: entry.name.clone(), path: asset,
-                        bytes: bytes.len(), content: content.to_owned(),
-                    });
-                }
-                skill_output(SkillOutput::Binary {
-                    name: entry.name.clone(), path: asset,
-                    bytes: bytes.len(),
-                    note: "Binary asset contents are not inlined. Supply `to` with a destination file path to copy this asset into the workspace.".to_owned(),
-                })
             }
         },
     )?;
     Ok(())
+}
+
+async fn read_asset(
+    source: &Path,
+    metadata: &std::fs::Metadata,
+    maximum: usize,
+) -> Result<Vec<u8>, ToolError> {
+    if !metadata.is_file() {
+        return Err(ToolError::Failed(
+            "skill asset is not a file; directories cannot be copied".to_owned(),
+        ));
+    }
+    let exceeds = || ToolError::Failed(format!("skill asset exceeds {maximum} bytes"));
+    if metadata.len() > maximum as u64 {
+        return Err(exceeds());
+    }
+    let mut input = fs::File::open(source).await?;
+    read_bounded(&mut input, maximum)
+        .await
+        .map_err(|error| match error {
+            BoundedReadError::TooLarge { .. } => exceeds(),
+            BoundedReadError::Io(error) => error.into(),
+        })
+}
+
+async fn inspect_asset(
+    entry: &SkillEntry,
+    asset: String,
+    store: &SessionStore,
+) -> Result<ToolOutput, ToolError> {
+    let source = resolve_asset(entry, &asset).await?;
+    let metadata = fs::metadata(&source).await?;
+    if metadata.is_dir() {
+        return skill_output(SkillOutput::Directory {
+            name: entry.name.clone(),
+            path: asset,
+            assets: asset_tree(&source, false).await?,
+        });
+    }
+    let bytes = read_asset(
+        &source,
+        &metadata,
+        MAX_COPY_BYTES.max(MAX_IMAGE_BYTES as usize),
+    )
+    .await?;
+    if crate::media::ImageFormat::sniff(&bytes).is_some() {
+        let image = crate::media::Image::new(bytes)
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        let image = store
+            .store_image(Some(asset.clone()), &image)
+            .await
+            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        return Ok(skill_output(SkillOutput::Image {
+            name: entry.name.clone(),
+            path: asset,
+            image: image.clone(),
+        })?
+        .with_images(vec![image]));
+    }
+    if let Some(content) = text_content(&bytes) {
+        if bytes.len() as u64 > MAX_INLINE_BYTES {
+            return Err(ToolError::Failed(format!(
+                "text skill asset exceeds {MAX_INLINE_BYTES} bytes; use `to` to copy it"
+            )));
+        }
+        return skill_output(SkillOutput::Text {
+            name: entry.name.clone(),
+            path: asset,
+            bytes: bytes.len(),
+            content: content.to_owned(),
+        });
+    }
+    skill_output(SkillOutput::Binary {
+        name: entry.name.clone(), path: asset, bytes: bytes.len(),
+        note: "Binary asset contents are not inlined. Supply `to` with a destination file path to copy this asset into the workspace.".to_owned(),
+    })
 }
 
 fn skill_output(output: SkillOutput) -> Result<ToolOutput, ToolError> {
@@ -429,10 +509,11 @@ async fn asset_tree(root: &Path, exclude_instructions: bool) -> Result<String, T
     Ok(tree)
 }
 
-async fn resolve_asset(entry: &SkillEntry, asset: &str) -> Result<PathBuf, ToolError> {
-    let relative = Path::new(asset);
+/// A nonblank relative source with no parent/root/prefix components. This does
+/// not prove existence, file kind, or containment after following symlinks.
+fn check_asset_syntax(asset: &str) -> Result<(), ToolError> {
     if asset.trim().is_empty()
-        || relative
+        || Path::new(asset)
             .components()
             .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
     {
@@ -440,7 +521,13 @@ async fn resolve_asset(entry: &SkillEntry, asset: &str) -> Result<PathBuf, ToolE
             "asset path must be relative and cannot contain `..`".to_owned(),
         ));
     }
-    let source = fs::canonicalize(entry.root.join(relative)).await?;
+    Ok(())
+}
+
+// Canonicalization checks actual symlink containment at use time; it is not TOCTOU immunity.
+async fn resolve_asset(entry: &SkillEntry, asset: &str) -> Result<PathBuf, ToolError> {
+    check_asset_syntax(asset)?;
+    let source = fs::canonicalize(entry.root.join(asset)).await?;
     if !source.starts_with(&entry.root) {
         return Err(ToolError::Failed(
             "skill asset escapes its skill directory".to_owned(),
@@ -452,38 +539,6 @@ async fn resolve_asset(entry: &SkillEntry, asset: &str) -> Result<PathBuf, ToolE
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct NoArgs {}
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct SkillArgs {
-    name: String,
-    /// Relative file or directory within the skill; `.` lists its root. Omitted or null loads instructions.
-    #[serde(default)]
-    path: Option<String>,
-    /// Destination file path for copying an asset; requires path. Omitted or null reads without copying.
-    #[serde(default)]
-    to: Option<String>,
-}
-
-impl SkillArgs {
-    fn validate(&self) -> Result<(), ToolError> {
-        for (name, value) in [
-            ("name", Some(self.name.as_str())),
-            ("path", self.path.as_deref()),
-            ("to", self.to.as_deref()),
-        ] {
-            if value.is_some_and(|value| value.trim().is_empty()) {
-                return Err(ToolError::InvalidArguments(format!(
-                    "{name} must not be empty"
-                )));
-            }
-        }
-        if self.to.is_some() && self.path.is_none() {
-            return Err(ToolError::InvalidArguments("to requires path".to_owned()));
-        }
-        Ok(())
-    }
-}
 
 #[derive(Serialize, JsonSchema)]
 struct SkillSummary {
@@ -510,7 +565,7 @@ enum SkillOutput {
     Image {
         name: String,
         path: String,
-        image: ImageReference,
+        image: ImageRef,
     },
     Binary {
         name: String,
@@ -538,11 +593,83 @@ enum SkillOutput {
 mod tests {
     use std::sync::Arc;
 
+    use serde_json::{Value, json};
+
     use super::*;
     use crate::{
         session::SessionStore,
-        tool::{ToolRegistryBuilder, executor::ToolExecutor, policy::AllowAll},
+        tests::TestRuntime,
+        tool::{ToolRegistryBuilder, executor::ExecutionError, policy::AllowAll},
     };
+
+    #[test]
+    fn skill_requests_admit_operations_and_reject_blank_or_malformed_fields() {
+        let request = |value| {
+            serde_json::from_value::<SkillArgs>(value)
+                .map_err(|error| ToolError::InvalidArguments(error.to_string()))
+                .and_then(SkillRequest::try_from)
+        };
+        let operation = |value| request(value).unwrap().operation;
+        assert!(matches!(
+            operation(json!({"name":"demo","path":null,"to":null})),
+            SkillOperation::Instructions
+        ));
+        assert!(matches!(
+            operation(json!({"name":"demo","path":"."})),
+            SkillOperation::Inspect { asset } if asset == "."
+        ));
+        // Copy destinations are ordinary workspace paths; nothing is trimmed.
+        let copy = request(json!({"name":" demo ","path":" asset ","to":"../x"})).unwrap();
+        assert_eq!(copy.name, " demo ");
+        assert!(matches!(
+            copy.operation,
+            SkillOperation::Copy { asset, destination } if asset == " asset " && destination == "../x"
+        ));
+        for value in [
+            json!({}),
+            json!({"name":1}),
+            json!({"name":" \t\n"}),
+            json!({"name":"demo","path":" "}),
+            json!({"name":"demo","path":"file","to":"\t"}),
+            json!({"name":"demo","to":"copy"}),
+            json!({"name":"demo","unknown":1}),
+        ] {
+            let result = request(value.clone());
+            assert!(
+                matches!(result, Err(ToolError::InvalidArguments(_))),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn asset_syntax_is_confined_without_normalizing_spelling() {
+        for value in [
+            "",
+            " \n",
+            "/absolute",
+            "..",
+            "../file",
+            "a/../b",
+            "a/..",
+            "./../file",
+        ] {
+            assert!(check_asset_syntax(value).is_err(), "{value:?}");
+        }
+        for value in [
+            ".",
+            "./",
+            "file",
+            "a/b",
+            "./a//b",
+            " leading ",
+            "a/ trailing ",
+            "...",
+            "a/./b",
+        ] {
+            check_asset_syntax(value).unwrap();
+        }
+    }
 
     fn register(
         builder: &mut ToolRegistryBuilder,
@@ -556,12 +683,15 @@ mod tests {
             Arc::new(crate::remote::RejectSensitivePrompts),
             authorization.clone(),
         );
-        let router = crate::target::TargetRouter::new(
-            crate::target::TargetRegistry::default(),
-            remote,
-            authorization,
-        );
+        let targets = crate::target::TargetRegistry::default();
+        let router = crate::target::TargetRouter::new(targets, remote, authorization);
         super::register(builder, skills, store, router)
+    }
+
+    fn builder(runtime: &TestRuntime, skills: HostSkills) -> ToolRegistryBuilder {
+        let mut builder = ToolRegistryBuilder::default();
+        register(&mut builder, skills, runtime.store.clone()).unwrap();
+        builder
     }
 
     async fn fixture_skills() -> HostSkills {
@@ -571,7 +701,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_skill_arguments_are_rejected_before_authorization() {
+    async fn invalid_arguments_and_read_only_copy_never_write_or_authorize_malformed_requests() {
         use crate::tool::policy::{AuthorizationRequest, Policy, PolicyFuture};
         struct UnexpectedAuthorization;
         impl Policy for UnexpectedAuthorization {
@@ -579,51 +709,40 @@ mod tests {
                 panic!("malformed skill arguments must not request authorization");
             }
         }
-        let runtime = crate::tests::TestRuntime::new().await;
-        let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder, fixture_skills().await, runtime.store.clone()).unwrap();
-        let executor = ToolExecutor::new(
-            builder.build(),
+        let runtime = TestRuntime::new().await;
+        let agent = &runtime.agent;
+        let strict = runtime.executor_with_policy(
+            builder(&runtime, fixture_skills().await),
             Arc::new(UnexpectedAuthorization),
-            runtime.jobs.clone(),
-            runtime.root.path().to_path_buf(),
         );
+        let before = runtime.jobs.list(agent).await.len();
         for args in [
-            serde_json::json!({}),
-            serde_json::json!({"name":""}),
-            serde_json::json!({"name":"mixed-assets", "to":"copied"}),
-            serde_json::json!({"name":"mixed-assets", "path":"", "to":"copied"}),
+            json!({}),
+            json!({"name":""}),
+            json!({"name":"mixed-assets", "to":"copied"}),
+            json!({"name":"mixed-assets", "path":"", "to":"copied"}),
         ] {
+            let result = strict.run_host(agent, "skill", args).await;
             assert!(matches!(
-                executor
-                    .execute(runtime.agent.clone(), "skill", args, None)
-                    .await,
-                Err(crate::tool::executor::ExecutionError::Tool(
-                    ToolError::InvalidArguments(_)
-                ))
+                result,
+                Err(ExecutionError::Tool(ToolError::InvalidArguments(_)))
             ));
         }
         assert!(!runtime.root.path().join("copied").exists());
-    }
+        assert_eq!(runtime.jobs.list(agent).await.len(), before);
 
-    #[tokio::test]
-    async fn invalid_arguments_and_read_only_copy_never_write() {
-        let runtime = crate::tests::TestRuntime::new().await;
-        let skills = fixture_skills().await;
-        let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder, skills, runtime.store.clone()).unwrap();
-        let executor = runtime.executor(builder);
+        let executor = runtime.executor(builder(&runtime, fixture_skills().await));
         for args in [
-            serde_json::json!({"name":"mixed-assets", "path":""}),
-            serde_json::json!({"name":"mixed-assets", "path":"references/note.txt", "to":""}),
-            serde_json::json!({"name":"mixed-assets", "path":"references", "to":"must-not-exist"}),
-            serde_json::json!({"name":"mixed-assets", "path":"references/note.txt", "to":"."}),
-            serde_json::json!({"name":"mixed-assets", "path":"../mixed-assets/SKILL.md", "to":"must-not-exist"}),
-            serde_json::json!({"name":"mixed-assets", "path":"/etc/passwd", "to":"must-not-exist"}),
+            json!({"name":"mixed-assets", "path":""}),
+            json!({"name":"mixed-assets", "path":"references/note.txt", "to":""}),
+            json!({"name":"mixed-assets", "path":"references", "to":"must-not-exist"}),
+            json!({"name":"mixed-assets", "path":"references/note.txt", "to":"."}),
+            json!({"name":"mixed-assets", "path":"../mixed-assets/SKILL.md", "to":"must-not-exist"}),
+            json!({"name":"mixed-assets", "path":"/etc/passwd", "to":"must-not-exist"}),
         ] {
             assert!(
                 executor
-                    .execute(runtime.agent.clone(), "skill", args.clone(), None)
+                    .run_host(agent, "skill", args.clone())
                     .await
                     .is_err(),
                 "{args}"
@@ -633,23 +752,19 @@ mod tests {
         let mut capabilities = crate::tool::policy::CapabilitySet::default();
         capabilities.remove(Capability::Write);
         let executor = executor.with_capabilities(capabilities);
-        executor
-            .execute(
-                runtime.agent.clone(),
-                "skill",
-                serde_json::json!({"name":"mixed-assets", "path":"assets/payload.bin"}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(executor.execute(runtime.agent.clone(), "skill", serde_json::json!({"name":"mixed-assets", "path":"assets/payload.bin", "to":"must-not-exist"}), None).await.is_err());
+        let payload = json!({"name":"mixed-assets", "path":"assets/payload.bin"});
+        executor.run_host(agent, "skill", payload).await.unwrap();
+        let copy =
+            json!({"name":"mixed-assets", "path":"assets/payload.bin", "to":"must-not-exist"});
+        assert!(executor.run_host(agent, "skill", copy).await.is_err());
         assert!(!runtime.root.path().join("must-not-exist").exists());
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn symlink_discovery_does_not_allow_asset_escape() {
-        let runtime = crate::tests::TestRuntime::new().await;
+        use std::os::unix::fs::symlink;
+        let runtime = TestRuntime::new().await;
         let root = runtime.root.path().join(".agents/skills/demo");
         fs::create_dir_all(&root).await.unwrap();
         fs::write(root.join("SKILL.md"), "# Demo\nSafe instructions.")
@@ -658,48 +773,26 @@ mod tests {
         fs::write(runtime.root.path().join("secret"), "outside")
             .await
             .unwrap();
-        std::os::unix::fs::symlink(runtime.root.path().join("secret"), root.join("escape"))
-            .unwrap();
-        std::os::unix::fs::symlink("SKILL.md", root.join("inside")).unwrap();
-        std::os::unix::fs::symlink(".", root.join("loop")).unwrap();
+        symlink(runtime.root.path().join("secret"), root.join("escape")).unwrap();
+        symlink("SKILL.md", root.join("inside")).unwrap();
+        symlink(".", root.join("loop")).unwrap();
         let skills = HostSkills::discover_from(runtime.root.path(), None).await;
-        let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder, skills, runtime.store.clone()).unwrap();
-        let executor = runtime.executor(builder);
-        let listed = executor
-            .execute(
-                runtime.agent.clone(),
-                "skill",
-                serde_json::json!({"name":"demo"}),
-                None,
-            )
-            .await
-            .unwrap();
+        let executor = runtime.executor(builder(&runtime, skills));
+        let skill = async |args| executor.run_host(&runtime.agent, "skill", args).await;
+        let listed = skill(json!({"name":"demo"})).await.unwrap();
         assert_eq!(
             listed.output.value["assets"],
             "├── escape [symlink]\n├── inside [symlink]\n└── loop [symlink]"
         );
-        for to in [serde_json::Value::Null, serde_json::json!("must-not-exist")] {
+        for to in [Value::Null, json!("must-not-exist")] {
             assert!(
-                executor
-                    .execute(
-                        runtime.agent.clone(),
-                        "skill",
-                        serde_json::json!({"name":"demo", "path":"escape", "to":to}),
-                        None
-                    )
+                skill(json!({"name":"demo", "path":"escape", "to":to}))
                     .await
                     .is_err()
             );
         }
         assert!(!runtime.root.path().join("must-not-exist").exists());
-        let loaded = executor
-            .execute(
-                runtime.agent.clone(),
-                "skill",
-                serde_json::json!({"name":"demo", "path":"inside"}),
-                None,
-            )
+        let loaded = skill(json!({"name":"demo", "path":"inside"}))
             .await
             .unwrap();
         assert_eq!(loaded.output.value["kind"], "text");
@@ -707,7 +800,7 @@ mod tests {
 
     #[tokio::test]
     async fn nearest_skill_wins_and_assets_copy_from_the_host() {
-        let runtime = crate::tests::TestRuntime::new().await;
+        let runtime = TestRuntime::new().await;
         let user = runtime.root.path().join("user-skills");
         let outer = runtime.root.path().join("project");
         let workspace = outer.join("workspace");
@@ -720,47 +813,44 @@ mod tests {
             std::fs::create_dir_all(&skill).unwrap();
             std::fs::write(skill.join("SKILL.md"), format!("# Common\n\n{marker}")).unwrap();
             std::fs::write(skill.join("asset.bin"), marker.as_bytes()).unwrap();
+            std::fs::write(skill.join(" asset "), "spaced content").unwrap();
         }
         let workspace = std::fs::canonicalize(workspace).unwrap();
         let skills = HostSkills::discover_from(&workspace, Some(&user)).await;
-        let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder, skills, runtime.store.clone()).unwrap();
+        let location = crate::execution::ExecutionLocation::root(workspace.clone());
         let executor = runtime
-            .executor(builder)
-            .with_location(crate::execution::ExecutionLocation::root(workspace.clone()));
+            .executor(builder(&runtime, skills))
+            .with_location(location);
+        let skill = async |args| {
+            executor
+                .run_host(&runtime.agent, "skill", args)
+                .await
+                .unwrap()
+        };
         // The host skill tool is always read-only; the transfer authorizes writes separately.
-        assert_eq!(
-            executor.registry().get("skill").unwrap().capabilities(),
-            vec![Capability::Read]
-        );
-        let loaded = executor
-            .execute(
-                runtime.agent.clone(),
-                "skill",
-                serde_json::json!({"name":"common"}),
-                None,
-            )
-            .await
-            .unwrap();
+        let capabilities = executor.registry().get("skill").unwrap().capabilities();
+        assert_eq!(capabilities, vec![Capability::Read]);
+        let loaded = skill(json!({"name":"common"})).await;
         assert!(
             loaded.output.value["content"]
                 .as_str()
                 .unwrap()
                 .contains("nearest")
         );
-        let copied = executor
-            .execute(
-                runtime.agent,
-                "skill",
-                serde_json::json!({"name":"common", "path":"asset.bin", "to":"copied.bin"}),
-                None,
-            )
-            .await
-            .unwrap();
+        let copied = skill(json!({"name":"common", "path":"asset.bin", "to":"copied.bin"})).await;
         assert_eq!(copied.output.value["bytes"], 7);
         assert_eq!(
             std::fs::read(workspace.join("copied.bin")).unwrap(),
             b"nearest"
+        );
+        // Spaced asset spellings round-trip untrimmed.
+        let loaded = skill(json!({"name":"common","path":" asset ","to":null}))
+            .await
+            .output
+            .value;
+        assert_eq!(
+            (&loaded["kind"], &loaded["path"], &loaded["content"]),
+            (&json!("text"), &json!(" asset "), &json!("spaced content"))
         );
     }
 }

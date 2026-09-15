@@ -94,11 +94,14 @@ impl SessionRuntime {
             startup_warnings,
             router,
             agents: StdRwLock::new(HashMap::new()),
+            queue_state: queue::QueueRuntimeState::default(),
             child_counters: RwLock::new(child_counters),
             questions,
             usage: Mutex::new(usage),
             events,
             caught_up_sequence,
+            #[cfg(test)]
+            store_forwarding_gate: Arc::new(Mutex::new(())),
         });
         runtime_slot
             .set(Arc::downgrade(&runtime))
@@ -128,7 +131,6 @@ impl SessionRuntime {
             runtime: self.clone(),
             root,
             root_tx,
-            enqueue_preparation: Arc::new(Mutex::new(())),
         })
     }
 }
@@ -149,7 +151,7 @@ impl SessionRuntime {
                 (
                     id.clone(),
                     agent.cancellation.clone(),
-                    agent.retryable_interrupt.clone(),
+                    agent.control.retryable_interrupt.clone(),
                 )
             })
             .collect::<Vec<_>>();

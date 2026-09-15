@@ -101,10 +101,9 @@ To use another machine's SSH configuration and credentials, set origin to its ta
                 let definition =
                     TargetDefinition::from_config(args.name, args.config, TargetSource::Session)
                         .map_err(target_error)?;
-                let name = definition.name.clone();
-                let origin = args.origin.unwrap_or_else(|| context.caller_location.target.clone());
-                let persisted = router.add(definition, origin, &context.authorization, &store).await.map_err(|e| e.into_tool_error())?;
-                let record = TargetRecord::from(persisted.iter().find(|d| d.name == name).expect("added destination"));
+                let origin = args.origin.unwrap_or_else(|| context.caller_location().target.clone());
+                let added = router.add(definition, origin, context.invocation_subject()?, &store).await.map_err(|e| e.into_tool_error())?;
+                let record = TargetRecord::from(&added);
                 Ok(record.into())
             }
         },

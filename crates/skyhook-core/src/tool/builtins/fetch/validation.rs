@@ -1,14 +1,73 @@
 //! Validate URLs, request framing, authentication, and bounded fetch options.
+use std::time::Duration;
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::{
     Method, Url,
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 
+use super::diagnostics::DiagnosticMessage;
 use super::{Auth, FetchArgs, HeaderValues, MAX_BYTES, ResponseFormat, ToolError, invalid};
 
-pub(super) fn parse_url(value: &str) -> Result<Url, ToolError> {
-    let url = Url::parse(value).map_err(|_| invalid("invalid absolute URL"))?;
+/// Request endpoints are not proxy endpoints: credentials are never accepted.
+#[derive(Clone, Debug)]
+pub(in crate::tool::builtins) struct HttpRequestUrl(Url);
+impl HttpRequestUrl {
+    pub(in crate::tool::builtins) fn parse(value: &str) -> Result<Self, ToolError> {
+        let url = Url::parse(value).map_err(|_| invalid("invalid absolute URL"))?;
+        Self::admit(url)
+    }
+    fn admit(mut url: Url) -> Result<Self, ToolError> {
+        check_url(&url)?;
+        url.set_fragment(None);
+        Ok(Self(url))
+    }
+    /// URL syntax versus scheme/credentials keep distinct redirect diagnostics.
+    pub(super) fn join(&self, location: &str) -> Result<Self, DiagnosticMessage> {
+        let url = self
+            .0
+            .join(location)
+            .map_err(|_| DiagnosticMessage::InvalidRedirectUrl)?;
+        Self::admit(url).map_err(|_| DiagnosticMessage::RedirectUrlNotHttp)
+    }
+    pub(in crate::tool::builtins) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+    pub(super) fn url(&self) -> &Url {
+        &self.0
+    }
+    pub(super) fn origin(&self) -> SanitizedOrigin {
+        SanitizedOrigin::from_url(&self.0)
+    }
+    fn append_query(&mut self, query: &[(String, String)]) {
+        if !query.is_empty() {
+            self.0
+                .query_pairs_mut()
+                .extend_pairs(query.iter().map(|(k, v)| (k, v)));
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(transparent)]
+pub(super) struct SanitizedOrigin(String);
+impl SanitizedOrigin {
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub(super) fn from_url(url: &Url) -> Self {
+        Self(url.origin().ascii_serialization())
+    }
+    // Proxy schemes and credentials follow reqwest's distinct endpoint contract.
+    pub(super) fn proxy(value: &str) -> Self {
+        Url::parse(value)
+            .map(|url| Self::from_url(&url))
+            .unwrap_or_else(|_| Self("unknown origin".into()))
+    }
+}
+
+fn check_url(url: &Url) -> Result<(), ToolError> {
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err(invalid("URL must use HTTP or HTTPS and have a host"));
     }
@@ -17,11 +76,9 @@ pub(super) fn parse_url(value: &str) -> Result<Url, ToolError> {
             "embedded URL credentials are not supported; use auth",
         ));
     }
-    Ok(url)
+    Ok(())
 }
-pub(super) fn validate(args: &FetchArgs) -> Result<(), ToolError> {
-    parse_url(&args.url)?;
-    Method::from_bytes(args.method.as_bytes()).map_err(invalid)?;
+fn validate_options(args: &FetchArgs) -> Result<(), ToolError> {
     if args.timeout == 0
         || args.timeout > 3600
         || args.connect_timeout == 0
@@ -43,11 +100,10 @@ pub(super) fn validate(args: &FetchArgs) -> Result<(), ToolError> {
     if args.overwrite && args.save_to.is_none() {
         return Err(invalid("overwrite requires save_to"));
     }
-    request_headers(args)?;
     Ok(())
 }
 
-pub(super) fn request_headers(args: &FetchArgs) -> Result<HeaderMap, ToolError> {
+fn request_headers(args: &FetchArgs) -> Result<HeaderMap, ToolError> {
     let mut headers = HeaderMap::new();
     for (key, values) in &args.headers {
         let name = HeaderName::from_bytes(key.as_bytes()).map_err(invalid)?;
@@ -88,6 +144,129 @@ pub(super) fn request_headers(args: &FetchArgs) -> Result<HeaderMap, ToolError> 
     Ok(headers)
 }
 
+pub(super) struct ClientSettings {
+    pub(super) timeout: Duration,
+    pub(super) connect_timeout: Duration,
+    pub(super) proxy: Option<String>,
+    pub(super) insecure: bool,
+}
+impl ClientSettings {
+    pub(super) fn proxy_origin(&self) -> Option<SanitizedOrigin> {
+        self.proxy.as_deref().map(SanitizedOrigin::proxy)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InlineMode {
+    Auto,
+    Text,
+    Base64,
+    ExtractText,
+}
+/// A download cannot be paired with inline decoding or extraction options.
+#[derive(Debug)]
+pub(super) enum OutputPlan {
+    Inline(InlineMode),
+    Download {
+        destination: std::path::PathBuf,
+        overwrite: bool,
+    },
+}
+
+pub(super) fn redirect_headers(
+    headers: &mut HeaderMap,
+    from: &HttpRequestUrl,
+    to: &HttpRequestUrl,
+    drop_body: bool,
+) {
+    headers.remove("host");
+    if from.origin() != to.origin() {
+        *headers = headers
+            .iter()
+            .filter(|(name, _)| {
+                matches!(
+                    name.as_str(),
+                    "accept"
+                        | "accept-language"
+                        | "accept-encoding"
+                        | "user-agent"
+                        | "content-type"
+                )
+            })
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+    }
+    if drop_body {
+        for name in [
+            "content-type",
+            "content-encoding",
+            "content-language",
+            "content-location",
+            "digest",
+        ] {
+            headers.remove(name);
+        }
+    }
+}
+
+/// The retained owner of validated execution inputs, separate from wire/schema DTOs.
+/// Checked values are constructed only while admitting the execution plan.
+pub(super) struct FetchPlan {
+    pub(super) url: HttpRequestUrl,
+    pub(super) method: Method,
+    pub(super) headers: HeaderMap,
+    pub(super) client: ClientSettings,
+    pub(super) max_bytes: u64,
+    pub(super) max_redirects: usize,
+    pub(super) redirects: super::RedirectPolicy,
+    pub(super) output: OutputPlan,
+    pub(super) body: Option<super::RequestBody>,
+    pub(super) include_headers: bool,
+}
+impl TryFrom<FetchArgs> for FetchPlan {
+    type Error = ToolError;
+    fn try_from(args: FetchArgs) -> Result<Self, ToolError> {
+        // Preserve the admission error ordering of URL, method, options and headers.
+        let mut url = HttpRequestUrl::parse(&args.url)?;
+        let method = Method::from_bytes(args.method.as_bytes()).map_err(invalid)?;
+        validate_options(&args)?;
+        let headers = request_headers(&args)?;
+        url.append_query(&args.query);
+        let output = match args.save_to {
+            Some(destination) => OutputPlan::Download {
+                destination: destination.into(),
+                overwrite: args.overwrite,
+            },
+            None => OutputPlan::Inline(if args.text {
+                InlineMode::ExtractText
+            } else {
+                match args.response_format {
+                    ResponseFormat::Auto => InlineMode::Auto,
+                    ResponseFormat::Text => InlineMode::Text,
+                    ResponseFormat::Base64 => InlineMode::Base64,
+                }
+            }),
+        };
+        Ok(Self {
+            url,
+            method,
+            headers,
+            client: ClientSettings {
+                timeout: Duration::from_secs(args.timeout),
+                connect_timeout: Duration::from_secs(args.connect_timeout),
+                proxy: args.proxy,
+                insecure: args.insecure,
+            },
+            max_bytes: args.max_bytes,
+            max_redirects: args.max_redirects,
+            redirects: args.redirects,
+            output,
+            body: args.body,
+            include_headers: args.include_headers,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{DEFAULT_MAX_BYTES, RedirectPolicy, tests::args};
@@ -95,18 +274,21 @@ mod tests {
     use schemars::schema_for;
     use serde_json::json;
 
+    fn plan(value: serde_json::Value) -> Result<FetchPlan, impl std::fmt::Debug> {
+        FetchPlan::try_from(args(value))
+    }
+
     #[test]
     fn defaults_and_validation() {
         let a = args(json!({"url":"https://example.org"}));
-        validate(&a).unwrap();
-        assert_eq!(a.method, "GET");
-        assert_eq!(a.timeout, 30);
-        assert_eq!(a.connect_timeout, 10);
-        assert_eq!(a.max_bytes, DEFAULT_MAX_BYTES);
-        assert_eq!(a.max_redirects, 5);
-        assert!(!a.insecure);
-        assert!(!a.include_headers);
+        assert_eq!(
+            (a.method.as_str(), a.timeout, a.connect_timeout),
+            ("GET", 30, 10)
+        );
+        assert_eq!((a.max_bytes, a.max_redirects), (DEFAULT_MAX_BYTES, 5));
+        assert!(!a.insecure && !a.include_headers);
         assert_eq!(a.redirects, RedirectPolicy::Safe);
+        FetchPlan::try_from(a).unwrap();
         for value in [
             json!({"url":"file:///etc/passwd"}),
             json!({"url":"https://user:secret@example.org"}),
@@ -117,33 +299,48 @@ mod tests {
             json!({"url":"http://example.org","max_redirects":21}),
             json!({"url":"http://example.org","text":true,"save_to":"out"}),
             json!({"url":"http://example.org","text":true,"response_format":"base64"}),
+            json!({"url":"http://example.org","overwrite":true}),
             json!({"url":"http://example.org","headers":{"a":"bad\r\nheader"}}),
             json!({"url":"http://example.org","headers":{"content-length":"2"}}),
             json!({"url":"http://example.org","auth":{"kind":"bearer","token":"a"},"headers":{"Authorization":"b"}}),
         ] {
-            assert!(validate(&args(value.clone())).is_err(), "{value}");
+            assert!(plan(value.clone()).is_err(), "{value}");
         }
-        validate(&args(
-            json!({"url":"http://example.org","method":"PROPFIND"}),
-        ))
+        plan(json!({"url":"http://example.org","method":"PROPFIND"})).unwrap();
+        // The retained plan keeps the appended query, sanitized origin and
+        // header sensitivity proofs.
+        let plan = plan(json!({
+            "url":"https://example.org/p?x=first#discard", "query":[["x","second"]],
+            "headers":{"X-Multi":["one","two"]}, "auth":{"kind":"bearer","token":"credential"},
+            "text":true
+        }))
         .unwrap();
+        assert_eq!(plan.url.as_str(), "https://example.org/p?x=first&x=second");
+        assert!(matches!(
+            plan.url.join("ftp://example.org/file"),
+            Err(DiagnosticMessage::RedirectUrlNotHttp)
+        ));
+        assert_eq!(plan.headers.get_all("x-multi").iter().count(), 2);
+        assert!(plan.headers.get("authorization").unwrap().is_sensitive());
+        assert!(matches!(
+            plan.output,
+            OutputPlan::Inline(InlineMode::ExtractText)
+        ));
     }
 
     #[test]
     fn body_and_query_schemas_match_argument_deserialization() {
         let schema = serde_json::to_value(schema_for!(FetchArgs)).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
-        for body in [
-            json!({"kind":"text", "value":"text"}),
-            json!({"kind":"form", "fields":[["key", "value"]]}),
-            json!({"kind":"base64", "value":"YQ=="}),
-            json!({"kind":"file", "path":"upload.txt"}),
-        ] {
-            let input = json!({"url":"https://example.org", "body":body});
-            assert!(validator.is_valid(&input), "{input}");
-            assert!(serde_json::from_value::<FetchArgs>(input).is_ok());
-        }
-        for value in [
+        let url = |extra: serde_json::Value| {
+            let mut input = json!({"url":"https://example.org"});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            input
+        };
+        let json_bodies = [
             json!(null),
             json!(true),
             json!(42),
@@ -151,35 +348,65 @@ mod tests {
             json!("text"),
             json!([null, false, {"nested": [1, 2]}]),
             json!({"nested": {"key": "value"}}),
-        ] {
-            let input = json!({"url":"https://example.org", "body":{"kind":"json", "value":value}});
+        ];
+        let valid = [
+            json!({"body":{"kind":"text", "value":"text"}}),
+            json!({"body":{"kind":"form", "fields":[["key", "value"]]}}),
+            json!({"body":{"kind":"base64", "value":"YQ=="}}),
+            json!({"body":{"kind":"file", "path":"upload.txt"}}),
+            json!({"query":[["key", "one"], ["key", "two"]]}),
+        ]
+        .into_iter()
+        .chain(json_bodies.map(|value| json!({"body":{"kind":"json", "value":value}})));
+        for input in valid.map(url) {
             assert!(validator.is_valid(&input), "{input}");
             assert!(serde_json::from_value::<FetchArgs>(input).is_ok());
         }
-        let input = json!({"url":"https://example.org", "query":[["key", "one"], ["key", "two"]]});
-        assert!(validator.is_valid(&input));
+        let query = args(url(json!({"query":[["key", "one"], ["key", "two"]]}))).query;
         assert_eq!(
-            args(input).query,
+            query,
             vec![("key".into(), "one".into()), ("key".into(), "two".into())]
         );
-        for query in [
+        let invalid_queries = [
             json!({"key":"value"}),
             json!(["key", "value"]),
             json!([["key"]]),
             json!([["key", "value", "extra"]]),
             json!([[1, "value"]]),
             json!([["key", false]]),
-        ] {
-            let input = json!({"url":"https://example.org", "query":query});
+        ];
+        let invalid = invalid_queries
+            .map(|query| json!({"query":query}))
+            .into_iter()
+            .chain([
+                json!({"unknown":true}),
+                json!({"body":{"kind":"multipart", "parts":[]}}),
+            ]);
+        for input in invalid.map(url) {
             assert!(!validator.is_valid(&input), "{input}");
             assert!(serde_json::from_value::<FetchArgs>(input).is_err());
         }
-        for input in [
-            json!({"url":"https://example.org", "unknown":true}),
-            json!({"url":"https://example.org", "body":{"kind":"multipart", "parts":[]}}),
+        for (key, max) in [
+            ("timeout", 3600u64),
+            ("connect_timeout", 3600),
+            ("max_bytes", MAX_BYTES),
+            ("max_redirects", 20),
         ] {
-            assert!(!validator.is_valid(&input), "{input}");
-            assert!(serde_json::from_value::<FetchArgs>(input).is_err());
+            for n in [0, 1, max, max + 1] {
+                let input = url(json!({key: n}));
+                let expected = n <= max && (n > 0 || key == "max_redirects");
+                assert_eq!(validator.is_valid(&input), expected, "schema {input}");
+            }
+        }
+        // Intentional pre-existing difference: JSON schema models the wire string;
+        // runtime admission enforces credential-free HTTP endpoints, methods and framing.
+        for input in [
+            json!({"url":"https://user:secret@example.org"}),
+            json!({"url":"https://example.org", "method":"bad method"}),
+            json!({"url":"https://example.org", "headers":{"Transfer-Encoding":"chunked"}}),
+        ] {
+            assert!(validator.is_valid(&input));
+            assert!(plan(input).is_err());
         }
     }
 }

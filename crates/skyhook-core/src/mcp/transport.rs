@@ -1,7 +1,7 @@
 //! Root-session owned MCP transports. No shell interpolation or implicit reconnect/replay.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io,
     pin::Pin,
     process::Stdio,
@@ -31,7 +31,7 @@ use tokio::{
 };
 
 use super::{
-    config::{McpServerConfig, McpTransport},
+    config::{CommandSpec, McpConnection, McpServerConfig},
     manager::McpError,
 };
 
@@ -97,20 +97,13 @@ pub(crate) struct OwnedProcess {
 }
 
 impl OwnedProcess {
-    fn spawn(config: &McpServerConfig, piped: bool) -> Result<Self, McpError> {
-        let argv = config
-            .start_command
-            .as_ref()
-            .filter(|args| !args.is_empty())
-            .ok_or_else(|| {
-                McpError::Configuration("start_command must contain an executable".into())
-            })?;
-        let mut command = Command::new(&argv[0]);
+    fn spawn(spec: &CommandSpec, piped: bool) -> Result<Self, McpError> {
+        let mut command = Command::new(&spec.argv[0]);
         command
-            .args(&argv[1..])
-            .envs(&config.env)
+            .args(&spec.argv[1..])
+            .envs(&spec.env)
             .kill_on_drop(true);
-        if let Some(cwd) = &config.cwd {
+        if let Some(cwd) = &spec.cwd {
             command.current_dir(cwd);
         }
         command.stdin(if piped { Stdio::piped() } else { Stdio::null() });
@@ -195,24 +188,16 @@ fn unreachable(error: &ClientInitializeError) -> bool {
     false
 }
 
-fn http_config(config: &McpServerConfig) -> Result<StreamableHttpClientTransportConfig, McpError> {
-    let url = config
-        .url
-        .as_deref()
-        .ok_or_else(|| McpError::Configuration("HTTP transport requires url".into()))?;
-    let parsed =
-        reqwest::Url::parse(url).map_err(|_| McpError::Configuration("invalid MCP URL".into()))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(McpError::Configuration(
-            "MCP URL must use http or https".into(),
-        ));
-    }
-    let mut transport = StreamableHttpClientTransportConfig::with_uri(url.to_owned());
+fn http_config(
+    endpoint: &str,
+    headers: &BTreeMap<String, String>,
+) -> Result<StreamableHttpClientTransportConfig, McpError> {
+    let mut transport = StreamableHttpClientTransportConfig::with_uri(endpoint.to_owned());
     // A call with an uncertain outcome must never be automatically sent again.
     transport.reinit_on_expired_session = false;
     transport.retry_config = Arc::new(NeverRetry::default());
     transport.max_sse_event_size = MAX_MESSAGE_BYTES;
-    for (header, variable) in &config.headers_env {
+    for (header, variable) in headers {
         let name = HeaderName::from_bytes(header.as_bytes())
             .map_err(|_| McpError::Configuration("invalid MCP header name".into()))?;
         let value = std::env::var(variable).map_err(|_| {
@@ -524,9 +509,9 @@ pub(crate) async fn connect(
     config: &McpServerConfig,
     process: &mut Option<OwnedProcess>,
 ) -> Result<Client, McpError> {
-    match config.transport {
-        McpTransport::Stdio => {
-            *process = Some(OwnedProcess::spawn(config, true)?);
+    match config.connection() {
+        McpConnection::Stdio(command) => {
+            *process = Some(OwnedProcess::spawn(command, true)?);
             let child = &mut process.as_mut().expect("process just created").child;
             let stdout = child.stdout.take().expect("piped stdout");
             let stdin = child.stdin.take().expect("piped stdin");
@@ -534,8 +519,12 @@ pub(crate) async fn connect(
                 .await
                 .map_err(|_| McpError::Startup("stdio MCP initialization failed".into()))
         }
-        McpTransport::StreamableHttp => {
-            let transport = http_config(config)?;
+        McpConnection::Http {
+            endpoint,
+            headers,
+            start_if_unreachable,
+        } => {
+            let transport = http_config(endpoint, headers)?;
             let client = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .retry(reqwest::retry::never())
@@ -544,20 +533,25 @@ pub(crate) async fn connect(
                 .map_err(|_| McpError::Startup("could not build MCP HTTP client".into()))?;
             let client = BoundedHttpClient {
                 inner: client,
-                timeout: Duration::from_secs(
-                    config.call_timeout_secs.max(config.startup_timeout_secs),
-                ),
+                timeout: config.call_timeout().max(config.startup_timeout()),
             };
-            match http_connect(client.clone(), transport.clone()).await {
+            let command = match http_connect(client.clone(), transport.clone()).await {
                 Ok(service) => return Ok(service),
-                Err(error) if unreachable(&error) && config.start_command.is_some() => {}
+                Err(error) if unreachable(&error) => match start_if_unreachable {
+                    Some(command) => command,
+                    None => {
+                        return Err(McpError::Startup(
+                            "HTTP MCP initialization failed (server not launchable)".into(),
+                        ));
+                    }
+                },
                 Err(_) => {
                     return Err(McpError::Startup(
                         "HTTP MCP initialization failed (server not launchable)".into(),
                     ));
                 }
-            }
-            *process = Some(OwnedProcess::spawn(config, false)?);
+            };
+            *process = Some(OwnedProcess::spawn(command, false)?);
             // Retry only establishment, before any tool has been advertised or
             // invoked. Authentication/protocol failures stop readiness immediately.
             loop {
@@ -586,14 +580,9 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
-        let error = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap()
-            .get(format!("http://{address}/mcp?token=private-secret"))
-            .send()
-            .await
-            .unwrap_err();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = format!("http://{address}/mcp?token=private-secret");
+        let error = client.get(url).send().await.unwrap_err();
         let was_connect_error = error.is_connect();
         let error = redact_http_error(StreamableHttpError::Client(error));
         assert!(!error.to_string().contains("private-secret"));
@@ -606,24 +595,17 @@ mod tests {
 
     #[tokio::test]
     async fn raw_http_limit_counts_across_chunks_and_allows_exact_limit() {
-        let chunks =
-            futures_util::stream::iter([Ok::<_, io::Error>(b"ab".to_vec()), Ok(b"cd".to_vec())]);
-        assert_eq!(
-            bounded_bytes(chunks, 4)
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap()
-                .len(),
-            2
-        );
-        let chunks =
-            futures_util::stream::iter([Ok::<_, io::Error>(b"ab".to_vec()), Ok(b"cd".to_vec())]);
-        assert!(
-            bounded_bytes(chunks, 3)
-                .try_collect::<Vec<_>>()
-                .await
-                .is_err()
-        );
+        for (limit, accepted) in [(4, true), (3, false)] {
+            let chunks = futures_util::stream::iter([
+                Ok::<_, io::Error>(b"ab".to_vec()),
+                Ok(b"cd".to_vec()),
+            ]);
+            let collected = bounded_bytes(chunks, limit).try_collect::<Vec<_>>().await;
+            assert_eq!(
+                collected.map(|chunks| chunks.len()).ok(),
+                accepted.then_some(2)
+            );
+        }
     }
 
     // Chunked encoding intentionally omits Content-Length so the tests exercise
@@ -673,33 +655,27 @@ mod tests {
 
     #[tokio::test]
     async fn http_json_and_error_bodies_are_bounded_before_parsing() {
-        for (status, content_type) in [("200 OK", "application/json"), ("500 Error", "text/plain")]
-        {
-            let (uri, server) =
-                http_fixture(status, content_type, vec![b'x'; MAX_MESSAGE_BYTES + 1]).await;
+        let oversized = vec![b'x'; MAX_MESSAGE_BYTES + 1];
+        let small = br#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_vec();
+        for (status, content_type, body) in [
+            ("200 OK", "application/json", oversized.clone()),
+            ("500 Error", "text/plain", oversized),
+            ("200 OK", "application/json", small),
+        ] {
+            let accepted = body.len() <= MAX_MESSAGE_BYTES;
+            let (uri, server) = http_fixture(status, content_type, body).await;
             let result = test_http_client()
                 .post_message(uri, ping_message(), None, None, HashMap::new())
                 .await;
-            assert!(
-                matches!(result, Err(StreamableHttpError::UnexpectedServerResponse(ref text)) if text.contains("byte limit"))
-            );
+            if accepted {
+                assert!(matches!(result, Ok(StreamableHttpPostResponse::Json(..))));
+            } else {
+                assert!(
+                    matches!(result, Err(StreamableHttpError::UnexpectedServerResponse(ref text)) if text.contains("byte limit"))
+                );
+            }
             server.await.unwrap();
         }
-    }
-
-    #[tokio::test]
-    async fn http_small_json_is_accepted() {
-        let (uri, server) = http_fixture(
-            "200 OK",
-            "application/json",
-            br#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_vec(),
-        )
-        .await;
-        let result = test_http_client()
-            .post_message(uri, ping_message(), None, None, HashMap::new())
-            .await;
-        assert!(matches!(result, Ok(StreamableHttpPostResponse::Json(..))));
-        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -708,7 +684,7 @@ mod tests {
             let (uri, server) = http_fixture("200 OK", "text/event-stream", vec![b'x'; 100]).await;
             let client = test_http_client();
             let mut stream = if post {
-                match client
+                let response = client
                     .post_message_with_max_sse_event_size(
                         uri,
                         ping_message(),
@@ -718,11 +694,11 @@ mod tests {
                         32,
                     )
                     .await
-                    .unwrap()
-                {
-                    StreamableHttpPostResponse::Sse(stream, _) => stream,
-                    _ => panic!("expected SSE"),
-                }
+                    .unwrap();
+                let StreamableHttpPostResponse::Sse(stream, _) = response else {
+                    panic!("expected SSE")
+                };
+                stream
             } else {
                 client
                     .get_stream_with_max_sse_event_size(uri, None, None, None, HashMap::new(), 32)
@@ -741,16 +717,14 @@ mod tests {
         let mut config = StreamableHttpClientTransportConfig::with_uri(uri);
         config.reinit_on_expired_session = false;
         config.retry_config = Arc::new(NeverRetry::default());
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            http_connect(test_http_client(), config),
-        )
-        .await
-        .unwrap();
-        match result {
-            Err(error) => assert!(!unreachable(&error)),
-            Ok(_) => panic!("plaintext endpoint unexpectedly negotiated TLS"),
-        }
+        let connect = http_connect(test_http_client(), config);
+        let result = tokio::time::timeout(Duration::from_secs(2), connect)
+            .await
+            .unwrap();
+        let Err(error) = result else {
+            panic!("plaintext endpoint unexpectedly negotiated TLS")
+        };
+        assert!(!unreachable(&error));
         server.await.unwrap();
     }
 
@@ -764,12 +738,10 @@ mod tests {
         });
         let mut client = test_http_client();
         client.timeout = Duration::from_millis(25);
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            client.post_message(uri, ping_message(), None, None, HashMap::new()),
-        )
-        .await
-        .unwrap();
+        let post = client.post_message(uri, ping_message(), None, None, HashMap::new());
+        let result = tokio::time::timeout(Duration::from_secs(2), post)
+            .await
+            .unwrap();
         assert!(
             matches!(result, Err(StreamableHttpError::Client(ref error)) if error.is_timeout())
         );
@@ -778,23 +750,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stdio_frame_limit_applies_before_newline_and_stays_failed() {
+    async fn stdio_frame_limit_applies_before_newline_resets_per_line_and_stays_failed() {
         let data = vec![b'x'; MAX_MESSAGE_BYTES + 1];
         let mut reader = BoundedLines::new(data.as_slice());
-        let mut output = Vec::new();
-        assert!(reader.read_to_end(&mut output).await.is_err());
-        let mut byte = [0; 1];
-        assert!(reader.read(&mut byte).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn stdio_frame_counter_resets_per_line_not_per_read() {
+        assert!(reader.read_to_end(&mut Vec::new()).await.is_err());
+        assert!(reader.read(&mut [0; 1]).await.is_err());
+        // The counter resets per line, not per read.
         let mut data = vec![b'x'; MAX_MESSAGE_BYTES];
-        data.push(b'\n');
-        data.extend_from_slice(b"next line\n");
-        let mut reader = BoundedLines::new(data.as_slice());
+        data.extend_from_slice(b"\nnext line\n");
         let mut output = Vec::new();
-        reader.read_to_end(&mut output).await.unwrap();
+        BoundedLines::new(data.as_slice())
+            .read_to_end(&mut output)
+            .await
+            .unwrap();
         assert_eq!(output, data);
     }
 
@@ -807,11 +775,8 @@ mod tests {
         output.write_all(b"x").await.unwrap();
         let mut byte = [0; 1];
         reader.read_exact(&mut byte).await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), reader.read_exact(&mut byte))
-                .await
-                .is_err()
-        );
+        let pending = tokio::time::timeout(Duration::from_millis(10), reader.read_exact(&mut byte));
+        assert!(pending.await.is_err());
         output.write_all(b"x").await.unwrap();
         assert!(reader.read_exact(&mut byte).await.is_err());
     }

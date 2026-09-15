@@ -118,20 +118,19 @@ mod tests {
     use syntect::{highlighting::Highlighter, parsing::Scope};
 
     #[test]
-    fn content_roles_preserve_neutrals() {
-        let theme = ContentTheme::new();
-        assert_eq!(theme.fg, Color::Rgb(222, 225, 230));
-        assert_eq!(theme.heading, theme.primary);
-        assert_eq!(theme.strong, theme.secondary);
-        assert_eq!(theme.quote, theme.muted);
-        assert_eq!(theme.inline_code, theme.primary);
-        assert_ne!(theme.primary, theme.secondary);
-        assert_ne!(theme.accent, theme.success);
-    }
-
-    #[test]
-    fn syntax_scopes_follow_semantic_roles() {
+    fn content_roles_preserve_neutrals_and_syntax_scopes_follow_semantic_roles() {
         let colors = ContentTheme::new();
+        assert_eq!(colors.fg, Color::Rgb(222, 225, 230));
+        assert_eq!(
+            (colors.heading, colors.inline_code),
+            (colors.primary, colors.primary)
+        );
+        assert_eq!(
+            (colors.strong, colors.quote),
+            (colors.secondary, colors.muted)
+        );
+        assert_ne!(colors.primary, colors.secondary);
+        assert_ne!(colors.accent, colors.success);
         let theme = colors.syntax_theme();
         assert_eq!(theme.settings.background, None);
         assert!(
@@ -179,8 +178,6 @@ mod tests {
             0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
         }
         let theme = ContentTheme::new();
-        // Brightest surface, including selection.
-        let bg = Color::Rgb(64, 64, 64);
         for color in [
             theme.fg,
             theme.muted,
@@ -192,15 +189,16 @@ mod tests {
             theme.warning,
             theme.error,
         ] {
-            let a = luminance(color);
-            let b = luminance(bg);
-            let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
-            assert!(contrast >= 3., "{color:?} contrast {contrast}");
-            // Normal content is on user/agent backgrounds, not selection.
-            let bg = Color::Rgb(44, 44, 44);
-            let b = luminance(bg);
-            let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
-            assert!(contrast >= 4.5, "{color:?} contrast {contrast}");
+            // The brightest surface includes selection; normal content sits on
+            // user/agent backgrounds.
+            for (bg, minimum) in [(Color::Rgb(64, 64, 64), 3.), (Color::Rgb(44, 44, 44), 4.5)] {
+                let (a, b) = (luminance(color), luminance(bg));
+                let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+                assert!(
+                    contrast >= minimum,
+                    "{color:?} on {bg:?}: contrast {contrast}"
+                );
+            }
         }
     }
 }

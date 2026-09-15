@@ -43,7 +43,7 @@ pub(super) fn tool_names(
             continue;
         }
         let item = &catalog[index];
-        let server = &item.server;
+        let server = item.server.as_str();
         let tool = item.tool.name.as_ref();
         // Length-delimited originals distinguish identities such as a_b/c and
         // a/b_c, as well as names that normalize to the same ASCII spelling.
@@ -89,6 +89,7 @@ mod tests {
             server: server.to_owned(),
             tool: serde_json::from_value(json!({"name":tool,"inputSchema":{"type":"object"}}))
                 .unwrap(),
+            capabilities: Vec::new(),
         }
     }
 

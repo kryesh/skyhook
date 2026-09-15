@@ -141,11 +141,6 @@ impl HarnessBuilder {
             &self.model_profiles,
             &default_model_profile,
         )?;
-        for (name, config) in &self.mcp {
-            config.validate().map_err(|error| {
-                HarnessError::Initialization(format!("invalid MCP server {name}: {error}"))
-            })?;
-        }
         let session_root = self
             .session_root
             .unwrap_or_else(|| workspace.join(".skyhook/sessions"));
@@ -369,69 +364,156 @@ mod tests {
         std::fs::write(directory.join(name), content).unwrap();
     }
 
+    fn contains_path(error: &std::io::Error, path: PathBuf) -> bool {
+        error.to_string().contains(&path.display().to_string())
+    }
+
+    #[tokio::test]
+    async fn build_rejects_invalid_model_profiles() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let base = || test_builder(root.path(), &sessions, Arc::new(HangingProvider), false);
+        let profile = |provider, context, output| {
+            ModelProfile::new(provider, "model", None, context, output, false)
+        };
+        let cases = [
+            ("missing default", base().default_model_profile("absent")),
+            (
+                "zero context",
+                base().model_profile("bad", profile("test", 0, 1)),
+            ),
+            (
+                "output limit",
+                base().model_profile("bad", profile("test", 8, 8)),
+            ),
+            (
+                "provider",
+                base().model_profile("bad", profile("absent", 16, 8)),
+            ),
+        ];
+        for (case, builder) in cases {
+            let message = match builder.build().await {
+                Err(HarnessError::UnknownModelProfile(name)) => name,
+                Err(HarnessError::InvalidProfile(message)) => message,
+                other => panic!("{case}: expected a profile error, got {:?}", other.err()),
+            };
+            let expected = match case {
+                "missing default" => "absent",
+                "zero context" => "model profile `bad`: max_context must be positive",
+                "output limit" => {
+                    "model profile `bad`: max_output must be smaller than max_context"
+                }
+                _ => "model profile `bad` uses unknown provider `absent`",
+            };
+            assert_eq!(message, expected, "{case}");
+        }
+        assert!(base().build().await.is_ok());
+    }
+
     #[test]
     fn instruction_roots_are_ordered_and_independent_of_config() {
         let xdg = PathBuf::from("xdg");
         let home = PathBuf::from("home");
-        assert_eq!(
-            user_instruction_directories(Some(xdg.clone().into()), Some(home.clone().into())),
-            vec![xdg.join("skyhook"), home.join(".config/skyhook")]
-        );
-        assert_eq!(
-            user_instruction_directories(Some("".into()), Some(home.clone().into())),
-            vec![home.join(".config/skyhook")]
-        );
-        assert_eq!(
-            user_instruction_directories(
-                Some(home.join(".config").into()),
-                Some(home.clone().into())
-            ),
-            vec![home.join(".config/skyhook")]
-        );
+        let directories = |xdg: &Path, home: &Path| {
+            user_instruction_directories(Some(xdg.into()), Some(home.into()))
+        };
+        let preferred = vec![xdg.join("skyhook"), home.join(".config/skyhook")];
+        assert_eq!(directories(&xdg, &home), preferred);
+        let fallback = vec![home.join(".config/skyhook")];
+        assert_eq!(directories(Path::new(""), &home), fallback);
+        assert_eq!(directories(&home.join(".config"), &home), fallback);
         assert!(user_instruction_directories(None, Some("".into())).is_empty());
+    }
+
+    #[tokio::test]
+    async fn instructions_are_labeled_in_order_without_ancestors_or_duplicate_files() {
+        // (files as (directory, name, content), user directories, expected)
+        type Case<'a> = (
+            &'a [(&'a str, &'a str, &'a str)],
+            &'a [&'a str],
+            &'a [&'a str],
+        );
+        let cases: &[Case] = &[
+            // User then workspace; whitespace is preserved.
+            (
+                &[
+                    ("user", "AGENTS.md", "user rules\n"),
+                    ("workspace", "AGENTS.md", " \n\t"),
+                ],
+                &["user"],
+                &[
+                    "user AGENTS.md:\nuser rules\n",
+                    "workspace AGENTS.md:\n \n\t",
+                ],
+            ),
+            // An empty user file selects its location and casing without fallback.
+            (
+                &[
+                    ("user", "agents.md", "alternate"),
+                    ("user", "AGENTS.md", ""),
+                    ("fallback", "AGENTS.md", "fallback"),
+                    ("workspace", "AGENTS.md", ""),
+                ],
+                &["user", "fallback"],
+                &["user AGENTS.md:\n", "workspace AGENTS.md:\n"],
+            ),
+            // Missing user locations are allowed and ancestors are never loaded.
+            (
+                &[("", "AGENTS.md", "ancestor must not load")],
+                &["missing-xdg", "missing-home"],
+                &[],
+            ),
+            // The same file as user and workspace instructions is included once.
+            (
+                &[("workspace", "AGENTS.md", "shared")],
+                &["workspace"],
+                &["user AGENTS.md:\nshared"],
+            ),
+            // Distinct files with identical contents are not deduplicated.
+            (
+                &[
+                    ("user", "AGENTS.md", "same text"),
+                    ("workspace", "AGENTS.md", "same text"),
+                ],
+                &["user"],
+                &[
+                    "user AGENTS.md:\nsame text",
+                    "workspace AGENTS.md:\nsame text",
+                ],
+            ),
+        ];
+        for (files, users, expected) in cases {
+            let root = tempfile::tempdir().unwrap();
+            let workspace = root.path().join("workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+            for (directory, name, content) in *files {
+                instruction_file(&root.path().join(directory), name, content);
+            }
+            let users = users
+                .iter()
+                .map(|user| root.path().join(user))
+                .collect::<Vec<_>>();
+            let loaded = load_agent_instructions_from(&workspace, &users)
+                .await
+                .unwrap();
+            assert_eq!(loaded, *expected, "{files:?}");
+        }
     }
 
     #[tokio::test]
     async fn user_only_instructions_select_one_location() {
         let root = tempfile::tempdir().unwrap();
-        let xdg = root.path().join("xdg");
-        let home = root.path().join("home");
+        let (xdg, home) = (root.path().join("xdg"), root.path().join("home"));
         let workspace = root.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
         instruction_file(&xdg, "AGENTS.md", "preferred");
         instruction_file(&home, "AGENTS.md", "fallback");
         let directories = [xdg.clone(), home];
-        assert_eq!(
-            load_agent_instructions_from(&workspace, &directories)
-                .await
-                .unwrap(),
-            vec!["user AGENTS.md:\npreferred"]
-        );
+        let loaded = load_agent_instructions_from(&workspace, &directories).await;
+        assert_eq!(loaded.unwrap(), vec!["user AGENTS.md:\npreferred"]);
         std::fs::remove_file(xdg.join("AGENTS.md")).unwrap();
-        assert_eq!(
-            load_agent_instructions_from(&workspace, &directories)
-                .await
-                .unwrap(),
-            vec!["user AGENTS.md:\nfallback"]
-        );
-    }
-
-    #[tokio::test]
-    async fn user_and_workspace_instructions_are_labeled_in_order() {
-        let root = tempfile::tempdir().unwrap();
-        let user = root.path().join("user");
-        let workspace = root.path().join("workspace");
-        instruction_file(&user, "AGENTS.md", "user rules\n");
-        instruction_file(&workspace, "AGENTS.md", "local rules\n");
-        assert_eq!(
-            load_agent_instructions_from(&workspace, &[user])
-                .await
-                .unwrap(),
-            vec![
-                "user AGENTS.md:\nuser rules\n",
-                "workspace AGENTS.md:\nlocal rules\n"
-            ]
-        );
+        let loaded = load_agent_instructions_from(&workspace, &directories).await;
+        assert_eq!(loaded.unwrap(), vec!["user AGENTS.md:\nfallback"]);
     }
 
     #[tokio::test]
@@ -445,149 +527,54 @@ mod tests {
             for candidate in AGENT_INSTRUCTION_NAMES[index..].iter().rev() {
                 instruction_file(&instructions, candidate, candidate);
             }
-            assert_eq!(
-                load_agent_instructions_from(&empty, std::slice::from_ref(&instructions))
-                    .await
-                    .unwrap(),
-                vec![format!("user AGENTS.md:\n{name}")]
-            );
-            assert_eq!(
-                load_agent_instructions_from(&instructions, &[])
-                    .await
-                    .unwrap(),
-                vec![format!("workspace AGENTS.md:\n{name}")]
-            );
+            let users = std::slice::from_ref(&instructions);
+            let user = load_agent_instructions_from(&empty, users).await.unwrap();
+            assert_eq!(user, vec![format!("user AGENTS.md:\n{name}")]);
+            let workspace = load_agent_instructions_from(&instructions, &[])
+                .await
+                .unwrap();
+            assert_eq!(workspace, vec![format!("workspace AGENTS.md:\n{name}")]);
         }
     }
 
     #[tokio::test]
-    async fn empty_user_file_selects_location_and_casing_without_fallback() {
-        let root = tempfile::tempdir().unwrap();
-        let user = root.path().join("user");
-        let fallback = root.path().join("fallback");
-        let workspace = root.path().join("workspace");
-        instruction_file(&user, "agents.md", "alternate");
-        instruction_file(&user, "AGENTS.md", "");
-        instruction_file(&fallback, "AGENTS.md", "fallback");
-        instruction_file(&workspace, "AGENTS.md", "");
-        assert_eq!(
-            load_agent_instructions_from(&workspace, &[user, fallback])
-                .await
-                .unwrap(),
-            vec!["user AGENTS.md:\n", "workspace AGENTS.md:\n"]
-        );
-    }
-
-    #[tokio::test]
-    async fn whitespace_is_preserved() {
-        let root = tempfile::tempdir().unwrap();
-        instruction_file(root.path(), "AGENTS.md", " \n\t");
-        assert_eq!(
-            load_agent_instructions_from(root.path(), &[])
-                .await
-                .unwrap(),
-            vec!["workspace AGENTS.md:\n \n\t"]
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_user_locations_and_workspace_file_are_allowed_without_ancestors() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = root.path().join("nested/workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
-        instruction_file(root.path(), "AGENTS.md", "ancestor must not load");
-        instruction_file(
-            workspace.parent().unwrap(),
-            "agents.md",
-            "near ancestor must not load",
-        );
-        assert!(
-            load_agent_instructions_from(
-                &workspace,
-                &[
-                    root.path().join("missing-xdg"),
-                    root.path().join("missing-home")
-                ]
-            )
-            .await
-            .unwrap()
-            .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn user_utf8_error_falls_back_without_trying_another_casing() {
-        let root = tempfile::tempdir().unwrap();
-        let user = root.path().join("user");
-        let fallback = root.path().join("fallback");
-        instruction_file(&user, "agents.md", "must not load");
-        instruction_file(&user, "AGENTS.md", [0xff]);
-        instruction_file(&fallback, "Agents.md", "fallback");
-        let loaded = load_user_instructions(&[user, fallback])
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded.text, "fallback");
-    }
-
-    #[tokio::test]
-    async fn user_discovery_and_read_errors_fall_back() {
-        for discovery_error in [false, true] {
+    async fn user_discovery_read_and_utf8_errors_fall_back_without_another_casing() {
+        for case in ["discovery", "read", "utf8"] {
             let root = tempfile::tempdir().unwrap();
             let user = root.path().join("user");
             let fallback = root.path().join("fallback");
-            if discovery_error {
+            match case {
                 // ENOTDIR is a discovery error, unlike a missing candidate.
-                std::fs::write(&user, "not a directory").unwrap();
-            } else {
-                std::fs::create_dir_all(user.join("AGENTS.md")).unwrap();
-                if !user.join("agents.md").exists() {
-                    instruction_file(&user, "agents.md", "must not load");
-                }
+                "discovery" => std::fs::write(&user, "not a directory").unwrap(),
+                "read" => std::fs::create_dir_all(user.join("AGENTS.md")).unwrap(),
+                _ => instruction_file(&user, "AGENTS.md", [0xff]),
             }
-            instruction_file(&fallback, "AGENTS.MD", "fallback");
-            assert_eq!(
-                load_user_instructions(&[user, fallback])
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .text,
-                "fallback"
-            );
+            if case != "discovery" && !user.join("agents.md").exists() {
+                instruction_file(&user, "agents.md", "must not load");
+            }
+            instruction_file(&fallback, "Agents.md", "fallback");
+            let loaded = load_user_instructions(&[user, fallback]).await.unwrap();
+            assert_eq!(loaded.unwrap().text, "fallback", "{case}");
         }
     }
 
     #[tokio::test]
-    async fn user_error_survives_missing_fallback_and_reports_path() {
-        let root = tempfile::tempdir().unwrap();
-        let user = root.path().join("user");
-        instruction_file(&user, "AGENTS.md", [0xff]);
-        let error = load_user_instructions(&[user.clone(), root.path().join("missing")])
-            .await
-            .err()
-            .unwrap();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(
-            error
-                .to_string()
-                .contains(&user.join("AGENTS.md").display().to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn both_user_errors_are_reported() {
+    async fn user_errors_survive_missing_fallback_and_report_every_path() {
         let root = tempfile::tempdir().unwrap();
         let user = root.path().join("user");
         let fallback = root.path().join("fallback");
         instruction_file(&user, "AGENTS.md", [0xff]);
+        let missing = [user.clone(), root.path().join("missing")];
+        let error = load_user_instructions(&missing).await.err().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(contains_path(&error, user.join("AGENTS.md")));
         instruction_file(&fallback, "Agents.md", [0xfe]);
         let error = load_user_instructions(&[user.clone(), fallback.clone()])
             .await
             .err()
             .unwrap();
-        for path in [user.join("AGENTS.md"), fallback.join("Agents.md")] {
-            assert!(error.to_string().contains(&path.display().to_string()));
-        }
+        assert!(contains_path(&error, user.join("AGENTS.md")));
+        assert!(contains_path(&error, fallback.join("Agents.md")));
     }
 
     #[tokio::test]
@@ -605,11 +592,7 @@ mod tests {
             let error = load_agent_instructions_from(root.path(), &[])
                 .await
                 .unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains(&root.path().join("AGENTS.md").display().to_string())
-            );
+            assert!(contains_path(&error, root.path().join("AGENTS.md")));
         }
     }
 
@@ -628,26 +611,8 @@ mod tests {
         let error = load_agent_instructions_from(&user, &[]).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         instruction_file(&fallback, "AGENTS.md", "fallback");
-        assert_eq!(
-            load_user_instructions(&[user, fallback])
-                .await
-                .unwrap()
-                .unwrap()
-                .text,
-            "fallback"
-        );
-    }
-
-    #[tokio::test]
-    async fn same_user_and_workspace_file_is_only_included_once() {
-        let root = tempfile::tempdir().unwrap();
-        instruction_file(root.path(), "AGENTS.md", "shared");
-        assert_eq!(
-            load_agent_instructions_from(root.path(), &[root.path().to_owned()])
-                .await
-                .unwrap(),
-            vec!["user AGENTS.md:\nshared"]
-        );
+        let loaded = load_user_instructions(&[user, fallback]).await.unwrap();
+        assert_eq!(loaded.unwrap().text, "fallback");
     }
 
     #[cfg(unix)]
@@ -665,45 +630,26 @@ mod tests {
                 std::os::unix::fs::symlink(user.join("AGENTS.md"), workspace.join("agents.md"))
                     .unwrap();
             }
-            assert_eq!(
-                load_agent_instructions_from(&workspace, &[user])
-                    .await
-                    .unwrap(),
-                vec!["user AGENTS.md:\nshared"]
-            );
+            let loaded = load_agent_instructions_from(&workspace, &[user])
+                .await
+                .unwrap();
+            assert_eq!(loaded, vec!["user AGENTS.md:\nshared"]);
         }
     }
 
     #[tokio::test]
-    async fn distinct_files_with_identical_contents_are_not_deduplicated() {
-        let root = tempfile::tempdir().unwrap();
-        let user = root.path().join("user");
-        let workspace = root.path().join("workspace");
-        instruction_file(&user, "AGENTS.md", "same text");
-        instruction_file(&workspace, "AGENTS.md", "same text");
-        assert_eq!(
-            load_agent_instructions_from(&workspace, &[user])
-                .await
-                .unwrap()
-                .len(),
-            2
-        );
-    }
-
-    #[tokio::test]
     async fn library_instructions_are_appended_after_workspace_instructions() {
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        instruction_file(workspace.path(), "AGENTS.md", "workspace rules");
-        let harness = test_builder(workspace.path(), sessions.path(), Arc::new(HangingProvider))
+        let root = tempfile::tempdir().unwrap();
+        instruction_file(root.path(), "AGENTS.md", "workspace rules");
+        let provider = Arc::new(HangingProvider);
+        let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
             .instructions("library rules")
             .build()
             .await
             .unwrap();
-        assert!(harness.inner.instructions.ends_with(&[
-            "workspace AGENTS.md:\nworkspace rules".to_owned(),
-            "library rules".to_owned(),
-        ]));
+        let expected =
+            ["workspace AGENTS.md:\nworkspace rules", "library rules"].map(str::to_owned);
+        assert!(harness.inner.instructions.ends_with(&expected));
     }
 
     #[tokio::test]
@@ -720,49 +666,43 @@ mod tests {
             }
         }
 
-        let workspace = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
         for interactive in [false, true] {
             let calls = Arc::new(AtomicUsize::new(0));
             let mut capabilities = CapabilitySet::default();
             if !interactive {
                 capabilities.remove(Capability::Interactive);
             }
-            let harness =
-                test_builder(workspace.path(), sessions.path(), Arc::new(HangingProvider))
-                    .capabilities(capabilities)
-                    .policy(Arc::new(crate::tool::policy::AllowAll))
-                    .sensitive_prompt_handler(Arc::new(RecordingSensitive(calls.clone())))
-                    .build()
-                    .await
-                    .unwrap();
+            let provider = Arc::new(HangingProvider);
+            let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
+                .capabilities(capabilities)
+                .policy(Arc::new(crate::tool::policy::AllowAll))
+                .sensitive_prompt_handler(Arc::new(RecordingSensitive(calls.clone())))
+                .build()
+                .await
+                .unwrap();
+            use SensitivePromptKind::*;
             for kind in [
-                SensitivePromptKind::Password,
-                SensitivePromptKind::KeyboardInteractive,
-                SensitivePromptKind::KeyPassphrase,
-                SensitivePromptKind::HostConfirmation,
-                SensitivePromptKind::AgentConfirmation,
+                Password,
+                KeyboardInteractive,
+                KeyPassphrase,
+                HostConfirmation,
+                AgentConfirmation,
             ] {
-                let result = harness
-                    .inner
-                    .sensitive_prompts
-                    .prompt(SensitivePrompt {
-                        kind,
-                        message: "authentication requested".to_owned(),
-                    })
-                    .await;
-                assert_eq!(result.is_ok(), interactive);
-                if !interactive {
-                    assert_eq!(
-                        result.unwrap_err().to_string(),
-                        "interactive authentication is unavailable"
-                    );
+                let message = "authentication requested".to_owned();
+                let prompt = SensitivePrompt { kind, message };
+                let result = harness.inner.sensitive_prompts.prompt(prompt).await;
+                match result {
+                    Ok(_) => assert!(interactive),
+                    Err(error) => {
+                        assert!(!interactive);
+                        let found = error.to_string();
+                        assert_eq!(found, "interactive authentication is unavailable");
+                    }
                 }
             }
-            assert_eq!(
-                calls.load(Ordering::SeqCst),
-                if interactive { 5 } else { 0 }
-            );
+            let found = calls.load(Ordering::SeqCst);
+            assert_eq!(found, if interactive { 5 } else { 0 });
         }
     }
 }

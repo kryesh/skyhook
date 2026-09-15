@@ -149,7 +149,10 @@ pub(crate) fn estimate_message(message: &Message) -> u64 {
                 | UserContent::Runtime { text }
                 | UserContent::ParentInput { text }
                 | UserContent::Compaction { text } => 4 + estimate_text(text),
-                UserContent::Image { .. } => 2_048,
+                UserContent::Attachment { attachment } => match attachment {
+                    crate::media::AttachmentRef::Image(_) => 2_048,
+                    crate::media::AttachmentRef::Text(text) => 4 + text.blob.bytes.div_ceil(4),
+                },
             })
             .sum::<u64>(),
         Message::Assistant(items) => items
@@ -162,9 +165,9 @@ pub(crate) fn estimate_message(message: &Message) -> u64 {
                             4 + estimate_text(text)
                         }
                         BlockContent::ToolCall(call) => {
-                            12 + estimate_text(&call.id)
-                                + estimate_text(&call.name)
-                                + estimate_text(&call.arguments.to_string())
+                            12 + estimate_text(call.id())
+                                + estimate_text(call.name())
+                                + estimate_text(&serde_json::Value::Object(call.arguments().clone()).to_string())
                         }
                     })
                     .sum::<u64>()
@@ -201,7 +204,7 @@ pub(crate) fn estimate_request(request: &ModelRequest) -> u64 {
                     + estimate_text(&tool.input_schema.to_string())
             })
             .sum::<u64>()
-        + request.messages.iter().map(estimate_message).sum::<u64>()
+        + request.messages().map(estimate_message).sum::<u64>()
         + request.response_schema.as_ref().map_or(0, |response| {
             8 + estimate_text(&response.name) + estimate_text(&response.schema.to_string())
         })
@@ -210,6 +213,7 @@ pub(crate) fn estimate_request(request: &ModelRequest) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn text(message: &Message) -> &str {
         let Message::User(blocks) = message else {
@@ -222,7 +226,7 @@ mod tests {
     }
 
     fn summary() -> serde_json::Value {
-        serde_json::json!({
+        json!({
             "objective": "Continue the task",
             "user_instructions": ["Read only"],
             "session_rules": [],
@@ -246,51 +250,48 @@ mod tests {
         })
     }
 
+    fn with(pointer: &str, value: serde_json::Value) -> serde_json::Value {
+        let mut summary = summary();
+        *summary.pointer_mut(pointer).unwrap() = value;
+        summary
+    }
+
     #[test]
     fn generated_schema_accepts_continuations_and_rejects_invalid_contract_data() {
-        // Validate the schema after the same JSON round trip used by providers.
-        // Declaration order is a generation hint, not a response-key-order
-        // requirement: reordered valid responses must still validate and parse.
+        // Validate after the providers' JSON round trip. Declaration order is a
+        // generation hint: reordered valid responses must still validate and parse.
         let schema = serde_json::from_str(&response_schema().to_string()).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         let valid = summary();
-        let reordered: serde_json::Map<_, _> = valid
-            .as_object()
-            .unwrap()
-            .iter()
-            .rev()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        let reordered = serde_json::Value::Object(reordered);
+        let reordered = valid.as_object().unwrap().iter().rev();
+        let reordered = reordered.map(|(key, value)| (key.clone(), value.clone()));
+        let reordered = serde_json::Value::Object(reordered.collect());
         assert!(validator.is_valid(&reordered));
-        assert_eq!(
-            continuation(&reordered.to_string()).unwrap().message,
-            continuation(&valid.to_string()).unwrap().message
-        );
+        let parse = |value: &serde_json::Value| continuation(&value.to_string()).unwrap().message;
+        assert_eq!(parse(&reordered), parse(&valid));
         for field in valid.as_object().unwrap().keys() {
             let mut missing = valid.clone();
             missing.as_object_mut().unwrap().remove(field);
             assert!(!validator.is_valid(&missing), "accepted missing {field}");
         }
         for (pointer, replacement) in [
-            ("/objective", serde_json::json!([])),
-            ("/findings", serde_json::json!([42])),
-            ("/jobs", serde_json::json!(["not a job id"])),
-            ("/todos/0/status", serde_json::json!("finished")),
-            ("/todos/0/text", serde_json::json!(null)),
+            ("/objective", json!([])),
+            ("/findings", json!([42])),
+            ("/jobs", json!(["not a job id"])),
+            ("/todos/0/status", json!("finished")),
+            ("/todos/0/text", json!(null)),
         ] {
-            let mut invalid = valid.clone();
-            *invalid.pointer_mut(pointer).unwrap() = replacement;
+            let invalid = with(pointer, replacement);
             assert!(!validator.is_valid(&invalid), "accepted invalid {pointer}");
         }
         for pointer in ["", "/todos/0"] {
             let mut unknown = valid.clone();
-            unknown
+            let object = unknown
                 .pointer_mut(pointer)
                 .unwrap()
                 .as_object_mut()
-                .unwrap()
-                .insert("unexpected".into(), serde_json::json!(true));
+                .unwrap();
+            object.insert("unexpected".into(), json!(true));
             assert!(
                 !validator.is_valid(&unknown),
                 "accepted extra field at {pointer}"
@@ -311,31 +312,26 @@ mod tests {
         let value = summary();
         let continuation = continuation(&value.to_string()).unwrap();
         let rendered = text(&continuation.message);
-        assert!(rendered.contains(&format!(
+        let plan = |index: usize| value["plan"][index].as_str().unwrap();
+        let expected = format!(
             "## Plan\n\n{}\n\n{}\n\n## Resumption point",
-            value["plan"][0].as_str().unwrap(),
-            value["plan"][1].as_str().unwrap()
-        )));
-        for (_, value) in value
-            .as_object()
-            .unwrap()
-            .iter()
-            .filter(|(key, _)| *key != "todos")
-        {
+            plan(0),
+            plan(1)
+        );
+        assert!(rendered.contains(&expected));
+        for (key, value) in value.as_object().unwrap() {
+            if key == "todos" {
+                continue;
+            }
             if let Some(entries) = value.as_array() {
-                let entries = entries
-                    .iter()
-                    .map(|entry| entry.as_str().unwrap())
-                    .collect::<Vec<_>>();
-                assert!(rendered.contains(&entries.join("\n\n")));
+                let entries = entries.iter().map(|entry| entry.as_str().unwrap());
+                assert!(rendered.contains(&entries.collect::<Vec<_>>().join("\n\n")));
             } else {
                 assert!(rendered.contains(value.as_str().unwrap()));
             }
         }
-        assert_eq!(
-            serde_json::to_value(continuation.todos).unwrap(),
-            value["todos"]
-        );
+        let found = serde_json::to_value(continuation.todos).unwrap();
+        assert_eq!(found, value["todos"]);
     }
 
     #[test]
@@ -343,16 +339,18 @@ mod tests {
         for output in ["", " ", "prose", "```json\n{}\n```", "{}", "[]", "null"] {
             assert!(continuation(output).is_err(), "accepted {output:?}");
         }
-        let mut cases = Vec::new();
-        let mut missing = summary();
+        let (mut missing, mut unknown, mut unknown_todo_field) = (summary(), summary(), summary());
         missing.as_object_mut().unwrap().remove("plan");
-        cases.push(missing);
-        let mut unknown = summary();
         unknown["unexpected"] = true.into();
-        cases.push(unknown);
-        let mut wrong_type = summary();
-        wrong_type["findings"] = serde_json::Value::Null;
-        cases.push(wrong_type);
+        unknown_todo_field["todos"][0]["unexpected"] = true.into();
+        let mut cases = vec![
+            missing,
+            unknown,
+            unknown_todo_field,
+            with("/findings", serde_json::Value::Null),
+            with("/todos/0/status", "blocked".into()),
+            with("/todos/0/text", " \t\n".into()),
+        ];
         for field in summary().as_object().unwrap().keys() {
             if matches!(
                 field.as_str(),
@@ -360,42 +358,25 @@ mod tests {
             ) {
                 continue;
             }
-            for invalid in [
-                serde_json::json!("old string format"),
-                serde_json::json!([42]),
-            ] {
-                let mut wrong_type = summary();
-                wrong_type[field] = invalid;
-                cases.push(wrong_type);
+            for invalid in [json!("old string format"), json!([42])] {
+                cases.push(with(&format!("/{field}"), invalid));
             }
         }
         for invalid in [
-            serde_json::json!([0]),
-            serde_json::json!([-1]),
-            serde_json::json!(["17"]),
+            json!([0]),
+            json!([-1]),
+            json!(["17"]),
             serde_json::Value::Null,
         ] {
-            let mut value = summary();
-            value["jobs"] = invalid;
-            cases.push(value);
+            cases.push(with("/jobs", invalid));
         }
-        let mut wrong_status = summary();
-        wrong_status["todos"][0]["status"] = "blocked".into();
-        cases.push(wrong_status);
-        let mut unknown_todo_field = summary();
-        unknown_todo_field["todos"][0]["unexpected"] = true.into();
-        cases.push(unknown_todo_field);
-        let mut blank_todo = summary();
-        blank_todo["todos"][0]["text"] = " \t\n".into();
-        cases.push(blank_todo);
         for value in cases {
             assert!(
                 continuation(&value.to_string()).is_err(),
                 "accepted {value}"
             );
         }
-        let mut empty_todos = summary();
-        empty_todos["todos"] = serde_json::json!([]);
+        let empty_todos = with("/todos", json!([]));
         assert!(
             continuation(&empty_todos.to_string())
                 .unwrap()
@@ -409,10 +390,11 @@ mod tests {
         use crate::provider::protocol::{
             AssistantBlock, AssistantItem, ItemKind, ReplayEnvelope, ToolCall,
         };
-        let payload = serde_json::json!({"encrypted_content": "opaque".repeat(100)});
-        let mut items: Vec<_> = [3, 3, 2]
-            .into_iter()
-            .enumerate()
+        let payload = json!({"encrypted_content": "opaque".repeat(100)});
+        // The final reasoning item has replay but no visible blocks.
+        let blocks = [3, 3, 2, 0];
+        let mut items: Vec<_> = (0..)
+            .zip(blocks)
             .map(|(position, count)| AssistantItem {
                 id: format!("item-{position}"),
                 position,
@@ -436,48 +418,18 @@ mod tests {
             })
             .collect();
         let reasoning_cost =
-            8 * (4 + estimate_text("visible summary")) + 3 * estimate_text(&payload.to_string());
-        assert_eq!(
-            estimate_message(&Message::Assistant(items.clone())),
-            8 + reasoning_cost
-        );
-        items.push(AssistantItem::text("answer", 3, "visible answer"));
-        let call = ToolCall {
-            id: "call".into(),
-            name: "read".into(),
-            arguments: serde_json::json!({"path":"file"}),
-        };
-        let call_cost = 12
-            + estimate_text(&call.id)
-            + estimate_text(&call.name)
-            + estimate_text(&call.arguments.to_string());
-        items.push(AssistantItem::tool_call("tool", 4, call));
+            8 * (4 + estimate_text("visible summary")) + 4 * estimate_text(&payload.to_string());
+        let found = estimate_message(&Message::Assistant(items.clone()));
+        assert_eq!(found, 8 + reasoning_cost);
+        items.push(AssistantItem::text("answer", 4, "visible answer"));
+        let call = ToolCall::new("call", "read", json!({"path":"file"})).unwrap();
+        let arguments = serde_json::Value::Object(call.arguments().clone()).to_string();
+        let call_cost =
+            12 + estimate_text(call.id()) + estimate_text(call.name()) + estimate_text(&arguments);
+        items.push(AssistantItem::tool_call("tool", 5, call));
         assert_eq!(
             estimate_message(&Message::Assistant(items)),
             8 + reasoning_cost + 4 + estimate_text("visible answer") + call_cost
-        );
-    }
-
-    #[test]
-    fn estimate_counts_replay_even_without_visible_blocks() {
-        use crate::provider::protocol::{AssistantItem, ItemKind, ReplayEnvelope};
-        let payload = serde_json::json!({"encrypted_content": "hidden reasoning"});
-        let item = AssistantItem {
-            id: "hidden".into(),
-            position: 0,
-            kind: ItemKind::Reasoning,
-            blocks: vec![],
-            replay: Some(ReplayEnvelope {
-                version: 1,
-                protocol: "responses".into(),
-                model: "model".into(),
-                scope: "reasoning".into(),
-                payload: payload.clone(),
-            }),
-        };
-        assert_eq!(
-            estimate_message(&Message::Assistant(vec![item])),
-            8 + estimate_text(&payload.to_string())
         );
     }
 
@@ -486,12 +438,15 @@ mod tests {
         let mut request = ModelRequest {
             model: "model".into(),
             system: vec![],
-            messages: vec![],
+            history: Vec::new(),
+            tail: Vec::new(),
+            history_lifetime: Default::default(),
             tools: vec![],
             response_schema: None,
             reasoning: None,
             max_output_tokens: None,
             correlation: None,
+            blobs: Default::default(),
         };
         let without_schema = estimate_request(&request);
         request.response_schema = Some(crate::provider::protocol::ResponseSchema {
@@ -502,20 +457,32 @@ mod tests {
     }
 
     #[test]
-    fn image_estimate_ignores_encoded_payload_length() {
-        let mut image = crate::media::ImageReference {
-            sha256: "hash".into(),
-            media_type: "image/png".into(),
-            name: "image".into(),
-            bytes: 10,
-            data_base64: Some("a".repeat(10)),
+    fn attachment_estimates_fix_image_cost_and_scale_text_with_length() {
+        use crate::media::{AttachmentRef, BlobRef, ImageFormat, ImageRef, TextRef};
+        let estimate = |attachment| {
+            estimate_message(&Message::User(vec![UserContent::Attachment { attachment }]))
         };
-        let short = estimate_message(&Message::User(vec![UserContent::Image {
-            image: image.clone(),
-        }]));
-        image.data_base64 = Some("a".repeat(100_000));
-        let long = estimate_message(&Message::User(vec![UserContent::Image { image }]));
-        assert_eq!(short, long);
-        assert!(short > 1_000);
+        let blob = |bytes| BlobRef {
+            bytes,
+            ..BlobRef::of(b"")
+        };
+        let image = |bytes| {
+            let format = ImageFormat::Png;
+            estimate(AttachmentRef::Image(ImageRef {
+                file: None,
+                format,
+                blob: blob(bytes),
+            }))
+        };
+        let text = |bytes| {
+            estimate(AttachmentRef::Text(TextRef {
+                file: None,
+                blob: blob(bytes),
+            }))
+        };
+        assert_eq!(image(10), image(100_000));
+        assert!(image(10) > 1_000);
+        assert_eq!(text(4_000) - text(0), 1_000);
+        assert_eq!(text(4_001) - text(0), 1_001);
     }
 }

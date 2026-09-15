@@ -23,6 +23,7 @@ pub(super) async fn restore(
                 job,
                 parent,
                 tool,
+                role,
                 name,
                 accepts_input,
                 background,
@@ -37,6 +38,7 @@ pub(super) async fn restore(
                         agent: record.agent.clone(),
                         parent: *parent,
                         tool: tool.clone(),
+                        role: *role,
                         name: name.clone(),
                         arguments: serde_json::Value::Null,
                         output_schema: output_schema.clone(),
@@ -71,15 +73,20 @@ pub(super) async fn restore(
             }
             SessionEvent::JobStateChanged { job, state } => {
                 if let Some(entry) = jobs.get_mut(job) {
-                    if entry.state == super::JobState::Completed
-                        && *state == super::JobState::Running
+                    if matches!(
+                        entry.state,
+                        super::JobState::Completed
+                            | super::JobState::Failed
+                            | super::JobState::Interrupted
+                    ) && *state == super::JobState::Running
                     {
-                        entry.output = None;
-                        entry.images.clear();
-                        entry.error = None;
-                        entry.denial = None;
+                        entry.clear_invocation_output();
                         entry.delivery = DeliveryState::Pending;
-                        entry.background = true;
+                        // Match live retained reset: an interrupted foreground
+                        // invocation still owns its original waiter.
+                        if entry.state != super::JobState::Interrupted {
+                            entry.background = true;
+                        }
                     }
                     if *state == super::JobState::WaitingInput
                         || (entry.state == super::JobState::WaitingInput
@@ -110,11 +117,7 @@ pub(super) async fn restore(
                 denial,
             } => {
                 if let Some(entry) = jobs.get_mut(job) {
-                    entry.state = *state;
-                    entry.delivery = DeliveryState::Pending;
-                    entry.error.clone_from(error);
-                    entry.denial.clone_from(denial);
-                    entry.images.clone_from(images);
+                    entry.apply_finished(*state, images.clone(), error.clone(), denial.clone());
                     if let Some(relative) = output_path {
                         if !is_safe_artifact_path(relative) {
                             return Err(SessionError::UnsafeArtifactPath.into());
@@ -242,32 +245,68 @@ pub(super) fn acknowledge_message(
 mod tests {
     use super::*;
     use crate::execution::ExecutionLocation;
-    use crate::job::{JobState, presented_job_schema};
+    use crate::job::{JobRole, JobState, presented_job_schema};
     use crate::{
         job::output,
-        tool::{ToolError, policy::CapabilitySet},
+        tool::{ToolError, ToolOutput, policy::CapabilitySet},
     };
 
+    /// Drain owners, drop the manager, and replay the durable journal.
+    async fn reopen(jobs: JobManager, root: &std::path::Path) -> JobManager {
+        let session = jobs.store().id();
+        jobs.drain_creations().await;
+        jobs.drain_supervisors().await;
+        drop(jobs);
+        let (store, records) = SessionStore::open(root, session).await.unwrap();
+        JobManager::restore(store, &records).await.unwrap()
+    }
+
     #[tokio::test]
-    async fn denial_survives_replay_and_agent_views_hide_pending_authorization() {
+    async fn replay_recovers_creation_committed_before_map_publication() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::create(root.path()).await.unwrap();
         let agent = AgentId::root(store.id());
-        let jobs = JobManager::new(store.clone());
+        let job = JobId::new(7).unwrap();
+        let created = SessionEvent::JobCreated {
+            origin: None,
+            job,
+            parent: None,
+            tool: "committed-without-map".into(),
+            role: JobRole::Tool,
+            name: None,
+            arguments: serde_json::json!({}),
+            output_schema: None,
+            accepts_input: false,
+            background: false,
+            location: ExecutionLocation::root(".".into()),
+        };
+        let accepted = store.accept_append(agent.clone(), created).await.unwrap();
+        accepted.committed().await.unwrap();
+        // Simulate the persisted prefix at a crash between commit and insertion:
+        // no JobManager has ever published this creation into its map.
+        let jobs = reopen(JobManager::new(store), root.path()).await;
+        assert_eq!(
+            jobs.metadata(job).await.unwrap().state,
+            JobState::Interrupted
+        );
+        assert_eq!(
+            jobs.test_create(JobSpec::test(agent, "next")).await.get(),
+            8
+        );
+    }
+
+    #[tokio::test]
+    async fn denial_survives_replay_and_agent_views_hide_pending_authorization() {
+        let (root, jobs, agent) = super::super::tests::runtime().await;
+        let capabilities = CapabilitySet::default();
         let job = jobs.test_create(JobSpec::test(agent, "shell")).await;
         jobs.transition(job, JobState::AwaitingApproval)
             .await
             .unwrap();
         let pending = jobs.snapshot(job).await.unwrap();
-        assert_eq!(
-            pending.presented(&CapabilitySet::default()).unwrap()["state"],
-            "queued"
-        );
-        assert!(
-            !presented_job_schema(&CapabilitySet::default(), false)
-                .to_string()
-                .contains("awaiting_approval")
-        );
+        assert_eq!(pending.presented(&capabilities).unwrap()["state"], "queued");
+        let schema = presented_job_schema(&capabilities, false).to_string();
+        assert!(!schema.contains("awaiting_approval"));
         jobs.finish(job, ToolError::Denied("user reason".to_owned()).into())
             .await
             .unwrap();
@@ -275,120 +314,197 @@ mod tests {
             .wait(job, None, true)
             .await
             .unwrap()
-            .presented(&CapabilitySet::default())
+            .presented(&capabilities)
             .unwrap();
-        assert_eq!(denied["code"], "permission_denied");
-        assert_eq!(denied["executed"], false);
-        assert_eq!(denied["error"], "user reason");
-        // The persisted terminal event is the source of truth for replay.
-        let session_id = store.id();
-        drop(jobs);
-        drop(store);
-        let (store, records) = SessionStore::open(root.path(), session_id).await.unwrap();
-        let restored = JobManager::restore(store, &records).await.unwrap();
         assert_eq!(
-            restored
-                .snapshot(job)
-                .await
-                .unwrap()
-                .presented(&CapabilitySet::default())
-                .unwrap(),
-            denied
+            (&denied["code"], &denied["executed"], &denied["error"]),
+            (
+                &"permission_denied".into(),
+                &false.into(),
+                &"user reason".into()
+            )
         );
+        // The persisted terminal event is the source of truth for replay.
+        let restored = reopen(jobs, &root.path().join("sessions")).await;
+        let replayed = restored
+            .snapshot(job)
+            .await
+            .unwrap()
+            .presented(&capabilities)
+            .unwrap();
+        assert_eq!(replayed, denied);
     }
 
     #[tokio::test]
     async fn restore_interrupts_active_jobs_and_advances_ids() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let session = store.id();
-        let agent = AgentId::root(session);
-        let manager = JobManager::new(store.clone());
-        let lease = manager
-            .test_lease(JobSpec {
+        let (root, manager, agent) = super::super::tests::runtime().await;
+        let named = ExecutionLocation::named("build", "/srv/project".into());
+        let mut leases = Vec::new();
+        // Unfinished registered captures must not be presented as a structured result.
+        for (location, field, kind, bytes) in [
+            (
+                ExecutionLocation::root(".".into()),
+                "/result/stdout",
+                output::CaptureKind::Text,
+                "prefix\n",
+            ),
+            (
+                named.clone(),
+                "/result/custom",
+                output::CaptureKind::Json,
+                "{\"partial\":",
+            ),
+        ] {
+            let spec = JobSpec {
                 background: true,
+                location,
                 ..JobSpec::test(agent.clone(), "shell")
-            })
-            .await;
-        manager
-            .transition(lease.id, JobState::Running)
-            .await
+            };
+            let lease = manager.test_lease(spec).await;
+            manager
+                .transition(lease.id(), JobState::Running)
+                .await
+                .unwrap();
+            let directory = manager.output_directory(lease.id());
+            std::fs::write(
+                output::register_capture(&directory, field, kind).unwrap(),
+                bytes,
+            )
             .unwrap();
-        let located = manager
-            .test_lease(JobSpec {
-                background: true,
-                location: ExecutionLocation::named("build", "/srv/project".into()),
-                ..JobSpec::test(agent.clone(), "located")
-            })
-            .await;
-        manager
-            .transition(located.id, JobState::Running)
-            .await
-            .unwrap();
-        // Legacy sessions had bare hashed captures, sometimes with an index but
-        // no sidecars. Neither recovery route may invent a structured result.
-        let shell_dir = manager.output_directory(lease.id);
-        std::fs::create_dir_all(&shell_dir).unwrap();
-        std::fs::write(output::field_file(&shell_dir, "/result/stdout"), "prefix\n").unwrap();
-        let located_dir = manager.output_directory(located.id);
-        std::fs::create_dir_all(&located_dir).unwrap();
-        std::fs::write(
-            output::field_file(&located_dir, "/result/custom"),
-            "{\"partial\":",
-        )
-        .unwrap();
-        std::fs::write(located_dir.join("fields.json"), r#"["/result/custom"]"#).unwrap();
-        std::fs::write(
-            located_dir.join("document.json"),
-            r#"{"result":{"custom":{}}}"#,
-        )
-        .unwrap();
-        drop(lease);
-        drop(located);
-        drop(manager);
-        drop(store);
-
-        let (store, records) = SessionStore::open(root.path(), session).await.unwrap();
-        let restored = JobManager::restore(store, &records).await.unwrap();
-        for (job, field, kind) in [(1, "/result/stdout", "text"), (2, "/result/custom", "json")] {
+            leases.push(lease);
+        }
+        drop(leases);
+        let restored = reopen(manager, &root.path().join("sessions")).await;
+        for (job, field, kind, location) in [
+            (
+                1,
+                "/result/stdout",
+                "text",
+                ExecutionLocation::root(".".into()),
+            ),
+            (2, "/result/custom", "json", named),
+        ] {
+            let id = JobId::new(job).unwrap();
+            let args = output::OutputArgs::new(id);
             let view = restored
-                .present_output(
-                    output::OutputArgs::new(JobId::new(job).unwrap()),
-                    &CapabilitySet::default(),
-                )
+                .present_output(args, &CapabilitySet::default())
                 .await
                 .unwrap();
             assert!(view.get("result").is_none());
+            let capture = serde_json::json!({"field":field,"kind":kind,"complete":false});
+            assert_eq!(view["captures"][0], capture);
+            let snapshot = restored.snapshot(id).await.unwrap();
             assert_eq!(
-                view["captures"][0],
-                serde_json::json!({"field":field,"kind":kind,"complete":false})
+                (snapshot.state, snapshot.location),
+                (JobState::Interrupted, location)
             );
         }
-        assert_eq!(
-            restored
-                .snapshot(JobId::new(1).unwrap())
-                .await
-                .unwrap()
-                .state,
-            JobState::Interrupted
-        );
-        assert_eq!(
-            restored
-                .snapshot(JobId::new(1).unwrap())
-                .await
-                .unwrap()
-                .location,
-            ExecutionLocation::root(".".into())
-        );
-        assert_eq!(
-            restored
-                .snapshot(JobId::new(2).unwrap())
-                .await
-                .unwrap()
-                .location,
-            ExecutionLocation::named("build", "/srv/project".into())
-        );
         let next = restored.create(JobSpec::test(agent, "next")).await.unwrap();
-        assert_eq!(next.id.get(), 3);
+        assert_eq!(next.id().get(), 3);
+    }
+
+    fn outcome_image() -> crate::media::ImageRef {
+        crate::media::ImageRef {
+            file: Some("historical-image".into()),
+            format: crate::media::ImageFormat::Png,
+            blob: crate::media::BlobRef {
+                sha256: "ab".repeat(32).parse().unwrap(),
+                bytes: 1,
+            },
+        }
+    }
+
+    async fn stored_projection(jobs: &JobManager, id: JobId) -> serde_json::Value {
+        let entries = jobs.inner.jobs.lock().await;
+        let entry = entries.get(&id).unwrap();
+        serde_json::json!({
+            "state": entry.state, "output": entry.output,
+            "images": entry.images, "error": entry.error, "denial": entry.denial,
+            "pending": entry.delivery == DeliveryState::Pending,
+            "resumable": entry.resume.is_some(),
+        })
+    }
+
+    /// Case 7 is a volatile failure: persistence is unavailable, so the live
+    /// entry keeps its denial, clears partial output and is not replayed.
+    #[tokio::test]
+    async fn outcome_application_live_replay_and_interrupted_cancellation_matrix() {
+        for case in 0..8 {
+            let (root, jobs, agent) = super::super::tests::runtime().await;
+            let spec = JobSpec {
+                accepts_input: true,
+                ..JobSpec::test(agent, "outcome")
+            };
+            let id = jobs.test_create(spec).await;
+            let handler: super::super::ResumeHandler = std::sync::Arc::new(|_, _| {
+                Box::pin(async { Ok(ToolOutput::new(serde_json::Value::Null)) })
+            });
+            jobs.set_resume_handler(id, handler).await.unwrap();
+            jobs.transition(id, JobState::Running).await.unwrap();
+            let question = serde_json::json!({"question":"partial"});
+            jobs.request_input(id, question).await.unwrap();
+            let result = || {
+                ToolOutput::new(serde_json::json!({"result":"sidecar"}))
+                    .with_images(vec![outcome_image()])
+            };
+            let failed = |message: &str, output| JobOutcome::Failed {
+                message: message.into(),
+                output,
+                denial: None,
+            };
+            let outcome = match case {
+                0 => JobOutcome::Completed(result()),
+                1 => failed("failed", None),
+                2 => failed("partial failure", Some(result())),
+                3 => ToolError::Denied("denied".into()).into(),
+                4 => JobOutcome::Cancelled,
+                5 | 6 => JobOutcome::Interrupted,
+                _ => {
+                    let mut entries = jobs.inner.jobs.lock().await;
+                    let entry = entries.get_mut(&id).unwrap();
+                    entry.images = vec![outcome_image()];
+                    entry.denial = Some(crate::tool::Denial::permission_denied());
+                    drop(entries);
+                    jobs.fail_volatile(id, "cannot persist".into()).await;
+                    let projection = stored_projection(&jobs, id).await;
+                    assert_eq!(
+                        (
+                            &projection["state"],
+                            &projection["images"],
+                            &projection["error"]
+                        ),
+                        (
+                            &"failed".into(),
+                            &serde_json::json!([]),
+                            &"cannot persist".into()
+                        )
+                    );
+                    assert!(projection["output"].is_null() && !projection["denial"].is_null());
+                    continue;
+                }
+            };
+            jobs.finish(id, outcome).await.unwrap();
+            if case == 6 {
+                jobs.finish(id, JobOutcome::Cancelled).await.unwrap();
+            }
+            let projection = stored_projection(&jobs, id).await;
+            assert!(projection["output"].is_null());
+            assert_eq!(projection["resumable"], !matches!(case, 4 | 6));
+            // Projection application must not replace the saved payload by an
+            // in-memory question or materialize it into the stored entry.
+            if matches!(case, 0 | 2) {
+                let document = std::fs::read(jobs.output_directory(id).join("document.json"));
+                let document: serde_json::Value =
+                    serde_json::from_slice(&document.unwrap()).unwrap();
+                assert_eq!(document["result"], serde_json::json!({"result":"sidecar"}));
+            }
+            let mut projection = projection;
+            let replay = reopen(jobs, &root.path().join("sessions")).await;
+            let mut replayed = stored_projection(&replay, id).await;
+            // Resume handlers are live-only and never replayed.
+            projection["resumable"] = false.into();
+            replayed["resumable"] = false.into();
+            assert_eq!(projection, replayed);
+        }
     }
 }

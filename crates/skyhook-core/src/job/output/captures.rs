@@ -4,9 +4,14 @@
 //! capture's registration. A reservation is not available until its data file exists.
 use super::*;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+mod stream;
+pub(crate) use stream::{
+    AsyncCapture, CaptureWriter, CompletedCapture, PendingCapture, TextCaptureField,
+};
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum CaptureKind {
+pub enum CaptureKind {
     Text,
     Json,
     /// Transports may stream a capture before its final JSON type is known.
@@ -20,6 +25,25 @@ struct Registration {
     kind: CaptureKind,
 }
 
+fn validate_capture_field(field: &str) -> std::io::Result<()> {
+    let mut chars = field.chars();
+    let valid_root = field.is_empty() || field.starts_with('/');
+    let mut valid_escapes = true;
+    while let Some(character) = chars.next() {
+        if character == '~' && !matches!(chars.next(), Some('0' | '1')) {
+            valid_escapes = false;
+            break;
+        }
+    }
+    if !valid_root || !valid_escapes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "capture field must be a JSON Pointer",
+        ));
+    }
+    Ok(())
+}
+
 /// Reserve a capture's identity before its writer creates the file. Discovery
 /// filters out uncreated reservations, and never parses capture bytes as JSON.
 pub(crate) fn register_capture(
@@ -27,12 +51,7 @@ pub(crate) fn register_capture(
     field: &str,
     kind: CaptureKind,
 ) -> std::io::Result<PathBuf> {
-    if !field.is_empty() && !field.starts_with('/') {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "capture field must be a JSON Pointer",
-        ));
-    }
+    validate_capture_field(field)?;
     std::fs::create_dir_all(directory)?;
     let path = field_file(directory, field);
     let mut metadata = tempfile::NamedTempFile::new_in(directory)?;
@@ -88,28 +107,6 @@ pub(crate) fn available_captures(
         BTreeSet::new()
     };
     let mut captures = BTreeMap::new();
-    // Older sessions saved pointer identities in fields.json but had no sidecars.
-    // Recover types from the compact tree, never from potentially partial bytes.
-    if directory.join("fields.json").exists() {
-        for field in fields(directory)? {
-            if !field_file(directory, &field).is_file() {
-                continue;
-            }
-            let kind = match document.as_ref().and_then(|value| value.pointer(&field)) {
-                Some(Value::String(_)) => CaptureKind::Text,
-                Some(Value::Object(_) | Value::Array(_)) => CaptureKind::Json,
-                _ => CaptureKind::Unknown,
-            };
-            captures.insert(
-                field.clone(),
-                CaptureDescriptor {
-                    complete: completed_fields.contains(&field),
-                    field,
-                    kind,
-                },
-            );
-        }
-    }
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
@@ -133,31 +130,6 @@ pub(crate) fn available_captures(
         );
     }
     Ok(captures.into_values().collect())
-}
-
-/// Migrate sidecar-less captures before finish replaces the old fields index.
-/// The small identity fallback is only for unfinished legacy built-ins; current
-/// producers must register arbitrary captures explicitly.
-pub(crate) fn recover_legacy_captures(
-    directory: &Path,
-    unfinished_tool: Option<&str>,
-) -> Result<(), ToolError> {
-    for capture in available_captures(directory, false)? {
-        if !registration_file(directory, &capture.field).exists() {
-            register_capture(directory, &capture.field, capture.kind)?;
-        }
-    }
-    let known: &[&str] = match unfinished_tool {
-        Some("exec" | "shell") => &["/result/stdout", "/result/stderr"],
-        Some("script") => &["/result/console"],
-        _ => &[],
-    };
-    for field in known {
-        if field_file(directory, field).is_file() && !registration_file(directory, field).exists() {
-            register_capture(directory, field, CaptureKind::Text)?;
-        }
-    }
-    Ok(())
 }
 
 fn registration_file(directory: &Path, field: &str) -> PathBuf {

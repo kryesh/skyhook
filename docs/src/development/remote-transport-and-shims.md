@@ -38,11 +38,12 @@ Both modes use the same musl targets and static ELF validation, and publish to t
 filenames in `target/shims/`. Switching build modes replaces those files with the matching variants;
 debug artifacts and the binaries embedding them are substantially larger.
 
-The build matrix is the `SHIM_TARGETS` constant in [`build.rs`](https://github.com/kryesh/skyhook/blob/main/build.rs). Each entry declares `platform`,
-`protocol`, `arch`, and the Rust `target` triple. The Cargo binary name is derived as
-`<platform>-<protocol>`; the saved artifact is `<platform>-<protocol>-<arch>`. The runtime discovers
-embedded filenames and selects by protocol, platform, and architecture after probing the remote
-machine. The catalog also understands executable extensions, such as
+The private build matrix is `ShimArchitecture` in [`build.rs`](https://github.com/kryesh/skyhook/blob/main/build.rs).
+Its single architecture definition generates the supported variants and their architecture labels,
+Rust target triples, and expected ELF machine codes. All built-in shims use the `linux-ssh` Cargo
+binary; the saved artifacts remain `linux-ssh-x86_64` and `linux-ssh-aarch64`. This closed build
+matrix does not restrict the runtime catalog: it discovers embedded filenames and selects by
+protocol, platform, and architecture after probing the remote machine. The catalog also understands executable extensions, such as
 `windows-winrm-x86_64.exe`, but no Windows build target or WinRM transport is implemented yet.
 
 `rust-embed` embeds both the file list and bytes in debug and release builds, so installed binaries

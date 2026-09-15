@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
-use crate::media::ImageReference;
+use crate::media::{AttachmentRef, ImageRef};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "role", content = "content", rename_all = "snake_case")]
@@ -15,10 +15,22 @@ pub enum Message {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UserContent {
     Text { text: String },
-    Image { image: ImageReference },
+    Attachment { attachment: AttachmentRef },
     Runtime { text: String },
     ParentInput { text: String },
     Compaction { text: String },
+}
+
+impl UserContent {
+    #[must_use]
+    pub fn is_image(&self) -> bool {
+        matches!(
+            self,
+            Self::Attachment {
+                attachment: AttachmentRef::Image(_)
+            }
+        )
+    }
 }
 
 /// A provider-native item. Its blocks and replay state must remain grouped.
@@ -132,27 +144,43 @@ impl AssistantItem {
         }
     }
 
-    /// Concatenates visible text without flattening the stored item boundaries.
+    /// Concatenates visible text without flattening stored item boundaries.
+    /// Kind-mismatched blocks yield `None` rather than a partial projection.
     pub fn text_content(&self) -> Option<String> {
-        (self.kind == ItemKind::Text).then(|| {
-            self.blocks
-                .iter()
-                .filter_map(|b| b.content.text_content())
-                .collect()
-        })
+        (self.kind == ItemKind::Text)
+            .then(|| {
+                self.blocks
+                    .iter()
+                    .map(|b| b.content.text_content())
+                    .collect()
+            })
+            .flatten()
     }
 
     pub fn reasoning_content(&self) -> Option<String> {
-        (self.kind == ItemKind::Reasoning).then(|| {
-            self.blocks
-                .iter()
-                .filter_map(|b| b.content.reasoning_content())
-                .collect()
-        })
+        (self.kind == ItemKind::Reasoning)
+            .then(|| {
+                self.blocks
+                    .iter()
+                    .map(|b| b.content.reasoning_content())
+                    .collect()
+            })
+            .flatten()
     }
 
     pub fn tool_call_ref(&self) -> Option<&ToolCall> {
-        self.blocks.iter().find_map(|b| b.content.tool_call_ref())
+        match (self.kind, self.blocks.as_slice()) {
+            (
+                ItemKind::ToolCall,
+                [
+                    AssistantBlock {
+                        content: BlockContent::ToolCall(call),
+                        ..
+                    },
+                ],
+            ) => Some(call),
+            _ => None,
+        }
     }
 }
 
@@ -187,11 +215,77 @@ impl BlockContent {
     }
 }
 
+/// A completed call: identity is nonblank and arguments are a JSON object.
+/// Fields are private (also through serde); provider name rules stay at their boundaries.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(try_from = "RawToolCall")]
 pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: Value,
+    id: String,
+    name: String,
+    arguments: Map<String, Value>,
+}
+
+/// Wire/journal DTO; its shape intentionally matches the original completed call.
+#[derive(Deserialize)]
+struct RawToolCall {
+    id: String,
+    name: String,
+    arguments: Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ToolCallError {
+    #[error("tool call ID must be nonblank")]
+    EmptyId,
+    #[error("tool call name must be nonblank")]
+    EmptyName,
+    #[error("tool call arguments must be a JSON object")]
+    ArgumentsNotObject,
+}
+
+impl ToolCall {
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: Value,
+    ) -> Result<Self, ToolCallError> {
+        let id = id.into();
+        let name = name.into();
+        if id.trim().is_empty() {
+            return Err(ToolCallError::EmptyId);
+        }
+        if name.trim().is_empty() {
+            return Err(ToolCallError::EmptyName);
+        }
+        let Value::Object(arguments) = arguments else {
+            return Err(ToolCallError::ArgumentsNotObject);
+        };
+        Ok(Self {
+            id,
+            name,
+            arguments,
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn arguments(&self) -> &Map<String, Value> {
+        &self.arguments
+    }
+}
+
+impl TryFrom<RawToolCall> for ToolCall {
+    type Error = ToolCallError;
+
+    fn try_from(raw: RawToolCall) -> Result<Self, Self::Error> {
+        Self::new(raw.id, raw.name, raw.arguments)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -200,7 +294,31 @@ pub struct ToolResult {
     pub name: String,
     pub result: Value,
     #[serde(default)]
-    pub images: Vec<ImageReference>,
+    pub images: Vec<ImageRef>,
     #[serde(default)]
     pub is_error: bool,
+}
+
+#[cfg(test)]
+mod completed_call_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn completed_call_rejects_blank_identity_and_nonobject_arguments() {
+        for (id, name, error) in [
+            ("", "tool", ToolCallError::EmptyId),
+            (" ", "tool", ToolCallError::EmptyId),
+            ("call", "", ToolCallError::EmptyName),
+            ("call", "\t", ToolCallError::EmptyName),
+        ] {
+            assert_eq!(ToolCall::new(id, name, json!({})), Err(error));
+        }
+        for arguments in [Value::Null, json!(false), json!(1), json!("{}"), json!([])] {
+            assert_eq!(
+                ToolCall::new("call", "tool", arguments),
+                Err(ToolCallError::ArgumentsNotObject),
+            );
+        }
+    }
 }

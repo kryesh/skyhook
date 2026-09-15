@@ -1,10 +1,11 @@
 //! Encode canonical history and provider-bound reasoning replay into Chat requests.
 use super::{schema::validate_schema, valid_name, wire};
+use crate::media::AttachmentRef;
 use crate::provider::{
     ProviderError,
     backends::{
         ChatReasoningReplay,
-        common::{image_url, invalid, opaque_payload, tool_text},
+        common::{attachment_text, image_url, invalid, opaque_payload, tool_text},
     },
     protocol::{BlockContent, Message, ModelRequest, UserContent},
 };
@@ -24,7 +25,7 @@ pub(crate) fn encode(
     for segment in &request.system {
         messages.push(json!({"role": "system", "content": segment.text}));
     }
-    for message in &request.messages {
+    for message in request.messages() {
         match message {
             Message::User(parts) => {
                 let mut content = Vec::new();
@@ -34,9 +35,14 @@ pub(crate) fn encode(
                         | UserContent::Runtime { text }
                         | UserContent::ParentInput { text }
                         | UserContent::Compaction { text } => json!({"type": "text", "text": text}),
-                        UserContent::Image { image } => {
-                            json!({"type": "image_url", "image_url": {"url": image_url(image)?}})
-                        }
+                        UserContent::Attachment { attachment } => match attachment {
+                            AttachmentRef::Image(image) => {
+                                json!({"type": "image_url", "image_url": {"url": image_url(request, image)?}})
+                            }
+                            AttachmentRef::Text(text) => {
+                                json!({"type": "text", "text": attachment_text(request, text)?})
+                            }
+                        },
                     });
                 }
                 messages.push(json!({"role": "user", "content": content}));
@@ -60,18 +66,15 @@ pub(crate) fn encode(
                             // reasoning (including foreign summaries) is not provenance.
                             BlockContent::Reasoning { .. } => {}
                             BlockContent::ToolCall(call) => {
-                                if call.id.is_empty()
-                                    || !valid_name(&call.name)
-                                    || !call.arguments.is_object()
-                                {
+                                if !valid_name(call.name()) {
                                     return Err(invalid(
-                                        "Chat tool calls require an ID, a valid function name, and object arguments",
+                                        "Chat tool calls require a valid function name",
                                     ));
                                 }
                                 calls.push(json!({
-                                "id": call.id, "type": "function",
-                                "function": {"name": call.name, "arguments": call.arguments.to_string()}
-                            }));
+                                    "id": call.id(), "type": "function",
+                                    "function": {"name": call.name(), "arguments": serde_json::to_string(call.arguments()).expect("JSON object serialization cannot fail")}
+                                }));
                             }
                         }
                     }
@@ -105,7 +108,7 @@ pub(crate) fn encode(
                     if !result.images.is_empty() {
                         images.push(json!({"type": "text", "text": format!("Images returned by tool call {}:", result.call_id)}));
                         for image in &result.images {
-                            images.push(json!({"type": "image_url", "image_url": {"url": image_url(image)?}}));
+                            images.push(json!({"type": "image_url", "image_url": {"url": image_url(request, image)?}}));
                         }
                     }
                 }
@@ -192,53 +195,64 @@ mod tests {
     use super::*;
     use crate::provider::backends::common::{reasoning_envelope, tests::request};
     use crate::{
-        media::ImageReference,
+        media::{AttachmentRef, BlobRef, ImageFormat, ImageRef, TextRef},
         provider::protocol::{
-            AssistantItem, ResponseAssembler, SystemSegment, ToolCall, ToolDefinition, ToolResult,
+            AssistantItem, ItemKind, ReplayEnvelope, ResponseAssembler, SystemSegment, ToolCall,
+            ToolDefinition, ToolResult,
         },
     };
 
-    fn image() -> ImageReference {
-        ImageReference {
-            sha256: "digest".into(),
-            media_type: "image/png".into(),
-            name: "image.png".into(),
-            bytes: 3,
-            data_base64: Some("AQID".into()),
+    fn image() -> ImageRef {
+        ImageRef {
+            file: Some("image.png".into()),
+            format: ImageFormat::Png,
+            blob: BlobRef::of(b"\x01\x02\x03"),
         }
+    }
+
+    fn history(items: Vec<AssistantItem>) -> ModelRequest {
+        ModelRequest {
+            tail: Vec::new(),
+            history_lifetime: Default::default(),
+            history: vec![Message::Assistant(items)],
+            ..request("test-model")
+        }
+    }
+
+    fn inspect(id: &str, arguments: Value) -> ToolCall {
+        ToolCall::new(id, "inspect", arguments).unwrap()
     }
 
     #[test]
     fn request_preserves_text_tools_images_and_reasoning_settings() {
+        let notes = TextRef {
+            file: Some("notes.txt".into()),
+            blob: BlobRef::of(b"notes"),
+        };
         let mut request = request("gpt-5");
         request.system = vec![SystemSegment {
             text: "system".into(),
             cache: true,
         }];
         request.reasoning = Some("high".into());
+        let schema = json!({"type":"object", "properties":{"value":{}, "choice":{"oneOf":[{"const":true},{"type":"array"}]}}});
         request.tools = vec![ToolDefinition {
             name: "inspect".into(),
             description: "Inspect".into(),
-            input_schema: json!({"type":"object"}),
+            input_schema: schema.clone(),
         }];
-        request.messages = vec![
+        let attach = |attachment| UserContent::Attachment { attachment };
+        request.history = vec![
             Message::User(vec![
                 UserContent::Text {
                     text: "look".into(),
                 },
-                UserContent::Image { image: image() },
+                attach(AttachmentRef::Image(image())),
+                attach(AttachmentRef::Text(notes.clone())),
             ]),
             Message::Assistant(vec![
                 AssistantItem::text("text", 0, "Checking"),
-                AssistantItem::tool_call(
-                    "call",
-                    1,
-                    ToolCall {
-                        id: "call-a".into(),
-                        name: "inspect".into(),
-                        arguments: json!({"path":"a"}),
-                    },
-                ),
+                AssistantItem::tool_call("call", 1, inspect("call-a", json!({"path":"a"}))),
             ]),
             Message::Tool(vec![ToolResult {
                 call_id: "call-a".into(),
@@ -248,32 +262,47 @@ mod tests {
                 images: vec![image()],
             }]),
         ];
+        assert!(encode(&request, ChatReasoningReplay::Unsupported).is_err());
+        // Load the fixture blobs as the session store would.
+        request.blobs.insert(image().blob, b"\x01\x02\x03".to_vec());
+        request.blobs.insert(notes.blob, b"notes".to_vec());
         let body = encode(&request, ChatReasoningReplay::Unsupported).unwrap();
-        assert_eq!(body["messages"][0]["content"], "system");
-        assert_eq!(body["messages"][1]["content"][0]["text"], "look");
+        let messages = &body["messages"];
+        let image_url = "data:image/png;base64,AQID";
+        assert_eq!(messages[0]["content"], "system");
+        assert_eq!(messages[1]["content"][0]["text"], "look");
+        assert_eq!(messages[1]["content"][1]["image_url"]["url"], image_url);
         assert_eq!(
-            body["messages"][1]["content"][1]["image_url"]["url"],
-            "data:image/png;base64,AQID"
+            messages[1]["content"][2],
+            json!({"type":"text", "text":"File: notes.txt\nnotes"})
         );
-        assert_eq!(body["messages"][2]["content"], "Checking");
-        assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "call-a");
-        assert_eq!(body["messages"][3]["tool_call_id"], "call-a");
-        let result: Value =
-            serde_json::from_str(body["messages"][3]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(messages[2]["content"], "Checking");
+        assert_eq!(messages[2]["tool_calls"][0]["id"], "call-a");
+        assert_eq!(messages[3]["tool_call_id"], "call-a");
+        let result: Value = serde_json::from_str(messages[3]["content"].as_str().unwrap()).unwrap();
         assert_eq!(result, json!({"result":{"ok":false},"is_error":true}));
-        assert_eq!(
-            body["messages"][4]["content"][1]["image_url"]["url"],
-            "data:image/png;base64,AQID"
-        );
+        assert_eq!(messages[4]["content"][1]["image_url"]["url"], image_url);
+        // Tool schemas are preserved without strict response-schema restrictions.
         assert_eq!(body["tools"][0]["function"]["name"], "inspect");
+        assert_eq!(body["tools"][0]["function"]["parameters"], schema);
         assert_eq!(body["reasoning_effort"], "high");
-    }
-
-    fn history(items: Vec<AssistantItem>) -> ModelRequest {
-        ModelRequest {
-            messages: vec![Message::Assistant(items)],
-            ..request("test-model")
+        for (effort, valid) in [("max", true), ("unbounded", false)] {
+            let mut request = history(vec![]);
+            request.reasoning = Some(effort.into());
+            let body = encode(&request, ChatReasoningReplay::Unsupported);
+            assert_eq!(
+                body.ok().map(|body| body["reasoning_effort"].clone()),
+                valid.then(|| json!(effort))
+            );
         }
+        // A completed call still obeys chat-specific name restrictions.
+        let call = ToolCall::new("call", "vendor.tool/雪", json!({"x-vendor": [null, 1]})).unwrap();
+        let request = history(vec![AssistantItem::tool_call("item", 0, call)]);
+        let error = encode(&request, ChatReasoningReplay::Unsupported).unwrap_err();
+        assert_eq!(
+            error.kind,
+            crate::provider::ProviderErrorKind::InvalidRequest
+        );
     }
 
     #[test]
@@ -284,11 +313,12 @@ mod tests {
         let scope = reasoning_scope("local", "http://localhost/v1/chat/completions");
         let mut decoder = Decoder::new("test-model".into());
         let mut assembler = ResponseAssembler::default();
-        for frame in [
+        let frames = [
             delta(json!({"reasoning_content":"first "})),
             delta(json!({"reasoning":"second"})),
             end("stop"),
-        ] {
+        ];
+        for frame in frames {
             for mut chunk in decoder.decode(&frame).unwrap() {
                 bind_reasoning_scope(&mut chunk, &scope);
                 assembler.push(&chunk).unwrap();
@@ -299,10 +329,15 @@ mod tests {
         }
         let (items, _, _) = assembler.finish().unwrap();
         let envelope = items[0].replay.as_ref().unwrap();
-        assert_eq!(envelope.version, 1);
-        assert_eq!(envelope.protocol, "chat_completions");
-        assert_eq!(envelope.model, "test-model");
-        assert_eq!(envelope.scope, scope);
+        assert_eq!(
+            (
+                envelope.version,
+                &*envelope.protocol,
+                &*envelope.model,
+                &envelope.scope
+            ),
+            (1, "chat_completions", "test-model", &scope)
+        );
         assert_eq!(envelope.payload, json!({"text":"first second"}));
         let original = history(items);
         for (policy, field, absent) in [
@@ -321,95 +356,72 @@ mod tests {
             filter_reasoning_scope(&mut request, &scope);
             let body = encode(&request, policy).unwrap();
             assert_eq!(body["messages"].as_array().unwrap().len(), 1);
-            assert!(body["messages"][0]["content"].is_null());
-            assert_eq!(body["messages"][0][field], "first second");
-            assert!(body["messages"][0].get(absent).is_none());
+            let message = &body["messages"][0];
+            assert!(message["content"].is_null());
+            assert_eq!(message[field], "first second");
+            assert!(message.get(absent).is_none());
             assert_eq!(body["n"], 1);
         }
-        assert_eq!(
-            encode(&original, ChatReasoningReplay::Unsupported).unwrap()["messages"],
-            json!([])
-        );
-        for mutation in [
-            "scope", "model", "protocol", "version", "missing", "payload",
-        ] {
+        let unsupported = encode(&original, ChatReasoningReplay::Unsupported).unwrap();
+        assert_eq!(unsupported["messages"], json!([]));
+        let mutations: [fn(&mut ReplayEnvelope); 5] = [
+            |envelope| envelope.scope = "elsewhere".into(),
+            |envelope| envelope.model = "different-model".into(),
+            |envelope| envelope.protocol = "responses".into(),
+            |envelope| envelope.version += 1,
+            |envelope| envelope.payload = json!({"text":42}),
+        ];
+        for mutation in mutations.map(Some).into_iter().chain([None]) {
             let mut request = original.clone();
-            let Message::Assistant(items) = &mut request.messages[0] else {
+            let Message::Assistant(items) = &mut request.history[0] else {
                 unreachable!()
             };
-            let envelope = items[0].replay.as_mut().unwrap();
             match mutation {
-                "scope" => envelope.scope = "elsewhere".into(),
-                "model" => envelope.model = "different-model".into(),
-                "protocol" => envelope.protocol = "responses".into(),
-                "version" => envelope.version += 1,
-                "payload" => envelope.payload = json!({"text":42}),
-                "missing" => items[0].replay = None,
-                _ => unreachable!(),
+                Some(mutate) => mutate(items[0].replay.as_mut().unwrap()),
+                None => items[0].replay = None,
             }
             filter_reasoning_scope(&mut request, &scope);
-            assert_eq!(
-                encode(&request, ChatReasoningReplay::ReasoningContent).unwrap()["messages"],
-                json!([]),
-                "{mutation}"
-            );
+            let body = encode(&request, ChatReasoningReplay::ReasoningContent).unwrap();
+            assert_eq!(body["messages"], json!([]));
         }
     }
 
     #[test]
     fn replay_uses_payload_not_visible_blocks_and_keeps_text_and_tools() {
+        let envelope =
+            |text| reasoning_envelope("chat_completions", "test-model", json!({ "text": text }));
         let item = AssistantItem::reasoning(
             "r",
             0,
             "visible summary not original",
-            Some(reasoning_envelope(
-                "chat_completions",
-                "test-model",
-                json!({"text":"original private thought"}),
-            )),
+            Some(envelope("original private thought")),
         );
         let req = history(vec![
             item,
             AssistantItem::text("t", 1, "answer"),
-            AssistantItem::tool_call(
-                "c",
-                2,
-                ToolCall {
-                    id: "call".into(),
-                    name: "inspect".into(),
-                    arguments: json!({}),
-                },
-            ),
+            AssistantItem::tool_call("c", 2, inspect("call", json!({}))),
         ]);
         let body = encode(&req, ChatReasoningReplay::Reasoning).unwrap();
         assert_eq!(body["messages"][0]["reasoning"], "original private thought");
         assert_eq!(body["messages"][0]["content"], "answer");
         assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "call");
         assert!(!body.to_string().contains("visible summary"));
-    }
-
-    #[test]
-    fn max_reasoning_effort_is_allowed_but_unknown_values_are_not() {
-        let mut req = history(vec![]);
-        req.reasoning = Some("max".into());
-        assert_eq!(
-            encode(&req, ChatReasoningReplay::Unsupported).unwrap()["reasoning_effort"],
-            "max"
-        );
-        req.reasoning = Some("unbounded".into());
-        assert!(encode(&req, ChatReasoningReplay::Unsupported).is_err());
-    }
-
-    #[test]
-    fn tool_schemas_are_preserved_without_strict_response_schema_restrictions() {
-        let mut request = request("gpt-5");
-        let schema = json!({"type":"object", "properties":{"value":{}, "choice":{"oneOf":[{"const":true},{"type":"array"}]}}});
-        request.tools.push(ToolDefinition {
-            name: "fetch".into(),
-            description: "Fetch".into(),
-            input_schema: schema.clone(),
-        });
-        let body = encode(&request, ChatReasoningReplay::Unsupported).unwrap();
-        assert_eq!(body["tools"][0]["function"]["parameters"], schema);
+        // Empty reasoning items are omitted; replay-only items keep their payload.
+        for replay in [None, Some(envelope("private"))] {
+            let has_replay = replay.is_some();
+            let item = AssistantItem {
+                id: "r".into(),
+                position: 0,
+                kind: ItemKind::Reasoning,
+                blocks: vec![],
+                replay,
+            };
+            let body = encode(&history(vec![item]), ChatReasoningReplay::Reasoning).unwrap();
+            let messages = body["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), usize::from(has_replay));
+            if has_replay {
+                assert_eq!(messages[0]["reasoning"], "private");
+            }
+        }
     }
 }

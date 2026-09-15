@@ -6,7 +6,6 @@ use std::{
 };
 
 use crate::{
-    agent::HarnessBuilder,
     mcp::config::McpServerConfig,
     provider::backends::OpenAiApi,
     provider::profile::ModelProfile,
@@ -19,6 +18,9 @@ use thiserror::Error;
 mod loader;
 mod paths;
 mod providers;
+mod runtime;
+
+pub use runtime::{ConfiguredModel, RuntimeConfig};
 
 pub use loader::{ConfigDiagnostic, ConfigReport, ResolvedConfig};
 pub(crate) use paths::user_config_directory;
@@ -137,58 +139,30 @@ impl Config {
         Ok(toml::to_string_pretty(self)?)
     }
 
-    /// Validate entries without runtime model selection or external resources.
-    fn validate_structure(&self) -> Result<(), ConfigError> {
-        for (name, profile) in &self.models {
-            profile
-                .validate_limits()
-                .map_err(|message| ConfigError::Model(name.clone(), message.to_owned()))?;
-        }
-        for (name, server) in &self.mcp {
-            server
-                .validate()
-                .map_err(|message| ConfigError::Mcp(name.clone(), message))?;
-        }
-        for (name, provider) in &self.providers {
-            providers::validate(name, provider)?;
-        }
+    /// Admit provider settings, then targets, then model limits, without model
+    /// selection or external resources. Loading discards the admitted providers.
+    fn validate_structure(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, providers::ValidatedProvider>, ConfigError> {
+        let providers = self
+            .providers
+            .iter()
+            .map(|(name, config)| {
+                Ok((
+                    name.clone(),
+                    providers::ValidatedProvider::new(name, config)?,
+                ))
+            })
+            .collect::<Result<_, ConfigError>>()?;
         self.targets
             .validate_structure()
             .map_err(|error| ConfigError::Structure(error.to_string()))?;
-        Ok(())
-    }
-
-    pub fn harness_builder(
-        &self,
-        workspace: impl Into<PathBuf>,
-        model: &str,
-    ) -> Result<HarnessBuilder, ConfigError> {
         for (name, profile) in &self.models {
             profile
                 .validate_limits()
                 .map_err(|message| ConfigError::Model(name.clone(), message.to_owned()))?;
         }
-        for (name, server) in &self.mcp {
-            server
-                .validate()
-                .map_err(|message| ConfigError::Mcp(name.clone(), message))?;
-        }
-        let mut builder = HarnessBuilder::new(workspace)
-            .default_model_profile(model)
-            .max_child_depth(self.max_child_depth)
-            .capabilities(self.capabilities.iter().copied().collect())
-            .mcp(self.mcp.clone())
-            .targets_config(self.targets.clone());
-        if let Some(root) = &self.session_root {
-            builder = builder.session_root(root.clone());
-        }
-        for (name, config) in &self.providers {
-            builder = builder.provider(name.clone(), providers::build(name, config)?);
-        }
-        for (name, profile) in &self.models {
-            builder = builder.model_profile(name.clone(), profile.clone());
-        }
-        Ok(builder)
+        Ok(providers)
     }
 }
 
@@ -213,10 +187,12 @@ pub enum ConfigError {
     MissingEnvironment(String),
     #[error("provider `{0}` could not be initialized: {1}")]
     Provider(String, String),
+    #[error("No model profiles configured. Add a [models.<name>] entry to your config.")]
+    NoModels,
+    #[error("Model profile {model} references unknown provider {provider}.")]
+    UnknownModelProvider { model: String, provider: String },
     #[error("invalid model profile `{0}`: {1}")]
     Model(String, String),
-    #[error("invalid MCP server `{0}`: {1}")]
-    Mcp(String, String),
     #[error(transparent)]
     Harness(#[from] crate::agent::HarnessError),
 }
@@ -235,16 +211,14 @@ impl ConfigError {
 mod tests {
     use super::*;
 
+    const ANTHROPIC_MISSING_KEY: &str = "[providers.test]\nkind = 'anthropic'\nbase_url = 'https://api.anthropic.com/v1'\napi_key_env = 'SKYHOOK_TEST_MISSING_API_KEY'\n";
+
     #[tokio::test]
     async fn explicit_config_is_authoritative() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("explicit.toml");
-        tokio::fs::write(
-            &path,
-            "[models.local]\nprovider = 'local'\nmodel = 'test'\nmax_context = 128000\nmax_output = 16384\nsupports_images = false\n",
-        )
-        .await
-        .unwrap();
+        let text = "[models.local]\nprovider = 'local'\nmodel = 'test'\nmax_context = 128000\nmax_output = 16384\nsupports_images = false\n";
+        tokio::fs::write(&path, text).await.unwrap();
         let config = Config::load(Some(&path)).await.unwrap();
         assert_eq!(config.models.first().unwrap().0, "local");
         assert!(!config.approve_all);
@@ -258,26 +232,21 @@ mod tests {
         let root = tempfile::tempdir_in(&current).unwrap();
         let path = root.path().join("mcp.toml");
         let absolute = root.path().join("absolute");
-        let mut config_value: toml::Value = toml::from_str(
-            "[mcp.relative]\ntransport = 'stdio'\nstart_command = ['server']\ncwd = 'work'\n[mcp.absolute]\ntransport = 'stdio'\nstart_command = ['server']\n[mcp.default]\ntransport = 'stdio'\nstart_command = ['server']",
-        ).unwrap();
-        config_value["mcp"]["absolute"]
-            .as_table_mut()
-            .unwrap()
-            .insert(
-                "cwd".to_owned(),
-                toml::Value::String(absolute.to_str().unwrap().to_owned()),
-            );
-        tokio::fs::write(&path, toml::to_string(&config_value).unwrap())
-            .await
-            .unwrap();
+        let server = "transport = 'stdio'\nstart_command = ['server']";
+        let text = format!(
+            "[mcp.relative]\n{server}\ncwd = 'work'\n[mcp.absolute]\n{server}\ncwd = {}\n[mcp.default]\n{server}",
+            toml::Value::String(absolute.to_str().unwrap().to_owned())
+        );
+        tokio::fs::write(&path, text).await.unwrap();
         // A relative --config path must still produce absolute process directories.
         let config = Config::load(Some(path.strip_prefix(&current).unwrap()))
             .await
             .unwrap();
-        assert_eq!(config.mcp["relative"].cwd, Some(root.path().join("work")));
-        assert_eq!(config.mcp["absolute"].cwd, Some(absolute));
-        assert_eq!(config.mcp["default"].cwd, None);
+        let work = root.path().join("work");
+        let cwd = |name: &str| crate::mcp::RawMcpServerConfig::from(config.mcp[name].clone()).cwd;
+        assert_eq!(cwd("relative"), Some(work));
+        assert_eq!(cwd("absolute"), Some(absolute));
+        assert_eq!(cwd("default"), None);
     }
 
     #[test]
@@ -285,27 +254,20 @@ mod tests {
         assert!(toml::from_str::<Config>("[mcp]").unwrap().mcp.is_empty());
         assert!(toml::from_str::<Config>("[mcp_servers]").is_err());
         assert!(toml::from_str::<Config>("[mcp.invalid]\ntransport = 'stdio'").is_err());
-        let mut config: Config = toml::from_str(
-            "[mcp.test]\ntransport = 'stdio'\nstart_command = ['server']\n[providers.test]\nkind = 'anthropic'\nbase_url = 'https://api.anthropic.com/v1'\napi_key_env = 'SKYHOOK_TEST_MISSING_API_KEY'",
-        ).unwrap();
-        config.mcp.get_mut("test").unwrap().startup_timeout_secs = 0;
-        let Err(ConfigError::Mcp(name, message)) = config.harness_builder(".", "test") else {
-            panic!("expected MCP validation before credential loading");
-        };
-        assert_eq!(name, "test");
-        assert!(message.contains("startup_timeout_secs"));
+        let text = format!(
+            "[mcp.test]\ntransport = 'stdio'\nstart_command = ['server']\nstartup_timeout_secs = 0\n{ANTHROPIC_MISSING_KEY}"
+        );
+        let error = toml::from_str::<Config>(&text)
+            .expect_err("MCP is rejected at ingress before provider credentials");
+        assert!(error.to_string().contains("startup_timeout_secs"));
     }
 
     #[test]
-    fn model_profiles_require_both_limits() {
+    fn model_limits_are_required_and_validated_before_credentials_are_loaded() {
         for limits in ["", "max_context = 128000\n", "max_output = 16384\n"] {
             let text = format!("[models.test]\nprovider = 'test'\nmodel = 'test'\n{limits}");
             assert!(toml::from_str::<Config>(&text).is_err(), "{text}");
         }
-    }
-
-    #[test]
-    fn invalid_limits_are_rejected_before_credentials_are_loaded() {
         for (max_context, max_output, expected) in [
             (0, 1, "max_context must be positive"),
             (128000, 0, "max_output must be positive"),
@@ -313,9 +275,9 @@ mod tests {
             (128000, 128001, "max_output must be smaller"),
         ] {
             let config: Config = toml::from_str(&format!(
-                "[providers.test]\nkind = 'anthropic'\nbase_url = 'https://api.anthropic.com/v1'\napi_key_env = 'SKYHOOK_TEST_MISSING_API_KEY'\n[models.test]\nprovider = 'test'\nmodel = 'test'\nmax_context = {max_context}\nmax_output = {max_output}\n"
+                "{ANTHROPIC_MISSING_KEY}[models.test]\nprovider = 'test'\nmodel = 'test'\nmax_context = {max_context}\nmax_output = {max_output}\n"
             )).unwrap();
-            let Err(ConfigError::Model(name, message)) = config.harness_builder(".", "test") else {
+            let Err(ConfigError::Model(name, message)) = config.into_runtime() else {
                 panic!("expected limit validation before credential loading");
             };
             assert_eq!(name, "test");
@@ -332,41 +294,59 @@ mod tests {
     }
 
     #[test]
-    fn native_protocols_require_explicit_configuration_without_presets() {
-        for text in [
-            "kind = 'openai'\napi = 'responses'",
-            "kind = 'openai'\nbase_url = 'https://example.com/v1'",
-            "kind = 'anthropic'",
-            "kind = 'claude'",
-            "kind = 'openai_compatible'\nbase_url = 'https://example.com/v1'\napi = 'responses'",
+    fn native_protocols_require_explicit_configuration_and_pass_model_identifiers_through() {
+        for (text, valid) in [
+            ("kind = 'openai'\napi = 'responses'", false),
+            (
+                "kind = 'openai'\nbase_url = 'https://example.com/v1'",
+                false,
+            ),
+            ("kind = 'anthropic'", false),
+            ("kind = 'claude'", false),
+            (
+                "kind = 'openai_compatible'\nbase_url = 'https://example.com/v1'\napi = 'responses'",
+                false,
+            ),
+            (
+                "kind = 'openai'\nbase_url = 'https://example.com/custom/v1'\napi = 'responses'",
+                true,
+            ),
+            (
+                "kind = 'openai'\nbase_url = 'http://localhost:8080/v1'\napi = 'chat_completions'",
+                true,
+            ),
+            (
+                "kind = 'anthropic'\nbase_url = 'https://example.com/v1'",
+                true,
+            ),
+            ("kind = 'codex'", true),
         ] {
-            assert!(toml::from_str::<ProviderConfig>(text).is_err(), "{text}");
+            assert_eq!(
+                toml::from_str::<ProviderConfig>(text).is_ok(),
+                valid,
+                "{text}"
+            );
         }
-        for text in [
-            "kind = 'openai'\nbase_url = 'https://example.com/custom/v1'\napi = 'responses'",
-            "kind = 'openai'\nbase_url = 'http://localhost:8080/v1'\napi = 'chat_completions'",
-            "kind = 'anthropic'\nbase_url = 'https://example.com/v1'",
-            "kind = 'codex'",
-        ] {
-            assert!(toml::from_str::<ProviderConfig>(text).is_ok(), "{text}");
-        }
-    }
-
-    #[test]
-    fn native_configuration_passes_model_identifiers_through() {
         let config: Config = toml::from_str(
             "[providers.local]\nkind = 'openai'\nbase_url = 'http://localhost:8080/v1'\napi = 'responses'\n\
              [models.local]\nprovider = 'local'\nmodel = 'exact-model-id'\nmax_context = 128000\nmax_output = 16384\n",
         ).unwrap();
         assert_eq!(config.models["local"].model, "exact-model-id");
         // Provider construction must not connect to an endpoint or require a key.
-        assert!(config.harness_builder(".", "local").is_ok());
+        let runtime = config.into_runtime().unwrap();
+        assert!(
+            runtime
+                .select_model("local")
+                .unwrap()
+                .harness_builder(".")
+                .is_ok()
+        );
     }
 
     #[test]
     fn capabilities_are_exact_and_validate_names() {
-        let defaults: Config = toml::from_str("").unwrap();
-        let expected = vec![
+        let parse = |text: &str| toml::from_str::<Config>(text);
+        let expected = [
             Capability::Read,
             Capability::Write,
             Capability::Exec,
@@ -374,52 +354,32 @@ mod tests {
             Capability::Agents,
             Capability::Mcp,
         ];
-        assert_eq!(defaults.capabilities, expected);
-
-        let empty: Config = toml::from_str("capabilities = []").unwrap();
-        assert!(empty.capabilities.is_empty());
-        let exact: Config = toml::from_str("capabilities = ['read', 'targets']").unwrap();
+        assert_eq!(parse("").unwrap().capabilities, expected);
+        assert!(parse("capabilities = []").unwrap().capabilities.is_empty());
+        let exact = parse("capabilities = ['read', 'targets']").unwrap();
         assert_eq!(exact.capabilities, [Capability::Read, Capability::Targets]);
         for name in ["unknown", "Mcp", "Interactive", "READ"] {
-            let error = toml::from_str::<Config>(&format!("capabilities = ['{name}']"))
+            let error = parse(&format!("capabilities = ['{name}']"))
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(name), "{error}");
             assert!(error.contains("unknown variant"), "{error}");
         }
-        let all: Config = toml::from_str(
+        let all = parse(
             "capabilities = ['read', 'write', 'exec', 'network', 'targets', 'agents', 'mcp']",
         )
         .unwrap();
-        assert_eq!(
-            all.capabilities,
-            Capability::ALL
-                .into_iter()
-                .filter(|capability| *capability != Capability::Interactive)
-                .collect::<Vec<_>>()
-        );
-        let error = toml::from_str::<Config>("capabilities = ['interactive']").unwrap_err();
+        let non_interactive: Vec<_> = Capability::ALL
+            .into_iter()
+            .filter(|capability| *capability != Capability::Interactive)
+            .collect();
+        assert_eq!(all.capabilities, non_interactive);
+        let error = parse("capabilities = ['interactive']").unwrap_err();
         assert!(error.to_string().contains("controlled by the runtime host"));
-        let approved: Config = toml::from_str("approve_all = true\ncapabilities = []").unwrap();
+        let approved = parse("approve_all = true\ncapabilities = []").unwrap();
         assert!(approved.approve_all);
         assert!(approved.capabilities.is_empty());
-        assert!(toml::from_str::<Config>("capabilities = 'read'").is_err());
-        assert!(toml::from_str::<Config>("targets_enabled = true").is_err());
-    }
-
-    #[test]
-    fn approve_all_is_opt_in() {
-        let disabled: Config = toml::from_str(
-            "[models.test]\nprovider='test'\nmodel='test'\nmax_context=128000\nmax_output=16384\nsupports_images=false\n",
-        )
-        .unwrap();
-        assert!(!disabled.approve_all);
-        assert!(!disabled.capabilities.contains(&Capability::Targets));
-
-        let enabled: Config = toml::from_str(
-            "approve_all=true\n[models.test]\nprovider='test'\nmodel='test'\nmax_context=128000\nmax_output=16384\nsupports_images=false\n",
-        )
-        .unwrap();
-        assert!(enabled.approve_all);
+        assert!(parse("capabilities = 'read'").is_err());
+        assert!(parse("targets_enabled = true").is_err());
     }
 }

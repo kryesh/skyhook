@@ -79,16 +79,16 @@ pub(super) fn active_job(
     use crate::tool::policy::Capability;
 
     let entry = &jobs[&id];
-    let is_agent = entry.tool == "agent" || progress.agents.contains_key(&id);
+    let is_agent = entry.role == super::JobRole::Agent;
     let mut children = Vec::new();
     path.insert(id);
-    if let Some(agent) = progress.agents.get(&id) {
+    if is_agent && let Some(agent) = progress.agents.get(&id) {
         let mut child_ids = jobs
             .iter()
             .filter(|(job, child)| {
                 &child.agent == agent
                     && !child.state.is_terminal()
-                    && (child.tool == "agent" || progress.agents.contains_key(job))
+                    && child.role == super::JobRole::Agent
                     && !path.contains(job)
             })
             .map(|(job, _)| *job)
@@ -131,28 +131,21 @@ mod tests {
 
     async fn started(jobs: &JobManager, agent: &AgentId, owner: JobId, target: &str) {
         let location = ExecutionLocation::named(target, format!("/{target}/work").into());
-        jobs.test_append(
-            agent.clone(),
-            SessionEvent::AgentStarted {
-                parent: None,
-                owner_job: Some(owner),
-                model_profile: "test".into(),
-                max_context: None,
-                location: location.clone(),
-            },
-        )
-        .await;
+        let event = SessionEvent::AgentStarted {
+            parent: None,
+            owner_job: Some(owner),
+            model_profile: "test".into(),
+            max_context: None,
+            location: location.clone(),
+        };
+        jobs.test_append(agent.clone(), event).await;
         jobs.set_agent_location(owner, location).await.unwrap();
     }
 
     async fn committed(jobs: &JobManager, agent: &AgentId) {
-        jobs.test_append(
-            agent.clone(),
-            SessionEvent::MessageCommitted {
-                message: Message::Assistant(vec![AssistantContent::text("answer", 0, "done")]),
-            },
-        )
-        .await;
+        let message = Message::Assistant(vec![AssistantContent::text("answer", 0, "done")]);
+        jobs.test_append(agent.clone(), SessionEvent::MessageCommitted { message })
+            .await;
     }
 
     async fn snapshot(jobs: &JobManager, owner: &AgentId, targets: bool) -> Value {
@@ -161,6 +154,18 @@ mod tests {
             capabilities.insert(Capability::Targets);
         }
         serde_json::to_value(jobs.active_states(owner, &capabilities, i64::MAX).await).unwrap()
+    }
+
+    fn agent_spec(agent: &AgentId, parent: Option<JobId>) -> JobSpec {
+        JobSpec {
+            parent,
+            role: JobRole::Agent,
+            ..JobSpec::test(agent.clone(), "delegate")
+        }
+    }
+
+    fn progress(value: &Value) -> (Value, Value) {
+        (value["turns"].clone(), value["tool_calls"].clone())
     }
 
     #[tokio::test]
@@ -172,92 +177,80 @@ mod tests {
         let grandchild = child.child(1);
         let great_grandchild = grandchild.child(1);
         let jobs = JobManager::new(store);
-        let delegated = jobs.test_lease(JobSpec::test(root.clone(), "agent")).await;
-        let ordinary = jobs.test_lease(JobSpec::test(root.clone(), "exec")).await;
+        let delegated = jobs.test_lease(agent_spec(&root, None)).await;
+        let ordinary = jobs.test_lease(JobSpec::test(root.clone(), "agent")).await;
         // Even queued agents without AgentStarted have zero counters; tools do not.
         let initial = snapshot(&jobs, &root, false).await;
-        assert_eq!(initial[0]["turns"], 0);
-        assert_eq!(initial[0]["tool_calls"], 0);
+        assert_eq!(progress(&initial[0]), (0.into(), 0.into()));
         assert!(initial[0].get("children").is_none());
-        assert!(initial[1].get("turns").is_none());
-        assert!(initial[1].get("tool_calls").is_none());
-        started(&jobs, &child, delegated.id, "child").await;
+        assert_eq!(progress(&initial[1]), (Value::Null, Value::Null));
+        started(&jobs, &child, delegated.id(), "child").await;
         committed(&jobs, &child).await;
         committed(&jobs, &child).await;
         committed(&jobs, &root).await; // Not child progress.
         let script = jobs
             .test_lease(JobSpec::test(child.clone(), "script"))
             .await;
-        let nested = jobs
-            .test_lease(JobSpec {
-                parent: Some(script.id),
-                ..JobSpec::test(child.clone(), "exec")
-            })
-            .await;
-        jobs.test_finish(nested.id, serde_json::Value::Null).await;
-        let delegated_again = jobs
-            .test_lease(JobSpec {
-                parent: Some(script.id),
-                ..JobSpec::test(child.clone(), "agent")
-            })
-            .await;
-        started(&jobs, &grandchild, delegated_again.id, "grandchild").await;
-        jobs.transition(delegated_again.id, JobState::AwaitingApproval)
+        let spec = JobSpec {
+            parent: Some(script.id()),
+            ..JobSpec::test(child.clone(), "exec")
+        };
+        let nested = jobs.test_lease(spec).await;
+        jobs.test_finish(nested.id(), Value::Null).await;
+        let delegated_again = jobs.test_lease(agent_spec(&child, Some(script.id()))).await;
+        started(&jobs, &grandchild, delegated_again.id(), "grandchild").await;
+        jobs.transition(delegated_again.id(), JobState::AwaitingApproval)
             .await
             .unwrap();
         committed(&jobs, &grandchild).await;
-        let deepest = jobs
-            .test_lease(JobSpec::test(grandchild.clone(), "agent"))
-            .await;
-        started(&jobs, &great_grandchild, deepest.id, "deepest").await;
+        let deepest = jobs.test_lease(agent_spec(&grandchild, None)).await;
+        started(&jobs, &great_grandchild, deepest.id(), "deepest").await;
         committed(&jobs, &great_grandchild).await;
-        jobs.test_lease(JobSpec::test(great_grandchild.clone(), "read"))
+        let _leaf = jobs
+            .test_create(JobSpec::test(great_grandchild.clone(), "read"))
             .await;
-        let terminal = jobs.test_lease(JobSpec::test(child.clone(), "agent")).await;
-        jobs.test_finish(terminal.id, serde_json::Value::Null).await;
+        let terminal = jobs.test_lease(agent_spec(&child, None)).await;
+        jobs.test_finish(terminal.id(), Value::Null).await;
 
         let state = snapshot(&jobs, &root, false).await;
         assert_eq!(state.as_array().unwrap().len(), 2);
-        assert_eq!(state[0]["job"], delegated.id.get());
-        assert_eq!(state[1]["job"], ordinary.id.get());
-        assert_eq!(state[0]["turns"], 2);
-        assert_eq!(state[0]["tool_calls"], 4); // Script, nested exec, two agent jobs.
+        assert_eq!(
+            (&state[0]["job"], &state[1]["job"]),
+            (&delegated.id().get().into(), &ordinary.id().get().into())
+        );
+        // Script, nested exec, and two agent jobs.
+        assert_eq!(progress(&state[0]), (2.into(), 4.into()));
         assert_eq!(state[0]["children"].as_array().unwrap().len(), 1);
         let grand = &state[0]["children"][0];
-        assert_eq!(grand["job"], delegated_again.id.get());
+        assert_eq!(grand["job"], delegated_again.id().get());
         assert_eq!(grand["state"], "queued"); // Approval stays host-only.
-        assert_eq!(grand["turns"], 1);
-        assert_eq!(grand["tool_calls"], 1);
+        assert_eq!(progress(grand), (1.into(), 1.into()));
         assert_eq!(grand["location"]["workspace"], "/grandchild/work");
         let deepest_state = &grand["children"][0];
-        assert_eq!(deepest_state["job"], deepest.id.get());
-        assert_eq!(deepest_state["turns"], 1);
-        assert_eq!(deepest_state["tool_calls"], 1);
+        assert_eq!(deepest_state["job"], deepest.id().get());
+        assert_eq!(progress(deepest_state), (1.into(), 1.into()));
         assert!(deepest_state.get("children").is_none());
-        for entry in [&state[0], grand, deepest_state] {
-            assert!(entry["location"].get("target").is_none());
-        }
         let visible = snapshot(&jobs, &root, true).await;
-        assert_eq!(visible[0]["location"]["target"], "child");
-        assert_eq!(
-            visible[0]["children"][0]["location"]["target"],
-            "grandchild"
-        );
-        assert_eq!(
-            visible[0]["children"][0]["children"][0]["location"]["target"],
-            "deepest"
-        );
+        let mut visible = &visible[0];
+        for (entry, target) in [
+            (&state[0], "child"),
+            (grand, "grandchild"),
+            (deepest_state, "deepest"),
+        ] {
+            assert!(entry["location"].get("target").is_none());
+            assert_eq!(visible["location"]["target"], target);
+            visible = &visible["children"][0];
+        }
         // Polling and a different viewer cannot double count the same journal suffix.
         assert_eq!(snapshot(&jobs, &root, false).await, state);
-        let own = snapshot(&jobs, &child, false).await;
-        assert_eq!(own[1]["turns"], grand["turns"]);
-        assert_eq!(own[1]["tool_calls"], grand["tool_calls"]);
-        let future = serde_json::to_value(
-            jobs.active_states(&root, &CapabilitySet::default(), 0)
-                .await,
-        )
-        .unwrap();
-        assert_eq!(future[0]["age_seconds"], 0);
+        assert_eq!(
+            progress(&snapshot(&jobs, &child, false).await[1]),
+            progress(grand)
+        );
+        let future = jobs
+            .active_states(&root, &CapabilitySet::default(), 0)
+            .await;
+        assert_eq!(serde_json::to_value(future).unwrap()[0]["age_seconds"], 0);
     }
 
     #[tokio::test]
@@ -267,90 +260,69 @@ mod tests {
         let root = AgentId::root(store.id());
         let child = root.child(1);
         let jobs = JobManager::new(store.clone());
-        let delegated = jobs
-            .test_lease(JobSpec {
-                accepts_input: true,
-                ..JobSpec::test(root.clone(), "agent")
-            })
-            .await;
-        started(&jobs, &child, delegated.id, "child").await;
-        committed(&jobs, &child).await;
-        let tool = jobs.test_lease(JobSpec::test(child.clone(), "read")).await;
-        jobs.test_finish(tool.id, serde_json::Value::Null).await;
+        let spec = JobSpec {
+            accepts_input: true,
+            ..agent_spec(&root, None)
+        };
+        let delegated = jobs.test_lease(spec).await;
+        started(&jobs, &child, delegated.id(), "child").await;
+        let turn = async |jobs: JobManager, child: AgentId| {
+            committed(&jobs, &child).await;
+            let tool = jobs.test_lease(JobSpec::test(child, "read")).await;
+            jobs.test_finish(tool.id(), Value::Null).await;
+        };
+        turn(jobs.clone(), child.clone()).await;
         let release = Arc::new(tokio::sync::Semaphore::new(0));
-        jobs.set_resume_handler(
-            delegated.id,
-            Arc::new({
-                let jobs = jobs.clone();
-                let child = child.clone();
-                let release = release.clone();
-                move |_, _| {
-                    let jobs = jobs.clone();
-                    let child = child.clone();
-                    let release = release.clone();
-                    Box::pin(async move {
-                        committed(&jobs, &child).await;
-                        let tool = jobs.test_lease(JobSpec::test(child, "read")).await;
-                        jobs.test_finish(tool.id, serde_json::Value::Null).await;
-                        release.acquire().await.unwrap().forget();
-                        Ok(ToolOutput::default())
-                    })
-                }
-            }),
-        )
-        .await
-        .unwrap();
+        let handler: ResumeHandler = Arc::new({
+            let (jobs, child, release) = (jobs.clone(), child.clone(), release.clone());
+            move |_, _| {
+                let (jobs, child, release) = (jobs.clone(), child.clone(), release.clone());
+                Box::pin(async move {
+                    turn(jobs, child).await;
+                    release.acquire().await.unwrap().forget();
+                    Ok(ToolOutput::default())
+                })
+            }
+        });
+        jobs.set_resume_handler(delegated.id(), handler)
+            .await
+            .unwrap();
         assert_eq!(snapshot(&jobs, &root, false).await[0]["turns"], 1);
-        jobs.test_finish(delegated.id, serde_json::Value::Null)
-            .await;
-        assert!(
-            snapshot(&jobs, &root, false)
-                .await
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
-        jobs.send(delegated.id, Value::Null).await.unwrap();
+        jobs.test_finish(delegated.id(), Value::Null).await;
+        assert_eq!(snapshot(&jobs, &root, false).await, serde_json::json!([]));
+        jobs.send(delegated.id(), Value::Null).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let state = snapshot(&jobs, &root, false).await;
-                if state[0]["tool_calls"] == 2 {
-                    assert_eq!(state[0]["turns"], 2);
-                    break;
-                }
+            while snapshot(&jobs, &root, false).await[0]["tool_calls"] != 2 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
+        assert_eq!(snapshot(&jobs, &root, false).await[0]["turns"], 2);
         release.add_permits(1);
-        jobs.wait(delegated.id, Some(Duration::from_secs(5)), true)
+        jobs.wait(delegated.id(), Some(Duration::from_secs(5)), true)
             .await
             .unwrap();
-        jobs.clear_resume_handler(delegated.id).await;
+        jobs.clear_resume_handler(delegated.id()).await;
 
         let records = store.records().await;
         let restored = JobManager::restore(store, &records).await.unwrap();
+        let retained = async || {
+            let progress = restored.inner.progress.lock().await.for_job(delegated.id());
+            serde_json::to_value(progress).unwrap()
+        };
         // Completed agents remain omitted after replay, but retain progress for resumption.
-        assert!(
-            snapshot(&restored, &root, false)
-                .await
-                .as_array()
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            snapshot(&restored, &root, false).await,
+            serde_json::json!([])
         );
         assert_eq!(
-            serde_json::to_value(restored.inner.progress.lock().await.for_job(delegated.id))
-                .unwrap(),
+            retained().await,
             serde_json::json!({"turns": 2, "tool_calls": 2})
         );
         // Exercise the same projection after replay without resetting the retained identity.
         committed(&restored, &child).await;
         snapshot(&restored, &root, false).await;
-        assert_eq!(
-            serde_json::to_value(restored.inner.progress.lock().await.for_job(delegated.id))
-                .unwrap()["turns"],
-            3
-        );
+        assert_eq!(retained().await["turns"], 3);
     }
 }

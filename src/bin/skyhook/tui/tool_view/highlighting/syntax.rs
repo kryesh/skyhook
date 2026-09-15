@@ -1,6 +1,6 @@
 //! Shared foreground-only grammar and theme service for tools and code fences.
-use super::super::ContentTheme;
-use super::{MAX_LINE, MAX_SECTION, model};
+use super::super::{ContentTheme, model};
+use super::{MAX_LINE, MAX_SECTION};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -106,8 +106,14 @@ mod tests {
             .join("\n")
     }
 
+    fn has_span(line: &Line<'_>, test: impl Fn(&str, Option<Color>) -> bool) -> bool {
+        line.spans
+            .iter()
+            .any(|span| test(&span.content, span.style.fg))
+    }
+
     #[test]
-    fn shared_highlighter_maps_tokens_and_preserves_source() {
+    fn shared_highlighter_maps_tokens_preserves_source_and_declines_unsupported_input() {
         let source = "let value = (true, 42, \"hello\");  \n\t// comment 界 👩‍💻\n\n";
         let theme = ContentTheme::new();
         let lines = highlight_code(source, "rust").unwrap();
@@ -121,12 +127,18 @@ mod tests {
             ("hello", theme.success),
             ("comment", theme.muted),
         ] {
-            assert!(
-                spans
-                    .iter()
-                    .any(|span| span.content.contains(token) && span.style.fg == Some(color)),
-                "{token}: {spans:?}"
-            );
+            let found = spans
+                .iter()
+                .any(|span| span.content.contains(token) && span.style.fg == Some(color));
+            assert!(found, "{token}: {spans:?}");
+        }
+        for (source, language) in [
+            ("hello".to_owned(), "not-a-real-language"),
+            ("hello".to_owned(), ""),
+            ("x".repeat(MAX_LINE + 1), "rust"),
+            ("x\n".repeat(MAX_SECTION / 2 + 1), "rust"),
+        ] {
+            assert!(highlight_code(&source, language).is_none());
         }
     }
 
@@ -144,10 +156,11 @@ mod tests {
         }
         assert!(source.contains(needle), "missing {needle:?}");
         for (start, _) in source.match_indices(needle) {
+            let colored = colors[start..start + needle.len()]
+                .iter()
+                .all(|color| *color == Some(expected));
             assert!(
-                colors[start..start + needle.len()]
-                    .iter()
-                    .all(|color| *color == Some(expected)),
+                colored,
                 "{needle:?} at {start} should be {expected:?}: {lines:?}"
             );
         }
@@ -159,31 +172,18 @@ mod tests {
         let theme = ContentTheme::new();
         let lines = highlight_code(source, "javascript").unwrap();
         assert_eq!(text(&lines), source);
-        // Inspect actual source tokens, not only synthetic theme selectors.
         for token in ["declared", "called", "method"] {
             assert_source_color(&lines[..2], token, theme.secondary);
         }
         assert_source_color(&lines[..1], "result", theme.fg);
-        let literal_line = &lines[2];
         for (token, color) in [
             ("declared() called() method()", theme.success),
             (" declared() called() method()", theme.muted),
         ] {
-            assert!(
-                literal_line
-                    .spans
-                    .iter()
-                    .any(|span| span.content.as_ref() == token && span.style.fg == Some(color)),
-                "{token}: {literal_line:?}"
-            );
+            let found = has_span(&lines[2], |content, fg| {
+                content == token && fg == Some(color)
+            });
+            assert!(found, "{token}: {:?}", lines[2]);
         }
-    }
-
-    #[test]
-    fn shared_highlighter_declines_unrecognised_and_oversized_input() {
-        assert!(highlight_code("hello", "not-a-real-language").is_none());
-        assert!(highlight_code("hello", "").is_none());
-        assert!(highlight_code(&"x".repeat(MAX_LINE + 1), "rust").is_none());
-        assert!(highlight_code(&"x\n".repeat(MAX_SECTION / 2 + 1), "rust").is_none());
     }
 }

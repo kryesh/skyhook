@@ -78,14 +78,11 @@ mod tests {
             packet(json!({"cached_tokens":null}), 5),
             end("stop"),
         ]);
-        assert_eq!(
-            usage,
-            Usage {
-                input_tokens: 20,
-                cached_input_tokens: 80,
-                output_tokens: 5
-            }
-        );
+        let expected = Usage {
+            output_tokens: 5,
+            ..USAGE
+        };
+        assert_eq!(usage, expected);
     }
 
     #[test]
@@ -127,32 +124,20 @@ mod tests {
 
     #[test]
     fn repeated_finish_can_refine_usage() {
-        let packet = |prompt, completion, cached| {
-            json!({
+        let packet = |completion, cached: Value| {
+            event(json!({
                 "choices":[{"finish_reason":"length"}],
-                "usage":{
-                    "prompt_tokens":prompt,"completion_tokens":completion,
-                    "prompt_tokens_details":{"cached_tokens":cached}
-                }
-            })
+                "usage":{"prompt_tokens":100,"completion_tokens":completion,
+                    "prompt_tokens_details":{"cached_tokens":cached}}
+            }))
         };
-        let initial = packet(100, 9, Value::Null);
-        let refined = packet(100, 10, json!(80));
         let (_, usage, stop) = decode(vec![
             delta(json!({"content":"partial"})),
             end("length"),
-            event(initial.clone()),
-            event(refined.clone()),
+            packet(9, Value::Null),
+            packet(10, json!(80)),
             event(json!({"choices":[{"finish_reason":"length","delta":null}]})),
         ]);
-        assert_eq!(stop, StopReason::MaxTokens);
-        assert_eq!(
-            usage,
-            Usage {
-                input_tokens: 20,
-                cached_input_tokens: 80,
-                output_tokens: 10
-            }
-        );
+        assert_eq!((stop, usage), (StopReason::MaxTokens, USAGE));
     }
 }

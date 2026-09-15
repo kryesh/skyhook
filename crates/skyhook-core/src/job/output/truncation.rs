@@ -5,6 +5,7 @@ pub(super) const FIELD_BYTES: usize = 2 * 1024;
 pub(super) const FIELD_LINES: usize = 100;
 const ANNOTATION: &str = "x-skyhook-truncatable";
 
+/// The projected view, with its truncated fields listed under `truncated`.
 pub(super) fn project(
     directory: &Path,
     schema: &Value,
@@ -28,7 +29,10 @@ pub(super) fn project(
     output.insert("result".into(), document["result"].take());
     capture_notice(&mut output, document["capture_complete"].as_bool());
     if !projection.truncated.is_empty() {
-        output.insert("truncated".into(), Value::Array(projection.truncated));
+        output.insert(
+            "truncated".into(),
+            serde_json::to_value(&projection.truncated)?,
+        );
     }
     Ok(output)
 }
@@ -36,7 +40,7 @@ pub(super) fn project(
 struct Projection<'a> {
     directory: &'a Path,
     stored_fields: Vec<String>,
-    truncated: Vec<Value>,
+    truncated: Vec<OutputTruncation>,
     cancellation: &'a super::super::CancellationToken,
     annotated: &'a BTreeSet<String>,
     replacements: &'a BTreeMap<String, Value>,
@@ -81,12 +85,14 @@ impl Projection<'_> {
                     .iter()
                     .rposition(|&b| b == b'\n')
                     .map_or(end, |last| end - last - 1);
-                let mut marker =
-                    json!({"field":field,"total_lines":index.total_lines(),"next_start":line});
-                if offset != 0 {
-                    marker["next_offset"] = json!(offset);
-                }
-                self.truncated.push(marker);
+                self.truncated.push(OutputTruncation {
+                    field: field.into(),
+                    total_lines: index.total_lines(),
+                    next: OutputContinuation {
+                        start: line,
+                        offset,
+                    },
+                });
             }
             return Ok(());
         }
@@ -438,7 +444,6 @@ fn matches<'a>(schema: &'a Value, root: &'a Value, value: &Value, refs: &mut Vec
 mod tests {
     use super::*;
     use crate::{
-        identity::AgentId,
         job::{JobOutcome, JobSpec},
         session::SessionStore,
         tool::ToolOutput,
@@ -452,21 +457,43 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::create(root.path()).await.unwrap();
         let manager = JobManager::new(store.clone());
-        let mut spec = JobSpec::test(AgentId::root(store.id()), "annotated");
+        let mut spec = JobSpec::test(crate::identity::AgentId::root(store.id()), "annotated");
         spec.output_schema = Some(schema);
         let id = manager.test_create(spec).await;
         let output = ToolOutput::new(value);
-        let outcome = if let Some(message) = error {
-            JobOutcome::Failed {
+        let outcome = match error {
+            Some(message) => JobOutcome::Failed {
                 message,
                 output: Some(output),
                 denial: None,
-            }
-        } else {
-            JobOutcome::Completed(output)
+            },
+            None => JobOutcome::Completed(output),
         };
         manager.finish(id, outcome).await.unwrap();
         (root, manager, id)
+    }
+
+    /// Follows a truncation marker or page continuation as a new field query.
+    fn continuation(id: JobId, position: &Value) -> OutputArgs {
+        let mut args = OutputArgs::new(id);
+        args.field = Some(
+            position["field"]
+                .as_str()
+                .unwrap_or("/result/stdout")
+                .into(),
+        );
+        args.start = Some(position["next_start"].as_u64().unwrap() as usize);
+        args.offset = Some(position["next_offset"].as_u64().unwrap_or(0) as usize);
+        args
+    }
+
+    fn marker<'a>(view: &'a Value, field: &str) -> &'a Value {
+        view["truncated"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["field"] == field)
+            .unwrap()
     }
 
     #[tokio::test]
@@ -482,26 +509,21 @@ mod tests {
             .present_output(OutputArgs::new(id), &Default::default())
             .await
             .unwrap();
-        assert_eq!(view["result"]["content"], "line\n".repeat(100));
-        assert_eq!(
-            view["result"]["stdout"].as_str().unwrap().len(),
-            FIELD_BYTES
-        );
-        assert_eq!(
-            view["result"]["stderr"].as_str().unwrap().len(),
-            FIELD_BYTES
-        );
-        assert_eq!(view["result"]["metadata"], value["metadata"]);
-        assert_eq!(view["result"]["extra"], value["extra"]);
-        assert_eq!(view["result"]["exit_code"], 7);
+        let result = &view["result"];
+        assert_eq!(result["content"], "line\n".repeat(100));
+        for field in ["stdout", "stderr"] {
+            assert_eq!(result[field].as_str().unwrap().len(), FIELD_BYTES);
+        }
+        for field in ["metadata", "extra", "exit_code"] {
+            assert_eq!(result[field], value[field]);
+        }
         assert_eq!(view["error"], error);
         assert_eq!(
             manager.metadata(id).await.unwrap().error.as_deref(),
             Some(error.as_str())
         );
-        assert!(view.get("console").is_none());
+        assert!(view.get("console").is_none() && view.get("preview").is_none());
         assert_eq!(view["truncated"].as_array().unwrap().len(), 3);
-        assert!(view.get("preview").is_none());
         assert_eq!(manager.snapshot(id).await.unwrap().output.unwrap(), value);
         let session = manager.store().id();
         drop(manager);
@@ -518,24 +540,19 @@ mod tests {
             ("/result/content", "line", 101, 0),
             ("/result/stderr", "e", 1, FIELD_BYTES),
         ] {
-            let entry = view["truncated"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|t| t["field"] == field)
-                .unwrap();
-            let mut args = OutputArgs::new(id);
-            args.field = Some(entry["field"].as_str().unwrap().into());
-            args.start = Some(entry["next_start"].as_u64().unwrap() as usize);
-            args.offset = Some(entry["next_offset"].as_u64().unwrap_or(0) as usize);
-            let page = restored
-                .present_output(args, &Default::default())
-                .await
-                .unwrap();
-            let first = &page["preview"]["lines"][0];
+            let entry = marker(&view, field);
             assert_eq!(entry["next_start"], line);
             assert_eq!(entry["next_offset"].as_u64().unwrap_or(0) as usize, offset);
-            assert!(first.as_str().unwrap().starts_with(expected));
+            let page = restored
+                .present_output(continuation(id, entry), &Default::default())
+                .await
+                .unwrap();
+            assert!(
+                page["preview"]["lines"][0]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(expected)
+            );
         }
     }
 
@@ -543,27 +560,19 @@ mod tests {
     async fn initial_positions_read_remaining_service_and_container_lines_without_gaps() {
         let schema = json!({"properties":{"stdout":{ANNOTATION:true}}});
         for (width, count) in [(94, 80), (223, 18), (2047, 2)] {
-            let text = (1..=count)
+            let text: String = (1..=count)
                 .map(|line| format!("{line:0width$}\r\n"))
-                .collect::<String>();
+                .collect();
             let (_root, manager, id) = fixture(json!({"stdout":text}), schema.clone(), None).await;
             let view = manager
                 .present_output(OutputArgs::new(id), &Default::default())
                 .await
                 .unwrap();
-            let position = view["truncated"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|entry| entry["field"] == "/result/stdout")
-                .unwrap();
+            let position = marker(&view, "/result/stdout");
             assert_eq!(position["total_lines"], count);
             let prefix = view["result"]["stdout"].as_str().unwrap();
             assert!(text.starts_with(prefix));
-            let mut query = OutputArgs::new(id);
-            query.field = Some("/result/stdout".into());
-            query.start = Some(position["next_start"].as_u64().unwrap() as usize);
-            query.offset = Some(position["next_offset"].as_u64().unwrap_or(0) as usize);
+            let mut query = continuation(id, position);
             let mut remaining = String::new();
             loop {
                 let page = manager
@@ -574,11 +583,10 @@ mod tests {
                     remaining.push_str(row.as_str().unwrap());
                     remaining.push_str("\r\n");
                 }
-                let Some(start) = page["preview"]["next_start"].as_u64() else {
+                if page["preview"]["next_start"].is_null() {
                     break;
-                };
-                query.start = Some(start as usize);
-                query.offset = Some(page["preview"]["next_offset"].as_u64().unwrap_or(0) as usize);
+                }
+                query = continuation(id, &page["preview"]);
             }
             assert_eq!(format!("{prefix}{remaining}"), text);
         }

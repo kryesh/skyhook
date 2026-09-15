@@ -22,7 +22,7 @@ pub(crate) use tokio_util::sync::CancellationToken;
 use crate::{
     execution::ExecutionLocation,
     identity::{AgentId, JobId},
-    media::ImageReference,
+    media::ImageRef,
     provider::protocol::Message,
     session::{EventRecord, SessionError, SessionEvent, SessionStore},
     tool::{
@@ -32,7 +32,9 @@ use crate::{
 };
 
 pub(crate) mod output;
-pub use output::{OutputArgs as JobOutputQuery, omit_null_fields};
+pub use output::{
+    CaptureKind, OutputArgs as JobOutputQuery, OutputSelection, PresentedOutput, omit_null_fields,
+};
 mod cancellation;
 mod delivery;
 mod input;
@@ -45,8 +47,28 @@ pub use views::JobEnvelope;
 pub(crate) use views::{ActiveJob, ActiveJobLocation, presented_job_schema};
 mod persistence;
 mod progress;
+mod supervisor;
+pub use supervisor::JobLease;
 
 const JOB_INPUT_CAPACITY: usize = 32;
+
+/// Semantic execution role, independent of extensible tool names.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobRole {
+    #[default]
+    Tool,
+    Agent,
+    Script,
+    Question,
+}
+
+/// Automatic completion delivery may reference an already-visible child reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutputPresentation {
+    Full,
+    Automatic,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -137,11 +159,12 @@ struct JobEntry {
     agent: AgentId,
     parent: Option<JobId>,
     tool: String,
+    role: JobRole,
     name: Option<String>,
     created_at_millis: i64,
     state: JobState,
     output: Option<Value>,
-    images: Vec<ImageReference>,
+    images: Vec<ImageRef>,
     error: Option<String>,
     denial: Option<crate::tool::Denial>,
     accepts_input: bool,
@@ -171,6 +194,7 @@ impl JobEntry {
                 agent: spec.agent,
                 parent: spec.parent,
                 tool: spec.tool,
+                role: spec.role,
                 name: spec.name,
                 created_at_millis,
                 state: JobState::Queued,
@@ -198,6 +222,40 @@ impl JobEntry {
         )
     }
 
+    /// Clear the previous invocation's in-memory projection without touching its
+    /// sidecar artifacts. Live resumption owns file reset before starting work;
+    /// replay must never rewrite an earlier invocation's files while folding it.
+    fn clear_invocation_output(&mut self) {
+        self.output = None;
+        self.images.clear();
+        self.error = None;
+        self.denial = None;
+    }
+
+    /// Install all reported-outcome metadata together. Live callers establish
+    /// transition validity before publication; replay preserves permissive
+    /// historical state/error/denial combinations rather than tightening them.
+    /// Saved result values and captures stay sidecar-backed, not in JobEntry.
+    fn apply_finished(
+        &mut self,
+        state: JobState,
+        images: Vec<ImageRef>,
+        error: Option<String>,
+        denial: Option<crate::tool::Denial>,
+    ) {
+        self.state = state;
+        self.output = None;
+        self.images = images;
+        self.error = error;
+        self.denial = denial;
+        // A reported outcome is a new delivery even after an earlier question
+        // was claimed/injected. Only explicit cancellation retires resumption.
+        self.delivery = DeliveryState::Pending;
+        if state == JobState::Cancelled {
+            self.resume = None;
+        }
+    }
+
     fn suspended(&self) -> bool {
         self.state == JobState::Interrupted && self.resume.is_some()
     }
@@ -221,6 +279,7 @@ impl JobEntry {
             id,
             parent: self.parent,
             tool: self.tool.clone(),
+            role: self.role,
             name: self.name.clone(),
             state: self.state,
             output: None,
@@ -232,15 +291,8 @@ impl JobEntry {
 
     fn envelope(&self, id: JobId) -> JobEnvelope {
         JobEnvelope {
-            id,
-            parent: self.parent,
-            tool: self.tool.clone(),
-            name: self.name.clone(),
-            state: self.state,
             output: self.output.clone(),
-            error: self.error.clone(),
-            location: self.location.clone(),
-            denial: self.denial.clone(),
+            ..self.metadata(id)
         }
     }
 }
@@ -255,7 +307,11 @@ enum DeliveryState {
 #[derive(Clone, Copy)]
 enum WaitMode {
     Foreground,
-    Explicit { claim: bool },
+    /// Foreground readiness without acknowledging completion or question delivery.
+    Transfer,
+    Explicit {
+        claim: bool,
+    },
     Terminal,
 }
 
@@ -273,7 +329,12 @@ struct JobManagerInner {
     store: SessionStore,
     jobs: Mutex<HashMap<JobId, JobEntry>>,
     progress: Mutex<progress::Progress>,
+    supervision: Arc<supervisor::Supervision>,
     delivery_operation: Arc<Mutex<()>>,
+    /// Serializes parent validation/creation publication against map pruning.
+    /// Never acquired while holding a jobs, delivery, or per-job operation lock.
+    /// Shared by concurrent creations; exclusive for pruning and drain.
+    creation_operation: Arc<tokio::sync::RwLock<()>>,
     next_id: AtomicU64,
     completions: broadcast::Sender<JobCompletion>,
 }
@@ -293,12 +354,6 @@ pub(crate) struct AgentMessage {
     pub text: String,
 }
 
-pub struct JobLease {
-    pub id: JobId,
-    pub(crate) cancellation: CancellationToken,
-    pub input: mpsc::Receiver<Value>,
-}
-
 #[derive(Clone, Debug)]
 pub struct JobSpec {
     pub origin: Option<crate::session::ModelCallOrigin>,
@@ -306,6 +361,7 @@ pub struct JobSpec {
     pub agent: AgentId,
     pub parent: Option<JobId>,
     pub tool: String,
+    pub role: JobRole,
     pub name: Option<String>,
     pub arguments: Value,
     pub accepts_input: bool,
@@ -323,6 +379,7 @@ impl JobSpec {
             agent,
             parent: None,
             tool: tool.into(),
+            role: JobRole::Tool,
             name: None,
             arguments: Value::Object(serde_json::Map::new()),
             accepts_input: false,
@@ -346,7 +403,9 @@ impl JobManager {
                 store,
                 jobs: Mutex::new(jobs),
                 progress: Mutex::new(progress::Progress::default()),
+                supervision: Arc::new(supervisor::Supervision::default()),
                 delivery_operation: Arc::new(Mutex::new(())),
+                creation_operation: Arc::default(),
                 next_id: AtomicU64::new(next_id),
                 completions,
             }),
@@ -391,6 +450,9 @@ pub enum JobError {
 }
 
 #[cfg(test)]
+mod creation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -399,15 +461,30 @@ mod tests {
         (runtime.root, runtime.jobs, runtime.agent)
     }
 
+    /// Poll until a published job settles into a terminal state.
+    pub(super) async fn terminal(jobs: &JobManager, id: JobId) -> JobEnvelope {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match jobs.metadata(id).await {
+                    Ok(envelope) if envelope.state.is_terminal() => return envelope,
+                    Ok(_) | Err(JobError::Unknown(_)) => tokio::task::yield_now().await,
+                    Err(error) => panic!("unexpected job lookup failure: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("creation owner must settle its published job")
+    }
+
     // Small fixture operations keep tests focused on the delivery/state boundary
     // under test. Error-path calls deliberately bypass these success-only helpers.
     impl JobManager {
         pub(super) async fn test_lease(&self, spec: JobSpec) -> JobLease {
-            self.create(spec).await.unwrap()
+            self.create(spec).await.unwrap().into_test_fixture()
         }
 
         pub(super) async fn test_create(&self, spec: JobSpec) -> JobId {
-            self.test_lease(spec).await.id
+            self.test_lease(spec).await.into_test_id()
         }
 
         pub(super) async fn test_finish(&self, job: JobId, output: Value) {

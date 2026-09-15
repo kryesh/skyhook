@@ -1,37 +1,71 @@
 use super::*;
 
 pub(super) enum PendingStart {
-    Input(QueuedInput),
-    QueuedInput(QueuedInput),
+    Input(Box<QueuedInput>),
+    QueuedInput(Box<QueuedInput>),
     Script(PathBuf),
 }
 
+/// Creation owns its pending action until the asynchronous task completes.
+/// A parked or failed script remains an explicit retry, not an active creation.
+#[derive(Default)]
+pub(super) enum StartState {
+    #[default]
+    Idle,
+    Creating(PendingStart),
+    RetryScript(PathBuf),
+}
+impl StartState {
+    pub(super) fn is_creating(&self) -> bool {
+        matches!(self, Self::Creating(_))
+    }
+    /// Leaves the state `Idle`.
+    fn take_action(&mut self) -> Option<PendingStart> {
+        match std::mem::take(self) {
+            Self::Creating(action) => Some(action),
+            Self::RetryScript(path) => Some(PendingStart::Script(path)),
+            Self::Idle => None,
+        }
+    }
+}
+
 impl App {
+    /// Invariant: at most one creation or switch is in flight. Every caller is
+    /// gated by `busy()`/`start.is_creating()`/`switching`, and `switch` defers
+    /// behind a creation, so a `Started` completion is always the current one.
     pub(super) fn begin_session(&mut self, action: PendingStart) {
-        if matches!(self.pending_start, Some(PendingStart::Script(_))) {
+        if matches!(self.start, StartState::RetryScript(_)) {
             self.notice("Cancelled the pending script in favor of the new action");
         }
-        self.pending_start = Some(action);
-        self.creating = true;
+        if self.start.is_creating() {
+            return;
+        }
+        self.start = StartState::Creating(action);
         let launch = self.launch.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = launch.create(None).await;
-            if let Err(error) = tx.send(Work::Started(result))
-                && let Work::Started(Ok(session)) = error.0
+            if let Err(error) = tx.send(Work::Started { result })
+                && let Work::Started {
+                    result: Ok(session),
+                    ..
+                } = error.0
             {
                 let _ = session.shutdown().await;
             }
         });
         self.dirty = true;
     }
-    pub fn session_started(&mut self, session: SessionHandle, snapshot: ObservationSnapshot) {
-        self.creating = false;
+    pub(super) fn session_started(&mut self, prepared: PreparedObservation) {
+        let pending = self.start.take_action();
         let draft = self.selected.clone();
         self.attached_draft = Some(draft.clone());
-        self.selected = session.root_agent().clone();
-        self.session = Some(session);
-        self.snapshot = snapshot;
+        self.install_observation(Some(prepared));
+        self.selected = self
+            .session()
+            .expect("started session")
+            .root_agent()
+            .clone();
         if let Some(view) = self.views.remove(&draft) {
             self.views.insert(self.selected.clone(), view);
         }
@@ -45,48 +79,48 @@ impl App {
         self.reset_projection();
         self.show_warnings();
         if self.stopping {
-            self.pending_start = None;
             self.finish_shutdown();
             return;
         }
         if let Some(id) = self.deferred_switch.take() {
-            self.park_pending_input();
+            self.park_action(pending);
             self.switch(id);
             return;
         }
         if self.paused {
-            self.park_pending_input();
+            self.park_action(pending);
             return;
         }
-        match self.pending_start.take() {
-            Some(PendingStart::Input(input)) => self.send_input(input),
+        match pending {
+            Some(PendingStart::Input(input)) => self.send_input(*input),
             Some(PendingStart::QueuedInput(input)) => {
-                self.queue.push_front(input);
+                self.queue.push_front(*input);
                 self.deliver_queue();
             }
             Some(PendingStart::Script(path)) => self.start_script(path),
             None => {}
         }
     }
-    pub(super) fn park_pending_input(&mut self) {
-        match self.pending_start.take() {
+    fn park_action(&mut self, pending: Option<PendingStart>) {
+        match pending {
             Some(PendingStart::Input(input) | PendingStart::QueuedInput(input)) => {
-                self.queue.push_front(input);
+                self.queue.push_front(*input);
                 self.refresh_queue_menu();
             }
-            other => self.pending_start = other,
+            Some(PendingStart::Script(path)) => self.start = StartState::RetryScript(path),
+            None => {}
         }
     }
     pub(super) fn start_failed(&mut self, error: String) {
-        self.creating = false;
-        if let Some(action) = self.pending_start.take() {
+        let pending = self.start.take_action();
+        if let Some(action) = pending {
             match action {
                 PendingStart::Input(input) | PendingStart::QueuedInput(input) => {
-                    self.queue.push_front(input)
+                    self.queue.push_front(*input)
                 }
                 PendingStart::Script(path) => {
                     // Keep an explicit script retry separate from composer input.
-                    self.pending_start = Some(PendingStart::Script(path));
+                    self.start = StartState::RetryScript(path);
                 }
             }
         }
@@ -99,13 +133,32 @@ impl App {
             self.switch(id);
         }
     }
+    /// Submit the command-line prompt. When an image cannot be read, keep the
+    /// prompt as an editable draft so the user can fix it and resend.
+    pub async fn start_prompt(&mut self, text: String, images: Vec<PathBuf>) {
+        match crate::launch::read_images(&self.launch.workspace, &images).await {
+            Ok(attachments) => self.submit(Submission { text, attachments }),
+            Err(error) => {
+                self.notice(error);
+                self.replace_draft(Submission {
+                    text,
+                    attachments: Vec::new(),
+                });
+                self.dirty = true;
+            }
+        }
+    }
     pub fn start_script(&mut self, path: PathBuf) {
         if self.busy() {
             self.notice("Wait for the current operation before starting a script");
             return;
         }
-        let Some(session) = self.session.clone() else {
-            self.launch.model.clone_from(&self.model);
+        let Some(session) = self.session().cloned() else {
+            let Ok(model) = self.launch.model.config().select_model(&self.model) else {
+                self.notice("The selected model is no longer configured");
+                return;
+            };
+            self.launch.model = model;
             self.begin_session(PendingStart::Script(path));
             return;
         };
@@ -136,17 +189,16 @@ impl App {
         if self.stopping {
             return;
         }
-        self.paused = true;
-        self.cancel_queue_delivery();
+        self.pause_queue();
         self.stopping = true;
         // Creation/switch tasks own handles which must arrive before teardown.
-        if !self.creating && self.switch_restore.is_none() {
+        if !self.start.is_creating() && self.switching.is_none() {
             self.finish_shutdown();
         }
         self.dirty = true;
     }
     pub(super) fn finish_shutdown(&self) {
-        let session = self.session.clone();
+        let session = self.session().cloned();
         let tx = self.tx.clone();
         let notices = self.root_notifier();
         let status = self.status.clone();
@@ -167,99 +219,131 @@ impl App {
 mod tests {
     use super::super::tests::*;
     use super::*;
-    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn unreadable_start_image_keeps_the_prompt_as_a_draft() {
+        let (_root, mut app) = draft_fixture().await;
+        app.start_prompt("long prompt".into(), vec!["typo.png".into()])
+            .await;
+        assert_eq!(app.editor.expanded_text(), "long prompt");
+        assert!(app.editor.attachments().is_empty());
+        assert!(app.history.is_empty() && app.queue.is_empty());
+        assert!(!app.start.is_creating() && app.session().is_none());
+    }
+
+    async fn started(rx: &mut mpsc::UnboundedReceiver<Work>) -> SessionHandle {
+        let Work::Started {
+            result: Ok(session),
+            ..
+        } = next_lifecycle(rx).await
+        else {
+            panic!("session creation should succeed");
+        };
+        session
+    }
+
+    async fn fail_creation(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Work>) {
+        let work = next_lifecycle(rx).await;
+        assert!(matches!(work, Work::Started { result: Err(_), .. }));
+        app.work(work);
+    }
+
+    /// Model proofs cannot be invalidated after selection, so fail creation at
+    /// the real filesystem boundary instead.
+    fn block_sessions(app: &App) {
+        std::fs::create_dir_all(app.launch.sessions.parent().unwrap()).unwrap();
+        std::fs::write(&app.launch.sessions, "not a directory").unwrap();
+    }
+
+    fn queued(app: &App) -> Vec<(&str, &str, &[Attachment])> {
+        let rows = app.queue.iter();
+        rows.map(|row| {
+            (
+                &*row.submission.text,
+                &*row.model,
+                &row.submission.attachments[..],
+            )
+        })
+        .collect()
+    }
+
     #[tokio::test]
     async fn first_submit_creates_once_and_preserves_queue_models_and_draft() {
         let (_root, mut app) = draft_fixture().await;
         let broken_skill = app.launch.workspace.join(".agents/skills/broken");
         std::fs::create_dir_all(&broken_skill).unwrap();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        app.tx = tx;
-        for command in ["export", "retry"] {
+        let mut rx = capture_work(&mut app);
+        for command in [Command::Export, Command::Retry] {
             app.command(command);
         }
-        assert!(app.session.is_none() && !app.launch.sessions.exists());
-        app.submit("first input".into(), vec![]);
-        assert!(app.creating);
-        assert!(app.session.is_none());
+        assert!(app.session().is_none() && !app.launch.sessions.exists());
+        app.submit("first input".into());
+        assert!(app.start.is_creating() && app.session().is_none());
         app.model = "second".into();
-        app.submit("second input".into(), vec![PathBuf::from("queued.png")]);
+        let attachments = vec![png_attachment("queued.png")];
+        app.submit(Submission {
+            text: "second input".into(),
+            attachments,
+        });
         app.editor.set("still composing".into());
         app.editor.insert_paste("unsent attachment".into());
-        let Work::Started(Ok(session)) = next_lifecycle(&mut rx).await else {
-            panic!("first submit should create a session");
-        };
+        let session = started(&mut rx).await;
         assert_eq!(std::fs::read_dir(&app.launch.sessions).unwrap().count(), 1);
-        let snapshot = session.observe().await.snapshot;
-        app.session_started(session, snapshot);
-        assert!(!app.creating);
-        assert!(app.operation);
+        app.session_started(PreparedObservation::subscribe(session).await);
+        assert!(!app.start.is_creating() && app.operation);
         assert_eq!(app.history, ["first input"]);
         assert_eq!(app.model, "second");
-        assert_eq!(app.queue.len(), 1);
-        assert_eq!(app.queue[0].text, "second input");
-        assert_eq!(app.queue[0].model, "second");
-        assert_eq!(app.queue[0].images, [PathBuf::from("queued.png")]);
+        let image = [png_attachment("queued.png")];
+        assert_eq!(queued(&app), [("second input", "second", &image[..])]);
         assert_eq!(
             app.editor.expanded_text(),
             "still composingunsent attachment"
         );
-        assert_eq!(
-            app.editor
-                .pastes()
-                .map(|(_, text)| text)
-                .collect::<Vec<_>>(),
-            ["unsent attachment"]
-        );
+        let pastes: Vec<_> = app.editor.pastes().map(|(_, text)| text).collect();
+        assert_eq!(pastes, ["unsent attachment"]);
         app.status.flush().await;
-        let session = app.session.as_ref().unwrap();
+        let session = app.session().unwrap();
         let snapshot = session.observe().await.snapshot;
         assert!(!session.warnings().is_empty());
         for warning in session.warnings() {
+            let status = format!("Startup warning: {warning}");
             assert!(snapshot.records.values().any(|record| matches!(
-                &record.event, skyhook::session::SessionEvent::Status { message }
-                if message == &format!("Startup warning: {warning}")
+                &record.event, SessionEvent::Status { message } if message == &status
             )));
         }
         session.shutdown().await.unwrap();
     }
+
     #[tokio::test]
     async fn failed_creation_retains_inputs_and_can_resume_without_duplicate_creation() {
         let (_root, mut app) = draft_fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        app.tx = tx;
-        let config = app.launch.config.clone();
-        Arc::make_mut(&mut app.launch.config)
-            .models
-            .shift_remove("first");
-        app.submit("first".into(), vec![PathBuf::from("first.png")]);
+        let mut rx = capture_work(&mut app);
+        block_sessions(&app);
+        let attachments = vec![png_attachment("first.png")];
+        app.submit(Submission {
+            text: "first".into(),
+            attachments,
+        });
         app.model = "second".into();
-        app.submit("second".into(), vec![]);
+        app.submit("second".into());
         app.editor.set("new draft".into());
-        let work = next_lifecycle(&mut rx).await;
-        assert!(matches!(work, Work::Started(Err(_))));
-        app.work(work);
-        assert!(!app.busy());
-        assert!(app.paused);
-        assert!(app.session.is_none());
-        assert_eq!(app.queue.len(), 2);
-        assert_eq!(app.queue[0].text, "first");
-        assert_eq!(app.queue[0].model, "first");
-        assert_eq!(app.queue[0].images, [PathBuf::from("first.png")]);
-        assert_eq!(app.queue[1].model, "second");
-        assert_eq!(app.editor.text, "new draft");
-        app.launch.config = config;
-        app.command("resume");
+        fail_creation(&mut app, &mut rx).await;
+        assert!(!app.busy() && app.paused && app.session().is_none());
+        let image = [png_attachment("first.png")];
+        assert_eq!(
+            queued(&app),
+            [("first", "first", &image[..]), ("second", "second", &[])]
+        );
+        assert_eq!(app.editor.text(), "new draft");
+        std::fs::remove_file(&app.launch.sessions).unwrap();
+        app.command(Command::Resume);
         app.tick();
-        assert!(app.creating);
+        assert!(app.start.is_creating());
         app.tick();
         assert_eq!(app.queue.len(), 1);
-        let Work::Started(Ok(session)) = next_lifecycle(&mut rx).await else {
-            panic!("resume should retry creation");
-        };
+        let session = started(&mut rx).await;
         app.shutdown();
-        let snapshot = session.observe().await.snapshot;
-        app.session_started(session, snapshot);
+        app.session_started(PreparedObservation::subscribe(session).await);
         app.work(next_lifecycle(&mut rx).await);
         assert!(app.exit);
         assert!(
@@ -267,56 +351,58 @@ mod tests {
             "shutdown must suppress the pending prompt"
         );
     }
+
     #[tokio::test]
     async fn script_creation_and_new_wait_for_inflight_creation() {
         let (_root, mut app) = draft_fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        app.tx = tx;
+        let mut rx = capture_work(&mut app);
         app.start_script(PathBuf::from("explicit.js"));
-        assert!(app.creating);
+        assert!(app.start.is_creating());
         app.switch(None);
-        let Work::Started(Ok(session)) = next_lifecycle(&mut rx).await else {
-            panic!("script should create on demand");
-        };
-        let snapshot = session.observe().await.snapshot;
-        app.session_started(session, snapshot);
-        let Work::SessionReady(Ok(None)) = next_lifecycle(&mut rx).await else {
-            panic!("new waits for and shuts down created handle");
-        };
-        app.set_session(None, ObservationSnapshot::default());
-        assert!(app.session.is_none());
-        assert!(app.pending_start.is_none());
-        assert!(!app.operation);
+        let session = started(&mut rx).await;
+        app.session_started(PreparedObservation::subscribe(session).await);
+        let work = next_lifecycle(&mut rx).await;
+        let reset = matches!(
+            work,
+            Work::SessionReady {
+                result: Ok(None),
+                ..
+            }
+        );
+        assert!(reset, "new waits for and shuts down the created handle");
+        app.set_session(None);
+        assert!(app.session().is_none() && !app.operation);
+        assert!(matches!(app.start, StartState::Idle));
         assert_eq!(std::fs::read_dir(&app.launch.sessions).unwrap().count(), 1);
     }
+
     #[tokio::test]
     async fn shutdown_waits_for_failed_creation_and_for_new_session_reset() {
         let (_root, mut app) = draft_fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        app.tx = tx;
-        Arc::make_mut(&mut app.launch.config)
-            .models
-            .shift_remove("first");
-        app.submit("unsent".into(), vec![]);
+        let mut rx = capture_work(&mut app);
+        block_sessions(&app);
+        app.submit("unsent".into());
         app.shutdown();
         assert!(!app.exit);
-        let work = next_lifecycle(&mut rx).await;
-        assert!(matches!(work, Work::Started(Err(_))));
-        app.work(work);
+        fail_creation(&mut app, &mut rx).await;
         app.work(next_lifecycle(&mut rx).await);
-        assert!(app.exit);
-        assert!(!app.launch.sessions.exists());
+        assert!(app.exit && app.launch.sessions.is_file());
 
         let (_root, mut app) = fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        app.tx = tx;
+        let mut rx = capture_work(&mut app);
         app.switch(None);
         app.shutdown();
         assert!(!app.exit);
-        let Work::SessionReady(Ok(None)) = next_lifecycle(&mut rx).await else {
-            panic!("shutdown waits for the reset task");
-        };
-        app.set_session(None, ObservationSnapshot::default());
+        let work = next_lifecycle(&mut rx).await;
+        let reset = matches!(
+            work,
+            Work::SessionReady {
+                result: Ok(None),
+                ..
+            }
+        );
+        assert!(reset, "shutdown waits for the reset task");
+        app.set_session(None);
         app.work(next_lifecycle(&mut rx).await);
         assert!(app.exit);
     }

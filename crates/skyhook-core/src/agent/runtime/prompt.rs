@@ -277,8 +277,9 @@ mod tests {
 
     #[test]
     fn empty_state_contains_only_date() {
+        let rendered = render_state("2026-09-10", &[], &[], &location());
         assert_eq!(
-            render_state("2026-09-10", &[], &[], &location()),
+            rendered,
             "<skyhook_state>\ndate:2026-09-10\n</skyhook_state>"
         );
     }
@@ -310,7 +311,8 @@ mod tests {
     }
 
     #[test]
-    fn nested_jobs_use_snapshot_location_not_parent_and_keep_exact_counters() {
+    fn job_rows_keep_snapshot_locations_exact_counters_and_row_structure() {
+        // Nested jobs use their own snapshot location, not the parent's.
         let mut parent = job(7, "agent", "/other");
         parent.name = Some("runtime-review".to_owned());
         parent.location.target = Some("remote".to_owned());
@@ -322,82 +324,63 @@ mod tests {
         grandchild.location.target = Some("remote".to_owned());
         child.children.push(grandchild);
         parent.children.push(child);
-        let tool = job(18, "exec", "/project");
-        assert_eq!(
-            render_state("2026-09-10", &[parent, tool], &[], &location()),
-            concat!(
-                "<skyhook_state>\ndate:2026-09-10\n",
-                "jobs: job parent tool name state age_s turns tool_calls\n",
-                "7 - agent runtime-review running 12 3 8 target=\"remote\" workspace=\"/other\"\n",
-                "9 7 agent - waiting_input 12 0 0\n",
-                "12 9 agent - running 12 0 0 target=\"remote\" workspace=\"/other\"\n",
-                "18 - exec - running 12 - -\n",
-                "</skyhook_state>"
-            )
-        );
-    }
-
-    #[test]
-    fn location_overrides_are_independent_and_target_visibility_is_preserved() {
+        // Target and workspace overrides are independent; hidden targets stay hidden.
         let mut target_only = job(1, "agent", "/project");
         target_only.location.target = Some("remote".to_owned());
-        let workspace_only = job(2, "exec", "/other");
         let mut hidden_target = job(3, "exec", "/project");
         hidden_target.location.target = None;
-        assert_eq!(
-            render_state(
-                "2026-09-10",
-                &[target_only, workspace_only, hidden_target],
-                &[],
-                &location()
-            ),
-            concat!(
-                "<skyhook_state>\ndate:2026-09-10\n",
-                "jobs: job parent tool name state age_s turns tool_calls\n",
-                "1 - agent - running 12 0 0 target=\"remote\"\n",
-                "2 - exec - running 12 - - workspace=\"/other\"\n",
-                "3 - exec - running 12 - -\n",
-                "</skyhook_state>"
-            )
-        );
-    }
-
-    #[test]
-    fn remote_snapshot_uses_its_own_context_as_the_default() {
-        let context = ExecutionLocation::named("remote", "/remote-project".into());
+        // A remote snapshot uses its own context as the default.
         let mut same = job(1, "agent", "/remote-project");
         same.location.target = Some("remote".to_owned());
-        let root = job(2, "exec", "/project");
-        assert_eq!(
-            render_state("2026-09-10", &[same, root], &[], &context),
-            concat!(
-                "<skyhook_state>\ndate:2026-09-10\n",
-                "jobs: job parent tool name state age_s turns tool_calls\n",
-                "1 - agent - running 12 0 0\n",
-                "2 - exec - running 12 - - target=\"root\" workspace=\"/project\"\n",
-                "</skyhook_state>"
-            )
-        );
-    }
-
-    #[test]
-    fn arbitrary_strings_cannot_change_row_structure() {
+        let remote = ExecutionLocation::named("remote", "/remote-project".into());
+        // Arbitrary strings cannot change row structure.
+        let mut item = job(1, "custom\n\"tool\"", "/other\n\"dir\"");
+        item.name = Some("-".to_owned());
+        item.location.target = Some("remote\nserver".to_owned());
+        let cases = [
+            (
+                location(),
+                vec![parent, job(18, "exec", "/project")],
+                concat!(
+                    "7 - agent runtime-review running 12 3 8 target=\"remote\" workspace=\"/other\"\n",
+                    "9 7 agent - waiting_input 12 0 0\n",
+                    "12 9 agent - running 12 0 0 target=\"remote\" workspace=\"/other\"\n",
+                    "18 - exec - running 12 - -\n",
+                ),
+            ),
+            (
+                location(),
+                vec![target_only, job(2, "exec", "/other"), hidden_target],
+                concat!(
+                    "1 - agent - running 12 0 0 target=\"remote\"\n",
+                    "2 - exec - running 12 - - workspace=\"/other\"\n",
+                    "3 - exec - running 12 - -\n",
+                ),
+            ),
+            (
+                remote,
+                vec![same, job(2, "exec", "/project")],
+                concat!(
+                    "1 - agent - running 12 0 0\n",
+                    "2 - exec - running 12 - - target=\"root\" workspace=\"/project\"\n",
+                ),
+            ),
+            (
+                location(),
+                vec![item],
+                "1 - \"custom\\n\\\"tool\\\"\" \"-\" running 12 - - target=\"remote\\nserver\" workspace=\"/other\\n\\\"dir\\\"\"\n",
+            ),
+        ];
+        for (context, jobs, rows) in cases {
+            let header = "jobs: job parent tool name state age_s turns tool_calls";
+            let expected =
+                format!("<skyhook_state>\ndate:2026-09-10\n{header}\n{rows}</skyhook_state>");
+            assert_eq!(render_state("2026-09-10", &jobs, &[], &context), expected);
+        }
         assert_eq!(cell("run-tests"), "run-tests");
         assert_eq!(cell("-"), "\"-\"");
         assert_eq!(cell(""), "\"\"");
         assert_eq!(cell("two words"), "\"two words\"");
         assert_eq!(cell("λ"), "\"λ\"");
-        let mut item = job(1, "custom\n\"tool\"", "/other\n\"dir\"");
-        item.name = Some("-".to_owned());
-        item.location.target = Some("remote\nserver".to_owned());
-        assert_eq!(
-            render_state("2026-09-10", &[item], &[], &location()),
-            concat!(
-                "<skyhook_state>\ndate:2026-09-10\n",
-                "jobs: job parent tool name state age_s turns tool_calls\n",
-                "1 - \"custom\\n\\\"tool\\\"\" \"-\" running 12 - - target=\"remote\\nserver\" workspace=\"/other\\n\\\"dir\\\"\"\n",
-                "</skyhook_state>"
-            )
-        );
     }
 }

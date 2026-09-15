@@ -11,13 +11,16 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use crate::{
-    agent::{HarnessError, Question, TodoItem, todo::TodoStore},
+    agent::{Question, TodoItem, todo::TodoStore},
     provider::protocol::UserContent,
     session::SessionEvent,
     tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::Capability},
 };
 
-use super::{AgentCommand, AgentLaunch, QueuedPromptToken, SessionRuntime, queue::QueuedInput};
+use super::{
+    AgentCommand, AgentLaunch, PreparedQueuedPrompt, QueuedPromptToken, RequestFailure,
+    SessionRuntime, queue::QueuedInput,
+};
 
 /// Connect only root-eligible MCP servers; adapters enforce per-agent gates later.
 pub(super) async fn connect_mcp(
@@ -26,21 +29,10 @@ pub(super) async fn connect_mcp(
     store: &crate::session::SessionStore,
 ) -> (Arc<crate::mcp::manager::McpManager>, Vec<String>) {
     let capabilities = harness.capabilities.for_agent(harness.max_child_depth);
-    let configs = harness
-        .mcp
-        .iter()
-        .filter(|(_, config)| {
-            capabilities.contains(Capability::Mcp)
-                && config
-                    .capabilities
-                    .iter()
-                    .all(|cap| capabilities.contains(*cap))
-        })
-        .map(|(name, config)| (name.clone(), config.clone()))
-        .collect::<std::collections::BTreeMap<_, _>>();
     let manager = Arc::new(
         crate::mcp::manager::McpManager::connect(
-            &configs,
+            &harness.mcp,
+            &capabilities,
             tokio_util::sync::CancellationToken::new(),
         )
         .await,
@@ -49,7 +41,6 @@ pub(super) async fn connect_mcp(
     warnings.extend(crate::mcp::adapter::register(
         builder,
         manager.clone(),
-        &configs,
         store.clone(),
     ));
     (manager, warnings)
@@ -117,10 +108,10 @@ fn register_todo(
                         return Err(ToolError::InvalidArguments("items and job cannot be combined".to_owned()));
                     }
                     TodoStore::validate(&items)?;
-                    runtime.todos.replace(&context.agent, items).await.map_err(|error| tool_error(&error))?;
+                    runtime.todos.replace(context.agent(), items).await.map_err(|error| tool_error(&error))?;
                     Ok(TodoOutput::Updated { updated: true })
                 } else {
-                    Ok(TodoOutput::Items { items: runtime.todos.inspect(&context.agent, input.job).await?.items })
+                    Ok(TodoOutput::Items { items: runtime.todos.inspect(context.agent(), input.job).await?.items })
                 }
             }
         },
@@ -153,19 +144,19 @@ fn register_ask(
     builder.register::<Question, Value, _, _>(
         "ask",
         "Ask one structured question. Issue independent questions concurrently; the runtime merges calls that become ready together. Use bg:true to continue independent work while awaiting an answer; inspect the returned job with job_output.",
-        ToolOptions::default().background().input().requires_for_root(Capability::Interactive),
+        ToolOptions::default().job_role(crate::job::JobRole::Question).background().input().requires_for_root(Capability::Interactive),
         move |context, input| {
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
             async move {
                 let runtime = runtime.ok_or_else(runtime_unavailable)?;
-                let question_id = format!("q-{}", context.job);
+                let question_id = format!("q-{}", context.job());
                 let questions = vec![input.clone()];
                 runtime
                     .store
                     .append(
-                        context.agent.clone(),
+                        context.agent().clone(),
                         SessionEvent::QuestionOpened {
-                            job: context.job,
+                            job: context.job(),
                             question_id: question_id.clone(),
                             questions: serde_json::to_value(&questions)?,
                         },
@@ -176,9 +167,9 @@ fn register_ask(
                 runtime
                     .store
                     .append(
-                        context.agent,
+                        context.agent().clone(),
                         SessionEvent::QuestionResolved {
-                            job: context.job,
+                            job: context.job(),
                             question_id,
                             answers: answers.clone(),
                         },
@@ -199,7 +190,7 @@ fn register_child_agent(
     builder.register::<AgentArgs, String, _, _>(
         "agent",
         "Start a child agent. Send follow-ups or answers with tool.job(id).send({value: ...}). Questions pause the child; follow-ups arrive automatically at its next model-request boundary. Replies arrive as events. Sending input to a completed child resumes its retained history under the same job ID.",
-        ToolOptions::default()
+        ToolOptions::default().job_role(crate::job::JobRole::Agent)
             .named()
             .requires(Capability::Agents)
             .conditional_input(
@@ -216,7 +207,7 @@ fn register_child_agent(
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
             async move {
                 let runtime = runtime.ok_or_else(runtime_unavailable)?;
-                let available_depth = runtime.available_depth(&context.agent);
+                let available_depth = runtime.available_depth(context.agent());
                 let todos = input.todos;
                 if let Some(items) = &todos {
                     TodoStore::validate(items)?;
@@ -226,23 +217,26 @@ fn register_child_agent(
                         "depth must be less than the caller's available depth of {available_depth}"
                     )));
                 }
-                let child = runtime.next_child(&context.agent).await;
+                let child = runtime.next_child(context.agent()).await;
                 let model = input.model
                     .or_else(|| runtime.agents.read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .get(&context.agent).map(|agent| agent.model_profile.clone()))
+                        .get(context.agent()).map(|agent| agent.model_profile.clone()))
                     .ok_or_else(|| ToolError::Failed("parent agent is no longer running".into()))?;
-                let target = input.target.as_deref().unwrap_or(&context.caller_location.target);
+                let target = input.target.as_deref().unwrap_or(&context.caller_location().target);
                 let definition = if target == crate::target::ROOT_TARGET {
                     None
                 } else {
                     Some(runtime.router.targets().get(target).await.map_err(|error| tool_error(&error))?)
                 };
                 let mut location = crate::execution::ExecutionLocation::select(
-                    &context.caller_location,
+                    context.caller_location(),
                     &runtime.harness.workspace,
-                    input.target.as_deref(),
-                    definition.as_ref().map(|definition| definition.workspace.as_path()),
+                    match (input.target.as_deref(), definition.as_ref()) {
+                        (None, _) => crate::execution::LocationSelection::Inherit,
+                        (Some(_), None) => crate::execution::LocationSelection::Root,
+                        (Some(_), Some(definition)) => crate::execution::LocationSelection::Other(definition),
+                    },
                 );
                 if let Some(workspace) = input.workspace {
                     if workspace.as_os_str().is_empty() {
@@ -252,7 +246,7 @@ fn register_child_agent(
                 }
                 let sender = runtime.spawn_agent(AgentLaunch {
                     id: child.clone(),
-                    owner_job: Some(context.job),
+                    owner_job: Some(context.job()),
                     model_profile: model,
                     todos,
                     available_depth: input.depth,
@@ -260,16 +254,16 @@ fn register_child_agent(
                 }).await.map_err(|error| tool_error(&error))?;
                 // Associate immediately so a failed first turn is selectable for retry
                 // even when it never emitted visible assistant text.
-                runtime.jobs.set_child_agent(context.job, child.clone()).await.map_err(|error| tool_error(&error))?;
+                runtime.jobs.set_child_agent(context.job(), child.clone()).await.map_err(|error| tool_error(&error))?;
                 // Only this live child session may opt its terminal job into resumption.
                 // Keep a weak runtime reference: jobs must not retain their own manager.
                 let resume_runtime = Arc::downgrade(&runtime);
                 let resume_child = child.clone();
                 let resume_sender = sender.clone();
-                let authorization = context.authorization.clone();
-                let execution_location = context.execution_location.clone();
-                let caller_location = context.caller_location.clone();
-                runtime.jobs.set_resume_handler(context.job, Arc::new(move |value, input| {
+                let authorization = context.job_subject().clone();
+                let execution_location = context.execution_location().clone();
+                let caller_location = context.caller_location().clone();
+                runtime.jobs.set_resume_handler(context.job(), Arc::new(move |value, input| {
                     let runtime = resume_runtime.upgrade();
                     let child = resume_child.clone();
                     let sender = resume_sender.clone();
@@ -316,6 +310,7 @@ async fn run_child_request(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(child)
         .ok_or_else(|| ToolError::Failed("child agent stopped".into()))?
+        .control
         .completion_gate
         .clone();
     *completion_gate.lock().await = true;
@@ -333,12 +328,9 @@ async fn run_child_request(
             result = &mut done_rx => {
                 let text = result
                     .map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?
-                    .map_err(|error| {
-                        if error == HarnessError::Interrupted.to_string() {
-                            ToolError::Interrupted
-                        } else {
-                            ToolError::Failed(error)
-                        }
+                    .map_err(|failure| match failure {
+                        RequestFailure::Interrupted => ToolError::Interrupted,
+                        RequestFailure::Failed(message) => ToolError::Failed(message),
                     })?;
                 let mut content = Vec::new();
                 for value in context.drain_input_or_close().await {
@@ -355,12 +347,12 @@ async fn run_child_request(
                 let value = match value {
                     Ok(value) => value,
                     Err(error) => {
-                        runtime.questions.cancel_child_question(context.job).await;
+                        runtime.questions.cancel_child_question(context.job()).await;
                         runtime.interrupt_tree(child).await;
                         return Err(error);
                     }
                 };
-                if !runtime.questions.answer_child_question(context.job, value.clone()).await
+                if !runtime.questions.answer_child_question(context.job(), value.clone()).await
                     .map_err(|error| tool_error(&error))?
                 {
                     let mut active = completion_gate.lock().await;
@@ -377,11 +369,23 @@ async fn run_child_request(
                     }
                     // Owner updates use the same request-boundary mailbox as
                     // queued root prompts, rather than waiting for a new turn.
+                    let token = match QueuedPromptToken::new() {
+                        Ok(token) => token,
+                        Err(error) => {
+                            // Same teardown as a closed owner channel: never
+                            // leave the child running without its owner.
+                            runtime.questions.cancel_child_question(context.job()).await;
+                            runtime.interrupt_tree(child).await;
+                            return Err(tool_error(&error));
+                        }
+                    };
                     let (committed, _receipt) = oneshot::channel();
                     sender.send(AgentCommand::QueuedInputs(vec![QueuedInput {
-                        model: None,
-                        content: vec![UserContent::ParentInput { text: format!("Owner input: {value}") }],
-                        token: QueuedPromptToken::new(),
+                        prepared: PreparedQueuedPrompt {
+                            model: None,
+                            content: vec![UserContent::ParentInput { text: format!("Owner input: {value}") }],
+                            token,
+                        },
                         committed,
                     }])).await.map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?;
                 }
@@ -402,15 +406,11 @@ fn tool_error(error: &impl ToString) -> ToolError {
 mod tests {
     use crate::agent::runtime::tests::*;
     use crate::{execution::ExecutionLocation, mcp::McpServerConfig, tool::policy::CapabilitySet};
-    use std::{collections::BTreeMap, path::Path, sync::Mutex as StdMutex, time::Duration};
+    use std::{collections::BTreeMap, path::Path, time::Duration};
 
-    fn builder(root: &Path, requests: Arc<StdMutex<Vec<ModelRequest>>>) -> HarnessBuilder {
-        test_builder(
-            root,
-            &root.join("sessions"),
-            scripted_provider(&requests, [answer("done"), answer("done")]),
-        )
-        .max_child_depth(1)
+    fn builder(root: &Path, requests: Requests) -> HarnessBuilder {
+        let provider = scripted_provider(&requests, [answer("done"), answer("done")]);
+        test_builder(root, &root.join("sessions"), provider, false).max_child_depth(1)
     }
     const FIXTURE: &str = r#"
 import json, os, sys
@@ -452,17 +452,28 @@ for line in sys.stdin:
         BTreeMap::from([("fixture".into(), config)])
     }
 
+    fn mcp_names(session: &SessionHandle) -> Vec<String> {
+        let tools = session.runtime.executor.registry().tools();
+        let names = tools.map(|tool| tool.name().to_owned());
+        names.filter(|name| name.starts_with("mcp_")).collect()
+    }
+
     fn mcp_name(session: &SessionHandle) -> String {
-        let names = session
-            .runtime
-            .executor
-            .registry()
-            .tools()
-            .filter(|tool| tool.name().starts_with("mcp_"))
-            .map(|tool| tool.name().to_owned())
-            .collect::<Vec<_>>();
+        let names = mcp_names(session);
         assert_eq!(names.len(), 1, "{:?}", session.startup_warnings());
         names[0].clone()
+    }
+
+    /// `typeof tool.<name>` inside a script run by `executor`.
+    async fn script_type(executor: &ToolExecutor, session: &SessionHandle, name: &str) -> String {
+        let source = json!({"source":format!("return typeof tool.{name};")});
+        let script = executor.execute(session.root.clone(), "script", source, None);
+        let output = script.await.unwrap().output.value;
+        output["value"].as_str().unwrap().to_owned()
+    }
+
+    fn launched(root: &Path) -> String {
+        std::fs::read_to_string(root.join("launched")).unwrap()
     }
 
     #[tokio::test]
@@ -489,44 +500,36 @@ for line in sys.stdin:
                 "capabilities":required, "startup_timeout_secs":1
             }))
             .unwrap();
-            let harness = builder(root.path(), Arc::default())
+            let mcp = BTreeMap::from([
+                ("stdio".into(), stdio_config(root.path(), required)),
+                ("http".into(), http),
+            ]);
+            let harness = builder(root.path(), Requests::default())
                 .capabilities(capabilities)
                 .max_child_depth(depth)
                 .policy(Arc::new(crate::tool::policy::AllowAll))
-                .mcp(BTreeMap::from([
-                    ("stdio".into(), stdio_config(root.path(), required)),
-                    ("http".into(), http),
-                ]))
+                .mcp(mcp)
                 .build()
                 .await
                 .unwrap();
             let session = harness.new_session().await.unwrap();
             assert!(session.startup_warnings().is_empty());
-            assert!(
-                !session
-                    .runtime
-                    .executor
-                    .registry()
-                    .tools()
-                    .any(|tool| tool.name().starts_with("mcp_"))
-            );
+            assert!(mcp_names(&session).is_empty());
             shutdown_session(session).await;
             assert!(!root.path().join("launched").exists());
-            assert!(
-                tokio::time::timeout(Duration::from_millis(30), listener.accept())
-                    .await
-                    .is_err()
-            );
+            let accepted = tokio::time::timeout(Duration::from_millis(30), listener.accept());
+            assert!(accepted.await.is_err());
         }
     }
+
     #[tokio::test]
     async fn empty_capability_requirements_expose_direct_and_script_tools() {
         let root = tempfile::tempdir().unwrap();
-        let provider: Arc<StdMutex<Vec<ModelRequest>>> = Arc::default();
+        let requests = Requests::default();
         // Empty per-server requirements still need the global gate, but neither
         // Read nor Exec is implicitly required to use an MCP connection.
         let capabilities = [Capability::Mcp].into_iter().collect::<CapabilitySet>();
-        let harness = builder(root.path(), provider.clone())
+        let harness = builder(root.path(), requests.clone())
             .capabilities(capabilities.clone())
             .mcp(servers(stdio_config(root.path(), vec![])))
             .build()
@@ -535,73 +538,37 @@ for line in sys.stdin:
         let session = harness.new_session().await.unwrap();
         assert!(session.startup_warnings().is_empty());
         let name = mcp_name(&session);
-        let executor = session
-            .runtime
-            .executor
-            .clone()
-            .with_capabilities(capabilities);
+        let executor = session.runtime.executor.clone();
+        let executor = executor.with_capabilities(capabilities);
         assert_eq!(session.prompt("list your tools").await.unwrap(), "done");
-        assert!(
-            provider.lock().unwrap()[0]
-                .tools
-                .iter()
-                .any(|tool| tool.name == name)
-        );
-        let direct = executor
-            .execute(session.root.clone(), &name, json!({"text":"direct"}), None)
-            .await
-            .unwrap();
-        assert_eq!(
-            direct.output.value["structuredContent"],
-            json!({"text":"direct"})
-        );
-        let script = session
-            .run_script(format!("return await tool.{name}({{text:'script'}});"))
-            .await
-            .unwrap();
-        assert_eq!(
-            script.value["value"]["structuredContent"],
-            json!({"text":"script"})
-        );
+        let tools = requests.lock().unwrap()[0].tools.clone();
+        assert!(tools.iter().any(|tool| tool.name == name));
+        let direct = executor.execute(session.root.clone(), &name, json!({"text":"direct"}), None);
+        let direct = direct.await.unwrap().output.value;
+        assert_eq!(direct["structuredContent"], json!({"text":"direct"}));
+        let script = format!("return await tool.{name}({{text:'script'}});");
+        let script = session.run_script(script).await.unwrap().value;
+        let found = &script["value"]["structuredContent"];
+        assert_eq!(*found, json!({"text":"script"}));
         // Also test a discovered adapter with empty server requirements. Startup
         // omission alone would not catch a missing adapter-level global gate.
         let disabled = executor.with_capabilities(CapabilitySet::empty());
         assert!(disabled.surface().get(&name).is_none());
-        assert!(
-            disabled
-                .execute(session.root.clone(), &name, json!({"text":"denied"}), None)
-                .await
-                .is_err()
-        );
-        assert!(
-            disabled
-                .execute_script(session.root.clone(), &name, json!({"text":"denied"}), None)
-                .await
-                .is_err()
-        );
-        let script = disabled
-            .execute(
-                session.root.clone(),
-                "script",
-                json!({"source":format!("return typeof tool.{name};")}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(script.output.value["value"], "undefined");
+        let denied = json!({"text":"denied"});
+        let direct = disabled.execute(session.root.clone(), &name, denied.clone(), None);
+        assert!(direct.await.is_err());
+        let scripted = disabled.execute_script(session.root.clone(), &name, denied, None);
+        assert!(scripted.await.is_err());
+        assert_eq!(script_type(&disabled, &session, &name).await, "undefined");
         shutdown_session(session).await;
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("launched")).unwrap(),
-            "launched\n"
-        );
+        assert_eq!(launched(root.path()), "launched\n");
     }
 
     #[tokio::test]
     async fn depth_zero_child_omits_agent_gated_mcp_without_reconnecting() {
         let root = tempfile::tempdir().unwrap();
-        let provider: Arc<StdMutex<Vec<ModelRequest>>> = Arc::default();
-        let harness = builder(root.path(), provider.clone())
-            .max_child_depth(1)
+        let requests = Requests::default();
+        let harness = builder(root.path(), requests.clone())
             .mcp(servers(stdio_config(root.path(), vec![Capability::Agents])))
             .build()
             .await
@@ -609,49 +576,30 @@ for line in sys.stdin:
         let session = harness.new_session().await.unwrap();
         let name = mcp_name(&session);
         session.prompt("root request").await.unwrap();
-        let child = session
-            .run_script("return await tool.agent({prompt:'child request', depth:0});")
-            .await
-            .unwrap();
-        assert_eq!(child.value["value"], "done");
+        let child =
+            session.run_script("return await tool.agent({prompt:'child request', depth:0});");
+        assert_eq!(child.await.unwrap().value["value"], "done");
         {
-            let requests = provider.lock().unwrap();
-            assert_eq!(requests.len(), 2);
-            assert!(requests[0].tools.iter().any(|tool| tool.name == name));
-            assert!(!requests[1].tools.iter().any(|tool| tool.name == name));
+            let requests = requests.lock().unwrap();
+            let offered = |index: usize| requests[index].tools.iter().any(|tool| tool.name == name);
+            assert_eq!((requests.len(), offered(0), offered(1)), (2, true, false));
         }
-        let child_executor = session
-            .runtime
-            .executor
-            .clone()
-            .with_capabilities(session.runtime.harness.capabilities.for_agent(0));
-        assert!(
-            child_executor
-                .execute(session.root.clone(), &name, json!({"text":"denied"}), None)
-                .await
-                .is_err()
-        );
-        let script = child_executor
-            .execute(
-                session.root.clone(),
-                "script",
-                json!({"source":format!("return typeof tool.{name};")}),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(script.output.value["value"], "undefined");
+        let child_capabilities = session.runtime.harness.capabilities.for_agent(0);
+        let child_executor = session.runtime.executor.clone();
+        let child_executor = child_executor.with_capabilities(child_capabilities);
+        let denied =
+            child_executor.execute(session.root.clone(), &name, json!({"text":"denied"}), None);
+        assert!(denied.await.is_err());
+        let found = script_type(&child_executor, &session, &name).await;
+        assert_eq!(found, "undefined");
         shutdown_session(session).await;
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("launched")).unwrap(),
-            "launched\n"
-        );
+        assert_eq!(launched(root.path()), "launched\n");
     }
 
     #[tokio::test]
-    async fn mcp_stays_on_host_for_remote_location() {
+    async fn mcp_stays_on_host_for_remote_location_and_failed_startup_is_reported() {
         let root = tempfile::tempdir().unwrap();
-        let harness = builder(root.path(), Arc::default())
+        let harness = builder(root.path(), Requests::default())
             .mcp(servers(stdio_config(root.path(), vec![])))
             .build()
             .await
@@ -660,188 +608,100 @@ for line in sys.stdin:
         let name = mcp_name(&session);
         // This location has no route/worker. A targeted dispatch would fail; Host
         // dispatch must still use the session-owning process and its MCP manager.
-        let remote = session
-            .runtime
-            .executor
-            .clone()
-            .with_location(ExecutionLocation::named(
-                "unconnected-remote",
-                PathBuf::from("/remote/workspace"),
-            ));
-        let output = remote
-            .execute(session.root.clone(), &name, json!({"text":"host"}), None)
-            .await
-            .unwrap();
-        assert_eq!(output.output.value["structuredContent"]["text"], "host");
+        let location =
+            ExecutionLocation::named("unconnected-remote", PathBuf::from("/remote/workspace"));
+        let remote = session.runtime.executor.clone().with_location(location);
+        let output = remote.execute(session.root.clone(), &name, json!({"text":"host"}), None);
+        let output = output.await.unwrap().output.value;
+        assert_eq!(output["structuredContent"]["text"], "host");
         shutdown_session(session).await;
-    }
 
-    #[tokio::test]
-    async fn failed_startup_is_reported_without_breaking_the_session() {
-        let root = tempfile::tempdir().unwrap();
-        let mut config = stdio_config(root.path(), vec![]);
-        config.start_command = Some(vec![
-            root.path()
-                .join("nonexistent-mcp")
-                .to_string_lossy()
-                .into_owned(),
-        ]);
-        let harness = builder(root.path(), Arc::default())
-            .mcp(servers(config))
+        let missing = root.path().join("nonexistent-mcp");
+        let config = json!({"transport": "stdio", "start_command": [missing.to_string_lossy()]});
+        let harness = builder(root.path(), Requests::default())
+            .mcp(servers(serde_json::from_value(config).unwrap()))
             .build()
             .await
             .unwrap();
         let session = harness.new_session().await.unwrap();
         assert_eq!(session.startup_warnings().len(), 1);
         assert!(session.startup_warnings()[0].contains("fixture"));
-        assert!(
-            !session
-                .runtime
-                .executor
-                .registry()
-                .tools()
-                .any(|tool| tool.name().starts_with("mcp_"))
-        );
+        assert!(mcp_names(&session).is_empty());
         assert_eq!(session.prompt("still usable").await.unwrap(), "done");
         shutdown_session(session).await;
-    }
-
-    async fn terminal(
-        session: &SessionHandle,
-        job: crate::identity::JobId,
-    ) -> crate::job::JobEnvelope {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !session
-                .runtime
-                .jobs
-                .snapshot(job)
-                .await
-                .unwrap()
-                .state
-                .is_terminal()
-            {
-                tokio::task::yield_now().await;
-            }
-            session.runtime.jobs.wait(job, None, true).await.unwrap()
-        })
-        .await
-        .expect("tool test stalled")
     }
 
     #[tokio::test]
     async fn root_interactive_gate_covers_dispatch_and_nested_scripts() {
         for enabled in [false, true] {
             let root = tempfile::tempdir().unwrap();
-            let requests: Arc<StdMutex<Vec<ModelRequest>>> = Arc::default();
+            let requests = Requests::default();
             let batches: Arc<StdMutex<Vec<Vec<Question>>>> = Arc::default();
             let mut capabilities = CapabilitySet::default();
             if !enabled {
                 capabilities.remove(Capability::Interactive);
             }
+            let questions = RecordingQuestions {
+                batches: batches.clone(),
+                answer: json!("host-answer"),
+            };
             let harness = builder(root.path(), requests.clone())
                 .capabilities(capabilities.clone())
-                .question_handler(Arc::new(RecordingQuestions {
-                    batches: batches.clone(),
-                    answer: json!("host-answer"),
-                }))
+                .question_handler(Arc::new(questions))
                 .build()
                 .await
                 .unwrap();
             let session = harness.new_session().await.unwrap();
-            let executor = session
-                .runtime
-                .executor
-                .clone()
-                .with_capabilities(capabilities);
+            let executor = session.runtime.executor.clone();
+            let executor = executor.with_capabilities(capabilities);
             session.prompt("list tools").await.unwrap();
-            assert_eq!(
-                requests.lock().unwrap()[0]
-                    .tools
-                    .iter()
-                    .any(|tool| tool.name == "ask"),
-                enabled
-            );
-            assert_eq!(
-                session
-                    .run_script("return typeof tool.ask;")
-                    .await
-                    .unwrap()
-                    .value["value"],
-                if enabled { "function" } else { "undefined" }
-            );
+            let tools = requests.lock().unwrap()[0].tools.clone();
+            assert_eq!(tools.iter().any(|tool| tool.name == "ask"), enabled);
+            let ask_type = session.run_script("return typeof tool.ask;").await.unwrap();
+            let found = &ask_type.value["value"];
+            assert_eq!(*found, if enabled { "function" } else { "undefined" });
             for background in [false, true] {
                 for route in ["host", "model", "script"] {
                     let args = json!({"id":"root", "prompt":"question", "bg":background});
-                    let result = tokio::time::timeout(Duration::from_secs(5), async {
+                    let agent = session.root.clone();
+                    let result = bounded(async {
                         match route {
-                            "host" => {
-                                executor
-                                    .execute(session.root.clone(), "ask", args, None)
-                                    .await
-                            }
-                            "model" => {
-                                executor
-                                    .execute_model(session.root.clone(), "ask", args, None)
-                                    .await
-                            }
-                            _ => {
-                                executor
-                                    .execute_script(session.root.clone(), "ask", args, None)
-                                    .await
-                            }
+                            "host" => executor.execute(agent, "ask", args, None).await,
+                            "model" => executor.execute_model(agent, "ask", args, None).await,
+                            _ => executor.execute_script(agent, "ask", args, None).await,
                         }
                     })
-                    .await
-                    .unwrap();
+                    .await;
                     if enabled {
-                        let job = result.unwrap().job;
-                        let output = terminal(&session, job).await;
+                        let output = terminal(&session, result.unwrap().job).await;
                         assert_eq!(output.output, Some(json!("host-answer")));
                     } else {
                         assert!(result.unwrap_err().to_string().contains("unavailable"));
                     }
                 }
                 // Nested root asks cannot escape the gate through script jobs.
+                let source = "return await tool.ask({id:'nested', prompt:'question'});";
+                let arguments = json!({"source":source, "bg":background});
                 let result = executor
-                    .execute(
-                        session.root.clone(),
-                        "script",
-                        json!({
-                            "source":"return await tool.ask({id:'nested', prompt:'question'});",
-                            "bg":background,
-                        }),
-                        None,
-                    )
+                    .execute(session.root.clone(), "script", arguments, None)
                     .await;
-                if enabled || background {
-                    let output = terminal(&session, result.unwrap().job).await;
-                    assert_eq!(
-                        output.state,
-                        if enabled {
-                            crate::job::JobState::Completed
-                        } else {
-                            crate::job::JobState::Failed
-                        }
-                    );
-                    if enabled {
-                        assert_eq!(output.output.unwrap()["value"], "host-answer");
-                    }
+                if !enabled && !background {
+                    use crate::tool::executor::ExecutionError::Failed;
+                    assert!(matches!(result, Err(Failed { .. })));
+                    continue;
+                }
+                let output = terminal(&session, result.unwrap().job).await;
+                if enabled {
+                    assert_eq!(output.state, crate::job::JobState::Completed);
+                    assert_eq!(output.output.unwrap()["value"], "host-answer");
                 } else {
-                    assert!(matches!(
-                        result,
-                        Err(crate::tool::executor::ExecutionError::Failed { .. })
-                    ));
+                    assert_eq!(output.state, crate::job::JobState::Failed);
                 }
             }
             assert_eq!(batches.lock().unwrap().len(), if enabled { 8 } else { 0 });
             if !enabled {
-                assert!(
-                    session
-                        .inspect_jobs(&session.root)
-                        .await
-                        .iter()
-                        .all(|job| job.tool != "ask")
-                );
+                let jobs = session.inspect_jobs(&session.root).await;
+                assert!(jobs.iter().all(|job| job.tool != "ask"));
             }
             shutdown_session(session).await;
         }

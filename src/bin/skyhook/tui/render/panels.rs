@@ -20,7 +20,7 @@ impl PromptLayout {
         let body = wrap_plain(&body_text, width as usize);
         let title_start = match app.prompts.front().map(|prompt| &prompt.kind) {
             Some(crate::interaction::PromptKind::Questions { questions, .. })
-                if app.question_index < questions.len() =>
+                if app.question_index() < questions.len() =>
             {
                 body_text
                     .split_once('\n')
@@ -30,9 +30,9 @@ impl PromptLayout {
         };
         let choices = match app.prompts.front().map(|prompt| &prompt.kind) {
             Some(crate::interaction::PromptKind::Questions { questions, .. })
-                if app.question_index < questions.len() =>
+                if app.question_index() < questions.len() =>
             {
-                questions[app.question_index]
+                questions[app.question_index()]
                     .options
                     .iter()
                     .enumerate()
@@ -51,29 +51,33 @@ impl PromptLayout {
                 .map(|label| (label, String::new()))
                 .collect(),
         };
-        let (options, selected_start) = prompt_option_lines(&choices, app.prompt_choice, width);
+        let (options, selected_start) =
+            prompt_option_lines(&choices, app.prompt_input().choice, width);
         let secret = app.prompts.front().is_some_and(|prompt| prompt.secret());
         let input = if secret {
             // Never give a password to the renderer. Map source graphemes onto
             // mask bytes before using the same layout as a regular input field.
             let mut masked = super::super::editor::Editor::default();
-            masked.set("●".repeat(app.prompt_editor.text.graphemes(true).count()));
-            masked.cursor = app.prompt_editor.text[..app.prompt_editor.cursor]
+            masked.set("●".repeat(app.prompt_input().editor.text().graphemes(true).count()));
+            let cursor = app.prompt_input().editor.text()[..app.prompt_input().editor.cursor()]
                 .graphemes(true)
                 .count()
                 * "●".len();
-            masked.anchor = app
-                .prompt_editor
-                .anchor
-                .map(|anchor| app.prompt_editor.text[..anchor].graphemes(true).count() * "●".len());
+            let anchor = app.prompt_input().editor.anchor().map(|anchor| {
+                app.prompt_input().editor.text()[..anchor]
+                    .graphemes(true)
+                    .count()
+                    * "●".len()
+            });
+            masked.set_selection(anchor, cursor);
             masked.layout(width as usize)
         } else {
-            app.prompt_editor.layout(width as usize)
+            app.prompt_input().editor.layout(width as usize)
         };
         let input_label = match app.prompts.front().map(|prompt| &prompt.kind) {
             Some(crate::interaction::PromptKind::Questions { questions, .. }) => {
-                match questions.get(app.question_index) {
-                    Some(question) if app.prompt_choice < question.options.len() => {
+                match questions.get(app.question_index()) {
+                    Some(question) if app.prompt_input().choice < question.options.len() => {
                         "Comment (optional):"
                     }
                     Some(_) => "Answer:",
@@ -146,18 +150,19 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette, layout: 
         option_height,
     );
     app.prompt_body_rows = lines.len();
-    app.prompt_body_scroll = app
-        .prompt_body_scroll
+    app.prompt_input_mut().body_scroll = app
+        .prompt_input()
+        .body_scroll
         .min(lines.len().saturating_sub(body_height as usize));
     for (offset, line) in lines
         .iter()
-        .skip(app.prompt_body_scroll)
+        .skip(app.prompt_input().body_scroll)
         .take(body_height as usize)
         .enumerate()
     {
         let title = layout
             .title_start
-            .is_some_and(|start| app.prompt_body_scroll + offset >= start);
+            .is_some_and(|start| app.prompt_input().body_scroll + offset >= start);
         let style = if title {
             Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
         } else {
@@ -169,22 +174,23 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette, layout: 
         );
     }
     app.prompt_option_rows = option_lines.len();
-    if app.prompt_reveal {
-        if selected_start < app.prompt_option_scroll {
-            app.prompt_option_scroll = selected_start;
-        } else if selected_start >= app.prompt_option_scroll + option_height as usize {
-            app.prompt_option_scroll =
+    if !app.prompt_input().options_scrolled {
+        if selected_start < app.prompt_input().option_scroll {
+            app.prompt_input_mut().option_scroll = selected_start;
+        } else if selected_start >= app.prompt_input().option_scroll + option_height as usize {
+            app.prompt_input_mut().option_scroll =
                 selected_start.saturating_sub(option_height.saturating_sub(1) as usize);
         }
-        app.prompt_reveal = false;
+        app.prompt_input_mut().options_scrolled = true;
     }
-    app.prompt_option_scroll = app
-        .prompt_option_scroll
+    app.prompt_input_mut().option_scroll = app
+        .prompt_input()
+        .option_scroll
         .min(option_lines.len().saturating_sub(option_height as usize));
     let mut cursor_drawn = false;
     for (offset, line) in option_lines
         .iter()
-        .skip(app.prompt_option_scroll)
+        .skip(app.prompt_input().option_scroll)
         .take(option_height as usize)
         .enumerate()
     {
@@ -195,13 +201,13 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette, layout: 
             1,
         );
         frame.render_widget(
-            Paragraph::new(line.text.as_str()).style(line.style(p, app.prompt_choice)),
+            Paragraph::new(line.text.as_str()).style(line.style(p, app.prompt_input().choice)),
             row,
         );
-        if line.index == app.prompt_choice
+        if line.index == app.prompt_input().choice
             && !cursor_drawn
             && app.menu.is_none()
-            && !(app.multiple_questions() && app.question_editing)
+            && !(app.multiple_questions() && app.question_editing())
         {
             focus_cursor(frame, row.x - 1, row.y, p.input);
             cursor_drawn = true;
@@ -256,7 +262,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette, layout: 
         );
     }
     if visible > 0
-        && (!app.multiple_questions() || app.question_editing)
+        && (!app.multiple_questions() || app.question_editing())
         && app.menu.is_none()
         && app.search_editor.is_none()
     {
@@ -268,7 +274,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette, layout: 
     let question_counter = matches!(
         app.prompts.front().map(|prompt| &prompt.kind),
         Some(crate::interaction::PromptKind::Questions { questions, .. })
-            if questions.len() > 1 && app.question_index < questions.len()
+            if questions.len() > 1 && app.question_index() < questions.len()
     );
     text(
         frame,
@@ -280,13 +286,13 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette, layout: 
         ),
         match app.prompts.front().map(|prompt| &prompt.kind) {
             Some(crate::interaction::PromptKind::Questions { questions, .. })
-                if questions.len() > 1 && app.question_index < questions.len() =>
+                if questions.len() > 1 && app.question_index() < questions.len() =>
             {
                 format!(
                     "Question {}/{} · {} · ↑↓ choose · Enter answer · Esc cancel",
-                    app.question_index + 1,
+                    app.question_index() + 1,
                     questions.len(),
-                    if app.question_editing {
+                    if app.question_editing() {
                         "←→ cursor · Tab switch questions"
                     } else {
                         "←→ switch · Tab edit"
@@ -295,7 +301,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette, layout: 
             }
             kind => format!(
                 "↑↓ choose · PgUp/PgDn text · Ctrl+PgUp/PgDn choices · Enter submit · Esc {}",
-                if matches!(kind, Some(crate::interaction::PromptKind::Approval(_))) {
+                if matches!(kind, Some(crate::interaction::PromptKind::Approval { .. })) {
                     "dismiss"
                 } else {
                     "cancel"
@@ -366,9 +372,9 @@ pub(super) fn draw_tree(
             p.panel
         };
         fill(frame, rect, bg);
-        let (running, status) = app.agent_status(agent);
-        app.animating |= running;
-        let symbol = agent_symbol(running, &status, agent.terminal, app.tick_count);
+        let status = app.agent_status(agent);
+        app.animating |= status.running();
+        let symbol = agent_symbol(status, agent.terminal(), app.tick_count);
         let indent = (agent.id.depth() as u16 * 4).min(width / 3);
         let target = model::target_suffix(&agent.target);
         let stats = stats_columns.format(&agent_stats[index]);
@@ -377,10 +383,7 @@ pub(super) fn draw_tree(
             &agent.name,
             &target,
             if selected { "> " } else { "  " },
-            Span::styled(
-                symbol,
-                Style::default().fg(agent_status_color(running, &status, p)),
-            ),
+            Span::styled(symbol, Style::default().fg(agent_status_color(status, p))),
             name_width,
             p,
         );
@@ -392,8 +395,8 @@ pub(super) fn draw_tree(
             text(
                 frame,
                 r(columns.identity_width + 4, y, columns.status_width, 1),
-                status.clone(),
-                agent_status_color(running, &status, p),
+                status.label(),
+                agent_status_color(status, p),
                 bg,
             );
         }
@@ -486,6 +489,7 @@ mod tests {
             ),
             ("Write an answer…".into(), String::new()),
         ];
+        let p = Palette::new();
         for width in [6, 12, 30] {
             let (rows, selected_start) = prompt_option_lines(&options, 1, width);
             assert_eq!(rows[selected_start].index, 1);
@@ -494,33 +498,25 @@ mod tests {
                 rows.iter().filter(|row| row.text.starts_with("> ")).count(),
                 1
             );
-            assert!(rows.iter().all(|row| row.text.width() <= width as usize));
-            assert!(rows.iter().all(|row| !row.text.contains('—')));
+            assert!(
+                rows.iter()
+                    .all(|row| row.text.width() <= width as usize && !row.text.contains('—'))
+            );
             for (index, (label, description)) in options.iter().enumerate() {
-                let choice_rows = rows
-                    .iter()
-                    .filter(|row| row.index == index)
-                    .collect::<Vec<_>>();
-                assert!(!choice_rows[0].description);
+                let choice: Vec<_> = rows.iter().filter(|row| row.index == index).collect();
+                assert!(!choice[0].description);
                 for (is_description, source) in [(false, label), (true, description)] {
-                    let reconstructed = choice_rows
+                    let parts = choice
                         .iter()
-                        .filter(|row| row.description == is_description)
-                        .map(|row| &row.text[2..])
-                        .collect::<String>();
+                        .filter(|row| row.description == is_description);
+                    let reconstructed: String = parts.map(|row| &row.text[2..]).collect();
                     assert_eq!(reconstructed, model::clean(source));
                 }
-                if let Some(first_description) = choice_rows.iter().position(|row| row.description)
-                {
-                    assert!(first_description > 0);
-                    assert!(
-                        choice_rows[first_description..]
-                            .iter()
-                            .all(|row| row.description)
-                    );
+                // Descriptions follow the label rows contiguously.
+                if let Some(first) = choice.iter().position(|row| row.description) {
+                    assert!(first > 0 && choice[first..].iter().all(|row| row.description));
                 }
             }
-            let p = Palette::new();
             for row in &rows {
                 let style = row.style(p, 1);
                 assert_eq!(

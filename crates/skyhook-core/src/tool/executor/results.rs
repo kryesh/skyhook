@@ -1,13 +1,17 @@
 //! Collect job outcomes, import remote payloads, and present execution failures.
 
 use super::*;
-use base64::Engine as _;
 use thiserror::Error;
+
+#[derive(Clone, Copy)]
+enum CollectionPurpose {
+    Native,
+    Transfer,
+}
 
 impl ToolExecutor {
     pub(super) async fn collect_model_started(
         &self,
-        name: &str,
         started: StartedExecution,
     ) -> Result<ExecutionResult, ExecutionError> {
         let job = started.job;
@@ -15,34 +19,28 @@ impl ToolExecutor {
         if !background {
             self.shared.jobs.wait_foreground(job).await?;
         }
-        let mut output = self
+        let presented = self
             .shared
             .jobs
-            .present_output_for(
+            .present_output_with(
                 crate::job::output::OutputArgs::new(job),
                 &self.capabilities,
-                &self.caller_location,
-                background,
+                crate::job::output::OutputOptions::Model {
+                    viewer: Some(&self.caller_location),
+                    detailed: background,
+                    presentation: crate::job::OutputPresentation::Automatic,
+                },
             )
             .await?;
-        // Automatic model responses reference independently published child
-        // replies instead of returning their text again. This also handles
-        // a background child that finishes before its launch is presented.
-        // Explicit job_output and native script/host results are unchanged.
-        if name == "agent"
-            && output["state"] == "completed"
-            && let Some(sequence) = self.shared.jobs.last_agent_message(job).await?
-            && let Some(view) = output.as_object_mut()
-        {
-            view.remove("result");
-            view.remove("preview");
-            view.remove("truncated");
-            view.insert("last_message".into(), serde_json::json!(sequence));
-        }
+        let (state, output, images) = presented.into_parts();
         Ok(ExecutionResult {
             job,
             background,
-            output: ToolOutput::new(output).with_images(self.shared.jobs.images(job).await?),
+            is_error: matches!(
+                state,
+                JobState::Failed | JobState::Cancelled | JobState::Interrupted
+            ),
+            output: ToolOutput::new(output).with_images(images),
         })
     }
 
@@ -50,21 +48,22 @@ impl ToolExecutor {
         &self,
         started: StartedExecution,
     ) -> Result<ExecutionResult, ExecutionError> {
-        self.collect_up_to(started, u64::MAX).await
+        self.collect_result(started, CollectionPurpose::Native)
+            .await
     }
 
     pub(crate) async fn collect_for_transfer(
         &self,
         started: StartedExecution,
     ) -> Result<ExecutionResult, ExecutionError> {
-        self.collect_up_to(started, crate::job::output::PAGE_BYTES as u64)
+        self.collect_result(started, CollectionPurpose::Transfer)
             .await
     }
 
-    async fn collect_up_to(
+    async fn collect_result(
         &self,
         started: StartedExecution,
-        maximum: u64,
+        purpose: CollectionPurpose,
     ) -> Result<ExecutionResult, ExecutionError> {
         let StartedExecution { job, background } = started;
         if background {
@@ -74,18 +73,30 @@ impl ToolExecutor {
             return Ok(ExecutionResult {
                 job,
                 background: true,
+                is_error: false,
                 output: ToolOutput::new(value),
             });
         }
-        let mut envelope = self.shared.jobs.wait_foreground(job).await?;
-        self.shared
-            .jobs
-            .hydrate_envelope_up_to(&mut envelope, maximum)
-            .await?;
+        let mut envelope = match purpose {
+            CollectionPurpose::Native => self.shared.jobs.wait_foreground(job).await?,
+            CollectionPurpose::Transfer => {
+                self.shared.jobs.wait_foreground_for_transfer(job).await?
+            }
+        };
+        match purpose {
+            CollectionPurpose::Native => self.shared.jobs.hydrate_envelope(&mut envelope).await?,
+            CollectionPurpose::Transfer => {
+                self.shared
+                    .jobs
+                    .hydrate_envelope_up_to(&mut envelope, crate::job::output::PAGE_BYTES as u64)
+                    .await?
+            }
+        }
         if !envelope.state.is_terminal() {
             return Ok(ExecutionResult {
                 job,
                 background: true,
+                is_error: false,
                 output: ToolOutput::new(envelope.presented_for(
                     &self.capabilities,
                     Some(&self.caller_location),
@@ -93,7 +104,7 @@ impl ToolExecutor {
                 )?),
             });
         }
-        if maximum == u64::MAX {
+        if matches!(purpose, CollectionPurpose::Native) {
             self.shared.jobs.claim(job).await?;
         }
         let images = self.shared.jobs.images(job).await?;
@@ -101,10 +112,8 @@ impl ToolExecutor {
             Ok(ExecutionResult {
                 job,
                 background: false,
-                output: ToolOutput {
-                    value: envelope.output.unwrap_or(Value::Null),
-                    images,
-                },
+                is_error: false,
+                output: ToolOutput::new(envelope.output.unwrap_or(Value::Null)).with_images(images),
             })
         } else if envelope.denial.is_some() {
             Err(ExecutionError::Denied(
@@ -119,56 +128,11 @@ impl ToolExecutor {
                     .unwrap_or_else(|| format!("job ended as {:?}", envelope.state)),
                 output: envelope
                     .output
-                    .map(|value| ToolOutput { value, images })
+                    .map(|value| ToolOutput::new(value).with_images(images))
                     .map(Box::new),
             })
         }
     }
-}
-
-pub(super) async fn import_remote_result(
-    store: &crate::session::SessionStore,
-    result: Result<ToolOutput, RemoteError>,
-) -> Result<ToolOutput, ToolError> {
-    match result {
-        Ok(output) => import_remote_output(store, output).await,
-        Err(RemoteError::Remote {
-            message,
-            output: Some(output),
-        }) => Err(ToolError::with_output(
-            message,
-            import_remote_output(store, *output).await?,
-        )),
-        Err(error) => Err(error.into_tool_error()),
-    }
-}
-
-async fn import_remote_output(
-    store: &crate::session::SessionStore,
-    mut output: ToolOutput,
-) -> Result<ToolOutput, ToolError> {
-    let mut imported = Vec::with_capacity(output.images.len());
-    for image in output.images {
-        let encoded = image
-            .data_base64
-            .as_deref()
-            .ok_or_else(|| ToolError::Failed("remote image payload is missing".to_owned()))?;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|error| ToolError::Failed(error.to_string()))?;
-        let reference = store
-            .import_blob(&bytes, image.name, image.media_type)
-            .await
-            .map_err(|error| ToolError::Failed(error.to_string()))?;
-        if reference.sha256 != image.sha256 {
-            return Err(ToolError::Failed(
-                "remote image hash did not match its payload".to_owned(),
-            ));
-        }
-        imported.push(reference);
-    }
-    output.images = imported;
-    Ok(output)
 }
 
 pub(crate) struct StartedExecution {
@@ -194,6 +158,7 @@ pub struct ExecutionResult {
     pub job: JobId,
     pub background: bool,
     pub output: ToolOutput,
+    pub(crate) is_error: bool,
 }
 
 #[derive(Debug, Error)]
@@ -256,74 +221,93 @@ pub(crate) struct ExecutionFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolRegistryBuilder;
+    use crate::{
+        job::{JobRole, JobSpec},
+        provider::protocol::{AssistantContent, Message},
+        session::SessionEvent,
+        tool::ToolRegistryBuilder,
+    };
+
+    async fn created(runtime: &crate::tests::TestRuntime, spec: JobSpec) -> JobId {
+        runtime.jobs.create(spec).await.unwrap().into_test_id()
+    }
+
+    async fn complete(runtime: &crate::tests::TestRuntime, job: JobId, value: serde_json::Value) {
+        let outcome = JobOutcome::Completed(ToolOutput::new(value));
+        runtime.jobs.finish(job, outcome).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transfer_collection_does_not_consume_delivery() {
+        let runtime = crate::tests::TestRuntime::new().await;
+        let executor = runtime.executor(ToolRegistryBuilder::default());
+        // Both paths collect the same small completed payload. Only native
+        // consumption acknowledges delivery; transfer is not consumption.
+        let spec = JobSpec {
+            background: true,
+            ..JobSpec::test(runtime.agent.clone(), "transfer")
+        };
+        let job = created(&runtime, spec).await;
+        complete(&runtime, job, serde_json::json!(42)).await;
+        let started = StartedExecution {
+            job,
+            background: false,
+        };
+        let transfer = executor.collect_for_transfer(started).await.unwrap();
+        assert_eq!(transfer.output.value, 42);
+        assert!(runtime.jobs.has_pending(&runtime.agent).await);
+        let native = executor
+            .collect_started(StartedExecution {
+                job,
+                background: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(native.output.value, 42);
+        assert!(!runtime.jobs.has_pending(&runtime.agent).await);
+    }
 
     #[tokio::test]
     async fn automatic_completed_child_results_reference_independent_messages() {
-        use crate::{
-            job::JobSpec,
-            provider::protocol::{AssistantContent, Message},
-            session::SessionEvent,
-        };
-
         // Cover foreground presentation and a background child that has already
         // finished before its launch response is collected, without a timing race.
         for background in [false, true] {
             let runtime = crate::tests::TestRuntime::new().await;
             let executor = runtime.executor(ToolRegistryBuilder::default());
             let child = runtime.agent.child(1);
-            let job = runtime
-                .jobs
-                .create(JobSpec {
-                    background,
-                    ..JobSpec::test(runtime.agent.clone(), "agent")
-                })
-                .await
-                .unwrap()
-                .id;
-            runtime
-                .store
-                .append(
-                    child.clone(),
-                    SessionEvent::AgentStarted {
-                        parent: Some(runtime.agent.clone()),
-                        owner_job: Some(job),
-                        model_profile: "test".into(),
-                        max_context: None,
-                        location: ExecutionLocation::root(runtime.root.path().to_owned()),
-                    },
-                )
-                .await
-                .unwrap();
+            let spec = JobSpec {
+                background,
+                role: JobRole::Agent,
+                ..JobSpec::test(runtime.agent.clone(), "delegate")
+            };
+            let job = created(&runtime, spec).await;
+            let started = SessionEvent::AgentStarted {
+                parent: Some(runtime.agent.clone()),
+                owner_job: Some(job),
+                model_profile: "test".into(),
+                max_context: None,
+                location: ExecutionLocation::root(runtime.root.path().to_owned()),
+            };
+            runtime.store.append(child.clone(), started).await.unwrap();
             runtime
                 .jobs
                 .transition(job, JobState::Running)
                 .await
                 .unwrap();
-            let text = (0..500)
+            let text: String = (0..500)
                 .map(|line| format!("child answer line {line}\n"))
-                .collect::<String>();
+                .collect();
+            let message =
+                Message::Assistant(vec![AssistantContent::text("answer", 0, text.clone())]);
             let sequence = runtime
                 .jobs
-                .commit_child_message(
-                    &child,
-                    job,
-                    Message::Assistant(vec![AssistantContent::text("answer", 0, text.clone())]),
-                    text.clone(),
-                )
+                .commit_child_message(&child, job, message, text.clone())
                 .await
                 .unwrap();
-            runtime
-                .jobs
-                .finish(
-                    job,
-                    JobOutcome::Completed(ToolOutput::new(serde_json::json!(text))),
-                )
-                .await
-                .unwrap();
+            complete(&runtime, job, serde_json::json!(text)).await;
 
             let result = executor
-                .collect_model_started("agent", StartedExecution { job, background })
+                .collect_model_started(StartedExecution { job, background })
                 .await
                 .unwrap();
             assert_eq!(result.output.value["state"], "completed");

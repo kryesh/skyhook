@@ -126,41 +126,36 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn permanent_http_rejections_cannot_enter_an_unbounded_retry_loop() {
-        for status in [301, 400, 401, 403, 404, 405, 413, 422, 426] {
-            assert!(
-                classify_error(Some(status), &json!({}))
-                    .recovery()
-                    .is_none(),
-                "HTTP {status}"
-            );
+    fn status_recovery_and_diagnostics_never_expose_server_text() {
+        for (statuses, retryable) in [
+            (&[301, 400, 401, 403, 404, 405, 413, 422, 426][..], false),
+            (&[408, 409, 425, 429, 500, 503, 504][..], true),
+        ] {
+            for &status in statuses {
+                let recovery = classify_error(Some(status), &json!({})).recovery();
+                assert_eq!(recovery.is_some(), retryable, "HTTP {status}");
+            }
         }
-        for status in [408, 409, 425, 429, 500, 503, 504] {
-            assert!(
-                classify_error(Some(status), &json!({}))
-                    .recovery()
-                    .is_some(),
-                "HTTP {status}"
-            );
+        // Diagnostics preserve status and known codes but not server text.
+        for (status, native, expected) in [
+            (
+                Some(503),
+                json!({"error": {"code":"server_error", "message":"private prompt and credential"}}),
+                "provider HTTP 503 error [code=server_error]",
+            ),
+            (
+                Some(429),
+                json!({"error": {"code":"sk-private-credential", "message":"private prompt"}}),
+                "provider HTTP 429 error",
+            ),
+            (
+                None,
+                json!({"error":{"message":"secret"}}),
+                "provider stream error",
+            ),
+        ] {
+            assert_eq!(classify_error(status, &native).message, expected);
         }
-    }
-
-    #[test]
-    fn diagnostics_preserve_status_and_known_codes_but_not_server_text() {
-        let error = classify_error(
-            Some(503),
-            &json!({"error": {
-                "code":"server_error", "message":"private prompt and credential"
-            }}),
-        );
-        assert_eq!(error.message, "provider HTTP 503 error [code=server_error]");
-        let error = classify_error(
-            Some(429),
-            &json!({"error": {
-                "code":"sk-private-credential", "message":"private prompt"
-            }}),
-        );
-        assert_eq!(error.message, "provider HTTP 429 error");
     }
 
     #[test]
@@ -190,17 +185,10 @@ mod tests {
             for status in [None, Some(400)] {
                 let error = classify_error(status, &native);
                 assert_eq!(error.kind, expected);
-                assert!(!error.message.contains("secret"));
-                assert!(!error.message.contains("unknown"));
+                assert!(!error.message.contains("secret") && !error.message.contains("unknown"));
             }
         }
-        assert_eq!(
-            classify_error(Some(401), &json!({})).kind,
-            ProviderErrorKind::Authentication
-        );
-        assert_eq!(
-            classify_error(None, &json!({"error":{"message":"secret"}})).message,
-            "provider stream error"
-        );
+        let unauthorized = classify_error(Some(401), &json!({}));
+        assert_eq!(unauthorized.kind, ProviderErrorKind::Authentication);
     }
 }

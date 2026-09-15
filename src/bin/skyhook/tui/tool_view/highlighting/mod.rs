@@ -1,7 +1,7 @@
 //! Bounded asynchronous syntax cache and immutable source identities.
 mod syntax;
 use super::super::app::Work;
-use super::{Document, MAX_LINE, MAX_SECTION, Section, model};
+use super::{Document, MAX_LINE, MAX_SECTION, Section};
 use ratatui::text::Line;
 use std::{
     collections::{HashMap, HashSet},
@@ -61,52 +61,59 @@ impl Hash for CodeSource {
     }
 }
 
+/// One admission predicate for scheduling and reverse invalidation.
+fn admitted(source: &CodeSource, language: &str) -> bool {
+    source.eligible && !language.is_empty()
+}
 impl Document {
-    /// Content IDs for indexing highlight completions back to affected documents.
-    /// A digest collision only causes an extra invalidation; cache equality verifies text.
-    pub fn highlight_sources(&self) -> impl Iterator<Item = u64> + '_ {
+    fn admitted_codes(&self) -> impl Iterator<Item = (&CodeSource, &str)> {
         self.sections.iter().filter_map(|section| match section {
             Section::Code {
                 source, language, ..
-            } if source.eligible && !language.is_empty() => Some(source.digest),
+            } if admitted(source, language) => Some((source, language.as_str())),
             _ => None,
         })
     }
+    /// Content IDs for indexing highlight completions back to affected documents.
+    /// A digest collision only causes an extra invalidation; cache equality verifies text.
+    pub fn highlight_sources(&self) -> impl Iterator<Item = u64> + '_ {
+        self.admitted_codes().map(|(source, _)| source.digest)
+    }
     fn keys(&self) -> impl Iterator<Item = CodeKey> + '_ {
-        self.sections
-            .iter()
-            .filter_map(move |section| match section {
-                Section::Code {
-                    source, language, ..
-                } if source.eligible && !language.is_empty() => {
-                    Some(CodeKey::new(source.clone(), language))
-                }
-                _ => None,
-            })
+        self.admitted_codes()
+            .map(|(source, language)| CodeKey::admit(source, language).unwrap())
     }
 }
+/// Cloning shares an already-checked immutable source; it does not grant a cache
+/// slot. Every insertion still passes the independent source-byte budget.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct CodeKey {
     source: CodeSource,
     language: String,
 }
 impl CodeKey {
-    pub(super) fn new(source: CodeSource, language: &str) -> Self {
-        Self {
-            source,
+    pub(super) fn admit(source: &CodeSource, language: &str) -> Option<Self> {
+        admitted(source, language).then(|| Self {
+            source: source.clone(),
             language: language.into(),
-        }
+        })
     }
+}
+/// Styled lines, or `None` when the source falls back to plain rendering.
+type HighlightResult = Option<Vec<Line<'static>>>;
+enum HighlightState {
+    Unscheduled,
+    InFlight,
+    Ready(HighlightResult),
 }
 struct CachedHighlight {
     last_used: u64,
-    pending: bool,
-    lines: Option<Vec<Line<'static>>>,
+    state: HighlightState,
 }
 struct Completion {
     generation: u64,
     key: CodeKey,
-    lines: Vec<Line<'static>>,
+    result: HighlightResult,
 }
 /// A bounded worker queue keeps regex work out of the terminal/event loop.
 /// Recent sections survive collapse within a bounded cache; old-session results are discarded.
@@ -135,12 +142,12 @@ impl HighlightCache {
                 // Load grammars while the initial UI is being displayed, not on the first click.
                 let _ = syntax_resources();
                 while let Ok((generation, key)) = jobs.recv() {
-                    let lines = highlight(&key);
+                    let result = highlight_code(&key.source, &key.language);
                     if completed
                         .send(Completion {
                             generation,
                             key,
-                            lines,
+                            result,
                         })
                         .is_err()
                     {
@@ -167,12 +174,21 @@ impl HighlightCache {
     }
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
-        for completion in self.receiver.try_iter() {
+        loop {
+            let completion = match self.receiver.try_recv() {
+                Ok(completion) => completion,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.disconnect();
+                    break;
+                }
+            };
             if completion.generation == self.generation
                 && let Some(entry) = self.entries.get_mut(&completion.key)
+                && matches!(entry.state, HighlightState::InFlight)
             {
                 self.changed_sources.push(completion.key.source.digest);
-                entry.lines = Some(completion.lines);
+                entry.state = HighlightState::Ready(completion.result);
                 changed = true;
             }
         }
@@ -189,19 +205,8 @@ impl HighlightCache {
                 .collect();
             self.schedule(missing.into_iter());
         }
-        // Queue pressure must not strand admitted sections when the renderer
-        // subsequently prepares only changed documents. This bounded cache owns
-        // retrying its unscheduled work independently of view invalidations.
-        if let Some(sender) = &self.sender {
-            for (key, entry) in &mut self.entries {
-                if !entry.pending && entry.lines.is_none() {
-                    if sender.try_send((self.generation, key.clone())).is_err() {
-                        break;
-                    }
-                    entry.pending = true;
-                }
-            }
-        }
+        // Queue pressure must not strand admitted work after document preparation.
+        self.submit_unscheduled();
         changed
     }
     /// Drain content IDs whose highlights completed since the last drain.
@@ -243,7 +248,7 @@ impl HighlightCache {
                         .iter()
                         .filter(|(key, entry)| {
                             !self.working_set.contains(*key)
-                                && (!entry.pending || entry.lines.is_some())
+                                && !matches!(entry.state, HighlightState::InFlight)
                         })
                         .min_by_key(|(_, entry)| entry.last_used)
                         .map(|(key, _)| key.clone());
@@ -259,21 +264,48 @@ impl HighlightCache {
                 bytes += key.source.len();
             }
             let entry = self.entries.entry(key.clone()).or_insert(CachedHighlight {
-                pending: false,
-                lines: None,
+                state: HighlightState::Unscheduled,
                 last_used: self.clock,
             });
             entry.last_used = self.clock;
-            if !entry.pending
-                && let Some(sender) = &self.sender
-                && sender.try_send((self.generation, key)).is_ok()
-            {
-                entry.pending = true;
+        }
+        self.submit_unscheduled();
+    }
+    /// The cache, not its rendering callers, owns queue retry. A disconnected
+    /// worker disables submission until the cache is recreated. Pending sources
+    /// become evictable Unscheduled entries and keep their ordinary source-based
+    /// fallback; this is deliberately not an automatic worker-restart policy.
+    fn submit_unscheduled(&mut self) {
+        let Some(sender) = &self.sender else {
+            return;
+        };
+        for (key, entry) in &mut self.entries {
+            if !matches!(entry.state, HighlightState::Unscheduled) {
+                continue;
+            }
+            match sender.try_send((self.generation, key.clone())) {
+                Ok(()) => entry.state = HighlightState::InFlight,
+                Err(mpsc::TrySendError::Full(_)) => break,
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.disconnect();
+                    break;
+                }
             }
         }
     }
-    pub(super) fn ready(&self, key: &CodeKey) -> Option<&Vec<Line<'static>>> {
-        self.entries.get(key)?.lines.as_ref()
+    fn disconnect(&mut self) {
+        self.sender = None;
+        for entry in self.entries.values_mut() {
+            if matches!(entry.state, HighlightState::InFlight) {
+                entry.state = HighlightState::Unscheduled;
+            }
+        }
+    }
+    pub(super) fn ready(&self, key: &CodeKey) -> Option<&HighlightResult> {
+        match &self.entries.get(key)?.state {
+            HighlightState::Ready(result) => Some(result),
+            _ => None,
+        }
     }
     #[cfg(test)]
     pub fn is_highlighted(&self, document: &Document) -> bool {
@@ -285,14 +317,6 @@ impl HighlightCache {
             && document.keys().all(|key| self.ready(&key).is_some())
     }
 }
-fn highlight(key: &CodeKey) -> Vec<Line<'static>> {
-    highlight_code(&key.source, &key.language).unwrap_or_else(|| {
-        key.source
-            .split('\n')
-            .map(|text| Line::from(model::clean(text)))
-            .collect()
-    })
-}
 
 #[cfg(test)]
 mod tests {
@@ -300,70 +324,128 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    fn queued_cache(
-        capacity: usize,
-    ) -> (
+    type Queue = (
         HighlightCache,
         mpsc::Receiver<(u64, CodeKey)>,
         mpsc::Sender<Completion>,
-    ) {
+    );
+
+    fn queued_cache(capacity: usize) -> Queue {
         let (sender, queued) = mpsc::sync_channel(capacity);
         let (completed, receiver) = mpsc::channel();
-        (
-            HighlightCache {
-                entries: HashMap::new(),
-                working_set: HashSet::new(),
-                sender: Some(sender),
-                receiver,
-                generation: 0,
-                clock: 0,
-                changed_sources: Vec::new(),
-            },
-            queued,
-            completed,
-        )
+        let cache = HighlightCache {
+            entries: HashMap::new(),
+            working_set: HashSet::new(),
+            sender: Some(sender),
+            receiver,
+            generation: 0,
+            clock: 0,
+            changed_sources: Vec::new(),
+        };
+        (cache, queued, completed)
+    }
+
+    fn code(source: &str, language: &str, role: Role) -> Document {
+        let mut document = Document::default();
+        document.code(source, language, 0, Default::default(), role);
+        document
+    }
+
+    fn complete(
+        completed: &mpsc::Sender<Completion>,
+        (generation, key): (u64, CodeKey),
+        result: HighlightResult,
+    ) {
+        let completion = Completion {
+            generation,
+            key,
+            result,
+        };
+        completed.send(completion).unwrap();
+    }
+
+    fn states(cache: &HighlightCache, test: impl Fn(&HighlightState) -> bool) -> usize {
+        cache
+            .entries
+            .values()
+            .filter(|entry| test(&entry.state))
+            .count()
+    }
+
+    fn text(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn source_bytes(cache: &HighlightCache) -> usize {
+        cache.entries.keys().map(|key| key.source.len()).sum()
+    }
+
+    #[test]
+    fn styled_completion_is_not_reinterpreted_as_fallback_by_span_color() {
+        let (mut cache, queued, completed) = queued_cache(1);
+        let document = code("source", "js", Role::Warning);
+        cache.prepare(std::iter::once(&document));
+        let styled = Some(vec![Line::from("source")]);
+        complete(&completed, queued.try_recv().unwrap(), styled);
+        assert!(cache.poll());
+        let rendered = document.lines(Some(&cache));
+        assert_eq!(rendered[0].spans.last().unwrap().style.fg, None);
+        assert_eq!(text(&rendered), "source");
+    }
+
+    #[test]
+    fn disconnected_worker_releases_inflight_entries_without_claiming_completion() {
+        let (mut cache, queued, completed) = queued_cache(1);
+        let document = code("source", "js", Role::Warning);
+        cache.prepare(std::iter::once(&document));
+        let in_flight = |state: &_| matches!(state, HighlightState::InFlight);
+        assert_eq!(states(&cache, in_flight), cache.entries.len());
+        drop((queued, completed));
+        assert!(!cache.poll());
+        assert!(cache.sender.is_none());
+        let unscheduled = |state: &_| matches!(state, HighlightState::Unscheduled);
+        assert_eq!(states(&cache, unscheduled), cache.entries.len());
+        assert!(!cache.is_highlighted(&document));
+        assert_eq!(document.lines(Some(&cache)), document.lines(None));
     }
 
     #[test]
     fn unsupported_syntax_completion_preserves_each_callers_fallback_role() {
-        let styled_tokens = |lines: &[Line<'_>]| {
-            lines
-                .iter()
-                .flat_map(|line| &line.spans)
-                .filter(|span| !span.content.is_empty())
-                .map(|span| (span.content.to_string(), span.style))
-                .collect::<Vec<_>>()
+        let assert_fallback = |cache: &HighlightCache, document: &Document| {
+            let tokens = |lines: Vec<Line<'_>>| {
+                let spans = lines.iter().flat_map(|line| &line.spans);
+                let spans = spans.filter(|span| !span.content.is_empty());
+                spans
+                    .map(|span| (span.content.to_string(), span.style))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                tokens(document.lines(Some(cache))),
+                tokens(document.lines(None))
+            );
+            assert!(cache.is_fully_highlighted(document));
         };
         let (mut cache, queued, completed) = queued_cache(16);
-        let mut document = Document::default();
         let original = "unchanged  \n\n";
-        document.code(original, "unknown-extension", 0, vec![], Role::Constant);
-        let pending = document.lines(None);
+        let document = code(original, "unknown-extension", Role::Constant);
         cache.prepare(std::iter::once(&document));
         let (generation, key) = queued.try_recv().unwrap();
-        completed
-            .send(Completion {
-                generation,
-                lines: highlight(&key),
-                key,
-            })
-            .unwrap();
+        complete(
+            &completed,
+            (generation, key.clone()),
+            highlight_code(&key.source, &key.language),
+        );
         assert!(cache.poll());
-        assert!(cache.is_fully_highlighted(&document));
-        let rendered = document.lines(Some(&cache));
-        assert_eq!(text(&rendered), text(&pending));
-        assert_eq!(styled_tokens(&rendered), styled_tokens(&pending));
-
+        assert_fallback(&cache, &document);
         // The shared key must not bake in the first document's role.
         for role in [Role::Plain, Role::String, Role::Added, Role::Removed] {
-            let mut other = Document::default();
-            other.code(original, "unknown-extension", 0, vec![], role);
+            let other = code(original, "unknown-extension", role);
             assert!(!cache.prepare(std::iter::once(&other)));
-            let rendered = other.lines(Some(&cache));
-            let pending = other.lines(None);
-            assert_eq!(text(&rendered), text(&pending));
-            assert_eq!(styled_tokens(&rendered), styled_tokens(&pending));
-            assert!(cache.is_fully_highlighted(&other));
+            assert_fallback(&cache, &other);
         }
         for _ in 0..3 {
             assert!(!cache.prepare(std::iter::once(&document)));
@@ -375,95 +457,86 @@ mod tests {
         }
     }
 
-    fn finish(cache: &mut HighlightCache, document: &Document) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            cache.prepare(std::iter::once(document));
-            if document.keys().all(|key| cache.ready(&key).is_some()) {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "highlight worker did not complete"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    fn text(lines: &[Line<'_>]) -> String {
-        lines
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     #[test]
     fn admitted_highlights_retry_after_queue_pressure_without_repreparing_documents() {
-        let mut cache = HighlightCache::default();
-        let mut documents = Vec::new();
-        for index in 0..40 {
-            let mut doc = Document::default();
-            doc.code(
-                &format!("let value_{index} = {index};"),
-                "rust",
-                0,
-                Vec::new(),
-                Role::Plain,
-            );
-            documents.push(doc);
+        let (mut cache, queued, completed) = queued_cache(1);
+        let mut document = Document::default();
+        for source in ["one", "two"] {
+            document.code(source, "unknown", 0, Default::default(), Role::Plain);
         }
-        cache.prepare(documents.iter());
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < until {
-            cache.poll();
-            if documents.iter().all(|doc| cache.is_highlighted(doc)) {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        cache.prepare(std::iter::once(&document));
+        assert_eq!(
+            states(&cache, |state| matches!(state, HighlightState::InFlight)),
+            1
+        );
+        assert_eq!(
+            states(&cache, |state| matches!(state, HighlightState::Unscheduled)),
+            1
+        );
+        for _ in 0..2 {
+            complete(&completed, queued.try_recv().unwrap(), None);
+            assert!(cache.poll());
         }
-        panic!("admitted sections were stranded after the worker queue filled");
+        let fallback = |state: &_| matches!(state, HighlightState::Ready(None));
+        assert_eq!(states(&cache, fallback), 2);
+        assert!(!cache.prepare(std::iter::once(&document)));
+        assert!(queued.try_recv().is_err());
     }
 
     #[test]
     fn oversized_and_unknown_source_falls_back_without_losing_text() {
         let mut cache = HighlightCache::default();
         for original in ["x".repeat(MAX_LINE + 1), "x\n".repeat(MAX_SECTION / 2 + 1)] {
-            let mut document = Document::default();
-            document.code(&original, "js", 0, vec![], Role::Plain);
+            let document = code(&original, "js", Role::Plain);
             assert!(!cache.prepare(std::iter::once(&document)));
             assert!(cache.entries.is_empty());
             assert_eq!(text(&document.lines(Some(&cache))), original);
         }
-        let mut document = Document::default();
-        document.code(
-            "unchanged  \n\n",
-            "unknown-extension",
-            0,
-            vec![],
-            Role::Plain,
-        );
-        finish(&mut cache, &document);
+        let document = code("unchanged  \n\n", "unknown-extension", Role::Plain);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while {
+            cache.prepare(std::iter::once(&document));
+            !document.keys().all(|key| cache.ready(&key).is_some())
+        } {
+            assert!(
+                Instant::now() < deadline,
+                "highlight worker did not complete"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(text(&document.lines(Some(&cache))), "unchanged  \n\n");
+        // Admission and exact source identity share one boundary.
+        let mut document = Document::default();
+        for (source, language) in [
+            ("plain".into(), ""),
+            ("unknown".into(), "future-syntax"),
+            ("".into(), "js"),
+            ("x".repeat(MAX_LINE + 1), "js"),
+            ("x\n".repeat(MAX_SECTION / 2 + 1), "js"),
+        ] {
+            document.code(&source, language, 0, Default::default(), Role::Plain);
+        }
+        let digests: Vec<_> = document.keys().map(|key| key.source.digest).collect();
+        assert_eq!(digests.len(), 2);
+        assert_eq!(document.highlight_sources().collect::<Vec<_>>(), digests);
+        assert!(CodeKey::admit(&CodeSource::from("plain"), "").is_none());
+        let long = "x".repeat(MAX_LINE + 1);
+        assert!(CodeKey::admit(&CodeSource::from(long.as_str()), "js").is_none());
     }
 
     #[tokio::test]
     async fn worker_wakes_the_ui_and_reopening_reuses_highlights() {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut cache = HighlightCache::with_notify(sender);
-        let mut document = Document::default();
-        document.code("const value = 42;", "js", 0, vec![], Role::Plain);
+        let document = code("const value = 42;", "js", Role::Plain);
         cache.prepare(std::iter::once(&document));
-        let wake = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
-            .await
-            .unwrap();
-        assert!(matches!(wake, Some(Work::HighlightsReady)));
+        let wake = tokio::time::timeout(Duration::from_secs(5), receiver.recv());
+        assert!(matches!(wake.await.unwrap(), Some(Work::HighlightsReady)));
         assert!(cache.poll());
         assert!(cache.is_highlighted(&document));
         cache.prepare(std::iter::empty());
-        let ready = cache.is_highlighted(&document);
         assert!(!cache.prepare(std::iter::once(&document)));
-        assert_eq!(cache.is_highlighted(&document), ready);
+        assert!(cache.is_highlighted(&document));
         assert!(receiver.try_recv().is_err());
     }
 
@@ -471,85 +544,66 @@ mod tests {
     fn more_open_sections_than_the_cache_budget_do_not_requeue_forever() {
         let (mut cache, queued, completed) = queued_cache(512);
         let documents: Vec<_> = (0..CACHE_SECTIONS + 10)
-            .map(|index| {
-                let mut document = Document::default();
-                document.code(
-                    &format!("const value = {index};"),
-                    "js",
-                    0,
-                    vec![],
-                    Role::Plain,
-                );
-                document
-            })
+            .map(|index| code(&format!("const value = {index};"), "js", Role::Plain))
             .collect();
         cache.prepare(documents.iter());
         assert_eq!(cache.entries.len(), CACHE_SECTIONS);
-        for (generation, key) in queued.try_iter() {
-            completed
-                .send(Completion {
-                    generation,
-                    key,
-                    lines: vec![Line::from("ready")],
-                })
-                .unwrap();
+        for queued in queued.try_iter() {
+            complete(&completed, queued, Some(vec![Line::from("ready")]));
         }
         assert!(cache.prepare(documents.iter()));
         for _ in 0..3 {
             assert!(!cache.prepare(documents.iter()));
             assert!(queued.try_recv().is_err());
         }
-        assert!(
-            cache
-                .entries
-                .keys()
-                .map(|key| key.source.len())
-                .sum::<usize>()
-                <= CACHE_BYTES
-        );
+        assert!(source_bytes(&cache) <= CACHE_BYTES);
         // Switching the working set still admits a newly visible section.
         cache.prepare(std::iter::once(documents.last().unwrap()));
         assert_eq!(queued.try_iter().count(), 1);
+        // Cloned admitted keys still obey the source byte budget.
+        let (mut cache, _queued, _completed) = queued_cache(CACHE_SECTIONS);
+        let source = "x\n".repeat(MAX_SECTION / 2);
+        let key = CodeKey::admit(&CodeSource::from(source.as_str()), "js").unwrap();
+        cache.schedule(std::iter::repeat_n(key.clone(), CACHE_SECTIONS + 1));
+        assert_eq!(cache.entries.len(), 1);
+        let keys = (0..CACHE_SECTIONS).map(|index| {
+            let text = format!("{index}\n{}", &source[..source.len() - 8]);
+            CodeKey::admit(&CodeSource::from(text.as_str()), "js").unwrap()
+        });
+        cache.schedule(keys);
+        assert!(source_bytes(&cache) <= CACHE_BYTES);
+        assert!(cache.entries.len() < CACHE_SECTIONS);
     }
 
     #[test]
     fn cache_discards_old_sessions_and_reuses_collapsed_sections() {
-        let (sender, receiver) = mpsc::channel();
-        let mut cache = HighlightCache {
-            entries: HashMap::new(),
-            working_set: HashSet::new(),
-            sender: None,
-            receiver,
-            generation: 0,
-            clock: 0,
-            changed_sources: Vec::new(),
-        };
-        let mut document = Document::default();
-        document.code("return 42;", "js", 0, vec![], Role::Plain);
+        // Real completions follow submission; retain both generations in the
+        // fake queue so this exercises late results without inventing a result
+        // for an Unscheduled entry.
+        let (mut cache, _queued, sender) = queued_cache(2);
+        let document = code("return 42;", "js", Role::Plain);
         let key = document.keys().next().unwrap();
         cache.prepare(std::iter::once(&document));
         cache.clear();
         cache.prepare(std::iter::once(&document));
-        sender
-            .send(Completion {
-                generation: 0,
-                key: key.clone(),
-                lines: vec![Line::from("stale")],
-            })
-            .unwrap();
+        let styled = |text| Some(vec![Line::from(text)]);
+        complete(&sender, (0, key.clone()), styled("stale"));
         assert!(!cache.prepare(std::iter::once(&document)));
         assert!(!cache.is_highlighted(&document));
-        sender
-            .send(Completion {
-                generation: 1,
-                key,
-                lines: vec![Line::from("collapsed")],
-            })
-            .unwrap();
+        complete(&sender, (1, key), styled("collapsed"));
         assert!(cache.prepare(std::iter::empty()));
-        let ready = cache.is_highlighted(&document);
-        assert!(ready);
+        assert!(cache.is_highlighted(&document));
         assert!(!cache.prepare(std::iter::once(&document)));
-        assert_eq!(cache.is_highlighted(&document), ready);
+        assert!(cache.is_highlighted(&document));
+        // A completion whose entry was evicted publishes nothing.
+        let (mut cache, queued, completed) = queued_cache(2);
+        let document = code("source", "js", Role::Plain);
+        cache.prepare(std::iter::once(&document));
+        let (generation, key) = queued.try_recv().unwrap();
+        cache.entries.remove(&key);
+        complete(&completed, (generation, key), None);
+        assert!(!cache.poll());
+        assert!(!cache.is_highlighted(&document));
+        assert!(cache.take_changed_sources().is_empty());
     }
 }

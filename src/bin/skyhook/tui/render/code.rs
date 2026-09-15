@@ -1,61 +1,27 @@
 //! Fence metadata for the shared, bounded asynchronous syntax cache.
 //!
-//! Committed Markdown blocks retain their immutable CodeSource allocations. Live
-//! appends only parse the unstable suffix; ordinary prose needs no Markdown pass.
-//! This never runs Syntect on the render thread.
+//! Sources are authoritative replacements. The former append-only checkpoints
+//! had no production producer and are retired; ordinary prose still avoids a
+//! Markdown pass. This never runs Syntect on the render thread.
 use super::super::tool_view::{CodeSource, Document, MAX_SECTION, Role, Section};
-use super::{markdown, model, stream};
+use super::{markdown, model};
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 
 #[derive(Default)]
 pub(super) struct Fences {
     pub document: Document,
-    len: usize,
-    stable_bytes: usize,
-    stable_sections: usize,
-    detected: bool,
-    global: bool,
 }
 
 impl Fences {
-    pub fn update(&mut self, text: &str, append_from: Option<usize>) {
-        let append = append_from == Some(self.len) && self.len <= text.len();
-        if append && self.len == text.len() {
-            return;
-        }
-        if !append {
-            *self = Self::default();
-        }
-        let from = self.len;
-        self.len = text.len();
-        self.global |= text[from..]
-            .chars()
-            .any(|c| matches!(c, '[' | ']' | '<' | '>') || (c.is_control() && c != '\n'));
-        // Include two previous bytes to catch a delimiter arriving one character
-        // at a time. Byte windows need not start at a UTF-8 character boundary.
-        self.detected |= text.as_bytes()[from.saturating_sub(2)..]
+    pub fn update(&mut self, text: &str) {
+        self.document.sections.clear();
+        if text
+            .as_bytes()
             .windows(3)
-            .any(|s| s == b"```" || s == b"~~~");
-        if !self.detected {
-            return;
+            .any(|s| s == b"```" || s == b"~~~")
+        {
+            collect(text, &mut self.document);
         }
-        if self.global {
-            self.stable_bytes = 0;
-            self.stable_sections = 0;
-        }
-        self.document.sections.truncate(self.stable_sections);
-        let suffix = &text[self.stable_bytes..];
-        let boundary = if self.global {
-            0
-        } else {
-            stream::stable_boundary(suffix)
-        };
-        if boundary > 0 {
-            collect(&suffix[..boundary], &mut self.document);
-            self.stable_bytes += boundary;
-            self.stable_sections = self.document.sections.len();
-        }
-        collect(&suffix[boundary..], &mut self.document);
     }
 }
 
@@ -85,7 +51,7 @@ fn collect(text: &str, document: &mut Document) {
                         source: CodeSource::from(source.as_str()),
                         language,
                         indent: 0,
-                        gutters: Vec::new(),
+                        gutters: Default::default(),
                         role: Role::Plain,
                     });
                 }
@@ -98,137 +64,115 @@ fn collect(text: &str, document: &mut Document) {
 #[cfg(test)]
 mod tests {
     use super::super::super::tool_view::HighlightCache;
-    use super::super::{Palette, stream::StreamLayout};
+    use super::super::{Palette, stream};
     use super::*;
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
 
     fn complete(cache: &mut HighlightCache, document: &Document) {
         cache.prepare(std::iter::once(document));
-        let expected: std::collections::HashSet<_> = document.highlight_sources().collect();
-        let mut completed = std::collections::HashSet::new();
-        let start = std::time::Instant::now();
-        loop {
-            cache.poll();
-            completed.extend(cache.take_changed_sources());
-            if expected.is_subset(&completed) {
-                break;
-            }
+        let expected: HashSet<_> = document.highlight_sources().collect();
+        let mut completed = HashSet::new();
+        let start = Instant::now();
+        while !expected.is_subset(&completed) {
             assert!(
-                start.elapsed() < std::time::Duration::from_secs(5),
+                start.elapsed() < Duration::from_secs(5),
                 "highlight worker timed out"
             );
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(Duration::from_millis(2));
+            cache.poll();
+            completed.extend(cache.take_changed_sources());
         }
     }
 
     fn text(rows: &[markdown::LayoutLine]) -> Vec<(String, bool)> {
-        rows.iter()
-            .filter(|row| !row.layout.decorative)
-            .map(|row| (row.line.to_string(), row.continued))
+        let rows = rows.iter().filter(|row| !row.layout.decorative());
+        rows.map(|row| (row.line.to_string(), row.layout.continued()))
+            .collect()
+    }
+
+    fn fence_metadata(fences: &Fences) -> Vec<(&str, &str)> {
+        let sections = fences.document.sections.iter();
+        sections
+            .map(|section| {
+                let Section::Code {
+                    source, language, ..
+                } = section
+                else {
+                    panic!("only code metadata")
+                };
+                (language.as_str(), source.as_ref())
+            })
             .collect()
     }
 
     #[test]
-    fn streamed_fence_metadata_matches_saved_at_every_character() {
-        for source in [
-            "Prose\n\n```rust extra\nlet café = 42;  \n\n```\n\nTail\n\n~~~python\nprint('yes')\n~~~\n",
-            "> ```js\n> const x = true;\n> ```\n\n- ```sh\n  echo hi\n  ```\n",
-            "```unknown\nvalue\n```\n\n```\nnot labelled\n```\n\n    indented\n",
-            "```rust\nlet x = \u{1b}[31m42;\n```\n",
+    fn replacement_fence_metadata_preserves_named_nested_and_cleaned_sources() {
+        for (source, expected) in [
+            (
+                "Prose\n\n```rust extra\nlet café = 42;  \n\n```\n\nTail\n\n~~~python\nprint('yes')\n~~~\n",
+                &[
+                    ("rust", "let café = 42;  \n\n"),
+                    ("python", "print('yes')\n"),
+                ][..],
+            ),
+            (
+                "> ```js\n> const x = true;\n> ```\n\n- ```sh\n  echo hi\n  ```\n",
+                &[("js", "const x = true;\n"), ("sh", "echo hi\n")],
+            ),
+            (
+                "```unknown\nvalue\n```\n\n```\nnot labelled\n```\n\n    indented\n",
+                &[("unknown", "value\n")],
+            ),
+            // Cleaning removes control characters, not ANSI sequences: ESC is
+            // removed while the printable suffix remains.
+            (
+                "```rust\nlet x = \u{1b}[31m42;\n```\n",
+                &[("rust", "let x = [31m42;\n")],
+            ),
         ] {
-            let mut live = Fences::default();
-            let mut previous = 0;
-            for end in source.char_indices().map(|(i, ch)| i + ch.len_utf8()) {
-                live.update(&source[..end], Some(previous));
-                let mut saved = Fences::default();
-                saved.update(&source[..end], None);
-                assert_eq!(live.document, saved.document, "{end}: {:?}", &source[..end]);
-                previous = end;
-            }
+            let mut fences = Fences::default();
+            fences.update(source);
+            assert_eq!(fence_metadata(&fences), expected);
+        }
+        // Oversized sources and ordinary prose clear old metadata.
+        let mut fences = Fences::default();
+        fences.update("```rust\nlet x = 42;\n```\n\nPlain tail\n");
+        assert_eq!(fences.document.sections.len(), 1);
+        for source in [
+            format!("```rust\n{}\n```", "x".repeat(MAX_SECTION + 1)),
+            "Ordinary prose without a code fence".into(),
+        ] {
+            fences.update(&source);
+            assert!(fences.document.sections.is_empty());
         }
     }
 
     #[test]
-    fn committed_fence_sources_are_shared_and_oversized_sources_not_admitted() {
-        let mut fences = Fences::default();
-        let mut source = "```rust\nlet x = 42;\n```\n\nPlain tail\n".to_owned();
-        fences.update(&source, None);
-        assert!(fences.stable_bytes > 0);
-        let Section::Code { source: first, .. } = &fences.document.sections[0] else {
-            panic!()
-        };
-        let original = first.clone();
-        let old = source.len();
-        source.push_str("more text\n");
-        fences.update(&source, Some(old));
-        let Section::Code { source: first, .. } = &fences.document.sections[0] else {
-            panic!()
-        };
-        assert_eq!(
-            first.as_ptr(),
-            original.as_ptr(),
-            "committed source must not be copied or rehashed"
-        );
-
-        fences.update(
-            &format!("```rust\n{}\n```", "x".repeat(MAX_SECTION + 1)),
-            None,
-        );
-        assert!(fences.document.sections.is_empty());
-        fences.update("Ordinary prose without a code fence", None);
-        assert!(!fences.detected);
-        assert!(fences.document.sections.is_empty());
-    }
-
-    #[test]
-    fn async_saved_and_live_fences_preserve_layout() {
+    fn async_fence_completion_preserves_full_layout() {
         let mut cache = HighlightCache::default();
-        let mut source = String::new();
+        let source =
+            "Prose\n\n```rust\nlet value = (true, 42, \"hello\");  \n\n// comment\n```\n\nTail";
         let mut fences = Fences::default();
-        let mut stream = StreamLayout::default();
-        let mut rows = Vec::new();
-        let chunks = [
-            "Prose\n\n```rust\n",
-            "let value = (true, 42, \"hello\");  \n",
-            "\n// comment\n",
-            "```\n\nTail",
-        ];
+        fences.update(source);
         let p = Palette::new();
-        for chunk in chunks {
-            let old = source.len();
-            source.push_str(chunk);
-            fences.update(&source, Some(old));
-            if let Some((at, suffix)) =
-                stream.update_highlighted(&source, 18, p, Some(old), "↳ ", Some(&cache))
-            {
-                rows.truncate(at);
-                rows.extend(suffix);
-            }
-        }
-        let fallback = text(&rows);
+        let fallback = text(&stream::layout_highlighted(
+            source,
+            18,
+            p,
+            "↳ ",
+            Some(&cache),
+        ));
         complete(&mut cache, &fences.document);
-        // Completion invalidates the owning entry, including committed blocks.
-        let (at, live) = stream
-            .update_highlighted(&source, 18, p, None, "↳ ", Some(&cache))
-            .unwrap();
-        assert_eq!(at, 0);
+        // Completion invalidates the owning entry; text, geometry and token roles follow.
+        let live = stream::layout_highlighted(source, 18, p, "↳ ", Some(&cache));
         assert_eq!(text(&live), fallback);
-        let (_, saved) = StreamLayout::default()
-            .update_highlighted(&source, 18, p, None, "↳ ", Some(&cache))
-            .unwrap();
-        assert_eq!(live, saved);
-        let colors: std::collections::HashSet<_> = live
-            .iter()
-            .flat_map(|row| &row.line.spans)
-            .filter_map(|s| s.style.fg)
-            .collect();
+        let spans: Vec<_> = live.iter().flat_map(|row| &row.line.spans).collect();
+        let colors: HashSet<_> = spans.iter().filter_map(|s| s.style.fg).collect();
         assert!(
             colors.len() >= 3,
             "named fences should have distinct token roles: {colors:?}"
         );
-        assert!(
-            live.iter()
-                .flat_map(|row| &row.line.spans)
-                .all(|s| s.style.bg.is_none())
-        );
+        assert!(spans.iter().all(|s| s.style.bg.is_none()));
     }
 }

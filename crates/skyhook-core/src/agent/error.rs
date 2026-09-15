@@ -26,6 +26,8 @@ pub enum HarnessError {
     Execution(#[from] ExecutionError),
     #[error(transparent)]
     Job(#[from] JobError),
+    #[error(transparent)]
+    Queue(#[from] crate::agent::QueueConflict),
     #[error("a default model profile is required")]
     MissingDefaultModelProfile,
     #[error("unknown provider `{0}`")]
@@ -54,8 +56,6 @@ pub enum HarnessError {
     UnsupportedImage,
     #[error("model `{0}` does not support image inputs")]
     ImagesUnsupported(String),
-    #[error("path is outside the workspace")]
-    OutsideWorkspace,
     #[error("harness initialization failed: {0}")]
     Initialization(String),
 }

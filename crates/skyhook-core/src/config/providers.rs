@@ -1,190 +1,150 @@
 //! Native provider construction. Model names are passed through unchanged.
-//! Backend-specific settings are resolved here, never by the agent runtime.
+//! Raw TOML DTOs are admitted without credential or process effects.
 
 use std::{env, sync::Arc, time::Duration};
 
+use super::{ConfigError, ProviderConfig};
 use crate::provider::{
     Provider, ProviderTimeouts,
-    backends::{OpenAiApi, anthropic_api, codex::CodexProvider, openai_compatible},
+    backends::{NativeSettings, OpenAiApi, Protocol, codex::CodexProvider},
 };
 
-use super::{ConfigError, ProviderConfig};
+/// No public fields or constructors: each value owns exactly one validated auth
+/// source. Environment lookup and shell execution are deliberately not admission.
+#[derive(Clone)]
+pub(super) enum AuthSource {
+    None,
+    Environment(String),
+    Command(String),
+}
 
-/// Structural checks shared by resolution, without constructing a provider or
-/// looking up its environment variables/OAuth state.
-pub(super) fn validate(name: &str, config: &ProviderConfig) -> Result<(), ConfigError> {
-    let (base_url, environment, command, startup, idle) = match config {
-        ProviderConfig::Openai {
-            base_url,
-            api,
-            chat_reasoning_replay,
-            api_key_env,
-            api_key_command,
-            startup_timeout_secs,
-            read_idle_timeout_secs,
-        } => {
-            if *api != OpenAiApi::ChatCompletions && chat_reasoning_replay.is_some() {
-                return Err(ConfigError::Provider(name.into(),
-                    "chat_reasoning_replay applies only to Chat Completions; Responses replays native reasoning automatically".into()));
+impl AuthSource {
+    fn new(
+        name: &str,
+        environment: Option<&str>,
+        command: Option<&str>,
+    ) -> Result<Self, ConfigError> {
+        let invalid = |message: &str| ConfigError::Provider(name.into(), message.into());
+        match (environment, command) {
+            (Some(_), Some(_)) => Err(invalid(
+                "api_key_env and api_key_command are mutually exclusive",
+            )),
+            (_, Some(command)) if command.trim().is_empty() => {
+                Err(invalid("api_key_command must not be blank"))
             }
-            (
+            (Some(environment), _)
+                if environment.trim().is_empty() || environment.contains(['=', '\0']) =>
+            {
+                Err(invalid(
+                    "api_key_env must name a nonempty environment variable",
+                ))
+            }
+            (Some(environment), None) => Ok(Self::Environment(environment.into())),
+            (None, Some(command)) => Ok(Self::Command(command.into())),
+            (None, None) => Ok(Self::None),
+        }
+    }
+}
+
+/// Live construction consumes settings whose syntax and applicability have
+/// already been proven. Codex keeps its existing auth/context lifecycle.
+#[derive(Clone)]
+pub(super) enum ValidatedProvider {
+    Native {
+        settings: NativeSettings,
+        auth: AuthSource,
+    },
+    Codex,
+}
+
+impl ValidatedProvider {
+    pub(super) fn new(name: &str, config: &ProviderConfig) -> Result<Self, ConfigError> {
+        let (base, protocol, environment, command, startup, idle) = match config {
+            ProviderConfig::Openai {
+                base_url,
+                api,
+                chat_reasoning_replay,
+                api_key_env,
+                api_key_command,
+                startup_timeout_secs,
+                read_idle_timeout_secs,
+            } => {
+                let protocol = match api {
+                    OpenAiApi::ChatCompletions => Protocol::Chat {
+                        reasoning_replay: chat_reasoning_replay.unwrap_or_default(),
+                    },
+                    OpenAiApi::Responses => {
+                        if chat_reasoning_replay.is_some() {
+                            return Err(ConfigError::Provider(name.into(),
+                                "chat_reasoning_replay applies only to Chat Completions; Responses replays native reasoning automatically".into()));
+                        }
+                        Protocol::Responses
+                    }
+                };
+                (
+                    base_url,
+                    protocol,
+                    api_key_env,
+                    api_key_command,
+                    startup_timeout_secs,
+                    read_idle_timeout_secs,
+                )
+            }
+            ProviderConfig::Anthropic {
                 base_url,
                 api_key_env,
                 api_key_command,
                 startup_timeout_secs,
                 read_idle_timeout_secs,
-            )
-        }
-        ProviderConfig::Anthropic {
-            base_url,
-            api_key_env,
-            api_key_command,
-            startup_timeout_secs,
-            read_idle_timeout_secs,
-        } => (
-            base_url,
-            api_key_env,
-            api_key_command,
-            startup_timeout_secs,
-            read_idle_timeout_secs,
-        ),
-        ProviderConfig::Codex {} => return Ok(()),
-    };
-    validate_auth(name, environment.as_deref(), command.as_deref())?;
-    timeouts(name, *startup, *idle)?;
-    let url = reqwest::Url::parse(base_url).map_err(|_| {
-        ConfigError::Provider(
-            name.into(),
-            "base_url must be an absolute HTTP(S) API-root URL".into(),
-        )
-    })?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(ConfigError::Provider(
-            name.into(),
-            "base_url must be HTTP(S), without credentials, query, or fragment".into(),
-        ));
+            } => (
+                base_url,
+                Protocol::Anthropic,
+                api_key_env,
+                api_key_command,
+                startup_timeout_secs,
+                read_idle_timeout_secs,
+            ),
+            ProviderConfig::Codex {} => return Ok(Self::Codex),
+        };
+        let auth = AuthSource::new(name, environment.as_deref(), command.as_deref())?;
+        let defaults = ProviderTimeouts::default();
+        let timeouts = ProviderTimeouts {
+            startup: startup.map(Duration::from_secs).unwrap_or(defaults.startup),
+            read_idle: idle.map(Duration::from_secs).unwrap_or(defaults.read_idle),
+        };
+        let settings = NativeSettings::new(base, protocol, timeouts)
+            .map_err(|error| ConfigError::Provider(name.into(), error.message))?;
+        Ok(Self::Native { settings, auth })
     }
-    Ok(())
-}
 
-pub(super) fn build(name: &str, config: &ProviderConfig) -> Result<Arc<dyn Provider>, ConfigError> {
-    let error = |error: crate::provider::ProviderError| {
-        ConfigError::Provider(name.to_owned(), error.to_string())
-    };
-    match config {
-        ProviderConfig::Openai {
-            base_url,
-            api,
-            api_key_env,
-            api_key_command,
-            chat_reasoning_replay,
-            startup_timeout_secs,
-            read_idle_timeout_secs,
-        } => {
-            if *api != OpenAiApi::ChatCompletions && chat_reasoning_replay.is_some() {
-                return Err(ConfigError::Provider(name.into(),
-                    "chat_reasoning_replay applies only to Chat Completions; Responses replays native reasoning automatically".into()));
+    pub(super) fn build(self, name: &str) -> Result<Arc<dyn Provider>, ConfigError> {
+        let error = |error: crate::provider::ProviderError| {
+            ConfigError::Provider(name.into(), error.to_string())
+        };
+        match self {
+            Self::Native { settings, auth } => {
+                // Environment credentials retain build-time lookup. Commands
+                // retain lazy invocation-time resolution/cache/cancellation.
+                let key = match &auth {
+                    AuthSource::Environment(variable) => Some(required_env(variable)?),
+                    AuthSource::None | AuthSource::Command(_) => None,
+                };
+                let mut provider = settings.build(name, key).map_err(error)?;
+                if let AuthSource::Command(command) = auth {
+                    provider = provider.with_api_key_command(command).map_err(error)?;
+                }
+                Ok(Arc::new(provider))
             }
-            let key = api_key(name, api_key_env.as_deref(), api_key_command.as_deref())?;
-            let timeouts = timeouts(name, *startup_timeout_secs, *read_idle_timeout_secs)?;
-            let mut provider = openai_compatible(name, base_url, *api, key)
-                .map_err(error)?
-                .with_timeouts(timeouts)
-                .with_chat_reasoning_replay(chat_reasoning_replay.unwrap_or_default());
-            if let Some(command) = api_key_command {
-                provider = provider.with_api_key_command(command.clone());
-            }
-            Ok(Arc::new(provider))
+            Self::Codex => Ok(Arc::new(
+                CodexProvider::new().map_err(error)?.with_name(name),
+            )),
         }
-        ProviderConfig::Anthropic {
-            base_url,
-            api_key_env,
-            api_key_command,
-            startup_timeout_secs,
-            read_idle_timeout_secs,
-        } => {
-            let key = api_key(name, api_key_env.as_deref(), api_key_command.as_deref())?;
-            let timeouts = timeouts(name, *startup_timeout_secs, *read_idle_timeout_secs)?;
-            let mut provider = anthropic_api(name, base_url, key)
-                .map_err(error)?
-                .with_timeouts(timeouts);
-            if let Some(command) = api_key_command {
-                provider = provider.with_api_key_command(command.clone());
-            }
-            Ok(Arc::new(provider))
-        }
-        ProviderConfig::Codex {} => Ok(Arc::new(
-            CodexProvider::new().map_err(error)?.with_name(name),
-        )),
     }
 }
 
-fn timeouts(
-    name: &str,
-    startup_secs: Option<u64>,
-    read_idle_secs: Option<u64>,
-) -> Result<ProviderTimeouts, ConfigError> {
-    let defaults = ProviderTimeouts::default();
-    let timeouts = ProviderTimeouts {
-        startup: startup_secs
-            .map(Duration::from_secs)
-            .unwrap_or(defaults.startup),
-        read_idle: read_idle_secs
-            .map(Duration::from_secs)
-            .unwrap_or(defaults.read_idle),
-    };
-    if [timeouts.startup, timeouts.read_idle]
-        .into_iter()
-        .any(|value| value.is_zero() || std::time::Instant::now().checked_add(value).is_none())
-    {
-        return Err(ConfigError::Provider(
-            name.into(),
-            "startup_timeout_secs and read_idle_timeout_secs must be positive, representable durations".into(),
-        ));
-    }
-    Ok(timeouts)
-}
-
-/// Validate without executing commands, including for currently unused providers.
-fn api_key(
-    provider: &str,
-    environment: Option<&str>,
-    command: Option<&str>,
-) -> Result<Option<String>, ConfigError> {
-    validate_auth(provider, environment, command)?;
-    environment.map(required_env).transpose()
-}
-
-fn validate_auth(
-    provider: &str,
-    environment: Option<&str>,
-    command: Option<&str>,
-) -> Result<(), ConfigError> {
-    if environment.is_some() && command.is_some() {
-        return Err(ConfigError::Provider(
-            provider.to_owned(),
-            "api_key_env and api_key_command are mutually exclusive".to_owned(),
-        ));
-    }
-    if command.is_some_and(|command| command.trim().is_empty()) {
-        return Err(ConfigError::Provider(
-            provider.to_owned(),
-            "api_key_command must not be blank".to_owned(),
-        ));
-    }
-    if environment.is_some_and(|name| name.trim().is_empty() || name.contains(['=', '\0'])) {
-        return Err(ConfigError::Provider(
-            provider.to_owned(),
-            "api_key_env must name a nonempty environment variable".to_owned(),
-        ));
-    }
-    Ok(())
+#[cfg(test)]
+fn build(name: &str, config: &ProviderConfig) -> Result<Arc<dyn Provider>, ConfigError> {
+    ValidatedProvider::new(name, config)?.build(name)
 }
 
 fn required_env(name: &str) -> Result<String, ConfigError> {
@@ -211,9 +171,22 @@ max_context = 4096
 max_output = 512
 "#;
 
-    #[test]
-    fn provider_replay_defaults_to_reasoning_content_and_can_override_or_disable() {
-        let config: Config = toml::from_str(LOCAL).unwrap();
+    fn with_replay(value: &str) -> String {
+        let replay = format!("chat_reasoning_replay = \"{value}\"\n[models.local]");
+        LOCAL.replace("[models.local]", &replay)
+    }
+
+    fn builds(text: &str) -> bool {
+        let config: Config = toml::from_str(text).unwrap();
+        config
+            .into_runtime()
+            .and_then(|runtime| runtime.select_model("local")?.harness_builder("."))
+            .is_ok()
+    }
+
+    fn chat_replay(text: &str) -> Option<ChatReasoningReplay> {
+        assert!(builds(text));
+        let config: Config = toml::from_str(text).unwrap();
         let ProviderConfig::Openai {
             chat_reasoning_replay,
             ..
@@ -221,60 +194,34 @@ max_output = 512
         else {
             panic!("expected OpenAI provider");
         };
-        assert_eq!(
-            chat_reasoning_replay.unwrap_or_default(),
-            ChatReasoningReplay::ReasoningContent
-        );
-        assert!(config.harness_builder(".", "local").is_ok());
+        chat_reasoning_replay
+    }
+
+    #[test]
+    fn provider_replay_defaults_to_reasoning_content_and_can_override_or_disable() {
+        let default = chat_replay(LOCAL).unwrap_or_default();
+        assert_eq!(default, ChatReasoningReplay::ReasoningContent);
         for (value, expected) in [
             ("reasoning_content", ChatReasoningReplay::ReasoningContent),
             ("reasoning", ChatReasoningReplay::Reasoning),
             ("unsupported", ChatReasoningReplay::Unsupported),
         ] {
-            let configured = LOCAL.replace(
-                "[models.local]",
-                &format!("chat_reasoning_replay = \"{value}\"\n[models.local]"),
-            );
-            let config: Config = toml::from_str(&configured).unwrap();
-            let ProviderConfig::Openai {
-                chat_reasoning_replay,
-                ..
-            } = config.providers["local"]
-            else {
-                panic!("expected OpenAI provider");
-            };
-            assert_eq!(chat_reasoning_replay, Some(expected));
-            assert!(config.harness_builder(".", "local").is_ok());
+            assert_eq!(chat_replay(&with_replay(value)), Some(expected));
         }
     }
 
     #[test]
     fn replay_is_provider_scoped_and_only_configurable_for_chat() {
-        let bad_value = LOCAL.replace(
-            "[models.local]",
-            "chat_reasoning_replay = \"guess\"\n[models.local]",
-        );
-        assert!(toml::from_str::<Config>(&bad_value).is_err());
+        assert!(toml::from_str::<Config>(&with_replay("guess")).is_err());
         let on_model = format!("{LOCAL}\nchat_reasoning_replay = \"reasoning\"\n");
         assert!(
             toml::from_str::<Config>(&on_model).is_err(),
             "model-level policy must not be silently ignored"
         );
-        let wrong_api = LOCAL
-            .replace(
-                "[models.local]",
-                "chat_reasoning_replay = \"reasoning\"\n[models.local]",
-            )
-            .replace("api = \"chat_completions\"", "api = \"responses\"");
-        let config: Config = toml::from_str(&wrong_api).unwrap();
-        assert!(config.harness_builder(".", "local").is_err());
-        let native = LOCAL.replace("api = \"chat_completions\"", "api = \"responses\"");
-        let config: Config = toml::from_str(&native).unwrap();
-        assert!(config.harness_builder(".", "local").is_ok());
-    }
-
-    #[test]
-    fn unrelated_provider_kinds_reject_the_chat_selector() {
+        let responses =
+            |text: &str| text.replace("api = \"chat_completions\"", "api = \"responses\"");
+        assert!(!builds(&responses(&with_replay("reasoning"))));
+        assert!(builds(&responses(LOCAL)));
         for provider in [
             "kind = \"anthropic\"\nbase_url = \"https://api.anthropic.com/v1\"",
             "kind = \"codex\"",
@@ -324,13 +271,19 @@ max_output = 512
     }
 
     #[test]
-    fn credential_sources_are_exclusive_and_blank_commands_are_rejected() {
-        for config in native_configs(
-            "api_key_env = 'SKYHOOK_TEST_MISSING_API_KEY'\napi_key_command = 'echo secret'",
-        ) {
-            let error = build("test", &config).err().unwrap().to_string();
-            assert!(error.contains("mutually exclusive"), "{error}");
-            assert!(!error.contains("echo secret"));
+    fn credential_sources_are_exclusive_blank_commands_rejected_and_kept_out_of_errors() {
+        let exclusive =
+            "api_key_env = 'SKYHOOK_TEST_MISSING_API_KEY'\napi_key_command = 'secret-marker'";
+        for config in native_configs(exclusive) {
+            let admitted = ValidatedProvider::new("vendor", &config).map(|_| ());
+            let built = build("test", &config).map(|_| ());
+            for error in [
+                admitted.unwrap_err().to_string(),
+                built.unwrap_err().to_string(),
+            ] {
+                assert!(error.contains("mutually exclusive"), "{error}");
+                assert!(!error.contains("secret-marker"));
+            }
         }
         for config in native_configs("api_key_command = '   '") {
             let error = build("test", &config).err().unwrap().to_string();
@@ -350,22 +303,33 @@ max_output = 512
                 Err(ConfigError::MissingEnvironment(_))
             ));
         }
-        assert!(
-            toml::from_str::<ProviderConfig>("kind = 'codex'\napi_key_command = 'echo key'")
-                .is_err()
-        );
+        let codex = "kind = 'codex'\napi_key_command = 'echo key'";
+        assert!(toml::from_str::<ProviderConfig>(codex).is_err());
     }
 
     #[test]
     fn timeout_defaults_overrides_and_validation() {
-        let defaults = timeouts("local", None, None).unwrap();
-        assert_eq!(defaults.startup, Duration::from_secs(600));
-        assert_eq!(defaults.read_idle, Duration::from_secs(600));
-        let custom = timeouts("local", Some(180), Some(300)).unwrap();
-        assert_eq!(custom.startup, Duration::from_secs(180));
-        assert_eq!(custom.read_idle, Duration::from_secs(300));
-        assert!(timeouts("local", Some(0), None).is_err());
-        assert!(timeouts("local", None, Some(0)).is_err());
-        assert!(timeouts("local", Some(u64::MAX), None).is_err());
+        // Exercise sealed admission without creating a client or resolving credentials.
+        let timeouts = |startup_timeout_secs, read_idle_timeout_secs| {
+            let config = ProviderConfig::Anthropic {
+                base_url: "https://example.com/v1".into(),
+                api_key_env: None,
+                api_key_command: None,
+                startup_timeout_secs,
+                read_idle_timeout_secs,
+            };
+            match ValidatedProvider::new("local", &config)? {
+                ValidatedProvider::Native { settings, .. } => {
+                    let timeouts = settings.timeouts();
+                    Ok::<_, ConfigError>((timeouts.startup.as_secs(), timeouts.read_idle.as_secs()))
+                }
+                ValidatedProvider::Codex => unreachable!("native fixture"),
+            }
+        };
+        assert_eq!(timeouts(None, None).unwrap(), (600, 600));
+        assert_eq!(timeouts(Some(180), Some(300)).unwrap(), (180, 300));
+        for (startup, read_idle) in [(Some(0), None), (None, Some(0)), (Some(u64::MAX), None)] {
+            assert!(timeouts(startup, read_idle).is_err());
+        }
     }
 }

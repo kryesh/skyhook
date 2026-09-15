@@ -106,8 +106,7 @@ state; it is not cumulative usage. Missing context data appears as `—`.
 
 ## Keyboard and mouse
 
-The shortcuts below are defaults; configurable actions use your overrides in the command palette
-and `/help`. `Ctrl+X` is a leader: release it, then press the next key when ready, or `Esc` to cancel.
+The command palette and `/help` also list these shortcuts. `Ctrl+X` is a leader: release it, then press the next key when ready, or `Esc` to cancel.
 
 | Shortcut | Action |
 | --- | --- |
@@ -117,6 +116,7 @@ and `/help`. `Ctrl+X` is a leader: release it, then press the next key when read
 | `Ctrl+X A` | Agent picker |
 | `Ctrl+X I`, `/queue` | Edit queued follow-ups |
 | `Ctrl+X T`, `/details` | Toggle tool details |
+| `Ctrl+X F`, `@` | Attach a workspace file |
 | `Ctrl+X R`, `/attention` | Reopen pending questions and permissions |
 | `/requests`, `/jobs` | Requests, jobs |
 | `Ctrl+X ↑`, `Ctrl+X ↓` | Parent, first child |
@@ -154,12 +154,12 @@ Selection supports parts of a line and multiple lines; copying preserves Unicode
 without adding newlines at visual wraps.
 The workspace path is centered in the top bar. The bottom bar shows the model ID, session ID,
 and token statistics. These are plain text; use the terminal emulator’s selection gesture
-(usually Shift-drag) and copy shortcut. Copy uses the terminal's OSC 52 clipboard support. `@` attaches a workspace file; `/attach`
-adds an image. Pastes longer than 12 lines and attached file contents appear as inline items
-at the cursor. Type before, between, or after multiple paste items; move across, select, delete,
-and undo them as single editing units. Sending or copying expands their original contents in
-place. Shorter pastes remain ordinary editable text. Use `/attachments` to inspect or remove
-paste items and images.
+(usually Shift-drag) and copy shortcut. Copy uses the terminal's OSC 52 clipboard support. `@` or `Ctrl+X F` attaches a workspace file
+(press `Esc` to keep a typed `@`): image files attach as images and other files as text.
+Attachments are listed below the composer, and attached text is sent after the message. Pastes longer than 12 lines appear as inline items at the cursor. Type
+before, between, or after multiple paste items; move across, select, delete, and undo them as
+single editing units. Sending or copying expands their original contents in place. Shorter pastes
+remain ordinary editable text. Use `/attachments` to inspect or remove pasted items and attachments.
 Questions and permissions open even while inspecting the agent tree or
 conversation; open menus and search keep input focus until closed. `Esc` dismisses foreground
 questions and permissions without answering them; reopen pending requests with `Ctrl+X R`
@@ -182,23 +182,6 @@ Question choices are suggestions: you can select one, optionally add a comment, 
 a free-form answer. A suggestion without a non-whitespace comment returns its label as a string;
 with a comment it returns `{"answer": "selected label", "comment": "user text"}`. Free-form
 answers remain strings.
-
-Optional settings live in `$XDG_CONFIG_HOME/skyhook/tui.toml` (or `~/.config/skyhook/tui.toml`):
-
-Theme removal is a clean break: the interface always uses the dark palette. When upgrading,
-remove the old top-level `theme` setting and any `themes` entry from `[keybinds]`;
-these are no longer recognized and will cause a configuration error. Also remove the old example's `inspect = "ctrl+x i"`
-override to use the new queue shortcut. To retain that custom focus-conversation binding,
-assign `queue` another shortcut or set `queue = "none"` to avoid a conflict. `Ctrl+X T`
-now toggles tool details by default.
-
-```toml
-[keybinds]
-model = "ctrl+x m"
-queue = "ctrl+x i"
-details = "ctrl+x t"
-# Disable an action binding with "none". /help lists available actions.
-```
 
 See [sessions and context](sessions-and-context.md) for compaction and persistence,
 and the [CLI reference](../reference/cli.md) for startup options.

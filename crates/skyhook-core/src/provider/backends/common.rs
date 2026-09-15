@@ -1,10 +1,12 @@
 //! Shared model-facing input conversion and opaque reasoning provenance.
 use crate::{
     job::omit_null_fields,
-    media::ImageReference,
-    provider::{ProviderError, ProviderErrorKind, protocol::ToolResult},
+    media::{ImageRef, MediaError, TextRef},
+    provider::{
+        ProviderError, ProviderErrorKind,
+        protocol::{ModelRequest, ToolResult},
+    },
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 
 pub(crate) fn invalid(message: impl Into<String>) -> ProviderError {
@@ -15,44 +17,34 @@ pub(crate) fn invalid(message: impl Into<String>) -> ProviderError {
     }
 }
 
-fn image_data(image: &ImageReference) -> Result<&str, ProviderError> {
-    if !matches!(
-        image.media_type.as_str(),
-        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-    ) {
-        return Err(invalid(format!(
-            "unsupported image media type: {}",
-            image.media_type
-        )));
-    }
-    let data = image
-        .data_base64
-        .as_deref()
-        .ok_or_else(|| invalid(format!("image {} has no request-local payload", image.name)))?;
-    let decoded = STANDARD
-        .decode(data)
-        .map_err(|_| invalid(format!("image {} has invalid base64", image.name)))?;
-    if decoded.is_empty() || decoded.len() as u64 != image.bytes {
-        return Err(invalid(format!(
-            "image {} payload does not match its byte length",
-            image.name
-        )));
-    }
-    Ok(data)
+fn blob_error(error: MediaError) -> ProviderError {
+    invalid(format!("attachment: {error}"))
 }
 
-pub(crate) fn image_url(image: &ImageReference) -> Result<String, ProviderError> {
-    Ok(format!(
-        "data:{};base64,{}",
-        image.media_type,
-        image_data(image)?
-    ))
+pub(crate) fn image_url(request: &ModelRequest, image: &ImageRef) -> Result<String, ProviderError> {
+    let data = request.blobs.base64(&image.blob).map_err(blob_error)?;
+    Ok(format!("data:{};base64,{data}", image.format.media_type()))
 }
 
-pub(crate) fn anthropic_image(image: &ImageReference) -> Result<Value, ProviderError> {
-    Ok(
-        json!({"type":"image", "source":{"type":"base64", "media_type":image.media_type, "data":image_data(image)?}}),
-    )
+pub(crate) fn anthropic_image(
+    request: &ModelRequest,
+    image: &ImageRef,
+) -> Result<Value, ProviderError> {
+    let data = request.blobs.base64(&image.blob).map_err(blob_error)?;
+    Ok(json!({"type":"image", "source":{"type":"base64",
+        "media_type":image.format.media_type(), "data":data}}))
+}
+
+/// Attached text as the model sees it: its source file, if any, then the content.
+pub(crate) fn attachment_text(
+    request: &ModelRequest,
+    text: &TextRef,
+) -> Result<String, ProviderError> {
+    let content = request.blobs.text(text).map_err(blob_error)?;
+    Ok(match &text.file {
+        Some(file) => format!("File: {file}\n{content}"),
+        None => content.to_owned(),
+    })
 }
 
 pub(crate) fn tool_text(tool: &ToolResult) -> String {
@@ -102,7 +94,7 @@ pub(crate) fn filter_reasoning_scope(
     scope: &str,
 ) {
     use crate::provider::protocol::Message;
-    for message in &mut request.messages {
+    for message in request.messages_mut() {
         if let Message::Assistant(items) = message {
             for item in items {
                 if item
@@ -135,6 +127,47 @@ pub(crate) fn bind_reasoning_scope(
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::media::{BlobRef, ImageFormat};
+    use crate::provider::protocol::{
+        AssistantBlock, AssistantItem, BlockContent, Message, ModelRequest, ResponseChunk, ToolCall,
+    };
+
+    #[test]
+    fn replay_binding_and_filtering_include_text_tool_and_late_enrichment() {
+        let call = ToolCall::new("call", "lookup", json!({})).unwrap();
+        let items = [
+            AssistantItem::text("text", 0, "visible"),
+            AssistantItem::reasoning("reasoning", 1, "summary", None),
+            AssistantItem::tool_call("tool", 2, call),
+        ];
+        for mut item in items {
+            for update in [false, true] {
+                let replay = reasoning_envelope("responses", "model", json!({"opaque":[1,null]}));
+                let id = item.id.clone();
+                let mut chunk = if update {
+                    ResponseChunk::ItemReplayUpdated { id, replay }
+                } else {
+                    let replay = Some(replay);
+                    ResponseChunk::ItemEnded { id, replay }
+                };
+                bind_reasoning_scope(&mut chunk, "expected");
+                item.replay = match chunk {
+                    ResponseChunk::ItemEnded { replay, .. } => replay,
+                    ResponseChunk::ItemReplayUpdated { replay, .. } => Some(replay),
+                    _ => unreachable!(),
+                };
+                assert!(opaque_payload(&item.replay, "responses", "model").is_some());
+                let mut request = request("model");
+                request.history = vec![Message::Assistant(vec![item.clone()])];
+                filter_reasoning_scope(&mut request, "foreign");
+                let Message::Assistant(filtered) = &request.history[0] else {
+                    unreachable!()
+                };
+                assert!(filtered[0].replay.is_none());
+                assert_eq!(filtered[0].blocks, item.blocks);
+            }
+        }
+    }
 
     /// Minimal request shared by codec/provider tests; cases override only the
     /// inputs relevant to the behavior under test.
@@ -143,7 +176,9 @@ pub(super) mod tests {
         ModelRequest {
             model: model.into(),
             system: vec![],
-            messages: vec![Message::User(vec![UserContent::Text {
+            tail: Vec::new(),
+            history_lifetime: Default::default(),
+            history: vec![Message::User(vec![UserContent::Text {
                 text: "hello".into(),
             }])],
             tools: vec![],
@@ -151,6 +186,7 @@ pub(super) mod tests {
             reasoning: None,
             max_output_tokens: Some(8192),
             correlation: None,
+            blobs: Default::default(),
         }
     }
 
@@ -161,15 +197,14 @@ pub(super) mod tests {
     ) -> crate::provider::protocol::ModelRequest {
         use crate::{
             identity::AgentId,
-            session::{
-                ContextMessage, ModelPurpose, SessionEvent, SessionStore, reconstruct_model_request,
-            },
+            session::{ModelPurpose, SessionEvent, SessionStore, reconstruct_model_request},
         };
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::create(directory.path()).await.unwrap();
         let agent = AgentId::root(store.id());
         let mut template = request.clone();
-        template.messages.clear();
+        (template.history, template.tail) = (Vec::new(), Vec::new());
+        template.history_lifetime = Default::default();
         let context = store
             .append(
                 agent.clone(),
@@ -180,8 +215,8 @@ pub(super) mod tests {
             )
             .await
             .unwrap();
-        let mut messages = Vec::new();
-        for message in &request.messages {
+        let mut history = Vec::new();
+        for message in &request.history {
             let record = store
                 .append(
                     agent.clone(),
@@ -191,9 +226,7 @@ pub(super) mod tests {
                 )
                 .await
                 .unwrap();
-            messages.push(ContextMessage::Source {
-                sequence: record.sequence,
-            });
+            history.push(record.sequence);
         }
         let call = store
             .append(
@@ -201,7 +234,9 @@ pub(super) mod tests {
                 SessionEvent::ModelRequested {
                     context: context.sequence,
                     purpose: ModelPurpose::Agent,
-                    messages,
+                    history,
+                    tail: request.tail.clone(),
+                    history_lifetime: request.history_lifetime,
                 },
             )
             .await
@@ -216,35 +251,32 @@ pub(super) mod tests {
 
     #[test]
     fn endpoint_scope_is_required_and_preserves_only_matching_private_state() {
-        use crate::provider::protocol::{AssistantItem, Message, ModelRequest, ResponseChunk};
         let a = reasoning_scope("api", "https://a.example/v1/responses");
         let b = reasoning_scope("api", "https://b.example/v1/responses");
         assert_ne!(a, b);
+        let native = json!({"type":"reasoning","encrypted_content":"private"});
+        let replay = Some(reasoning_envelope("responses", "same-model", native));
         let mut chunk = ResponseChunk::ItemEnded {
             id: "reasoning-0".into(),
-            replay: Some(reasoning_envelope(
-                "responses",
-                "same-model",
-                json!({"type":"reasoning","encrypted_content":"private"}),
-            )),
+            replay,
         };
         bind_reasoning_scope(&mut chunk, &a);
         let ResponseChunk::ItemEnded { replay, .. } = chunk else {
             unreachable!()
         };
-        let mut block = AssistantItem::reasoning("reasoning-0", 0, "summary", replay);
-        block
-            .blocks
-            .push(crate::provider::protocol::AssistantBlock {
-                id: "summary-1".into(),
-                position: 1,
-                content: crate::provider::protocol::BlockContent::Reasoning {
-                    text: "second summary".into(),
-                },
-            });
-        let expected_blocks = block.blocks.clone();
+        let mut item = AssistantItem::reasoning("reasoning-0", 0, "summary", replay);
+        let content = BlockContent::Reasoning {
+            text: "second summary".into(),
+        };
+        item.blocks.push(AssistantBlock {
+            id: "summary-1".into(),
+            position: 1,
+            content,
+        });
+        let expected_blocks = item.blocks.clone();
+        let messages = vec![Message::Assistant(vec![item])];
         let request = ModelRequest {
-            messages: vec![Message::Assistant(vec![block])],
+            history: messages,
             ..request("same-model")
         };
         let mut matching = request.clone();
@@ -252,10 +284,44 @@ pub(super) mod tests {
         assert_eq!(matching, request);
         let mut foreign = request;
         filter_reasoning_scope(&mut foreign, &b);
-        let Message::Assistant(parts) = &foreign.messages[0] else {
+        let Message::Assistant(parts) = &foreign.history[0] else {
             unreachable!()
         };
         assert!(parts[0].replay.is_none());
         assert_eq!(parts[0].blocks, expected_blocks);
+    }
+
+    #[test]
+    fn direct_provider_wire_parity_requires_a_loaded_blob() {
+        let image = ImageRef {
+            file: Some("fixture.png".into()),
+            format: ImageFormat::Png,
+            blob: BlobRef::of(b"x"),
+        };
+        let text = TextRef {
+            file: Some("notes.txt".into()),
+            blob: BlobRef::of(b"notes"),
+        };
+        let mut request = request("model");
+        let missing = image_url(&request, &image).unwrap_err();
+        assert_eq!(missing.kind, ProviderErrorKind::InvalidRequest);
+        assert!(anthropic_image(&request, &image).is_err());
+        assert!(attachment_text(&request, &text).is_err());
+        request.blobs.insert(image.blob, b"x".to_vec());
+        request.blobs.insert(text.blob, b"notes".to_vec());
+        assert_eq!(
+            image_url(&request, &image).unwrap(),
+            "data:image/png;base64,eA=="
+        );
+        assert_eq!(
+            anthropic_image(&request, &image).unwrap(),
+            json!({"type":"image", "source":{"type":"base64", "media_type":"image/png", "data":"eA=="}})
+        );
+        assert_eq!(
+            attachment_text(&request, &text).unwrap(),
+            "File: notes.txt\nnotes"
+        );
+        let pasted = TextRef { file: None, ..text };
+        assert_eq!(attachment_text(&request, &pasted).unwrap(), "notes");
     }
 }

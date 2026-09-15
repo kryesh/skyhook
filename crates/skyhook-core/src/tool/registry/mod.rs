@@ -32,12 +32,22 @@ use super::{ToolContext, ToolError, ToolOutput};
 pub struct RegisteredTool {
     definition: GeneratedToolDefinition,
     execution: ToolExecution,
-    handler: ToolHandler,
+    admit: ArgumentAdmission,
 }
 
-type ToolHandler = Arc<
-    dyn Fn(ToolContext, Value) -> BoxFuture<'static, Result<ToolOutput, ToolError>> + Send + Sync,
->;
+/// A one-shot handler with its admitted input retained, not reconstructed from JSON.
+/// The closure erases the input type without a downcast or a mismatched tool/input pair.
+pub(crate) struct AdmittedInvocation(
+    Box<dyn FnOnce(ToolContext) -> BoxFuture<'static, Result<ToolOutput, ToolError>> + Send>,
+);
+
+impl AdmittedInvocation {
+    pub(crate) async fn call(self, context: ToolContext) -> Result<ToolOutput, ToolError> {
+        (self.0)(context).await
+    }
+}
+
+type ArgumentAdmission = Arc<dyn Fn(Value) -> Result<AdmittedInvocation, ToolError> + Send + Sync>;
 type ArgumentPermissions =
     Arc<dyn Fn(&ExecutionLocation, &Value) -> Result<Vec<PermissionUse>, ToolError> + Send + Sync>;
 type ArgumentPaths = Arc<dyn Fn(&Value) -> Result<Vec<PathArgument>, ToolError> + Send + Sync>;
@@ -45,6 +55,9 @@ type ArgumentValidator = Arc<dyn Fn(&Value) -> Result<(), ToolError> + Send + Sy
 
 #[derive(Clone, Debug)]
 pub struct ToolSpec {
+    pub supports_background: bool,
+    pub job_role: crate::job::JobRole,
+    pub result_policy: ToolResultPolicy,
     pub name: String,
     pub description: String,
     pub input_schema: Value,
@@ -114,6 +127,15 @@ pub enum ScriptBinding {
     Unavailable,
 }
 
+/// Whether a handler returns a native value or a manager-produced job view.
+/// Only `register_presented` selects `JobView`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolResultPolicy {
+    #[default]
+    Value,
+    JobView,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ToolPlacement {
     #[default]
@@ -132,27 +154,92 @@ pub enum PathKind {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) enum PathBinding {
+    TopLevel {
+        name: String,
+        default: Option<String>,
+    },
+    /// Nested bindings always contribute permission, even inside the root.
+    Pointer(String),
+}
+
+#[derive(Clone, Debug)]
 pub struct PathArgument {
-    pub(crate) name: String,
+    pub(crate) binding: PathBinding,
     pub(crate) access: PathAccess,
     pub(crate) kind: PathKind,
-    pub(crate) default: Option<String>,
-    /// JSON pointer for nested paths; unlike legacy top-level paths these always
-    /// contribute a permission, even inside the authorization root.
-    pub(crate) pointer: Option<String>,
+}
+
+fn unidentified_pointer(pointer: &str) -> ToolError {
+    ToolError::InvalidArguments(format!(
+        "path pointer `{pointer}` does not identify an argument"
+    ))
 }
 
 impl PathArgument {
     #[must_use]
-    pub fn pointer(pointer: impl Into<String>, access: PathAccess, kind: PathKind) -> Self {
-        let pointer = pointer.into();
+    pub fn top_level(
+        name: impl Into<String>,
+        default: Option<String>,
+        access: PathAccess,
+        kind: PathKind,
+    ) -> Self {
+        let name = name.into();
         Self {
-            name: pointer.clone(),
+            binding: PathBinding::TopLevel { name, default },
             access,
             kind,
-            default: None,
-            pointer: Some(pointer),
         }
+    }
+
+    pub fn pointer(pointer: impl Into<String>, access: PathAccess, kind: PathKind) -> Self {
+        Self {
+            binding: PathBinding::Pointer(pointer.into()),
+            access,
+            kind,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        match &self.binding {
+            PathBinding::TopLevel { name, .. } => name,
+            PathBinding::Pointer(pointer) => pointer,
+        }
+    }
+
+    pub(crate) fn input<'a>(&'a self, arguments: &'a Value) -> Result<Option<&'a str>, ToolError> {
+        let value = match &self.binding {
+            PathBinding::TopLevel { name, .. } => arguments.get(name),
+            PathBinding::Pointer(pointer) => arguments.pointer(pointer),
+        };
+        match value {
+            Some(Value::String(value)) => Ok(Some(value)),
+            Some(_) => Err(ToolError::InvalidArguments(format!(
+                "{} must be a string",
+                self.name()
+            ))),
+            None => match &self.binding {
+                PathBinding::TopLevel { default, .. } => Ok(default.as_deref()),
+                PathBinding::Pointer(pointer) => Err(unidentified_pointer(pointer)),
+            },
+        }
+    }
+
+    pub(crate) fn rewrite(&self, arguments: &mut Value, value: Value) -> Result<(), ToolError> {
+        match &self.binding {
+            PathBinding::TopLevel { name, .. } => {
+                arguments
+                    .as_object_mut()
+                    .ok_or(ToolError::ArgumentsMustBeObject)?
+                    .insert(name.clone(), value);
+            }
+            PathBinding::Pointer(pointer) => {
+                *arguments
+                    .pointer_mut(pointer)
+                    .ok_or_else(|| unidentified_pointer(pointer))? = value;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -173,6 +260,8 @@ pub struct ToolOptions {
 /// Internal execution metadata.
 #[derive(Clone, Default)]
 struct ToolExecution {
+    job_role: crate::job::JobRole,
+    result_policy: ToolResultPolicy,
     pub capabilities: Vec<Capability>,
     pub accepts_input: bool,
     supports_name: bool,
@@ -183,9 +272,16 @@ struct ToolExecution {
     argument_permissions: Option<ArgumentPermissions>,
     argument_paths: Option<ArgumentPaths>,
     read_error_output: Option<fn(&str, &ToolError) -> Option<ToolOutput>>,
+    target_authentication: bool,
 }
 
 impl ToolOptions {
+    #[must_use]
+    pub const fn job_role(mut self, role: crate::job::JobRole) -> Self {
+        self.execution.job_role = role;
+        self
+    }
+
     /// Built-in read only: expected OS read failures are successful structured results.
     pub(crate) fn read_error_output(
         mut self,
@@ -205,6 +301,13 @@ impl ToolOptions {
     #[must_use]
     pub const fn named(mut self) -> Self {
         self.execution.supports_name = true;
+        self
+    }
+
+    /// The handler spawns processes that may authenticate to configured targets.
+    #[must_use]
+    pub(crate) const fn target_authentication(mut self) -> Self {
+        self.execution.target_authentication = true;
         self
     }
 
@@ -315,13 +418,9 @@ impl ToolOptions {
         access: PathAccess,
         kind: PathKind,
     ) -> Self {
-        self.execution.path_arguments.push(PathArgument {
-            name: name.into(),
-            access,
-            kind,
-            default: None,
-            pointer: None,
-        });
+        self.execution
+            .path_arguments
+            .push(PathArgument::top_level(name, None, access, kind));
         self
     }
 
@@ -333,13 +432,12 @@ impl ToolOptions {
         access: PathAccess,
         kind: PathKind,
     ) -> Self {
-        self.execution.path_arguments.push(PathArgument {
-            name: name.into(),
+        self.execution.path_arguments.push(PathArgument::top_level(
+            name,
+            Some(default.into()),
             access,
             kind,
-            default: Some(default.into()),
-            pointer: None,
-        });
+        ));
         self
     }
 
@@ -410,6 +508,16 @@ impl Default for ToolOptions {
 }
 
 impl RegisteredTool {
+    #[must_use]
+    pub const fn job_role(&self) -> crate::job::JobRole {
+        self.execution.job_role
+    }
+
+    #[must_use]
+    pub const fn result_policy(&self) -> ToolResultPolicy {
+        self.execution.result_policy
+    }
+
     pub(crate) fn output_schema(&self, capabilities: &CapabilitySet) -> Option<Value> {
         self.definition
             .output_schema
@@ -439,19 +547,34 @@ impl RegisteredTool {
         context: ToolContext,
         arguments: Value,
     ) -> Result<ToolOutput, ToolError> {
-        let read_path = self.execution.read_error_output.and_then(|_| {
-            arguments
-                .get("path")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
+        self.validate_arguments(&arguments)?;
+        self.admit(arguments)?.call(context).await
+    }
+
+    /// Admit handler input before allocating a job or requesting approval.
+    /// Native-path consumers retain wire spelling before IO; other consumers
+    /// retain path-rewritten input. Neither reconstructs the typed value later.
+    pub(crate) fn admit(&self, arguments: Value) -> Result<AdmittedInvocation, ToolError> {
+        // The declared path argument, in its wire spelling, names the failed read.
+        let read_path = self.execution.read_error_output.and_then(|convert| {
+            let spec = self.execution.path_arguments.first()?;
+            let path = spec.input(&arguments).ok().flatten()?.to_owned();
+            Some((path, convert))
         });
-        match (self.handler)(context, arguments).await {
-            Err(error) => match read_path.and_then(|path| self.read_error_output(&path, &error)) {
-                Some(output) => Ok(output),
-                None => Err(error),
-            },
-            result => result,
-        }
+        let admitted = (self.admit)(arguments)?;
+        Ok(AdmittedInvocation(Box::new(move |context| {
+            Box::pin(async move {
+                match admitted.call(context).await {
+                    Err(error) => {
+                        match read_path.and_then(|(path, convert)| convert(&path, &error)) {
+                            Some(output) => Ok(output),
+                            None => Err(error),
+                        }
+                    }
+                    result => result,
+                }
+            })
+        })))
     }
 
     pub(crate) fn validate_arguments(&self, arguments: &Value) -> Result<(), ToolError> {
@@ -470,8 +593,9 @@ impl RegisteredTool {
         capabilities: &CapabilitySet,
         agent: &crate::identity::AgentId,
     ) -> Option<ToolSpec> {
+        let child = agent.parent().is_some();
         self.definition
-            .generate_scoped(capabilities, agent.parent().is_some())
+            .generate_scoped(capabilities, &self.execution, child)
     }
 
     #[must_use]
@@ -516,11 +640,17 @@ impl RegisteredTool {
     pub(crate) fn permission_resource(&self) -> Option<&ResourceId> {
         self.execution.permission_resource.as_ref()
     }
+
+    pub(crate) const fn target_authentication(&self) -> bool {
+        self.execution.target_authentication
+    }
 }
 
 #[derive(Clone, Default)]
 pub struct ToolSurface {
     tools: BTreeMap<String, ToolSpec>,
+    /// The presented job schema that direct tool results and job methods share.
+    job_envelope: Value,
 }
 
 impl ToolSurface {
@@ -580,11 +710,14 @@ impl ToolRegistry {
             .values()
             .filter_map(|tool| {
                 tool.definition
-                    .generate_scoped(capabilities, child)
+                    .generate_scoped(capabilities, &tool.execution, child)
                     .map(|spec| (spec.name.clone(), spec))
             })
             .collect();
-        ToolSurface { tools }
+        ToolSurface {
+            tools,
+            job_envelope: crate::job::presented_job_schema(capabilities, false),
+        }
     }
 
     pub fn split_execution(
@@ -595,10 +728,9 @@ impl ToolRegistry {
         let object = arguments
             .as_object_mut()
             .ok_or(ToolError::ArgumentsMustBeObject)?;
-        let supports_background = tool.input_schema["properties"]["bg"].is_object();
         let background = match object.remove("bg") {
             None => false,
-            Some(Value::Bool(value)) if supports_background => value,
+            Some(Value::Bool(value)) if tool.supports_background => value,
             Some(Value::Bool(_)) => {
                 return Err(ToolError::BackgroundUnsupported(tool.name.clone()));
             }
@@ -633,13 +765,30 @@ impl ToolRegistryBuilder {
         name: impl Into<String>,
         description: impl Into<String>,
         input_schema: Value,
-        mut options: ToolOptions,
+        options: ToolOptions,
         handler: F,
     ) -> Result<&mut Self, RegistryError>
     where
         F: Fn(ToolContext, Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
     {
+        let handler = Arc::new(handler);
+        self.register_admission(name, description, input_schema, options, move |arguments| {
+            let handler = handler.clone();
+            Ok(AdmittedInvocation(Box::new(move |context| {
+                Box::pin(handler(context, arguments))
+            })))
+        })
+    }
+
+    fn register_admission(
+        &mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+        mut options: ToolOptions,
+        admit: impl Fn(Value) -> Result<AdmittedInvocation, ToolError> + Send + Sync + 'static,
+    ) -> Result<&mut Self, RegistryError> {
         if options.execution.placement == ToolPlacement::TargetedWorkspace {
             ensure_no_target(&input_schema)?;
             options =
@@ -699,30 +848,15 @@ impl ToolRegistryBuilder {
             required,
             root_required,
         };
-        self.register_definition(definition, execution, handler)
-    }
-
-    fn register_definition<F, Fut>(
-        &mut self,
-        definition: GeneratedToolDefinition,
-        execution: ToolExecution,
-        handler: F,
-    ) -> Result<&mut Self, RegistryError>
-    where
-        F: Fn(ToolContext, Value) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
-    {
-        let name = definition.name.clone();
-        validate_name(&name)?;
-        if self.tools.contains_key(&name) {
-            return Err(RegistryError::Duplicate(name));
+        if self.tools.contains_key(&definition.name) {
+            return Err(RegistryError::Duplicate(definition.name));
         }
         // Input transformations only add properties/defaults; their object root is
         // validated at registration. Static outputs likewise have invariant root
         // types. Only arbitrary output generators require every capability variant.
         let generated_output = matches!(definition.output_schema, Some(OutputSchema::Generated(_)));
         for capabilities in capability_subsets() {
-            if let Some(spec) = definition.generate(&capabilities) {
+            if let Some(spec) = definition.generate_scoped(&capabilities, &execution, false) {
                 validate_object_schema(&spec.input_schema)?;
                 if let Some(schema) = &spec.output_schema {
                     validate_output_schema(schema)?;
@@ -732,15 +866,12 @@ impl ToolRegistryBuilder {
                 }
             }
         }
-        let handler = Arc::new(move |context, arguments| {
-            Box::pin(handler(context, arguments)) as BoxFuture<'static, _>
-        });
         self.tools.insert(
-            name,
+            definition.name.clone(),
             Arc::new(RegisteredTool {
                 definition,
                 execution,
-                handler,
+                admit: Arc::new(admit),
             }),
         );
         Ok(self)
@@ -750,7 +881,7 @@ impl ToolRegistryBuilder {
         &mut self,
         name: impl Into<String>,
         description: impl Into<String>,
-        mut options: ToolOptions,
+        options: ToolOptions,
         handler: F,
     ) -> Result<&mut Self, RegistryError>
     where
@@ -759,29 +890,104 @@ impl ToolRegistryBuilder {
         F: Fn(ToolContext, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O, ToolError>> + Send + 'static,
     {
-        let input_schema = serde_json::to_value(schema_for!(I))
-            .map_err(|error| RegistryError::Schema(error.to_string()))?;
+        self.register_product::<I, O, _, _>(name, description, options, move |context, input| {
+            let future = handler(context, input);
+            async move {
+                let output = future.await?;
+                Ok(ToolOutput::new(serde_json::to_value(output)?))
+            }
+        })
+    }
+
+    /// Register a typed input with an already-constructed output product.
+    /// `O` supplies only the advertised result schema. Unlike `register`, this
+    /// adapter never serializes the product, so native capture ownership and
+    /// images survive until the canonical completion owner consumes them.
+    pub fn register_product<I, O, F, Fut>(
+        &mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        mut options: ToolOptions,
+        handler: F,
+    ) -> Result<&mut Self, RegistryError>
+    where
+        I: DeserializeOwned + JsonSchema + Send + 'static,
+        O: JsonSchema,
+        F: Fn(ToolContext, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
+    {
         let output_schema = serde_json::to_value(schema_for!(O))
             .map_err(|error| RegistryError::Schema(error.to_string()))?;
         if options.output_schema.is_none() {
             options = options.output_schema(output_schema);
         }
-        self.register_dynamic(
-            name,
-            description,
-            input_schema,
-            options,
-            move |context, arguments| {
-                let parsed = serde_json::from_value(arguments);
-                let future = parsed.map(|input| handler(context, input));
-                async move {
-                    let output = future
-                        .map_err(|error| ToolError::InvalidArguments(error.to_string()))?
-                        .await?;
-                    Ok(ToolOutput::new(serde_json::to_value(output)?))
-                }
-            },
-        )
+        self.register_typed::<I, _, _>(name, description, options, handler)
+    }
+
+    /// Register the concrete manager-produced presentation product. This
+    /// derives JobView presentation and the canonical capability-scoped schema;
+    /// an options policy/schema cannot override the product's contract. Images
+    /// remain attached to the same projection. Native/dynamic registrations and
+    /// their legacy JobView presentation policy do not acquire this provenance.
+    /// Only host execution is supported: workspace placement (which can route to
+    /// remote JSON dispatch) and synthetic read-error outputs would bypass this
+    /// typed producer, so either is rejected with `RegistryError::PresentedPlacement`.
+    /// This proves successful output only; ToolError partial outputs stay raw.
+    ///
+    /// Arbitrary JSON (even a job-shaped object) cannot enter this adapter.
+    pub fn register_presented<I, F, Fut>(
+        &mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        mut options: ToolOptions,
+        handler: F,
+    ) -> Result<&mut Self, RegistryError>
+    where
+        I: DeserializeOwned + JsonSchema + Send + 'static,
+        F: Fn(ToolContext, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<crate::job::output::PresentedOutput, ToolError>>
+            + Send
+            + 'static,
+    {
+        if options.execution.placement != ToolPlacement::Host
+            || options.execution.read_error_output.is_some()
+        {
+            return Err(RegistryError::PresentedPlacement(name.into()));
+        }
+        options.execution.result_policy = ToolResultPolicy::JobView;
+        options = options.generated_output_schema(crate::job::output::view_schema);
+        self.register_typed::<I, _, _>(name, description, options, move |context, input| {
+            let future = handler(context, input);
+            async move {
+                let (_, view, images) = future.await?.into_parts();
+                Ok(ToolOutput::new(view).with_images(images))
+            }
+        })
+    }
+
+    fn register_typed<I, F, Fut>(
+        &mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        options: ToolOptions,
+        handler: F,
+    ) -> Result<&mut Self, RegistryError>
+    where
+        I: DeserializeOwned + JsonSchema + Send + 'static,
+        F: Fn(ToolContext, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
+    {
+        let input_schema = serde_json::to_value(schema_for!(I))
+            .map_err(|error| RegistryError::Schema(error.to_string()))?;
+        let handler = Arc::new(handler);
+        self.register_admission(name, description, input_schema, options, move |arguments| {
+            let input = serde_json::from_value::<I>(arguments)
+                .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+            let handler = handler.clone();
+            Ok(AdmittedInvocation(Box::new(move |context| {
+                Box::pin(handler(context, input))
+            })))
+        })
     }
 
     pub fn build(self) -> ToolRegistry {
@@ -843,4 +1049,160 @@ pub enum RegistryError {
     ReservedBackground,
     #[error("`target` is reserved for structurally targeted tools")]
     ReservedTarget,
+    #[error("presented tool `{0}` must run on the host without read-error outputs")]
+    PresentedPlacement(String),
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use crate::job::{JobOutcome, JobSpec, output};
+    use std::io::Write as _;
+
+    #[tokio::test]
+    async fn product_registration_preserves_capture_evidence_without_serialization() {
+        #[derive(serde::Deserialize, JsonSchema)]
+        struct Input {
+            text: String,
+        }
+        // This is a schema-only declaration, deliberately not Serialize.
+        #[derive(JsonSchema)]
+        struct Output {
+            #[serde(rename = "text")]
+            _text: String,
+        }
+        let runtime = crate::tests::TestRuntime::new().await;
+        let lease = runtime
+            .jobs
+            .create(JobSpec::test(runtime.agent.clone(), "product"));
+        let mut lease = lease.await.unwrap();
+        let job = lease.id();
+        let context = runtime.tool_context(&mut lease);
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register_product::<Input, Output, _, _>(
+                "product",
+                "Native output product",
+                ToolOptions::default(),
+                |context, input| async move {
+                    let capture =
+                        context.pending_stream_capture("/result/text", output::CaptureKind::Text);
+                    let mut capture = capture.await?.open();
+                    capture.write_all(input.text.as_bytes())?;
+                    let completed = capture.finish()?;
+                    Ok(ToolOutput::new(serde_json::json!({})).with_captures(vec![completed]))
+                },
+            )
+            .unwrap();
+        let registry = builder.build();
+        let tool = registry.get("product").unwrap();
+        let spec = tool
+            .spec(&CapabilitySet::default(), &runtime.agent)
+            .unwrap();
+        assert_eq!(
+            spec.result_schema.unwrap()["properties"]["text"]["type"],
+            "string"
+        );
+        let arguments = serde_json::json!({"text":"native evidence"});
+        let mut output = tool.call(context, arguments).await.unwrap();
+        assert_eq!(output.value, serde_json::json!({}));
+        let captures = output.take_captures();
+        assert_eq!(captures.len(), 1);
+        assert!(captures[0].matches(job, "/result/text"));
+        assert!(output.take_captures().is_empty());
+        lease.fail(JobOutcome::Cancelled).await;
+    }
+
+    #[tokio::test]
+    async fn presented_registration_derives_contract_and_projection() {
+        #[derive(serde::Deserialize, JsonSchema)]
+        struct Input {}
+        let runtime = crate::tests::TestRuntime::new().await;
+        let source = runtime
+            .jobs
+            .create(JobSpec::test(runtime.agent.clone(), "source"));
+        let source = source.await.unwrap().into_test_id();
+        let result = ToolOutput::new(serde_json::json!({"text":"source result"}));
+        runtime
+            .jobs
+            .finish(source, JobOutcome::Completed(result))
+            .await
+            .unwrap();
+        let location = ExecutionLocation::root(runtime.root.path().to_owned());
+        let options = output::OutputOptions::Model {
+            viewer: Some(&location),
+            detailed: false,
+            presentation: crate::job::OutputPresentation::Automatic,
+        };
+        let args = output::OutputArgs::new(source);
+        let capabilities = CapabilitySet::default();
+        let projected = runtime
+            .jobs
+            .present_output_with(args, &capabilities, options);
+        let projected = projected.await.unwrap();
+        let expected = projected.view().clone();
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register_presented::<Input, _, _>(
+                "inspect_source",
+                "Canonical projection independent of tool name",
+                ToolOptions::default(),
+                move |_, _| {
+                    let projected = projected.clone();
+                    async move { Ok(projected) }
+                },
+            )
+            .unwrap()
+            .register_dynamic(
+                "schema_control",
+                "Schema reference",
+                serde_json::json!({"type":"object"}),
+                ToolOptions::default().generated_output_schema(output::view_schema),
+                |_, _| async { Ok(ToolOutput::new(Value::Null)) },
+            )
+            .unwrap();
+        let registry = builder.build();
+        let surface = registry.surface(&CapabilitySet::default());
+        let spec = surface.get("inspect_source").unwrap();
+        assert_eq!(spec.result_policy, ToolResultPolicy::JobView);
+        assert_eq!(
+            spec.output_schema,
+            surface.get("schema_control").unwrap().output_schema
+        );
+        let executor = crate::tool::executor::ToolExecutor::new(
+            registry,
+            Arc::new(crate::tool::policy::AllowAll),
+            runtime.jobs.clone(),
+            runtime.root.path().to_path_buf(),
+        );
+        let model = executor.run_model(&runtime.agent, "inspect_source", serde_json::json!({}));
+        assert_eq!(model.await.unwrap().output.value, expected);
+    }
+
+    #[test]
+    fn presented_registration_rejects_workspace_placement_and_read_error_outputs() {
+        #[derive(serde::Deserialize, JsonSchema)]
+        struct Input {}
+        fn read_error(_: &str, _: &ToolError) -> Option<ToolOutput> {
+            None
+        }
+        for options in [
+            ToolOptions::default().placement(ToolPlacement::InheritWorkspace),
+            ToolOptions::default().placement(ToolPlacement::TargetedWorkspace),
+            ToolOptions::default().read_error_output(read_error),
+        ] {
+            let mut builder = ToolRegistryBuilder::default();
+            let result = builder.register_presented::<Input, _, _>(
+                "presented",
+                "rejected",
+                options,
+                |_, _| async { Err(ToolError::Cancelled) },
+            );
+            assert!(matches!(
+                result,
+                Err(RegistryError::PresentedPlacement(name)) if name == "presented"
+            ));
+            assert!(builder.build().get("presented").is_none());
+        }
+    }
 }

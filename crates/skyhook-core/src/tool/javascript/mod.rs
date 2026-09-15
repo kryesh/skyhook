@@ -1,8 +1,15 @@
 //! Sandboxed JavaScript orchestration over the shared tool registry.
 
+mod bridge;
 mod console;
+mod outcome;
+mod result;
 mod runtime;
+
+#[cfg(test)]
+mod regression_tests;
 
 pub use runtime::JsError;
 
-pub(crate) use runtime::evaluate_captured;
+pub(crate) use result::{ScriptResult, script_output};
+pub(crate) use runtime::{CapturedJsError, evaluate_captured};

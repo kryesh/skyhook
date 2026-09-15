@@ -75,24 +75,22 @@ mod tests {
 
     #[test]
     fn codex_errors_are_classified_and_sanitized() {
+        use CodexWebSocketError::*;
+        let reset = Some(ProviderRecovery::ResetContext);
         for category in [
-            CodexWebSocketError::EndOfStream,
-            CodexWebSocketError::Closed,
-            CodexWebSocketError::Read,
-            CodexWebSocketError::ReadTimeout,
-            CodexWebSocketError::Ping,
-            CodexWebSocketError::Write,
-            CodexWebSocketError::WriteTimeout,
+            EndOfStream,
+            Closed,
+            Read,
+            ReadTimeout,
+            Ping,
+            Write,
+            WriteTimeout,
         ] {
             let error = websocket_error(category);
             assert_eq!(error.kind, ProviderErrorKind::CodexWebSocket(category));
-            assert_eq!(error.recovery(), Some(ProviderRecovery::ResetContext));
+            assert_eq!(error.recovery(), reset);
         }
-        for operation in [
-            CodexWebSocketError::Read,
-            CodexWebSocketError::Write,
-            CodexWebSocketError::Ping,
-        ] {
+        for operation in [Read, Write, Ping] {
             let native = tungstenite::Error::Io(std::io::Error::other(
                 "Bearer SECRET wss://user:password@example.invalid/private?token=SECRET",
             ));
@@ -101,21 +99,15 @@ mod tests {
             assert!(!format!("{error:?} {error}").contains("SECRET"));
             assert!(!error.message.contains("example.invalid"));
         }
+        let protocol = |error| socket_error(tungstenite::Error::Protocol(error), Read);
+        let reset_without_close = protocol(ProtocolError::ResetWithoutClosingHandshake);
         assert_eq!(
-            socket_error(
-                tungstenite::Error::Protocol(ProtocolError::ResetWithoutClosingHandshake),
-                CodexWebSocketError::Read
-            )
-            .kind,
-            ProviderErrorKind::CodexWebSocket(CodexWebSocketError::EndOfStream),
+            reset_without_close.kind,
+            ProviderErrorKind::CodexWebSocket(EndOfStream)
         );
         assert_eq!(
-            socket_error(
-                tungstenite::Error::Protocol(ProtocolError::UnmaskedFrameFromClient),
-                CodexWebSocketError::Read
-            )
-            .recovery(),
-            None,
+            protocol(ProtocolError::UnmaskedFrameFromClient).recovery(),
+            None
         );
         for code in [
             CloseCode::Protocol,
@@ -127,13 +119,10 @@ mod tests {
         ] {
             assert_eq!(close_error(Some(code)).recovery(), None);
         }
+        let custom = close_error(Some(CloseCode::from(4001)));
         assert_eq!(
-            close_error(Some(CloseCode::from(4001))).kind,
-            ProviderErrorKind::Response
-        );
-        assert_eq!(
-            close_error(Some(CloseCode::from(4001))).recovery(),
-            Some(ProviderRecovery::ResetContext)
+            (custom.kind, custom.recovery()),
+            (ProviderErrorKind::Response, reset)
         );
         for code in [
             None,
@@ -143,10 +132,7 @@ mod tests {
             Some(CloseCode::Again),
             Some(CloseCode::Error),
         ] {
-            assert_eq!(
-                close_error(code).recovery(),
-                Some(ProviderRecovery::ResetContext)
-            );
+            assert_eq!(close_error(code).recovery(), reset);
         }
     }
 }

@@ -4,6 +4,17 @@ use crate::target::{TargetAuth, TargetDefinition};
 use serde::{Deserialize, Serialize};
 use std::{io::Write as _, path::Path, process::Stdio, sync::Arc};
 use tokio::process::Command;
+/// OpenSSH config and forwarded environment are UTF-8 protocols. Reject a
+/// native path that cannot be represented instead of redirecting authority.
+pub(super) fn wire_path(path: &Path) -> std::io::Result<&str> {
+    path.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "native path cannot be represented losslessly in SSH configuration",
+        )
+    })
+}
+
 pub(crate) struct SshConfig {
     pub _directory: tempfile::TempDir,
     path: std::path::PathBuf,
@@ -261,7 +272,7 @@ fn write_auth(
             writeln!(
                 file,
                 "  BatchMode no\n  IdentityFile {}\n  IdentitiesOnly yes\n  PreferredAuthentications publickey,password,keyboard-interactive",
-                ssh_token(&path.to_string_lossy())?
+                ssh_token(wire_path(path)?)?
             )?;
         }
     }
@@ -343,6 +354,19 @@ mod tests {
         target
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ssh_wire_paths_reject_unrepresentable_native_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let path =
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/key-\xff".to_vec()));
+        assert_eq!(
+            wire_path(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(wire_path(Path::new("/tmp/key-é")).unwrap(), "/tmp/key-é");
+    }
+
     #[test]
     fn resolved_options_never_put_environment_forwarding_on_the_wire() {
         let target = target("destination");
@@ -361,15 +385,19 @@ mod tests {
         for wire in [
             serde_json::to_string(resolved).unwrap(),
             serde_json::to_string(&crate::remote::protocol::Request::OpenSsh {
-                channel: 1,
+                channel: crate::remote::protocol::RequestId::FIRST,
                 route: vec![target],
                 command: "exec remote-worker --serve /remote/work".into(),
             })
             .unwrap(),
         ] {
-            assert!(!wire.contains("SKYHOOK_TEST_"), "{wire}");
-            assert!(!wire.contains("local-config-secret"), "{wire}");
-            assert!(!wire.contains("local-dotenv-secret"), "{wire}");
+            for forbidden in [
+                "SKYHOOK_TEST_",
+                "local-config-secret",
+                "local-dotenv-secret",
+            ] {
+                assert!(!wire.contains(forbidden), "{wire}");
+            }
         }
     }
 
@@ -394,20 +422,25 @@ mod tests {
             .unwrap();
         let text = std::fs::read_to_string(&config.path).unwrap();
         let lower = text.to_ascii_lowercase();
-        assert!(!lower.contains("sendenv"), "{text}");
-        assert!(!lower.contains("setenv"), "{text}");
-        assert!(!lower.contains("secret"), "{text}");
-        assert!(!lower.contains("skyhook_test_"), "{text}");
-        assert!(!lower.contains("include"), "{text}");
-        assert!(!lower.contains("forwardx11 yes"), "{text}");
+        for forbidden in [
+            "sendenv",
+            "setenv",
+            "secret",
+            "skyhook_test_",
+            "include",
+            "forwardx11 yes",
+        ] {
+            assert!(!lower.contains(forbidden), "{forbidden}: {text}");
+        }
         assert_eq!(lower.matches("forwardx11 no").count(), route.len());
         assert_eq!(lower.matches("forwardx11trusted no").count(), route.len());
-        assert!(text.contains("ProxyJump skyhook-target-0"), "{text}");
-        assert!(
-            text.contains("IdentityFile \"~/.ssh/id_ed25519\""),
-            "{text}"
-        );
-        assert!(text.contains("IdentityAgent SSH_AUTH_SOCK"), "{text}");
+        for required in [
+            "ProxyJump skyhook-target-0",
+            "IdentityFile \"~/.ssh/id_ed25519\"",
+            "IdentityAgent SSH_AUTH_SOCK",
+        ] {
+            assert!(text.contains(required), "{required}: {text}");
+        }
 
         let command = ssh_command(&config, &config.destination);
         let args: Vec<_> = command.as_std().get_args().collect();

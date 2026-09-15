@@ -1,9 +1,18 @@
 //! Saved output presentation, independent of model providers and execution transports.
 mod captures;
+mod finalization;
+mod products;
+pub(crate) use finalization::save_completed;
+pub(crate) use products::{OutputContinuation, OutputPreview, OutputTruncation};
+pub use products::{OutputSelection, PresentedOutput};
 mod reader;
-pub(crate) use captures::{CaptureKind, recover_legacy_captures, register_capture};
+pub use captures::CaptureKind;
+pub(crate) use captures::{
+    AsyncCapture, CaptureWriter, CompletedCapture, PendingCapture, TextCaptureField,
+    register_capture,
+};
 mod truncation;
-use super::{JobError, JobManager, JobState};
+use super::{JobError, JobManager, JobRole, JobState, OutputPresentation};
 use crate::{
     identity::JobId,
     tool::{ToolError, policy::CapabilitySet},
@@ -122,6 +131,16 @@ pub(crate) fn field_file(directory: &Path, field: &str) -> PathBuf {
 
 /// Persist a compact structured tree with file-backed large strings.
 pub(crate) fn save(directory: &Path, document: &Value) -> std::io::Result<()> {
+    save_inner(directory, document, None)
+}
+
+// The legacy writer can recognize already-present field files. New terminal
+// products instead name exactly the validated completed captures they reference.
+fn save_inner(
+    directory: &Path,
+    document: &Value,
+    external_refs: Option<&BTreeSet<String>>,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(directory)?;
     let mut document = document.clone();
     let mut fields = Vec::<String>::new();
@@ -130,11 +149,15 @@ pub(crate) fn save(directory: &Path, document: &Value) -> std::io::Result<()> {
         field: &str,
         value: &mut Value,
         fields: &mut Vec<String>,
+        external_refs: Option<&BTreeSet<String>>,
     ) -> std::io::Result<()> {
+        let path = field_file(directory, field);
+        let referenced = external_refs.map_or_else(|| path.exists(), |refs| refs.contains(field));
         match value {
             Value::String(text) => {
-                let path = field_file(directory, field);
-                if path.exists() || text.len() > 4096 {
+                // Do not overwrite or adopt an unreferenced raw capture merely
+                // because the ordinary result happens to use the same pointer.
+                if referenced || (text.len() > 4096 && !path.exists()) {
                     register_capture(directory, field, CaptureKind::Text)?;
                     if !path.exists() {
                         let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
@@ -146,7 +169,7 @@ pub(crate) fn save(directory: &Path, document: &Value) -> std::io::Result<()> {
                 }
             }
             Value::Object(map) => {
-                if field_file(directory, field).exists() {
+                if referenced {
                     register_capture(directory, field, CaptureKind::Json)?;
                     fields.push(field.to_owned());
                     map.clear();
@@ -158,17 +181,24 @@ pub(crate) fn save(directory: &Path, document: &Value) -> std::io::Result<()> {
                         &format!("{field}/{}", key.replace('~', "~0").replace('/', "~1")),
                         value,
                         fields,
+                        external_refs,
                     )?;
                 }
             }
             Value::Array(items) => {
-                if field_file(directory, field).exists() {
+                if referenced {
                     register_capture(directory, field, CaptureKind::Json)?;
                     fields.push(field.to_owned());
                     items.clear();
                 } else {
                     for (index, value) in items.iter_mut().enumerate() {
-                        visit(directory, &format!("{field}/{index}"), value, fields)?;
+                        visit(
+                            directory,
+                            &format!("{field}/{index}"),
+                            value,
+                            fields,
+                            external_refs,
+                        )?;
                     }
                 }
             }
@@ -176,7 +206,7 @@ pub(crate) fn save(directory: &Path, document: &Value) -> std::io::Result<()> {
         }
         Ok(())
     }
-    visit(directory, "", &mut document, &mut fields)?;
+    visit(directory, "", &mut document, &mut fields, external_refs)?;
     for (name, value) in [
         ("fields.json", serde_json::to_value(fields)?),
         ("document.json", document),
@@ -294,6 +324,28 @@ fn render(
     Ok(())
 }
 
+/// Who reads a presentation. Model-facing reads acknowledge the job's pending
+/// notification; host inspection never does and always shows details.
+#[derive(Clone, Copy)]
+pub(crate) enum OutputOptions<'a> {
+    Host {
+        viewer: Option<&'a crate::execution::ExecutionLocation>,
+        presentation: OutputPresentation,
+    },
+    Model {
+        viewer: Option<&'a crate::execution::ExecutionLocation>,
+        detailed: bool,
+        presentation: OutputPresentation,
+    },
+}
+
+impl OutputOptions<'_> {
+    pub(crate) const HOST: Self = Self::Host {
+        viewer: None,
+        presentation: OutputPresentation::Full,
+    };
+}
+
 impl JobManager {
     pub(crate) async fn save_script_presentation(
         &self,
@@ -349,8 +401,17 @@ impl JobManager {
         args: OutputArgs,
         capabilities: &CapabilitySet,
     ) -> Result<Value, ToolError> {
-        self.present_output_inner(args, capabilities, true, None, true)
-            .await
+        self.present_output_with(
+            args,
+            capabilities,
+            OutputOptions::Model {
+                viewer: None,
+                detailed: true,
+                presentation: crate::job::OutputPresentation::Full,
+            },
+        )
+        .await
+        .map(PresentedOutput::into_view)
     }
 
     /// Host inspection never acknowledges an agent's pending notification.
@@ -367,8 +428,9 @@ impl JobManager {
         args: OutputArgs,
         capabilities: &CapabilitySet,
     ) -> Result<Value, ToolError> {
-        self.present_output_inner(args, capabilities, false, None, true)
+        self.present_output_with(args, capabilities, OutputOptions::HOST)
             .await
+            .map(PresentedOutput::into_view)
     }
 
     /// Host UI field discovery uses the saved tree, never presentation wrappers
@@ -432,35 +494,63 @@ impl JobManager {
         .map_err(|error| ToolError::Failed(error.to_string()))?
     }
 
-    pub(crate) async fn present_output_for(
+    /// Host inspection with automatic pages for captures absent from the whole
+    /// presentation. Any explicit selection (including `context: 0`) suppresses
+    /// hydration. A present JSON null is not an absent capture.
+    ///
+    /// Metadata/images belong to the initial job snapshot; capture files remain
+    /// live reads and can advance while up to four pages are read concurrently.
+    /// A failed initial inspection is returned; individual page failures are
+    /// embedded as `{error}` in that capture's `output`. This never acknowledges
+    /// pending notifications, and does not recursively hydrate capture pages.
+    pub async fn inspect_output_with_captures(
         &self,
         args: OutputArgs,
         capabilities: &CapabilitySet,
-        viewer: &crate::execution::ExecutionLocation,
-        detailed: bool,
-    ) -> Result<Value, ToolError> {
-        self.present_output_inner(args, capabilities, true, Some(viewer), detailed)
-            .await
+    ) -> Result<PresentedOutput, ToolError> {
+        use futures_util::{StreamExt, stream};
+
+        let mut output = self
+            .present_output_with(args.clone(), capabilities, OutputOptions::HOST)
+            .await?;
+        let mut pages = stream::iter(std::mem::take(&mut output.capture_targets))
+            .map(|(index, field)| {
+                let mut query = OutputArgs::new(args.job);
+                query.field = Some(field);
+                query.cancellation = args.cancellation.clone();
+                async move {
+                    let page = self
+                        .present_output_with(query, capabilities, OutputOptions::HOST)
+                        .await;
+                    (index, page)
+                }
+            })
+            .buffer_unordered(4);
+        while let Some((index, page)) = pages.next().await {
+            output.attach_capture(index, page);
+        }
+        Ok(output)
     }
 
-    pub(crate) async fn inspect_output_for(
+    /// Return the state and presentation from the same job snapshot. Explicit
+    /// field/page queries always retain full output, even under Automatic policy.
+    pub(crate) async fn present_output_with(
         &self,
         args: OutputArgs,
         capabilities: &CapabilitySet,
-        viewer: &crate::execution::ExecutionLocation,
-    ) -> Result<Value, ToolError> {
-        self.present_output_inner(args, capabilities, false, Some(viewer), true)
-            .await
-    }
-
-    async fn present_output_inner(
-        &self,
-        args: OutputArgs,
-        capabilities: &CapabilitySet,
-        acknowledge: bool,
-        viewer: Option<&crate::execution::ExecutionLocation>,
-        detailed: bool,
-    ) -> Result<Value, ToolError> {
+        options: OutputOptions<'_>,
+    ) -> Result<PresentedOutput, ToolError> {
+        let (acknowledge, viewer, detailed, presentation) = match options {
+            OutputOptions::Host {
+                viewer,
+                presentation,
+            } => (false, viewer, true, presentation),
+            OutputOptions::Model {
+                viewer,
+                detailed,
+                presentation,
+            } => (true, viewer, detailed, presentation),
+        };
         let limit = args.limit.unwrap_or(100);
         if !(1..=1000).contains(&limit) || args.start == Some(0) || args.context.unwrap_or(0) > 20 {
             return Err(ToolError::InvalidArguments(
@@ -472,11 +562,8 @@ impl JobManager {
                 "context requires pattern".into(),
             ));
         }
-        let explicit = args.field.is_some()
-            || args.start.is_some()
-            || args.pattern.is_some()
-            || args.offset.is_some()
-            || args.limit.is_some();
+        let output_selection = args.selection();
+        let explicit = output_selection == OutputSelection::Explicit;
         let mut selection = Selection {
             field: args.field.clone().unwrap_or_else(|| "/result".into()),
             matcher: None,
@@ -495,7 +582,7 @@ impl JobManager {
                 crate::tool::builtins::search::output_matcher(pattern)?,
             ));
         }
-        let (mut envelope, output_schema) = {
+        let (mut envelope, output_schema, last_message, images) = {
             let jobs = self.inner.jobs.lock().await;
             let entry = jobs
                 .get(&args.job)
@@ -503,8 +590,35 @@ impl JobManager {
             (
                 entry.envelope(args.job),
                 entry.output_schema.clone().unwrap_or(Value::Bool(true)),
+                entry.last_agent_message.filter(|_| {
+                    !explicit
+                        && presentation == OutputPresentation::Automatic
+                        && entry.role == JobRole::Agent
+                        && entry.state == JobState::Completed
+                }),
+                if output_selection == OutputSelection::WholeWithImages {
+                    entry.images.clone()
+                } else {
+                    Vec::new()
+                },
             )
         };
+        if last_message.is_some() {
+            envelope.output = None;
+            let view =
+                envelope.presented_with_reference(capabilities, viewer, detailed, last_message)?;
+            if acknowledge {
+                self.claim(args.job)
+                    .await
+                    .map_err(|error| ToolError::Failed(error.to_string()))?;
+            }
+            return Ok(PresentedOutput {
+                state: envelope.state,
+                view,
+                images,
+                capture_targets: Vec::new(),
+            });
+        }
         let terminal = envelope.state.is_terminal();
         let question = envelope.state == JobState::WaitingInput;
         let live_question = envelope.output.take();
@@ -530,21 +644,21 @@ impl JobManager {
                             .is_some_and(|suffix| suffix.starts_with('/')))
             });
         if !captures.is_empty() {
-            map.insert("captures".into(), serde_json::to_value(captures)?);
+            map.insert("captures".into(), serde_json::to_value(&captures)?);
         }
         let document_path = directory.join("document.json");
         let structured = !explicit && terminal && document_path.exists();
         let mut presented_question = false;
         if structured {
             let presentation_directory = directory.clone();
-            let presentation = tokio::task::spawn_blocking(move || {
+            let script_presentation = tokio::task::spawn_blocking(move || {
                 ScriptPresentation::load(&presentation_directory)
             })
             .await
             .map_err(|error| ToolError::Failed(error.to_string()))??;
             let mut children = BTreeMap::new();
             let mut replacements = BTreeMap::new();
-            for (field, child) in presentation.jobs {
+            for (field, child) in script_presentation.jobs {
                 if self
                     .metadata(child)
                     .await
@@ -557,32 +671,33 @@ impl JobManager {
                 if let std::collections::btree_map::Entry::Vacant(entry) = children.entry(child) {
                     let mut query = OutputArgs::new(child);
                     query.cancellation = args.cancellation.clone();
-                    let view = Box::pin(self.present_output_inner(
+                    let view = Box::pin(self.present_output_with(
                         query,
                         capabilities,
-                        false,
-                        viewer,
-                        true,
+                        OutputOptions::Host {
+                            viewer,
+                            presentation: OutputPresentation::Full,
+                        },
                     ))
                     .await?;
-                    entry.insert(view);
+                    entry.insert(view.into_view());
                 }
                 replacements.insert(field, children[&child].clone());
             }
             let directory = directory.clone();
             let cancellation = args.cancellation.clone().unwrap_or_default();
-            let projection = tokio::task::spawn_blocking(move || {
+            let view = tokio::task::spawn_blocking(move || {
                 truncation::project(
                     &directory,
                     &output_schema,
                     &cancellation,
-                    &presentation.fields,
+                    &script_presentation.fields,
                     &replacements,
                 )
             })
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))??;
-            map.extend(projection);
+            map.extend(view);
         } else if question && let Some(value) = live_question {
             if !explicit {
                 map.insert("question".into(), value);
@@ -610,8 +725,9 @@ impl JobManager {
             let directory = directory.clone();
             let c = selection.clone();
             let cancellation = args.cancellation.clone().unwrap_or_default();
+            // A whole-result query always resolves to "/result" or "" here.
             let unavailable =
-                !terminal && !question && (!explicit || c.field == "/result" || c.field.is_empty());
+                !terminal && !question && (c.field == "/result" || c.field.is_empty());
             let page = if unavailable {
                 reader::empty(&c, None, false)
             } else {
@@ -631,7 +747,7 @@ impl JobManager {
                     .and_then(|v| v.get("capture_complete").and_then(Value::as_bool));
                 capture_notice(map, complete);
             }
-            map.insert("preview".into(), page);
+            map.insert("preview".into(), serde_json::to_value(&page)?);
         }
         if incomplete_capture {
             capture_notice(map, Some(false));
@@ -643,8 +759,24 @@ impl JobManager {
                 .await
                 .map_err(|e| ToolError::Failed(e.to_string()))?;
         }
+        // Preserve presence before presentation elides object nulls. Hydration
+        // targets come from discovered records, never decoded wire descriptors.
+        let capture_targets = captures
+            .iter()
+            .enumerate()
+            .filter(|(_, capture)| {
+                output_selection == OutputSelection::WholeWithImages
+                    && view.pointer(&capture.field).is_none()
+            })
+            .map(|(index, capture)| (index, capture.field.clone()))
+            .collect();
         omit_null_fields(&mut view);
-        Ok(view)
+        Ok(PresentedOutput {
+            state: envelope.state,
+            view,
+            images,
+            capture_targets,
+        })
     }
 
     pub(crate) async fn hydrate_envelope(
@@ -827,27 +959,129 @@ pub(crate) fn transfer_fields(
 }
 
 #[cfg(test)]
+mod hydration_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        identity::AgentId,
-        job::{JobOutcome, JobSpec},
-        session::SessionStore,
-    };
+    use crate::job::{JobOutcome, JobSpec, tests::runtime};
 
-    async fn fixture(value: Value) -> (tempfile::TempDir, JobManager, JobId) {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let manager = JobManager::new(store.clone());
-        let lease = manager
-            .test_lease(JobSpec::test(AgentId::root(store.id()), "fixture"))
-            .await;
+    /// A running fixture job, finished with `value` when one is given.
+    pub(super) async fn fixture(value: Option<Value>) -> (tempfile::TempDir, JobManager, JobId) {
+        let (root, manager, agent) = runtime().await;
+        let id = manager
+            .test_lease(JobSpec::test(agent, "fixture"))
+            .await
+            .id();
+        manager.transition(id, JobState::Running).await.unwrap();
+        if let Some(value) = value {
+            manager.test_finish(id, value).await;
+        }
+        (root, manager, id)
+    }
+
+    fn field_args(id: JobId, field: &str) -> OutputArgs {
+        let mut args = OutputArgs::new(id);
+        args.field = Some(field.into());
+        args
+    }
+
+    async fn host(manager: &JobManager, args: OutputArgs) -> Value {
         manager
-            .transition(lease.id, JobState::Running)
+            .inspect_output(args, &Default::default())
+            .await
+            .unwrap()
+    }
+
+    async fn model(manager: &JobManager, args: OutputArgs) -> Value {
+        manager
+            .present_output(args, &Default::default())
+            .await
+            .unwrap()
+    }
+
+    fn incomplete(field: &str, kind: &str) -> Value {
+        json!([{ "field":field, "kind":kind, "complete":false }])
+    }
+
+    /// Any explicit selector, including an explicitly supplied default, also
+    /// suppresses automatic capture hydration.
+    #[tokio::test]
+    async fn output_product_owns_image_eligibility_and_typed_page() {
+        use crate::{
+            media::{BlobRef, ImageFormat, ImageRef},
+            tool::ToolOutput,
+        };
+        let (_root, manager, id) = fixture(None).await;
+        let blob = BlobRef {
+            sha256: "ab".repeat(32).parse().unwrap(),
+            bytes: 1,
+        };
+        let images = ["first", "second"]
+            .map(|name| ImageRef {
+                file: Some(name.into()),
+                format: ImageFormat::Png,
+                blob,
+            })
+            .to_vec();
+        let output = ToolOutput::new(json!({"text": "first\nsecond"})).with_images(images.clone());
+        manager
+            .finish(id, JobOutcome::Completed(output))
             .await
             .unwrap();
-        manager.test_finish(lease.id, value).await;
-        (root, manager, lease.id)
+        let path = register_capture(
+            &manager.output_directory(id),
+            "/result/raw",
+            CaptureKind::Text,
+        );
+        std::fs::write(path.unwrap(), b"line").unwrap();
+        let whole = manager
+            .present_output_with(
+                OutputArgs::new(id),
+                &Default::default(),
+                OutputOptions::HOST,
+            )
+            .await
+            .unwrap();
+        assert_eq!((whole.state, &whole.images), (JobState::Completed, &images));
+        assert_eq!(
+            OutputArgs::new(id).selection(),
+            OutputSelection::WholeWithImages
+        );
+        assert!(whole.view().get("preview").is_none());
+        for field in ["field", "start", "limit", "pattern", "context", "offset"] {
+            let mut args = OutputArgs::new(id);
+            match field {
+                "field" => args.field = Some("/result/text".into()),
+                "start" => args.start = Some(1),
+                "limit" => args.limit = Some(100),
+                "pattern" => args.pattern = Some(String::new()),
+                "context" => args.context = Some(0),
+                "offset" => args.offset = Some(0),
+                _ => unreachable!(),
+            }
+            let selection = args.selection();
+            let product = manager
+                .inspect_output_with_captures(args, &Default::default())
+                .await
+                .unwrap();
+            assert!(
+                product.images.is_empty(),
+                "explicit {field} attached images"
+            );
+            // `context` without a pattern selects nothing: the whole result, without images.
+            let whole = field == "context";
+            let expected = if whole {
+                OutputSelection::Whole
+            } else {
+                OutputSelection::Explicit
+            };
+            assert_eq!(selection, expected);
+            assert_eq!(product.view()["preview"].is_object(), !whole, "{field}");
+            assert_eq!(product.view()["captures"].as_array().unwrap().len(), 1);
+            assert!(product.view()["captures"][0].get("output").is_none());
+        }
+        assert_eq!(manager.images(id).await.unwrap(), images);
     }
 
     #[tokio::test]
@@ -857,129 +1091,85 @@ mod tests {
             "nested": {"absent": null, "ok": false},
             "array": [null, {"absent": null, "count": 0}]
         });
-        let (_root, manager, id) = fixture(raw.clone()).await;
-        let expected = json!({
-            "nested": {"ok": false},
-            "array": [null, {"count": 0}]
-        });
-        let model = manager
-            .present_output(OutputArgs::new(id), &Default::default())
+        let (_root, manager, id) = fixture(Some(raw.clone())).await;
+        let expected = json!({"nested": {"ok": false}, "array": [null, {"count": 0}]});
+        assert_eq!(
+            model(&manager, OutputArgs::new(id)).await["result"],
+            expected
+        );
+        let host_view = host(&manager, OutputArgs::new(id)).await;
+        assert_eq!(host_view["result"], expected);
+        let product = manager
+            .present_output_with(
+                OutputArgs::new(id),
+                &Default::default(),
+                OutputOptions::HOST,
+            )
             .await
             .unwrap();
-        let host = manager
-            .inspect_output(OutputArgs::new(id), &Default::default())
-            .await
-            .unwrap();
-        assert_eq!(model["result"], expected);
-        assert_eq!(host["result"], expected);
-
-        let saved: Value = serde_json::from_slice(
-            &tokio::fs::read(manager.output_directory(id).join("document.json"))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        // The canonical product preserves established presentation policy; it
+        // is not a new raw/lossless payload channel.
+        assert_eq!(product.view(), &host_view);
+        let saved = tokio::fs::read(manager.output_directory(id).join("document.json")).await;
+        let saved: Value = serde_json::from_slice(&saved.unwrap()).unwrap();
         assert_eq!(saved["result"], raw);
     }
 
+    /// Unfinished captures, whether abandoned by a successful result, a failure,
+    /// or cancellation, remain discoverable, readable, and marked incomplete.
     #[tokio::test]
-    async fn arbitrary_incomplete_captures_remain_discoverable_and_readable() {
-        for cancelled in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let store = SessionStore::create(root.path()).await.unwrap();
-            let manager = JobManager::new(store.clone());
-            let id = manager
-                .test_create(JobSpec::test(AgentId::root(store.id()), "custom"))
-                .await;
-            manager.transition(id, JobState::Running).await.unwrap();
-            let field = "/result/events~1custom/nested~0key";
+    async fn incomplete_captures_remain_discoverable_and_readable() {
+        for outcome in ["failed", "cancelled", "unreferenced"] {
+            let (_root, manager, id) = fixture(None).await;
+            let field = if outcome == "unreferenced" {
+                "/result/abandoned"
+            } else {
+                "/result/events~1custom/nested~0key"
+            };
             let path =
                 register_capture(&manager.output_directory(id), field, CaptureKind::Json).unwrap();
-            let query = OutputArgs::new(id);
-            let absent = manager
-                .inspect_output(query.clone(), &Default::default())
-                .await
-                .unwrap();
-            assert!(absent.get("captures").is_none());
+            assert!(
+                host(&manager, OutputArgs::new(id))
+                    .await
+                    .get("captures")
+                    .is_none()
+            );
             let bytes = "{\"partial\":"; // Deliberately unfinished JSON.
             std::fs::write(&path, bytes).unwrap();
             for terminal in [false, true] {
                 if terminal {
-                    manager
-                        .finish(
-                            id,
-                            if cancelled {
-                                JobOutcome::Cancelled
-                            } else {
-                                JobOutcome::Failed {
-                                    message: "injected failure".into(),
-                                    output: None,
-                                    denial: None,
-                                }
-                            },
-                        )
-                        .await
-                        .unwrap();
+                    let outcome = match outcome {
+                        "cancelled" => JobOutcome::Cancelled,
+                        "failed" => JobOutcome::Failed {
+                            message: "injected failure".into(),
+                            output: None,
+                            denial: None,
+                        },
+                        _ => JobOutcome::Completed(crate::tool::ToolOutput::new(
+                            json!({"abandoned":null}),
+                        )),
+                    };
+                    manager.finish(id, outcome).await.unwrap();
                 }
-                let view = manager
-                    .inspect_output(query.clone(), &Default::default())
-                    .await
-                    .unwrap();
-                assert!(view.get("result").is_none());
-                assert_eq!(
-                    view["captures"],
-                    json!([{ "field":field, "kind":"json", "complete":false }])
-                );
-                let mut page_query = query.clone();
-                page_query.field = Some(field.into());
-                let page = manager
-                    .inspect_output(page_query, &Default::default())
-                    .await
-                    .unwrap();
-                assert_eq!(page["preview"]["lines"], json!([bytes]));
+                let view = host(&manager, OutputArgs::new(id)).await;
+                let page = host(&manager, field_args(id, field)).await;
+                assert_eq!(view["captures"], incomplete(field, "json"));
+                assert_eq!(page["preview"]["lines"], json!([bytes]), "{outcome}");
+                if outcome == "unreferenced" && terminal {
+                    assert_eq!(view["notice"], "Output incomplete.");
+                    assert_eq!(page["notice"], "Output incomplete.");
+                } else {
+                    assert!(view.get("result").is_none(), "{outcome}");
+                }
             }
             assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
         }
     }
 
     #[tokio::test]
-    async fn unreferenced_capture_is_not_marked_complete() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let manager = JobManager::new(store.clone());
-        let id = manager
-            .test_create(JobSpec::test(AgentId::root(store.id()), "custom"))
-            .await;
-        let field = "/result/abandoned";
-        let path =
-            register_capture(&manager.output_directory(id), field, CaptureKind::Json).unwrap();
-        std::fs::write(path, b"[unfinished").unwrap();
-        manager.test_finish(id, json!({"abandoned":null})).await;
-        let view = manager
-            .inspect_output(OutputArgs::new(id), &Default::default())
-            .await
-            .unwrap();
-        assert_eq!(
-            view["captures"],
-            json!([{ "field":field, "kind":"json", "complete":false }])
-        );
-        assert_eq!(view["notice"], "Output incomplete.");
-        let mut query = OutputArgs::new(id);
-        query.field = Some(field.into());
-        let page = manager
-            .inspect_output(query, &Default::default())
-            .await
-            .unwrap();
-        assert_eq!(page["notice"], "Output incomplete.");
-        assert_eq!(page["preview"]["lines"], json!(["[unfinished"]));
-    }
-
-    #[tokio::test]
     async fn script_console_capture_can_be_paged_while_running_and_after_cancellation() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let manager = JobManager::new(store.clone());
-        let mut spec = JobSpec::test(AgentId::root(store.id()), "script");
+        let (_root, manager, agent) = runtime().await;
+        let mut spec = JobSpec::test(agent, "script");
         spec.output_schema = Some(json!({"type":"object","properties":{
             "value":{}, "console":{"type":"string","x-skyhook-truncatable":true}
         }}));
@@ -987,51 +1177,36 @@ mod tests {
         manager.transition(id, JobState::Running).await.unwrap();
         let directory = manager.output_directory(id);
         std::fs::create_dir_all(&directory).unwrap();
-        std::fs::write(
-            register_capture(&directory, "/result/console", CaptureKind::Text).unwrap(),
-            "console\n".repeat(150),
-        )
-        .unwrap();
-        let mut query = OutputArgs::new(id);
-        query.field = Some("/result/console".into());
+        let path = register_capture(&directory, "/result/console", CaptureKind::Text).unwrap();
+        std::fs::write(path, "console\n".repeat(150)).unwrap();
+        let mut query = field_args(id, "/result/console");
         query.start = Some(101);
-        let live = manager
-            .present_output(query.clone(), &Default::default())
-            .await
-            .unwrap();
-        assert_eq!(live["preview"]["lines"].as_array().unwrap().len(), 50);
+        let lines = |page: &Value| page["preview"]["lines"].as_array().unwrap().len();
+        assert_eq!(lines(&model(&manager, query.clone()).await), 50);
         manager.finish(id, JobOutcome::Cancelled).await.unwrap();
-        let view = manager
-            .present_output(OutputArgs::new(id), &Default::default())
-            .await
-            .unwrap();
+        let view = model(&manager, OutputArgs::new(id)).await;
         assert!(view.get("result").is_none());
-        assert_eq!(
-            view["captures"],
-            json!([{
-                "field":"/result/console", "kind":"text", "complete":false
-            }])
-        );
+        assert_eq!(view["captures"], incomplete("/result/console", "text"));
         assert_eq!(view["notice"], "Output incomplete.");
-        let page = manager
-            .present_output(query, &Default::default())
-            .await
-            .unwrap();
-        assert_eq!(page["preview"]["lines"].as_array().unwrap().len(), 50);
+        assert_eq!(lines(&model(&manager, query).await), 50);
     }
 
     #[tokio::test]
     async fn capture_completeness_is_internal_and_only_partial_finished_jobs_have_a_notice() {
         for complete in [true, false] {
-            let (_root, manager, job) =
-                fixture(json!({"stdout":"line\n".repeat(120), "timed_out":!complete})).await;
+            let (_root, manager, job) = fixture(None).await;
+            let mut output = crate::tool::ToolOutput::new(json!({"stdout":"line\n".repeat(120)}));
+            if !complete {
+                output.streams = crate::tool::StreamEnd::Cut;
+            }
+            manager
+                .finish(job, JobOutcome::Completed(output))
+                .await
+                .unwrap();
             for field in [None, Some("/result/stdout"), Some("")] {
                 let mut query = OutputArgs::new(job);
                 query.field = field.map(str::to_owned);
-                let view = manager
-                    .present_output(query, &Default::default())
-                    .await
-                    .unwrap();
+                let view = model(&manager, query).await;
                 assert!(!view.to_string().contains("capture_complete"));
                 assert_eq!(view.get("notice").is_some(), !complete);
                 if !complete {
@@ -1046,15 +1221,11 @@ mod tests {
         // Exhaustive reconstruction and replay live in reader tests. Here retain
         // the integration boundary: correct offsets and the entire view budget.
         let expected = format!("{}\nlast", "🦀\"\\".repeat(4000));
-        let (_root, manager, id) = fixture(json!({"content":expected})).await;
-        let mut args = OutputArgs::new(id);
-        args.field = Some("/result/content".into());
+        let (_root, manager, id) = fixture(Some(json!({"content":expected}))).await;
+        let mut args = field_args(id, "/result/content");
         for _ in 0..2 {
             let offset = args.offset.unwrap_or(0);
-            let view = manager
-                .present_output(args.clone(), &Default::default())
-                .await
-                .unwrap();
+            let view = model(&manager, args.clone()).await;
             assert!(serde_json::to_vec(&view).unwrap().len() <= PAGE_BYTES);
             let page = &view["preview"];
             assert_eq!(page["next_start"], 1);
@@ -1068,43 +1239,29 @@ mod tests {
 
     #[tokio::test]
     async fn search_reaches_beyond_preview_and_merges_context_across_pages() {
-        let text = (1..=500)
+        let text: String = (1..=500)
             .map(|n| {
                 format!(
                     "{} {n}\n",
                     if n == 450 || n == 452 { "ERROR" } else { "ok" }
                 )
             })
-            .collect::<String>();
-        let (_root, manager, id) = fixture(json!({"stdout":text})).await;
-        let mut args = OutputArgs::new(id);
-        args.field = Some("/result/stdout".into());
-        args.pattern = Some("(?i)error".into());
-        args.context = Some(2);
-        args.limit = Some(2);
-        let mut numbers = Vec::new();
+            .collect();
+        let (_root, manager, id) = fixture(Some(json!({"stdout":text}))).await;
+        let (mut start, mut offset, mut numbers) = (None, None, Vec::new());
         loop {
-            let view = manager
-                .present_output(args, &Default::default())
-                .await
-                .unwrap();
-            numbers.extend(
-                view["preview"]["lines"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|line| line.as_str().unwrap().to_owned()),
-            );
-            let Some(start) = view["preview"]["next_start"].as_u64() else {
+            let mut args = field_args(id, "/result/stdout");
+            (args.start, args.offset) = (start, offset);
+            (args.pattern, args.context, args.limit) = (Some("(?i)error".into()), Some(2), Some(2));
+            let view = model(&manager, args).await;
+            let lines = view["preview"]["lines"].as_array().unwrap();
+            numbers.extend(lines.iter().map(|line| line.as_str().unwrap().to_owned()));
+            let Some(next) = view["preview"]["next_start"].as_u64() else {
                 break;
             };
-            args = OutputArgs::new(id);
-            args.field = Some(view["preview"]["field"].as_str().unwrap().into());
-            args.start = Some(start as usize);
-            args.offset = Some(view["preview"]["next_offset"].as_u64().unwrap_or(0) as usize);
-            args.limit = Some(2);
-            args.pattern = Some("(?i)error".into());
-            args.context = Some(2);
+            assert_eq!(view["preview"]["field"], "/result/stdout");
+            start = Some(next as usize);
+            offset = Some(view["preview"]["next_offset"].as_u64().unwrap_or(0) as usize);
         }
         assert_eq!(numbers, text.lines().skip(447).take(7).collect::<Vec<_>>());
     }

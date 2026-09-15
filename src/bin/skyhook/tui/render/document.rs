@@ -10,6 +10,7 @@ pub(super) struct EntryGeometry {
     pub(super) body_width: u16,
     pub(super) surface: Surface,
     pub(super) entry: usize,
+    entry_key: std::sync::Arc<model::EntryKey>,
     pub(super) selectable: bool,
     pub(super) tool_gutter: bool,
 }
@@ -40,6 +41,7 @@ impl EntryGeometry {
                 .max(1),
             surface: entry.surface,
             entry: index,
+            entry_key: std::sync::Arc::new(entry.key().clone()),
             selectable: entry_selectable(entry),
             tool_gutter: false,
         }
@@ -47,30 +49,26 @@ impl EntryGeometry {
     pub(super) fn row(&self, line: Line<'static>, header: bool, continued: bool) -> Row {
         Row {
             line: std::sync::Arc::new(line),
-            header,
             x: self.x,
             width: self.row_width,
             surface: self.surface,
             entry: self.entry,
+            entry_key: self.entry_key.clone(),
             selectable: self.selectable,
-            blank: false,
-            continued,
-            layout: markdown::RowLayout::default(),
+            layout: markdown::RowLayout::default().with_flow(header, continued),
             inset: u16::from(self.tool_gutter && !header),
         }
     }
     pub(super) fn blank(&self, surface: Surface, x: u16, width: u16) -> Row {
         Row {
             line: std::sync::Arc::new(Line::default()),
-            header: false,
             x,
             width,
             surface,
             entry: self.entry,
+            entry_key: self.entry_key.clone(),
             selectable: self.selectable,
-            blank: true,
-            continued: false,
-            layout: markdown::RowLayout::default(),
+            layout: markdown::RowLayout::spacer(),
             inset: 0,
         }
     }
@@ -86,13 +84,22 @@ pub(super) fn layout_document_or_plain_with_expansion(
     expanded: bool,
 ) -> Vec<Row> {
     let mut geometry = EntryGeometry::new(entry, width, index);
-    geometry.tool_gutter = expanded && entry.expandable && entry.surface == Surface::Tool;
+    geometry.tool_gutter = expanded && entry.expandable() && entry.surface == Surface::Tool;
     let block = matches!(entry.surface, Surface::User | Surface::Agent);
-    let lines = if let Some(document) = &entry.document {
+    let lines = if let Some(header) = entry.header() {
+        let mut lines = vec![(
+            super::super::tool_view::header_line(header),
+            super::super::tool_view::Wrap::Hard,
+        )];
+        if let Some(body) = entry.document() {
+            lines.extend(body.layout_lines(Some(highlights)));
+        }
+        lines
+    } else if let Some(document) = entry.document() {
         document.layout_lines(Some(highlights))
     } else {
         debug_assert!(!block && entry.surface != Surface::Reasoning);
-        model::clean(&entry.text)
+        model::clean(entry.text())
             .split('\n')
             .map(|s| {
                 (
@@ -108,13 +115,10 @@ pub(super) fn layout_document_or_plain_with_expansion(
     }
     let mut header = true;
     for (line_index, (mut line, wrapping)) in lines.into_iter().enumerate() {
-        if line_index == 0 && entry.surface == Surface::Tool {
-            if let Some(header) = &entry.header {
-                line = super::super::tool_view::header_line(header);
-            } else {
-                for span in &mut line.spans {
-                    span.style.fg = Some(p.content.fg);
-                }
+        // Card headers were already built as line 0 above.
+        if line_index == 0 && entry.surface == Surface::Tool && entry.header().is_none() {
+            for span in &mut line.spans {
+                span.style.fg = Some(p.content.fg);
             }
         }
         let body_width = geometry
@@ -156,37 +160,45 @@ pub(super) fn layout_document_or_plain_with_expansion(
 /// in the surface style and skips individual graphemes wider than the viewport.
 #[cfg(test)]
 mod tests {
+    use super::super::super::tool_view::{
+        Document, HighlightCache, Role, Run, Section, Wrap, header_line,
+    };
     use super::*;
 
-    fn assert_argument_reflow(
-        document: &super::super::super::tool_view::Document,
-        cache: &super::super::super::tool_view::HighlightCache,
-    ) {
-        use super::super::super::tool_view::Wrap;
-        let entry = model::Entry {
-            key: "tool-wrap".into(),
-            text: document.plain_text(),
-            surface: Surface::Tool,
-            expandable: true,
-            default_open: true,
-            running: false,
-            footer: None,
-            request: None,
-            indent: 0,
-            job: None,
-            compact_after: true,
-            header: None,
-            document: Some(document.clone()),
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn rows_of(entry: &model::Entry, width: u16, cache: &HighlightCache) -> Vec<Row> {
+        let p = Palette::new();
+        layout_document_or_plain_with_expansion(entry, width, p, cache, 0, entry.default_open)
+    }
+
+    fn arguments(tool: &str, args: &serde_json::Value) -> Document {
+        let mut document = Document::default();
+        document.line(tool, Role::ToolName);
+        document.arguments(tool, args);
+        document
+    }
+
+    fn assert_argument_reflow(document: &Document, cache: &HighlightCache) {
+        let mut body = document.clone();
+        let Section::Line(header) = body.sections.remove(0) else {
+            panic!("argument fixture starts with its tool header");
         };
+        let mut entry = model::Entry::card(model::EntryKey::Record(1), header, Some(body));
+        entry.default_open = true;
+        entry.compact_after = true;
         for width in [0, 1, 2, 5, 12, 24, 40, 64, 120, 24] {
             let geometry = EntryGeometry::new(&entry, width, 0);
-            let rows = layout_document_or_plain(&entry, width, Palette::new(), cache, 0);
-            let expected = document
-                .layout_lines(Some(cache))
-                .into_iter()
-                .enumerate()
+            let rows = rows_of(&entry, width, cache);
+            let body = geometry.body_width.saturating_sub(1).max(1) as usize;
+            let lines = document.layout_lines(Some(cache)).into_iter().enumerate();
+            let expected: Vec<_> = lines
                 .flat_map(|(index, (line, wrap))| {
-                    let body = geometry.body_width.saturating_sub(1).max(1) as usize;
                     let first = if index == 0 {
                         geometry.body_width as usize
                     } else {
@@ -197,44 +209,31 @@ mod tests {
                         Wrap::Words => wrap_words(line, first),
                     }
                 })
-                .collect::<Vec<_>>();
+                .map(|line| line_text(&line))
+                .collect();
             assert_eq!(
                 rows.iter().map(Row::text).collect::<Vec<_>>(),
-                expected
-                    .iter()
-                    .map(|line| line
-                        .spans
-                        .iter()
-                        .map(|span| span.content.as_ref())
-                        .collect::<String>())
-                    .collect::<Vec<_>>(),
+                expected,
                 "width {width}"
             );
-            let selection = (
-                TextPosition { row: 0, byte: 0 },
-                TextPosition {
-                    row: rows.len() - 1,
-                    byte: rows.last().unwrap().text().len(),
-                },
-            );
+            let start = TextPosition { row: 0, byte: 0 };
+            let end = TextPosition {
+                row: rows.len() - 1,
+                byte: rows.last().unwrap().text().len(),
+            };
             let mut blocks = RowBlocks::default();
-            *blocks.block_mut(0) = rows;
-            blocks.finish_update(0);
+            blocks.replace_entry(0, rows, Vec::new());
             assert_eq!(
-                selected_text(&blocks, selection),
-                entry.text,
+                selected_text(&blocks, (start, end)),
+                entry.text(),
                 "width {width}"
             );
-            assert_eq!(
-                selected_text(&blocks, (selection.1, selection.0)),
-                entry.text
-            );
+            assert_eq!(selected_text(&blocks, (end, start)), entry.text());
         }
     }
 
     #[test]
     fn tool_argument_prose_wraps_words_without_interpreting_or_losing_text() {
-        use super::super::super::tool_view::{Document, HighlightCache, Role};
         let prompt = "Please inspect the current implementation and explain every relevant change. "
             .repeat(5)
             + "\n\n  Keep **literal** text, café e\u{301}lan 世界 👩‍💻 together.  \n";
@@ -245,40 +244,23 @@ mod tests {
             "token": "extraordinarilylongunbrokentoken世界👩‍💻e\u{301}",
         });
         let original = args.clone();
-        let cache = HighlightCache::default();
-        let mut document = Document::default();
-        document.line("agent", Role::ToolName);
-        document.arguments("agent", &args);
-        assert_argument_reflow(&document, &cache);
+        let document = arguments("agent", &args);
+        assert_argument_reflow(&document, &HighlightCache::default());
         // A long prompt's short words must never be split, even though its
         // paragraphs are longer than the viewport and include indentation.
         for (line, wrapping) in document.layout_lines(None) {
-            if wrapping != super::super::super::tool_view::Wrap::Words {
-                continue;
-            }
-            let original = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
-            if original.contains("extraordinarily") {
+            let text = line_text(&line);
+            if wrapping != Wrap::Words || text.contains("extraordinarily") {
                 continue;
             }
             for width in [24, 40, 64] {
-                let parts = wrap_words(line.clone(), width);
-                let words = parts
+                let parts: Vec<_> = wrap_words(line.clone(), width)
                     .iter()
-                    .flat_map(|part| {
-                        part.spans
-                            .iter()
-                            .map(|span| span.content.as_ref())
-                            .collect::<String>()
-                            .split_whitespace()
-                            .map(str::to_owned)
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>();
-                assert_eq!(words, original.split_whitespace().collect::<Vec<_>>());
+                    .map(line_text)
+                    .collect();
+                let words = parts.join(" ");
+                let words: Vec<_> = words.split_whitespace().collect();
+                assert_eq!(words, text.split_whitespace().collect::<Vec<_>>());
             }
         }
         assert_eq!(args, original);
@@ -286,9 +268,9 @@ mod tests {
 
     #[test]
     fn tool_argument_code_keeps_hard_wrap_and_copy_after_highlights_and_resize() {
-        use super::super::super::tool_view::{Document, HighlightCache, Role};
         let source = "  const message = 'long words stay hard wrapped';\t// café 👩‍💻\n\n    console.log(message);  \n";
-        let cases = [
+        let mut cache = HighlightCache::default();
+        for (tool, args) in [
             (
                 "script",
                 serde_json::json!({"source": source, "description": "prose next to source"}),
@@ -313,22 +295,16 @@ mod tests {
                 "patch",
                 serde_json::json!({"patch": "@@ -1 +1 @@\n-  old words\n+  new words  \n"}),
             ),
-        ];
-        let mut cache = HighlightCache::default();
-        for (tool, args) in cases {
-            let mut document = Document::default();
-            document.line(tool, Role::ToolName);
-            document.arguments(tool, &args);
+        ] {
+            let document = arguments(tool, &args);
             let original = document.clone();
             assert_argument_reflow(&document, &cache);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
+            while {
                 cache.prepare(std::iter::once(&document));
-                if document.highlight_sources().next().is_none()
-                    || cache.is_fully_highlighted(&document)
-                {
-                    break;
-                }
+                document.highlight_sources().next().is_some()
+                    && !cache.is_fully_highlighted(&document)
+            } {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "highlight worker did not finish"
@@ -342,7 +318,6 @@ mod tests {
 
     #[test]
     fn segmented_tool_headers_keep_roles_when_wrapped_or_in_documents() {
-        use super::super::super::tool_view::{Document, Role, Run, Section, header_line};
         let p = Palette::new();
         let header = vec![
             Run::new("▸", Role::Indicator),
@@ -353,74 +328,37 @@ mod tests {
             Run::new("Completed", Role::Success),
             Run::new(" · #42", Role::Muted),
         ];
-        let line = header_line(&header);
-        let text = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        let entry = model::Entry {
-            key: "tool-header".into(),
-            text,
-            surface: Surface::Tool,
-            expandable: true,
-            default_open: false,
-            running: false,
-            footer: None,
-            request: None,
-            indent: 0,
-            job: None,
-            document: None,
-            header: Some(header.clone()),
-            compact_after: false,
+        let text = line_text(&header_line(&header));
+        let key = model::EntryKey::Record(1);
+        let entry = model::Entry::card(key.clone(), header.clone(), None);
+        assert_eq!(entry.text(), text);
+        let expanded = model::Entry::card(key, header, Some(Document::default()));
+        let cache = HighlightCache::default();
+        let lines = |rows: Vec<Row>| {
+            let rows = rows.into_iter();
+            rows.map(|row| (row.line.clone(), row.layout.continued()))
+                .collect::<Vec<_>>()
         };
-        let mut expanded = entry.clone();
-        expanded.document = Some(Document {
-            sections: vec![Section::Line(header)],
-        });
-        let cache = super::super::super::tool_view::HighlightCache::default();
         for width in [8, 25, 100] {
-            let rows = layout_document_or_plain(&entry, width, p, &cache, 0);
-            let document_rows = layout_document_or_plain(&expanded, width, p, &cache, 0);
-            let lines = |rows: &[Row]| {
-                rows.iter()
-                    .map(|row| (row.line.clone(), row.continued))
-                    .collect::<Vec<_>>()
+            let rows = rows_of(&entry, width, &cache);
+            let spans: Vec<_> = rows.iter().flat_map(|row| &row.line.spans).collect();
+            let bold = |span: &Span<'_>| {
+                span.style.fg == Some(p.content.fg)
+                    && span.style.add_modifier.contains(Modifier::BOLD)
             };
-            assert_eq!(lines(&rows), lines(&document_rows));
-            let name = rows
+            let name: String = spans
                 .iter()
-                .flat_map(|row| &row.line.spans)
-                .filter(|span| {
-                    span.style.fg == Some(p.content.fg)
-                        && span.style.add_modifier.contains(Modifier::BOLD)
-                })
+                .filter(|span| bold(span))
                 .map(|span| span.content.as_ref())
-                .collect::<String>();
+                .collect();
             assert!(name.contains("read"));
             assert!(
-                rows.iter()
-                    .flat_map(|row| &row.line.spans)
+                spans
+                    .iter()
                     .any(|span| span.content.contains("▸")
                         && span.style.fg == Some(p.content.primary))
             );
+            assert_eq!(lines(rows), lines(rows_of(&expanded, width, &cache)));
         }
-    }
-
-    fn layout_document_or_plain(
-        entry: &model::Entry,
-        width: u16,
-        p: Palette,
-        highlights: &super::super::super::tool_view::HighlightCache,
-        index: usize,
-    ) -> Vec<Row> {
-        layout_document_or_plain_with_expansion(
-            entry,
-            width,
-            p,
-            highlights,
-            index,
-            entry.default_open,
-        )
     }
 }

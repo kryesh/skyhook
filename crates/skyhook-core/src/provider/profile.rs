@@ -13,6 +13,25 @@ pub struct ModelProfile {
 }
 
 impl ModelProfile {
+    pub fn new(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        reasoning: Option<String>,
+        max_context: u64,
+        max_output: u64,
+        supports_images: bool,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            reasoning,
+            max_context,
+            max_output,
+            supports_images,
+        }
+    }
+
+    /// Relational limits are checked at config ingress, not on construction.
     pub(crate) fn validate_limits(&self) -> Result<(), &'static str> {
         if self.max_context == 0 {
             return Err("max_context must be positive");
@@ -24,5 +43,25 @@ impl ModelProfile {
             return Err("max_output must be smaller than max_context");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn limits_and_flat_serde_shape() {
+        for (context, output) in [(0, 1), (1, 0), (1, 1), (1, 2)] {
+            assert!(
+                ModelProfile::new("v", "m", None, context, output, false)
+                    .validate_limits()
+                    .is_err()
+            );
+        }
+        let raw = serde_json::json!({"provider":"arbitrary/vendor", "model":"unlisted:model", "reasoning":"opaque vendor mode", "max_context":4096, "max_output":512, "supports_images":false});
+        let profile: ModelProfile = serde_json::from_value(raw.clone()).unwrap();
+        assert!(profile.validate_limits().is_ok());
+        assert_eq!(serde_json::to_value(profile).unwrap(), raw);
     }
 }

@@ -14,7 +14,7 @@ impl Drop for ClientStream {
 
 struct StreamOwner {
     parent: Arc<PooledConnection>,
-    channel: u64,
+    channel: RequestId,
     tasks: Vec<tokio::task::AbortHandle>,
 }
 impl Drop for StreamOwner {
@@ -81,11 +81,8 @@ impl PooledConnection {
                         data: bytes[..count].to_vec(),
                     }
                 };
-                if write_frame(&mut parent.writer.lock().await.input, &request)
-                    .await
-                    .is_err()
-                    || count == 0
-                {
+                let writer = parent.writer.clone().lock_owned().await;
+                if parent.write(writer, request).await.is_err() || count == 0 {
                     break;
                 }
             }
@@ -108,12 +105,11 @@ impl PooledConnection {
                 if output.write_all(&bytes).await.is_err() {
                     break;
                 }
-                if write_frame(
-                    &mut parent.writer.lock().await.input,
-                    &Request::StreamAck { channel },
-                )
-                .await
-                .is_err()
+                let writer = parent.writer.clone().lock_owned().await;
+                if parent
+                    .write(writer, Request::StreamAck { channel })
+                    .await
+                    .is_err()
                 {
                     break;
                 }

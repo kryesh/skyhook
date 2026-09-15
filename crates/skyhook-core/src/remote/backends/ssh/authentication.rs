@@ -43,7 +43,7 @@ impl Authentication {
             let mut environment = askpass.environment();
             environment.insert(
                 "SSH_AUTH_SOCK".into(),
-                socket.to_string_lossy().into_owned(),
+                super::config::wire_path(std::path::Path::new(&socket))?.to_owned(),
             );
             let mut child = Command::new("ssh-agent")
                 .arg("-D")
@@ -107,11 +107,12 @@ impl WorkerAuthentication {
         let mut environment = askpass.environment();
         // OpenSSH already owns a private forwarded socket for this connection.
         // Pass it through; a second forwarding listener adds no isolation or lifetime.
-        if let Some(socket) = std::env::var_os("SSH_AUTH_SOCK") {
-            environment.insert(
-                "SSH_AUTH_SOCK".into(),
-                socket.to_string_lossy().into_owned(),
-            );
+        // A socket path SSH configuration cannot represent only disables agent
+        // authentication; password and key authentication still work.
+        if let Some(socket) =
+            std::env::var_os("SSH_AUTH_SOCK").and_then(|socket| socket.into_string().ok())
+        {
+            environment.insert("SSH_AUTH_SOCK".into(), socket);
         }
         Ok(Self {
             _askpass: askpass,

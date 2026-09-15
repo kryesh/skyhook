@@ -97,7 +97,7 @@ pub(super) fn render_row_line(
     style: Style,
     p: Palette,
 ) {
-    if row.layout == markdown::RowLayout::default() {
+    if !row.layout.has_geometry() {
         render_line(&row.line, area, buffer, style);
         return;
     }
@@ -115,37 +115,37 @@ pub(super) fn render_row_line(
             style,
         );
     }
-    if let Some(code) = row.layout.code {
-        let offset = code.indent;
+    if let Some(code) = row.layout.code() {
+        let offset = code.indent();
         let rect = r(
             area.x.saturating_add(offset as u16),
             area.y,
-            code.width as u16,
+            code.width() as u16,
             1,
         )
         .intersection(area);
         buffer.set_style(rect, Style::default().bg(p.content.code_bg));
     }
-    if row.layout.decorative {
+    if row.layout.decorative() {
         return;
     }
     let mut byte = 0;
     let mut column = prefix_width;
+    let (source_prefix, source_prefix_width) = row.layout.source_prefix();
     for grapheme in row.line.styled_graphemes(Style::default()) {
-        if byte == row.layout.source_prefix {
+        if byte == source_prefix {
             column = row
                 .layout
-                .code
-                .map_or(prefix_width + row.layout.source_prefix_width, |code| {
-                    code.indent + code.padding
+                .code()
+                .map_or(prefix_width + source_prefix_width, |code| {
+                    code.indent() + code.padding()
                 });
         }
         let size = grapheme.symbol.width();
-        let in_prefix = byte < row.layout.source_prefix;
-        let prefix_clipped =
-            in_prefix && column + size > prefix_width + row.layout.source_prefix_width;
-        let body_end = row.layout.code.map_or(area.width as usize, |code| {
-            (code.indent + code.width - code.padding).min(area.width as usize)
+        let in_prefix = byte < source_prefix;
+        let prefix_clipped = in_prefix && column + size > prefix_width + source_prefix_width;
+        let body_end = row.layout.code().map_or(area.width as usize, |code| {
+            (code.indent() + code.width() - code.padding()).min(area.width as usize)
         });
         if !in_prefix && column + size > body_end {
             break;
@@ -205,7 +205,7 @@ impl Row {
     ) -> Color {
         // Fill expanded items and collapsed hover/focus highlights uniformly.
         // Text selection is painted separately over the persistent expanded fill.
-        if !self.blank && (expanded || (interactive && !text_selected)) {
+        if !self.layout.is_spacer() && (expanded || (interactive && !text_selected)) {
             p.content.code_bg
         } else {
             p.background(self.surface)
@@ -215,91 +215,67 @@ impl Row {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::tool_view::{Document, HighlightCache, Role, Section};
+    use super::super::tests::{expandable_entry, fixture_row};
     use super::*;
     use ratatui::widgets::Widget;
 
-    fn markdown_rows(
-        input: &str,
-        width: u16,
-        p: Palette,
-        cache: Option<&super::super::super::tool_view::HighlightCache>,
-    ) -> Vec<Row> {
-        markdown::layout_highlighted(input, p, false, width as usize, width as usize, "", cache)
-            .into_iter()
-            .map(|line| Row {
-                line: std::sync::Arc::new(line.line),
-                header: false,
-                x: 1,
-                width,
-                surface: Surface::Tool,
-                entry: 0,
-                selectable: true,
-                blank: false,
-                continued: line.continued,
-                layout: line.layout,
-                inset: 0,
-            })
+    fn markdown_rows(input: &str, width: u16, cache: Option<&HighlightCache>) -> Vec<Row> {
+        let (p, columns) = (Palette::new(), width as usize);
+        let lines = markdown::layout_highlighted(input, p, false, columns, columns, "", cache);
+        let rows = lines.into_iter();
+        rows.map(|line| fixture_row(line.line, line.layout, 1, width, 0))
             .collect()
     }
 
     fn copy_rows(rows: &[Row]) -> String {
         let mut blocks = RowBlocks::default();
-        *blocks.block_mut(0) = rows.to_vec();
-        blocks.finish_update(0);
-        selected_text(
-            &blocks,
-            (
-                TextPosition { row: 0, byte: 0 },
-                TextPosition {
-                    row: rows.len() - 1,
-                    byte: usize::MAX,
-                },
-            ),
-        )
+        blocks.replace_entry(0, rows.to_vec(), Vec::new());
+        let end = TextPosition {
+            row: rows.len() - 1,
+            byte: usize::MAX,
+        };
+        selected_text(&blocks, (TextPosition { row: 0, byte: 0 }, end))
     }
 
-    fn assert_code_geometry(rows: &[Row], p: Palette, width: u16) {
+    /// The copyable text of unwrapped markdown.
+    fn original(input: &str) -> String {
+        let lines = markdown::render(input, Palette::new(), true, 80);
+        lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn assert_code_geometry(rows: &[Row], width: u16) {
+        let p = Palette::new();
         for row in rows {
             let mut buffer = Buffer::empty(Rect::new(0, 0, width + 2, 1));
             buffer.set_style(buffer.area, Style::default().bg(p.agent));
-            render_row_line(
-                row,
-                Rect::new(1, 0, width, 1),
-                &mut buffer,
-                Style::default().fg(p.fg).bg(p.agent),
-                p,
-            );
-            let left = 1 + row.layout.code.map_or(0, |code| code.indent);
+            let style = Style::default().fg(p.fg).bg(p.agent);
+            render_row_line(row, Rect::new(1, 0, width, 1), &mut buffer, style, p);
+            let left = 1 + row.layout.code().map_or(0, |code| code.indent());
             for x in 0..width + 2 {
-                let code = row.layout.code.is_some_and(|code| {
-                    (left..(left + code.width).min(width as usize + 1)).contains(&(x as usize))
+                let code = row.layout.code().is_some_and(|code| {
+                    (left..(left + code.width()).min(width as usize + 1)).contains(&(x as usize))
                 });
-                assert_eq!(
-                    buffer[(x, 0)].bg,
-                    if code { p.content.code_bg } else { p.agent },
-                    "row={:?}, x={x}",
-                    row.text()
-                );
+                let expected = if code { p.content.code_bg } else { p.agent };
+                assert_eq!(buffer[(x, 0)].bg, expected, "row={:?}, x={x}", row.text());
             }
-            if row.layout.decorative {
+            if row.layout.decorative() {
                 assert!(row.text().is_empty());
-                assert!(
-                    row.selection_range(
-                        0,
-                        Some((
-                            TextPosition { row: 0, byte: 0 },
-                            TextPosition { row: 1, byte: 0 }
-                        ))
-                    )
-                    .is_none()
+                let all = (
+                    TextPosition { row: 0, byte: 0 },
+                    TextPosition { row: 1, byte: 0 },
                 );
+                assert!(row.text_view().selection_range(0, Some(all)).is_none());
             }
         }
     }
 
     #[test]
     fn markdown_code_geometry_fits_pads_wraps_and_preserves_copy() {
-        let p = Palette::new();
         for input in [
             "```\n  alpha beta gamma delta  \n\n    \nlast\n```",
             "```unknown\n  alpha beta gamma delta  \n\n    \nlast\n```",
@@ -310,53 +286,44 @@ mod tests {
             "- ```\n  short\n  last\n  ```",
             "```\na\n```\n\n```\nlonger\n```",
         ] {
-            let original = markdown(input, p, 80)
-                .iter()
-                .map(Line::to_string)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let original = original(input);
             for width in [1, 2, 3, 7, 80] {
-                let rows = markdown_rows(input, width, p, None);
-                assert_code_geometry(&rows, p, width);
+                let rows = markdown_rows(input, width, None);
+                assert_code_geometry(&rows, width);
                 assert_eq!(copy_rows(&rows), original, "input {input:?}, width {width}");
-                let code_rows = rows
+                let code_rows: Vec<_> = rows
                     .iter()
-                    .filter(|row| row.layout.code.is_some())
-                    .collect::<Vec<_>>();
+                    .filter(|row| row.layout.code().is_some())
+                    .collect();
                 assert!(code_rows.len() >= 3);
-                assert!(code_rows[0].layout.decorative);
-                assert!(code_rows.last().unwrap().layout.decorative);
-                for row in code_rows.iter().filter(|row| !row.layout.decorative) {
+                assert!(code_rows[0].layout.decorative());
+                assert!(code_rows.last().unwrap().layout.decorative());
+                for row in code_rows.iter().filter(|row| !row.layout.decorative()) {
                     assert!(row.line.style.bg.is_none());
-                    if row.layout.source_prefix == 0 && row.layout.prefix.width() == 0 {
-                        let pad = row.layout.code.unwrap().padding;
+                    if row.layout.source_prefix().0 == 0 && row.layout.prefix.width() == 0 {
+                        let pad = row.layout.code().unwrap().padding();
                         assert_eq!(row.text_x(), 1 + pad as u16);
                         assert_eq!(row.byte_at_column(row.text_x()), 0);
                     }
                 }
             }
         }
-        let rows = markdown_rows(
-            "before `inline` after\n\n```\nabc\n\nx\n```\n\nafter",
-            40,
-            p,
-            None,
-        );
-        let code = rows
-            .iter()
-            .filter_map(|row| row.layout.code)
-            .collect::<Vec<_>>();
+        let input = "before `inline` after\n\n```\nabc\n\nx\n```\n\nafter";
+        let rows = markdown_rows(input, 40, None);
+        let code: Vec<_> = rows.iter().filter_map(|row| row.layout.code()).collect();
         assert_eq!(code.len(), 5); // three source rows plus top/bottom
-        assert!(code.iter().all(|code| code.width == 5 && code.padding == 1));
-        assert_code_geometry(&rows, p, 40);
-        assert!(rows.first().unwrap().layout.code.is_none());
-        assert!(rows.last().unwrap().layout.code.is_none());
+        assert!(
+            code.iter()
+                .all(|code| code.width() == 5 && code.padding() == 1)
+        );
+        assert_code_geometry(&rows, 40);
+        assert!(rows.first().unwrap().layout.code().is_none());
+        assert!(rows.last().unwrap().layout.code().is_none());
         assert_eq!(copy_rows(&rows), "before inline after\n\nabc\n\nx\n\nafter");
     }
 
     #[test]
     fn markdown_code_geometry_survives_highlight_arrival_without_styling_tools() {
-        use super::super::super::tool_view::{Document, HighlightCache, Role, Section};
         let source = "let answer = 42;  \n\n// a sufficiently long comment to wrap\n";
         let input = format!("```rust\n{source}```");
         let document = Document {
@@ -364,69 +331,51 @@ mod tests {
                 source: source.into(),
                 language: "rust".into(),
                 indent: 0,
-                gutters: Vec::new(),
+                gutters: Default::default(),
                 role: Role::Constant,
             }],
         };
-        let p = Palette::new();
         let mut cache = HighlightCache::default();
-        let pending = markdown_rows(&input, 80, p, Some(&cache));
+        let pending = markdown_rows(&input, 80, Some(&cache));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
+        while {
             cache.prepare(std::iter::once(&document));
-            if cache.is_fully_highlighted(&document) {
-                break;
-            }
+            !cache.is_fully_highlighted(&document)
+        } {
             assert!(
                 std::time::Instant::now() < deadline,
                 "highlight worker did not finish"
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let highlighted = markdown_rows(&input, 80, p, Some(&cache));
+        let highlighted = markdown_rows(&input, 80, Some(&cache));
         assert_eq!(copy_rows(&pending), copy_rows(&highlighted));
-        assert_eq!(
-            pending.iter().map(|row| &row.layout).collect::<Vec<_>>(),
-            highlighted
-                .iter()
-                .map(|row| &row.layout)
+        let layouts = |rows: &[Row]| {
+            rows.iter()
+                .map(|row| row.layout.clone())
                 .collect::<Vec<_>>()
-        );
+        };
+        assert_eq!(layouts(&pending), layouts(&highlighted));
         assert_ne!(pending[1].line.spans, highlighted[1].line.spans);
         for width in [1, 5, 80] {
-            assert_code_geometry(&markdown_rows(&input, width, p, Some(&cache)), p, width);
+            assert_code_geometry(&markdown_rows(&input, width, Some(&cache)), width);
         }
         let tool_lines = document.lines(Some(&cache));
         assert!(tool_lines.iter().all(|line| line.style.bg.is_none()));
-        assert!(
-            tool_lines
-                .iter()
-                .flat_map(|line| &line.spans)
-                .all(|span| span.style.bg.is_none())
-        );
-        for (markdown, tool) in highlighted
-            .iter()
-            .filter(|row| !row.layout.decorative)
-            .zip(tool_lines)
-        {
-            assert_eq!(
-                markdown
-                    .line
-                    .spans
-                    .iter()
-                    .filter(|span| !span.content.is_empty())
-                    .collect::<Vec<_>>(),
-                tool.spans
-                    .iter()
-                    .filter(|span| !span.content.is_empty())
-                    .collect::<Vec<_>>()
-            );
+        let mut spans = tool_lines.iter().flat_map(|line| &line.spans);
+        assert!(spans.all(|span| span.style.bg.is_none()));
+        let visible = |spans: &[Span<'static>]| {
+            let spans = spans.iter().filter(|span| !span.content.is_empty());
+            spans.cloned().collect::<Vec<_>>()
+        };
+        let source_rows = highlighted.iter().filter(|row| !row.layout.decorative());
+        for (markdown, tool) in source_rows.zip(tool_lines) {
+            assert_eq!(visible(&markdown.line.spans), visible(&tool.spans));
         }
     }
 
     #[test]
     fn markdown_hanging_prefixes_are_decorative_and_preserve_copy() {
-        let p = Palette::new();
         for input in [
             "- alpha bravo charlie delta echo foxtrot",
             "10. alpha bravo charlie delta echo foxtrot",
@@ -435,15 +384,11 @@ mod tests {
             "> - alpha bravo charlie delta echo foxtrot",
             "1. outer\n   - inner alpha bravo charlie delta echo foxtrot",
         ] {
-            let original = markdown(input, p, 80)
-                .iter()
-                .map(Line::to_string)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let original = original(input);
             for width in [8, 16, 24] {
-                let rows = markdown_rows(input, width, p, None);
+                let rows = markdown_rows(input, width, None);
                 assert_eq!(copy_rows(&rows), original, "{input:?}, width {width}");
-                for row in rows.iter().filter(|row| row.continued) {
+                for row in rows.iter().filter(|row| row.layout.continued()) {
                     assert!(
                         row.layout.prefix.width() >= 2,
                         "missing hanging prefix for {input:?}"
@@ -455,49 +400,40 @@ mod tests {
         }
     }
 
-    fn expandable_entry() -> model::Entry {
-        model::Entry {
-            key: "entry".into(),
-            text:
-                "first header with many wrapped fragments\nbody with many wrapped fragments\n  \n"
-                    .into(),
-            surface: Surface::Tool,
-            expandable: true,
-            default_open: false,
-            running: false,
-            footer: None,
-            request: None,
-            indent: 0,
-            job: None,
-            compact_after: false,
-            header: None,
-            document: None,
-        }
-    }
-
     #[test]
     fn expanded_backgrounds_fill_all_content_rows_even_with_selection() {
         let p = Palette::new();
         let entry = expandable_entry();
+        let highlights = HighlightCache::default();
+        let mut layout = Vec::new();
+        let options = EntryLayout {
+            width: 20,
+            palette: p,
+            highlights: &highlights,
+            request_columns: RequestColumns::default(),
+            expanded: entry.default_open,
+        };
+        update_entry_rows(&mut layout, &entry, 0, options);
         let mut rows = RowBlocks::default();
-        *rows.block_mut(0) = layout(std::slice::from_ref(&entry), 20, p, None);
-        rows.finish_update(0);
-        let nonblank = rows
+        rows.replace_entry(0, layout, Vec::new());
+        let nonblank: Vec<_> = rows
             .iter()
             .filter(|row| !row.text().trim().is_empty())
-            .collect::<Vec<_>>();
+            .collect();
         assert!(nonblank.len() > 4, "both header and body should wrap");
         for row in rows.iter() {
+            let expected = if row.layout.is_spacer() {
+                p.background(row.surface)
+            } else {
+                p.content.code_bg
+            };
             for interactive in [false, true] {
-                for text_selected in [false, true] {
+                for selected in [false, true] {
+                    let background = row.background(p, true, interactive, selected);
                     assert_eq!(
-                        row.background(p, true, interactive, text_selected),
-                        if !row.blank {
-                            p.content.code_bg
-                        } else {
-                            p.background(row.surface)
-                        },
-                        "row {:?}, interactive={interactive}, selection={text_selected}",
+                        background,
+                        expected,
+                        "row {:?}, {interactive}/{selected}",
                         row.text()
                     );
                 }
@@ -511,70 +447,58 @@ mod tests {
 
     #[test]
     fn foreground_only_overlay_preserves_each_underlying_background() {
-        let bounds = Rect::new(0, 0, 24, 2);
         let area = Rect::new(3, 1, 17, 1);
-        let mut buffer = Buffer::empty(bounds);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 24, 2));
         for (index, cell) in buffer.content.iter_mut().enumerate() {
+            let bg = if index % 2 == 0 {
+                Color::Red
+            } else {
+                Color::Blue
+            };
             cell.set_symbol("x")
-                .set_bg(if index % 2 == 0 {
-                    Color::Red
-                } else {
-                    Color::Blue
-                })
+                .set_bg(bg)
                 .set_style(Style::default().add_modifier(Modifier::all()));
         }
-        let backgrounds = buffer
-            .content
-            .iter()
-            .map(|cell| cell.bg)
-            .collect::<Vec<_>>();
-        render_line(
-            &Line::from("↓ Latest activity"),
-            area,
-            &mut buffer,
-            Style::default()
-                .fg(Color::Yellow)
-                .remove_modifier(Modifier::all()),
-        );
-        assert_eq!(
+        let backgrounds = |buffer: &Buffer| {
             buffer
                 .content
                 .iter()
                 .map(|cell| cell.bg)
-                .collect::<Vec<_>>(),
-            backgrounds
-        );
+                .collect::<Vec<_>>()
+        };
+        let before = backgrounds(&buffer);
+        let style = Style::default()
+            .fg(Color::Yellow)
+            .remove_modifier(Modifier::all());
+        render_line(&Line::from("↓ Latest activity"), area, &mut buffer, style);
+        assert_eq!(backgrounds(&buffer), before);
+        let cells = (area.x..area.right()).map(|x| &buffer[(x, area.y)]);
         assert_eq!(
-            (area.x..area.right())
-                .map(|x| buffer[(x, area.y)].symbol())
-                .collect::<String>(),
+            cells.clone().map(|cell| cell.symbol()).collect::<String>(),
             "↓ Latest activity"
         );
-        assert!((area.x..area.right()).all(|x| buffer[(x, area.y)].modifier.is_empty()));
+        assert!(cells.clone().all(|cell| cell.modifier.is_empty()));
     }
 
     #[test]
     fn borrowed_lines_match_paragraph_styles_and_clipping() {
+        let bold = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
         let lines = [
             Line::from("plain text"),
             Line::from("  界 👩‍💻 wide  "),
             Line::from(vec![
-                Span::styled(
-                    "bold ",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
+                Span::styled("bold ", bold),
                 Span::styled("界 tail", Style::default().bg(Color::Blue)),
             ])
             .style(Style::default().add_modifier(Modifier::ITALIC)),
             Line::default(),
         ];
+        let style = Style::default().fg(Color::White).bg(Color::DarkGray);
         for line in lines {
             for width in 0..20 {
-                let bounds = Rect::new(0, 0, 25, 3);
                 let area = Rect::new(2, 1, width, 1);
-                let mut expected = Buffer::empty(bounds);
+                let mut expected = Buffer::empty(Rect::new(0, 0, 25, 3));
                 let mut actual = expected.clone();
-                let style = Style::default().fg(Color::White).bg(Color::DarkGray);
                 Paragraph::new(line.clone())
                     .style(style)
                     .render(area, &mut expected);
@@ -582,36 +506,5 @@ mod tests {
                 assert_eq!(actual, expected, "width {width}: {line:?}");
             }
         }
-    }
-    fn layout(
-        entries: &[model::Entry],
-        width: u16,
-        p: Palette,
-        highlights: Option<&super::super::super::tool_view::HighlightCache>,
-    ) -> Vec<Row> {
-        let fallback = super::super::super::tool_view::HighlightCache::default();
-        let highlights = highlights.unwrap_or(&fallback);
-        let mut rows = Vec::new();
-        for (index, entry) in entries.iter().enumerate() {
-            update_entry_rows(
-                &mut rows,
-                &mut CachedEntry::default(),
-                entry,
-                index,
-                EntryLayout {
-                    width,
-                    palette: p,
-                    highlights,
-                    request_columns: RequestColumns::default(),
-                    expanded: entry.default_open,
-                },
-                None,
-            );
-        }
-        rows
-    }
-
-    fn markdown(text: &str, p: Palette, width: usize) -> Vec<Line<'static>> {
-        markdown::render(text, p, true, width)
     }
 }

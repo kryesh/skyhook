@@ -1,6 +1,6 @@
 //! Read-only CLI inspection, deliberately independent of harness/session startup.
 
-use super::{Args, DumpKind, launch};
+use super::{cli::Inspection, launch};
 use std::io::{self, Write};
 
 /// Diagnostics can contain repository-controlled paths and parser messages.
@@ -17,32 +17,10 @@ pub(super) fn diagnostic_text(value: impl std::fmt::Display) -> String {
     output
 }
 
-pub(super) fn validate_options(args: &Args) -> Result<(), clap::Error> {
-    let Some(kind) = args.dump else {
-        return Ok(());
-    };
-    let conflict = if args.command.is_some() {
-        Some("--dump cannot be combined with an auth command")
-    } else if kind == DumpKind::Skills
-        && (args.config.is_some() || args.capabilities.is_some() || args.approve_all)
-    {
-        Some("--dump skills uses skill discovery, not --config, --capabilities, or --approve-all")
-    } else {
-        None
-    };
-    if let Some(message) = conflict {
-        return Err(clap::Error::raw(
-            clap::error::ErrorKind::ArgumentConflict,
-            message,
-        ));
-    }
-    Ok(())
-}
-
-pub(super) async fn run(args: &Args, kind: DumpKind) -> Result<(), Box<dyn std::error::Error>> {
-    match kind {
-        DumpKind::Config => {
-            let resolved = launch::resolve_config(args).await?;
+pub(super) async fn run(request: Inspection) -> Result<(), Box<dyn std::error::Error>> {
+    match request {
+        Inspection::Config(request) => {
+            let resolved = launch::resolve_config(&request).await?;
             for diagnostic in &resolved.report.diagnostics {
                 eprintln!("skyhook config: {}", diagnostic_text(diagnostic));
             }
@@ -52,14 +30,14 @@ pub(super) async fn run(args: &Args, kind: DumpKind) -> Result<(), Box<dyn std::
                     diagnostic_text(source.display())
                 );
             }
-            launch::validate_config(&resolved.config)?;
+            resolved.config.clone().into_runtime()?;
             let output = resolved.config.to_toml()?;
             io::stdout().lock().write_all(output.as_bytes())?;
         }
-        DumpKind::Skills => {
-            let workspace = tokio::fs::canonicalize(&args.workspace)
+        Inspection::Skills(request) => {
+            let workspace = tokio::fs::canonicalize(&request)
                 .await
-                .map_err(|error| format!("workspace {}: {error}", args.workspace.display()))?;
+                .map_err(|error| format!("workspace {}: {error}", request.display()))?;
             if !workspace.is_dir() {
                 return Err("workspace must be a directory".into());
             }

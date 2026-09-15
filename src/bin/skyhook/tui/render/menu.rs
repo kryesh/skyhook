@@ -1,18 +1,27 @@
 //! Agent identity and command menu rendering.
 
 use super::*;
+use skyhook::job::JobState;
 
-pub(super) fn agent_status_color(running: bool, status: &str, p: Palette) -> Color {
-    if status == "Failed" {
-        p.content.error
-    } else if status.starts_with("Waiting") || status.starts_with("Reconnecting") {
-        p.content.warning
-    } else if running {
-        p.content.primary
-    } else if status == "Completed" {
-        p.content.success
-    } else {
-        p.muted
+pub(super) fn agent_status_color(state: model::AgentDisplayState, p: Palette) -> Color {
+    use model::AgentDisplayState as State;
+    match state {
+        State::Job(JobState::Failed) => p.content.error,
+        // Only a bounded retry warns; an unlimited one reads as ordinary work.
+        State::Waiting(_)
+        | State::Reconnecting {
+            max_attempts: Some(_),
+            ..
+        }
+        | State::Job(JobState::AwaitingApproval | JobState::WaitingInput) => p.content.warning,
+        State::Working
+        | State::Reconnecting {
+            max_attempts: None, ..
+        }
+        | State::Compacting
+        | State::RunningTools => p.content.primary,
+        State::Job(JobState::Completed) => p.content.success,
+        State::Ready | State::Job(_) => p.muted,
     }
 }
 
@@ -45,46 +54,42 @@ pub(super) fn agent_identity(
 }
 
 pub(super) fn agent_symbol(
-    running: bool,
-    status: &str,
+    state: model::AgentDisplayState,
     terminal: bool,
     tick: usize,
 ) -> &'static str {
-    if running {
-        spinner(tick)
-    } else if status == "Failed" {
-        "✗"
-    } else if matches!(status, "Cancelled" | "Interrupted") {
-        "■"
-    } else if status.contains("permission") {
-        "◇"
-    } else if status.contains("input") {
-        "?"
-    } else if status.starts_with("Waiting") {
-        "◷"
-    } else if terminal {
-        "✓"
-    } else {
-        "·"
+    use model::{AgentDisplayState as State, WaitReason};
+    if state.running() {
+        return spinner(tick);
+    }
+    match state {
+        State::Job(JobState::Failed) => "✗",
+        State::Job(JobState::Cancelled | JobState::Interrupted) => "■",
+        State::Waiting(WaitReason::Permission) | State::Job(JobState::AwaitingApproval) => "◇",
+        State::Waiting(WaitReason::Input | WaitReason::ParentInput)
+        | State::Job(JobState::WaitingInput) => "?",
+        State::Waiting(WaitReason::Child) => "◷",
+        _ if terminal => "✓",
+        _ => "·",
     }
 }
 pub(super) fn draw_menu_item(
     frame: &mut Frame,
     row: Rect,
-    item: &super::super::app::Item,
+    item: &super::super::app::ItemRef<'_>,
     kind: &MenuKind,
     selected: bool,
     p: Palette,
     bg: Color,
 ) {
-    let label = model::clean(&item.label);
-    let detail = model::clean(&item.detail);
-    let fg = if selected && !matches!(kind, MenuKind::Info | MenuKind::Output(_)) {
+    let label = model::clean(item.label);
+    let detail = model::clean(item.detail);
+    let fg = if selected && !matches!(kind, MenuKind::Info(_) | MenuKind::Output(_, _)) {
         p.content.primary
     } else {
         p.fg
     };
-    if matches!(kind, MenuKind::Commands) {
+    if matches!(kind, MenuKind::Commands(_)) {
         // Paint the whole row, including the gap between label and shortcut.
         fill(frame, row, bg);
         // Never sacrifice label space for a shortcut. Visible hints share the
@@ -127,7 +132,7 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
     let Some(menu) = &app.menu else { return };
     let area = app.content_rect;
     // Avoid spending scarce identity space on margins in narrow palettes.
-    let minimum_width = if matches!(menu.kind, MenuKind::Agents) {
+    let minimum_width = if matches!(menu.kind, MenuKind::Agents(_)) {
         31
     } else {
         20
@@ -146,12 +151,12 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
     text(
         frame,
         r(rect.x + 1, rect.y + 1, width.saturating_sub(2), 1),
-        format!("> {}▏", model::clean(&menu.input.text)),
+        format!("> {}▏", model::clean(menu.input.text())),
         p.fg,
         p.input,
     );
     let items = menu.filtered();
-    let agent_menu = matches!(menu.kind, MenuKind::Agents);
+    let agent_menu = matches!(menu.kind, MenuKind::Agents(_));
     let agent_stats = if agent_menu {
         app.projection
             .agents
@@ -197,16 +202,16 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
         let selected = i == menu.selected;
         let bg = if selected { p.selected } else { p.input };
         let row = r(rect.x + 1, y, width.saturating_sub(2), 1);
-        if agent_menu {
+        if let MenuKind::Agents(agents) = &menu.kind {
             if let Some(agent) = app
                 .projection
                 .agents
                 .iter()
-                .find(|agent| agent.id.to_string() == item.value)
+                .find(|agent| agent.id == agents[item.index].value)
             {
-                let (running, status) = app.agent_status(agent);
-                app.animating |= running;
-                let symbol = agent_symbol(running, &status, agent.terminal, app.tick_count);
+                let state = app.agent_status(agent);
+                app.animating |= state.running();
+                let symbol = agent_symbol(state, agent.terminal(), app.tick_count);
                 let stats = model::agent_footer_stats(&app.snapshot, &app.projection, &agent.id);
                 let target = model::target_suffix(&agent.target);
                 let indent = (agent.id.depth() as u16 * 4).min(row.width / 3);
@@ -215,10 +220,7 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
                     &agent.name,
                     &target,
                     &" ".repeat(indent as usize),
-                    Span::styled(
-                        symbol,
-                        Style::default().fg(agent_status_color(running, &status, p)),
-                    ),
+                    Span::styled(symbol, Style::default().fg(agent_status_color(state, p))),
                     name_width,
                     p,
                 );
@@ -228,8 +230,8 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
                     text(
                         frame,
                         r(row.x + name_width + 2, y, columns.status_width, 1),
-                        status.clone(),
-                        agent_status_color(running, &status, p),
+                        state.label(),
+                        agent_status_color(state, p),
                         bg,
                     );
                 }
@@ -251,7 +253,7 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
         }
         app.hits.push((row, Hit::Menu(i)));
     }
-    if items.is_empty() && !matches!(menu.kind, MenuKind::Attach | MenuKind::OutputSearch(_)) {
+    if items.is_empty() && !matches!(menu.kind, MenuKind::OutputSearch(_)) {
         text(
             frame,
             r(
@@ -282,21 +284,25 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
 
     #[tokio::test]
     async fn agents_palette_hides_columns_without_stacking_rows() {
         let (_root, mut app) = crate::tui::app::tests::fixture().await;
         let root = app.projection.agents[0].clone();
-        app.projection.agents = (0..2)
+        let agents: Vec<_> = (0..2)
             .map(|index| {
                 let mut agent = root.clone();
                 agent.id = root.id.child(index);
                 agent.name = format!("agent-{index}");
-                agent.terminal = true;
                 agent
             })
             .collect();
-        app.command("agents");
+        app.projection.agents = agents.clone();
+        for agent in agents {
+            app.projection.complete_agent(&agent.id);
+        }
+        app.command(crate::tui::keys::Command::Agents);
         for (width, stats, status) in [
             (40, false, false),
             (65, false, false),
@@ -304,8 +310,7 @@ mod tests {
             (80, false, true),
             (120, true, true),
         ] {
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 10)).unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
             app.content_rect = r(0, 0, width, 10);
             app.hits.clear();
             terminal
@@ -318,25 +323,28 @@ mod tests {
                     .collect::<String>()
             };
             assert_eq!(line(2).contains("Input (uncached)"), stats);
-            let rows = app
-                .hits
-                .iter()
+            let hits = app.hits.iter();
+            let rows: Vec<_> = hits
                 .filter_map(|(rect, hit)| matches!(hit, Hit::Menu(_)).then_some(*rect))
-                .collect::<Vec<_>>();
+                .collect();
             assert_eq!(rows.len(), 2);
             for (index, row) in rows.iter().enumerate() {
-                assert_eq!(row.height, 1);
-                assert_eq!(row.y, 2 + u16::from(stats) + index as u16);
-                assert!(line(row.y).contains(&format!("agent-{index}")));
-                assert_eq!(line(row.y).contains("Completed"), status);
+                assert_eq!(
+                    (row.height, row.y),
+                    (1, 2 + u16::from(stats) + index as u16)
+                );
+                let text = line(row.y);
+                assert!(text.contains(&format!("agent-{index}")));
+                assert_eq!(text.contains("Completed"), status);
             }
         }
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
+        app.session().as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[test]
     fn menu_hints_are_muted_right_aligned_and_yield_to_labels() {
         let p = Palette::new();
+        let kind = MenuKind::Commands(vec![]);
         for (label, hint) in [
             ("New session", "ctrl+x n"),
             ("Quit", "alt+q"),
@@ -344,28 +352,25 @@ mod tests {
             ("Unbound", ""),
             ("Long custom shortcut", "ctrl+x ctrl+y ctrl+z"),
         ] {
+            let item = super::super::super::app::ItemRef {
+                index: 0,
+                label,
+                detail: hint,
+            };
             for width in [0, 1, 6, 12, 20, 38, 80] {
                 for selected in [false, true] {
-                    let item = super::super::super::app::Item {
-                        value: String::new(),
-                        label: label.into(),
-                        detail: hint.into(),
-                        attachment: None,
-                    };
-                    let mut terminal =
-                        ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 3)).unwrap();
+                    let mut terminal = Terminal::new(TestBackend::new(90, 3)).unwrap();
                     let row = r(3, 1, width, 1);
                     let bg = if selected { p.selected } else { p.input };
                     terminal
                         .draw(|frame| {
                             fill(frame, frame.area(), p.base);
                             fill(frame, row, bg);
-                            draw_menu_item(frame, row, &item, &MenuKind::Commands, selected, p, bg);
+                            draw_menu_item(frame, row, &item, &kind, selected, p, bg);
                         })
                         .unwrap();
                     let buffer = terminal.backend().buffer();
-                    let fits =
-                        !hint.is_empty() && label.width() + hint.width() + 2 <= width as usize;
+                    let cell = move |x: u16| &buffer[(x, 1)];
                     // Ratatui resets the hidden continuation cells of wide
                     // graphemes. They are not independently painted terminal
                     // cells: the leading cell's style covers the whole glyph.
@@ -373,16 +378,15 @@ mod tests {
                     let mut x = row.x;
                     while x < row.right() {
                         painted.push(x);
-                        x += buffer[(x, 1)].symbol().width().max(1) as u16;
+                        x += cell(x).symbol().width().max(1) as u16;
                     }
-                    let actual = painted
-                        .iter()
-                        .map(|&x| buffer[(x, 1)].symbol())
-                        .collect::<String>();
+                    let actual: String = painted.iter().map(|&x| cell(x).symbol()).collect();
+                    let fits =
+                        !hint.is_empty() && label.width() + hint.width() + 2 <= width as usize;
                     if fits {
                         assert!(actual.ends_with(hint), "{actual:?}");
                         let start = row.right() - hint.width() as u16;
-                        assert!((start..row.right()).all(|x| buffer[(x, 1)].fg == p.muted));
+                        assert!((start..row.right()).all(|x| cell(x).fg == p.muted));
                     } else if !hint.is_empty() {
                         assert!(!actual.contains(hint), "{actual:?}");
                     }
@@ -390,19 +394,15 @@ mod tests {
                         assert!(actual.starts_with(label), "{actual:?}");
                     }
                     if width > 0 && !label.contains('界') {
-                        assert_eq!(
-                            buffer[(row.x, 1)].fg,
-                            if selected { p.content.primary } else { p.fg }
-                        );
+                        let fg = if selected { p.content.primary } else { p.fg };
+                        assert_eq!(cell(row.x).fg, fg);
                     }
+                    let filled = painted.iter().all(|&x| cell(x).bg == bg);
                     assert!(
-                        painted.iter().all(|&x| buffer[(x, 1)].bg == bg),
-                        "row background: label={label:?}, hint={hint:?}, width={width}, selected={selected}: {:?}",
-                        (row.x..row.right())
-                            .map(|x| (x, buffer[(x, 1)].symbol(), buffer[(x, 1)].bg))
-                            .collect::<Vec<_>>()
+                        filled,
+                        "row background: {label:?}, {hint:?}, width={width}, selected={selected}"
                     );
-                    assert_eq!(buffer[(row.right(), 1)].bg, p.base);
+                    assert_eq!(cell(row.right()).bg, p.base);
                 }
             }
         }

@@ -131,6 +131,9 @@ impl From<&TargetDefinition> for TargetRecord {
 #[derive(Clone, Default)]
 pub struct TargetRegistry {
     entries: Arc<RwLock<BTreeMap<String, TargetDefinition>>>,
+    /// Serializes updates from preparation through publication, so readers only
+    /// wait for the in-memory install, never for the journal append.
+    updates: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl TargetRegistry {
@@ -144,6 +147,7 @@ impl TargetRegistry {
         validate_graph(&entries)?;
         Ok(Self {
             entries: Arc::new(RwLock::new(entries)),
+            updates: Arc::default(),
         })
     }
 
@@ -195,12 +199,23 @@ impl TargetRegistry {
         &self,
         definitions: Vec<TargetDefinition>,
     ) -> Result<(Vec<TargetDefinition>, Vec<String>), TargetError> {
-        let mut entries = self.entries.write().await;
-        let mut next = entries.clone();
+        Ok(self.prepare_upsert_many(definitions).await?.publish().await)
+    }
+
+    /// Retain the update gate through durable acceptance so publication cannot
+    /// fail or allocate a second, different revision after the append.
+    pub(super) async fn prepare_upsert_many(
+        &self,
+        definitions: Vec<TargetDefinition>,
+    ) -> Result<PreparedTargetUpdate, TargetError> {
+        let update = self.updates.clone().lock_owned().await;
+        let mut next = self.entries.read().await.clone();
         let mut saved = Vec::new();
         for mut definition in definitions {
             definition.source = TargetSource::Session;
-            definition.revision = entries
+            // Allocate against the staged batch as well as the live registry:
+            // repeated names in one batch must not reuse a route revision.
+            definition.revision = next
                 .get(&definition.name)
                 .map_or(1, |old| old.revision.saturating_add(1));
             next.insert(definition.name.clone(), definition.clone());
@@ -213,8 +228,35 @@ impl TargetRegistry {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        *entries = next;
-        Ok((saved, invalidated))
+        Ok(PreparedTargetUpdate {
+            _update: update,
+            entries: self.entries.clone(),
+            next,
+            saved,
+            invalidated,
+        })
+    }
+}
+
+/// Prepared target definitions and the sole right to install them. Dropping an
+/// unaccepted update leaves the registry unchanged. An accepted append owner
+/// must retain this value until its corresponding live publication completes.
+pub(super) struct PreparedTargetUpdate {
+    _update: tokio::sync::OwnedMutexGuard<()>,
+    entries: Arc<RwLock<BTreeMap<String, TargetDefinition>>>,
+    next: BTreeMap<String, TargetDefinition>,
+    saved: Vec<TargetDefinition>,
+    invalidated: Vec<String>,
+}
+
+impl PreparedTargetUpdate {
+    pub(super) fn definitions(&self) -> &[TargetDefinition] {
+        &self.saved
+    }
+
+    pub(super) async fn publish(self) -> (Vec<TargetDefinition>, Vec<String>) {
+        *self.entries.write().await = self.next;
+        (self.saved, self.invalidated)
     }
 }
 
@@ -386,22 +428,23 @@ mod tests {
             target("build", Some("bastion")),
         ])
         .unwrap();
-        assert_eq!(
-            registry
-                .route("build")
-                .await
-                .unwrap()
-                .iter()
-                .map(|t| t.name.as_str())
-                .collect::<Vec<_>>(),
-            ["edge", "bastion", "build"]
-        );
+        let route = registry.route("build").await.unwrap();
+        let names: Vec<_> = route.iter().map(|target| target.name.as_str()).collect();
+        assert_eq!(names, ["edge", "bastion", "build"]);
         let mut changed = target("edge", Some("build"));
         changed.source = TargetSource::Session;
-        assert!(matches!(
-            registry.upsert_many(vec![changed]).await,
-            Err(TargetError::Cycle(_))
-        ));
+        let result = registry.upsert_many(vec![changed]).await;
+        assert!(matches!(result, Err(TargetError::Cycle(_))));
+    }
+
+    #[tokio::test]
+    async fn repeated_names_in_a_batch_receive_distinct_revisions() {
+        let registry = TargetRegistry::default();
+        let batch = vec![target("build", None), target("build", None)];
+        let (saved, _) = registry.upsert_many(batch).await.unwrap();
+        let revisions: Vec<_> = saved.iter().map(|target| target.revision).collect();
+        assert_eq!(revisions, [1, 2]);
+        assert_eq!(registry.get("build").await.unwrap().revision, 2);
     }
 
     #[tokio::test]
@@ -415,29 +458,27 @@ mod tests {
         assert!(!json.contains("secret-key"));
         assert!(json.contains("\"auth\":\"key\""));
     }
+
     #[tokio::test]
     async fn batch_registration_is_atomic_and_validates_origins() {
         let registry = TargetRegistry::from_definitions([target("first", None)]).unwrap();
         let before = registry.definitions().await;
         let mut invalid = target("invalid", None);
         invalid.origin = "first".into();
-        assert!(
-            registry
-                .upsert_many(vec![target("added", None), invalid])
-                .await
-                .is_err()
-        );
+        let result = registry
+            .upsert_many(vec![target("added", None), invalid])
+            .await;
+        assert!(result.is_err());
         assert_eq!(registry.definitions().await, before);
     }
+
     #[test]
     fn native_segments_cannot_silently_reinterpret_remote_credential_paths() {
         let first = target("first", None);
         let mut remote = target("remote", Some("first"));
         remote.origin = "first".into();
         let invalid = target("destination", Some("remote"));
-        assert!(matches!(
-            TargetRegistry::from_definitions([first, remote, invalid]),
-            Err(TargetError::Origin(_))
-        ));
+        let result = TargetRegistry::from_definitions([first, remote, invalid]);
+        assert!(matches!(result, Err(TargetError::Origin(_))));
     }
 }

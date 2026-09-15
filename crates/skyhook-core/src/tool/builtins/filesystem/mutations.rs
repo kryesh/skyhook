@@ -5,10 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
-use super::super::workspace::{
-    atomic_write, relative_path, resolve_existing, resolve_removable, resolve_writable,
-    resolve_writable_with_parents,
-};
+use super::super::workspace::{atomic_write, relative_path};
 use crate::tool::{
     PathKind, RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
     policy::{Capability, PathAccess},
@@ -25,29 +22,14 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             .argument_paths(|arguments| {
                 let args: WriteArgs = serde_json::from_value(arguments.clone())
                     .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
-                Ok(vec![crate::tool::PathArgument {
-                    name: "path".to_owned(),
-                    access: PathAccess::Write,
-                    kind: if args.create_parents {
-                        PathKind::WritableWithParents
-                    } else {
-                        PathKind::Writable
-                    },
-                    default: None,
-                    pointer: None,
-                }])
+                Ok(vec![crate::tool::PathArgument::top_level(
+                    "path", None, PathAccess::Write,
+                    if args.create_parents { PathKind::WritableWithParents } else { PathKind::Writable },
+                )])
             }),
         |context, args| async move {
             check_write_size(&args.content)?;
-            let path = if args.create_parents {
-                resolve_writable_with_parents(
-                    &context.execution_location.workspace,
-                    &args.path,
-                )
-                .await?
-            } else {
-                resolve_writable(&context.execution_location.workspace, &args.path).await?
-            };
+            let path = std::path::PathBuf::from(&args.path);
             if args.create_parents {
                 let parent = path
                     .parent()
@@ -56,7 +38,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             }
             atomic_write(&path, args.content.as_bytes()).await?;
             Ok(WriteOutput {
-                path: relative_path(&context.execution_location.workspace, &path),
+                path: relative_path(&context.execution_location().workspace, &path),
                 bytes: args.content.len(),
             })
         },
@@ -68,6 +50,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             .placement(crate::tool::ToolPlacement::InheritWorkspace)
             .path_argument("path", PathAccess::Write, PathKind::Existing),
         |context, args| async move {
+            // Reject oversized input before reading or building a replacement.
             if args.old.len().saturating_add(args.new.len()) > MAX_WRITE_BYTES {
                 return Err(ToolError::InvalidArguments(format!(
                     "replace input exceeds the {MAX_WRITE_BYTES}-byte limit"
@@ -78,7 +61,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
                     "old cannot be empty".to_owned(),
                 ));
             }
-            let path = resolve_existing(&context.execution_location.workspace, &args.path).await?;
+            let path = std::path::PathBuf::from(&args.path);
             let text = fs::read_to_string(&path).await?;
             let replacements = text.matches(&args.old).count();
             if replacements != args.count {
@@ -91,7 +74,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             check_write_size(&output)?;
             atomic_write(&path, output.as_bytes()).await?;
             Ok(EditOutput {
-                path: relative_path(&context.execution_location.workspace, &path),
+                path: relative_path(&context.execution_location().workspace, &path),
                 replacements,
                 bytes: output.len(),
             })
@@ -105,7 +88,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             .path_argument("path", PathAccess::Write, PathKind::Existing),
         |context, args| async move {
             check_write_size(&args.patch)?;
-            let path = resolve_existing(&context.execution_location.workspace, &args.path).await?;
+            let path = std::path::PathBuf::from(&args.path);
             let text = fs::read_to_string(&path).await?;
             let patch = Patch::from_str(&args.patch)
                 .map_err(|error| ToolError::Failed(error.to_string()))?;
@@ -115,7 +98,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             check_write_size(&output)?;
             atomic_write(&path, output.as_bytes()).await?;
             Ok(EditOutput {
-                path: relative_path(&context.execution_location.workspace, &path),
+                path: relative_path(&context.execution_location().workspace, &path),
                 replacements,
                 bytes: output.len(),
             })
@@ -128,27 +111,27 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             .placement(crate::tool::ToolPlacement::InheritWorkspace)
             .path_argument("path", PathAccess::Write, PathKind::Removable),
         |context, args| async move {
-            let path = resolve_removable(&context.execution_location.workspace, &args.path).await?;
+            let path = std::path::PathBuf::from(&args.path);
             let metadata = fs::symlink_metadata(&path).await?;
             let kind = if metadata.file_type().is_symlink() {
                 fs::remove_file(&path).await?;
-                "symlink"
+                RemoveKind::Symlink
             } else if metadata.is_file() {
                 fs::remove_file(&path).await?;
-                "file"
+                RemoveKind::File
             } else if metadata.is_dir() {
                 if args.recursive {
                     fs::remove_dir_all(&path).await?;
                 } else {
                     fs::remove_dir(&path).await?;
                 }
-                "directory"
+                RemoveKind::Directory
             } else {
                 return Err(ToolError::Failed("unsupported filesystem entry".to_owned()));
             };
             Ok(RemoveOutput {
-                path: relative_path(&context.execution_location.workspace, &path),
-                kind: kind.to_owned(),
+                path: relative_path(&context.execution_location().workspace, &path),
+                kind,
             })
         },
     )?;
@@ -226,7 +209,15 @@ struct RemoveArgs {
 #[derive(Serialize, JsonSchema)]
 struct RemoveOutput {
     path: String,
-    kind: String,
+    kind: RemoveKind,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum RemoveKind {
+    File,
+    Directory,
+    Symlink,
 }
 
 const fn default_one() -> usize {
@@ -235,34 +226,47 @@ const fn default_one() -> usize {
 
 #[cfg(test)]
 mod tests {
+    use crate::tool::builtins::workspace::atomic_write;
+    use serde_json::json;
     use std::sync::Arc;
 
     use super::*;
-    use crate::tool::{
-        executor::{ExecutionError, ToolExecutor},
-        policy::{AuthorizationRequest, Policy, PolicyDecision, PolicyFuture},
+    use crate::{
+        tests::{RecordingPolicy, TestRuntime},
+        tool::{
+            executor::{ExecutionError, ExecutionResult, ToolExecutor},
+            policy::{PolicyDecision, ResourceId},
+        },
     };
-    use tokio::sync::Mutex;
 
-    fn mutation_executor(runtime: &crate::tests::TestRuntime) -> ToolExecutor {
+    fn builder() -> ToolRegistryBuilder {
         let mut builder = ToolRegistryBuilder::default();
         register(&mut builder).unwrap();
-        runtime.executor(builder)
+        builder
+    }
+
+    async fn write(
+        executor: &ToolExecutor,
+        runtime: &TestRuntime,
+        path: impl serde::Serialize,
+        content: &str,
+        create_parents: bool,
+    ) -> Result<ExecutionResult, ExecutionError> {
+        let arguments = json!({"path": path, "content": content, "create_parents": create_parents});
+        executor.run_host(&runtime.agent, "write", arguments).await
     }
 
     #[tokio::test]
     async fn write_creates_nested_parents_only_when_requested() {
-        use serde_json::json;
-
-        let runtime = crate::tests::TestRuntime::new().await;
-        let executor = mutation_executor(&runtime);
+        let runtime = TestRuntime::new().await;
+        let executor = runtime.executor(builder());
         for create_parents in [None, Some(false)] {
             let mut args = json!({"path": "missing/nested/file.txt", "content": "text"});
             if let Some(value) = create_parents {
                 args["create_parents"] = json!(value);
             }
             let error = executor
-                .execute(runtime.agent.clone(), "write", args, None)
+                .run_host(&runtime.agent, "write", args)
                 .await
                 .unwrap_err();
             assert!(
@@ -271,27 +275,14 @@ mod tests {
             );
             assert!(!runtime.root.path().join("missing").exists());
         }
-        for absolute in [false, true] {
-            let relative = if absolute {
-                "absolute/nested/file.txt"
-            } else {
-                "relative/nested/file.txt"
-            };
+        for relative in ["relative/nested/file.txt", "absolute/nested/file.txt"] {
             let path = runtime.root.path().join(relative);
-            let input = if absolute {
+            let input = if relative.starts_with("absolute") {
                 path.to_string_lossy().into_owned()
             } else {
                 relative.to_owned()
             };
-            let result = executor
-                .execute(
-                    runtime.agent.clone(),
-                    "write",
-                    json!({
-                        "path": input, "content": "hello", "create_parents": true
-                    }),
-                    None,
-                )
+            let result = write(&executor, &runtime, &input, "hello", true)
                 .await
                 .unwrap();
             assert_eq!(result.output.value["path"], relative);
@@ -299,148 +290,98 @@ mod tests {
             assert_eq!(fs::read_to_string(&path).await.unwrap(), "hello");
             // Both modes keep working with existing parents and replace files.
             for create_parents in [false, true] {
-                executor.execute(runtime.agent.clone(), "write", json!({
-                    "path": input, "content": "replacement", "create_parents": create_parents
-                }), None).await.unwrap();
+                write(&executor, &runtime, &input, "replacement", create_parents)
+                    .await
+                    .unwrap();
                 assert_eq!(fs::read_to_string(&path).await.unwrap(), "replacement");
-                executor
-                    .execute(
-                        runtime.agent.clone(),
-                        "write",
-                        json!({
-                            "path": path.with_file_name(format!("new-{create_parents}.txt")),
-                            "content": "new", "create_parents": create_parents
-                        }),
-                        None,
-                    )
+                let sibling = path.with_file_name(format!("new-{create_parents}.txt"));
+                write(&executor, &runtime, sibling, "new", create_parents)
                     .await
                     .unwrap();
             }
             let entries = std::fs::read_dir(path.parent().unwrap()).unwrap();
-            assert!(entries.into_iter().all(|entry| {
-                !entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".skyhook-")
-            }));
+            let temporary =
+                |name: std::ffi::OsString| name.to_string_lossy().starts_with(".skyhook-");
+            assert!(
+                !entries
+                    .into_iter()
+                    .any(|entry| temporary(entry.unwrap().file_name()))
+            );
         }
     }
 
     #[tokio::test]
-    async fn write_create_parents_normalizes_missing_parent_traversal() {
-        use serde_json::json;
-
-        let runtime = crate::tests::TestRuntime::new().await;
-        let executor = mutation_executor(&runtime);
+    async fn write_create_parents_normalizes_traversal_and_rejects_file_ancestors_and_oversize() {
+        let runtime = TestRuntime::new().await;
+        let executor = runtime.executor(builder());
+        let root = runtime.root.path();
         for (input, expected) in [
             ("missing/../file.txt", "file.txt"),
             ("missing/../new/nested/file.txt", "new/nested/file.txt"),
         ] {
-            let result = executor
-                .execute(
-                    runtime.agent.clone(),
-                    "write",
-                    json!({
-                        "path": input, "content": "text", "create_parents": true
-                    }),
-                    None,
-                )
+            let result = write(&executor, &runtime, input, "text", true)
                 .await
                 .unwrap();
             assert_eq!(result.output.value["path"], expected);
             assert_eq!(
-                fs::read_to_string(runtime.root.path().join(expected))
-                    .await
-                    .unwrap(),
+                fs::read_to_string(root.join(expected)).await.unwrap(),
                 "text"
             );
-            assert!(!runtime.root.path().join("missing").exists());
+            assert!(!root.join("missing").exists());
         }
-    }
-
-    #[tokio::test]
-    async fn write_create_parents_rejects_file_ancestors_and_oversized_content() {
-        use serde_json::json;
-
-        let runtime = crate::tests::TestRuntime::new().await;
-        let executor = mutation_executor(&runtime);
-        fs::write(runtime.root.path().join("file"), "unchanged")
-            .await
-            .unwrap();
+        fs::write(root.join("file"), "unchanged").await.unwrap();
         for path in [
             "file/child.txt",
             "file/nested/child.txt",
             "file/../child.txt",
         ] {
             assert!(
-                executor
-                    .execute(
-                        runtime.agent.clone(),
-                        "write",
-                        json!({
-                            "path": path, "content": "text", "create_parents": true
-                        }),
-                        None
-                    )
+                write(&executor, &runtime, path, "text", true)
                     .await
                     .is_err()
             );
         }
         assert_eq!(
-            fs::read_to_string(runtime.root.path().join("file"))
-                .await
-                .unwrap(),
+            fs::read_to_string(root.join("file")).await.unwrap(),
             "unchanged"
         );
-        assert!(executor.execute(runtime.agent.clone(), "write", json!({
-            "path": "oversized/nested/file.txt", "content": "x".repeat(MAX_WRITE_BYTES + 1), "create_parents": true
-        }), None).await.is_err());
-        assert!(!runtime.root.path().join("oversized").exists());
+        let oversized = "x".repeat(MAX_WRITE_BYTES + 1);
+        let path = "oversized/nested/file.txt";
+        assert!(
+            write(&executor, &runtime, path, &oversized, true)
+                .await
+                .is_err()
+        );
+        assert!(!root.join("oversized").exists());
     }
 
-    #[derive(Default)]
-    struct WritePolicy {
-        deny_write: bool,
-        requests: Mutex<Vec<AuthorizationRequest>>,
-    }
-
-    impl Policy for WritePolicy {
-        fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
-            Box::pin(async move {
-                let deny = request.permissions.iter().any(|permission| {
-                    (self.deny_write && permission.capability == Capability::Write)
-                        || permission.resource.namespace == "path"
-                });
-                self.requests.lock().await.push(request);
-                if deny {
-                    PolicyDecision::Deny {
-                        reason: "write fixture denied".to_owned(),
-                    }
-                } else {
-                    PolicyDecision::allow()
+    /// Denies every path resource, plus every write when `deny_write` is set.
+    fn write_policy(deny_write: bool) -> Arc<RecordingPolicy> {
+        RecordingPolicy::deciding(move |request| {
+            let deny = request.permissions.iter().any(|permission| {
+                (deny_write && permission.capability == Capability::Write)
+                    || matches!(permission.resource, ResourceId::Path { .. })
+            });
+            if deny {
+                PolicyDecision::Deny {
+                    reason: "write fixture denied".to_owned(),
                 }
-            })
-        }
+            } else {
+                PolicyDecision::allow()
+            }
+        })
     }
 
     #[tokio::test]
     async fn write_create_parents_does_not_mutate_denied_paths() {
-        use serde_json::json;
-
-        let runtime = crate::tests::TestRuntime::new().await;
+        let runtime = TestRuntime::new().await;
         let workspace = runtime.root.path().join("workspace");
         fs::create_dir(&workspace).await.unwrap();
         let outside = runtime.root.path().join("outside");
         for deny_write in [false, true] {
-            let mut builder = ToolRegistryBuilder::default();
-            register(&mut builder).unwrap();
-            let policy = Arc::new(WritePolicy {
-                deny_write,
-                ..Default::default()
-            });
+            let policy = write_policy(deny_write);
             let executor = ToolExecutor::new(
-                builder.build(),
+                builder().build(),
                 policy.clone(),
                 runtime.jobs.clone(),
                 workspace.clone(),
@@ -457,20 +398,12 @@ mod tests {
                 paths.push("local/nested/file.txt".to_owned());
             }
             for path in paths {
-                let error = executor
-                    .execute(
-                        runtime.agent.clone(),
-                        "write",
-                        json!({
-                            "path": path, "content": "text", "create_parents": true
-                        }),
-                        None,
-                    )
+                let error = write(&executor, &runtime, path, "text", true)
                     .await
                     .unwrap_err();
                 assert!(matches!(error, ExecutionError::Denied(_)), "{error:?}");
             }
-            assert!(!policy.requests.lock().await.is_empty());
+            assert!(!policy.requests.lock().unwrap().is_empty());
             assert!(!outside.exists());
             assert!(!workspace.join("missing").exists());
             assert!(!workspace.join("local").exists());
@@ -480,53 +413,45 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn write_create_parents_resolves_symlinks_before_authorization() {
-        use serde_json::json;
         use std::os::unix::fs::symlink;
 
-        let runtime = crate::tests::TestRuntime::new().await;
+        let runtime = TestRuntime::new().await;
         let workspace = runtime.root.path().join("workspace");
         let outside = runtime.root.path().join("outside");
         fs::create_dir(&workspace).await.unwrap();
         fs::create_dir(&outside).await.unwrap();
         symlink(&outside, workspace.join("link")).unwrap();
         symlink(outside.join("missing"), workspace.join("dangling")).unwrap();
-        let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder).unwrap();
-        let policy = Arc::new(WritePolicy::default());
+        let policy = write_policy(false);
         let executor = ToolExecutor::new(
-            builder.build(),
+            builder().build(),
             policy.clone(),
             runtime.jobs.clone(),
             workspace,
         );
-        let error = executor
-            .execute(
-                runtime.agent.clone(),
-                "write",
-                json!({
-                    "path": "link/nested/file.txt", "content": "text", "create_parents": true
-                }),
-                None,
-            )
+        let error = write(&executor, &runtime, "link/nested/file.txt", "text", true)
             .await
             .unwrap_err();
         assert!(matches!(error, ExecutionError::Denied(_)), "{error:?}");
+        let resource = ResourceId::path("root", &outside.join("nested/file.txt"));
+        let requests = policy.requests.lock().unwrap().clone();
         assert!(
-            policy
-                .requests
-                .lock()
-                .await
+            requests
                 .iter()
-                .flat_map(|request| &request.permissions)
-                .any(|permission| permission.resource
-                    == crate::tool::policy::ResourceId::path(
-                        "root",
-                        &outside.join("nested/file.txt")
-                    ))
+                .flat_map(|r| &r.permissions)
+                .any(|p| p.resource == resource)
         );
-        assert!(executor.execute(runtime.agent.clone(), "write", json!({
-            "path": "dangling/nested/file.txt", "content": "text", "create_parents": true
-        }), None).await.is_err());
+        assert!(
+            write(
+                &executor,
+                &runtime,
+                "dangling/nested/file.txt",
+                "text",
+                true
+            )
+            .await
+            .is_err()
+        );
         assert!(!outside.join("nested").exists());
         assert!(!outside.join("missing").exists());
     }
@@ -551,31 +476,17 @@ mod tests {
 
     #[tokio::test]
     async fn remove_requires_recursion_and_refuses_the_workspace_root() {
-        let runtime = crate::tests::TestRuntime::new().await;
-        let executor = mutation_executor(&runtime);
+        let runtime = TestRuntime::new().await;
+        let executor = runtime.executor(builder());
+        let remove = async |arguments| executor.run_host(&runtime.agent, "remove", arguments).await;
         let workspace = runtime.root.path();
         fs::create_dir(workspace.join("directory")).await.unwrap();
         fs::write(workspace.join("directory/file"), "data")
             .await
             .unwrap();
-        let error = executor
-            .execute(
-                runtime.agent.clone(),
-                "remove",
-                serde_json::json!({"path":"directory"}),
-                None,
-            )
-            .await
-            .err()
-            .unwrap();
+        let error = remove(json!({"path":"directory"})).await.unwrap_err();
         assert!(error.to_string().contains("not empty"));
-        executor
-            .execute(
-                runtime.agent.clone(),
-                "remove",
-                serde_json::json!({"path":"directory", "recursive":true}),
-                None,
-            )
+        remove(json!({"path":"directory", "recursive":true}))
             .await
             .unwrap();
         assert!(!fs::try_exists(workspace.join("directory")).await.unwrap());
@@ -583,28 +494,12 @@ mod tests {
         {
             std::fs::write(workspace.join("target"), "safe").unwrap();
             std::os::unix::fs::symlink("target", workspace.join("link")).unwrap();
-            executor
-                .execute(
-                    runtime.agent.clone(),
-                    "remove",
-                    serde_json::json!({"path":"link"}),
-                    None,
-                )
-                .await
-                .unwrap();
+            let result = remove(json!({"path":"link"})).await.unwrap();
+            assert_eq!(result.output.value["kind"], "symlink");
             assert!(fs::try_exists(workspace.join("target")).await.unwrap());
             assert!(!fs::try_exists(workspace.join("link")).await.unwrap());
         }
-        let error = executor
-            .execute(
-                runtime.agent,
-                "remove",
-                serde_json::json!({"path":"."}),
-                None,
-            )
-            .await
-            .err()
-            .unwrap();
+        let error = remove(json!({"path":"."})).await.unwrap_err();
         assert!(error.to_string().contains("workspace root"));
     }
 }

@@ -10,8 +10,11 @@ mod status;
 mod theme;
 mod tool_view;
 
-use super::{Args, interaction::UiInteraction};
-use app::{App, Work};
+use super::{
+    cli::{ExecutionRequest, InitialInput},
+    interaction::UiInteraction,
+};
+use app::{App, PreparedObservation, Work};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -64,30 +67,29 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    request: ExecutionRequest,
+    initial_input: Option<InitialInput>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("Skyhook requires an interactive terminal. Run skyhook in a terminal; redirected input/output is not supported.".into());
     }
-    let config = Arc::new(super::launch::load_config(&args).await?);
+    let config = super::launch::load_config(&request.config, true).await?;
     let (saved, warning) = state::load();
     let model =
-        super::launch::select_model(&config, args.model.as_deref(), saved.model.as_deref())?;
-    let settings = state::settings()?;
-    let keymap = keys::KeyMap::new(&settings.keybinds)?;
+        super::launch::select_model(&config, request.model.as_deref(), saved.model.as_deref())?;
     let (interaction, mut prompts) = UiInteraction::new();
-    let launch = Launch::from_args(&args, config, model, Some(Arc::new(interaction))).await?;
-    let session = match args.resume {
+    let launch = Launch::from_request(&request.config, model, Some(Arc::new(interaction))).await?;
+    let session = match request.resume {
         Some(id) => Some(launch.create(Some(id)).await?),
         None => None,
     };
-    let (snapshot, mut updates) = if let Some(session) = &session {
-        let observation = session.observe().await;
-        (observation.snapshot, Some(observation.updates))
-    } else {
-        (Default::default(), None)
+    let observation = match session {
+        Some(session) => Some(PreparedObservation::subscribe(session).await),
+        None => None,
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut app = App::new(session, launch, snapshot, saved.model, tx.clone(), keymap);
+    let mut app = App::new(observation, launch, saved.model, tx.clone());
     if let Some(warning) = warning {
         app.notice(warning);
     }
@@ -111,10 +113,10 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    if let Some(path) = args.script {
-        app.start_script(path);
-    } else if let Some(prompt) = args.prompt {
-        app.submit(prompt, args.images);
+    match initial_input {
+        Some(InitialInput::Script(path)) => app.start_script(path),
+        Some(InitialInput::Prompt { text, images }) => app.start_prompt(text, images).await,
+        None => {}
     }
     let result: io::Result<()> = async {
         loop {
@@ -128,23 +130,15 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     Some(Err(error)) => return Err(error),
                     None => break,
                 },
-                event = async {
-                    match &mut updates {
-                        Some(updates) => updates.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => match event {
+                event = app.recv_observation() => match event {
                     Ok(event) => {
                         let mut records = app.observe(event);
                         // Reduce a burst once instead of rebuilding the projection per token.
                         for _ in 0..255 {
-                            match updates.as_mut().expect("active observation").try_recv() {
+                            match app.try_recv_observation() {
                                 Ok(event) => records |= app.observe(event),
                                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
-                                    let observation = app.session.as_ref().expect("observed session").observe().await;
-                                    app.snapshot = observation.snapshot;
-                                    updates = Some(observation.updates);
-                                    app.reset_projection();
+                                    app.resubscribe().await;
                                     break;
                                 }
                                 Err(_) => break,
@@ -153,31 +147,18 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                         if records { app.projection.rebuild(&app.snapshot); }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let observation = app.session.as_ref().expect("observed session").observe().await;
-                        app.snapshot = observation.snapshot;
-                        updates = Some(observation.updates);
-                        app.reset_projection();
+                        app.resubscribe().await;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => updates = None,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => app.close_observation(),
                 },
                 Some(prompt) = prompts.recv() => app.prompt(prompt),
                 Some(work) = rx.recv() => {
                     match work {
-                        Work::SessionReady(Ok(session)) => {
-                            let snapshot = if let Some(session) = &session {
-                                let observation = session.observe().await;
-                                updates = Some(observation.updates);
-                                observation.snapshot
-                            } else {
-                                updates = None;
-                                Default::default()
-                            };
-                            app.set_session(session, snapshot);
+                        Work::SessionReady { result: Ok(session) } => {
+                            app.session_ready(session, false).await;
                         }
-                        Work::Started(Ok(session)) => {
-                            let observation = session.observe().await;
-                            updates = Some(observation.updates);
-                            app.session_started(session, observation.snapshot);
+                        Work::Started { result: Ok(session) } => {
+                            app.session_ready(Some(session), true).await;
                         }
                         work => app.work(work),
                     }
@@ -208,14 +189,21 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     rx.close();
     while let Ok(work) = rx.try_recv() {
         match work {
-            Work::Started(Ok(session)) | Work::SessionReady(Ok(Some(session))) => {
+            Work::Started {
+                result: Ok(session),
+                ..
+            }
+            | Work::SessionReady {
+                result: Ok(Some(session)),
+                ..
+            } => {
                 let _ = session.shutdown().await;
             }
             _ => {}
         }
     }
     app.status.flush().await;
-    if let Some(session) = &app.session {
+    if let Some(session) = app.session() {
         session.shutdown().await?;
     }
     result?;

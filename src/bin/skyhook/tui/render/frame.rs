@@ -1,6 +1,23 @@
 //! Main frame composition and viewport orchestration.
 
 use super::*;
+use crate::tui::keys::Command;
+
+/// Contextual labels for typed commands, rendered only when they are bound.
+fn leader_hints(app: &App) -> Vec<(Command, &'static str)> {
+    let mut hints = Vec::new();
+    if !app.prompts.is_empty() {
+        hints.push((Command::Attention, "Questions"));
+    }
+    hints.extend([
+        (Command::Model, "Model"),
+        (Command::Agents, "Inspect agent"),
+    ]);
+    if !app.queue.is_empty() {
+        hints.push((Command::Queue, "Edit queue"));
+    }
+    hints
+}
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -44,9 +61,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         })
         .collect();
     let viewing_child = !app.selected.path().is_empty();
-    let editor_height = (editor_lines.len() as u16 + 2 + u16::from(!app.images.is_empty()))
-        .clamp(3, 7)
-        .min(height.saturating_sub(footer_height + 3).max(3));
+    let editor_height =
+        (editor_lines.len() as u16 + 2 + u16::from(!app.editor.attachments().is_empty()))
+            .clamp(3, 7)
+            .min(height.saturating_sub(footer_height + 3).max(3));
     let notice_height = u16::from(
         !app.queue.is_empty()
             || (!app.prompts.is_empty() && !prompt_active)
@@ -137,7 +155,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     prepare_rows(app, width, p);
     if tab == Tab::Requests
         && app.content_rect.height > 1
-        && let Some(entry) = app.entries.iter().find(|entry| entry.request.is_some())
+        && let Some(entry) = app.entries().iter().find(|entry| entry.request().is_some())
     {
         let geometry = EntryGeometry::new(entry, width, 0);
         if let Some(header) = app.render.request_columns.header(geometry.body_width, p) {
@@ -166,7 +184,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let mut expanded_entry = None;
     let navigation_active = app.menu.is_none() && app.search_editor.is_none() && !prompt_active;
     let mut cursor_drawn = false;
-    if app.entries.is_empty() {
+    if app.entries().is_empty() {
         text(
             frame,
             r(3, 4, width.saturating_sub(6), 1),
@@ -185,12 +203,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     {
         let y = app.content_rect.y + offset as u16;
         let rect = r(row.x, y, row.width, 1);
-        let selected = row.selection_range(scroll + offset, app.selection);
-        let entry = app.entries.get(row.entry);
+        // Only rows inside the selection's row span need their text.
+        let row_text = app
+            .selection
+            .filter(|(a, b)| (a.row.min(b.row)..=a.row.max(b.row)).contains(&(scroll + offset)))
+            .map(|_| row.text_view());
+        let selected = row_text
+            .as_ref()
+            .and_then(|view| view.selection_range(scroll + offset, app.selection));
+        let entry = app.content_cache.entries().get(row.entry);
         let expanded = match expanded_entry {
             Some((index, expanded)) if index == row.entry => expanded,
             _ => {
-                let expanded = entry.is_some_and(|entry| entry_expanded(entry, view, app.details));
+                let expanded = entry.is_some_and(|entry| entry.is_expanded(view, app.details));
                 expanded_entry = Some((row.entry, expanded));
                 expanded
             }
@@ -201,11 +226,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             && row.entry == selected_entry;
         let hovered = navigation_active
             && app.hover.is_some_and(|point| rect.contains(point.into()))
-            && entry.is_some_and(|e| e.expandable);
+            && entry.is_some_and(|e| e.expandable());
         let bg = row.background(
             p,
             expanded,
-            (focused && entry.is_some_and(|e| e.expandable)) || hovered,
+            (focused && entry.is_some_and(|e| e.expandable())) || hovered,
             selected.is_some(),
         );
         fill(frame, rect, bg);
@@ -229,16 +254,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             p,
         );
         if let Some(range) = selected {
-            let value = row.text();
+            let view = row_text.as_ref().expect("selected range has row text");
+            let value = view.text();
             // Source-to-column geometry skips hanging prefixes and code padding.
             for (byte, grapheme) in value.grapheme_indices(true) {
                 if !range.contains(&byte) {
                     continue;
                 }
-                let start = row.paragraph_x() as usize + row.source_column(&value, byte);
+                // A malformed layout has no column for this byte; never paint it elsewhere.
+                let Some(column) = view.source_column(byte) else {
+                    continue;
+                };
+                let start = row.paragraph_x() as usize + column;
                 let end = start + grapheme.width();
-                let source_end = row.layout.code.map_or(width as usize, |code| {
-                    (row.paragraph_x() as usize + code.indent + code.width - code.padding)
+                let source_end = row.layout.code().map_or(width as usize, |code| {
+                    (row.paragraph_x() as usize + code.indent() + code.width() - code.padding())
                         .min(width as usize)
                 });
                 if start >= source_end {
@@ -252,15 +282,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 }
             }
         }
-        if !row.blank {
-            if row.header && entry.is_some_and(|entry| entry.running) {
+        if !row.layout.is_spacer() {
+            if row.layout.header() && entry.is_some_and(|entry| entry.running) {
                 app.animating = true;
                 // Paint only the spinner; cached reasoning rows need no relayout on ticks.
                 text(
                     frame,
                     r(
                         row.x
-                            + if entry.is_some_and(|entry| entry.expandable) {
+                            + if entry.is_some_and(|entry| entry.expandable()) {
                                 2
                             } else {
                                 0
@@ -271,7 +301,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     ),
                     spinner(app.tick_count),
                     if row.surface == Surface::Tool
-                        && entry.is_some_and(|entry| entry.header.is_some())
+                        && entry.is_some_and(|entry| entry.header().is_some())
                     {
                         p.content.primary
                     } else {
@@ -289,7 +319,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     rect,
                     Hit::Entry(
                         row.entry,
-                        row.header || entry.is_some_and(|entry| entry.expandable),
+                        row.layout.header() || entry.is_some_and(|entry| entry.expandable()),
                     ),
                 ));
             }
@@ -325,29 +355,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         text(
             frame,
             r(2, app.content_rect.y, width.saturating_sub(4), 1),
-            format!("Find: {}▏", search.text),
+            format!("Find: {}▏", search.text()),
             p.fg,
             p.input,
         );
     }
     if notice_height > 0 {
         let message = if let Some(prefix) = app.leader {
-            let mut visible = vec![("model", "Model"), ("agents", "Inspect agent")];
-            if !app.prompts.is_empty() {
-                visible.insert(0, ("attention", "Questions"));
-            }
-            if !app.queue.is_empty() {
-                visible.push(("queue", "Edit queue"));
-            }
-            app.keys.leader_hint(prefix, &visible)
+            app.keys.leader_hint(prefix, &leader_hints(app))
         } else if let Some((message, _)) = &app.toast {
             message.clone()
         } else if !app.prompts.is_empty() && !prompt_active {
-            let binding = app.keys.binding("attention");
-            let hint = if binding.is_empty() {
-                "Reopen questions and permissions in the command palette".to_owned()
-            } else {
-                format!("{binding} reopen")
+            let hint = match app.keys.binding(Command::Attention) {
+                Some(binding) => format!("{binding} reopen"),
+                None => "Reopen questions and permissions in the command palette".to_owned(),
             };
             format!("{} pending request(s) · {hint}", app.prompts.len())
         } else if !app.queue.is_empty() {
@@ -389,7 +410,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 p.input,
             );
         }
-        if !app.images.is_empty() {
+        if !app.editor.attachments().is_empty() {
             text(
                 frame,
                 r(
@@ -398,14 +419,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     width.saturating_sub(4),
                     1,
                 ),
-                app.images
+                app.editor
+                    .attachments()
                     .iter()
-                    .map(|path| {
-                        format!(
-                            "[{}]",
-                            path.file_name().unwrap_or_default().to_string_lossy()
-                        )
-                    })
+                    .map(
+                        |attachment| match attachment.file().and_then(|file| file.file_name()) {
+                            Some(name) => format!("[{}]", name.to_string_lossy()),
+                            None => match attachment {
+                                skyhook::media::Attachment::Text { .. } => "[text]".to_owned(),
+                                skyhook::media::Attachment::Image { .. } => "[image]".to_owned(),
+                            },
+                        },
+                    )
                     .collect::<Vec<_>>()
                     .join(" "),
                 p.muted,
@@ -435,11 +460,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     let model = app
         .launch
-        .config
+        .model
+        .config()
+        .config()
         .models
         .get(model)
         .map_or(model, |profile| profile.model.as_str());
-    let session = app.session.as_ref().map_or_else(
+    let session = app.session().as_ref().map_or_else(
         || "new session".to_owned(),
         |session| session.id().to_string(),
     );
@@ -521,48 +548,42 @@ mod tests {
     };
     use std::time::Duration;
 
-    fn commit_message(app: &mut App, text: &str) {
-        let sequence = app
-            .snapshot
-            .records
+    fn push_record(app: &mut App, event: SessionEvent) {
+        let records = &app.snapshot.records;
+        let sequence = records
             .last_key_value()
             .map_or(1, |(sequence, _)| sequence + 1);
-        app.snapshot.records.insert(
+        let record = EventRecord {
+            id: skyhook::identity::EventId::generate().unwrap(),
+            queue_attempt: None,
+            version: 1,
             sequence,
-            EventRecord {
-                version: 1,
-                sequence,
-                timestamp_millis: 0,
-                agent: app.selected.clone(),
-                event: SessionEvent::MessageCommitted {
-                    message: Message::Assistant(vec![AssistantItem::text("frame-test", 0, text)]),
-                },
-            },
-        );
+            timestamp_millis: sequence as i64 * 1000,
+            agent: app.selected.clone(),
+            event,
+        };
+        app.snapshot.records.insert(sequence, record);
+    }
+
+    fn commit_message(app: &mut App, text: &str) {
+        let message = Message::Assistant(vec![AssistantItem::text("frame-test", 0, text)]);
+        push_record(app, SessionEvent::MessageCommitted { message });
         app.refresh();
     }
 
     #[tokio::test]
     async fn request_headers_stay_outside_the_scrolling_rows() {
         let (_root, mut app) = fixture().await;
-        let first = app
-            .snapshot
-            .records
-            .last_key_value()
-            .map_or(1, |(seq, _)| seq + 1);
-        for sequence in first..first + 30 {
-            app.snapshot.records.insert(
-                sequence,
-                EventRecord {
-                    version: 1,
-                    sequence,
-                    timestamp_millis: sequence as i64 * 1000,
-                    agent: app.selected.clone(),
-                    event: SessionEvent::ModelRequested {
-                        context: 0,
-                        messages: Vec::new(),
-                        purpose: skyhook::session::ModelPurpose::Agent,
-                    },
+        for _ in 0..30 {
+            let purpose = skyhook::session::ModelPurpose::Agent;
+            push_record(
+                &mut app,
+                SessionEvent::ModelRequested {
+                    context: 0,
+                    history: Vec::new(),
+                    tail: Vec::new(),
+                    history_lifetime: Default::default(),
+                    purpose,
                 },
             );
         }
@@ -573,34 +594,31 @@ mod tests {
             for scroll in [0, 5] {
                 app.view().scroll = Some(scroll);
                 terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-                let line = (0..width)
-                    .map(|x| terminal.backend().buffer()[(x, 2)].symbol())
-                    .collect::<String>();
+                let buffer = terminal.backend().buffer();
+                let line: String = (0..width).map(|x| buffer[(x, 2)].symbol()).collect();
                 assert_eq!(line.contains("Input (uncached)"), header);
-                assert_eq!(app.content_rect.y, 2 + u16::from(header));
-                assert_eq!(app.content_rows, 30);
-                let (rect, index) = app
-                    .hits
-                    .iter()
-                    .find_map(|(rect, hit)| match hit {
-                        Hit::Entry(index, _) => Some((rect, *index)),
-                        _ => None,
-                    })
-                    .unwrap();
-                assert_eq!(rect.y, app.content_rect.y);
-                assert_eq!(index, scroll);
+                assert_eq!(
+                    (app.content_rect.y, app.content_rows),
+                    (2 + u16::from(header), 30)
+                );
+                let first = app.hits.iter().find_map(|(rect, hit)| match hit {
+                    Hit::Entry(index, _) => Some((rect.y, *index)),
+                    _ => None,
+                });
+                assert_eq!(first, Some((app.content_rect.y, scroll)));
             }
         }
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
+        app.session().as_ref().unwrap().shutdown().await.unwrap();
     }
 
     fn number_is_painted(buffer: &Buffer, color: Color) -> bool {
+        let source = "let answer = 42;";
         buffer
             .content
             .chunks(buffer.area.width as usize)
             .any(|row| {
-                row.windows("let answer = 42;".len()).any(|cells| {
-                    cells.iter().map(|cell| cell.symbol()).collect::<String>() == "let answer = 42;"
+                row.windows(source.len()).any(|cells| {
+                    cells.iter().map(|cell| cell.symbol()).collect::<String>() == source
                         && cells[13..15].iter().all(|cell| cell.fg == color)
                 })
             })
@@ -610,22 +628,11 @@ mod tests {
     async fn expanded_items_paint_solid_code_backgrounds_across_clipped_rows() {
         let (_root, mut app) = fixture().await;
         app.content_dirty = false;
-        app.entries = vec![model::Entry {
-            key: "solid-background".into(),
-            text: format!("Expandable tool\n{}", "body\n\n".repeat(20)),
-            surface: Surface::Tool,
-            expandable: true,
-            default_open: true,
-            running: false,
-            footer: None,
-            request: None,
-            indent: 0,
-            job: None,
-            compact_after: false,
-            header: None,
-            document: None,
-        }];
-
+        let text = format!("Expandable tool\n{}", "body\n\n".repeat(20));
+        let mut entry =
+            model::Entry::expandable_text(model::EntryKey::Record(1), text, Surface::Tool);
+        entry.default_open = true;
+        app.install_entries(vec![entry]);
         let p = Palette::new();
         for width in [30, 60] {
             let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
@@ -636,10 +643,9 @@ mod tests {
             let mut empty_body_rows = 0;
             for (offset, row) in app.render.rows.iter().skip(scroll).enumerate() {
                 let y = app.content_rect.y + offset as u16;
-                let expected = if row.blank { p.base } else { p.content.code_bg };
-                if !row.blank && row.text().is_empty() {
-                    empty_body_rows += 1;
-                }
+                let spacer = row.layout.is_spacer();
+                let expected = if spacer { p.base } else { p.content.code_bg };
+                empty_body_rows += usize::from(!spacer && row.text().is_empty());
                 for x in row.x..row.x + row.width {
                     assert_eq!(
                         buffer[(x, y)].bg,
@@ -662,9 +668,9 @@ mod tests {
             "# Example\n\n```rust\nlet answer = 42;\n```\n\n**Done**",
         );
         let records = serde_json::to_vec(&app.snapshot.records).unwrap();
-
-        // Exercise a cold frame, an explicit reset at unchanged dimensions, a
-        // resize with warm highlights at different widths.
+        let accent = ContentTheme::new().accent;
+        // A cold frame, an explicit reset at unchanged dimensions, then resizes
+        // with warm highlights at different widths.
         for (width, reset, completion) in [
             (60, false, true),
             (60, true, true),
@@ -676,19 +682,15 @@ mod tests {
             }
             let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-            let accent = ContentTheme::new().accent;
             if completion {
                 // The first frame paints fallback text and schedules the worker.
                 // Its retained rows must repaint when the worker wakes the UI,
                 // without manually invalidating content or rebuilding layout.
                 assert!(!number_is_painted(terminal.backend().buffer(), accent));
-                assert!(!app.render.changes.reset);
-                assert!(app.render.changes.dirty.is_empty());
+                assert!(!app.render.changes.reset && app.render.changes.dirty.is_empty());
                 assert!(!app.content_dirty);
-                let work = tokio::time::timeout(Duration::from_secs(5), ready.recv())
-                    .await
-                    .expect("highlight worker did not wake the UI")
-                    .expect("highlight notification channel closed");
+                let work = tokio::time::timeout(Duration::from_secs(5), ready.recv()).await;
+                let work = work.expect("highlight worker woke the UI").unwrap();
                 assert!(matches!(work, Work::HighlightsReady));
                 app.work(work);
                 terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -699,50 +701,48 @@ mod tests {
             );
             assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
         }
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
+        app.session().as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn latest_activity_hit_restores_follow_tail_and_disappears() {
         let (_root, mut app) = fixture().await;
         commit_message(&mut app, &"ordinary prose\n".repeat(100));
-
+        let latest = |app: &App| {
+            let mut hits = app.hits.iter();
+            hits.find_map(|(rect, hit)| matches!(hit, Hit::Latest).then_some(*rect))
+        };
         let mut terminal = Terminal::new(TestBackend::new(80, 25)).unwrap();
         app.view().scroll = None;
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert!(!app.hits.iter().any(|(_, hit)| matches!(hit, Hit::Latest)));
+        assert!(latest(&app).is_none());
 
         app.view().scroll = Some(0);
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let rect = app
-            .hits
-            .iter()
-            .find_map(|(rect, hit)| matches!(hit, Hit::Latest).then_some(*rect))
-            .expect("scrolled history should offer Latest activity");
+        let rect = latest(&app).expect("scrolled history should offer Latest activity");
+        let buffer = terminal.backend().buffer();
         let label: String = (rect.x..rect.right())
-            .map(|x| terminal.backend().buffer()[(x, rect.y)].symbol())
+            .map(|x| buffer[(x, rect.y)].symbol())
             .collect();
         assert_eq!(label, "↓ Latest activity");
         assert_eq!(app.view().scroll, Some(0));
 
         // Use the rendered hit coordinates and the real event handler. The
         // overlay overlaps selectable text, which must not repin the view.
-        for kind in [
-            MouseEventKind::Down(MouseButton::Left),
-            MouseEventKind::Up(MouseButton::Left),
-        ] {
+        let left = MouseButton::Left;
+        for kind in [MouseEventKind::Down(left), MouseEventKind::Up(left)] {
+            let (column, row, modifiers) = (rect.x, rect.y, KeyModifiers::NONE);
             app.event(Event::Mouse(MouseEvent {
                 kind,
-                column: rect.x,
-                row: rect.y,
-                modifiers: KeyModifiers::NONE,
+                column,
+                row,
+                modifiers,
             }));
         }
-        assert!(app.view().scroll.is_none());
-        assert!(app.selection.is_none());
+        assert!(app.view().scroll.is_none() && app.selection.is_none());
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert!(app.view().scroll.is_none());
-        assert!(!app.hits.iter().any(|(_, hit)| matches!(hit, Hit::Latest)));
-        app.session.as_ref().unwrap().shutdown().await.unwrap();
+        assert!(latest(&app).is_none());
+        app.session().as_ref().unwrap().shutdown().await.unwrap();
     }
 }

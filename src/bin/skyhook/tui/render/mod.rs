@@ -13,9 +13,6 @@ mod selection;
 mod stream;
 mod wrapping;
 
-// Kept as part of the renderer API even when only inline tests name it directly.
-#[allow(unused_imports)]
-pub use cache::CachedEntry;
 pub use cache::RenderState;
 pub use frame::draw;
 pub use painting::Palette;
@@ -46,3 +43,38 @@ use ratatui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One selectable tool row for layout fixtures.
+    pub(super) fn fixture_row(
+        line: Line<'static>,
+        layout: markdown::RowLayout,
+        x: u16,
+        width: u16,
+        entry: usize,
+    ) -> Row {
+        Row {
+            line: std::sync::Arc::new(line),
+            x,
+            width,
+            surface: Surface::Tool,
+            entry,
+            entry_key: std::sync::Arc::new(model::EntryKey::Record(entry as u64)),
+            selectable: true,
+            layout,
+            inset: 0,
+        }
+    }
+
+    pub(super) fn expandable_entry() -> model::Entry {
+        model::Entry::expandable_text(
+            model::EntryKey::Record(1),
+            "first header with many wrapped fragments\nbody with many wrapped fragments\n  \n"
+                .into(),
+            Surface::Tool,
+        )
+    }
+}

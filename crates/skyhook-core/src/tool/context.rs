@@ -7,47 +7,143 @@ use tokio::sync::{Mutex, mpsc};
 use crate::{
     execution::ExecutionLocation,
     identity::{AgentId, JobId},
-    media::ImageReference,
+    media::ImageRef,
     tool::policy::{Capability, CapabilitySet, PermissionUse, ResourceId},
 };
 
 #[derive(Clone)]
+enum Authority {
+    Invocation {
+        coordinator: super::authorization::AuthorizationCoordinator,
+        tool: String,
+        arguments: Value,
+    },
+    UnavailableForResume,
+}
+
+#[derive(Clone)]
 pub struct ToolContext {
-    pub agent: AgentId,
-    pub job: JobId,
-    pub execution_location: ExecutionLocation,
-    pub caller_location: ExecutionLocation,
-    pub capabilities: CapabilitySet,
+    subject: super::authorization::AuthorizationSubject,
+    execution_location: ExecutionLocation,
+    caller_location: ExecutionLocation,
     pub(crate) process_environment: crate::remote::backend::ProcessEnvironment,
-    pub(crate) authorization: super::authorization::AuthorizationSubject,
-    pub(crate) authorizer: Option<(
-        super::authorization::AuthorizationCoordinator,
-        String,
-        Value,
-    )>,
+    authority: Authority,
     input: Arc<Mutex<mpsc::Receiver<Value>>>,
     jobs: crate::job::JobManager,
 }
 
 impl ToolContext {
+    pub(crate) fn store(&self) -> &crate::session::SessionStore {
+        self.jobs.store()
+    }
+
+    /// Construct a job-only context for resume operations, without invocation authority.
     pub(crate) fn new(
-        authorization: super::authorization::AuthorizationSubject,
+        subject: super::authorization::AuthorizationSubject,
         execution_location: ExecutionLocation,
         caller_location: ExecutionLocation,
         input: mpsc::Receiver<Value>,
         jobs: crate::job::JobManager,
     ) -> Self {
         Self {
-            agent: authorization.agent.clone(),
-            job: authorization.job,
+            subject,
             execution_location,
             caller_location,
-            capabilities: authorization.capabilities.clone(),
             process_environment: Default::default(),
-            authorization,
-            authorizer: None,
+            authority: Authority::UnavailableForResume,
             input: Arc::new(Mutex::new(input)),
             jobs,
+        }
+    }
+
+    /// Attach the invocation authority prepared by the executor.
+    #[must_use]
+    pub(super) fn with_invocation_authority(
+        mut self,
+        coordinator: super::authorization::AuthorizationCoordinator,
+        tool: String,
+        arguments: Value,
+    ) -> Self {
+        self.authority = Authority::Invocation {
+            coordinator,
+            tool,
+            arguments,
+        };
+        self
+    }
+
+    #[must_use]
+    pub fn agent(&self) -> &AgentId {
+        &self.subject.agent
+    }
+
+    #[must_use]
+    pub fn job(&self) -> JobId {
+        self.subject.job
+    }
+
+    #[must_use]
+    pub fn capabilities(&self) -> &CapabilitySet {
+        &self.subject.capabilities
+    }
+
+    #[must_use]
+    pub fn execution_location(&self) -> &ExecutionLocation {
+        &self.execution_location
+    }
+
+    #[must_use]
+    pub fn caller_location(&self) -> &ExecutionLocation {
+        &self.caller_location
+    }
+
+    /// Test fixture only: enter the same invocation-construction path as the
+    /// executor without making resume contexts authoritative in production.
+    #[cfg(test)]
+    pub(crate) fn with_test_invocation_authority(
+        self,
+        coordinator: super::authorization::AuthorizationCoordinator,
+        tool: String,
+        arguments: Value,
+    ) -> Self {
+        self.with_invocation_authority(coordinator, tool, arguments)
+    }
+
+    /// Identity/provenance for legitimate resumed job contexts. This is not
+    /// invocation authority; APIs requiring that must use invocation_subject.
+    pub(crate) fn job_subject(&self) -> &super::authorization::AuthorizationSubject {
+        &self.subject
+    }
+
+    /// Borrow the admitted invocation identity for an operation that still
+    /// performs its own policy check. A resumed job is deliberately not an
+    /// invocation and cannot silently acquire authorization this way.
+    pub(crate) fn invocation_subject(
+        &self,
+    ) -> Result<&super::authorization::AuthorizationSubject, ToolError> {
+        self.invocation().map(|_| &self.subject)
+    }
+
+    /// The invocation authority's coordinator, tool name and admitted arguments.
+    fn invocation(
+        &self,
+    ) -> Result<
+        (
+            &super::authorization::AuthorizationCoordinator,
+            &str,
+            &Value,
+        ),
+        ToolError,
+    > {
+        match &self.authority {
+            Authority::Invocation {
+                coordinator,
+                tool,
+                arguments,
+            } => Ok((coordinator, tool, arguments)),
+            Authority::UnavailableForResume => Err(ToolError::Denied(
+                "runtime authorization is unavailable".to_owned(),
+            )),
         }
     }
 
@@ -58,13 +154,9 @@ impl ToolContext {
         permissions: Vec<PermissionUse>,
         arguments: Value,
     ) -> Result<(), ToolError> {
-        let Some((coordinator, tool, _)) = &self.authorizer else {
-            return Err(ToolError::Denied(
-                "runtime authorization is unavailable".to_owned(),
-            ));
-        };
+        let (coordinator, tool, _) = self.invocation()?;
         coordinator
-            .authorize(&self.authorization, tool.clone(), permissions, arguments)
+            .authorize(&self.subject, tool.to_owned(), permissions, arguments)
             .await
             .map_err(|error| {
                 use super::authorization::AuthorizationError;
@@ -83,10 +175,7 @@ impl ToolContext {
     /// the normalized HTTP(S) origin from their parsed URL, never a full URL.
     /// No persistent grant is proposed; each invocation/destination is reviewed.
     pub async fn authorize_network(&self, normalized_origin: &str) -> Result<(), ToolError> {
-        let mut arguments = self
-            .authorizer
-            .as_ref()
-            .map_or(Value::Null, |(_, _, arguments)| arguments.clone());
+        let mut arguments = self.invocation()?.2.clone();
         if let Some(object) = arguments.as_object_mut() {
             object.insert(
                 "network_origin".to_owned(),
@@ -105,17 +194,21 @@ impl ToolContext {
 
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.authorization.cancellation.is_cancelled()
+        self.subject.cancellation.is_cancelled()
     }
 
     /// Wait until cancellation is requested for this tool invocation.
     pub async fn cancelled(&self) {
-        self.authorization.cancellation.cancelled().await;
+        self.subject.cancellation.cancelled().await;
     }
 
     pub(crate) async fn drain_input_or_close(&self) -> Vec<Value> {
         let mut input = self.input.lock().await;
-        let operation = self.jobs.operation(self.job).await.expect("live tool job");
+        let operation = self
+            .jobs
+            .operation(self.job())
+            .await
+            .expect("live tool job");
         let _operation = operation.lock().await;
         let mut pending = Vec::new();
         while let Ok(value) = input.try_recv() {
@@ -141,38 +234,56 @@ impl ToolContext {
     }
 
     pub(crate) fn cancellation_token(&self) -> crate::job::CancellationToken {
-        self.authorization.cancellation.clone()
+        self.subject.cancellation.clone()
     }
 
-    pub(crate) async fn capture_path(&self, field: &str) -> Result<std::path::PathBuf, ToolError> {
-        self.capture_path_with_kind(field, crate::job::output::CaptureKind::Text)
-            .await
-    }
-
-    pub(crate) async fn capture_path_with_kind(
+    /// Reserve one job-bound streaming capture without exposing its file path.
+    pub(crate) async fn pending_stream_capture(
         &self,
         field: &str,
         kind: crate::job::output::CaptureKind,
-    ) -> Result<std::path::PathBuf, ToolError> {
-        let directory = self.jobs.output_directory(self.job);
+    ) -> Result<crate::job::output::PendingCapture, ToolError> {
         let field = field.to_owned();
-        tokio::task::spawn_blocking(move || {
-            crate::job::output::register_capture(&directory, &field, kind)
-        })
-        .await
-        .map_err(|error| ToolError::Failed(error.to_string()))?
-        .map_err(Into::into)
+        self.jobs
+            .pending_capture(self.job(), field, kind, false)
+            .await
+    }
+
+    /// Reserve one builtin text capture, removed if abandoned before finishing.
+    pub(crate) async fn text_capture(
+        &self,
+        field: crate::job::output::TextCaptureField,
+    ) -> Result<crate::job::output::PendingCapture, ToolError> {
+        let (field, kind) = (field.pointer(), crate::job::output::CaptureKind::Text);
+        self.jobs
+            .pending_capture(self.job(), field, kind, true)
+            .await
     }
 
     pub(crate) async fn output_changed(&self) {
-        self.jobs.output_changed(self.job).await;
+        self.jobs.output_changed(self.job()).await;
     }
+}
+
+/// Whether a producer's streams ran to their end; a timeout cuts them short.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StreamEnd {
+    #[default]
+    Finished,
+    Cut,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 pub struct ToolOutput {
     pub value: Value,
-    pub images: Vec<ImageReference>,
+    pub images: Vec<ImageRef>,
+    /// Producer-owned fields, consumed by the job finalizer. Wire/replay values
+    /// cannot deserialize completion evidence or substitute arbitrary files.
+    #[serde(skip)]
+    pub(crate) captures: Vec<crate::job::output::CompletedCapture>,
+    #[serde(skip)]
+    pub(crate) streams: StreamEnd,
 }
 
 impl ToolOutput {
@@ -181,11 +292,25 @@ impl ToolOutput {
         Self {
             value,
             images: Vec::new(),
+            captures: Vec::new(),
+            streams: StreamEnd::Finished,
         }
     }
 
+    pub(crate) fn with_captures(
+        mut self,
+        captures: Vec<crate::job::output::CompletedCapture>,
+    ) -> Self {
+        self.captures = captures;
+        self
+    }
+
+    pub(crate) fn take_captures(&mut self) -> Vec<crate::job::output::CompletedCapture> {
+        std::mem::take(&mut self.captures)
+    }
+
     #[must_use]
-    pub fn with_images(mut self, images: Vec<ImageReference>) -> Self {
+    pub fn with_images(mut self, images: Vec<ImageRef>) -> Self {
         self.images = images;
         self
     }

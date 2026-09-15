@@ -27,25 +27,47 @@ pub(super) fn array<'a>(value: &'a Value, key: &str) -> Result<&'a Vec<Value>, P
         .ok_or_else(|| protocol(format!("missing or invalid {key}")))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Kind {
-    Text,
-    Reasoning,
-    Function,
-}
-
-pub(super) fn kind(item: &Value) -> Result<Kind, ProviderError> {
+pub(super) fn kind(item: &Value) -> Result<ItemKind, ProviderError> {
     match string(item, "type")? {
-        "message" => Ok(Kind::Text),
-        "reasoning" => Ok(Kind::Reasoning),
-        "function_call" => Ok(Kind::Function),
+        "message" => Ok(ItemKind::Text),
+        "reasoning" => Ok(ItemKind::Reasoning),
+        "function_call" => Ok(ItemKind::ToolCall),
         _ => Err(protocol("unsupported output item type")),
     }
 }
 
+/// Validated view of consumed item identity; all vendor fields stay in `raw`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct NativeItem<'a> {
+    pub(super) raw: &'a Value,
+    pub(super) id: &'a str,
+    pub(super) kind: ItemKind,
+}
+impl<'a> NativeItem<'a> {
+    pub(super) fn parse(raw: &'a Value) -> Result<Self, ProviderError> {
+        let id = string(raw, "id")?;
+        if id.is_empty() {
+            return Err(protocol("empty item ID"));
+        }
+        Ok(Self {
+            raw,
+            id,
+            kind: kind(raw)?,
+        })
+    }
+
+    pub(super) fn final_parts(self) -> Result<Vec<BlockContent>, ProviderError> {
+        parts_for_kind(self.raw, self.kind)
+    }
+}
+
 pub(super) fn final_parts(item: &Value) -> Result<Vec<BlockContent>, ProviderError> {
-    match kind(item)? {
-        Kind::Text => {
+    parts_for_kind(item, kind(item)?)
+}
+
+fn parts_for_kind(item: &Value, kind: ItemKind) -> Result<Vec<BlockContent>, ProviderError> {
+    match kind {
+        ItemKind::Text => {
             if string(item, "role")? != "assistant" {
                 return Err(protocol("output message role is not assistant"));
             }
@@ -61,46 +83,34 @@ pub(super) fn final_parts(item: &Value) -> Result<Vec<BlockContent>, ProviderErr
                 })
                 .collect()
         }
-        Kind::Reasoning => Ok(reasoning_parts(item)?.into_values().collect()),
-        Kind::Function => {
-            let arguments = arguments(string(item, "arguments")?)?;
-            let id = string(item, "call_id")?;
-            let name = string(item, "name")?;
-            if id.is_empty() || name.is_empty() {
-                return Err(protocol("empty function call ID or name"));
-            }
-            Ok(vec![BlockContent::ToolCall(ToolCall {
-                id: id.into(),
-                name: name.into(),
-                arguments,
-            })])
-        }
+        ItemKind::Reasoning => Ok(reasoning_parts(item)?.into_values().collect()),
+        ItemKind::ToolCall => Ok(vec![BlockContent::ToolCall(function_call(item)?)]),
     }
+}
+
+pub(super) fn function_call(item: &Value) -> Result<ToolCall, ProviderError> {
+    let arguments = arguments(string(item, "arguments")?)?;
+    let id = string(item, "call_id")?;
+    let name = string(item, "name")?;
+    ToolCall::new(id, name, Value::Object(arguments)).map_err(|error| protocol(error.to_string()))
 }
 
 /// Executable function arguments must decode to an object, not an arbitrary JSON value.
-pub(super) fn arguments(text: &str) -> Result<Value, ProviderError> {
+pub(super) fn arguments(text: &str) -> Result<serde_json::Map<String, Value>, ProviderError> {
     let value: Value =
         serde_json::from_str(text).map_err(|_| protocol("invalid function arguments JSON"))?;
-    if !value.is_object() {
+    let Value::Object(arguments) = value else {
         return Err(protocol("function arguments must be a JSON object"));
-    }
-    Ok(value)
+    };
+    Ok(arguments)
 }
 
-impl Kind {
-    pub(super) fn item_kind(self) -> ItemKind {
-        match self {
-            Self::Text => ItemKind::Text,
-            Self::Reasoning => ItemKind::Reasoning,
-            Self::Function => ItemKind::ToolCall,
-        }
-    }
+impl ItemKind {
     pub(super) fn block_kind(self) -> BlockKind {
         match self {
             Self::Text => BlockKind::Text,
             Self::Reasoning => BlockKind::Reasoning,
-            Self::Function => BlockKind::ToolCallArguments,
+            Self::ToolCall => BlockKind::ToolCallArguments,
         }
     }
     pub(super) fn part_id(self, position: usize) -> String {
@@ -108,7 +118,7 @@ impl Kind {
             Self::Text => format!("content_{position}"),
             Self::Reasoning if position.is_multiple_of(2) => format!("summary_{}", position / 2),
             Self::Reasoning => format!("content_{}", position / 2),
-            Self::Function => format!("arguments_{position}"),
+            Self::ToolCall => format!("arguments_{position}"),
         }
     }
 }
@@ -116,6 +126,21 @@ impl Kind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_function_identity_is_nonempty_without_chat_name_rules() {
+        let mut item = json!({"type":"function_call", "call_id":"call", "name":"vendor.tool/雪", "arguments":"{}"});
+        let parts = final_parts(&item).unwrap();
+        assert_eq!(parts[0].tool_call_ref().unwrap().name(), "vendor.tool/雪");
+        for (id, name) in [("", "tool"), ("call", "")] {
+            item["call_id"] = json!(id);
+            item["name"] = json!(name);
+            assert_eq!(
+                final_parts(&item).unwrap_err().kind,
+                ProviderErrorKind::Protocol
+            );
+        }
+    }
 
     #[test]
     fn function_arguments_require_a_json_object() {
@@ -130,11 +155,9 @@ mod tests {
         item["arguments"] = json!(r#"{"query":"rust"}"#);
         assert_eq!(
             final_parts(&item).unwrap(),
-            vec![BlockContent::ToolCall(ToolCall {
-                id: "call".into(),
-                name: "lookup".into(),
-                arguments: json!({"query":"rust"}),
-            })]
+            vec![BlockContent::ToolCall(
+                ToolCall::new("call", "lookup", json!({"query":"rust"})).unwrap()
+            )]
         );
     }
 }
