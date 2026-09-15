@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d98f569e.js";
+            window.path_to_searchindex_js = "../searchindex-67539886.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -182,9 +182,15 @@
                     <main>
                         <h1 id="jobs-and-agents"><a class="header" href="#jobs-and-agents">Jobs and agents</a></h1>
 <h2 id="delegation-and-child-input"><a class="header" href="#delegation-and-child-input">Delegation and child input</a></h2>
-<p>Child agents retain their conversation for follow-up work.
-<code>tool.job(id).send({value: instructions})</code> delivers unsolicited input automatically at a running
-child’s next model-request boundary, without interrupting the current request or tools.
+<p>Child agents retain their conversation for follow-up work. <code>tool.job(id).send({value: instructions})</code> delivers unsolicited input automatically at a running child’s next model-request
+boundary, without interrupting the current request or tools. A retained child whose job is
+<code>completed</code>, <code>failed</code>, or <code>interrupted</code> is restarted under the same job and agent identity; the
+new instruction is appended to its retained conversation. Explicitly <code>cancelled</code> jobs are not
+resumable. After a session interruption, retry resumes every retained failed/interrupted child
+(deepest descendants first), without selecting them individually. A child-only retry leaves a
+parent that is waiting on work untouched and does not add a root model request. Retrying without
+an instruction continues the same history without adding a synthetic user or parent-input
+message.
 Children do not need <code>receive()</code> to read these updates. Every visible child text reply,
 including text-only and final replies, is delivered independently through the background-job
 event path and wakes <code>wait</code>, without waiting for the child job to finish. Message events carry

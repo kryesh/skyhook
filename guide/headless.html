@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d98f569e.js";
+            window.path_to_searchindex_js = "../searchindex-67539886.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -186,11 +186,12 @@
 skyhook --non-interactive -s workflow.js --approve-all
 skyhook --non-interactive --resume "$session_id" -p "Summarize the findings"
 </code></pre>
-<p>Headless mode does not require a terminal, read answers from stdin, or load TUI themes/keybindings.
+<p>Headless mode does not require a terminal or read answers from stdin.
 It creates or opens the session, prints <strong>only its session ID followed by a newline to stdout</strong>, and
 flushes that line before executing the prompt or workflow. It then exits automatically. The ID lets
-external programs locate and follow the normal session logs under the configured <code>session_root</code>
-(default: <code>&lt;workspace&gt;/.skyhook/sessions</code>). Resumed runs print the existing session ID.</p>
+external programs locate and follow the normal session logs under <code>&lt;workspace&gt;/.skyhook/sessions</code>.
+Headless mode uses only the selected workspace’s history, just like the terminal UI; the CLI ignores
+<code>session_root</code> overrides. Resumed runs print the existing session ID.</p>
 <p>Assistant output, script console output/results, startup warnings, and execution diagnostics remain
 in the session logs; they are not printed to stdout or stderr. The process exits successfully when
 the submitted operation and shutdown succeed, and nonzero on failure or interruption. A failure

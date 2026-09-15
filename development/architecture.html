@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d98f569e.js";
+            window.path_to_searchindex_js = "../searchindex-67539886.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -196,7 +196,7 @@ encrypted-only reasoning items need not create an empty visible section.
 observation/UI layers. Cumulative usage snapshots replace earlier values, and response termination
 carries a stop reason rather than a truncation boolean. Legacy unindexed delta events are removed.
 Completed assistant messages persist nested items/blocks with their IDs and positions. Session
-journals now use format version 2; version-1 journals are rejected with an explicit unsupported-version
+journals now use format version 3; earlier journals are rejected with an explicit unsupported-version
 error rather than guessing the missing block boundaries. Start a new session after this upgrade.
 Reasoning
 replay payloads retain provider/endpoint/protocol/model provenance: incompatible private reasoning
@@ -229,7 +229,7 @@ same agent cache identity; compaction clears calibration from the previous histo
 <li><code>tool::ToolRegistryBuilder</code> supports typed and JSON-based tools, while <code>tool::executor::ToolExecutor</code>
 turns every invocation into a supervised job. Typed registrations generate both input and output
 schemas; compact result shapes are included in model and script documentation.</li>
-<li><code>session::SessionStore</code> persists a versioned append-only JSONL log, content-addressed image blobs, job
+<li><code>session::SessionStore</code> persists a versioned append-only JSONL log, content-addressed attachment and image blobs, job
 outputs, and line-addressable job output.</li>
 <li><code>agent::Harness</code> owns model profiles and policy; each <code>agent::SessionHandle</code> owns an isolated agent tree
 and registry.</li>

@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d98f569e.js";
+            window.path_to_searchindex_js = "../searchindex-67539886.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -221,11 +221,13 @@ recorded statuses. Host interfaces can read all current lists through <code>Sess
 and observe <code>SessionEvent::TodosReplaced</code> through the existing runtime event subscription.
 The public <code>TodoItem</code>, <code>TodoStatus</code>, and <code>TodoSnapshot</code> types live in <code>skyhook::agent</code>.</p>
 <h2 id="per-request-state-snapshot"><a class="header" href="#per-request-state-snapshot">Per-request state snapshot</a></h2>
-<p>Each model request ends with one fresh, compact-text <code>&lt;skyhook_state&gt;</code> snapshot. Its first
+<p>Unless the model profile’s <a href="../configuration/providers-and-models.html"><code>state_mode</code></a> is <code>none</code>,
+each model request carries a fresh, compact-text <code>&lt;skyhook_state&gt;</code> snapshot: after the history
+(<code>dynamic</code>, the default) or committed to the conversation after earlier snapshots (<code>persist</code>). Its first
 line is <code>date:YYYY-MM-DD</code>, using the host’s current local date, refreshed per request rather
 than fixed in the system prompt at agent startup. The optional <code>jobs:</code> and <code>todos:</code> sections
-follow in that order; empty sections are omitted. The system prompt explains this format once.
-This presentation does not change the JSON returned by job or todo tools.</p>
+follow in that order; empty sections are omitted. The format is self-describing; the system
+prompt does not explain it. This presentation does not change the JSON returned by job or todo tools.</p>
 <p>The jobs section starts with <code>jobs: job parent tool name state age_s turns tool_calls</code>.
 Each following row contains those fields separated by single spaces. <code>parent</code> is <code>-</code> for
 jobs directly visible to the caller; nested active child-agent rows identify their immediate

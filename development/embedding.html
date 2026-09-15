@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d98f569e.js";
+            window.path_to_searchindex_js = "../searchindex-67539886.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -186,7 +186,8 @@ configuration, a workspace, model selection, and interaction handlers rather tha
 on terminal UI state. See <a href="architecture.html">library architecture</a> for the provider, registry,
 and session ownership boundaries.</p>
 <h2 id="host-observation-api"><a class="header" href="#host-observation-api">Host observation API</a></h2>
-<p><code>Config::harness_builder(workspace, model)</code> takes an explicit model choice from its host.
+<p><code>config.into_runtime()?.select_model(name)?.harness_builder(workspace)?</code> admits the configuration,
+selects the host’s explicit model choice, and returns a <code>HarnessBuilder</code> for that workspace.
 <code>SessionHandle::observe()</code> returns an atomic snapshot/receiver pair with revisioned updates,
 request-scoped live responses, current activity, and context estimates. On receiver lag, replace
 both with a fresh observation. Durable records are identified by their original sequence.
@@ -203,16 +204,17 @@ but no Windows transport is implemented. Library embedders receive an empty cata
 and can provide their own <code>EmbeddedShimCatalog</code> through <code>HarnessBuilder</code>; selecting a combination
 without a supplied shim returns an unsupported-platform error.</p>
 <h2 id="reconstructing-model-calls"><a class="header" href="#reconstructing-model-calls">Reconstructing model calls</a></h2>
-<p>Session format 2 records the inputs needed to reconstruct each call at the shared <code>Provider</code>
+<p>Session format 3 records the inputs needed to reconstruct each call at the shared <code>Provider</code>
 boundary. It stores no backend-specific request bodies or authentication headers:</p>
 <ul>
 <li><code>model_context</code> records the configured provider name and a shared <code>ModelRequest</code> template:
 actual model ID, assembled system prompt (including harness instructions and location),
-tool descriptions and schemas, optional response schema, reasoning setting, output limit, and correlation. Its <code>messages</code>
-array is empty; conversation history remains in <code>message_committed</code> and <code>compaction</code> events.</li>
+tool descriptions and schemas, optional response schema, reasoning setting, output limit, and correlation. Its <code>history</code>
+and <code>tail</code> arrays are empty; conversation history remains in <code>message_committed</code> and <code>compaction</code> events.</li>
 <li><code>model_requested</code> is persisted before each provider invocation. It references the context event’s
-sequence and records an ordered list of source-event references and exact inline messages,
-including transient runtime state and compaction directives. Its purpose distinguishes ordinary
+sequence and records <code>history</code> as ordered source-event sequences (committed messages or compaction
+checkpoints), <code>tail</code> as exact inline messages (transient runtime state and compaction directives),
+and the request’s <code>history_lifetime</code>. Its purpose distinguishes ordinary
 agent calls from summarization. Ordinary calls within a turn share one context record;
 summarization records a separate template containing its response schema.</li>
 <li><code>compaction</code> is an ordinary log event containing the exact replacement message, retained original
@@ -226,10 +228,22 @@ their originating request, including summarization calls.</li>
 </ul>
 <p><code>session::reconstruct_model_request(&amp;records, sequence)</code> returns the provider name and reconstructed
 <code>ModelRequest</code> for a <code>model_requested</code> sequence, using sequence-ordered records from <code>SessionStore</code>.
-Image metadata references the existing session blobs;
-<code>store.hydrate_model_request(&amp;mut request).await</code> restores their payloads when needed. This reconstructs
-Skyhook’s provider-neutral input, not an API-specific wire encoding. Session journals use format version 2;
-there is no compatibility or migration layer for earlier layouts.</p>
+Attachments and tool images reference content-addressed session blobs by sha256;
+<code>store.load_blobs(&amp;mut request).await</code> loads their contents for provider encoding. This reconstructs
+Skyhook’s provider-neutral input, not an API-specific wire encoding.</p>
+<p>A <code>ModelRequest</code> sends <code>history</code> (committed conversation, an unchanged prefix of later requests in the
+same context until compaction replaces it) followed by <code>tail</code> (rebuilt for each request and never
+cacheable); <code>request.messages()</code> iterates both in order. A model profile’s <code>state_mode</code> decides where
+runtime state goes: in the tail (<code>dynamic</code>), committed to history (<code>persist</code>), or nowhere (<code>none</code>).
+<code>history_lifetime</code> is <code>continuing</code> (the default) when later requests in the context extend this
+history, <code>ending</code> when compaction replaces it after this agent request (its own estimate already
+reaches the compaction threshold), or <code>detached</code> for compaction summaries, which share no request
+settings with any other request. Providers decide prompt-cache placement from <code>history</code>, <code>tail</code>, and
+the lifetime: Anthropic places a cache breakpoint on the last history block unless it is detached
+(ending history is still marked, since cache reads land only at breakpoints), OpenAI protocols rely on
+automatic prefix caching with the tail sent last, and Codex records no WebSocket continuation for a
+request with a tail or non-continuing history.
+Session journals use format version 3; there is no compatibility or migration layer for earlier layouts.</p>
 <p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src/session">session module</a>
 and <a href="https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src/agent">agent module</a>.</p>
 

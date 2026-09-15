@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d98f569e.js";
+            window.path_to_searchindex_js = "../searchindex-67539886.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -183,26 +183,26 @@
                         <h1 id="remote-transport-and-shims"><a class="header" href="#remote-transport-and-shims">Remote transport and shims</a></h1>
 <h2 id="remote-transport-architecture"><a class="header" href="#remote-transport-architecture">Remote transport architecture</a></h2>
 <p>Remote connection protocols use the production <code>ConnectionFactory</code> interface in
-<code>crates/skyhook-core/src/remote/backend.rs</code>. Factories return an owned <code>Transport</code> byte stream;
-the manager performs the common shim handshake and client setup for both real backends and test
-doubles. Protocol selection and origin-side connection operations go through the backend dispatch
-layer, rather than constructing SSH launchers in the manager or target router.</p>
+<code>crates/skyhook-core/src/remote/backend.rs</code>. Factories receive the route hops after the destination’s origin and return an owned
+<code>Transport</code> byte stream; the manager performs the common shim handshake and client setup for both
+real backends and test doubles. Protocol selection goes through the backend dispatch layer, rather
+than constructing SSH launchers in the manager or target router.</p>
 <ul>
-<li><code>remote/manager.rs</code> owns route/origin handling, workspace connection pooling, cancellation, and
-invalidation.</li>
-<li><code>remote/client.rs</code> owns shared shim RPC and relayed stream state;
-<code>remote/transport.rs</code> defines the owned asynchronous byte-stream contract.</li>
+<li><code>remote/manager.rs</code> owns splitting routes at SSH origins, workspace connection pooling,
+cancellation, and invalidation.</li>
+<li><code>remote/client/</code> owns shared shim RPC and relayed stream state; <code>remote/transport.rs</code> defines
+the owned asynchronous byte-stream contract.</li>
 <li><code>remote/backends/ssh/</code> contains OpenSSH configuration/bootstrap, process supervision, askpass,
 and session-owned authentication. The public <code>remote::ssh</code> path remains a compatibility export.</li>
-<li><code>remote/protocol.rs</code> is the <strong>shim wire protocol</strong>, not the SSH/WinRM transport interface.
-Existing SSH control messages remain typed compatibility adapters; worker services dispatch
-those operations through the backend layer.</li>
+<li><code>remote/protocol.rs</code> is the <strong>shim wire protocol</strong>, not the SSH/WinRM transport interface.</li>
 </ul>
-<p>A backend must preserve credential ownership on <code>origin</code> (not <code>via</code>), retain its origin connection
-for the lifetime of child streams, and release its resources during session shutdown. Cancelling
-one waiter must not terminate a connection startup shared with other callers. Adding another
-protocol still requires its own target configuration, resolution, authentication, and bootstrap;
-the abstraction does not make SSH shell commands or ProxyJump semantics universal.</p>
+<p>SSH configuration is generated only from target definitions. An SSH process runs on root or on
+the shim of the destination’s <code>origin</code>, whose connection the child stream retains; <code>via</code> hops are
+native <code>ProxyJump</code> hops of that process and share its origin. Each origin runs its own lazy private
+agent. A backend must release its resources during session shutdown. Cancelling one waiter must not terminate a connection startup shared with
+other callers. Adding another protocol still requires its own target configuration,
+authentication, and bootstrap; the abstraction does not make SSH shell commands or ProxyJump
+semantics universal.</p>
 <h2 id="embedded-shim-builds"><a class="header" href="#embedded-shim-builds">Embedded shim builds</a></h2>
 <p>Build both statically linked Linux SSH shims and the release CLI with
 <code>cargo build --release -p skyhook-agent</code>. This default-feature build requires Zig and both Rust
@@ -214,11 +214,12 @@ debug assertions. Release builds keep the size-optimized, stripped <code>shim-re
 Both modes use the same musl targets and static ELF validation, and publish to the same artifact
 filenames in <code>target/shims/</code>. Switching build modes replaces those files with the matching variants;
 debug artifacts and the binaries embedding them are substantially larger.</p>
-<p>The build matrix is the <code>SHIM_TARGETS</code> constant in <a href="https://github.com/kryesh/skyhook/blob/main/build.rs"><code>build.rs</code></a>. Each entry declares <code>platform</code>,
-<code>protocol</code>, <code>arch</code>, and the Rust <code>target</code> triple. The Cargo binary name is derived as
-<code>&lt;platform&gt;-&lt;protocol&gt;</code>; the saved artifact is <code>&lt;platform&gt;-&lt;protocol&gt;-&lt;arch&gt;</code>. The runtime discovers
-embedded filenames and selects by protocol, platform, and architecture after probing the remote
-machine. The catalog also understands executable extensions, such as
+<p>The private build matrix is <code>ShimArchitecture</code> in <a href="https://github.com/kryesh/skyhook/blob/main/build.rs"><code>build.rs</code></a>.
+Its single architecture definition generates the supported variants and their architecture labels,
+Rust target triples, and expected ELF machine codes. All built-in shims use the <code>linux-ssh</code> Cargo
+binary; the saved artifacts remain <code>linux-ssh-x86_64</code> and <code>linux-ssh-aarch64</code>. This closed build
+matrix does not restrict the runtime catalog: it discovers embedded filenames and selects by
+protocol, platform, and architecture after probing the remote machine. The catalog also understands executable extensions, such as
 <code>windows-winrm-x86_64.exe</code>, but no Windows build target or WinRM transport is implemented yet.</p>
 <p><code>rust-embed</code> embeds both the file list and bytes in debug and release builds, so installed binaries
 do not need the build-time <code>target/shims/</code> directory. Local-only and rust-analyzer builds skip embedding even

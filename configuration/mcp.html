@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d98f569e.js";
+            window.path_to_searchindex_js = "../searchindex-67539886.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -225,7 +225,7 @@ processes are owned by the root session rather than independently restarted for 
 <p>The session must hold the global <strong><code>mcp</code> capability</strong> before any MCP server is launched or contacted,
 and before any MCP tool can be exposed or invoked. Each server’s <code>capabilities</code> array defaults to
 <code>[]</code> and adds requirements to that global gate. Valid names are <code>read</code>, <code>write</code>, <code>exec</code>, <code>network</code>,
-<code>targets</code>, <code>agents</code>, <code>interactive</code>, and <code>mcp</code>. An agent must hold <strong>all</strong> listed capabilities to see
+<code>targets</code>, <code>ssh_agent</code>, <code>agents</code>, <code>interactive</code>, and <code>mcp</code>. An agent must hold <strong>all</strong> listed capabilities to see
 or call a server’s tools; otherwise those tools are hidden from both the model catalog and
 JavaScript access. Servers whose requirements exceed the session’s capabilities are not contacted
 or launched at all. This is a host-configured gate, not an inference from server annotations.

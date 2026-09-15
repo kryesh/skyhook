@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d98f569e.js";
+            window.path_to_searchindex_js = "../searchindex-67539886.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -185,21 +185,21 @@
 grant the session’s target capability. It is not enabled by default. Without it, target-management
 tools, target arguments, JavaScript target setters, and target prompt guidance are all omitted
 from the model-visible surface. The former <code>targets_enabled</code> setting is no longer accepted.</p>
-<p>Targets are named directly under <code>[targets.&lt;name&gt;]</code>. Importing concrete aliases from the user’s
-SSH configuration is disabled by default. Session tools can upsert targets without modifying TOML.</p>
+<p>Targets are named directly under <code>[targets.&lt;name&gt;]</code>, and session tools can upsert targets without
+modifying TOML. Skyhook never reads SSH configuration files: a target’s host, user, port,
+authentication, and options come only from its own definition. Aliases, <code>ProxyJump</code>, identities,
+and other settings in <code>~/.ssh/config</code> or <code>/etc/ssh/ssh_config</code> do not apply.</p>
 <p>When <a href="../configuration/overview.html#file-selection-and-layering">user and workspace config are layered</a>,
 a workspace entry replaces the <strong>whole target with the same name</strong>; it does not inherit user SSH,
-authentication, origin, or routing settings. Targets with other names are retained. Repeat any
+authentication, or routing settings. Targets with other names are retained. Repeat any
 required settings in the replacement entry.</p>
-<pre><code class="language-toml">[targets]
-import_ssh_config = false
-
-[targets.bastion]
+<pre><code class="language-toml">[targets.bastion]
 type = "ssh"
 host = "bastion.example.com"
 
 [targets.bastion.ssh]
 user = "gateway"
+external_agent = true
 
 [targets.build]
 type = "ssh"
@@ -210,43 +210,80 @@ via = "bastion"
 [targets.build.ssh.auth]
 kind = "key"
 path = "~/.ssh/build_ed25519"
+
+[targets.database]
+type = "ssh"
+host = "db.internal"
+origin = "build"
+
+[targets.database.ssh]
+# Reach the host through a gateway using the deploy user's own SSH key on build.
+options = { ProxyCommand = "sudo -n -u deploy ssh -W %h:%p gateway.internal" }
 </code></pre>
 <p>Targets have an explicit <code>type</code>. The built-in <code>root</code> is <code>local</code>, meaning the session host—the machine
 running the main Skyhook process. It always identifies that machine, including when an agent’s
 current target is remote. Named target configuration and <code>target_add</code> accept only <code>type = "ssh"</code>.
-SSH-specific settings live under <code>ssh</code>, including authentication kinds <code>openssh</code> (default),
-<code>agent</code> (the session’s managed agent), and <code>key</code> (an explicit path). Older target configurations and
-session formats are rejected; update configurations and start a new session.</p>
-<p>The target list shows each target’s effective destination hostname/IP, original SSH alias, type,
-origin, and <code>via</code>. SSH imports resolve aliases with OpenSSH and translate <code>ProxyJump</code> into named
-<code>via</code> chains, creating stable names for unnamed or route-specific hops. Opaque <code>ProxyCommand</code>
-settings remain SSH-specific. Listing targets does not connect to their destinations.</p>
-<p>Agents receive their current target’s name, type, resolved hostname, origin, and <code>via</code> alongside
-their effective workspace in <code>skyhook_context</code>. Registering a target does not change the agent’s
-location.</p>
-<p><code>via</code> describes reachability; <code>origin</code> identifies the machine where connection configuration and
-outbound SSH processes belong. Local config/imports originate on <code>root</code>. <code>target_add</code> defaults its
-origin to the caller’s target and accepts an explicit <code>origin</code> override:</p>
-<pre><code class="language-javascript">await tool.target_add({name: "database", type: "ssh", host: "db.internal",
-  origin: "build", ssh: {auth: {kind: "key", path: "~/.ssh/database"}}});
+Older target configurations and session formats are rejected; update configurations and start a
+new session.</p>
+<h2 id="routing-origin-and-via"><a class="header" href="#routing-origin-and-via">Routing: <code>origin</code> and <code>via</code></a></h2>
+<ul>
+<li><code>origin</code> names the target whose Skyhook shim starts the SSH connection; it defaults to <code>root</code>.
+Key paths and agents belong to the origin.</li>
+<li><code>via</code> names a target to jump through with native <code>ProxyJump</code>, within that same connection. Jump
+hosts need no shim. A <code>via</code> target must have the same <code>origin</code>, so its key paths are never
+interpreted on another machine. Omit <code>via</code>, rather than naming the origin, to connect directly
+from the origin.</li>
+</ul>
+<p>Both may be set: <code>origin = "build"</code> with <code>via = "gateway"</code> makes <code>build</code> run SSH through <code>gateway</code>,
+where <code>gateway</code> also has <code>origin = "build"</code>.</p>
+<p>Registering targets never connects to them; registrations are session-wide.</p>
+<pre><code class="language-javascript">await tool.target_add({name: "database", type: "ssh", host: "db.internal", origin: "build",
+  ssh: {auth: {kind: "key", path: "~/.ssh/database"}}});
 </code></pre>
-<p>The resulting target automatically uses <code>via: "build"</code>, extended by any jump chain in build’s SSH
-configuration. Registration resolves configuration on the origin, which may require connecting to
-it, but never connects to the new destination or decrypts its keys. Registrations are session-wide.
-A root-origin connection via build uses native SSH forwarding; a build-origin connection runs SSH
-under build’s shim. Native forwarding alone does not require a shim on jump hosts. Native hops in
-a connection segment must share its configuration origin; use an explicit remote origin to start
-a shim-owned continuation. This prevents remote credential paths being interpreted on root.</p>
-<p>One private, session-owned SSH agent runs on root. SSH loads keys lazily from their configuration
-origin into this central agent. Remote Skyhook commands receive OpenSSH’s private forwarded socket in
+<h2 id="ssh-settings"><a class="header" href="#ssh-settings">SSH settings</a></h2>
+<p>SSH settings live under <code>ssh</code>. Every setting is optional:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Setting</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>user</code>, <code>port</code></td><td>Remote user (default: the origin’s username) and port (1–65535, default 22).</td></tr>
+<tr><td><code>auth</code></td><td><code>default</code> offers OpenSSH’s default key files (<code>~/.ssh/id_*</code>); <code>agent</code> offers only keys already in the agent; <code>key</code> with <code>path</code> offers one private key on the SSH origin.</td></tr>
+<tr><td><code>external_agent</code></td><td>Authenticate with, and forward, the agent the origin inherited in <code>SSH_AUTH_SOCK</code> instead of a private agent Skyhook runs on the origin. Keys are never added to it. Requires the <code>ssh_agent</code> capability; see <a href="#agents">agents</a>.</td></tr>
+<tr><td><code>options</code></td><td>Extra <code>ssh_config</code> options, written verbatim as in an ssh_config file, e.g. <code>{ ProxyCommand = "sudo -n -u deploy ssh -W %h:%p gateway.internal" }</code> to reach the host through a gateway with another user’s SSH key (commands run without a terminal, so <code>sudo</code> must not prompt). Use <code>%h</code> for the target host; <code>%n</code> is Skyhook’s internal host alias. Options cannot replace settings Skyhook writes first. These are rejected: <code>Host</code>, <code>Match</code>, <code>Include</code>, <code>HostName</code>, <code>User</code>, <code>Port</code>, <code>IdentityFile</code>, <code>IdentityAgent</code>, <code>AddKeysToAgent</code>, <code>BatchMode</code>, <code>ProxyJump</code>, <code>ControlMaster</code>, <code>ControlPath</code>, <code>ControlPersist</code>, <code>ForwardAgent</code>, <code>RemoteCommand</code>, <code>RequestTTY</code>, <code>SessionType</code>, <code>CanonicalizeHostname</code>, <code>SendEnv</code>, <code>SetEnv</code>, <code>ForwardX11</code>, and <code>ForwardX11Trusted</code>. <code>ProxyCommand</code> cannot be combined with <code>via</code>.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="agents"><a class="header" href="#agents">Agents</a></h2>
+<p>Each origin—root, or a target’s shim—runs its own private SSH agent, started when a connection from
+that origin first needs it; SSH loads keys into it lazily. An <code>external_agent</code> target instead uses
+the agent its origin inherited in <code>SSH_AUTH_SOCK</code>: on root, the one Skyhook was started with; on a
+remote origin, the agent forwarded to that origin’s connection. A chain of <code>external_agent</code> targets
+therefore keeps using the same external agent.</p>
+<p>Each connection forwards the agent it authenticated with, so remote Skyhook commands receive it in
 <code>SSH_AUTH_SOCK</code>, allowing commands such as <code>git</code>, <code>ssh</code>, and <code>ssh-add</code> to use the same identities.
-Skyhook does not inherit an existing user agent. Agent state is discarded at session shutdown and
-is not restored when resuming a session.</p>
+Private agent state is discarded when its origin’s session or connection ends and is not restored
+when resuming a session.</p>
+<p>Targets whose route includes an <code>external_agent</code> hop, including configured ones, require the
+<code>ssh_agent</code> capability. Without it they are invisible: <code>targets</code> omits them, selecting them or
+naming them in <code>via</code> or <code>origin</code> fails as an unknown target, <code>target_add</code> cannot replace them, and
+<code>target_add</code> does not offer <code>ssh.external_agent</code>. With it, connecting requires approval of that
+route (listing its origin and <code>external_agent</code> hops); an unchanged route is not asked again. Adding
+an <code>external_agent</code> target with <code>target_add</code> is approved separately from later connecting to it.</p>
+<p><code>target_add</code> also requires the <code>exec</code> capability and its approval when it sets <code>ssh.options</code>,
+because options such as <code>ProxyCommand</code> can run commands. Configuration files are trusted like MCP
+commands.</p>
 <p>Skyhook’s askpass handler routes passwords, key passphrases, keyboard-interactive challenges, host
-confirmations, and agent confirmations to the host UI. Interactivity is controlled by the handler,
-not target configuration. <code>--non-interactive</code> disables authentication prompts; invocations without an interactive
-terminal must use that mode and fail operations that require input; <code>--approve-all</code> does not approve authentication prompts. Secrets are never
-included in tool results or session logs.</p>
+confirmations, and agent confirmations to the host UI, including prompts from SSH started on a
+remote origin. Interactivity is controlled by the handler, not target configuration.
+<code>--non-interactive</code> disables authentication prompts; invocations without an interactive terminal
+must use that mode and fail operations that require input; <code>--approve-all</code> does not approve
+authentication prompts. Secrets are never included in tool results or session logs.</p>
+<h2 id="using-targets"><a class="header" href="#using-targets">Using targets</a></h2>
+<p>The target list shows each target’s host, type, <code>via</code>, and <code>origin</code>. Agents receive their current
+target’s name, type, host, <code>via</code>, and <code>origin</code> alongside their effective workspace in
+<code>skyhook_context</code>. Registering a target does not change the agent’s location.</p>
 <p>Target-aware tools, including <code>agent</code>, use these rules:</p>
 <ul>
 <li>Omitting <code>target</code> uses the calling agent’s target and current workspace.</li>
@@ -259,7 +296,7 @@ calling agent’s current named target retains that agent’s workspace override
 <p>Prefer these named targets to manually running <code>ssh</code>. The first tool in a session that needs an SSH
 route asks for approval before any probe, authentication, or shim deployment. Approval is shared
 across tools and workspace-specific pooled connections; reconnecting an unchanged route does not
-prompt again. Changing a target or any hop in its <code>via</code> route invalidates the affected approval.</p>
+prompt again. Changing a target or any hop in its route invalidates the affected approval.</p>
 <p>JavaScript remains host-owned while nested targeted tools inherit their caller’s location. The
 <code>agent</code> tool also accepts a named target or <code>root</code>.
 Remote agent state machines, providers, approvals, message history, and canonical session logging

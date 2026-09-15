@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d98f569e.js";
+            window.path_to_searchindex_js = "../searchindex-67539886.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -182,7 +182,7 @@
                     <main>
                         <h1 id="configuration-overview"><a class="header" href="#configuration-overview">Configuration overview</a></h1>
 <p>Skyhook uses TOML configuration. The files are not rewritten when the terminal remembers a
-model or theme.</p>
+model.</p>
 <h2 id="file-selection-and-layering"><a class="header" href="#file-selection-and-layering">File selection and layering</a></h2>
 <p>With <strong><code>--config path.toml</code></strong>, Skyhook loads <strong>only that file</strong>. It does not search for or merge
 user or workspace configuration, even if the explicit file fails to load.</p>
@@ -200,7 +200,7 @@ A broken user file is not silently treated as missing if no fallback succeeds. T
 configuration must be valid; defaults are applied <strong>after merging</strong>.</p>
 <p>Tables merge recursively; arrays and scalar values replace the earlier value. The exception is
 <strong>named entries under <code>targets</code></strong>: a workspace <code>[targets.build]</code> replaces the <em>whole</em> user
-<code>[targets.build]</code> entry, including its SSH, authentication, workspace, origin, and routing settings.
+<code>[targets.build]</code> entry, including its SSH, authentication, workspace, and routing settings.
 It does not inherit omitted fields. Other named targets remain available.</p>
 <h3 id="example-user-models-workspace-targets"><a class="header" href="#example-user-models-workspace-targets">Example: user models, workspace targets</a></h3>
 <p>Keep provider/model definitions in the selected user <code>config.toml</code>:</p>
@@ -250,8 +250,9 @@ Review it before starting Skyhook in an untrusted checkout. This repository curr
 value</strong>. A user-defined <code>cwd</code> keeps its user-file base when other MCP fields are overlaid;
 a workspace-defined <code>cwd</code> uses the workspace config’s directory (<code>&lt;workspace&gt;/.skyhook</code>),
 not the workspace root.</p>
-<p><code>session_root</code> optionally changes session storage from <code>&lt;workspace&gt;/.skyhook/sessions</code>.
-Its existing relative-path semantics are unchanged: relative values use the process working
+<p>The CLI always stores and discovers sessions in <code>&lt;workspace&gt;/.skyhook/sessions</code>, including
+headless execution and resume. It does not search other workspaces or honor <code>session_root</code> overrides.
+For library users, <code>session_root</code> can still override storage; relative values use the process working
 directory, not the config file’s directory. Remote target paths retain their existing remote
 semantics. The workspace is a base directory, not filesystem isolation.</p>
 <p>The CLI still loads <strong><code>.env</code> from the invocation directory</strong>, with existing process environment
@@ -279,8 +280,6 @@ context/output limits, reasoning replay, and connection recovery.</li>
 and optional SSH-config import.</li>
 <li><a href="mcp.html">MCP servers</a>: trusted local server startup and imported tools.</li>
 </ul>
-<p>Terminal-specific theme and keybindings belong in the separate
-<a href="../guide/terminal-interface.html#keyboard-and-mouse"><code>tui.toml</code></a>.</p>
 <h2 id="complete-example"><a class="header" href="#complete-example">Complete example</a></h2>
 <p>This is included from the repository’s single maintained
 <a href="https://github.com/kryesh/skyhook/blob/main/config.example.toml"><code>config.example.toml</code></a>.
@@ -322,8 +321,7 @@ kind = "codex"
 # Keyless local llama.cpp endpoint; the model alias matches --alias below.
 # Example text-only server (requires enough memory for the configured context):
 # llama-server --model /path/to/Qwen3.8-27B.gguf --alias qwen3.8-27b \
-#   --host 127.0.0.1 --port 8080 --ctx-size 262144 --parallel 1 \
-#   --n-predict 131072 --jinja --reasoning-format deepseek
+#   --host 127.0.0.1 --port 8080 --ctx-size 262144 --parallel 1 --n-predict 131072
 [providers.local]
 kind = "openai"
 base_url = "http://127.0.0.1:8080/v1"
@@ -379,9 +377,7 @@ max_output = 131072
 # The text-only server above has no multimodal projector configured.
 supports_images = false
 
-# Importing concrete aliases from ~/.ssh/config is opt-in.
-[targets]
-import_ssh_config = false
+# Targets are defined only here or by target_add; SSH configuration files are never read.
 
 # [targets.bastion]
 # type = "ssh"
@@ -401,6 +397,16 @@ import_ssh_config = false
 # [targets.build.ssh.auth]
 # kind = "key"
 # path = "~/.ssh/build_ed25519"
+#
+# Start SSH on build's shim (using build's key paths and agents), with extra
+# ssh_config options. Any via jump must also use origin = "build".
+# [targets.appliance]
+# type = "ssh"
+# host = "appliance.internal"
+# origin = "build"
+# [targets.appliance.ssh]
+# Reach the host through a gateway using the deploy user's own SSH key (sudo must not prompt).
+# options = { ProxyCommand = "sudo -n -u deploy ssh -W %h:%p gateway.internal", ServerAliveInterval = "15" }
 
 # MCP servers are optional; an absent/empty [mcp] adds no tools or prompt guidance.
 # Commands in this user config are trusted: startup runs without model approval,
@@ -408,7 +414,7 @@ import_ssh_config = false
 # Global "mcp" capability is required before any server is launched or contacted.
 # A server's tools additionally require ALL listed capabilities; otherwise hidden.
 # Per-server capabilities defaults to [] (global mcp only, no approval prompt).
-# Valid names: read, write, exec, network, targets, agents, interactive, mcp.
+# Valid names: read, write, exec, network, targets, ssh_agent, agents, interactive, mcp.
 # Skyhook imports tools only; discovery is frozen at startup. Failed servers warn
 # and are skipped. Tools are available both directly and inside script. Native
 # input schemas are kept unless open/conflicting, when input uses `arguments`.

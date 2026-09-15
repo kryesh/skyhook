@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d98f569e.js";
+            window.path_to_searchindex_js = "../searchindex-67539886.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -201,7 +201,7 @@ Search returns <code>{matches:{"src/main.rs":["12: matching text"]}}</code>, pre
 <code>search({pattern:"...",details:true})</code> returns structured <code>{path,line,column,text}</code> matches instead.
 Empty compact directory/search maps are <code>{}</code>. Grouped maps share a single normal preview budget.
 <code>targets({details:true})</code> returns full target metadata without nulls; defaults and <code>target_add</code> use compact
-name/type/host records with nondefault origin/workspace and configured via where applicable.
+name/type/host records with nondefault workspace and configured via or origin where applicable.
 All defaulted input fields, including <code>details: false</code>, are optional in tool schemas.</p>
 <p>By default, hidden entries (including <code>.git</code>) and ignored files are excluded. <code>hidden: true</code>
 includes hidden entries, while <code>no_ignore: true</code> independently disables ignore files. Searches
@@ -272,15 +272,29 @@ match context is reconstructed from saved text. Live searches defer incomplete l
 windows until more output arrives or capture closes. A wait timeout never stops the original job.</p>
 <h2 id="persistence-and-live-output"><a class="header" href="#persistence-and-live-output">Persistence and live output</a></h2>
 <p>Reads are repeatable and survive session resume, without opaque tokens or saved query state.
-The old <code>cursor</code> argument is no longer accepted. Capture completeness remains internal; finished
-jobs with retained partial output have an <code>Output incomplete.</code> notice.</p>
-<p>Local process output can be read while running. Remote shims capture first and transfer their
-results in bounded frames after execution completes. Once transferred, output can be queried
-without reconnecting to the remote machine.</p>
+The old <code>cursor</code> argument is no longer accepted. Finished jobs with retained partial output have
+an <code>Output incomplete.</code> notice, including when viewing the final captured page.</p>
+<p>Output views advertise actual available captures, independently of tool names or whether a
+structured result was returned:</p>
+<pre><code class="language-json">{"captures":[{"field":"/result/console","kind":"text","complete":false}]}
+</code></pre>
+<p><code>kind</code> is <code>text</code>, <code>json</code>, or <code>unknown</code>. <code>complete: false</code> means the capture is still live or
+incomplete; in particular, a partial JSON capture must not be treated as a valid JSON value.
+Select a descriptor’s <code>field</code> to page or search its retained bytes. Capture descriptors survive
+failures, cancellation, and session resume even when there is no structured result containing
+those fields. Empty or absent result fields are not fabricated to represent partial captures.</p>
+<p>Local captures, including script console output, can be read while running. Remote shims capture
+first and transfer results in bounded frames; already-transferred captures can be queried locally,
+including during transfer, without reconnecting to the remote machine.</p>
+<p>The TUI’s automatic output view shows the structured result and previews any available captures
+not represented there. This exposes both process streams while live and preserves stderr and exit
+status on completion. Explicit field, page, and search selections remain selected; choose
+<strong>automatic output</strong> in the Saved output menu to return to automatic viewing. Menu fields are
+generated from the result object and available capture descriptors.</p>
 <p>The journal stores the exact model-visible previews, pages, and notifications. Full artifacts
 are separate; provider-neutral request reconstruction reuses committed content rather than
-regenerating it from current files or settings. Session format 2 has no migration layer;
-version-1 journals are rejected.</p>
+regenerating it from current files or settings. Session format 3 has no migration layer;
+earlier journals are rejected.</p>
 
                     </main>
 

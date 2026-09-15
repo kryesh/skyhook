@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d98f569e.js";
+            window.path_to_searchindex_js = "../searchindex-67539886.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -185,8 +185,10 @@
 <p>Startup and <code>/new</code> open an empty draft without creating a session or its files. The session is
 created when you send the first message or explicitly run a script; leaving an unused draft
 behind does not create an empty saved session. Resuming an existing session still opens it immediately.</p>
-<p>Use <code>--resume SESSION_ID</code> to reopen a session. Session logs default to
-<code>&lt;workspace&gt;/.skyhook/sessions</code>; <code>session_root</code> in the configuration overrides that location.
+<p>Use <code>--resume SESSION_ID</code> to reopen a session. The CLI stores session logs and looks for
+saved sessions only in <code>&lt;workspace&gt;/.skyhook/sessions</code>, where <code>--workspace</code> selects the workspace
+(default: the current directory). It does not search parent or sibling workspaces, and ignores
+the library-only <code>session_root</code> override.
 The terminal’s <code>/new</code> and session picker manage drafts and saved sessions; model selection
 and UI state are described in the <a href="terminal-interface.html#model-selection-and-ui-state">terminal guide</a>.</p>
 <p>Unacknowledged background questions/completions wake their owner for another turn. Child completion
@@ -210,7 +212,9 @@ new tool output. Skyhook does not silently reduce <code>max_output</code>. Token
 for context display and calibration, but do not control the automatic compaction trigger.</p>
 <p>Compaction uses the current model to summarize the conversation. The regular system prompt remains
 present, but the summarization request has no tool definitions and explicitly disables tool calls.
-Historical tool calls and results remain available as evidence. Subsequent agent requests retain
+Historical tool calls and results remain available as evidence. Signed reasoning that is bound to the
+conversation that produced it (Anthropic thinking) is invalidated by compaction, so the summarization
+request and retained messages omit it; its visible text and all other reasoning are kept. Subsequent agent requests retain
 their normal tool definitions. The directive and resulting
 compaction message occupy the user role with separate harness provenance. The model returns a
 structured JSON final answer with an objective and resumption point as strings, all other narrative
@@ -268,7 +272,7 @@ are not automatically retried. Ordinary model requests instead have separate con
 context-overflow recovery budgets, allowing up to five combined attempts when both recovery
 paths are needed; arbitrary streaming or protocol failures are not automatically replayed.
 Recognized provider context-overflow errors force compaction before the next ordinary attempt.
-See <a href="../configuration/providers-and-models.html#model-connection-recovery">model connection recovery</a>
+See <a href="../configuration/providers-and-models.html#model-failure-recovery">model failure recovery</a>
 for the retry conditions and budgets.</p>
 <p>Each attempt is journaled with its exact input, and failed streamed tool calls are never
 executed. The CLI reports compaction start, estimated input reduction, skipped compactions,
