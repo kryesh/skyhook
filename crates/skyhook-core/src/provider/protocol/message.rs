@@ -21,6 +21,24 @@ pub enum UserContent {
     Compaction { text: String },
 }
 
+impl Message {
+    /// Drop replay bound to the conversation that produced it, keeping display text. Changing
+    /// that conversation, as compaction does, invalidates such replay; other replay is kept.
+    pub fn strip_bound_reasoning(&mut self) {
+        if let Self::Assistant(items) = self {
+            for item in items {
+                if item
+                    .replay
+                    .as_ref()
+                    .is_some_and(|replay| replay.conversation_bound)
+                {
+                    item.replay = None;
+                }
+            }
+        }
+    }
+}
+
 impl UserContent {
     #[must_use]
     pub fn is_image(&self) -> bool {
@@ -85,6 +103,14 @@ pub struct ReplayEnvelope {
     pub model: String,
     pub scope: String,
     pub payload: Value,
+    /// Signed state bound to the exact conversation before it; changing that history, as
+    /// compaction does, invalidates it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub conversation_bound: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl AssistantItem {

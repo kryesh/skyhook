@@ -110,11 +110,6 @@ pub(super) async fn route_responses<R>(
                     cancellation.cancel();
                 }
             }
-            Response::ResolvedSsh { request_id, result } => {
-                if let Some(sender) = state.lock().await.resolutions.remove(&request_id) {
-                    let _ = sender.send(result.map_err(RemoteError::Resolution));
-                }
-            }
             Response::StreamData { channel, data } => {
                 let invalid = data.len() > 32 * 1024;
                 let overflow = {

@@ -10,6 +10,22 @@ pub struct ModelProfile {
     pub max_output: u64,
     #[serde(default)]
     pub supports_images: bool,
+    #[serde(default)]
+    pub state_mode: StateMode,
+}
+
+/// How per-request runtime state (date, jobs, todos) reaches the model.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StateMode {
+    /// Never send runtime state.
+    None,
+    /// Send current state after history; it never enters history.
+    #[default]
+    Dynamic,
+    /// Commit each request's state to history, keeping history append-only for providers
+    /// that bind signed reasoning to the exact earlier conversation.
+    Persist,
 }
 
 impl ModelProfile {
@@ -28,6 +44,7 @@ impl ModelProfile {
             max_context,
             max_output,
             supports_images,
+            state_mode: StateMode::default(),
         }
     }
 
@@ -59,9 +76,12 @@ mod tests {
                     .is_err()
             );
         }
-        let raw = serde_json::json!({"provider":"arbitrary/vendor", "model":"unlisted:model", "reasoning":"opaque vendor mode", "max_context":4096, "max_output":512, "supports_images":false});
+        let raw = serde_json::json!({"provider":"arbitrary/vendor", "model":"unlisted:model", "reasoning":"opaque vendor mode", "max_context":4096, "max_output":512, "supports_images":false, "state_mode":"persist"});
         let profile: ModelProfile = serde_json::from_value(raw.clone()).unwrap();
         assert!(profile.validate_limits().is_ok());
         assert_eq!(serde_json::to_value(profile).unwrap(), raw);
+        let minimal = serde_json::json!({"provider":"p", "model":"m", "reasoning":null, "max_context":2, "max_output":1});
+        let profile: ModelProfile = serde_json::from_value(minimal).unwrap();
+        assert_eq!(profile.state_mode, StateMode::Dynamic);
     }
 }

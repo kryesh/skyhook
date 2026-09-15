@@ -61,7 +61,7 @@ impl ToolExecutor {
             )
         })?;
         let route = router
-            .resolve(selected)
+            .resolve(selected, &self.capabilities)
             .await
             .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
         let definition = route.destination();
@@ -192,7 +192,7 @@ impl ToolExecutor {
                 )
         }));
         let authorization_arguments = if let Some(route) = &selected.route {
-            permissions.push(route.route.permission());
+            permissions.extend(route.route.permissions());
             serde_json::json!({
                 "tool": original_arguments,
                 "route": route.route.authorization_arguments(),

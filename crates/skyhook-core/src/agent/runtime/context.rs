@@ -8,7 +8,7 @@ use crate::{
     identity::AgentId,
     provider::{
         Provider, ProviderContext,
-        profile::ModelProfile,
+        profile::{ModelProfile, StateMode},
         protocol::{HistoryLifetime, Message, ModelRequest, Usage, UserContent},
     },
     session::{EventRecord, ModelRequestTemplate, SessionEvent, project_history},
@@ -65,7 +65,8 @@ impl AgentContext {
         Ok(())
     }
 
-    /// Build the next agent request: projected history, then runtime state as tail.
+    /// Build the next agent request: projected history, then runtime state as tail unless the
+    /// state mode is none.
     /// When this request's calibrated input estimate alone already reaches the
     /// compaction threshold, its completed response will compact and replace this
     /// history. The estimate excludes output, so it never predicts earlier than
@@ -77,7 +78,11 @@ impl AgentContext {
                 .iter()
                 .map(|(_, message)| message.clone())
                 .collect(),
-            tail: vec![Message::User(vec![runtime])],
+            // The caller commits persisted state to history before sending.
+            tail: match self.profile.state_mode {
+                StateMode::None => Vec::new(),
+                StateMode::Dynamic | StateMode::Persist => vec![Message::User(vec![runtime])],
+            },
             ..self.template.to_request()
         };
         if self.reaches_compaction(u128::from(self.meter.estimate(&request))) {
@@ -157,7 +162,7 @@ pub(in crate::agent) fn recorded_context(
         }) else {
             continue;
         };
-        // The recorded tail is that request's runtime state; history is re-projected.
+        // The recorded tail is that request's dynamic runtime state; history is re-projected.
         let tail = std::mem::take(&mut request.tail);
         request.history.clear();
         request.history_lifetime = HistoryLifetime::default();

@@ -158,11 +158,9 @@ fn dump_config_accepts_unresolved_routes_without_importing_or_running_ssh() {
     let ssh = f.path("bin/ssh");
     write(&ssh, "#!/bin/sh\ntouch SSH_WAS_RUN\nexit 1\n");
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
-    // Import would fail on this unreadable-as-a-file SSH config.
-    fs::create_dir_all(f.path(".ssh/config")).unwrap();
     let path = f.path("config/skyhook/config.toml");
     let mut config = fs::read_to_string(&path).unwrap();
-    config.push_str("\n[targets]\nimport_ssh_config=true\n[targets.remote]\ntype='ssh'\nhost='unresolved-alias'\nvia='imported-later'\n");
+    config.push_str("\n[targets.remote]\ntype='ssh'\nhost='remote.test'\nvia='defined-later'\n");
     write(&path, &config);
     let output = f
         .bare_command()
@@ -173,7 +171,7 @@ fn dump_config_accepts_unresolved_routes_without_importing_or_running_ssh() {
     let config = successful_config(&output);
     assert_eq!(
         config["targets"]["remote"]["via"].as_str(),
-        Some("imported-later")
+        Some("defined-later")
     );
     assert!(!f.path("SSH_WAS_RUN").exists());
     no_session(&f);

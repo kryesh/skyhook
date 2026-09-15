@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use crate::{
     job::CancellationToken,
     remote::{EmbeddedShimCatalog, SensitivePromptHandler},
-    target::{ResolvedRoute, RouteIdentity, TargetDefinition},
+    target::{ResolvedRoute, RouteIdentity},
     tool::{ToolContext, ToolOutput, authorization::AuthorizationCoordinator},
 };
 
@@ -198,23 +198,25 @@ impl RemoteManager {
         resolved_route: &ResolvedRoute,
         workspace: &Path,
     ) -> Result<Session, RemoteError> {
-        let destination = resolved_route.destination();
-        let target = destination.name.as_str();
+        let target = resolved_route.destination().name.as_str();
         let route = resolved_route.definitions();
-        let (origin, hops) = if destination.origin == crate::target::ROOT_TARGET {
-            (None, route)
-        } else {
-            let index = route
-                .iter()
-                .position(|hop| hop.name == destination.origin)
-                .ok_or_else(|| RemoteError::Protocol("origin missing from route".into()))?;
-            let prefix = ResolvedRoute::from_definitions(route[..=index].to_vec())
-                .expect("inclusive route prefix is nonempty");
-            let cancellation = CancellationToken::new();
-            let prepared = self
-                .connection(prefix, &route[index].workspace, &cancellation)
-                .await?;
-            (Some(prepared.connection), &route[index + 1..])
+        // The destination's origin starts this connection's SSH process on its shim;
+        // the hops after it are native jumps of that process.
+        let (origin, hops) = match &resolved_route.destination().origin {
+            None => (None, route),
+            Some(origin) => {
+                let index = route
+                    .iter()
+                    .position(|hop| &hop.name == origin)
+                    .ok_or_else(|| RemoteError::Protocol("origin missing from route".into()))?;
+                let prefix = ResolvedRoute::from_definitions(route[..=index].to_vec())
+                    .expect("inclusive route prefix is nonempty");
+                let cancellation = CancellationToken::new();
+                let prepared = self
+                    .connection(prefix, &route[index].workspace, &cancellation)
+                    .await?;
+                (Some(prepared.connection), &route[index + 1..])
+            }
         };
         let mut transport = self
             .inner
@@ -226,8 +228,8 @@ impl RemoteManager {
                 origin: origin.clone(),
             })
             .await?;
-        // Retain the credential-owning session for the whole child stream,
-        // independently of the backend's own transport lifetime guards.
+        // Retain the origin's session for the whole child stream, independently
+        // of the backend's own transport lifetime guards.
         transport.owner = Box::new((transport.owner, origin));
         Ok(Arc::new(
             PooledConnection::from_transport(
@@ -238,22 +240,6 @@ impl RemoteManager {
             )
             .await?,
         ))
-    }
-}
-
-impl PreparedConnection {
-    pub(crate) async fn resolve_target(
-        &self,
-        target: TargetDefinition,
-    ) -> Result<super::ssh::ResolvedSsh, RemoteError> {
-        let result = super::backend::resolve_on(&self.connection, target).await;
-        if matches!(
-            result,
-            Err(RemoteError::Io { .. } | RemoteError::Protocol(_))
-        ) {
-            self.manager.discard(self).await;
-        }
-        result
     }
 }
 
@@ -487,21 +473,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn factory_receives_only_route_after_credential_origin() {
+    async fn factory_receives_only_route_after_ssh_origin() {
         let factory = Arc::new(RecordingFactory::default());
         let manager = manager(factory.clone());
         let origin = TargetDefinition::test("origin", "/origin", None);
-        let mut via = TargetDefinition::test("via", "/via", Some("origin"));
-        via.origin = "origin".into();
+        let mut via = TargetDefinition::test("via", "/via", None);
+        via.origin = Some("origin".into());
+        // The jump belongs to the SSH process the destination's origin starts.
         let mut destination = TargetDefinition::test("build", "/build", Some("via"));
-        destination.origin = "origin".into();
-        let route = route(vec![origin, via, destination]);
+        destination.origin = Some("origin".into());
+        // Origins nest: deep's SSH process runs on build's shim.
+        let mut deep = TargetDefinition::test("deep", "/deep", None);
+        deep.origin = Some("build".into());
+        let route = route(vec![origin, via, destination, deep]);
         let cancellation = CancellationToken::new();
         let prepared = manager.connection(route, Path::new("/override"), &cancellation);
         let prepared = prepared.await.unwrap();
         let expected = [
             ("origin", vec!["origin"], false, "/origin"),
-            ("build", vec!["via", "build"], true, "/override"),
+            ("build", vec!["via", "build"], true, "/build"),
+            ("deep", vec!["deep"], true, "/override"),
         ]
         .map(|(target, route, has_origin, workspace)| RecordedRequest {
             target: target.into(),
@@ -612,36 +603,31 @@ mod tests {
             panic!("fixture SSH server timed out")
         }
 
-        async fn target(&self, name: &str, key: &str) -> TargetDefinition {
+        fn target(&self, name: &str, key: &str) -> TargetDefinition {
             let ssh = SshOptions {
                 user: Some(self.user.clone()),
-                port: Some(self.port),
+                port: std::num::NonZeroU16::new(self.port),
                 auth: TargetAuth::Key {
                     path: self.directory.path().join(key),
                 },
+                options: [
+                    ("StrictHostKeyChecking", "no"),
+                    ("UserKnownHostsFile", "/dev/null"),
+                ]
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .into(),
+                ..SshOptions::default()
             };
             let config = TargetConfig {
                 r#type: TargetConfigType::Ssh,
                 host: "127.0.0.1".into(),
                 workspace: self.directory.path().into(),
                 via: None,
+                origin: None,
                 ssh,
             };
-            let definition =
-                TargetDefinition::from_config(name.into(), config, TargetSource::Config).unwrap();
-            let resolver = Arc::new(crate::target::normalize::LocalResolver);
-            let normalized =
-                crate::target::normalize::normalize(vec![definition], vec![], resolver);
-            let mut definition = normalized.await.unwrap().remove(0);
-            trust_fixture(&mut definition);
-            definition
+            TargetDefinition::from_config(name.into(), config, TargetSource::Config).unwrap()
         }
-    }
-
-    fn trust_fixture(target: &mut TargetDefinition) {
-        let options = &mut target.resolved.as_mut().unwrap().options;
-        options.insert("stricthostkeychecking".into(), vec!["no".into()]);
-        options.insert("userknownhostsfile".into(), vec!["/dev/null".into()]);
     }
 
     #[tokio::test]
@@ -672,13 +658,8 @@ mod tests {
         }
         let run = async {
             let server = Server::start().await;
-            let mut target = server.target("environment", "first").await;
-            let options = &mut target.resolved.as_mut().unwrap().options;
-            // The server accepts every variable. A vulnerable client would export both
-            // inherited host variables and literal SSH SetEnv keys.
-            options.insert("sendenv".into(), vec!["*".into()]);
-            let set_env = "SKYHOOK_TEST_CONFIG_KEY=ssh-config-secret";
-            options.insert("SeTeNv".into(), vec![set_env.into()]);
+            // The server accepts every variable; the client must export none of them.
+            let target = server.target("environment", "first");
             let command = "printf '%s\\n' \"${SKYHOOK_TEST_HOST_ENV-unset}\" \"${SKYHOOK_TEST_DOTENV_KEY-unset}\" \"${SKYHOOK_TEST_CONFIG_KEY-unset}\" \"${SKYHOOK_TEST_REMOTE_ENV-unset}\" \"$HOME\"";
             let prompts = Arc::new(RejectSensitivePrompts);
             let transport =
@@ -703,7 +684,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires a built shim, sshd and loopback sockets; set SKYHOOK_TEST_SHIM"]
-    async fn native_jumps_and_shim_owned_connections_share_a_lazy_central_agent() {
+    async fn native_jumps_and_origins_use_lazy_private_agents() {
         tokio::time::timeout(std::time::Duration::from_secs(120), exercise_connections())
             .await
             .expect("SSH integration timed out");
@@ -722,21 +703,27 @@ mod tests {
         let prompted = || prompts.0.load(Ordering::SeqCst);
         let catalog = EmbeddedShimCatalog::from_embedded_assets(assets).unwrap();
         let manager = RemoteManager::new(catalog, prompts.clone(), allow_all());
-        let first = server.target("first", "first").await;
-        let mut native = first.clone();
-        native.name = "native".into();
+        // Root's askpass helper re-executes the host binary, which a test binary cannot
+        // serve, so only the origin's shim may prompt for the encrypted key.
+        let first = server.target("first", "first");
+        let mut native = server.target("native", "first");
         native.via = Some("first".into());
+        let mut nested = server.target("nested", "second");
+        nested.origin = Some("first".into());
         let cancel = CancellationToken::new();
         let connect = |route| manager.connection(route, workspace, &cancel);
         let a = connect(route(vec![first.clone()])).await.unwrap();
         let b = connect(route(vec![first.clone(), native])).await.unwrap();
         assert_eq!(prompted(), 0);
-        let nested = server.target("nested", "second").await;
+        let c = connect(route(vec![first, nested])).await.unwrap();
+        assert_eq!(
+            prompted(),
+            1,
+            "the origin's key is requested only when used"
+        );
         let store = crate::session::SessionStore::create_ephemeral(workspace)
             .await
             .unwrap();
-        let registry = crate::target::TargetRegistry::from_definitions([first.clone()]).unwrap();
-        let router = crate::target::TargetRouter::new(registry, manager.clone(), allow_all());
         let mut capabilities = crate::tool::policy::CapabilitySet::default();
         capabilities.insert(crate::tool::policy::Capability::Targets);
         let subject = crate::tool::authorization::AuthorizationSubject {
@@ -747,31 +734,12 @@ mod tests {
             capabilities,
             cancellation: cancel.clone(),
         };
-        let added = router.add(nested, "first".into(), &subject, &store).await;
-        let mut nested = added.unwrap();
-        assert_eq!(
-            (&*nested.origin, nested.via.as_deref()),
-            ("first", Some("first"))
-        );
-        assert_eq!(nested.host, "127.0.0.1");
-        assert_eq!(
-            prompted(),
-            0,
-            "registration must not decrypt the destination key"
-        );
-        trust_fixture(&mut nested);
-        let c = connect(route(vec![first, nested])).await.unwrap();
-        assert_eq!(
-            prompted(),
-            1,
-            "encrypted remote key should be requested only when used"
-        );
         let environment = manager.environment().await.unwrap();
         let mut ssh_add = tokio::process::Command::new("ssh-add");
         let identities = ssh_add.arg("-l").envs(&environment).output().await.unwrap();
         assert!(identities.status.success());
         let identities = String::from_utf8_lossy(&identities.stdout).lines().count();
-        assert_eq!(identities, 2, "both keys belong to root's managed agent");
+        assert_eq!(identities, 1, "root's agent holds only keys used from root");
         let (_, input) = tokio::sync::mpsc::channel(1);
         let context = ToolContext::new(
             subject,
@@ -789,11 +757,11 @@ mod tests {
         assert_eq!(listing.value["exit_code"], 0);
         assert_eq!(
             listing.value["stdout"].as_str().unwrap().lines().count(),
-            2,
-            "ordinary remote commands receive the forwarded central agent"
+            1,
+            "remote commands receive the agent their origin's shim runs"
         );
         // Exercise duplex flow control well beyond a stream window.
-        let echo = vec![server.target("echo", "first").await];
+        let echo = vec![server.target("echo", "first")];
         let mut transport = c
             .connection
             .clone()

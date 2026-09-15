@@ -44,6 +44,7 @@ capabilities = ["read", "write", "exec", "network", "agents", "mcp"]
 | `exec` | `exec` and `shell` | Enabled |
 | `network` | HTTP(S) `fetch` | Enabled |
 | `targets` | Target-management tools and target-selection inputs | Disabled |
+| `ssh_agent` | Targets using `ssh.external_agent`, which forward an SSH agent Skyhook does not own; without it they are hidden | Disabled |
 | `agents` | Child-agent creation, also limited by available delegation depth | Enabled |
 | `interactive` (runtime only) | Human-facing root questions, approval prompts, and sensitive authentication | Enabled by the terminal host; disabled in headless mode |
 | `mcp` | MCP server startup and MCP tool availability | Enabled |

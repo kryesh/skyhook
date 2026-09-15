@@ -181,7 +181,7 @@ where
                             let _ = sender.send(decision);
                         }
                     }
-                    control @ (Request::ResolveSsh { .. } | Request::OpenSsh { .. } | Request::StreamData { .. } | Request::StreamEnd { .. } | Request::StreamClose { .. } | Request::StreamAck { .. } | Request::SensitiveAnswer { .. }) => services.handle(control).await?,
+                    control @ (Request::OpenSsh { .. } | Request::StreamData { .. } | Request::StreamEnd { .. } | Request::StreamClose { .. } | Request::StreamAck { .. } | Request::SensitiveAnswer { .. }) => services.handle(control).await?,
                     Request::Hello { .. } => {
                         reader.abort();
                         return Err("received a second hello".into());

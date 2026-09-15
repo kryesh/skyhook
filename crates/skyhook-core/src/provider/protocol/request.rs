@@ -54,8 +54,12 @@ pub enum HistoryLifetime {
     /// Later requests in this context extend this history.
     #[default]
     Continuing,
-    /// This history is replaced after this request (compaction), so caching it cannot pay off.
+    /// This history is replaced after this request (compaction). Providers keep no reusable
+    /// server-side state for it, though reading an already-cached prefix may still pay off.
     Ending,
+    /// This history is sent once under settings no other request in the context shares
+    /// (compaction summaries), so there is no cached prefix to read or extend.
+    Detached,
 }
 
 /// A named JSON Schema that a provider must enforce for the final response text.

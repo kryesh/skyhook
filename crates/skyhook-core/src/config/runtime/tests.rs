@@ -20,8 +20,6 @@ provider = 'vendor / 任意'
 model = 'another-external-model'
 max_context = 4096
 max_output = 256
-[targets]
-import_ssh_config = false
 "#,
     )
     .unwrap()

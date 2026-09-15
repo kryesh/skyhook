@@ -228,7 +228,7 @@ mod tests {
     use crate::cli::{self, Invocation};
 
     fn history_config(root: Option<PathBuf>) -> RuntimeConfig {
-        let mut config: Config = toml::from_str("[providers.test]\nkind='openai'\napi='chat_completions'\nbase_url='http://127.0.0.1:1/v1'\n[models.test]\nprovider='test'\nmodel='fixture'\nmax_context=128000\nmax_output=4096\n[targets]\nimport_ssh_config=false\n").unwrap();
+        let mut config: Config = toml::from_str("[providers.test]\nkind='openai'\napi='chat_completions'\nbase_url='http://127.0.0.1:1/v1'\n[models.test]\nprovider='test'\nmodel='fixture'\nmax_context=128000\nmax_output=4096\n").unwrap();
         config.session_root = root;
         config.into_runtime().unwrap()
     }

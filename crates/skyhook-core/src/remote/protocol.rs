@@ -14,7 +14,8 @@ use crate::{
 use serde_json::Value;
 
 // Version 3 sends tool images as source-format bytes with their file provenance.
-pub(crate) const PROTOCOL_VERSION: u32 = 3;
+// Version 4 removes shim-side SSH configuration resolution.
+pub(crate) const PROTOCOL_VERSION: u32 = 4;
 
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
@@ -54,10 +55,6 @@ pub(crate) struct PromptId(pub u64);
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum Request {
-    ResolveSsh {
-        request_id: RequestId,
-        target: Box<crate::target::TargetDefinition>,
-    },
     OpenSsh {
         channel: RequestId,
         route: Vec<crate::target::TargetDefinition>,
@@ -123,10 +120,6 @@ pub(crate) enum Response {
     },
     SensitiveCancelled {
         prompt_id: PromptId,
-    },
-    ResolvedSsh {
-        request_id: RequestId,
-        result: Result<super::ssh::ResolvedSsh, String>,
     },
     StreamData {
         channel: RequestId,

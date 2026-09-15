@@ -456,6 +456,7 @@ mod tests {
             model: "fixture".into(),
             scope: "reasoning".into(),
             payload: serde_json::json!({"signature": "opaque"}),
+            conversation_bound: false,
         }
     }
 

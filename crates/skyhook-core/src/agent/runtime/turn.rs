@@ -95,6 +95,15 @@ impl SessionRuntime {
                 // normal request, rather than delaying it by another request.
                 continue 'requests;
             }
+            if profile.state_mode == crate::provider::profile::StateMode::Persist
+                && let Some(state) = request.tail.pop()
+            {
+                // Later requests then extend an unchanged conversation, which signed
+                // reasoning is bound to.
+                let sequence = self.commit(agent, state.clone()).await?;
+                agent_context.projected.push((sequence, state.clone()));
+                request.history.push(state);
+            }
             // Freeze the request across provider recovery. Input/notifications and
             // model changes remain queued until the next normal request boundary.
             // Partial streamed output is display-only: only a fully assembled response
@@ -508,6 +517,7 @@ mod tests {
             model: "native".into(),
             scope: "reasoning".into(),
             payload: json!({"encrypted_content":"retained"}),
+            conversation_bound: false,
         };
         let retained = vec![
             AssistantContent::reasoning("reason", 0, "completed reasoning", Some(replay)),

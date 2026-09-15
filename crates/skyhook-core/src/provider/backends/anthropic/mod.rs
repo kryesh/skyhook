@@ -49,6 +49,14 @@ enum Block {
     EmittedOther,
 }
 
+/// Signed thinking is bound to the exact conversation before it, so compaction drops it.
+fn bound_envelope(model: &str, native: &Value) -> ReplayEnvelope {
+    ReplayEnvelope {
+        conversation_bound: true,
+        ..reasoning_envelope("anthropic", model, native.clone())
+    }
+}
+
 fn block_delta(item: usize, delta: ContentDelta) -> ResponseChunk {
     ResponseChunk::BlockDelta {
         item: item.to_string(),
@@ -147,7 +155,7 @@ impl StreamingBlock {
                 }
                 CompletedBlock::Reasoning {
                     text: string(native, "thinking")?.into(),
-                    replay: reasoning_envelope("anthropic", model, native.clone()),
+                    replay: bound_envelope(model, native),
                 }
             }
             Self::RedactedThinking(native) => CompletedBlock::Reasoning {
@@ -157,7 +165,7 @@ impl StreamingBlock {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .into(),
-                replay: reasoning_envelope("anthropic", model, native.clone()),
+                replay: bound_envelope(model, native),
             },
             Self::Tool {
                 native,

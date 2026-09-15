@@ -23,7 +23,7 @@ Search returns `{matches:{"src/main.rs":["12: matching text"]}}`, preserving sou
 `search({pattern:"...",details:true})` returns structured `{path,line,column,text}` matches instead.
 Empty compact directory/search maps are `{}`. Grouped maps share a single normal preview budget.
 `targets({details:true})` returns full target metadata without nulls; defaults and `target_add` use compact
-name/type/host records with nondefault origin/workspace and configured via where applicable.
+name/type/host records with nondefault workspace and configured via or origin where applicable.
 All defaulted input fields, including `details: false`, are optional in tool schemas.
 
 By default, hidden entries (including `.git`) and ignored files are excluded. `hidden: true`

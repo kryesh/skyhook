@@ -19,6 +19,12 @@ of `max_output`; it does not estimate the next request.
 Use the model's published limits or your server's actual configured limits, whichever is lower.
 You can deliberately choose smaller budgets for cost, latency, or available memory.
 
+`state_mode` controls how per-request runtime state (date, active jobs, and todos) reaches the model.
+`dynamic` (the default) sends a fresh snapshot after the history on each request without storing it.
+`persist` commits each snapshot to the conversation, so history is only ever appended; providers that
+bind signed reasoning to the exact earlier conversation (such as Claude Fable 5.1) need this, at the
+cost of keeping every snapshot in context until compaction. `none` sends no runtime state.
+
 The [complete example](overview.md#complete-example) uses published hosted-model limits:
 
 | Profile | Context | Output | Source |
@@ -137,6 +143,9 @@ even when no model `reasoning` effort is configured. Configuring `reasoning` add
 changing that summary request. Skyhook displays the plaintext reasoning or summaries the provider
 exposes; this does not guarantee access to raw OpenAI reasoning. What is returned depends on the
 provider and model, and compatible servers may differ in support for these request fields.
+Anthropic requests summarized thinking (`thinking.display = "summarized"`) whenever `reasoning`
+enables thinking. With `reasoning` unset, no thinking configuration is sent, so models that think by
+default keep their own display default, which omits thinking text on current models.
 
 All backends retain returned reasoning and replay state in the session journal. Responses and Codex
 replay native reasoning items (including encrypted state), and Anthropic replays signed thinking or

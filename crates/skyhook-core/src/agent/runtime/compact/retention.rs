@@ -206,6 +206,7 @@ mod tests {
                 model: "model".into(),
                 scope: "scope".into(),
                 payload: json!({"opaque":"must survive", "signature":"signed"}),
+                conversation_bound: false,
             };
             let reasoning =
                 AssistantContent::reasoning("reason", 0, "visible reasoning", Some(replay));

@@ -50,7 +50,7 @@ processes are owned by the root session rather than independently restarted for 
 The session must hold the global **`mcp` capability** before any MCP server is launched or contacted,
 and before any MCP tool can be exposed or invoked. Each server's `capabilities` array defaults to
 `[]` and adds requirements to that global gate. Valid names are `read`, `write`, `exec`, `network`,
-`targets`, `agents`, `interactive`, and `mcp`. An agent must hold **all** listed capabilities to see
+`targets`, `ssh_agent`, `agents`, `interactive`, and `mcp`. An agent must hold **all** listed capabilities to see
 or call a server's tools; otherwise those tools are hidden from both the model catalog and
 JavaScript access. Servers whose requirements exceed the session's capabilities are not contacted
 or launched at all. This is a host-configured gate, not an inference from server annotations.

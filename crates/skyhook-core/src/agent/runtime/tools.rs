@@ -227,7 +227,8 @@ fn register_child_agent(
                 let definition = if target == crate::target::ROOT_TARGET {
                     None
                 } else {
-                    Some(runtime.router.targets().get(target).await.map_err(|error| tool_error(&error))?)
+                    let route = runtime.router.resolve(target, context.capabilities()).await;
+                    Some(route.map_err(|error| tool_error(&error))?.destination().clone())
                 };
                 let mut location = crate::execution::ExecutionLocation::select(
                     context.caller_location(),

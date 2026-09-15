@@ -1,8 +1,6 @@
 //! Typed execution targets, configuration, and routing.
 
 mod config;
-mod import;
-pub(crate) mod normalize;
 mod registry;
 mod router;
 
@@ -13,5 +11,3 @@ pub use registry::{
     ROOT_TARGET, TargetDefinition, TargetError, TargetRecord, TargetRegistry, TargetSource,
 };
 pub(crate) use router::{ResolvedRoute, RouteIdentity, TargetRouter};
-
-pub(crate) use import::import_ssh_targets;

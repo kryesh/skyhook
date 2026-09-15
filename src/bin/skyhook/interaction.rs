@@ -110,7 +110,7 @@ fn requires_prompt(permission: &PermissionUse) -> bool {
         // These capabilities are enforced by the core capability gate, not an
         // approval dialog. MCP adapters normally declare requires only.
         Capability::Read | Capability::Agents | Capability::Interactive | Capability::Mcp => false,
-        Capability::Exec | Capability::Targets | Capability::Network => true,
+        Capability::Exec | Capability::Targets | Capability::SshAgent | Capability::Network => true,
         Capability::Write => !matches!(
             &permission.resource,
             ResourceId::Workspace { target, .. } if target == ROOT_TARGET

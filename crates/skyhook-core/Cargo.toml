@@ -11,7 +11,6 @@ description = "Reusable runtime for the Skyhook programmable coding-agent harnes
 name = "skyhook"
 
 [dependencies]
-async-trait = "0.1.89"
 base64 = "0.23"
 bytes = "1.12.1"
 chrono = { version = "0.4.42", default-features = false, features = [
@@ -24,7 +23,6 @@ encoding_rs = "0.8"
 fs2 = "0.4.3"
 futures-util = "0.3.34"
 getrandom = "0.4.3"
-glob = "0.3.3"
 grep-matcher = "0.1.8"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"

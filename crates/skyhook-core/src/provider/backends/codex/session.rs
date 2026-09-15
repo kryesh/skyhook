@@ -5,7 +5,7 @@ use super::transport::{DEADLINE, Socket, http_stream, is_transport_metadata, ws_
 use super::{CodexProvider, auth_error, error};
 use crate::provider::{
     CodexWebSocketError, ProviderContext, ProviderError, ProviderErrorKind, ProviderFuture,
-    protocol::ModelRequest,
+    protocol::{HistoryLifetime, ModelRequest},
 };
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -195,6 +195,10 @@ impl ProviderContext for Context {
                 },
             };
             if let Some(mut connection) = connection {
+                // A previous_response_id would keep this request's tail in server-side
+                // context, and ending history is never extended: record no continuation.
+                let reusable = request.tail.is_empty()
+                    && request.history_lifetime == HistoryLifetime::Continuing;
                 let prepared = websocket_request(body, continuation.as_ref());
                 // Routing and continuation are request-owned before the write;
                 // failed or cancelled writes cannot restore any connection state.
@@ -212,7 +216,7 @@ impl ProviderContext for Context {
                     session,
                     responses::Decoder::codex(request.model),
                     prepared.settings,
-                    prepared.full_input,
+                    reusable.then_some(prepared.full_input),
                     scope,
                 ));
             }

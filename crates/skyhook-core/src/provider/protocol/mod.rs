@@ -25,5 +25,6 @@ pub(crate) fn replay() -> ReplayEnvelope {
         model: "m".into(),
         scope: "s".into(),
         payload: serde_json::json!({"opaque":{"nested":[null, 42]}}),
+        conversation_bound: false,
     }
 }

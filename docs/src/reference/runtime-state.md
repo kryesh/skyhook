@@ -50,11 +50,13 @@ The public `TodoItem`, `TodoStatus`, and `TodoSnapshot` types live in `skyhook::
 
 ## Per-request state snapshot
 
-Each model request ends with one fresh, compact-text `<skyhook_state>` snapshot. Its first
+Unless the model profile's [`state_mode`](../configuration/providers-and-models.md) is `none`,
+each model request carries a fresh, compact-text `<skyhook_state>` snapshot: after the history
+(`dynamic`, the default) or committed to the conversation after earlier snapshots (`persist`). Its first
 line is `date:YYYY-MM-DD`, using the host's current local date, refreshed per request rather
 than fixed in the system prompt at agent startup. The optional `jobs:` and `todos:` sections
-follow in that order; empty sections are omitted. The system prompt explains this format once.
-This presentation does not change the JSON returned by job or todo tools.
+follow in that order; empty sections are omitted. The format is self-describing; the system
+prompt does not explain it. This presentation does not change the JSON returned by job or todo tools.
 
 The jobs section starts with `jobs: job parent tool name state age_s turns tool_calls`.
 Each following row contains those fields separated by single spaces. `parent` is `-` for

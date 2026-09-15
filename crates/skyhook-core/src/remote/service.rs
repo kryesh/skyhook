@@ -110,7 +110,7 @@ pub(super) struct WorkerServices<W> {
     pub tasks: tokio::task::JoinSet<std::io::Result<()>>,
     prompts: Arc<dyn SensitivePromptHandler>,
     pub environment: ProcessEnvironment,
-    _backends: WorkerBackends,
+    backends: WorkerBackends,
 }
 impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
     pub fn new(output: Arc<Mutex<W>>) -> Result<Self, std::io::Error> {
@@ -129,7 +129,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
             tasks: tokio::task::JoinSet::new(),
             prompts,
             environment,
-            _backends: backends,
+            backends,
         })
     }
     pub async fn handle(&mut self, request: Request) -> Result<(), std::io::Error> {
@@ -143,19 +143,6 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
                 {
                     let _ = sender.send(answer);
                 }
-            }
-            Request::ResolveSsh { request_id, target } => {
-                let output = self.output.clone();
-                self.tasks.spawn(async move {
-                    let result = super::backend::resolve_local(&target)
-                        .await
-                        .map_err(|e| e.to_string());
-                    write_frame(
-                        &mut *output.lock().await,
-                        &Response::ResolvedSsh { request_id, result },
-                    )
-                    .await
-                });
             }
             Request::OpenSsh {
                 channel,
@@ -177,12 +164,12 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
                     },
                 );
                 let output = self.output.clone();
-                let environment = self.environment.clone();
+                let agent = self.backends.ssh_agent();
                 let prompts = self.prompts.clone();
                 self.tasks.spawn(async move {
                     let result = async {
                         let stream = tokio::select! {
-                            stream = super::backend::open_ssh_request(&route, &command, &environment, prompts) => stream?,
+                            stream = super::backend::open_ssh_request(&route, &command, &agent, prompts) => stream?,
                             () = cancellation.cancelled() => return Ok(()),
                         };
                         let super::transport::Transport { input: stdin, output: mut stdout, owner: _owner } = stream;

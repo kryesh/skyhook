@@ -5,9 +5,8 @@ mod config;
 mod process;
 
 pub(crate) use askpass::AskpassServer;
-pub(crate) use authentication::WorkerAuthentication;
-pub use config::ResolvedSsh;
-pub(crate) use config::resolve_local;
+pub(crate) use authentication::{Authentication, WorkerAuthentication};
+pub(crate) use config::configurable_option;
 pub(crate) use process::open;
 
 pub(crate) fn run_askpass_helper(
@@ -46,10 +45,13 @@ impl ConnectionFactory for Backend {
     fn connect(&self, request: ConnectionRequest) -> BoxFuture<'_, Result<Transport, RemoteError>> {
         Box::pin(async move {
             let destination = request.route.last().ok_or(RemoteError::EmptyRoute)?;
-            let environment = if request.origin.is_none() {
-                self.authentication.environment().await?
-            } else {
+            // A remote origin's shim chooses agents for the SSH process it starts.
+            let environment = if request.origin.is_some() {
                 ProcessEnvironment::new()
+            } else {
+                self.authentication
+                    .route_environment(&request.route)
+                    .await?
             };
             process::SshLauncher {
                 origin: request.origin,

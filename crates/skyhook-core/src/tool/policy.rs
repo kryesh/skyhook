@@ -20,18 +20,21 @@ pub enum Capability {
     Exec,
     Network,
     Targets,
+    /// Forward an SSH agent Skyhook does not own (`ssh.external_agent`).
+    SshAgent,
     Agents,
     Interactive,
     Mcp,
 }
 
 impl Capability {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Read,
         Self::Write,
         Self::Exec,
         Self::Network,
         Self::Targets,
+        Self::SshAgent,
         Self::Agents,
         Self::Interactive,
         Self::Mcp,
@@ -45,6 +48,7 @@ impl Capability {
             Self::Exec => "exec",
             Self::Network => "network",
             Self::Targets => "targets",
+            Self::SshAgent => "ssh_agent",
             Self::Agents => "agents",
             Self::Interactive => "interactive",
             Self::Mcp => "mcp",
@@ -60,7 +64,7 @@ impl fmt::Display for Capability {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "unknown capability {0:?}; expected read, write, exec, network, targets, agents, interactive, or mcp"
+    "unknown capability {0:?}; expected read, write, exec, network, targets, ssh_agent, agents, interactive, or mcp"
 )]
 pub struct ParseCapabilityError(String);
 
@@ -527,7 +531,7 @@ mod tests {
         for capability in Capability::ALL {
             assert_eq!(
                 defaults.contains(capability),
-                capability != Capability::Targets
+                !matches!(capability, Capability::Targets | Capability::SshAgent)
             );
         }
         let child = defaults.for_agent(0);

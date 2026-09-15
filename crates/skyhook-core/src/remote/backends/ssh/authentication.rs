@@ -2,6 +2,7 @@
 use super::askpass::AskpassServer;
 use crate::remote::backend::ProcessEnvironment;
 use crate::remote::{RemoteError, SensitivePromptHandler};
+use crate::target::TargetDefinition;
 use std::{process::Stdio, sync::Arc};
 use tokio::{
     process::{Child, Command},
@@ -87,6 +88,19 @@ impl Authentication {
             .environment
             .clone())
     }
+    /// Environment for an SSH process started on this machine. The private agent
+    /// starts only when some hop uses it; external_agent hops use this process's
+    /// own SSH_AUTH_SOCK.
+    pub async fn route_environment(
+        &self,
+        route: &[TargetDefinition],
+    ) -> Result<ProcessEnvironment, RemoteError> {
+        if route.iter().all(|hop| hop.ssh.external_agent) {
+            return Ok(ProcessEnvironment::new());
+        }
+        self.environment().await
+    }
+
     pub async fn shutdown(&self) {
         if let Some(mut agent) = self.agent.lock().await.take() {
             let _ = agent.child.kill().await;
@@ -95,14 +109,17 @@ impl Authentication {
     }
 }
 
-/// Worker-side OpenSSH authentication state, retaining the askpass server.
+/// Worker-side OpenSSH authentication: the forwarded agent and askpass server for
+/// worker processes, and a private agent for SSH processes this worker starts.
 pub(crate) struct WorkerAuthentication {
     _askpass: AskpassServer,
     environment: ProcessEnvironment,
+    agent: Arc<Authentication>,
 }
 
 impl WorkerAuthentication {
     pub(crate) fn new(prompts: Arc<dyn SensitivePromptHandler>) -> Result<Self, std::io::Error> {
+        let agent = Arc::new(Authentication::new(prompts.clone()));
         let askpass = AskpassServer::start(prompts)?;
         let mut environment = askpass.environment();
         // OpenSSH already owns a private forwarded socket for this connection.
@@ -117,10 +134,30 @@ impl WorkerAuthentication {
         Ok(Self {
             _askpass: askpass,
             environment,
+            agent,
         })
     }
 
     pub(crate) fn environment(&self) -> &ProcessEnvironment {
         &self.environment
+    }
+
+    pub(crate) fn agent(&self) -> Arc<Authentication> {
+        self.agent.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn routes_using_only_external_agents_never_start_the_private_agent() {
+        let authentication = Authentication::new(Arc::new(crate::remote::RejectSensitivePrompts));
+        let mut hop = TargetDefinition::test("external", ".", None);
+        hop.ssh.external_agent = true;
+        let environment = authentication.route_environment(&[hop]).await.unwrap();
+        assert!(environment.is_empty());
+        assert!(authentication.agent.lock().await.is_none());
     }
 }

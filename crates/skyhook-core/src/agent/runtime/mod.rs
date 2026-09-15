@@ -29,7 +29,7 @@ use crate::{
     },
     remote::{EmbeddedShimCatalog, RejectSensitivePrompts, RemoteManager, SensitivePromptHandler},
     session::{EventRecord, SessionError, SessionEvent, SessionStore},
-    target::{TargetDefinition, TargetRegistry, TargetsConfig, import_ssh_targets},
+    target::{TargetDefinition, TargetRegistry, TargetsConfig},
     tool::builtins::{HostSkills, install_script_tool, register_coding_tools},
     tool::policy::{AllowAll, Policy},
     tool::policy::{Capability, CapabilitySet},

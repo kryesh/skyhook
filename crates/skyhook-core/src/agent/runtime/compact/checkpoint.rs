@@ -65,7 +65,12 @@ impl SessionRuntime {
                 .iter()
                 .map(|(_, message)| message.clone())
                 .collect(),
-            tail: vec![Message::User(vec![runtime])],
+            // A fresh snapshot replaces the input's state tail, when its state mode sends one.
+            tail: if input.tail.is_empty() {
+                Vec::new()
+            } else {
+                vec![Message::User(vec![runtime])]
+            },
             history_lifetime: HistoryLifetime::Continuing,
             tools: input.tools.clone(),
             reasoning: input.reasoning.clone(),
@@ -89,10 +94,15 @@ impl SessionRuntime {
         });
         let template = summary_request.clone();
         summary_request.history = summary_history;
+        // Dropping tools changes the conversation, invalidating bound reasoning.
+        summary_request
+            .history
+            .iter_mut()
+            .for_each(Message::strip_bound_reasoning);
         summary_request.tail = summary_tail;
         summary_request.tail.push(directive);
         // The checkpoint replaces this history once the summary completes.
-        summary_request.history_lifetime = HistoryLifetime::Ending;
+        summary_request.history_lifetime = HistoryLifetime::Detached;
         let provider_name = records
             .iter()
             .find_map(|record| {
@@ -227,18 +237,23 @@ impl SessionRuntime {
         }
         let mut compacted = input.clone();
         compacted.history = vec![message.clone()];
-        compacted
-            .history
-            .extend(retained.iter().map(|source| source.message().clone()));
-        let runtime = prompt::runtime_state_with_todos(
-            &self.jobs,
-            agent,
-            turn.capabilities,
-            continuation.todos.clone(),
-            turn.location,
-        )
-        .await;
-        compacted.tail = vec![Message::User(vec![runtime])];
+        // Estimate what projection sends: retained bound reasoning is dropped.
+        compacted.history.extend(retained.iter().map(|source| {
+            let mut message = source.message().clone();
+            message.strip_bound_reasoning();
+            message
+        }));
+        if !compacted.tail.is_empty() {
+            let runtime = prompt::runtime_state_with_todos(
+                &self.jobs,
+                agent,
+                turn.capabilities,
+                continuation.todos.clone(),
+                turn.location,
+            )
+            .await;
+            compacted.tail = vec![Message::User(vec![runtime])];
+        }
         let after_tokens = compaction::estimate_request(&compacted);
         if after_tokens >= before_tokens {
             self.store.append(agent.clone(), SessionEvent::CompactionSkipped {

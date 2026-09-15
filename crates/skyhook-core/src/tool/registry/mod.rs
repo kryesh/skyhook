@@ -5,8 +5,8 @@ mod schema;
 
 pub(crate) use docs::{ScriptManifest, job_view_type};
 use schema::{
-    add_schema_property, ensure_no_target, target_property_schema, validate_object_schema,
-    validate_output_schema, validate_schema,
+    add_nested_schema_property, add_schema_property, ensure_no_target, target_property_schema,
+    validate_object_schema, validate_output_schema, validate_schema,
 };
 
 use std::{
@@ -253,7 +253,8 @@ pub struct ToolOptions {
     script_binding: ScriptBinding,
     required: BTreeSet<Capability>,
     root_required: BTreeSet<Capability>,
-    conditional_inputs: Vec<(String, Capability, Value)>,
+    /// (object pointer, property name, required capability, property schema)
+    conditional_inputs: Vec<(String, String, Capability, Value)>,
     output_schema: Option<OutputSchema>,
 }
 
@@ -382,13 +383,26 @@ impl ToolOptions {
 
     #[must_use]
     pub fn conditional_input(
+        self,
+        name: impl Into<String>,
+        capability: Capability,
+        schema: Value,
+    ) -> Self {
+        self.conditional_nested_input("", name, capability, schema)
+    }
+
+    /// Like `conditional_input`, for a property of the object schema at a JSON
+    /// pointer, such as a nested definition (`/$defs/Options`).
+    #[must_use]
+    pub fn conditional_nested_input(
         mut self,
+        pointer: impl Into<String>,
         name: impl Into<String>,
         capability: Capability,
         schema: Value,
     ) -> Self {
         self.conditional_inputs
-            .push((name.into(), capability, schema));
+            .push((pointer.into(), name.into(), capability, schema));
         self
     }
 
@@ -797,6 +811,13 @@ impl ToolRegistryBuilder {
         let name = name.into();
         validate_name(&name)?;
         validate_schema(&input_schema)?;
+        if let Some((pointer, ..)) = (options.conditional_inputs.iter())
+            .find(|(pointer, ..)| !input_schema.pointer(pointer).is_some_and(Value::is_object))
+        {
+            return Err(RegistryError::Schema(format!(
+                "conditional input location `{pointer}` is not an object schema"
+            )));
+        }
         let ToolOptions {
             execution,
             supports_background,
@@ -828,9 +849,9 @@ impl ToolRegistryBuilder {
                     }),
                 );
             }
-            for (name, capability, property) in &conditional_inputs {
+            for (pointer, name, capability, property) in &conditional_inputs {
                 if capabilities.contains(*capability) {
-                    add_schema_property(&mut schema, name, property.clone());
+                    add_nested_schema_property(&mut schema, pointer, name, property.clone());
                 }
             }
             schema
@@ -1111,6 +1132,58 @@ mod admission_tests {
         assert!(captures[0].matches(job, "/result/text"));
         assert!(output.take_captures().is_empty());
         lease.fail(JobOutcome::Cancelled).await;
+    }
+
+    #[tokio::test]
+    async fn conditional_nested_inputs_follow_capabilities_and_must_name_objects() {
+        #[derive(serde::Deserialize, JsonSchema)]
+        struct Inner {
+            #[serde(rename = "value")]
+            _value: String,
+        }
+        #[derive(serde::Deserialize, JsonSchema)]
+        struct Input {
+            #[serde(rename = "inner")]
+            _inner: Inner,
+        }
+        let runtime = crate::tests::TestRuntime::new().await;
+        let options = |pointer: &str| {
+            let extra = serde_json::json!({"type": "boolean"});
+            ToolOptions::default().conditional_nested_input(
+                pointer,
+                "extra",
+                Capability::Targets,
+                extra,
+            )
+        };
+        let mut builder = ToolRegistryBuilder::default();
+        let handler = |_, _: Input| async { Ok(String::new()) };
+        builder
+            .register::<Input, String, _, _>(
+                "nested",
+                "Nested input",
+                options("/$defs/Inner"),
+                handler,
+            )
+            .unwrap();
+        let missing = options("/$defs/Missing");
+        assert!(
+            builder
+                .register::<Input, String, _, _>("bad", "Bad", missing, handler)
+                .is_err()
+        );
+        let registry = builder.build();
+        let tool = registry.get("nested").unwrap();
+        let extra = |capabilities: &CapabilitySet| {
+            let spec = tool.spec(capabilities, &runtime.agent).unwrap();
+            spec.input_schema["$defs"]["Inner"]["properties"]
+                .get("extra")
+                .is_some()
+        };
+        let mut capabilities = CapabilitySet::default();
+        assert!(!extra(&capabilities));
+        capabilities.insert(Capability::Targets);
+        assert!(extra(&capabilities));
     }
 
     #[tokio::test]

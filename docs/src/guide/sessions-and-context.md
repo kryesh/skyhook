@@ -39,7 +39,9 @@ for context display and calibration, but do not control the automatic compaction
 
 Compaction uses the current model to summarize the conversation. The regular system prompt remains
 present, but the summarization request has no tool definitions and explicitly disables tool calls.
-Historical tool calls and results remain available as evidence. Subsequent agent requests retain
+Historical tool calls and results remain available as evidence. Signed reasoning that is bound to the
+conversation that produced it (Anthropic thinking) is invalidated by compaction, so the summarization
+request and retained messages omit it; its visible text and all other reasoning are kept. Subsequent agent requests retain
 their normal tool definitions. The directive and resulting
 compaction message occupy the user role with separate harness provenance. The model returns a
 structured JSON final answer with an objective and resumption point as strings, all other narrative

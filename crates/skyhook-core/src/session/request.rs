@@ -32,7 +32,9 @@ pub fn project_history(
             let SessionEvent::MessageCommitted { message } = &source.event else {
                 unreachable!()
             };
-            result.push((*sequence, message.clone()));
+            let mut message = message.clone();
+            message.strip_bound_reasoning();
+            result.push((*sequence, message));
         }
         checkpoint.frontier
     } else {
@@ -244,6 +246,29 @@ pub fn reconstruct_model_request(
         },
         |message| history.push(message.clone()),
     )?;
+    let SessionEvent::ModelRequested {
+        history: sources,
+        purpose,
+        ..
+    } = &records[index].event
+    else {
+        unreachable!("visit_request accepts only model requests")
+    };
+    // As in projection and summaries, bound reasoning never enters a changed conversation.
+    let frontier = sources.first().and_then(|source| {
+        let position = records[..index]
+            .binary_search_by_key(source, |record| record.sequence)
+            .ok()?;
+        match &records[position].event {
+            SessionEvent::Compaction { checkpoint } => Some(checkpoint.frontier),
+            _ => None,
+        }
+    });
+    for (source, message) in sources.iter().zip(&mut history) {
+        if *purpose == ModelPurpose::Compaction || frontier.is_some_and(|last| *source <= last) {
+            message.strip_bound_reasoning();
+        }
+    }
     let request = ModelRequest {
         history,
         tail: tail.to_vec(),
@@ -385,6 +410,7 @@ mod tests {
             model: "original-model".into(),
             scope: "reasoning".into(),
             payload: json!({"signature":"preserve"}),
+            conversation_bound: false,
         };
         let reasoning = AssistantItem::reasoning("reasoning-item", 0, "reasoning", Some(envelope));
         let assistant = Message::Assistant(vec![reasoning]);
@@ -700,5 +726,57 @@ mod tests {
                 "mutation {mutation}"
             );
         }
+    }
+
+    #[test]
+    fn bound_reasoning_does_not_survive_compaction() {
+        let (agent, mut records) = projection_fixture();
+        let portable = ReplayEnvelope {
+            version: 1,
+            protocol: "test".into(),
+            model: "model".into(),
+            scope: "scope".into(),
+            payload: json!({"signature":"opaque"}),
+            conversation_bound: false,
+        };
+        let bound = ReplayEnvelope {
+            conversation_bound: true,
+            ..portable.clone()
+        };
+        let message = |replay| {
+            Message::Assistant(vec![
+                AssistantItem::reasoning("bound", 0, "visible", replay),
+                AssistantItem::reasoning("portable", 1, "kept", Some(portable.clone())),
+            ])
+        };
+        let (signed, stripped) = (message(Some(bound)), message(None));
+        records[0].event = committed(signed.clone());
+        // Retained after each checkpoint, and sent without it by both summary requests.
+        assert_eq!(project_history(&records, &agent).unwrap()[1].1, stripped);
+        for (request, index) in [(4, 0), (8, 1)] {
+            let (_, request) = reconstruct_model_request(&records, request).unwrap();
+            assert_eq!(request.history[index], stripped);
+        }
+        // Bound reasoning after the latest checkpoint is kept; replay matches projection.
+        let mut append = |sequence: u64, event: SessionEvent| {
+            let mut record = records[8].clone();
+            (record.sequence, record.event) = (sequence, event);
+            records.push(record);
+        };
+        append(10, committed(signed.clone()));
+        let lifetime = HistoryLifetime::Continuing;
+        append(
+            11,
+            requested(3, ModelPurpose::Agent, &[9, 1, 5, 10], "state", lifetime),
+        );
+        let projected = project_history(&records, &agent).unwrap();
+        assert_eq!(projected[3].1, signed);
+        let (_, request) = reconstruct_model_request(&records, 11).unwrap();
+        assert!(
+            request
+                .history
+                .iter()
+                .eq(projected.iter().map(|(_, message)| message))
+        );
     }
 }

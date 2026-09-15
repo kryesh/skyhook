@@ -60,10 +60,16 @@ Skyhook's provider-neutral input, not an API-specific wire encoding.
 
 A `ModelRequest` sends `history` (committed conversation, an unchanged prefix of later requests in the
 same context until compaction replaces it) followed by `tail` (rebuilt for each request and never
-cacheable); `request.messages()` iterates both in order. `history_lifetime` is `continuing` (the
-default) when later requests in the context extend this history, or `ending` when compaction replaces
-it after this request: compaction summaries, and agent requests whose own estimate already reaches the
-compaction threshold. Providers decide prompt-cache placement from `history`, `tail`, and the lifetime.
+cacheable); `request.messages()` iterates both in order. A model profile's `state_mode` decides where
+runtime state goes: in the tail (`dynamic`), committed to history (`persist`), or nowhere (`none`).
+`history_lifetime` is `continuing` (the default) when later requests in the context extend this
+history, `ending` when compaction replaces it after this agent request (its own estimate already
+reaches the compaction threshold), or `detached` for compaction summaries, which share no request
+settings with any other request. Providers decide prompt-cache placement from `history`, `tail`, and
+the lifetime: Anthropic places a cache breakpoint on the last history block unless it is detached
+(ending history is still marked, since cache reads land only at breakpoints), OpenAI protocols rely on
+automatic prefix caching with the tail sent last, and Codex records no WebSocket continuation for a
+request with a tail or non-continuing history.
 Session journals use format version 3; there is no compatibility or migration layer for earlier layouts.
 
 Source: [session module](https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src/session)

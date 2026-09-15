@@ -18,13 +18,11 @@ pub(super) const TARGET_PROMPT: &str = r#"Tools default to the target and worksp
 
 "root" selects the session host running Skyhook and its configured workspace; "local" identifies that host's target type. Selecting another target uses its configured workspace; selecting the current remote target preserves your workspace override.
 
-Remote commands receive Skyhook's SSH_AUTH_SOCK; Skyhook handles SSH authentication prompts."#;
+Remote commands receive the SSH agent their target's connection forwards in SSH_AUTH_SOCK; Skyhook handles SSH authentication prompts."#;
 
 const WORKSPACE_PROMPT: &str = "Workspaces set the base directory; they do not isolate files. Agents on the same target share its filesystem. Paths/cwd may be absolute or relative (including `..`) on the selected machine. Relative child workspace overrides resolve against the selected base.";
 const LIFECYCLE_PROMPT: &str = "Direct tool calls return JobView; Result in tool descriptions refers to its result field. JavaScript calls return native results; background launches return job metadata. Use job_output to retrieve truncated results.\n\nCommand timeouts terminate execution; omitted timeouts have no deadline. Nonzero exit_code is a normal result. Script failures throw with partial error.output. Never circumvent a declined operation; use permitted alternatives or explain the limitation.";
-const AGENT_PROMPT: &str = "Children start without your conversation history. Supply their task, relevant context, and scope, and give each child a distinct responsibility.\n\nLet children continue working autonomously. Use the appended runtime state and child messages to decide whether intervention is needed. Elapsed time, a wait timeout, or unchanged turn/tool-call counts alone do not establish that a child is stalled; it may be processing a request or awaiting a tool. When dependent on unfinished work, wait again. Send follow-ups to answer questions, resolve concrete blockers, correct a demonstrated misunderstanding, or communicate changed requirements. Resolve questions from children you supervise. Progress updates do not require a reply. When spawning a child, consider using todos to give it an initial checklist for multi-step work";
-
-const STATE_PROMPT: &str = "The final <skyhook_state> is a fresh snapshot: date is local YYYY-MM-DD; absent jobs/todos sections are empty. Job rows follow the column header; parent is the containing agent job, or - for a top-level entry (not ownerless). Ages are seconds since creation; turns/tool_calls are exclusive per-agent counters. - means absent/not applicable, not zero. Strings use JSON quoting when needed; todo text and location overrides are always quoted. Omitted target/workspace equal skyhook_context, never the parent row. Todo status headings group consecutive items, preserving order including completed items.";
+const AGENT_PROMPT: &str = "Children start without your conversation history. Supply their task, relevant context, and scope, and give each child a distinct responsibility.\n\nLet children continue working autonomously. Use job status and child messages to decide whether intervention is needed. Elapsed time, a wait timeout, or unchanged turn/tool-call counts alone do not establish that a child is stalled; it may be processing a request or awaiting a tool. When dependent on unfinished work, wait again. Send follow-ups to answer questions, resolve concrete blockers, correct a demonstrated misunderstanding, or communicate changed requirements. Resolve questions from children you supervise. Progress updates do not require a reply. When spawning a child, consider using todos to give it an initial checklist for multi-step work";
 
 const TODO_PROMPT: &str = "Use todo for multi-step work and account for unfinished items.";
 
@@ -40,8 +38,8 @@ struct TargetContext<'a> {
     name: &'a str,
     r#type: crate::target::TargetType,
     host: &'a str,
-    origin: &'a str,
     via: Option<&'a str>,
+    origin: Option<&'a str>,
 }
 
 pub(super) fn system_segment(
@@ -61,8 +59,8 @@ pub(super) fn system_segment(
                 name: &location.target,
                 r#type: target.map_or(crate::target::TargetType::Local, |target| target.r#type),
                 host: target.map_or("localhost", |target| &target.host),
-                origin: target.map_or(crate::target::ROOT_TARGET, |target| &target.origin),
                 via: target.and_then(|target| target.via.as_deref()),
+                origin: target.and_then(|target| target.origin.as_deref()),
             }),
     };
     let mut parts = Vec::with_capacity(instructions.len().saturating_add(5));
@@ -73,7 +71,6 @@ pub(super) fn system_segment(
     });
     parts.push(WORKSPACE_PROMPT.to_owned());
     parts.push(TODO_PROMPT.to_owned());
-    parts.push(STATE_PROMPT.to_owned());
     parts.push(format!(
         "{LIFECYCLE_PROMPT}\n\nDirect tool result type: JobView = `{}`.",
         crate::tool::job_view_type(capabilities)
@@ -104,6 +101,7 @@ fn capability_prompt(capability: Capability, available_depth: usize) -> Option<S
         | Capability::Write
         | Capability::Exec
         | Capability::Network
+        | Capability::SshAgent
         | Capability::Interactive
         | Capability::Mcp => None,
     }

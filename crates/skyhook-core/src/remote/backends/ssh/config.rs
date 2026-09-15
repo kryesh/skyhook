@@ -1,8 +1,7 @@
-//! OpenSSH configuration generation and destination resolution.
-use crate::remote::{RemoteError, SensitivePromptHandler};
+//! OpenSSH configuration generated only from target definitions.
+use crate::remote::{RemoteError, SensitivePromptHandler, backend::ProcessEnvironment};
 use crate::target::{TargetAuth, TargetDefinition};
-use serde::{Deserialize, Serialize};
-use std::{io::Write as _, path::Path, process::Stdio, sync::Arc};
+use std::{io::Write as _, path::Path, sync::Arc};
 use tokio::process::Command;
 /// OpenSSH config and forwarded environment are UTF-8 protocols. Reject a
 /// native path that cannot be represented instead of redirecting authority.
@@ -23,8 +22,14 @@ pub(crate) struct SshConfig {
 }
 
 impl SshConfig {
-    pub async fn create(
+    /// Write one host block per hop. `-F` excludes user and system SSH configuration,
+    /// so every setting comes from registry-validated target definitions.
+    /// `external_agent` is the SSH_AUTH_SOCK this process inherited, if any: Skyhook's
+    /// own on root, or the agent forwarded to a remote origin's shim.
+    pub fn create(
         route: &[TargetDefinition],
+        environment: &ProcessEnvironment,
+        external_agent: Option<&str>,
         prompts: Arc<dyn SensitivePromptHandler>,
     ) -> Result<Self, RemoteError> {
         if route.is_empty() {
@@ -32,20 +37,6 @@ impl SshConfig {
         }
         let directory = tempfile::Builder::new().prefix("skyhook-ssh-").tempdir()?;
         let path = directory.path().join("config");
-        let source_path = directory.path().join("user-config");
-        {
-            let mut source = std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&source_path)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                source.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            }
-            writeln!(source, "Include ~/.ssh/config")?;
-            source.flush()?;
-        }
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -58,75 +49,27 @@ impl SshConfig {
         let mut previous = None::<String>;
         for (index, target) in route.iter().enumerate() {
             let alias = format!("skyhook-target-{index}");
-            let resolved = match &target.resolved {
-                Some(value) => value.clone(),
-                None => resolve_openssh(target, &source_path).await?,
-            };
-            writeln!(file, "Host {alias}")?;
-            writeln!(file, "  HostName {}", ssh_token(&resolved.host)?)?;
-            writeln!(file, "  User {}", ssh_token(&resolved.user)?)?;
-            writeln!(file, "  Port {}", resolved.port)?;
-            for (key, values) in &resolved.options {
-                // Also enforce this for pre-resolved routes received over shim RPC.
-                if forwards_environment(key) {
-                    continue;
-                }
-                if !matches!(target.ssh.auth, TargetAuth::Openssh)
-                    && matches!(key.as_str(), "identitiesonly" | "preferredauthentications")
-                {
-                    continue;
-                }
-                if matches!(
-                    key.as_str(),
-                    "host"
-                        | "hostname"
-                        | "user"
-                        | "port"
-                        | "identityfile"
-                        | "identityagent"
-                        | "addkeystoagent"
-                        | "batchmode"
-                        | "proxyjump"
-                        | "proxycommand"
-                        | "controlmaster"
-                        | "controlpath"
-                        | "controlpersist"
-                        | "forwardagent"
-                        | "remotecommand"
-                        | "requesttty"
-                        | "sessiontype"
-                        | "canonicalizehostname"
-                ) {
-                    continue;
-                }
-                for value in values {
-                    if value.chars().any(char::is_control) {
-                        return Err(RemoteError::InvalidSshValue);
-                    }
-                    let value = value.replace("%n", &target.ssh_alias);
-                    writeln!(file, "  {key} {value}")?;
-                }
-            }
             writeln!(
                 file,
-                "  ControlMaster no\n  ControlPath none\n  CanonicalizeHostname no\n  ForwardX11 no\n  ForwardX11Trusted no"
+                "Host {alias}\n  HostName {}",
+                ssh_token(&target.host)?
             )?;
+            if let Some(user) = &target.ssh.user {
+                writeln!(file, "  User {}", ssh_token(user)?)?;
+            }
+            if let Some(port) = target.ssh.port {
+                writeln!(file, "  Port {port}")?;
+            }
             if let Some(previous) = &previous {
                 writeln!(file, "  ProxyJump {previous}")?;
-            } else if let Some(proxy_command) = &resolved.proxy_command {
-                if proxy_command.chars().any(char::is_control) {
-                    return Err(RemoteError::InvalidSshValue);
-                }
-                writeln!(
-                    file,
-                    "  ProxyCommand {}",
-                    proxy_command.replace("%n", &target.ssh_alias)
-                )?;
-            } else {
-                writeln!(file, "  ProxyJump none")?;
             }
-            write_auth(&mut file, target, &resolved)?;
+            write_auth(&mut file, target, environment, external_agent)?;
             writeln!(file, "  LogLevel ERROR")?;
+            // Written verbatim, as in an ssh_config file. The first value wins, so
+            // options add settings but cannot replace those above.
+            for (key, value) in &target.ssh.options {
+                writeln!(file, "  {key} {value}")?;
+            }
             previous = Some(alias);
         }
 
@@ -141,137 +84,81 @@ impl SshConfig {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ResolvedSsh {
-    pub host: String,
-    pub user: String,
-    pub port: u16,
-    pub identity_files: Vec<String>,
-    pub options: std::collections::BTreeMap<String, Vec<String>>,
-    pub proxy_jump: Option<String>,
-    pub proxy_command: Option<String>,
-}
+/// Options with a dedicated target field, or refused because they forward local
+/// environment (SendEnv * would include .env secrets) or X11, multiplex connections,
+/// replace the worker command, disable prompts, or read other configuration.
+const MANAGED_OPTIONS: &[&str] = &[
+    "host",
+    "match",
+    "include",
+    "hostname",
+    "user",
+    "port",
+    "identityfile",
+    "identityagent",
+    "addkeystoagent",
+    "batchmode",
+    "proxyjump",
+    "controlmaster",
+    "controlpath",
+    "controlpersist",
+    "forwardagent",
+    "remotecommand",
+    "requesttty",
+    "sessiontype",
+    "canonicalizehostname",
+    "sendenv",
+    "setenv",
+    "forwardx11",
+    "forwardx11trusted",
+];
 
-// SSH clients retain their local environment for authentication and proxy commands,
-// but must not export it to a target. In particular, SendEnv * would include secrets
-// loaded from the invocation directory's .env. Drop SetEnv before resolved options
-// enter a route/RPC as well: its literal values can themselves contain local secrets.
-// X11 forwarding exports a derived DISPLAY and is not part of our worker protocol.
-fn forwards_environment(key: &str) -> bool {
-    ["sendenv", "setenv", "forwardx11", "forwardx11trusted"]
-        .iter()
-        .any(|option| key.eq_ignore_ascii_case(option))
-}
-
-pub(crate) async fn resolve_openssh(
-    target: &TargetDefinition,
-    source_config: &Path,
-) -> Result<ResolvedSsh, RemoteError> {
-    let mut command = Command::new("ssh");
-    command.arg("-G").arg("-F").arg(source_config);
-    if let Some(user) = &target.ssh.user {
-        command.args(["-l", user]);
-    }
-    if let Some(port) = target.ssh.port {
-        command.args(["-p", &port.to_string()]);
-    }
-    command
-        .arg("--")
-        .arg(&target.ssh_alias)
-        .stdin(Stdio::null())
-        .stderr(Stdio::piped())
-        .stdout(Stdio::piped())
-        .kill_on_drop(true);
-    let output = command.output().await.map_err(RemoteError::start)?;
-    if !output.status.success() {
-        return Err(RemoteError::Resolution(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ));
-    }
-    parse_resolved_ssh(&String::from_utf8_lossy(&output.stdout))
-}
-
-fn parse_resolved_ssh(output: &str) -> Result<ResolvedSsh, RemoteError> {
-    let mut host = None;
-    let mut user = None;
-    let mut port = None;
-    let mut identity_files = Vec::new();
-    let mut options = std::collections::BTreeMap::<String, Vec<String>>::new();
-    let mut proxy_jump = None;
-    let mut proxy_command = None;
-    for line in output.lines() {
-        let Some((key, value)) = line.split_once(' ') else {
-            continue;
-        };
-        if forwards_environment(key) {
-            continue;
-        }
-        options
-            .entry(key.to_owned())
-            .or_default()
-            .push(value.to_owned());
-        match key {
-            "hostname" => host = Some(value.to_owned()),
-            "user" => user = Some(value.to_owned()),
-            "port" => port = value.parse().ok(),
-            "identityfile" => identity_files.push(value.to_owned()),
-            "proxyjump" if value != "none" => proxy_jump = Some(value.to_owned()),
-            "proxycommand" if value != "none" => proxy_command = Some(value.to_owned()),
-            _ => {}
-        }
-    }
-    Ok(ResolvedSsh {
-        host: host.ok_or_else(|| RemoteError::Resolution("ssh -G omitted hostname".to_owned()))?,
-        user: user.ok_or_else(|| RemoteError::Resolution("ssh -G omitted user".to_owned()))?,
-        port: port.ok_or_else(|| RemoteError::Resolution("ssh -G omitted port".to_owned()))?,
-        identity_files,
-        options,
-        proxy_jump,
-        proxy_command,
-    })
+/// Whether a target may set this ssh_config option.
+pub(crate) fn configurable_option(key: &str, value: &str) -> bool {
+    !key.is_empty()
+        && key.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        && !MANAGED_OPTIONS
+            .iter()
+            .any(|option| key.eq_ignore_ascii_case(option))
+        && !value.is_empty()
+        && !value.chars().any(char::is_control)
 }
 
 fn write_auth(
     file: &mut std::fs::File,
     target: &TargetDefinition,
-    resolved: &ResolvedSsh,
+    environment: &ProcessEnvironment,
+    external_agent: Option<&str>,
 ) -> Result<(), RemoteError> {
-    let loading = resolved
-        .options
-        .get("addkeystoagent")
-        .and_then(|v| v.first())
-        .map_or("yes", |v| {
-            if v == "false" || v == "no" {
-                "yes"
-            } else {
-                v.as_str()
-            }
-        });
-    writeln!(
-        file,
-        "  IdentityAgent SSH_AUTH_SOCK\n  AddKeysToAgent {loading}"
-    )?;
+    // Name sockets explicitly: OpenSSH replaces its own SSH_AUTH_SOCK before
+    // starting jump hops, so an inherited variable is not stable across hops.
+    let agent = if target.ssh.external_agent {
+        let socket = external_agent.ok_or_else(|| {
+            RemoteError::Ssh(format!(
+                "target `{}` uses external_agent, but SSH_AUTH_SOCK is not set where its SSH connection starts",
+                target.name
+            ))
+        })?;
+        // Never add keys to an agent Skyhook does not own.
+        format!("{}\n  AddKeysToAgent no", ssh_token(socket)?)
+    } else if let Some(socket) = environment.get("SSH_AUTH_SOCK") {
+        format!("{}\n  AddKeysToAgent yes", ssh_token(socket)?)
+    } else {
+        "none".to_owned()
+    };
+    writeln!(file, "  IdentityAgent {agent}")?;
     match &target.ssh.auth {
-        TargetAuth::Openssh => {
-            writeln!(file, "  BatchMode no")?;
-            for path in &resolved.identity_files {
-                writeln!(
-                    file,
-                    "  IdentityFile {}",
-                    ssh_token(&path.replace("%n", &target.ssh_alias))?
-                )?;
-            }
-        }
+        TargetAuth::Default => {}
         TargetAuth::Agent => {
             writeln!(
                 file,
-                "  BatchMode no\n  IdentityFile none\n  IdentitiesOnly no\n  IdentityAgent SSH_AUTH_SOCK\n  PreferredAuthentications publickey,password,keyboard-interactive"
+                "  IdentityFile none\n  IdentitiesOnly no\n  PreferredAuthentications publickey,password,keyboard-interactive"
             )?;
         }
         TargetAuth::Key { path } => {
             writeln!(
                 file,
-                "  BatchMode no\n  IdentityFile {}\n  IdentitiesOnly yes\n  PreferredAuthentications publickey,password,keyboard-interactive",
+                "  IdentityFile {}\n  IdentitiesOnly yes\n  PreferredAuthentications publickey,password,keyboard-interactive",
                 ssh_token(wire_path(path)?)?
             )?;
         }
@@ -283,7 +170,7 @@ pub(crate) fn ssh_command(config: &SshConfig, destination: &str) -> Command {
     // -F selects only our generated configuration (including for ProxyJump), so
     // neither user nor system config can reintroduce SendEnv/SetEnv. Do not clear
     // the local client environment: HOME, PATH and authentication helpers need it.
-    // -A deliberately forwards the session agent, not arbitrary environment values.
+    // -A forwards the destination's configured agent, not arbitrary environment values.
     let mut command = Command::new("ssh");
     command
         .args(["-F"])
@@ -307,51 +194,22 @@ pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-pub(crate) async fn resolve_local(target: &TargetDefinition) -> Result<ResolvedSsh, RemoteError> {
-    let directory = tempfile::tempdir()?;
-    let source = directory.path().join("source");
-    std::fs::write(
-        &source,
-        "Include ~/.ssh/config\nInclude /etc/ssh/ssh_config\n",
-    )?;
-    resolve_openssh(target, &source).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         remote::prompt::RejectSensitivePrompts,
-        target::{SshOptions, TargetConfig, TargetConfigType, TargetSource},
+        target::{TargetError, TargetSource},
     };
+    use serde_json::json;
 
-    fn resolved() -> ResolvedSsh {
-        parse_resolved_ssh(
-            "hostname example.test\nuser remote-user\nport 22\n\
-         identityfile ~/.ssh/id_ed25519\nidentitiesonly yes\n\
-         sendenv *\nSendEnv SKYHOOK_TEST_DOTENV_KEY\n\
-         setenv SKYHOOK_TEST_CONFIG_KEY=local-config-secret\n\
-         SeTeNv SKYHOOK_TEST_DOTENV_KEY=local-dotenv-secret\n\
-         forwardx11 yes\nForwardX11Trusted yes\n",
-        )
-        .unwrap()
+    fn target(name: &str, config: serde_json::Value) -> Result<TargetDefinition, TargetError> {
+        let config = serde_json::from_value(config).unwrap();
+        TargetDefinition::from_config(name.into(), config, TargetSource::Config)
     }
 
-    fn target(name: &str) -> TargetDefinition {
-        let mut target = TargetDefinition::from_config(
-            name.into(),
-            TargetConfig {
-                r#type: TargetConfigType::Ssh,
-                host: "example.test".into(),
-                workspace: "/remote/work".into(),
-                via: None,
-                ssh: SshOptions::default(),
-            },
-            TargetSource::Config,
-        )
-        .unwrap();
-        target.resolved = Some(resolved());
-        target
+    fn managed() -> ProcessEnvironment {
+        ProcessEnvironment::from([("SSH_AUTH_SOCK".into(), "/managed.sock".into())])
     }
 
     #[cfg(unix)]
@@ -367,92 +225,79 @@ mod tests {
         assert_eq!(wire_path(Path::new("/tmp/key-é")).unwrap(), "/tmp/key-é");
     }
 
-    #[test]
-    fn resolved_options_never_put_environment_forwarding_on_the_wire() {
-        let target = target("destination");
-        let resolved = target.resolved.as_ref().unwrap();
-        assert_eq!(resolved.identity_files, ["~/.ssh/id_ed25519"]);
-        assert_eq!(resolved.options["identitiesonly"], ["yes"]);
-        assert!(
-            resolved
-                .options
-                .keys()
-                .all(|key| !forwards_environment(key))
-        );
-
-        // Resolved targets travel in both ResolveSsh responses and OpenSsh routes.
-        // Local SetEnv literals must not appear in either serialized representation.
-        for wire in [
-            serde_json::to_string(resolved).unwrap(),
-            serde_json::to_string(&crate::remote::protocol::Request::OpenSsh {
-                channel: crate::remote::protocol::RequestId::FIRST,
-                route: vec![target],
-                command: "exec remote-worker --serve /remote/work".into(),
-            })
-            .unwrap(),
+    #[tokio::test]
+    async fn generated_config_comes_only_from_target_definitions() {
+        let jump =
+            json!({"type": "ssh", "host": "jump.test", "ssh": {"user": "gate", "port": 2222}});
+        let destination = json!({"type": "ssh", "host": "db.test", "via": "jump", "ssh": {
+            "auth": {"kind": "key", "path": "/keys/db"},
+            "options": {"IdentitiesOnly": "no", "ServerAliveInterval": "15"},
+        }});
+        let route = [
+            target("jump", jump).unwrap(),
+            target("db", destination).unwrap(),
+        ];
+        let prompts = Arc::new(RejectSensitivePrompts);
+        let config = SshConfig::create(&route, &managed(), None, prompts).unwrap();
+        let text = std::fs::read_to_string(&config.path).unwrap();
+        for required in [
+            "HostName \"jump.test\"",
+            "User \"gate\"",
+            "Port 2222",
+            "IdentityAgent \"/managed.sock\"\n  AddKeysToAgent yes",
+            "ProxyJump skyhook-target-0",
+            "IdentityFile \"/keys/db\"",
+            "ServerAliveInterval 15",
         ] {
-            for forbidden in [
-                "SKYHOOK_TEST_",
-                "local-config-secret",
-                "local-dotenv-secret",
-            ] {
-                assert!(!wire.contains(forbidden), "{wire}");
-            }
+            assert!(text.contains(required), "{required}: {text}");
+        }
+        // Generated settings precede options, so an option cannot weaken them.
+        assert!(text.find("IdentitiesOnly yes") < text.find("IdentitiesOnly no"));
+        let command = ssh_command(&config, &config.destination);
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(
+            args[..2],
+            [std::ffi::OsStr::new("-F"), config.path.as_os_str()]
+        );
+        assert!(args.contains(&std::ffi::OsStr::new("-A")));
+
+        let proxy = json!({"type": "ssh", "host": "x", "via": "jump", "ssh": {"options": {"ProxyCommand": "nc %h %p"}}});
+        assert!(matches!(
+            target("x", proxy),
+            Err(TargetError::ProxyCommandWithVia(_))
+        ));
+        let forwarding = json!({"type": "ssh", "host": "x", "ssh": {"options": {"SendEnv": "*"}}});
+        assert!(matches!(
+            target("x", forwarding),
+            Err(TargetError::InvalidSshOption(_))
+        ));
+        for (key, value) in [("proxyjump", "a"), ("Server Alive", "1"), ("LogLevel", "")] {
+            assert!(!configurable_option(key, value), "{key}");
         }
     }
 
     #[tokio::test]
-    async fn generated_config_filters_pre_resolved_forwarding_for_every_hop() {
-        let mut route = vec![target("jump"), target("destination")];
-        for target in &mut route {
-            // Defense in depth for externally supplied/pre-resolved options. SSH
-            // option names are case-insensitive even if ssh -G normally lowers them.
-            let options = &mut target.resolved.as_mut().unwrap().options;
-            for key in ["SendEnv", "sendenv", "SENDENV"] {
-                options.insert(key.into(), vec!["* SKYHOOK_TEST_DOTENV_KEY".into()]);
-            }
-            for key in ["SetEnv", "setenv", "SETENV"] {
-                options.insert(key.into(), vec!["SKYHOOK_TEST_CONFIG_KEY=secret".into()]);
-            }
-            options.insert("ForwardX11".into(), vec!["yes".into()]);
-            options.insert("ForwardX11Trusted".into(), vec!["yes".into()]);
-        }
-        let config = SshConfig::create(&route, Arc::new(RejectSensitivePrompts))
-            .await
-            .unwrap();
+    async fn external_agent_hops_use_the_session_host_agent_without_adding_keys() {
+        let route = [
+            json!({"type": "ssh", "host": "jump.test", "ssh": {"external_agent": true}}),
+            json!({"type": "ssh", "host": "managed.test", "via": "jump"}),
+            json!({"type": "ssh", "host": "db.test", "via": "managed", "ssh": {"external_agent": true}}),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, config)| target(&format!("hop{index}"), config).unwrap())
+        .collect::<Vec<_>>();
+        let prompts = || Arc::new(RejectSensitivePrompts);
+        let config = SshConfig::create(&route, &managed(), Some("/user.sock"), prompts()).unwrap();
         let text = std::fs::read_to_string(&config.path).unwrap();
-        let lower = text.to_ascii_lowercase();
-        for forbidden in [
-            "sendenv",
-            "setenv",
-            "secret",
-            "skyhook_test_",
-            "include",
-            "forwardx11 yes",
-        ] {
-            assert!(!lower.contains(forbidden), "{forbidden}: {text}");
+        let blocks: Vec<_> = text.split("Host ").skip(1).collect();
+        for (block, agent) in blocks.iter().zip([
+            "\"/user.sock\"\n  AddKeysToAgent no",
+            "\"/managed.sock\"\n  AddKeysToAgent yes",
+            "\"/user.sock\"\n  AddKeysToAgent no",
+        ]) {
+            assert!(block.contains(&format!("IdentityAgent {agent}")), "{block}");
         }
-        assert_eq!(lower.matches("forwardx11 no").count(), route.len());
-        assert_eq!(lower.matches("forwardx11trusted no").count(), route.len());
-        for required in [
-            "ProxyJump skyhook-target-0",
-            "IdentityFile \"~/.ssh/id_ed25519\"",
-            "IdentityAgent SSH_AUTH_SOCK",
-        ] {
-            assert!(text.contains(required), "{required}: {text}");
-        }
-
-        let command = ssh_command(&config, &config.destination);
-        let args: Vec<_> = command.as_std().get_args().collect();
-        assert_eq!(args[0], "-F");
-        assert_eq!(args[1], config.path.as_os_str());
-        // Agent forwarding is a deliberate internal protocol, not SendEnv.
-        assert!(args.contains(&std::ffi::OsStr::new("-A")));
-        assert!(args.contains(&std::ffi::OsStr::new("-T")));
-        // No local environment values or secrets belong in remote command arguments.
-        assert!(
-            args.iter()
-                .all(|arg| !arg.to_string_lossy().contains("secret"))
-        );
+        assert!(SshConfig::create(&route, &managed(), None, prompts()).is_err());
     }
 }

@@ -26,9 +26,9 @@ pub(crate) async fn open(
     let prompts = Arc::new(ContextPrompts {
         inner: prompts,
         target: target.name.clone(),
-        origin: target.origin.clone(),
     });
-    let config = SshConfig::create(route, prompts).await?;
+    let external_agent = std::env::var("SSH_AUTH_SOCK").ok();
+    let config = SshConfig::create(route, environment, external_agent.as_deref(), prompts)?;
     let mut command = ssh_command(&config, &config.destination);
     command
         .arg(remote_command)
@@ -209,17 +209,13 @@ impl SshLauncher {
 struct ContextPrompts {
     inner: Arc<dyn SensitivePromptHandler>,
     target: String,
-    origin: String,
 }
 impl SensitivePromptHandler for ContextPrompts {
     fn prompt(
         &self,
         mut prompt: crate::remote::SensitivePrompt,
     ) -> crate::remote::SensitivePromptFuture {
-        prompt.message = format!(
-            "[target={} origin={}] {}",
-            self.target, self.origin, prompt.message
-        );
+        prompt.message = format!("[target={}] {}", self.target, prompt.message);
         self.inner.prompt(prompt)
     }
 }

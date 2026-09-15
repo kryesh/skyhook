@@ -189,15 +189,11 @@ async fn named_targets_replace_whole_definition_but_other_names_survive() {
     write(
         &f.xdg,
         format!(
-            "{MODEL}\n[targets]\nimport_ssh_config = true\n[targets.changed]\ntype = 'ssh'\nhost = 'old'\nworkspace = '/old'\nvia = 'retained'\nssh.user = 'old-user'\nssh.port = 2222\nssh.auth = {{ kind = 'key', path = '/old-key' }}\n[targets.retained]\ntype = 'ssh'\nhost = 'other'\n"
+            "{MODEL}\n[targets.changed]\ntype = 'ssh'\nhost = 'old'\nworkspace = '/old'\nvia = 'retained'\nssh.user = 'old-user'\nssh.port = 2222\nssh.auth = {{ kind = 'key', path = '/old-key' }}\n[targets.retained]\ntype = 'ssh'\nhost = 'other'\n"
         ),
     );
-    write(
-        &f.local,
-        "[targets]\nimport_ssh_config = false\n[targets.changed]\ntype = 'ssh'\nhost = 'new'\n",
-    );
+    write(&f.local, "[targets.changed]\ntype = 'ssh'\nhost = 'new'\n");
     let targets = f.resolve().await.unwrap().config.targets;
-    assert!(!targets.import_ssh_config);
     assert!(targets.entries.contains_key("retained"));
     let changed = &targets.entries["changed"];
     assert_eq!(
@@ -206,7 +202,7 @@ async fn named_targets_replace_whole_definition_but_other_names_survive() {
     );
     assert_eq!(
         (&changed.ssh.user, changed.ssh.port, &changed.ssh.auth),
-        (&None, None, &TargetAuth::Openssh)
+        (&None, None, &TargetAuth::Default)
     );
     write(&f.local, "[targets.changed]\nhost = 'incomplete'\n");
     assert!(
@@ -387,36 +383,27 @@ async fn explicit_and_merged_target_cycles_are_rejected() {
 async fn acyclic_targets_and_unresolved_references_are_valid_config() {
     use crate::target::{TargetError, TargetRegistry};
 
-    for import in [false, true] {
-        let f = Fixture::new();
-        write(
-            &f.xdg,
-            format!(
-                "[targets]\nimport_ssh_config = {import}\n{}",
-                target("a", Some("b"))
-            ),
-        );
-        // Names may be supplied later by workspace config, SSH imports or runtime.
-        let partial = f.resolve().await.unwrap();
-        assert_eq!(partial.report.sources, std::slice::from_ref(&f.xdg));
-        assert!(partial.report.diagnostics.is_empty());
-        assert!(matches!(
-            TargetRegistry::from_definitions(partial.config.targets.definitions().unwrap()),
-            Err(TargetError::UnknownJump(name)) if name == "b"
-        ));
-        write(
-            &f.local,
-            format!("{}{}", target("b", Some("c")), target("c", None)),
-        );
-        let resolved = f.resolve().await.unwrap();
-        assert!(resolved.report.diagnostics.is_empty());
-        let registry =
-            TargetRegistry::from_definitions(resolved.config.targets.definitions().unwrap())
-                .unwrap();
-        let route = registry.route("a").await.unwrap();
-        let names: Vec<_> = route.iter().map(|target| target.name.as_str()).collect();
-        assert_eq!(names, ["c", "b", "a"]);
-    }
+    let f = Fixture::new();
+    write(&f.xdg, target("a", Some("b")));
+    // Names may be supplied later by workspace config or at runtime.
+    let partial = f.resolve().await.unwrap();
+    assert_eq!(partial.report.sources, std::slice::from_ref(&f.xdg));
+    assert!(partial.report.diagnostics.is_empty());
+    assert!(matches!(
+        TargetRegistry::from_definitions(partial.config.targets.definitions().unwrap()),
+        Err(TargetError::UnknownJump(name)) if name == "b"
+    ));
+    write(
+        &f.local,
+        format!("{}{}", target("b", Some("c")), target("c", None)),
+    );
+    let resolved = f.resolve().await.unwrap();
+    assert!(resolved.report.diagnostics.is_empty());
+    let registry =
+        TargetRegistry::from_definitions(resolved.config.targets.definitions().unwrap()).unwrap();
+    let route = registry.route("a").await.unwrap();
+    let names: Vec<_> = route.iter().map(|target| target.name.as_str()).collect();
+    assert_eq!(names, ["c", "b", "a"]);
 }
 
 #[tokio::test]

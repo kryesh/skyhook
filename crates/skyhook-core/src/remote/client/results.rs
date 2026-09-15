@@ -431,7 +431,7 @@ mod tests {
                 async move {
                     let (peer, stream) = tokio::io::duplex(64 * 1024);
                     let (sender, receiver) = oneshot::channel();
-                    let state = Arc::new(Mutex::new(ConnectionState { pending:HashMap::from([(RequestId::FIRST, PendingCall {sender,context})]), failure:None,resolutions:HashMap::new(),streams:HashMap::new() }));
+                    let state = Arc::new(Mutex::new(ConnectionState { pending:HashMap::from([(RequestId::FIRST, PendingCall {sender,context})]), failure:None,streams:HashMap::new() }));
                     let reader_state = state.clone();
                     let reader = tokio::spawn(async move { route_fixture(stream, &reader_state, "fixture").await; });
                     let writer = tokio::spawn(async move {

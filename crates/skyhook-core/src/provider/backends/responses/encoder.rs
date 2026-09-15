@@ -30,8 +30,9 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<EncodedRequest, ProviderE
     if request.model.trim().is_empty() {
         return Err(invalid("Responses requires a nonempty model"));
     }
-    // System cache flags are cross-provider hints. OpenAI automatically caches
-    // matching prefixes and has no per-segment cache-control field.
+    // Cache hints need no wire field: OpenAI automatically caches matching
+    // prefixes, and history precedes the per-request tail so the tail never
+    // breaks the cached history prefix.
     let mut input = Vec::new();
     for message in request.messages() {
         match message {

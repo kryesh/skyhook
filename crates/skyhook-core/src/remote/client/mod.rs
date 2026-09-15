@@ -55,10 +55,6 @@ struct PendingCall {
 struct ConnectionState {
     pending: HashMap<RequestId, PendingCall>,
     failure: Option<RemoteError>,
-    resolutions: HashMap<
-        RequestId,
-        oneshot::Sender<Result<crate::remote::backends::ssh::ResolvedSsh, RemoteError>>,
-    >,
     streams: HashMap<RequestId, ClientStream>,
 }
 
@@ -225,9 +221,6 @@ async fn fail_connection(state: &Mutex<ConnectionState>, failure: RemoteError) {
             return;
         }
         state.failure = Some(failure.clone());
-        for (_, sender) in state.resolutions.drain() {
-            let _ = sender.send(Err(failure.clone()));
-        }
         state.streams.clear();
         std::mem::take(&mut state.pending)
     };
@@ -250,27 +243,6 @@ impl PooledConnection {
         context: &ToolContext,
     ) -> Result<ToolOutput, RemoteError> {
         call_tool(self, name, arguments, context).await
-    }
-    pub(in crate::remote) async fn resolve_ssh(
-        &self,
-        target: TargetDefinition,
-    ) -> Result<crate::remote::backends::ssh::ResolvedSsh, RemoteError> {
-        let (_, receiver) = self
-            .submit(move |request_id, state| {
-                let (sender, receiver) = oneshot::channel();
-                state.resolutions.insert(request_id, sender);
-                (
-                    Request::ResolveSsh {
-                        request_id,
-                        target: Box::new(target),
-                    },
-                    receiver,
-                )
-            })
-            .await?;
-        receiver
-            .await
-            .map_err(|_| RemoteError::Protocol("configuration channel closed".into()))?
     }
     pub(in crate::remote) async fn open_ssh(
         self: Arc<Self>,
@@ -501,29 +473,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_submission_rejects_failed_connections_and_drains_on_write_failure() {
-        for resolution in [true, false] {
-            let (connection, peer) = wired_connection(1).await;
-            drop(peer);
-            let (sender, receiver) = oneshot::channel();
-            let id = RequestId::new(99).unwrap();
-            connection.state.lock().await.resolutions.insert(id, sender);
-            let target = TargetDefinition::test("build", ".", None);
-            let result = if resolution {
-                connection.resolve_ssh(target.clone()).await.map(drop)
-            } else {
-                let stream = connection.open_stream(vec![target.clone()], "true".into());
-                stream.await.map(drop)
-            };
-            assert!(matches!(result, Err(RemoteError::Io { .. })));
-            assert!(receiver.await.unwrap().is_err());
-            // A writable pipe must not allow registration once the dispatcher has failed.
-            connection.writer.lock().await.input = Box::new(tokio::io::sink());
-            let retry = connection.resolve_ssh(target);
-            let retry = tokio::time::timeout(std::time::Duration::from_secs(2), retry).await;
-            assert!(retry.unwrap().is_err());
-            let state = connection.state.lock().await;
-            assert!(state.resolutions.is_empty() && state.streams.is_empty());
-        }
+    async fn stream_submission_rejects_failed_connections_and_drains_on_write_failure() {
+        let (connection, peer) = wired_connection(1).await;
+        drop(peer);
+        let target = TargetDefinition::test("build", ".", None);
+        let stream = connection.open_stream(vec![target.clone()], "true".into());
+        assert!(matches!(
+            stream.await.map(drop),
+            Err(RemoteError::Io { .. })
+        ));
+        // A writable pipe must not allow registration once the dispatcher has failed.
+        connection.writer.lock().await.input = Box::new(tokio::io::sink());
+        let retry = connection.open_stream(vec![target], "true".into());
+        let retry = tokio::time::timeout(std::time::Duration::from_secs(2), retry).await;
+        assert!(retry.unwrap().is_err());
+        assert!(connection.state.lock().await.streams.is_empty());
     }
 }

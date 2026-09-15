@@ -29,8 +29,6 @@ pub enum RemoteError {
         kind: std::io::ErrorKind,
         message: String,
     },
-    #[error("SSH configuration resolution failed: {0}")]
-    Resolution(String),
     #[error("target connection was denied: {0}")]
     ApprovalDenied(String),
     #[error("target connection returned an invalid approval grant: {0}")]

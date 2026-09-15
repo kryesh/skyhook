@@ -4,7 +4,7 @@ use super::native::validate_thinking;
 use crate::media::AttachmentRef;
 use crate::provider::{
     ProviderError,
-    protocol::{BlockContent, ItemKind, Message, ModelRequest, UserContent},
+    protocol::{BlockContent, HistoryLifetime, ItemKind, Message, ModelRequest, UserContent},
 };
 use serde_json::{Value, json};
 
@@ -35,96 +35,25 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
         }
         system.push(block);
     }
-    if cache_breakpoints > 4 {
-        return Err(invalid("Anthropic supports at most four cache breakpoints"));
-    }
     if !system.is_empty() {
         body["system"] = Value::Array(system);
     }
     let mut messages: Vec<Value> = Vec::new();
-    for message in request.messages() {
-        let (role, content) = match message {
-            Message::User(items) => {
-                let mut blocks = Vec::new();
-                for item in items {
-                    blocks.push(match item {
-                        UserContent::Text { text }
-                        | UserContent::Runtime { text }
-                        | UserContent::ParentInput { text }
-                        | UserContent::Compaction { text } => json!({"type":"text", "text":text}),
-                        UserContent::Attachment { attachment } => match attachment {
-                            AttachmentRef::Image(image) => anthropic_image(request, image)?,
-                            AttachmentRef::Text(text) => {
-                                json!({"type":"text", "text":attachment_text(request, text)?})
-                            }
-                        },
-                    });
-                }
-                ("user", blocks)
-            }
-            Message::Assistant(items) => {
-                let mut blocks = Vec::new();
-                for item in items {
-                    // Replay belongs to the native item, not to each display block.
-                    if let Some(payload) = opaque_payload(&item.replay, "anthropic", &request.model)
-                    {
-                        validate_thinking(payload).map_err(|error| invalid(error.message))?;
-                        blocks.push(payload.clone());
-                        continue;
-                    }
-                    for block in &item.blocks {
-                        match &block.content {
-                            BlockContent::Text { text } => {
-                                blocks.push(json!({"type":"text", "text":text}))
-                            }
-                            // Unsigned/foreign private reasoning is display-only.
-                            BlockContent::Reasoning { .. } => {}
-                            BlockContent::ToolCall(call) => {
-                                blocks.push(json!({"type":"tool_use", "id":call.id(), "name":call.name(), "input":call.arguments()}));
-                            }
-                        }
-                    }
-                }
-                ("assistant", blocks)
-            }
-            Message::Tool(results) => {
-                let mut blocks = Vec::new();
-                for result in results {
-                    if result.call_id.is_empty() {
-                        return Err(invalid("Anthropic tool results require a nonempty call_id"));
-                    }
-                    let mut content = vec![json!({"type":"text", "text":tool_text(result)})];
-                    for image in &result.images {
-                        content.push(anthropic_image(request, image)?);
-                    }
-                    blocks.push(json!({"type":"tool_result", "tool_use_id":result.call_id,
-                        "content":content, "is_error":result.is_error}));
-                }
-                ("user", blocks)
-            }
-        };
-        if content.is_empty() {
-            // Empty foreign redacted reasoning contributes no replayable content.
-            if matches!(message, Message::Assistant(items) if !items.is_empty()
-                && items.iter().all(|item| item.kind == ItemKind::Reasoning))
-            {
-                continue;
-            }
-            return Err(invalid(
-                "Anthropic messages must contain at least one content block",
-            ));
-        }
-        if let Some(previous) = messages
-            .last_mut()
-            .filter(|previous| previous["role"] == role)
-        {
-            previous["content"]
-                .as_array_mut()
-                .expect("constructed array")
-                .extend(content);
-        } else {
-            messages.push(json!({"role":role, "content":content}));
-        }
+    for message in &request.history {
+        push_message(request, &mut messages, message)?;
+    }
+    // History is an unchanged prefix of later requests (reads land only at breakpoints, so
+    // even ending history is marked); the tail and detached history never are.
+    if request.history_lifetime != HistoryLifetime::Detached {
+        cache_breakpoints += usize::from(mark_last_cacheable(&mut messages));
+    }
+    if cache_breakpoints > 4 {
+        return Err(invalid(
+            "Anthropic supports at most four cache breakpoints, including one for history",
+        ));
+    }
+    for message in &request.tail {
+        push_message(request, &mut messages, message)?;
     }
     if messages.is_empty() {
         return Err(invalid("Anthropic requires at least one message"));
@@ -156,28 +85,18 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
             json!({"type":"json_schema", "schema":schema.schema}),
         );
     }
+    // Summarized thinking is the default only on older models; request it wherever thinking is on.
     if let Some(reasoning) = &request.reasoning {
         match reasoning.as_str() {
             "off" => body["thinking"] = json!({"type":"disabled"}),
-            "adaptive" => body["thinking"] = json!({"type":"adaptive"}),
-            "low" | "medium" | "high" | "max" => {
-                body["thinking"] = json!({"type":"adaptive"});
+            "adaptive" => body["thinking"] = json!({"type":"adaptive", "display":"summarized"}),
+            "low" | "medium" | "high" | "xhigh" | "max" => {
+                body["thinking"] = json!({"type":"adaptive", "display":"summarized"});
                 output_config.insert("effort".into(), json!(reasoning));
-            }
-            value if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
-                let budget = value
-                    .parse::<u64>()
-                    .map_err(|_| invalid("Anthropic thinking budget exceeds u64"))?;
-                if budget < 1024 || budget >= max_tokens {
-                    return Err(invalid(
-                        "Anthropic manual thinking budget must be >= 1024 and strictly less than max_output_tokens",
-                    ));
-                }
-                body["thinking"] = json!({"type":"enabled", "budget_tokens":budget});
             }
             _ => {
                 return Err(invalid(
-                    "Unsupported Anthropic reasoning setting: use off, adaptive, low, medium, high, max, or an integer thinking-token budget",
+                    "Unsupported Anthropic reasoning setting: use off, adaptive, low, medium, high, xhigh, or max",
                 ));
             }
         }
@@ -189,6 +108,117 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
     Ok(body)
 }
 
+fn push_message(
+    request: &ModelRequest,
+    messages: &mut Vec<Value>,
+    message: &Message,
+) -> Result<(), ProviderError> {
+    let (role, content) = match message {
+        Message::User(items) => {
+            let mut blocks = Vec::new();
+            for item in items {
+                blocks.push(match item {
+                    UserContent::Text { text }
+                    | UserContent::Runtime { text }
+                    | UserContent::ParentInput { text }
+                    | UserContent::Compaction { text } => json!({"type":"text", "text":text}),
+                    UserContent::Attachment { attachment } => match attachment {
+                        AttachmentRef::Image(image) => anthropic_image(request, image)?,
+                        AttachmentRef::Text(text) => {
+                            json!({"type":"text", "text":attachment_text(request, text)?})
+                        }
+                    },
+                });
+            }
+            ("user", blocks)
+        }
+        Message::Assistant(items) => {
+            let mut blocks = Vec::new();
+            for item in items {
+                // Replay belongs to the native item, not to each display block.
+                if let Some(payload) = opaque_payload(&item.replay, "anthropic", &request.model) {
+                    validate_thinking(payload).map_err(|error| invalid(error.message))?;
+                    blocks.push(payload.clone());
+                    continue;
+                }
+                for block in &item.blocks {
+                    match &block.content {
+                        BlockContent::Text { text } => {
+                            blocks.push(json!({"type":"text", "text":text}))
+                        }
+                        // Unsigned/foreign private reasoning is display-only.
+                        BlockContent::Reasoning { .. } => {}
+                        BlockContent::ToolCall(call) => {
+                            blocks.push(json!({"type":"tool_use", "id":call.id(), "name":call.name(), "input":call.arguments()}));
+                        }
+                    }
+                }
+            }
+            ("assistant", blocks)
+        }
+        Message::Tool(results) => {
+            let mut blocks = Vec::new();
+            for result in results {
+                if result.call_id.is_empty() {
+                    return Err(invalid("Anthropic tool results require a nonempty call_id"));
+                }
+                let mut content = vec![json!({"type":"text", "text":tool_text(result)})];
+                for image in &result.images {
+                    content.push(anthropic_image(request, image)?);
+                }
+                blocks.push(json!({"type":"tool_result", "tool_use_id":result.call_id,
+                    "content":content, "is_error":result.is_error}));
+            }
+            ("user", blocks)
+        }
+    };
+    if content.is_empty() {
+        // Empty foreign redacted reasoning contributes no replayable content.
+        if matches!(message, Message::Assistant(items) if !items.is_empty()
+            && items.iter().all(|item| item.kind == ItemKind::Reasoning))
+        {
+            return Ok(());
+        }
+        return Err(invalid(
+            "Anthropic messages must contain at least one content block",
+        ));
+    }
+    if let Some(previous) = messages
+        .last_mut()
+        .filter(|previous| previous["role"] == role)
+    {
+        previous["content"]
+            .as_array_mut()
+            .expect("constructed array")
+            .extend(content);
+    } else {
+        messages.push(json!({"role":role, "content":content}));
+    }
+    Ok(())
+}
+
+/// Mark the last block that accepts `cache_control`; thinking and empty text blocks cannot.
+fn mark_last_cacheable(messages: &mut [Value]) -> bool {
+    let block = messages
+        .iter_mut()
+        .rev()
+        .flat_map(|message| {
+            let content = message["content"].as_array_mut();
+            content.expect("constructed array").iter_mut().rev()
+        })
+        .find(|block| {
+            !matches!(
+                block["type"].as_str(),
+                Some("thinking" | "redacted_thinking")
+            ) && block["text"] != ""
+        });
+    let Some(block) = block else {
+        return false;
+    };
+    block["cache_control"] = json!({"type": "ephemeral"});
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,8 +226,8 @@ mod tests {
     use crate::{
         media::{AttachmentRef, BlobRef, ImageFormat, ImageRef, TextRef},
         provider::protocol::{
-            AssistantBlock, AssistantItem, BlockContent, ReplayEnvelope, ResponseSchema,
-            SystemSegment, ToolCall, ToolDefinition, ToolResult,
+            AssistantBlock, AssistantItem, BlockContent, HistoryLifetime, ReplayEnvelope,
+            ResponseSchema, SystemSegment, ToolCall, ToolDefinition, ToolResult,
         },
     };
 
@@ -263,6 +293,9 @@ mod tests {
                 is_error: true,
             }]),
         ];
+        request.tail = vec![Message::User(vec![UserContent::Runtime {
+            text: "state".into(),
+        }])];
         assert!(encode(&request).is_err());
         // Load the fixture blobs as the session store would.
         request.blobs.insert(image.blob, b"x".to_vec());
@@ -279,7 +312,10 @@ mod tests {
         );
         assert_eq!(body["output_config"]["format"]["schema"], schema);
         assert_eq!(body["output_config"]["effort"], "high");
-        assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+        assert_eq!(
+            body["thinking"],
+            json!({"type":"adaptive", "display":"summarized"})
+        );
         let user = &body["messages"][0]["content"];
         assert_eq!(user[0]["text"], "look");
         assert_eq!(user[1]["source"]["data"], "eA==");
@@ -297,6 +333,78 @@ mod tests {
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(text, json!({"result":{"ok":false},"is_error":true}));
         assert_eq!(result["content"][1]["type"], "image");
+        // The history breakpoint precedes the tail, which merges into the same user turn.
+        assert_eq!(result["cache_control"], json!({"type":"ephemeral"}));
+        assert_eq!(
+            body["messages"][2]["content"][1],
+            json!({"type":"text", "text":"state"})
+        );
+        let markers = body["messages"]
+            .to_string()
+            .matches("cache_control")
+            .count();
+        assert_eq!(markers, 1);
+    }
+
+    #[test]
+    fn history_breakpoint_skips_thinking_and_respects_budget() {
+        let mut request = request();
+        let native = json!({"type":"thinking", "thinking":"private", "signature":"signature"});
+        let envelope = reasoning_envelope("anthropic", &request.model, native.clone());
+        let reasoning = AssistantItem::reasoning("r", 0, "", Some(envelope));
+        request.history.push(Message::Assistant(vec![reasoning]));
+        request.tail = vec![Message::User(vec![text("state")])];
+        // Ending history is still marked so the request reads the cached prefix.
+        request.history_lifetime = HistoryLifetime::Ending;
+        let body = encode(&request).unwrap();
+        let messages = &body["messages"];
+        assert_eq!(
+            messages[0]["content"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        assert_eq!(messages[1]["content"], json!([native]));
+        assert_eq!(
+            messages[2]["content"],
+            json!([{"type":"text", "text":"state"}])
+        );
+        let unmarked = |request: &ModelRequest| {
+            let body = encode(request).unwrap().to_string();
+            !body.contains("cache_control")
+        };
+        // Detached history shares no cached prefix with any other request.
+        request.history_lifetime = HistoryLifetime::Detached;
+        assert!(unmarked(&request));
+        request.history_lifetime = HistoryLifetime::Ending;
+        // A tail-only request has no history to cache.
+        request.history.clear();
+        assert!(unmarked(&request));
+        let cached = SystemSegment {
+            text: "cached".into(),
+            cache: true,
+        };
+        request.system = vec![cached; 4];
+        assert!(encode(&request).is_ok());
+        request.history = vec![Message::User(vec![text("hello")])];
+        assert!(encode(&request).is_err());
+    }
+
+    #[test]
+    fn configured_thinking_requests_summaries() {
+        let mut request = request();
+        request.history = vec![Message::User(vec![text("hello")])];
+        for (reasoning, thinking) in [
+            (
+                "adaptive",
+                json!({"type":"adaptive", "display":"summarized"}),
+            ),
+            ("off", json!({"type":"disabled"})),
+        ] {
+            request.reasoning = Some(reasoning.into());
+            assert_eq!(encode(&request).unwrap()["thinking"], thinking);
+        }
+        // Manual budgets require thinking that compaction may have removed.
+        request.reasoning = Some("2048".into());
+        assert!(encode(&request).is_err());
     }
 
     #[test]

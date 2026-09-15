@@ -217,6 +217,12 @@ pub(super) fn entries_inner(
                                         }
                                         continue;
                                     }
+                                    // Persisted runtime state is model context, not conversation.
+                                    UserContent::Runtime { text }
+                                        if text.starts_with("<skyhook_state>") =>
+                                    {
+                                        continue;
+                                    }
                                     UserContent::Runtime { text } => {
                                         (format!("Harness notification\n{text}"), Surface::Muted)
                                     }

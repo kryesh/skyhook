@@ -95,6 +95,20 @@ pub(super) fn add_schema_property(schema: &mut Value, name: &str, property: Valu
         .insert(name.to_owned(), property);
 }
 
+/// Add a property to the object schema at a JSON pointer (`""` is the root).
+/// Registration guarantees the pointer names an object.
+pub(super) fn add_nested_schema_property(
+    schema: &mut Value,
+    pointer: &str,
+    name: &str,
+    property: Value,
+) {
+    let object = schema
+        .pointer_mut(pointer)
+        .expect("registered conditional inputs name schema objects");
+    add_schema_property(object, name, property);
+}
+
 pub(super) fn validate_schema(schema: &Value) -> Result<(), RegistryError> {
     validate_object_schema(schema)?;
     if schema["properties"].get("bg").is_some() {

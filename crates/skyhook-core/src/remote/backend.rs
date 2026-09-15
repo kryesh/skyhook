@@ -102,35 +102,16 @@ fn validate_route(route: &[TargetDefinition]) -> Result<(), RemoteError> {
     Ok(())
 }
 
-/// Keep the existing typed SSH resolution payload and wire tag at the adapter edge.
-pub(crate) async fn resolve_local(
-    target: &TargetDefinition,
-) -> Result<ssh::ResolvedSsh, RemoteError> {
-    match target.r#type {
-        TargetType::Ssh => ssh::resolve_local(target).await,
-        TargetType::Local => Err(TargetError::BuiltinOnly.into()),
-    }
-}
-
-pub(crate) async fn resolve_on(
-    origin: &Session,
-    target: TargetDefinition,
-) -> Result<ssh::ResolvedSsh, RemoteError> {
-    match target.r#type {
-        TargetType::Ssh => origin.resolve_ssh(target).await,
-        TargetType::Local => Err(TargetError::BuiltinOnly.into()),
-    }
-}
-
 /// Adapter for the SSH-specific OpenSsh wire request, not a universal command API.
 pub(crate) async fn open_ssh_request(
     route: &[TargetDefinition],
     command: &str,
-    environment: &ProcessEnvironment,
+    agent: &ssh::Authentication,
     prompts: Arc<dyn SensitivePromptHandler>,
 ) -> Result<Transport, RemoteError> {
     validate_route(route)?;
-    ssh::open(route, command, environment, prompts).await
+    let environment = agent.route_environment(route).await?;
+    ssh::open(route, command, &environment, prompts).await
 }
 
 /// Backend-owned worker credentials stay alive for the worker's entire lifetime.
@@ -147,6 +128,11 @@ impl WorkerBackends {
 
     pub fn environment(&self) -> &ProcessEnvironment {
         self.ssh.environment()
+    }
+
+    /// The worker's private agent for SSH processes it starts as an origin.
+    pub fn ssh_agent(&self) -> Arc<ssh::Authentication> {
+        self.ssh.agent()
     }
 }
 

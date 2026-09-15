@@ -146,24 +146,7 @@ impl HarnessBuilder {
             .unwrap_or_else(|| workspace.join(".skyhook/sessions"));
         let mut instructions = load_agent_instructions(&workspace).await?;
         let skills = HostSkills::discover(&workspace).await;
-        let imported = if self.targets.import_ssh_config {
-            import_ssh_targets().await?
-        } else {
-            Vec::new()
-        };
-        let target_definitions = imported
-            .into_iter()
-            .chain(self.targets.definitions()?)
-            .map(|definition| (definition.name.clone(), definition))
-            .collect::<BTreeMap<_, _>>()
-            .into_values()
-            .collect::<Vec<_>>();
-        let target_definitions = crate::target::normalize::normalize(
-            target_definitions,
-            Vec::new(),
-            Arc::new(crate::target::normalize::LocalResolver),
-        )
-        .await?;
+        let target_definitions = self.targets.definitions()?;
         TargetRegistry::from_definitions(target_definitions.clone())?;
         instructions.extend(self.instructions);
         // A host handler must not restore a revoked interaction capability,

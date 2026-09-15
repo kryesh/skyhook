@@ -76,6 +76,7 @@ pub(crate) fn reasoning_envelope(
         model: model.into(),
         scope: String::new(),
         payload,
+        conversation_bound: false,
     }
 }
 

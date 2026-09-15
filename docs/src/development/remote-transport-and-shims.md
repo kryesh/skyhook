@@ -3,26 +3,26 @@
 ## Remote transport architecture
 
 Remote connection protocols use the production `ConnectionFactory` interface in
-`crates/skyhook-core/src/remote/backend.rs`. Factories return an owned `Transport` byte stream;
-the manager performs the common shim handshake and client setup for both real backends and test
-doubles. Protocol selection and origin-side connection operations go through the backend dispatch
-layer, rather than constructing SSH launchers in the manager or target router.
+`crates/skyhook-core/src/remote/backend.rs`. Factories receive the route hops after the destination's origin and return an owned
+`Transport` byte stream; the manager performs the common shim handshake and client setup for both
+real backends and test doubles. Protocol selection goes through the backend dispatch layer, rather
+than constructing SSH launchers in the manager or target router.
 
-- `remote/manager.rs` owns route/origin handling, workspace connection pooling, cancellation, and
-  invalidation.
-- `remote/client.rs` owns shared shim RPC and relayed stream state;
-  `remote/transport.rs` defines the owned asynchronous byte-stream contract.
+- `remote/manager.rs` owns splitting routes at SSH origins, workspace connection pooling,
+  cancellation, and invalidation.
+- `remote/client/` owns shared shim RPC and relayed stream state; `remote/transport.rs` defines
+  the owned asynchronous byte-stream contract.
 - `remote/backends/ssh/` contains OpenSSH configuration/bootstrap, process supervision, askpass,
   and session-owned authentication. The public `remote::ssh` path remains a compatibility export.
 - `remote/protocol.rs` is the **shim wire protocol**, not the SSH/WinRM transport interface.
-  Existing SSH control messages remain typed compatibility adapters; worker services dispatch
-  those operations through the backend layer.
 
-A backend must preserve credential ownership on `origin` (not `via`), retain its origin connection
-for the lifetime of child streams, and release its resources during session shutdown. Cancelling
-one waiter must not terminate a connection startup shared with other callers. Adding another
-protocol still requires its own target configuration, resolution, authentication, and bootstrap;
-the abstraction does not make SSH shell commands or ProxyJump semantics universal.
+SSH configuration is generated only from target definitions. An SSH process runs on root or on
+the shim of the destination's `origin`, whose connection the child stream retains; `via` hops are
+native `ProxyJump` hops of that process and share its origin. Each origin runs its own lazy private
+agent. A backend must release its resources during session shutdown. Cancelling one waiter must not terminate a connection startup shared with
+other callers. Adding another protocol still requires its own target configuration,
+authentication, and bootstrap; the abstraction does not make SSH shell commands or ProxyJump
+semantics universal.
 
 ## Embedded shim builds
 

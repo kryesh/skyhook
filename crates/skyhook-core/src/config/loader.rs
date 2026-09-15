@@ -256,7 +256,7 @@ fn merge(base: &mut toml::Value, overlay: toml::Value, path: &mut Vec<String>) {
         (toml::Value::Table(base), toml::Value::Table(overlay)) => {
             for (key, value) in overlay {
                 // A target's omitted fields must never leak in from another layer.
-                if path.as_slice() == ["targets"] && key != "import_ssh_config" {
+                if path.as_slice() == ["targets"] {
                     base.insert(key, value);
                 } else if let Some(previous) = base.get_mut(&key) {
                     path.push(key);

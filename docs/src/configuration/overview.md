@@ -23,7 +23,7 @@ configuration must be valid; defaults are applied **after merging**.
 
 Tables merge recursively; arrays and scalar values replace the earlier value. The exception is
 **named entries under `targets`**: a workspace `[targets.build]` replaces the *whole* user
-`[targets.build]` entry, including its SSH, authentication, workspace, origin, and routing settings.
+`[targets.build]` entry, including its SSH, authentication, workspace, and routing settings.
 It does not inherit omitted fields. Other named targets remain available.
 
 ### Example: user models, workspace targets

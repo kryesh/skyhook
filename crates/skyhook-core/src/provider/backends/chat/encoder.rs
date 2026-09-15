@@ -19,8 +19,9 @@ pub(crate) fn encode(
     if request.model.is_empty() {
         return Err(invalid("Chat Completions requires a model"));
     }
-    // SystemSegment.cache is a cross-protocol hint. OpenAI automatically caches
-    // eligible prefixes and has no per-segment cache-control wire field.
+    // Cache hints need no wire field: OpenAI automatically caches matching
+    // prefixes, and history precedes the per-request tail so the tail never
+    // breaks the cached history prefix.
     let mut messages = Vec::new();
     for segment in &request.system {
         messages.push(json!({"role": "system", "content": segment.text}));

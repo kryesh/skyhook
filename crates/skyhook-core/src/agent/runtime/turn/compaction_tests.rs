@@ -135,6 +135,48 @@ async fn high_usage_tool_response_closes_exchange_before_summary_and_next_normal
 }
 
 #[tokio::test]
+async fn state_mode_persists_or_omits_runtime_state() {
+    use crate::provider::{profile::StateMode, protocol::UserContent};
+    let state = |message: &&Message| {
+        matches!(message, Message::User(blocks) if blocks.iter().any(|block|
+            matches!(block, UserContent::Runtime { text } if text.starts_with("<skyhook_state>"))))
+    };
+    for mode in [StateMode::None, StateMode::Persist] {
+        let root = tempfile::tempdir().unwrap();
+        let requests = Requests::default();
+        let shell = response(vec![tool_call(
+            0,
+            "first",
+            "shell",
+            json!({"command": "true"}),
+        )]);
+        let provider = scripted_provider(&requests, [shell, answer("done")]);
+        let mut profile = ModelProfile::new("test", "test", None, 128_000, 4096, false);
+        profile.state_mode = mode;
+        let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
+            .model_profile("test", profile)
+            .build()
+            .await
+            .unwrap();
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(session.prompt("Run the tool.").await.unwrap(), "done");
+        let captured = requests.lock().unwrap().clone();
+        let [first, second] = captured.as_slice() else {
+            panic!("unexpected requests: {captured:?}")
+        };
+        let persist = usize::from(mode == StateMode::Persist);
+        for (request, states) in [(first, persist), (second, 2 * persist)] {
+            assert!(request.tail.is_empty());
+            assert_eq!(request.history.iter().filter(state).count(), states);
+        }
+        // Append-only: everything sent before is resent unchanged.
+        let sent: Vec<_> = first.messages().collect();
+        assert!(second.messages().take(sent.len()).eq(sent));
+        shutdown_session(session).await;
+    }
+}
+
+#[tokio::test]
 async fn only_compaction_summaries_end_their_history() {
     use crate::provider::protocol::{HistoryLifetime::*, UserContent};
     let shell = |id| response(vec![tool_call(0, id, "shell", json!({"command": "true"}))]);
@@ -153,7 +195,7 @@ async fn only_compaction_summaries_end_their_history() {
     let [first, second, summary, after] = requests.as_slice() else {
         panic!("unexpected requests: {requests:?}")
     };
-    assert_eq!((summary.0, summary.2), (ModelPurpose::Compaction, Ending));
+    assert_eq!((summary.0, summary.2), (ModelPurpose::Compaction, Detached));
     assert_eq!(summary.1.last(), Some(&compaction::directive()));
     for (purpose, tail, lifetime) in [first, second, after] {
         assert_eq!((*purpose, *lifetime), (ModelPurpose::Agent, Continuing));

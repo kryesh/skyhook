@@ -414,6 +414,7 @@ mod tests {
                     model: "model".into(),
                     scope: "reasoning".into(),
                     payload: payload.clone(),
+                    conversation_bound: false,
                 }),
             })
             .collect();

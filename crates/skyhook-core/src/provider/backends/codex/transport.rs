@@ -26,17 +26,18 @@ struct WsState {
     done: bool,
     failed: bool,
     settings: Map<String, Value>,
-    input: Vec<Value>,
+    input: Option<Vec<Value>>,
     completed: Option<Continuation>,
     assembler: ResponseAssembler,
     scope: String,
 }
+/// `input` is the full request input, or `None` when the request must not seed a continuation.
 pub(super) fn ws_stream(
     connection: Connection,
     session: OwnedMutexGuard<Session>,
     decoder: responses::Decoder,
     settings: Map<String, Value>,
-    input: Vec<Value>,
+    input: Option<Vec<Value>>,
     scope: String,
 ) -> ResponseStream {
     Box::pin(stream::unfold(
@@ -91,11 +92,11 @@ pub(super) fn ws_stream(
                             );
                             if event["type"] == "response.completed"
                                 && let Some(id) = event["response"]["id"].as_str()
+                                && let Some(input) = &state.input
                             {
-                                let input = state.input.clone();
                                 state.completed = Some(Continuation {
                                     id: id.into(),
-                                    input,
+                                    input: input.clone(),
                                     settings: state.settings.clone(),
                                 });
                             }
@@ -151,10 +152,7 @@ pub(super) fn ws_stream(
                                         blobs: Default::default(),
                                     };
                                     match responses::encode(&replay) {
-                                        Ok(encoded) => {
-                                            completed.input = state.input.clone();
-                                            completed.input.extend(encoded.input);
-                                        }
+                                        Ok(encoded) => completed.input.extend(encoded.input),
                                         Err(_) => state.completed = None,
                                     }
                                 }
@@ -300,7 +298,14 @@ pub(super) mod tests {
     ) -> ResponseStream {
         let decoder = responses::Decoder::codex("gpt-5".into());
         let guard = session.clone().lock_owned().await;
-        ws_stream(connection, guard, decoder, settings, input, scope.into())
+        ws_stream(
+            connection,
+            guard,
+            decoder,
+            settings,
+            Some(input),
+            scope.into(),
+        )
     }
 
     async fn ws(socket: Socket, session: &Arc<Mutex<Session>>) -> ResponseStream {
@@ -395,6 +400,32 @@ pub(super) mod tests {
         );
         server.await.unwrap();
         assert_eq!(chunks, http(events, &self::session()).await);
+    }
+
+    #[tokio::test]
+    async fn request_without_reusable_prefix_keeps_socket_but_no_continuation() {
+        let completed = json!({"type":"response.completed",
+            "response":{"id":"resp_tail","status":"completed","output":[]}});
+        let (socket, server) = mock_socket(vec![completed]).await;
+        let session = session();
+        let decoder = responses::Decoder::codex("gpt-5".into());
+        let guard = session.clone().lock_owned().await;
+        let settings = Map::from_iter([("model".into(), json!("gpt-5"))]);
+        let stream = ws_stream(
+            connection(socket),
+            guard,
+            decoder,
+            settings,
+            None,
+            "scope".into(),
+        );
+        let chunks: Chunks = stream.collect().await;
+        assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+        assert!(matches!(
+            &*session.lock().await,
+            Session::Reusable(reusable) if reusable.continuation.is_none()
+        ));
+        server.await.unwrap();
     }
 
     #[tokio::test]

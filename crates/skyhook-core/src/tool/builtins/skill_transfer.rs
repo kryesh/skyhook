@@ -121,14 +121,14 @@ pub(super) async fn copy(
         )
         .await?;
     let route = router
-        .resolve(&caller.target)
+        .resolve(&caller.target, context.capabilities())
         .await
         .map_err(|error| ToolError::Failed(error.to_string()))?;
     router
         .authorize_transfer(
             context,
             "connect_target",
-            vec![route.permission()],
+            route.permissions(),
             route.authorization_arguments(),
         )
         .await?;

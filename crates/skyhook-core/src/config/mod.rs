@@ -366,7 +366,7 @@ mod tests {
             assert!(error.contains("unknown variant"), "{error}");
         }
         let all = parse(
-            "capabilities = ['read', 'write', 'exec', 'network', 'targets', 'agents', 'mcp']",
+            "capabilities = ['read', 'write', 'exec', 'network', 'targets', 'ssh_agent', 'agents', 'mcp']",
         )
         .unwrap();
         let non_interactive: Vec<_> = Capability::ALL
