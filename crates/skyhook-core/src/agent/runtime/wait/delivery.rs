@@ -77,6 +77,156 @@ mod tests {
     use crate::agent::runtime::*;
     use crate::job::JobState;
 
+    /// Every runtime job-event envelope of the request, as its parsed entries.
+    /// `agent_messages`/`events` flatten across envelopes; batching claims need the
+    /// envelope grouping, since one envelope is exactly one delivery snapshot.
+    fn envelopes(request: &ModelRequest) -> Vec<Vec<serde_json::Value>> {
+        let (prefix, suffix) = ("<skyhook_job_events>\n", "\n</skyhook_job_events>");
+        let blocks = request.messages().flat_map(|message| match message {
+            Message::User(content) => content.as_slice(),
+            _ => &[],
+        });
+        blocks
+            .filter_map(|block| match block {
+                UserContent::Runtime { text } => text.strip_prefix(prefix)?.strip_suffix(suffix),
+                _ => None,
+            })
+            .map(|text| serde_json::from_str(text).unwrap())
+            .collect()
+    }
+
+    /// Wakes broadcast for `job` so far. Counting wakes rather than observing their
+    /// arrival order keeps these assertions independent of any coalescing window:
+    /// a wake published before the caller's last observation is already buffered.
+    fn drain_wakes(
+        wakes: &mut broadcast::Receiver<crate::job::JobCompletion>,
+        job: JobId,
+    ) -> usize {
+        let mut count = 0;
+        while let Ok(wake) = wakes.try_recv() {
+            count += usize::from(wake.job == job);
+        }
+        count
+    }
+
+    /// A completing child's answer and its completion envelope are one wake: the
+    /// answer is published without a wake and the job completion carries both.
+    #[tokio::test]
+    async fn terminal_child_reply_and_completion_reach_the_owner_in_one_batch() {
+        const FINAL: &str = "merged-child-final-answer";
+        let launch = json!({"prompt":"report", "model":"child", "name":"merged", "bg":true});
+        let tracking = Tracking::responses(vec![
+            ("root", vec![call("launch", "agent", launch)]),
+            ("child", vec![AssistantContent::text("final", 0, FINAL)]),
+            ("root", vec![call("waiting", "wait", json!({}))]),
+            ("root", vec![answer()]),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let turn = prompt(&session);
+        tracking.pass(0).await;
+        tracking.request(1).await;
+        let job = running_job(&session, &session.root, "agent").await;
+        // Park the owner in an indefinite wait: only a wake can produce its next
+        // request, so request count is exactly the number of wakes it observed.
+        tracking.pass(2).await;
+        running_job(&session, &session.root, "wait").await;
+        let mut wakes = session.runtime.jobs.subscribe_completions();
+        tracking.release(1);
+        child_completed(&session, job).await;
+        let woken = tracking.request(3).await;
+        assert_reason(&woken, "waiting", "event");
+        // Exactly one wake, independent of any coalescing window: the answer is
+        // published silently and the job completion is the wake that carries it.
+        assert_eq!(drain_wakes(&mut wakes, job), 1);
+        // One envelope, holding the answer and the completion that references it.
+        let envelopes = envelopes(&woken);
+        assert_eq!(
+            envelopes.len(),
+            1,
+            "answer and completion must share one batch"
+        );
+        let batch = &envelopes[0];
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0]["kind"], "message");
+        assert_eq!(batch[0]["text"], FINAL);
+        assert_child_completion(&batch[1], &batch[0]);
+        // The wake came from the completion, so the owner never ran on the answer
+        // alone: three requests total, and the answer is not copied anywhere else.
+        assert_eq!(tracking.requests.lock().unwrap().len(), 4);
+        let history = serde_json::to_string(&woken.messages().collect::<Vec<_>>()).unwrap();
+        assert_eq!(history.matches(FINAL).count(), 1);
+        tracking.release(3);
+        bounded(turn).await.unwrap().unwrap();
+        session.shutdown().await.unwrap();
+    }
+
+    /// A child that answers while its own work is still running has not resolved its
+    /// invocation, so the driver wakes the owner for that answer immediately.
+    #[tokio::test]
+    async fn answering_child_with_live_work_wakes_its_owner_before_completing() {
+        const PROGRESS: &str = "child-answer-with-live-work";
+        const FINAL: &str = "child-answer-after-live-work";
+        let launch = json!({"prompt":"report", "model":"child", "name":"worker", "bg":true});
+        let work = json!({"source":"return await receive();", "bg":true});
+        let tracking = Tracking::responses(vec![
+            ("root", vec![call("launch", "agent", launch)]),
+            ("child", vec![call("work", "script", work)]),
+            (
+                "child",
+                vec![AssistantContent::text("progress", 0, PROGRESS)],
+            ),
+            ("root", vec![call("waiting", "wait", json!({}))]),
+            ("root", vec![call("again", "wait", json!({}))]),
+            ("child", vec![AssistantContent::text("final", 0, FINAL)]),
+            ("root", vec![answer()]),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let jobs = &session.runtime.jobs;
+        let turn = prompt(&session);
+        tracking.pass(0).await;
+        let job = running_job(&session, &session.root, "agent").await;
+        // The child agent exists once it has requested a response.
+        tracking.request(1).await;
+        let (child, _) = only_child(&session);
+        tracking.release(1);
+        let work = running_job(&session, &child, "script").await;
+        tracking.pass(3).await;
+        running_job(&session, &session.root, "wait").await;
+        // A text-only response, but the child's own background job keeps the
+        // invocation open: the answer must not wait for that job to be delivered.
+        let mut wakes = session.runtime.jobs.subscribe_completions();
+        tracking.release(2);
+        let woken = tracking.request(4).await;
+        assert_reason(&woken, "waiting", "event");
+        // The driver, not the commit, issued this single wake.
+        assert_eq!(drain_wakes(&mut wakes, job), 1);
+        let replies = agent_messages(&woken);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0]["text"], PROGRESS);
+        assert!(events(&woken).is_empty(), "the child has not completed");
+        assert_eq!(jobs.snapshot(job).await.unwrap().state, JobState::Running);
+
+        // Releasing its work lets the child answer again and complete; that answer
+        // and the completion then arrive together, as in the merged case above.
+        tracking.release(4);
+        running_job(&session, &session.root, "wait").await;
+        jobs.send(work, json!("released")).await.unwrap();
+        tracking.pass(5).await;
+        child_completed(&session, job).await;
+        let completed = tracking.request(6).await;
+        assert_reason(&completed, "again", "event");
+        // The second answer completes the invocation, so its completion is again the
+        // only wake and presents both entries in one batch.
+        assert_eq!(drain_wakes(&mut wakes, job), 1);
+        let batch = envelopes(&completed).pop().unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0]["text"], FINAL);
+        assert_child_completion(&batch[1], &batch[0]);
+        tracking.release(6);
+        bounded(turn).await.unwrap().unwrap();
+        session.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn no_tool_child_reports_survive_queued_input_and_pending_runtime_events() {
         // (parent already waiting, input is a pending runtime event rather than a send)

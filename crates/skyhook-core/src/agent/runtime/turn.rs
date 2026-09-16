@@ -328,9 +328,23 @@ impl SessionRuntime {
                 });
                 return Err(error);
             }
+            // A response with tool calls means the child keeps working, so its
+            // progress wakes the owner immediately, as before. A text-only response
+            // is this invocation's answer: publish it durably but silently, so the
+            // wake comes from the invocation's resolution point instead (the owning
+            // job's completion, or an explicit wake wherever the invocation
+            // continues). The answer and the completion envelope then reach the
+            // owner in one delivery batch, without relying on any wake timing.
+            let working = !response.calls.is_empty();
             let origin = if let Some(job) = owner_job {
                 self.jobs
-                    .commit_child_message(agent, job, assistant.clone(), response.text.clone())
+                    .commit_child_message(
+                        agent,
+                        job,
+                        assistant.clone(),
+                        response.text.clone(),
+                        working,
+                    )
                     .await?
             } else {
                 self.commit(agent, assistant.clone()).await?
@@ -432,6 +446,13 @@ impl SessionRuntime {
                 if !content.is_empty() {
                     messages.commit().await?;
                     final_text.clear();
+                    // This invocation continues instead of resolving, so the answer
+                    // published silently above has no resolution point to ride on.
+                    // Wake the owner here or it would stay pending until the owner's
+                    // next unrelated boundary.
+                    if let Some(job) = owner_job {
+                        self.jobs.notify_owner(job).await;
+                    }
                     continue 'requests;
                 }
                 // A response without tools is still a request boundary. Consume
@@ -443,6 +464,11 @@ impl SessionRuntime {
                 {
                     context_sequence = None;
                     final_text.clear();
+                    // Same reasoning: queued input continues this invocation, so the
+                    // silently published answer needs its wake now.
+                    if let Some(job) = owner_job {
+                        self.jobs.notify_owner(job).await;
+                    }
                     continue 'requests;
                 }
                 self.events.send(RuntimeEvent::TurnCompleted {

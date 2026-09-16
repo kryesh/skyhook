@@ -46,12 +46,21 @@ impl JobManager {
     /// Commit a child's assistant history and publish its visible text as one
     /// cancellation-shielded operation. The source sequence is the delivery ID.
     /// Empty visible text is committed to history but produces no delivery/wake.
+    ///
+    /// `wake_owner` decides only *when* the owner is woken, never what is
+    /// published: the durable message record is identical either way. A
+    /// non-terminal reply (the child keeps working) wakes the owner immediately; a
+    /// terminal reply is published silently so the invocation's resolution point —
+    /// the owning job's own completion broadcast, or [`JobManager::notify_owner`]
+    /// where that invocation does not finish — presents it in the same delivery
+    /// batch as the completion envelope.
     pub(crate) async fn commit_child_message(
         &self,
         child: &AgentId,
         job: JobId,
         message: Message,
         text: String,
+        wake_owner: bool,
     ) -> Result<u64, JobError> {
         // Refuse a projection that replay could not reproduce (including reasoning).
         if visible_text(&message).as_deref() != Some(text.as_str()) {
@@ -104,7 +113,7 @@ impl JobManager {
             entry.child = Some(child);
             let visible = !text.is_empty();
             entry.publish_message(job, record.sequence, text);
-            if visible {
+            if visible && wake_owner {
                 // Foreground child replies are just as deliverable as background ones.
                 let _ = manager
                     .inner
@@ -115,6 +124,28 @@ impl JobManager {
         })
         .await
         .map_err(|error| JobError::Internal(error.to_string()))?
+    }
+
+    /// Wake a child job's owner for replies that are already durably published.
+    /// Nothing is published here, so delivery batching, acknowledgement, dedup and
+    /// replay are untouched; this only replaces the wake that
+    /// `commit_child_message(.., wake_owner: false)` deliberately withheld. Callers
+    /// are the invocation resolution paths that do *not* finish the owning job,
+    /// whose completion broadcast would otherwise be the wake.
+    pub(crate) async fn notify_owner(&self, job: JobId) {
+        let jobs = self.inner.jobs.lock().await;
+        let Some(entry) = jobs.get(&job) else {
+            return;
+        };
+        // Messages stay in the entry until acknowledged, so an empty list means the
+        // owner has nothing to collect and must not be woken with an empty snapshot.
+        if entry.messages.is_empty() {
+            return;
+        }
+        let _ = self.inner.completions.send(JobCompletion {
+            agent: entry.agent.clone(),
+            job,
+        });
     }
 
     /// Last committed *visible* child message, even after acknowledgement/resume.
@@ -211,7 +242,7 @@ mod tests {
     async fn commit(manager: &JobManager, child: &AgentId, job: JobId, text: &str) -> u64 {
         let message = assistant(text);
         manager
-            .commit_child_message(child, job, message, text.into())
+            .commit_child_message(child, job, message, text.into(), true)
             .await
             .unwrap()
     }
@@ -375,6 +406,46 @@ mod tests {
         }
     }
 
+    /// A terminal child reply is published durably but silently, so the job's own
+    /// completion is the single wake that presents both items in one batch.
+    #[tokio::test]
+    async fn deferred_reply_waits_for_its_completion_and_notify_owner_covers_the_rest() {
+        let (_root, manager, owner, child, job) = child_job(true).await;
+        let mut wakes = manager.subscribe_completions();
+        let message = assistant("terminal answer");
+        let sequence = manager
+            .commit_child_message(&child, job, message, "terminal answer".into(), false)
+            .await
+            .unwrap();
+        // Durable and deliverable, but the owner is not woken for it on its own.
+        assert!(manager.has_pending(&owner).await);
+        assert!(wakes.try_recv().is_err());
+        assert_eq!(
+            manager.last_agent_message(job).await.unwrap(),
+            Some(sequence)
+        );
+
+        // An invocation that does not finish wakes explicitly instead.
+        manager.notify_owner(job).await;
+        assert_eq!(wakes.try_recv().unwrap().job, job);
+        manager.notify_owner(job).await;
+        assert_eq!(wakes.try_recv().unwrap().agent, owner);
+
+        // The completion wake presents reply and envelope as one receipt.
+        finish(&manager, job).await;
+        assert_eq!(wakes.try_recv().unwrap().job, job);
+        let receipt = manager.pending_delivery(&owner).await.unwrap();
+        assert_eq!(sequences(&receipt), [sequence]);
+        assert_eq!(receipt.envelopes().len(), 1);
+        ack(receipt).await;
+        // Nothing pending: a wake with nothing to present is never sent.
+        assert!(!manager.has_pending(&owner).await);
+        while wakes.try_recv().is_ok() {}
+        manager.notify_owner(job).await;
+        assert!(wakes.try_recv().is_err());
+        assert!(!manager.test_replay().await.has_pending(&owner).await);
+    }
+
     #[tokio::test]
     async fn message_ack_does_not_claim_lifecycle_and_resume_does_not_claim_messages() {
         let (_root, manager, owner, child, job) = child_job(true).await;
@@ -417,7 +488,7 @@ mod tests {
         let mut wakes = manager.subscribe_completions();
         let message = assistant("survives");
         let mut pending =
-            Box::pin(manager.commit_child_message(&child, job, message, "survives".into()));
+            Box::pin(manager.commit_child_message(&child, job, message, "survives".into(), true));
         // Poll through the internal spawn, then cancel the caller while the spawned
         // transaction is waiting on the receipt's delivery gate.
         assert!(
@@ -452,7 +523,8 @@ mod tests {
             (owner.clone(), "visible"),
         ] {
             let message = assistant("visible");
-            let result = manager.commit_child_message(&author, job, message, projection.into());
+            let result =
+                manager.commit_child_message(&author, job, message, projection.into(), true);
             assert!(result.await.is_err());
         }
         assert_eq!(manager.store().records().await.len(), before);

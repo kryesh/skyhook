@@ -53,32 +53,76 @@ impl DriverPhase {
         }
     }
 
-    fn fail(&mut self, error: RequestFailure) {
-        if let Self::Child(phase) = self
-            && let Some(completion) = take_completion(phase, ChildPhase::Parked)
-        {
-            let _ = completion.send(Err(error));
-        }
+    // Parking is unconditional; the returned flag is only whether the failure
+    // reached this invocation's waiter, which is what finishes the owning job.
+    fn fail(&mut self, error: RequestFailure) -> bool {
+        let Self::Child(phase) = self else {
+            return false;
+        };
+        let Some(completion) = take_completion(phase, ChildPhase::Parked) else {
+            return false;
+        };
+        completion.send(Err(error)).is_ok()
     }
 
     // Consume the answer even without a waiter. Empty mailbox wakeups after
     // completion must not publish AgentCompleted again for this invocation.
-    fn complete(&mut self) -> bool {
+    // `None` means there was no answer to consume; `Some(true)` handed it to the
+    // waiter, so the owning job finishes and its own completion wakes the owner;
+    // `Some(false)` consumed it callback-free, leaving the owner to be woken here.
+    fn complete(&mut self) -> Option<bool> {
         let Self::Child(phase @ ChildPhase::Answered { .. }) = self else {
-            return false;
+            return None;
         };
-        if let ChildPhase::Answered {
-            answer,
-            completion: Some(completion),
-        } = std::mem::replace(phase, ChildPhase::Idle)
-        {
-            let _ = completion.send(Ok(answer));
-        }
-        true
+        let ChildPhase::Answered { answer, completion } =
+            std::mem::replace(phase, ChildPhase::Idle)
+        else {
+            // The guard above matched Answered.
+            return None;
+        };
+        Some(match completion {
+            Some(completion) => completion.send(Ok(answer)).is_ok(),
+            None => false,
+        })
     }
 }
 
 impl SessionRuntime {
+    /// Wake a child's owner for a terminal reply published without a wake (see
+    /// `commit_child_message`). Only resolution paths that do NOT finish the owning
+    /// job may call this: a finishing job broadcasts its own completion, which then
+    /// presents reply and completion envelope in one owner delivery batch, while an
+    /// extra earlier wake would split them again. Every resolution path in
+    /// `run_agent` therefore either finishes the invocation through its waiter or
+    /// wakes here:
+    ///
+    /// | resolution path after `run_turn`                    | wakes the owner       |
+    /// |-----------------------------------------------------|-----------------------|
+    /// | Ok, invocation completes with a waiter              | the job's completion  |
+    /// | Ok, callback-free completion (no waiter)            | `wake_owner`          |
+    /// | Ok, deferred queued input or own pending deliveries | `wake_owner`          |
+    /// | Ok, pending deliveries seen after the answer        | `wake_owner`          |
+    /// | Ok, own live jobs (loops back to the mailbox)       | `wake_owner` (tail)   |
+    /// | Err interrupted/cancelled, waiter observes it       | job interrupt/cancel  |
+    /// | Err parked (retained child), waiter observes it     | the job's failure     |
+    /// | Err of any kind with no waiter                      | `wake_owner`          |
+    /// | owner cancellation seen while idle                  | job cancel/`wake_owner`|
+    ///
+    /// A finishing job wakes the owner only for background jobs; a foreground caller
+    /// is already awaiting the tool result and presents pending replies at its own
+    /// next request boundary, in the same request as that result.
+    ///
+    /// Paths that publish no reply of their own (Shutdown, parked or empty JobsReady,
+    /// rejected model, failed input commit, closed mailbox) need no wake: the table
+    /// above leaves no un-woken reply behind at the loop head. `run_turn` wakes for
+    /// the two continues that keep a text-only response's invocation running, and
+    /// `run_child_request` wakes when owner input restarts it instead of finishing.
+    async fn wake_owner(&self, owner_job: Option<JobId>) {
+        if let Some(job) = owner_job {
+            self.jobs.notify_owner(job).await;
+        }
+    }
+
     pub(super) async fn run_agent(self: Arc<Self>, agent_loop: AgentLoop) {
         let AgentLoop {
             control:
@@ -121,10 +165,18 @@ impl SessionRuntime {
                 tokio::select! {
                     biased;
                     () = owner_cancellation.cancelled() => {
-                        phase.fail(RequestFailure::Failed("child agent cancelled".to_owned()));
+                        // The cancelled owning job finishes and wakes the owner for
+                        // whatever is still pending; with no waiter nothing finishes
+                        // it, so a retained reply needs the explicit wake.
+                        let failure = RequestFailure::Failed("child agent cancelled".to_owned());
+                        if !phase.fail(failure) {
+                            self.wake_owner(owner_job).await;
+                        }
                         let _ = self.store.append(id.clone(), SessionEvent::AgentInterrupted).await;
                         break;
                     }
+                    // The mailbox closes only at shutdown, after every resolution
+                    // path above already finished the job or woke the owner.
                     command = rx.recv() => match command { Some(command) => command, None => break },
                 }
             };
@@ -198,14 +250,22 @@ impl SessionRuntime {
                                 .any(|command| matches!(command, AgentCommand::QueuedInputs(_)))
                                 || self.jobs.has_pending(&id).await
                             {
+                                // The invocation keeps running instead of resolving,
+                                // so a retained terminal reply gets its wake here.
+                                self.wake_owner(owner_job).await;
                                 continue;
                             }
                             *completing = false;
-                            if phase.complete() {
+                            if let Some(handed) = phase.complete() {
                                 let _ = self
                                     .store
                                     .append(id.clone(), SessionEvent::AgentCompleted)
                                     .await;
+                                if !handed {
+                                    // Callback-free completion: no waiter finishes the
+                                    // owning job, so nothing else would wake the owner.
+                                    self.wake_owner(owner_job).await;
+                                }
                             }
                             continue;
                         }
@@ -247,6 +307,9 @@ impl SessionRuntime {
                     if let Some(done) = done {
                         let _ = done.send(Err(error.into()));
                     }
+                    // No reply was published in this iteration and every earlier
+                    // resolution already finished the job or woke the owner, so the
+                    // parked/failed handoff needs no wake of its own.
                     phase.fail(error.into());
                     if child {
                         self.interrupt_tree(&id).await;
@@ -297,6 +360,10 @@ impl SessionRuntime {
                     .any(|command| matches!(command, AgentCommand::QueuedInputs(_)))
                     || self.jobs.has_pending(&id).await
                 {
+                    // Queued input or the child's own pending deliveries continue
+                    // this invocation, so no job completion will carry the terminal
+                    // reply published during the turn: wake the owner now.
+                    self.wake_owner(owner_job).await;
                     continue;
                 }
             }
@@ -343,7 +410,12 @@ impl SessionRuntime {
                     // Explicit job/tree cancellation is deliberately final. A
                     // session-turn interrupt only cancels `cancellation` and is
                     // retained below as a retryable Interrupted child job.
-                    phase.fail(RequestFailure::Interrupted);
+                    // An interrupted turn can still have published visible text
+                    // (a shielded commit outlives the cancelled turn), so the owner
+                    // is woken unless the waiter finishes the job for us.
+                    if !phase.fail(RequestFailure::Interrupted) {
+                        self.wake_owner(owner_job).await;
+                    }
                     let _ = self
                         .store
                         .append(id.clone(), SessionEvent::AgentInterrupted)
@@ -355,7 +427,12 @@ impl SessionRuntime {
                 // projected history alive so the owning job can restart it.
                 *completing = false;
                 if let Err(error) = &result {
-                    phase.fail(error.into());
+                    // An aborted response commits its partial visible text before
+                    // failing the turn; the failing job wakes the owner for it, and
+                    // a parked child without a waiter needs the explicit wake.
+                    if !phase.fail(error.into()) {
+                        self.wake_owner(owner_job).await;
+                    }
                 }
                 continue;
             }
@@ -365,19 +442,33 @@ impl SessionRuntime {
                 // A descendant may have published a reply and then finished
                 // during the awaits above. Check after observing no live jobs.
                 if self.jobs.has_pending(&id).await {
+                    // The loop continues instead of completing, so the terminal reply
+                    // published during this turn needs its wake here.
+                    self.wake_owner(owner_job).await;
                     continue;
                 }
                 *completing = false;
-                if phase.complete() {
+                if let Some(handed) = phase.complete() {
                     let _ = self
                         .store
                         .append(id.clone(), SessionEvent::AgentCompleted)
                         .await;
+                    if !handed {
+                        // Callback-free completion (queued input or a descendant
+                        // wakeup drove this turn): the owning job does not finish
+                        // here, so only this wake reaches the owner.
+                        self.wake_owner(owner_job).await;
+                    }
                 }
                 // Retain the provider session and full projected history while idle.
                 // A fresh owner request resumes this same child, never a new agent.
                 continue;
             }
+            // Loop tail: a child that answered while holding live jobs of its own.
+            // The invocation stays open across another mailbox wait, so its terminal
+            // reply must not wait for that work to reach the owner. The root has no
+            // owner job and never wakes anyone here.
+            self.wake_owner(owner_job).await;
         }
         if let Some(job) = owner_job {
             self.jobs.clear_resume_handler(job).await;

@@ -12,7 +12,18 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
+
+/// A batch releases this long after the *most recent* event of a burst, so
+/// events that trickle in (a child's final message notification, then its job
+/// completion a few milliseconds later) become one wake instead of two.
+const COALESCE_QUIET_WINDOW: Duration = Duration::from_millis(100);
+/// Ceiling on a single window, measured from the burst's first event: a steady
+/// stream of notifications would otherwise reset the quiet timer forever, and
+/// both an idle agent's wake and `flush_events` (which blocks a turn on the
+/// open window) must stay bounded regardless of activity.
+const COALESCE_MAX_WINDOW: Duration = Duration::from_millis(500);
 
 /// Input and background notifications use the same per-agent delivery gate.
 #[derive(Clone)]
@@ -33,7 +44,9 @@ struct AgentWake {
 struct EventBatch {
     revision: u64,
     input_revision: u64,
-    scheduled: bool,
+    /// Present exactly while a window is open; signals the window task that
+    /// more events landed and its quiet timer must restart.
+    activity: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl AgentSender {
@@ -84,7 +97,10 @@ impl AgentSender {
     }
 
     /// One bounded coalescing window per agent, shared by every delivery path.
-    /// Continuous activity cannot postpone an already scheduled batch.
+    /// The window is trailing: activity restarts the quiet timer instead of
+    /// being cut off into the next window, bounded by `COALESCE_MAX_WINDOW`.
+    /// Stays synchronous and non-blocking; `send` calls this between
+    /// `reserve` and `permit.send` with no await in between.
     fn schedule(&self, input: bool) {
         let mut batch = self
             .wake
@@ -95,13 +111,31 @@ impl AgentSender {
         if input {
             batch.input_revision = batch.input_revision.wrapping_add(1);
         }
-        if batch.scheduled {
+        if let Some(activity) = &batch.activity {
+            // `notify_one` stores a permit, so a reset racing with the window
+            // task's select is observed rather than lost. A reset racing with
+            // release is harmless: this revision bump happened under the same
+            // lock the releasing task publishes from.
+            activity.notify_one();
             return;
         }
-        batch.scheduled = true;
+        let activity = Arc::new(tokio::sync::Notify::new());
+        batch.activity = Some(activity.clone());
+        // `Weak`: a dropped agent must not be kept alive by its own window.
         let wake = Arc::downgrade(&self.wake);
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let quiet = tokio::time::sleep(COALESCE_QUIET_WINDOW);
+            let cap = tokio::time::sleep(COALESCE_MAX_WINDOW);
+            tokio::pin!(quiet, cap);
+            loop {
+                tokio::select! {
+                    () = &mut quiet => break,
+                    () = &mut cap => break,
+                    () = activity.notified() => quiet
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + COALESCE_QUIET_WINDOW),
+                }
+            }
             let Some(wake) = wake.upgrade() else { return };
             let mut batch = wake
                 .batch
@@ -109,7 +143,7 @@ impl AgentSender {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             wake.ready_input_revision
                 .store(batch.input_revision, Ordering::Release);
-            batch.scheduled = false;
+            batch.activity = None;
             // Publish under the lock before another window can begin.
             wake.revision.send_replace(batch.revision);
         });
@@ -238,6 +272,7 @@ mod tests {
     use tokio::sync::{Notify, Semaphore};
 
     use super::super::*;
+    use super::{COALESCE_MAX_WINDOW, COALESCE_QUIET_WINDOW};
     pub(super) use crate::agent::runtime::tests::{bounded, enqueue_prompts};
     use crate::{
         job::{JobOutcome, JobSpec, JobState},
@@ -489,6 +524,71 @@ mod tests {
             let notification = serde_json::to_string(notification.unwrap()).unwrap();
             assert!(notification.contains(value));
         }
+    }
+
+    /// Drives one window's timers without the harness: paused time plus the
+    /// full session would race the provider gates, and only the release time
+    /// is under test here. One yield lets the window task register or rearm
+    /// its timers before the next `advance`.
+    async fn settle() {
+        tokio::task::yield_now().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trailing_window_coalesces_a_split_burst_into_one_batch() {
+        let sender = AgentSender::new(mpsc::channel(1).0);
+        let mut revision = sender.wake.revision.subscribe();
+        // Each gap ends inside the open quiet period, so every event resets it.
+        let gap = COALESCE_QUIET_WINDOW - std::time::Duration::from_millis(20);
+        sender.schedule(true);
+        settle().await;
+        for _ in 0..3 {
+            tokio::time::advance(gap).await;
+            settle().await;
+            assert_eq!(
+                *revision.borrow_and_update(),
+                0,
+                "batch released before the quiet period elapsed"
+            );
+            sender.schedule(true);
+            settle().await;
+        }
+        tokio::time::advance(COALESCE_QUIET_WINDOW).await;
+        settle().await;
+        // Four notifications spread over 340ms, one wake carrying all of them.
+        assert_eq!(*revision.borrow_and_update(), 4);
+        assert_eq!(
+            sender.wake.ready_input_revision.load(Ordering::Acquire),
+            4,
+            "released batch must expose every accumulated input"
+        );
+        assert!(
+            !revision.has_changed().unwrap(),
+            "a trailing burst must not release a second batch"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuous_activity_cannot_postpone_a_batch_past_the_cap() {
+        let sender = AgentSender::new(mpsc::channel(1).0);
+        let mut revision = sender.wake.revision.subscribe();
+        let step = std::time::Duration::from_millis(10);
+        sender.schedule(false);
+        settle().await;
+        let mut elapsed = std::time::Duration::ZERO;
+        while *revision.borrow_and_update() == 0 {
+            assert!(
+                elapsed <= COALESCE_MAX_WINDOW,
+                "cap failed to release after {elapsed:?} of continuous activity"
+            );
+            tokio::time::advance(step).await;
+            settle().await;
+            elapsed += step;
+            // Activity never quiets down: only the cap can end this window.
+            sender.schedule(false);
+            settle().await;
+        }
+        assert_eq!(elapsed, COALESCE_MAX_WINDOW);
     }
 
     #[tokio::test]

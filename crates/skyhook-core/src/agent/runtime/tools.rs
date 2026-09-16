@@ -338,6 +338,10 @@ async fn run_child_request(
                     content.push(UserContent::ParentInput { text: format!("Owner input: {value}") });
                 }
                 if content.is_empty() { return Ok(text); }
+                // Owner input continues this invocation instead of finishing the job.
+                // The answer above was published as a durable message without a wake
+                // (see `commit_child_message`), so wake the owner here.
+                runtime.jobs.notify_owner(context.job()).await;
                 let (done, next) = oneshot::channel();
                 done_rx = next;
                 *completion_gate.lock().await = true;
@@ -358,6 +362,11 @@ async fn run_child_request(
                 {
                     let mut active = completion_gate.lock().await;
                     if !*active {
+                        // The child already resolved this invocation; owner input
+                        // restarts it rather than finishing the job, and it replaces
+                        // `done_rx`, so any answer published without a wake would be
+                        // stranded. Wake the owner for it here.
+                        runtime.jobs.notify_owner(context.job()).await;
                         let (done, next) = oneshot::channel();
                         done_rx = next;
                         *active = true;

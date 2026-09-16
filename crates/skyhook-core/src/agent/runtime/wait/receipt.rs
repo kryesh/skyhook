@@ -76,7 +76,8 @@ pub(super) mod tests {
     ) -> u64 {
         let message = Message::Assistant(vec![AssistantContent::text("fixture-reply", 0, text)]);
         let jobs = &session.runtime.jobs;
-        let committed = jobs.commit_child_message(child, job, message, text.to_owned());
+        // Fixture progress stands in for a non-terminal child reply: it wakes the owner.
+        let committed = jobs.commit_child_message(child, job, message, text.to_owned(), true);
         committed.await.unwrap()
     }
 

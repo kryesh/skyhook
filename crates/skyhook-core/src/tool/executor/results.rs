@@ -301,7 +301,7 @@ mod tests {
                 Message::Assistant(vec![AssistantContent::text("answer", 0, text.clone())]);
             let sequence = runtime
                 .jobs
-                .commit_child_message(&child, job, message, text.clone())
+                .commit_child_message(&child, job, message, text.clone(), true)
                 .await
                 .unwrap();
             complete(&runtime, job, serde_json::json!(text)).await;
