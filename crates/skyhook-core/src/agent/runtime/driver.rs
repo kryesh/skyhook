@@ -300,6 +300,22 @@ impl SessionRuntime {
                     continue;
                 }
             }
+            // A terminal turn failure is journaled, not only broadcast: the retry
+            // affordance is gated on agent activity, which is otherwise lost when
+            // the session is reopened.
+            if let Err(error) = &result
+                && !matches!(error, HarnessError::Interrupted)
+            {
+                let _ = self
+                    .store
+                    .append(
+                        id.clone(),
+                        SessionEvent::AgentFailed {
+                            error: error.to_string(),
+                        },
+                    )
+                    .await;
+            }
             self.activity(
                 &id,
                 match &result {

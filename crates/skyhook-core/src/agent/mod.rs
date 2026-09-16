@@ -14,10 +14,10 @@ pub use observation::{
     AgentActivity, ContextUsage, LiveResponse, Observation, ObservationSnapshot, ObservedEvent,
 };
 pub use runtime::{
-    Harness, HarnessBuilder, PreparedQueuedPrompt, PromptOptions, QueueConflict, QueuedPrompt,
-    QueuedPromptCancellation, QueuedPromptCommit, QueuedPromptError, QueuedPromptIdentity,
-    QueuedPromptRecovery, QueuedPromptToken, RecoveredQueuedPrompt, RecoveredQueuedPromptState,
-    SessionHandle,
+    ContinueOptions, ContinueOutcome, Harness, HarnessBuilder, PreparedQueuedPrompt, PromptOptions,
+    QueueConflict, QueuedPrompt, QueuedPromptCancellation, QueuedPromptCommit, QueuedPromptError,
+    QueuedPromptIdentity, QueuedPromptRecovery, QueuedPromptToken, RecoveredQueuedPrompt,
+    RecoveredQueuedPromptState, SessionHandle,
 };
 pub use todo::{TodoItem, TodoSnapshot, TodoStatus};
 

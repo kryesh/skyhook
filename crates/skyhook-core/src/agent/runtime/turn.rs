@@ -275,7 +275,59 @@ impl SessionRuntime {
                 };
                 break (requested, response);
             };
+            if response.stop_reason == crate::provider::protocol::StopReason::ContentFilter {
+                // A refusal is a successful response that produced no usable turn.
+                // It is an error state, never conversation history, so nothing is
+                // committed. It is also never retried automatically: refusals are
+                // deterministic for a given request, so the trigger must come from
+                // outside the refused agent (its parent, or a human), optionally
+                // after selecting another model.
+                let error = HarnessError::Refused(refusal_detail(&response));
+                self.record_model_outcome(
+                    agent,
+                    requested.sequence,
+                    provider_attempt,
+                    response.usage,
+                    error.to_string(),
+                    crate::session::ModelFailureKind::Refusal,
+                )
+                .await?;
+                self.events.send(RuntimeEvent::ResponseSettled {
+                    agent: agent.clone(),
+                    request: requested.sequence,
+                    message: None,
+                    error: Some(error.to_string()),
+                });
+                return Err(error);
+            }
             let assistant = Message::Assistant(response.blocks);
+            if assistant.is_content_free() {
+                // The journal is append-only and Anthropic rejects a content-free
+                // assistant message on every subsequent request, so committing one
+                // would make the session permanently unusable. Fail the turn with
+                // nothing committed; an external retry can still continue it.
+                let error =
+                    if response.stop_reason == crate::provider::protocol::StopReason::Aborted {
+                        HarnessError::ProviderAborted
+                    } else {
+                        HarnessError::EmptyResponse
+                    };
+                self.record_model_failure(
+                    agent,
+                    requested.sequence,
+                    provider_attempt,
+                    response.usage,
+                    error.to_string(),
+                )
+                .await?;
+                self.events.send(RuntimeEvent::ResponseSettled {
+                    agent: agent.clone(),
+                    request: requested.sequence,
+                    message: None,
+                    error: Some(error.to_string()),
+                });
+                return Err(error);
+            }
             let origin = if let Some(job) = owner_job {
                 self.jobs
                     .commit_child_message(agent, job, assistant.clone(), response.text.clone())
@@ -318,6 +370,8 @@ impl SessionRuntime {
                 error: None,
             });
             self.record_model_usage(agent, requested.sequence, response.usage)
+                .await?;
+            self.record_response_completed(agent, requested.sequence, response.stop_reason.clone())
                 .await?;
             agent_context.meter.observe(input_estimate, response.usage);
             // Decide once from the successful completed response, never from an
@@ -400,6 +454,26 @@ impl SessionRuntime {
         }
     }
 }
+/// Bounded excerpt of any partial text a refused response produced.
+const REFUSAL_EXCERPT_LIMIT: usize = 240;
+
+/// Human-readable refusal detail for the journal and for a parent agent. Providers
+/// rarely return refusal prose, so partial visible text is preserved when present.
+fn refusal_detail(response: &FoldedResponse) -> String {
+    let text = response.text.trim();
+    if text.is_empty() {
+        return "content filter; the response contained no content".to_owned();
+    }
+    // This string is journaled twice and reaches a parent agent's context, so the
+    // excerpt is bounded. The full partial text remains in the response events.
+    let excerpt: String = text.chars().take(REFUSAL_EXCERPT_LIMIT).collect();
+    if excerpt.chars().count() < text.chars().count() {
+        format!("content filter; partial response: {excerpt}…")
+    } else {
+        format!("content filter; partial response: {excerpt}")
+    }
+}
+
 struct FoldedResponse {
     stop_reason: crate::provider::protocol::StopReason,
     blocks: Vec<AssistantContent>,
@@ -458,6 +532,243 @@ fn finish_response(
 mod tests {
     use super::*;
     use crate::agent::runtime::tests::*;
+
+    /// A decoded response that ends in a refusal, as a content filter produces.
+    fn refusal(items: Vec<AssistantContent>) -> Vec<ResponseChunk> {
+        let mut events = events_for_content(&items);
+        events.push(ResponseChunk::ResponseEnded {
+            stop_reason: StopReason::ContentFilter,
+        });
+        events
+    }
+
+    #[tokio::test]
+    async fn refusal_fails_the_turn_without_committing_history_or_retrying() {
+        // The real shape observed from a refusing provider: a successful stream
+        // whose content is empty, or only an unusable reasoning stub.
+        for response in [
+            refusal(Vec::new()),
+            refusal(vec![AssistantContent::reasoning("thought", 0, "", None)]),
+        ] {
+            let (root, requests, session) = scripted_session([response]).await;
+            let failure = session.prompt("Design feedback").await.unwrap_err();
+            let message = failure.to_string();
+            assert!(
+                message.contains("declined to respond") && message.contains("content filter"),
+                "unexpected failure: {message}"
+            );
+            // A refusal is deterministic, so the runtime must not retry it itself.
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            let sessions = root.path().join("sessions");
+            let id = session.id();
+            session.shutdown().await.unwrap();
+            let records = SessionStore::read_records(&sessions, id).await.unwrap();
+            // An error state, never conversation history.
+            assert_eq!(
+                count!(
+                    &records,
+                    SessionEvent::MessageCommitted {
+                        message: Message::Assistant(_)
+                    }
+                ),
+                0
+            );
+            let refusals = events!(
+                &records,
+                SessionEvent::ModelFailed { kind, error, .. }
+                    if *kind == crate::session::ModelFailureKind::Refusal => error.clone()
+            );
+            assert_eq!(refusals.len(), 1);
+            assert!(refusals[0].contains("declined to respond"));
+            // Journaled so a reopened session can still continue the turn.
+            let failed = events!(&records, SessionEvent::AgentFailed { error } => error.clone());
+            assert_eq!(failed.len(), 1);
+            assert!(failed[0].contains("declined to respond"));
+            assert_eq!(count!(&records, SessionEvent::ModelRequested { .. }), 1);
+            assert_eq!(
+                count!(&records, SessionEvent::ModelAttemptStarted { .. }),
+                1
+            );
+            assert_eq!(
+                count!(&records, SessionEvent::ModelRecoveryScheduled { .. }),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn child_refusal_reports_a_failed_agent_to_its_parent() {
+        let work = json!({"prompt":"work"});
+        let (root, _requests, session) = scripted_session([
+            response(vec![tool_call(0, "delegate", "agent", work)]),
+            // The child refuses; its owner job must fail with that reason.
+            refusal(Vec::new()),
+            answer("child could not proceed"),
+        ])
+        .await;
+        assert_eq!(
+            session.prompt("delegate").await.unwrap(),
+            "child could not proceed"
+        );
+        let sessions = root.path().join("sessions");
+        let id = session.id();
+        session.shutdown().await.unwrap();
+        let records = SessionStore::read_records(&sessions, id).await.unwrap();
+        // The parent sees a failed agent carrying the refusal message.
+        let results = events!(
+            &records,
+            SessionEvent::MessageCommitted {
+                message: Message::Tool(results)
+            } => results.clone()
+        );
+        let reported = results
+            .into_iter()
+            .flatten()
+            .find(|result| result.name == "agent")
+            .expect("the parent received an agent tool result");
+        assert!(reported.is_error, "the agent tool result must be an error");
+        let rendered = reported.result.to_string();
+        assert!(
+            rendered.contains("declined to respond") && rendered.contains("content filter"),
+            "parent-visible result lost the refusal reason: {rendered}"
+        );
+        // The child is journaled as refused and failed, not merely idle.
+        let child = records
+            .iter()
+            .map(|record| record.agent.clone())
+            .find(|agent| !agent.path().is_empty())
+            .expect("a child agent was started");
+        let child_records: Vec<_> = records
+            .iter()
+            .filter(|record| record.agent == child)
+            .cloned()
+            .collect();
+        assert_eq!(
+            count!(&child_records, SessionEvent::ModelFailed { kind, .. }
+                if *kind == crate::session::ModelFailureKind::Refusal),
+            1
+        );
+        assert_eq!(count!(&child_records, SessionEvent::AgentFailed { .. }), 1);
+        assert_eq!(
+            count!(
+                &child_records,
+                SessionEvent::MessageCommitted {
+                    message: Message::Assistant(_)
+                }
+            ),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn abnormal_stops_that_strip_their_only_tool_call_fail_instead_of_committing() {
+        // MaxTokens and Aborted discard tool calls, which can leave nothing at all.
+        // Committing that emptiness was a second, independent brick path.
+        for (stop_reason, expected) in [
+            (StopReason::MaxTokens, "no assistant content"),
+            (StopReason::Aborted, "provider aborted"),
+        ] {
+            let call = tool_call(0, "call", "shell", json!({"command":"true"}));
+            let mut events = events_for_content(&[call]);
+            events.push(ResponseChunk::ResponseEnded {
+                stop_reason: stop_reason.clone(),
+            });
+            let (root, _requests, session) = scripted_session([events]).await;
+            let failure = session.prompt("run it").await.unwrap_err();
+            assert!(
+                failure.to_string().contains(expected),
+                "unexpected failure for {stop_reason:?}: {failure}"
+            );
+            let sessions = root.path().join("sessions");
+            let id = session.id();
+            session.shutdown().await.unwrap();
+            let records = SessionStore::read_records(&sessions, id).await.unwrap();
+            assert_eq!(
+                count!(
+                    &records,
+                    SessionEvent::MessageCommitted {
+                        message: Message::Assistant(_)
+                    }
+                ),
+                0
+            );
+            // The stripped call must never have reached execution.
+            assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn blank_text_responses_are_committed_and_complete_the_turn() {
+        // Some providers return empty or whitespace text on a non-final turn. That
+        // is ordinary content: it encodes, so it must not be treated as a failure.
+        for text in ["", "   "] {
+            let (root, _requests, session) =
+                scripted_session([response(vec![AssistantContent::text("answer", 0, text)])]).await;
+            assert_eq!(session.prompt("hello").await.unwrap(), text);
+            let sessions = root.path().join("sessions");
+            let id = session.id();
+            session.shutdown().await.unwrap();
+            let records = SessionStore::read_records(&sessions, id).await.unwrap();
+            assert_eq!(
+                count!(
+                    &records,
+                    SessionEvent::MessageCommitted {
+                        message: Message::Assistant(_)
+                    }
+                ),
+                1
+            );
+            assert_eq!(count!(&records, SessionEvent::ModelFailed { .. }), 0);
+            assert_eq!(count!(&records, SessionEvent::AgentFailed { .. }), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn content_free_response_fails_instead_of_committing_an_unencodable_message() {
+        // Not a refusal, and not merely blank: a response carrying no blocks at all.
+        // Committing it would make every later request unencodable, so the turn fails.
+        let empty = response(Vec::new());
+        let (root, _requests, session) = scripted_session([empty]).await;
+        let failure = session.prompt("hello").await.unwrap_err();
+        assert!(
+            failure.to_string().contains("no assistant content"),
+            "unexpected failure: {failure}"
+        );
+        let sessions = root.path().join("sessions");
+        let id = session.id();
+        session.shutdown().await.unwrap();
+        let records = SessionStore::read_records(&sessions, id).await.unwrap();
+        assert_eq!(
+            count!(
+                &records,
+                SessionEvent::MessageCommitted {
+                    message: Message::Assistant(_)
+                }
+            ),
+            0
+        );
+        // Classified as an ordinary error, not a refusal.
+        assert_eq!(
+            count!(&records, SessionEvent::ModelFailed { kind, .. }
+                if *kind == crate::session::ModelFailureKind::Error),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_responses_journal_their_terminal_stop_reason() {
+        let (root, _requests, session) = scripted_session([answer("done")]).await;
+        assert_eq!(session.prompt("hello").await.unwrap(), "done");
+        let sessions = root.path().join("sessions");
+        let id = session.id();
+        session.shutdown().await.unwrap();
+        let records = SessionStore::read_records(&sessions, id).await.unwrap();
+        let reasons = events!(
+            &records,
+            SessionEvent::ResponseCompleted { stop_reason, .. } => stop_reason.clone()
+        );
+        assert_eq!(reasons, vec![StopReason::EndTurn]);
+    }
 
     #[tokio::test]
     async fn incomplete_native_response_is_not_retried_or_committed() {

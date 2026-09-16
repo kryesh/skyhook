@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::tui::keys::Command;
+use skyhook::agent::AgentActivity;
 
 /// Contextual labels for typed commands, rendered only when they are bound.
 fn leader_hints(app: &App) -> Vec<(Command, &'static str)> {
@@ -15,6 +16,16 @@ fn leader_hints(app: &App) -> Vec<(Command, &'static str)> {
     ]);
     if !app.queue.is_empty() {
         hints.push((Command::Queue, "Edit queue"));
+    }
+    // Advertise continuing only while something can be continued, so a refusal
+    // names the key that resolves it.
+    if app.snapshot.activity.values().any(|activity| {
+        matches!(
+            activity,
+            AgentActivity::Failed(_) | AgentActivity::Interrupted
+        )
+    }) {
+        hints.push((Command::Retry, "Continue"));
     }
     hints
 }

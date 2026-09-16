@@ -34,6 +34,9 @@ pub fn project_history(
             };
             let mut message = message.clone();
             message.strip_bound_reasoning();
+            if message.is_content_free() {
+                continue;
+            }
             result.push((*sequence, message));
         }
         checkpoint.frontier
@@ -45,6 +48,12 @@ pub fn project_history(
             && record.sequence > frontier
             && let SessionEvent::MessageCommitted { message } = &record.event
         {
+            // Journals written before the commit guard existed may contain a
+            // content-free assistant message. It is unencodable, so replaying a
+            // session that holds one would fail every later request.
+            if message.is_content_free() {
+                return None;
+            }
             return Some((record.sequence, message.clone()));
         }
         None
@@ -269,6 +278,9 @@ pub fn reconstruct_model_request(
             message.strip_bound_reasoning();
         }
     }
+    // Drop unencodable history only after the pairing above, which depends on
+    // `sources` and `history` staying index-aligned.
+    history.retain(|message| !message.is_content_free());
     let request = ModelRequest {
         history,
         tail: tail.to_vec(),
@@ -375,6 +387,47 @@ mod tests {
             history_lifetime,
             purpose,
         }
+    }
+
+    #[tokio::test]
+    async fn projection_drops_content_free_assistant_messages_from_older_journals() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(directory.path()).await.unwrap();
+        let agent = AgentId::root(store.id());
+        // A journal written before the commit guard existed: an assistant message
+        // with no content at all, which no provider can encode.
+        for event in [
+            committed(text_message("feedback")),
+            committed(Message::Assistant(Vec::new())),
+            committed(text_message("continue")),
+        ] {
+            store.append(agent.clone(), event).await.unwrap();
+        }
+        let records = store.records().await;
+        let history = project_history(&records, &agent).unwrap();
+        let messages: Vec<_> = history.into_iter().map(|(_, message)| message).collect();
+        assert_eq!(
+            messages,
+            vec![text_message("feedback"), text_message("continue")],
+        );
+        // Reasoning that still carries replay state is content-bearing and kept.
+        let replay = ReplayEnvelope {
+            version: 1,
+            protocol: "anthropic".into(),
+            model: "model".into(),
+            scope: "scope".into(),
+            payload: json!({"type":"thinking","thinking":"p","signature":"s"}),
+            conversation_bound: false,
+        };
+        let signed = AssistantItem::reasoning("thought", 0, "", Some(replay));
+        let message = Message::Assistant(vec![signed]);
+        store
+            .append(agent.clone(), committed(message.clone()))
+            .await
+            .unwrap();
+        let records = store.records().await;
+        let history = project_history(&records, &agent).unwrap();
+        assert_eq!(history.last().map(|(_, message)| message), Some(&message));
     }
 
     #[tokio::test]

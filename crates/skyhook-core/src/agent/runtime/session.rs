@@ -137,6 +137,29 @@ impl SessionHandle {
     /// This deliberately does not enqueue a root request while a parent is still
     /// waiting on those children; ordinary completion delivery wakes it later.
     pub async fn continue_turn(&self) -> Result<String, HarnessError> {
+        let outcome = self.continue_turn_with(ContinueOptions::default()).await?;
+        Ok(outcome.answer.unwrap_or_default())
+    }
+
+    /// Continue a failed or interrupted turn, optionally on another model profile.
+    /// A refusal is deterministic for a given request, so continuing one usually
+    /// requires a different model to make progress.
+    pub async fn continue_turn_with(
+        &self,
+        options: ContinueOptions,
+    ) -> Result<ContinueOutcome, HarnessError> {
+        if let Some(model) = &options.model
+            && !self.runtime.harness.model_profiles.contains_key(model)
+        {
+            return Err(HarnessError::UnknownModelProfile(model.clone()));
+        }
+        self.continue_turn_inner(options.model).await
+    }
+
+    async fn continue_turn_inner(
+        &self,
+        model: Option<String>,
+    ) -> Result<ContinueOutcome, HarnessError> {
         // Interrupt requests cancel model futures before their owning job has
         // finished journaling. An immediate resume must not miss those children.
         let interrupted = self
@@ -161,15 +184,27 @@ impl SessionHandle {
                 .get(&self.root),
             Some(crate::agent::AgentActivity::Failed(_) | crate::agent::AgentActivity::Interrupted)
         );
-        self.runtime.jobs.continue_resumable_children().await?;
+        let children_resumed = self.runtime.jobs.continue_resumable_children().await?;
         if root_retryable {
             // An independently failed root has no live wait to preserve; continue
             // it after scheduling descendant recovery.
-            return self.submit(Vec::new(), None).await;
+            let model_applied = model.is_some();
+            let answer = self.submit(Vec::new(), model).await?;
+            return Ok(ContinueOutcome {
+                answer: Some(answer),
+                children_resumed,
+                model_applied,
+            });
         }
         // Child-only recovery deliberately leaves a live/waiting root request
         // untouched. Its normal delivery path observes the replacement result.
-        Ok(String::new())
+        // A model change cannot apply here: only a continued root turn adopts one,
+        // so report it as unapplied rather than dropping it silently.
+        Ok(ContinueOutcome {
+            answer: None,
+            children_resumed,
+            model_applied: false,
+        })
     }
 
     /// Execute a JavaScript workflow through the session's registered `script` tool.

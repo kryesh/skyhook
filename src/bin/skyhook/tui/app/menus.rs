@@ -452,10 +452,45 @@ impl App {
                     Some(AgentActivity::Failed(_) | AgentActivity::Interrupted),
                 );
                 if owns_operation { self.operation = true; }
+                // A pending model choice is otherwise captured only by a submitted
+                // message. Forward it here too: a refusal repeats deterministically
+                // on the same model, so "swap then continue" must actually swap.
+                let active = self
+                    .projection
+                    .agents
+                    .iter()
+                    .find(|agent| &agent.id == self.root_agent())
+                    .map(|agent| agent.model.clone());
+                let model = (active.as_ref() != Some(&self.model)).then(|| self.model.clone());
                 let tx = self.tx.clone();
                 let notices = self.root_notifier();
+                let requested_model = model.clone();
                 tokio::spawn(async move {
-                    let result = session.continue_turn().await.map(|_| ()).map_err(|e| e.to_string());
+                    let outcome = session
+                        .continue_turn_with(skyhook::agent::ContinueOptions { model })
+                        .await;
+                    let result = match &outcome {
+                        // Only a continued root turn adopts a model change, and the
+                        // gate above admits historical failures too, so report what
+                        // actually happened rather than appearing to have retried.
+                        Ok(outcome) if outcome.is_empty() => {
+                            notices.send(
+                                "Nothing to continue: no retained turn is failed or interrupted"
+                                    .to_owned(),
+                            );
+                            Ok(())
+                        }
+                        Ok(outcome) => {
+                            if requested_model.is_some() && !outcome.model_applied {
+                                notices.send(format!(
+                                    "Continued {} child agent(s) on their own model; a model change applies to the root turn only",
+                                    outcome.children_resumed,
+                                ));
+                            }
+                            Ok(())
+                        }
+                        Err(error) => Err(error.to_string()),
+                    };
                     if owns_operation {
                         let _ = tx.send(Work::Done { session: session.id(), result });
                     } else if let Err(error) = result {
@@ -545,7 +580,7 @@ impl App {
                 "Footer: session output · total input(uncached) · estimated context (current/capacity)\n",
                 "Context belongs to the selected agent and includes system, tools and runtime state.\n",
                 "Messages always go to skyhook, including while viewing a child.\n",
-                "Model changes apply from the next submitted message. Instruction changes apply to new sessions.\n",
+                "Model changes apply from the next submitted message, or from continuing a failed root turn. Instruction changes apply to new sessions.\n",
                 "Mouse: click agent or tool, scroll, drag text then copy.\n",
                 "The workspace and session ID are plain text; use terminal selection to copy them.\n",
                 "Copy message uses the terminal clipboard (OSC 52).",

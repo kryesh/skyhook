@@ -22,6 +22,26 @@ pub enum UserContent {
 }
 
 impl Message {
+    /// An assistant message that yields no content blocks at all, and so cannot be
+    /// encoded into a later request: Anthropic rejects it outright, and Chat/Responses
+    /// drop it silently. It must never reach the append-only journal, because a
+    /// committed one makes every subsequent request fail.
+    ///
+    /// Emptiness here is structural, never a judgement about text. An empty or
+    /// whitespace-only text block is content: providers legitimately emit one
+    /// alongside tool calls on a non-final turn, and it replays without complaint.
+    /// Reasoning is content whenever it carries replay state, or a block that an
+    /// encoder may render.
+    #[must_use]
+    pub fn is_content_free(&self) -> bool {
+        match self {
+            Self::Assistant(items) => items
+                .iter()
+                .all(|item| item.blocks.is_empty() && item.replay.is_none()),
+            Self::User(_) | Self::Tool(_) => false,
+        }
+    }
+
     /// Drop replay bound to the conversation that produced it, keeping display text. Changing
     /// that conversation, as compaction does, invalidates such replay; other replay is kept.
     pub fn strip_bound_reasoning(&mut self) {
@@ -323,6 +343,70 @@ pub struct ToolResult {
     pub images: Vec<ImageRef>,
     #[serde(default)]
     pub is_error: bool,
+}
+
+#[cfg(test)]
+mod content_free_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn envelope() -> ReplayEnvelope {
+        ReplayEnvelope {
+            version: 1,
+            protocol: "anthropic".into(),
+            model: "model".into(),
+            scope: "scope".into(),
+            payload: json!({"type":"thinking","thinking":"private","signature":"signed"}),
+            conversation_bound: true,
+        }
+    }
+
+    /// An item whose blocks were all dropped, as a malformed decode would leave it.
+    fn blockless(kind: ItemKind, replay: Option<ReplayEnvelope>) -> AssistantItem {
+        AssistantItem {
+            id: "item".into(),
+            position: 0,
+            kind,
+            blocks: Vec::new(),
+            replay,
+        }
+    }
+
+    #[test]
+    fn content_free_means_no_blocks_at_all_not_empty_text() {
+        // The only unencodable shapes: no items, or items carrying no blocks and
+        // no replay state.
+        assert!(Message::Assistant(Vec::new()).is_content_free());
+        for kind in [ItemKind::Text, ItemKind::Reasoning, ItemKind::ToolCall] {
+            assert!(Message::Assistant(vec![blockless(kind, None)]).is_content_free());
+        }
+        // Only assistant messages can be content-free.
+        assert!(!Message::User(Vec::new()).is_content_free());
+        assert!(!Message::Tool(Vec::new()).is_content_free());
+    }
+
+    #[test]
+    fn empty_and_whitespace_text_blocks_remain_content() {
+        // Providers emit an empty or blank text block alongside tool calls on a
+        // non-final turn. Such a block encodes and replays, so it is not a failure.
+        for text in ["", " ", "\n\t "] {
+            let item = AssistantItem::text("answer", 0, text);
+            assert!(!Message::Assistant(vec![item]).is_content_free());
+        }
+        let call = ToolCall::new("call", "shell", json!({})).unwrap();
+        let non_final = vec![
+            AssistantItem::text("answer", 0, ""),
+            AssistantItem::tool_call("tool-1", 1, call),
+        ];
+        assert!(!Message::Assistant(non_final).is_content_free());
+        // Reasoning is content through a rendered block or through replay state.
+        let blank_prose = AssistantItem::reasoning("thought", 0, "   ", None);
+        assert!(!Message::Assistant(vec![blank_prose]).is_content_free());
+        let signed = blockless(ItemKind::Reasoning, Some(envelope()));
+        assert!(!Message::Assistant(vec![signed]).is_content_free());
+        let visible = AssistantItem::text("answer", 0, "hello");
+        assert!(!Message::Assistant(vec![visible]).is_content_free());
+    }
 }
 
 #[cfg(test)]

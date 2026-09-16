@@ -732,6 +732,7 @@ mod tests {
                 request,
                 attempt,
                 error: error.clone(),
+                kind: skyhook::session::ModelFailureKind::Error,
             };
             record(&mut snapshot, &agent, failed);
             let entries = render(&snapshot, &agent, false);
@@ -741,6 +742,57 @@ mod tests {
             let label = format!("Request failed · attempt {attempt}\n{error}");
             assert_eq!(failure.unwrap().text(), label);
         }
+    }
+
+    #[test]
+    fn refusals_reach_the_transcript_as_errors_through_the_real_projection() {
+        // Guards the journal-to-card wiring: rendering a refusal as an ordinary
+        // failure would restore the silent-failure UX this classification exists
+        // to prevent.
+        let mut snapshot = ObservationSnapshot::default();
+        let agent = root(1);
+        let refused_request = request(&mut snapshot, &agent, None);
+        let error = "the model declined to respond: content filter; \
+                     the response contained no content"
+            .to_string();
+        let refused = SessionEvent::ModelFailed {
+            request: refused_request,
+            attempt: 1,
+            error: error.clone(),
+            kind: skyhook::session::ModelFailureKind::Refusal,
+        };
+        record(&mut snapshot, &agent, refused);
+        let entries = render(&snapshot, &agent, false);
+        let card = entries
+            .iter()
+            .find(|entry| entry.key() == &EntryKey::Retry(refused_request))
+            .expect("a refusal is presented in the conversation");
+        assert_eq!(card.surface, Surface::Error);
+        let mut lines = card.text().lines();
+        assert_eq!(lines.next(), Some("Model declined to respond · attempt 1"));
+        assert_eq!(lines.next(), Some(error.as_str()));
+        assert_eq!(lines.next(), Some(super::super::retry::REFUSAL_HINT));
+        assert_eq!(lines.next(), None);
+        // An ordinary failure keeps the muted presentation and gains no hint.
+        let mut snapshot = ObservationSnapshot::default();
+        let failed_request = request(&mut snapshot, &agent, None);
+        let failed = SessionEvent::ModelFailed {
+            request: failed_request,
+            attempt: 1,
+            error: "Protocol: rejected".to_owned(),
+            kind: skyhook::session::ModelFailureKind::Error,
+        };
+        record(&mut snapshot, &agent, failed);
+        let entries = render(&snapshot, &agent, false);
+        let card = entries
+            .iter()
+            .find(|entry| entry.key() == &EntryKey::Retry(failed_request))
+            .expect("an ordinary failure is still presented");
+        assert_eq!(card.surface, Surface::Status);
+        assert_eq!(
+            card.text(),
+            "Request failed · attempt 1\nProtocol: rejected"
+        );
     }
 
     #[test]
@@ -755,6 +807,7 @@ mod tests {
             request: failed,
             attempt: 1,
             error,
+            kind: skyhook::session::ModelFailureKind::Error,
         };
         record(&mut snapshot, &agent, event);
         let retry = request(&mut snapshot, &agent, context);
@@ -853,6 +906,7 @@ mod tests {
                 request,
                 attempt: 1,
                 error: error.clone(),
+                kind: skyhook::session::ModelFailureKind::Error,
             };
             record(&mut snapshot, &agent, failed);
             let scheduled = SessionEvent::ModelRecoveryScheduled {

@@ -9,7 +9,7 @@ use skyhook::execution::ExecutionLocation;
 use skyhook::identity::{AgentId, JobId};
 use skyhook::job::{JobRole, JobState};
 use skyhook::provider::protocol::{Message, Usage};
-use skyhook::session::{ModelPurpose, SessionEvent};
+use skyhook::session::{ModelFailureKind, ModelPurpose, SessionEvent};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -362,10 +362,14 @@ impl Projection {
                     request,
                     attempt,
                     error,
+                    kind,
                 } => {
                     let info = self.requests.entry(*request).or_default();
                     info.failed = true;
-                    info.retry = Some(RetryState::failed(*attempt, error));
+                    info.retry = Some(match kind {
+                        ModelFailureKind::Refusal => RetryState::refused(*attempt, error),
+                        ModelFailureKind::Error => RetryState::failed(*attempt, error),
+                    });
                     info.finished_millis.get_or_insert(record.timestamp_millis);
                 }
                 SessionEvent::ModelAttemptStarted { request, attempt } => {

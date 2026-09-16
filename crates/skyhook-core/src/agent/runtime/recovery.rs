@@ -63,6 +63,29 @@ impl SessionRuntime {
         usage: Usage,
         error: String,
     ) -> Result<(), HarnessError> {
+        self.record_model_outcome(
+            agent,
+            request,
+            attempt,
+            usage,
+            error,
+            crate::session::ModelFailureKind::Error,
+        )
+        .await
+    }
+
+    /// Record a failed attempt with its classification. A refusal is journaled the
+    /// same way as any other failure so hosts render and resume it identically,
+    /// but its kind keeps it out of automatic recovery.
+    pub(super) async fn record_model_outcome(
+        &self,
+        agent: &AgentId,
+        request: u64,
+        attempt: u64,
+        usage: Usage,
+        error: String,
+        kind: crate::session::ModelFailureKind,
+    ) -> Result<(), HarnessError> {
         if usage != Usage::default() {
             self.record_model_usage(agent, request, usage).await?;
         }
@@ -73,6 +96,27 @@ impl SessionRuntime {
                     request,
                     attempt,
                     error,
+                    kind,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Journal the terminal stop reason of a decoded response so an audit can tell
+    /// an ordinary end of turn from a truncation, refusal, or abort.
+    pub(super) async fn record_response_completed(
+        &self,
+        agent: &AgentId,
+        request: u64,
+        stop_reason: crate::provider::protocol::StopReason,
+    ) -> Result<(), HarnessError> {
+        self.store
+            .append(
+                agent.clone(),
+                SessionEvent::ResponseCompleted {
+                    request,
+                    stop_reason,
                 },
             )
             .await?;

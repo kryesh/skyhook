@@ -4,7 +4,7 @@ use super::native::validate_thinking;
 use crate::media::AttachmentRef;
 use crate::provider::{
     ProviderError,
-    protocol::{BlockContent, HistoryLifetime, ItemKind, Message, ModelRequest, UserContent},
+    protocol::{BlockContent, HistoryLifetime, Message, ModelRequest, UserContent},
 };
 use serde_json::{Value, json};
 
@@ -143,6 +143,10 @@ fn push_message(
                 }
                 for block in &item.blocks {
                     match &block.content {
+                        // A blank block carries nothing and is not universally
+                        // accepted (a trailing one is a prefill error), so it is
+                        // dropped rather than replayed.
+                        BlockContent::Text { text } if text.trim().is_empty() => {}
                         BlockContent::Text { text } => {
                             blocks.push(json!({"type":"text", "text":text}))
                         }
@@ -173,10 +177,12 @@ fn push_message(
         }
     };
     if content.is_empty() {
-        // Empty foreign redacted reasoning contributes no replayable content.
-        if matches!(message, Message::Assistant(items) if !items.is_empty()
-            && items.iter().all(|item| item.kind == ItemKind::Reasoning))
-        {
+        // An assistant turn that encodes to nothing is skipped, never rejected.
+        // Rejecting is unsafe here: history is append-only and InvalidRequest has
+        // no recovery, so a single such message would fail every later request in
+        // the session permanently. Chat and Responses already drop these silently;
+        // the runtime's pre-commit guard is what catches the underlying bug.
+        if matches!(message, Message::Assistant(_)) {
             return Ok(());
         }
         return Err(invalid(
@@ -226,7 +232,7 @@ mod tests {
     use crate::{
         media::{AttachmentRef, BlobRef, ImageFormat, ImageRef, TextRef},
         provider::protocol::{
-            AssistantBlock, AssistantItem, BlockContent, HistoryLifetime, ReplayEnvelope,
+            AssistantBlock, AssistantItem, BlockContent, HistoryLifetime, ItemKind, ReplayEnvelope,
             ResponseSchema, SystemSegment, ToolCall, ToolDefinition, ToolResult,
         },
     };
@@ -243,8 +249,12 @@ mod tests {
     }
 
     fn continue_after(item: AssistantItem) -> Vec<Message> {
+        continue_after_items(vec![item])
+    }
+
+    fn continue_after_items(items: Vec<AssistantItem>) -> Vec<Message> {
         vec![
-            Message::Assistant(vec![item]),
+            Message::Assistant(items),
             Message::User(vec![text("continue")]),
         ]
     }
@@ -446,6 +456,28 @@ mod tests {
         let item = AssistantItem::reasoning("r", 0, "", Some(unsigned));
         request.history = vec![Message::Assistant(vec![item])];
         assert!(encode(&request).is_err());
+    }
+
+    #[test]
+    fn blank_text_is_skipped_and_a_message_encoding_to_nothing_is_dropped() {
+        let mut request = request();
+        // A blank block is dropped, but its siblings still encode.
+        let call = ToolCall::new("call", "shell", json!({})).unwrap();
+        request.history = continue_after_items(vec![
+            AssistantItem::text("blank", 0, "   "),
+            AssistantItem::tool_call("t", 1, call),
+        ]);
+        let body = encode(&request).unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "tool_use");
+        // A turn that encodes to nothing is skipped, never rejected: rejecting it
+        // would fail every later request in an append-only session forever.
+        for text in ["", "   "] {
+            request.history = continue_after(AssistantItem::text("blank", 0, text));
+            let body = encode(&request).unwrap();
+            assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+        }
     }
 
     #[test]

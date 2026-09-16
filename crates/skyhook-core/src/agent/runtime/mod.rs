@@ -103,6 +103,35 @@ pub struct SessionHandle {
     root_tx: AgentSender,
 }
 
+/// What a continue attempt actually did. A child-only continue leaves a live or
+/// waiting root untouched, so a caller cannot assume the root turn ran.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContinueOutcome {
+    /// Answer produced when the root turn itself was continued.
+    pub answer: Option<String>,
+    /// Retained child agents restarted by this call.
+    pub children_resumed: usize,
+    /// Whether a requested model change was applied. Only the continued root turn
+    /// can adopt one; resumed children keep their own model.
+    pub model_applied: bool,
+}
+
+impl ContinueOutcome {
+    /// True when there was nothing to continue.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.answer.is_none() && self.children_resumed == 0
+    }
+}
+
+/// Options for continuing a failed or interrupted turn without new input.
+#[derive(Clone, Debug, Default)]
+pub struct ContinueOptions {
+    /// Model profile to apply before continuing. Omitted retains the agent's active
+    /// model, which for a refusal would deterministically refuse again.
+    pub model: Option<String>,
+}
+
 /// Options captured when a user submits a message, including queued messages.
 #[derive(Clone, Debug, Default)]
 pub struct PromptOptions {

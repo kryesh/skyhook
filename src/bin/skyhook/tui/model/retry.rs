@@ -13,6 +13,12 @@ pub(super) enum RetryState {
         attempt: u64,
         error: String,
     },
+    /// The model declined to answer. Terminal for this request and never retried
+    /// automatically, so it is presented as an error rather than a pending retry.
+    Refused {
+        attempt: u64,
+        error: String,
+    },
     Scheduled {
         attempt: u64,
         max_attempts: Option<u64>,
@@ -37,6 +43,13 @@ impl RetryState {
         }
     }
 
+    pub(super) fn refused(attempt: u64, error: &str) -> Self {
+        Self::Refused {
+            attempt,
+            error: error.to_owned(),
+        }
+    }
+
     pub(super) fn scheduled(
         attempt: u64,
         max_attempts: Option<u64>,
@@ -51,6 +64,10 @@ impl RetryState {
         }
     }
 }
+
+/// Refusals are deterministic for a given request, so a plain retry repeats it.
+pub(super) const REFUSAL_HINT: &str =
+    "Choose another model with /model, then continue with /retry.";
 
 const DIAGNOSTIC_CHAR_LIMIT: usize = 240;
 const DIAGNOSTIC_ELLIPSIS_BUDGET: usize = DIAGNOSTIC_CHAR_LIMIT - 1;
@@ -86,9 +103,12 @@ pub(super) fn retry_entry(
     let state = info.retry.as_ref()?;
     // Started attempts have no diagnostic; scheduled retries always have one,
     // even when their retry budget is unlimited.
+    let refused = matches!(state, RetryState::Refused { .. });
     let (attempt, max_attempts, delay_millis, error) = match state {
         RetryState::Started { .. } => return None,
-        RetryState::Failed { attempt, error } => (*attempt, None, None, error),
+        RetryState::Failed { attempt, error } | RetryState::Refused { attempt, error } => {
+            (*attempt, None, None, error)
+        }
         RetryState::Scheduled {
             attempt,
             max_attempts,
@@ -104,7 +124,9 @@ pub(super) fn retry_entry(
     let running = projection.active_request.get(agent) == Some(&request)
         && !interrupted
         && delay_millis.is_some();
-    let label = if interrupted {
+    let label = if refused {
+        "Model declined to respond"
+    } else if interrupted {
         "Interrupted"
     } else if delay_millis.is_some() {
         "Retrying"
@@ -142,7 +164,17 @@ pub(super) fn retry_entry(
             }
         }
     }
-    let mut entry = Entry::new(EntryKey::Retry(request), text, Surface::Status);
+    if refused {
+        // Last line, after any partial response above, so the one actionable
+        // instruction is not buried. The same request refuses again unchanged.
+        text.push_str(&format!("\n{REFUSAL_HINT}"));
+    }
+    let surface = if refused {
+        Surface::Error
+    } else {
+        Surface::Status
+    };
+    let mut entry = Entry::new(EntryKey::Retry(request), text, surface);
     entry.running = running;
     Some(entry)
 }
@@ -205,5 +237,34 @@ mod tests {
             "Retrying · attempt 3 of 4 · retry delay 100 ms\nfailure"
         );
         assert!(!entry.running);
+    }
+
+    #[test]
+    fn refusals_render_as_errors_with_a_model_swap_hint() {
+        use skyhook::identity::SessionId;
+        let detail =
+            "the model declined to respond: content filter; the response contained no content";
+        let agent = AgentId::root(SessionId::from_bytes([1; 16]));
+        let mut projection = Projection::default();
+        let snapshot = ObservationSnapshot::default();
+        let state = RetryState::refused(1, detail);
+        assert!(state.has_error());
+        projection.requests.entry(4).or_default().retry = Some(state);
+        let entry = retry_entry(&snapshot, &projection, &agent, 4, false).unwrap();
+        let mut lines = entry.text().lines();
+        assert_eq!(lines.next(), Some("Model declined to respond · attempt 1"));
+        assert_eq!(lines.next(), Some(detail));
+        assert_eq!(lines.next(), Some(REFUSAL_HINT));
+        assert_eq!(lines.next(), None);
+        assert!(entry.text().ends_with(REFUSAL_HINT));
+        assert_eq!(entry.surface, Surface::Error);
+        // Refusals are terminal for the request, so nothing is pending.
+        assert!(!entry.running);
+        // Ordinary failures stay on the status surface without the swap hint.
+        projection.requests.entry(4).or_default().retry = Some(RetryState::failed(1, "boom"));
+        let entry = retry_entry(&snapshot, &projection, &agent, 4, false).unwrap();
+        assert_eq!(entry.text(), "Request failed · attempt 1\nboom");
+        assert_eq!(entry.surface, Surface::Status);
+        assert!(!entry.text().contains(REFUSAL_HINT));
     }
 }

@@ -641,6 +641,7 @@ mod tests {
                 request,
                 attempt,
                 error: error.clone(),
+                kind: skyhook::session::ModelFailureKind::Error,
             };
             assert!(commit((&mut snapshot, &mut projection), &mut cache, failed).reset);
             assert_eq!(cache.entries().len(), 1);
@@ -682,6 +683,7 @@ mod tests {
             request,
             attempt: 3,
             error,
+            kind: skyhook::session::ModelFailureKind::Error,
         };
         commit((&mut snapshot, &mut projection), &mut cache, failed);
         assert_eq!(cache.entries().len(), 2);

@@ -127,6 +127,13 @@ impl ObservationSnapshot {
                         self.activity
                             .insert(record.agent.clone(), AgentActivity::Interrupted);
                     }
+                    SessionEvent::AgentFailed { error } => {
+                        // Replaying this re-arms the host's retry affordance, so a
+                        // resumed session can continue a failed turn instead of
+                        // appearing idle. A later attempt/completion overrides it.
+                        self.activity
+                            .insert(record.agent.clone(), AgentActivity::Failed(error.clone()));
+                    }
                     SessionEvent::ModelFailed { request, error, .. } => {
                         let response = self
                             .responses
@@ -268,6 +275,47 @@ mod tests {
         provider::protocol::{BlockKind, ContentDelta, ItemKind, Message, ResponseEvent},
     };
 
+    #[test]
+    fn replayed_agent_failure_re_arms_the_retry_gate_and_later_work_clears_it() {
+        use crate::session::{EventRecord, SessionEvent};
+        let id = SessionId::from_bytes([3; 16]);
+        let agent = AgentId::root(id);
+        let record = |sequence: u64, event: SessionEvent| EventRecord {
+            id: crate::identity::EventId::from_bytes([sequence as u8; 16]),
+            queue_attempt: None,
+            version: crate::session::SESSION_FORMAT_VERSION,
+            sequence,
+            timestamp_millis: 0,
+            agent: agent.clone(),
+            event,
+        };
+        let failure = SessionEvent::AgentFailed {
+            error: "the model declined to respond: content filter".into(),
+        };
+        // A reopened session must observe the failure, or its retry affordance
+        // reports nothing to continue.
+        let records = vec![record(1, failure.clone())];
+        let snapshot = RuntimeEvents::new(&records).observe().snapshot;
+        let activity = snapshot.activity.get(&agent).cloned();
+        assert!(matches!(
+            activity,
+            Some(AgentActivity::Failed(error)) if error.contains("declined to respond")
+        ));
+        // A later attempt supersedes it, so a continued turn is not stuck failed.
+        let records = vec![
+            record(1, failure),
+            record(
+                2,
+                SessionEvent::ModelAttemptStarted {
+                    request: 1,
+                    attempt: 1,
+                },
+            ),
+        ];
+        let snapshot = RuntimeEvents::new(&records).observe().snapshot;
+        assert_eq!(snapshot.activity.get(&agent), Some(&AgentActivity::Working));
+    }
+
     fn emit(hub: &RuntimeEvents, agent: &AgentId, event: ResponseEvent) {
         let (agent, request) = (agent.clone(), 7);
         hub.send(RuntimeEvent::ResponseEvent {
@@ -381,6 +429,7 @@ mod tests {
             request: 7,
             attempt: 1,
             error: "connection lost".into(),
+            kind: crate::session::ModelFailureKind::Error,
         };
         record(&hub, &agent, 8, failed);
         let found = &hub.observe().snapshot.activity[&agent];

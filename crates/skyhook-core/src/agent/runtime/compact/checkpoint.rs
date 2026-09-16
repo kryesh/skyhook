@@ -99,6 +99,11 @@ impl SessionRuntime {
             .history
             .iter_mut()
             .for_each(Message::strip_bound_reasoning);
+        // Stripping can empty a message that carried only bound replay. Filter
+        // after stripping, as projection does, so no unencodable message is sent.
+        summary_request
+            .history
+            .retain(|message| !message.is_content_free());
         summary_request.tail = summary_tail;
         summary_request.tail.push(directive);
         // The checkpoint replaces this history once the summary completes.
@@ -237,12 +242,15 @@ impl SessionRuntime {
         }
         let mut compacted = input.clone();
         compacted.history = vec![message.clone()];
-        // Estimate what projection sends: retained bound reasoning is dropped.
-        compacted.history.extend(retained.iter().map(|source| {
-            let mut message = source.message().clone();
-            message.strip_bound_reasoning();
-            message
-        }));
+        // Estimate what projection sends: retained bound reasoning is dropped,
+        // and a message left content-free by that is dropped with it.
+        compacted
+            .history
+            .extend(retained.iter().filter_map(|source| {
+                let mut message = source.message().clone();
+                message.strip_bound_reasoning();
+                (!message.is_content_free()).then_some(message)
+            }));
         if !compacted.tail.is_empty() {
             let runtime = prompt::runtime_state_with_todos(
                 &self.jobs,

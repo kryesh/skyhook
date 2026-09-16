@@ -286,6 +286,7 @@ mod tests {
                 request: 9,
                 attempt: 1,
                 error: "failed".into(),
+                kind: skyhook::session::ModelFailureKind::Error,
             },
             SessionEvent::Usage {
                 request: Some(9),

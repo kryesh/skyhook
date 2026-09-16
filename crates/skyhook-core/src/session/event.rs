@@ -13,7 +13,7 @@ use crate::{
     identity::{AgentId, EventId, JobId, QueueAttemptId, SessionId},
     job::{JobRole, JobState},
     media::ImageRef,
-    provider::protocol::{HistoryLifetime, Message, ModelRequest, Usage, UserContent},
+    provider::protocol::{HistoryLifetime, Message, ModelRequest, StopReason, Usage, UserContent},
     target::TargetDefinition,
 };
 
@@ -137,6 +137,18 @@ pub enum SessionEvent {
         request: u64,
         attempt: u64,
         error: String,
+        /// Why the request failed. Absent in journals written before this field,
+        /// which are all ordinary errors.
+        #[serde(default)]
+        kind: ModelFailureKind,
+    },
+    /// Terminal stop reason of a response that completed the turn. Refusals and
+    /// aborts fail the turn before this point and are recorded by `ModelFailed`
+    /// instead, so this distinguishes an ordinary end of turn from truncation or
+    /// a stop sequence.
+    ResponseCompleted {
+        request: u64,
+        stop_reason: StopReason,
     },
     /// A failed model request will be retried after a recovery delay.
     /// This is host-facing status, not model-visible conversation history.
@@ -210,6 +222,24 @@ pub enum SessionEvent {
     },
     AgentCompleted,
     AgentInterrupted,
+    /// A turn ended in a terminal failure that retains the agent for an external
+    /// retry. Journaled so a resumed session re-arms its retry affordance instead
+    /// of appearing idle; the agent itself never retries on this signal.
+    AgentFailed {
+        error: String,
+    },
+}
+
+/// Classification of a failed model request.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFailureKind {
+    /// Transport, protocol, or validation failure.
+    #[default]
+    Error,
+    /// The model declined to answer. Deterministic for a given request, so it is
+    /// never retried automatically; only a parent agent or a human may retry it.
+    Refusal,
 }
 
 impl SessionEvent {
@@ -356,6 +386,7 @@ mod tests {
             request: 7,
             attempt: 1,
             error: "connection lost".into(),
+            kind: ModelFailureKind::Error,
         };
         assert_eq!(failure, expected);
         let scheduled = |attempt, max_attempts, delay_millis, error: &str| {

@@ -30,8 +30,8 @@ pub(crate) use template::ModelRequestTemplate;
 
 pub(crate) use event::is_safe_artifact_path;
 pub use event::{
-    CompactionCheckpoint, EventRecord, ModelCallOrigin, ModelPurpose, QueueIntent, QueueSettlement,
-    SessionEvent,
+    CompactionCheckpoint, EventRecord, ModelCallOrigin, ModelFailureKind, ModelPurpose,
+    QueueIntent, QueueSettlement, SessionEvent,
 };
 pub use queue::QueueIntentRecord;
 pub use request::{project_history, reconstruct_model_request};

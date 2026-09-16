@@ -44,6 +44,11 @@ pub enum HarnessError {
     Agent(String),
     #[error("provider returned no assistant content")]
     EmptyResponse,
+    /// The model declined to answer. Deterministic for a given request, so the
+    /// runtime never retries it: only a parent agent or a human may retry,
+    /// optionally on another model.
+    #[error("the model declined to respond: {0}")]
+    Refused(String),
     #[error("provider aborted response")]
     ProviderAborted,
     #[error("agent turn was interrupted")]
