@@ -60,8 +60,9 @@ pub(super) fn retained_sources<'a>(
         total = total.saturating_add(tokens);
         start = index;
     }
-    if start < visible.len() && matches!(visible[start].1, Message::Tool(_)) {
-        start = start.saturating_sub(1);
+    // Per-call results follow their assistant call; keep the whole exchange.
+    while start < visible.len() && start > 0 && matches!(visible[start].1, Message::Tool(_)) {
+        start -= 1;
     }
     retained.extend(visible[start..].iter().map(|(sequence, _)| *sequence));
     for origin in origins {
@@ -83,11 +84,22 @@ pub(super) fn retained_sources<'a>(
                 "active job creator call is missing".into(),
             ));
         }
-        let Some((result_sequence, Message::Tool(results))) = originals.get(index + 1) else {
+        let exchange: Vec<_> = originals[index + 1..]
+            .iter()
+            .take_while(|(_, message)| matches!(message, Message::Tool(_)))
+            .collect();
+        if exchange.is_empty() {
             return Err(HarnessError::Compaction(
                 "active job creator has no complete result exchange".into(),
             ));
-        };
+        }
+        let results: Vec<_> = exchange
+            .iter()
+            .flat_map(|(_, message)| match message {
+                Message::Tool(results) => results.as_slice(),
+                _ => &[],
+            })
+            .collect();
         for call in blocks
             .iter()
             .flat_map(|item| &item.blocks)
@@ -103,7 +115,7 @@ pub(super) fn retained_sources<'a>(
             }
         }
         retained.insert(origin.message);
-        retained.insert(*result_sequence);
+        retained.extend(exchange.iter().map(|(sequence, _)| *sequence));
     }
     let mut sources: Vec<_> = originals
         .into_iter()
@@ -183,7 +195,6 @@ mod tests {
             .map(|(i, message)| EventRecord {
                 id: crate::identity::EventId::generate().unwrap(),
                 queue_attempt: None,
-                version: 1,
                 sequence: i as u64 + 1,
                 timestamp_millis: 0,
                 agent: agent.clone(),

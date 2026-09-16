@@ -87,7 +87,7 @@ mod tests {
                 .await
                 .unwrap();
             Self {
-                agent: AgentId::root(store.id()),
+                agent: crate::session::fixture::started(&store, root.path()).await,
                 jobs: JobManager::new(store.clone()),
                 store,
                 root,

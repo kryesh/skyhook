@@ -316,12 +316,7 @@ mod tests {
         tool::policy::PolicyDecision,
     };
 
-    const BOUNDARIES: [AppendBoundary; 4] = [
-        AppendBoundary::Write,
-        AppendBoundary::Flush,
-        AppendBoundary::Sync,
-        AppendBoundary::Publication,
-    ];
+    const BOUNDARIES: [AppendBoundary; 2] = [AppendBoundary::Write, AppendBoundary::Publication];
 
     /// Replays scripted decisions, then allows; empty allowances adopt the proposed grants.
     fn recording(decisions: impl IntoIterator<Item = PolicyDecision>) -> Arc<RecordingPolicy> {
@@ -435,11 +430,8 @@ mod tests {
     }
 
     async fn ephemeral_store() -> (tempfile::TempDir, SessionStore) {
-        let directory = tempfile::tempdir().unwrap();
-        let store = SessionStore::create_ephemeral(directory.path())
-            .await
-            .unwrap();
-        (directory, store)
+        let session = crate::session::fixture::MemorySession::new().await;
+        (session.root, session.store)
     }
 
     fn subject() -> AuthorizationSubject {

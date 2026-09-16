@@ -67,7 +67,7 @@ impl TokenMeter {
             else {
                 continue;
             };
-            let same_template = records.iter().any(|record| record.sequence == *context && matches!(&record.event, SessionEvent::ModelContext { template: original, .. } if original == template));
+            let same_template = records.iter().any(|record| record.sequence == *context && matches!(&record.event, SessionEvent::ModelContext { context } if context.template(agent) == *template));
             if same_template
                 && let Ok((_, request)) =
                     crate::session::reconstruct_model_request(records, *request)
@@ -111,7 +111,8 @@ impl SessionRuntime {
         let mut model_attempt = 0;
         for attempt in 1..=MAX_COMPACTION_ATTEMPTS {
             let mut request_sequence = None;
-            match self
+            let attempted = model_attempt;
+            let result = self
                 .compact_inner(
                     turn,
                     provider,
@@ -124,8 +125,10 @@ impl SessionRuntime {
                     &mut request_sequence,
                     &mut launches,
                 )
-                .await
-            {
+                .await;
+            // Only an attempt of this summary request belongs to its outcome.
+            let summary_attempt = (model_attempt > attempted).then_some(model_attempt);
+            match result {
                 Ok(()) => return Ok(()),
                 Err(error) => {
                     self.store
@@ -133,6 +136,7 @@ impl SessionRuntime {
                             turn.agent.clone(),
                             SessionEvent::CompactionFailed {
                                 request: request_sequence,
+                                attempt: request_sequence.and(summary_attempt),
                                 error: format!(
                                     "attempt {attempt}/{MAX_COMPACTION_ATTEMPTS}: {error}"
                                 ),
@@ -374,10 +378,14 @@ mod tests {
         ) -> Result<(), HarnessError> {
             let runtime = &self.session.runtime;
             let agent = &self.session.root;
-            let context = SessionEvent::ModelContext {
-                provider: "test".into(),
-                template: self.template.clone(),
-            };
+            // Reuse the agent's journaled context, as a normal request would.
+            let records = runtime.store.records().await;
+            let context = records
+                .iter()
+                .rev()
+                .find(|record| matches!(record.event, SessionEvent::ModelContext { .. }))
+                .map(|record| record.event.clone())
+                .expect("the fixture prompt journaled a model context");
             let store = &runtime.store;
             let context = store.append(agent.clone(), context).await.unwrap().sequence;
             let mut input = self.template.clone();

@@ -2,8 +2,7 @@
 use super::{tests::fixture, *};
 
 fn capture(manager: &JobManager, id: JobId, field: &str, kind: CaptureKind, bytes: &[u8]) {
-    let path = register_capture(&manager.output_directory(id), field, kind).unwrap();
-    std::fs::write(path, bytes).unwrap();
+    manager.output(id).test_capture(field, kind, bytes);
 }
 
 async fn hydrated(manager: &JobManager, job: JobId) -> PresentedOutput {
@@ -108,11 +107,9 @@ async fn automatic_hydration_retains_nested_page_continuations() {
 #[tokio::test]
 async fn automatic_hydration_embeds_page_errors_but_propagates_initial_errors() {
     let (_root, manager, job) = fixture(None).await;
-    capture(&manager, job, "/result/bad", CaptureKind::Text, b"bad");
+    // Discovery succeeds, but this page cannot decode its capture.
+    capture(&manager, job, "/result/bad", CaptureKind::Text, b"\xffbad");
     capture(&manager, job, "/result/good", CaptureKind::Text, b"good");
-    // Discovery succeeds, but this page cannot atomically publish its line index.
-    let path = field_file(&manager.output_directory(job), "/result/bad");
-    std::fs::create_dir(path.with_extension("lines.json")).unwrap();
     let output = hydrated(&manager, job).await;
     let captures = &output.view()["captures"];
     assert!(!captures[0]["output"]["error"].as_str().unwrap().is_empty());

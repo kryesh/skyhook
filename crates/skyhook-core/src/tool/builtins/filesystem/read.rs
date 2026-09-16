@@ -7,7 +7,7 @@ use tokio::fs;
 use super::super::workspace::relative_path;
 use crate::{
     bounded_io::{BoundedReadError, read_bounded},
-    job::output::{CaptureWriter, CompletedCapture, TextCaptureField},
+    job::output::{CompletedCapture, TextCaptureField},
     media::{ImageRef, MAX_IMAGE_BYTES},
     session::SessionStore,
     tool::{
@@ -110,22 +110,19 @@ async fn read_text(
     let path = path.to_owned();
     let cancellation = context.cancellation_token().child_token();
     let _cancel_on_drop = cancellation.clone().drop_guard();
-    // All filesystem operations and cleanup run in one owner. Tokio fs creation or
-    // writes in separate tasks could otherwise finish after a dropped guard's unlink.
-    let pending =
-        tokio::task::spawn_blocking(move || -> Result<Option<CaptureWriter>, ToolError> {
-            let mut input = std::fs::File::open(path)?;
-            match copy_utf8(&mut input, |text| capture.write_text(text), &cancellation)? {
-                Utf8Read::Complete => Ok(Some(capture)),
-                Utf8Read::NotUtf8 => Ok(None),
-            }
-        })
-        .await
-        .map_err(|error| ToolError::Failed(error.to_string()))??;
-    // Every write_text flushed, so finishing here is synchronous and performs no
-    // blocking IO; a dropped awaiter still discards the returned writer's file.
-    if let Some(capture) = pending {
-        Ok(TextReadOutcome::Captured(capture.finish()?))
+    // Reading, capture writes and finishing run in one blocking owner; an abandoned
+    // capture discards itself.
+    let completed = tokio::task::spawn_blocking(move || -> Result<_, ToolError> {
+        let mut input = std::fs::File::open(path)?;
+        match copy_utf8(&mut input, |text| capture.write_text(text), &cancellation)? {
+            Utf8Read::Complete => Ok(Some(capture.finish()?)),
+            Utf8Read::NotUtf8 => Ok(None),
+        }
+    })
+    .await
+    .map_err(|error| ToolError::Failed(error.to_string()))??;
+    if let Some(completed) = completed {
+        Ok(TextReadOutcome::Captured(completed))
     } else {
         Ok(TextReadOutcome::NotUtf8)
     }

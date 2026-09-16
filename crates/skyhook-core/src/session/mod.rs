@@ -1,26 +1,21 @@
-//! Versioned append-only session persistence.
+//! Session persistence in one normalized SQLite database per session.
 
 use chrono::Utc;
 use fs2::FileExt;
-use serde::Deserialize;
 use std::{
-    collections::HashMap,
     fs::OpenOptions as StdOpenOptions,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock as StdRwLock},
 };
 use thiserror::Error;
-use tokio::{
-    fs::{self, File, OpenOptions},
-    io::{AsyncWriteExt, BufWriter},
-    sync::{Mutex, broadcast, oneshot},
-};
+use tokio::sync::{Mutex, broadcast, oneshot};
 
 use crate::{
-    identity::{AgentId, EventId, JobId, QueueAttemptId, SessionId},
+    identity::{AgentId, EventId, QueueAttemptId, SessionId},
     provider::protocol::{Message, ModelRequest, UserContent},
 };
 
+mod db;
 mod event;
 mod queue;
 mod request;
@@ -28,29 +23,31 @@ mod template;
 
 pub(crate) use template::ModelRequestTemplate;
 
-pub(crate) use event::is_safe_artifact_path;
+pub(crate) use db::{CaptureExtent, CaptureRow, Presentation, SharedDb};
+pub use db::{DbError, SessionSummary};
 pub use event::{
-    CompactionCheckpoint, EventRecord, ModelCallOrigin, ModelFailureKind, ModelPurpose,
-    QueueIntent, QueueSettlement, SessionEvent,
+    CompactionCheckpoint, EventRecord, ModelCallOrigin, ModelContext, ModelFailureKind,
+    ModelPurpose, ProfileSnapshot, QueueIntent, QueueSettlement, SessionEvent,
 };
 pub use queue::QueueIntentRecord;
-pub use request::{project_history, reconstruct_model_request};
+pub use request::{merge_tool_results, project_history, reconstruct_model_request};
 
-// Version 3 binds durable random event/queue identities and immutable queue intents.
-// Earlier formats are intentionally unsupported; no migration or compatibility reader.
-pub const SESSION_FORMAT_VERSION: u16 = 3;
+/// The database schema version; earlier formats are intentionally unsupported.
+pub const SESSION_FORMAT_VERSION: i64 = db::USER_VERSION;
+const DATABASE_FILE: &str = "session.db";
+const LOCK_FILE: &str = "lock";
 
 /// Restore the agent's last applied model.
 pub fn agent_selection(records: &[EventRecord], agent: &AgentId) -> Option<String> {
     let mut selection = None;
     for record in records.iter().filter(|record| &record.agent == agent) {
         match &record.event {
-            SessionEvent::AgentStarted { model_profile, .. } => {
-                selection = Some(model_profile.clone());
+            SessionEvent::AgentStarted { profile, .. } => {
+                selection = profile.as_ref().map(|profile| profile.name.clone());
             }
-            SessionEvent::ModelChanged { model_profile, .. } => {
+            SessionEvent::ModelChanged { profile } => {
                 if let Some(model) = &mut selection {
-                    model.clone_from(model_profile);
+                    model.clone_from(&profile.name);
                 }
             }
             _ => {}
@@ -74,120 +71,10 @@ fn lock_session(directory: &Path, id: SessionId) -> Result<SessionLock, SessionE
         .truncate(false)
         .read(true)
         .write(true)
-        .open(directory.join("session.lock"))?;
+        .open(directory.join(LOCK_FILE))?;
     lock.try_lock_exclusive()
         .map_err(|_| SessionError::AlreadyOpen(id))?;
     Ok(SessionLock(lock))
-}
-
-// The writer is dropped before its lock. Durability has one authority shared by
-// append and blob import; no durable writer can exist without its session lease.
-struct DurableBackend {
-    file: BufWriter<File>,
-    _lock: SessionLock,
-}
-
-struct SessionWriter {
-    /// `None` for an ephemeral session.
-    durable: Option<DurableBackend>,
-    next_sequence: u64,
-    records: Vec<EventRecord>,
-    health: WriterHealth,
-    closed: bool,
-    #[cfg(test)]
-    fault: Option<AppendFault>,
-}
-
-impl SessionWriter {
-    /// A poisoned writer's cached records cannot resolve an uncertain attempt.
-    fn require_healthy(&self) -> Result<(), SessionError> {
-        match &self.health {
-            WriterHealth::Healthy => Ok(()),
-            WriterHealth::NeedsRecovery(recovery) => {
-                Err(SessionError::AppendUnavailable(recovery.clone()))
-            }
-        }
-    }
-
-    async fn write_record(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
-        #[cfg(test)]
-        self.at_boundary(AppendBoundary::Write).await?;
-        if let Some(backend) = &mut self.durable {
-            backend.file.write_all(bytes).await?;
-        }
-        #[cfg(test)]
-        self.at_boundary(AppendBoundary::Flush).await?;
-        if let Some(backend) = &mut self.durable {
-            backend.file.flush().await?;
-        }
-        #[cfg(test)]
-        self.at_boundary(AppendBoundary::Sync).await?;
-        if let Some(backend) = &mut self.durable {
-            backend.file.get_ref().sync_data().await?;
-        }
-        #[cfg(test)]
-        self.at_boundary(AppendBoundary::Publication).await?;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    async fn at_boundary(&mut self, boundary: AppendBoundary) -> Result<(), std::io::Error> {
-        if self
-            .fault
-            .as_ref()
-            .is_some_and(|fault| fault.boundary == boundary)
-        {
-            match self.fault.take().unwrap().action {
-                AppendFaultAction::Pause { reached, resume } => {
-                    let _ = reached.send(());
-                    let _ = resume.await;
-                }
-                AppendFaultAction::Fail => {
-                    return Err(std::io::Error::other("injected append failure"));
-                }
-                AppendFaultAction::Panic => panic!("injected accepted writer loss"),
-                AppendFaultAction::PartialWrite => {
-                    if let Some(backend) = &mut self.durable {
-                        backend.file.write_all(b"{partial").await?;
-                        backend.file.flush().await?;
-                    }
-                    return Err(std::io::Error::other("injected partial write"));
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AppendBoundary {
-    Write,
-    Flush,
-    Sync,
-    Publication,
-}
-
-#[cfg(test)]
-impl AppendBoundary {
-    pub(crate) const ALL: [Self; 4] = [Self::Write, Self::Flush, Self::Sync, Self::Publication];
-}
-
-#[cfg(test)]
-struct AppendFault {
-    boundary: AppendBoundary,
-    action: AppendFaultAction,
-}
-
-#[cfg(test)]
-enum AppendFaultAction {
-    Pause {
-        reached: oneshot::Sender<()>,
-        resume: oneshot::Receiver<()>,
-    },
-    Fail,
-    Panic,
-    PartialWrite,
 }
 
 enum WriterHealth {
@@ -195,9 +82,8 @@ enum WriterHealth {
     NeedsRecovery(AppendRecovery),
 }
 
-/// Reconciliation key for one accepted journal append. A failed receipt is not
-/// permission to resubmit: reopen/replay must resolve the exact event first.
-/// Sequence is ordering metadata and may be reused after a torn tail is repaired.
+/// Reconciliation key for one accepted append. A failed receipt is not
+/// permission to resubmit: reopening must resolve the exact event first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AppendIdentity {
     pub event: EventId,
@@ -228,7 +114,7 @@ impl std::fmt::Display for AppendRecovery {
 #[derive(Debug)]
 pub struct AcceptedAppend {
     identity: AppendIdentity,
-    committed: oneshot::Receiver<Result<EventRecord, SessionError>>,
+    committed: oneshot::Receiver<Result<Vec<EventRecord>, SessionError>>,
 }
 
 impl AcceptedAppend {
@@ -238,22 +124,272 @@ impl AcceptedAppend {
     }
 
     pub async fn committed(self) -> Result<EventRecord, SessionError> {
-        self.committed.await.unwrap_or_else(|_| {
-            Err(SessionError::AppendIndeterminate(AppendRecovery {
-                identity: self.identity,
+        let identity = self.identity;
+        match self.committed.await {
+            Ok(result) => result.and_then(|mut records| {
+                records.pop().ok_or_else(|| {
+                    SessionError::AppendIndeterminate(AppendRecovery {
+                        identity,
+                        reason: "accepted append committed no record".into(),
+                    })
+                })
+            }),
+            Err(_) => Err(SessionError::AppendIndeterminate(AppendRecovery {
+                identity,
                 reason: "accepted writer lost its receipt; recovery is required".into(),
-            }))
+            })),
+        }
+    }
+}
+
+/// Test hooks at the commit boundary of the next accepted append.
+#[cfg(test)]
+pub(crate) enum CommitFault {
+    /// Stop after acceptance, before COMMIT, until resumed.
+    Pause {
+        reached: oneshot::Sender<()>,
+        resume: oneshot::Receiver<()>,
+    },
+    /// Roll back after acceptance: nothing is durable.
+    RollBack,
+    /// Commit, then report failure: the append is durable.
+    ReportAfterCommit,
+    /// Lose the writer thread before COMMIT.
+    Panic,
+    /// Stop after COMMIT, before publication, until resumed.
+    PauseCommitted {
+        reached: oneshot::Sender<()>,
+        resume: oneshot::Receiver<()>,
+    },
+}
+
+/// Where a test pauses or fails the next accepted append.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AppendBoundary {
+    /// Accepted, before COMMIT: failure leaves nothing durable.
+    Write,
+    /// Committed, before publication: failure leaves the append durable.
+    Publication,
+}
+
+#[cfg(test)]
+impl AppendBoundary {
+    pub(crate) const ALL: [Self; 2] = [Self::Write, Self::Publication];
+}
+
+type Acceptance = oneshot::Sender<Result<Vec<AppendIdentity>, SessionError>>;
+
+/// Builds events that reference the first entry's sequence, in the same transaction.
+type Follow = Box<dyn FnOnce(u64) -> Vec<(AgentId, SessionEvent)> + Send>;
+
+struct Pending {
+    agent: AgentId,
+    queue_attempt: Option<QueueAttemptId>,
+    event: SessionEvent,
+}
+
+struct State {
+    records: Vec<EventRecord>,
+    health: WriterHealth,
+    closed: bool,
+}
+
+impl State {
+    /// A poisoned writer's cached records cannot resolve an uncertain attempt.
+    fn require_healthy(&self) -> Result<(), SessionError> {
+        match &self.health {
+            WriterHealth::Healthy => Ok(()),
+            WriterHealth::NeedsRecovery(recovery) => {
+                Err(SessionError::AppendUnavailable(recovery.clone()))
+            }
+        }
+    }
+}
+
+struct Shared {
+    id: SessionId,
+    state: StdRwLock<State>,
+    events: broadcast::Sender<EventRecord>,
+}
+
+impl Shared {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, State> {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, State> {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The only read-write connection. Operations take it FIFO and run on the
+/// blocking pool, so no tokio worker waits on fsync and a dropped caller
+/// cannot cancel accepted work.
+struct Writer {
+    db: db::SharedDb,
+    _lock: Option<SessionLock>,
+    shared: Arc<Shared>,
+    encoder: db::Encoder,
+    #[cfg(test)]
+    fault: Option<CommitFault>,
+}
+
+impl Writer {
+    /// Accept, then commit; returns the commit result for the receipt, or a
+    /// rejection for the caller to report once the writer is released.
+    fn append(
+        &mut self,
+        entries: Vec<Pending>,
+        follow: Option<Follow>,
+        accepted: Acceptance,
+    ) -> Result<Result<Vec<EventRecord>, SessionError>, (Acceptance, SessionError)> {
+        // Output writers share the connection; hold it from BEGIN through COMMIT.
+        let connection = self.db.clone();
+        let db = connection.lock();
+        let records = match self.accept(&db, entries, follow) {
+            Ok(records) => records,
+            Err(error) => return Err((accepted, error)),
+        };
+        let identities: Vec<_> = records.iter().map(EventRecord::append_identity).collect();
+        let identity = *identities.last().expect("appends carry at least one entry");
+        let _ = accepted.send(Ok(identities));
+        // Pessimistic poison also survives a lost writer task.
+        self.shared.write().health = WriterHealth::NeedsRecovery(AppendRecovery {
+            identity,
+            reason: "accepted append did not finish publication".into(),
+        });
+        #[cfg(test)]
+        if let Some(fault) = self.fault.take() {
+            let shared = self.shared.clone();
+            let injected = |reason: &str| {
+                let recovery = AppendRecovery {
+                    identity,
+                    reason: reason.into(),
+                };
+                shared.write().health = WriterHealth::NeedsRecovery(recovery.clone());
+                Ok(Err(SessionError::AppendIndeterminate(recovery)))
+            };
+            match fault {
+                CommitFault::Pause { reached, resume } => {
+                    let _ = reached.send(());
+                    let _ = resume.blocking_recv();
+                }
+                CommitFault::RollBack => {
+                    let _ = db.rollback();
+                    self.encoder.reset();
+                    return injected("injected rollback");
+                }
+                CommitFault::ReportAfterCommit => {
+                    let _ = db.commit();
+                    return injected("injected failure after commit");
+                }
+                CommitFault::Panic => panic!("injected writer loss"),
+                CommitFault::PauseCommitted { reached, resume } => {
+                    self.fault = Some(CommitFault::PauseCommitted { reached, resume });
+                }
+            }
+        }
+        Ok(match db.commit() {
+            Ok(()) => {
+                #[cfg(test)]
+                if let Some(CommitFault::PauseCommitted { reached, resume }) = self.fault.take() {
+                    let _ = reached.send(());
+                    let _ = resume.blocking_recv();
+                }
+                let mut state = self.shared.write();
+                for record in &records {
+                    state.records.push(record.clone());
+                    let _ = self.shared.events.send(record.clone());
+                }
+                state.health = WriterHealth::Healthy;
+                Ok(records)
+            }
+            Err(error) => {
+                let _ = db.rollback();
+                self.encoder.reset();
+                let recovery = AppendRecovery {
+                    identity,
+                    reason: error.to_string(),
+                };
+                self.shared.write().health = WriterHealth::NeedsRecovery(recovery.clone());
+                Err(SessionError::AppendIndeterminate(recovery))
+            }
         })
+    }
+
+    /// Validate and encode inside an open transaction; any error is a definite rejection.
+    fn accept(
+        &mut self,
+        db: &db::Db,
+        mut entries: Vec<Pending>,
+        follow: Option<Follow>,
+    ) -> Result<Vec<EventRecord>, SessionError> {
+        let state = self.shared.read();
+        state.require_healthy()?;
+        if state.closed {
+            return Err(SessionError::Closed);
+        }
+        let first = state
+            .records
+            .last()
+            .map_or(1, |record| record.sequence.saturating_add(1));
+        let timestamp_millis = Utc::now().timestamp_millis();
+        if let Some(follow) = follow {
+            entries.extend(follow(first).into_iter().map(|(agent, event)| Pending {
+                agent,
+                queue_attempt: None,
+                event,
+            }));
+        }
+        let mut records = Vec::with_capacity(entries.len());
+        for (offset, pending) in entries.into_iter().enumerate() {
+            if pending.agent.session() != self.shared.id {
+                return Err(SessionError::WrongSession);
+            }
+            records.push(EventRecord {
+                id: EventId::generate()?,
+                queue_attempt: pending.queue_attempt.or(pending.event.queue_attempt()),
+                sequence: first.saturating_add(offset as u64),
+                timestamp_millis,
+                agent: pending.agent,
+                event: pending.event,
+            });
+        }
+        // Order-dependent rules validate against the committed prefix plus this batch.
+        // Only a multi-entry batch copies the prefix.
+        let mut prefix = std::borrow::Cow::Borrowed(state.records.as_slice());
+        for (index, record) in records.iter().enumerate() {
+            queue::validate_queue_record(&prefix, record)?;
+            request::validate_compaction(&prefix, record)?;
+            if index + 1 < records.len() {
+                prefix.to_mut().push(record.clone());
+            }
+        }
+        drop(prefix);
+        drop(state);
+        let encoder = &mut self.encoder;
+        let result = db.transaction(|| {
+            let tx = encoder.begin_tx(db, timestamp_millis)?;
+            encoder.records(db, tx, &records)
+        });
+        if result.is_err() {
+            self.encoder.reset();
+        }
+        result?;
+        Ok(records)
     }
 }
 
 struct StoreInner {
-    id: SessionId,
+    shared: Arc<Shared>,
+    db: SharedDb,
     directory: PathBuf,
-    writer: Arc<Mutex<SessionWriter>>,
-    events: broadcast::Sender<EventRecord>,
-    /// Blobs for ephemeral stores, which have no blob directory.
-    blobs: std::sync::Mutex<HashMap<crate::media::BlobDigest, Arc<[u8]>>>,
+    writer: Arc<Mutex<Writer>>,
 }
 
 #[derive(Clone)]
@@ -263,11 +399,8 @@ pub struct SessionStore {
 
 impl SessionStore {
     #[cfg(test)]
-    pub(crate) async fn fail_append_at(&self, boundary: AppendBoundary) {
-        self.inner.writer.lock().await.fault = Some(AppendFault {
-            boundary,
-            action: AppendFaultAction::Fail,
-        });
+    pub(crate) async fn fault_next_commit(&self, fault: CommitFault) {
+        self.inner.writer.lock().await.fault = Some(fault);
     }
 
     #[cfg(test)]
@@ -276,30 +409,98 @@ impl SessionStore {
         boundary: AppendBoundary,
     ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (reached, waiting) = oneshot::channel();
-        let (resume, resumed) = oneshot::channel();
-        self.inner.writer.lock().await.fault = Some(AppendFault {
-            boundary,
-            action: AppendFaultAction::Pause {
-                reached,
-                resume: resumed,
-            },
-        });
-        (waiting, resume)
+        let (resume_sender, resume) = oneshot::channel();
+        self.fault_next_commit(match boundary {
+            AppendBoundary::Write => CommitFault::Pause { reached, resume },
+            AppendBoundary::Publication => CommitFault::PauseCommitted { reached, resume },
+        })
+        .await;
+        (waiting, resume_sender)
     }
 
-    /// Read an archive without opening a writer, taking a lock, or repairing a partial tail.
+    #[cfg(test)]
+    pub(crate) async fn fail_append_at(&self, boundary: AppendBoundary) {
+        self.fault_next_commit(match boundary {
+            AppendBoundary::Write => CommitFault::RollBack,
+            AppendBoundary::Publication => CommitFault::ReportAfterCommit,
+        })
+        .await;
+    }
+
+    /// Replace a stored blob's bytes, or delete it, as disk corruption would.
+    #[cfg(test)]
+    pub(crate) async fn corrupt_blob(
+        &self,
+        blob: crate::media::BlobDigest,
+        bytes: Option<Vec<u8>>,
+    ) {
+        let key = blob.to_bytes().to_vec();
+        let db = self.outputs();
+        let db = db.lock();
+        match bytes {
+            Some(bytes) => db.execute(
+                "UPDATE blob SET bytes = ?1 WHERE sha256 = ?2",
+                db::params![bytes, key],
+            ),
+            None => db.execute("DELETE FROM blob WHERE sha256 = ?1", db::params![key]),
+        }
+        .unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn inherit_lock(&self) -> Option<std::fs::File> {
+        let writer = self.inner.writer.lock().await;
+        writer
+            ._lock
+            .as_ref()
+            .and_then(|lock| lock.0.try_clone().ok())
+    }
+
+    /// Read a session without taking its lock; a live owner may keep writing.
     pub async fn read_records(
         root: &Path,
         id: SessionId,
     ) -> Result<Vec<EventRecord>, SessionError> {
-        let bytes = fs::read(root.join(id.to_string()).join("events.jsonl")).await?;
-        let end = bytes
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |index| index + 1);
-        let records = parse_lines(&bytes[..end])?;
-        event::validate_records(&records, id)?;
-        Ok(records)
+        Self::read_only(root, id, move |db| db::decode_records(db, id)).await
+    }
+
+    /// A session list row, without decoding the session or taking its lock.
+    pub async fn summary(root: &Path, id: SessionId) -> Result<SessionSummary, SessionError> {
+        Self::read_only(root, id, db::summary).await
+    }
+
+    /// Every saved job output document and capture as text, for inspection.
+    pub async fn read_output_text(root: &Path, id: SessionId) -> Result<Vec<String>, SessionError> {
+        Self::read_only(root, id, db::output_text).await
+    }
+
+    /// Run `read` against one snapshot: a live owner may commit between its queries.
+    async fn read_only<T: Send + 'static>(
+        root: &Path,
+        id: SessionId,
+        read: impl FnOnce(&db::Db) -> Result<T, DbError> + Send + 'static,
+    ) -> Result<T, SessionError> {
+        let path = root.join(id.to_string()).join(DATABASE_FILE);
+        tokio::task::spawn_blocking(move || {
+            if !path.is_file() {
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+            }
+            let db = db::Db::open(&path, db::OpenMode::ReadOnly)?;
+            db.batch("BEGIN")?;
+            let value = read(&db);
+            db.batch("COMMIT")?;
+            Ok(value?)
+        })
+        .await
+        .map_err(|error| SessionError::Io(std::io::Error::other(error)))?
+    }
+
+    /// Attempts and tool calls a stopped process left without an outcome.
+    pub(crate) async fn interrupted_work(&self) -> Result<db::InterruptedWork, SessionError> {
+        let id = self.id();
+        Ok(self
+            .with_writer(move |writer| db::interrupted_work(&writer.db.lock(), id))
+            .await??)
     }
 
     pub async fn create(root: &Path) -> Result<Self, SessionError> {
@@ -311,14 +512,15 @@ impl SessionStore {
     }
 
     async fn create_with_durability(root: &Path, durable: bool) -> Result<Self, SessionError> {
-        fs::create_dir_all(root).await?;
+        tokio::fs::create_dir_all(root).await?;
         for _ in 0..16 {
             let id = SessionId::generate()?;
             let directory = root.join(id.to_string());
-            match fs::create_dir(&directory).await {
+            match tokio::fs::create_dir(&directory).await {
                 Ok(()) => {
-                    let lock = durable.then(|| lock_session(&directory, id)).transpose()?;
-                    return Self::initialize(id, directory, Vec::new(), lock).await;
+                    return Self::start(id, directory, durable, false)
+                        .await
+                        .map(|(store, _)| store);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error.into()),
@@ -331,88 +533,82 @@ impl SessionStore {
         root: &Path,
         id: SessionId,
     ) -> Result<(Self, Vec<EventRecord>), SessionError> {
-        let directory = root.join(id.to_string());
-        // Acquire ownership before inspecting or repairing a potentially active journal.
-        let lock = lock_session(&directory, id)?;
-        let path = directory.join("events.jsonl");
-        let bytes = fs::read(&path).await?;
-        let complete_len = bytes
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |position| position + 1);
-        let complete = &bytes[..complete_len];
-        let records = parse_lines(complete)?;
-        event::validate_records(&records, id)?;
-        if complete_len != bytes.len() {
-            let file = OpenOptions::new().write(true).open(&path).await?;
-            file.set_len(u64::try_from(complete_len).map_err(|_| SessionError::FileTooLarge)?)
-                .await?;
-            file.sync_all().await?;
-        }
+        Self::start(id, root.join(id.to_string()), true, true).await
+    }
+
+    async fn start(
+        id: SessionId,
+        directory: PathBuf,
+        durable: bool,
+        existing: bool,
+    ) -> Result<(Self, Vec<EventRecord>), SessionError> {
+        let (shared_directory, open_directory) = (directory.clone(), directory.clone());
+        let (db, lock, records) = tokio::task::spawn_blocking(move || {
+            // Acquire ownership before opening a potentially active database.
+            let lock = durable
+                .then(|| lock_session(&open_directory, id))
+                .transpose()?;
+            let path = open_directory.join(DATABASE_FILE);
+            let mode = match (durable, existing) {
+                (false, _) => db::OpenMode::Memory,
+                (true, false) => db::OpenMode::Create,
+                (true, true) if path.is_file() => db::OpenMode::Open,
+                (true, true) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+                }
+            };
+            let db = db::Db::open(&path, mode)?;
+            let records = db::decode_records(&db, id)?;
+            Ok::<_, SessionError>((db, lock, records))
+        })
+        .await
+        .map_err(|error| SessionError::Io(std::io::Error::other(error)))??;
+        let (events, _) = broadcast::channel(512);
+        let shared = Arc::new(Shared {
+            id,
+            state: StdRwLock::new(State {
+                records: records.clone(),
+                health: WriterHealth::Healthy,
+                closed: false,
+            }),
+            events,
+        });
+        let db = SharedDb::new(db);
+        let writer = Writer {
+            db: db.clone(),
+            _lock: lock,
+            shared: shared.clone(),
+            encoder: db::Encoder::default(),
+            #[cfg(test)]
+            fault: None,
+        };
         Ok((
-            Self::initialize(id, directory, records.clone(), Some(lock)).await?,
+            Self {
+                inner: Arc::new(StoreInner {
+                    shared,
+                    db,
+                    directory: shared_directory,
+                    writer: Arc::new(Mutex::new(writer)),
+                }),
+            },
             records,
         ))
     }
 
-    async fn initialize(
-        id: SessionId,
-        directory: PathBuf,
-        records: Vec<EventRecord>,
-        lock: Option<SessionLock>,
-    ) -> Result<Self, SessionError> {
-        fs::create_dir_all(directory.join("blobs")).await?;
-        fs::create_dir_all(directory.join("jobs")).await?;
-        let durable = match lock {
-            Some(lock) => Some(DurableBackend {
-                file: BufWriter::new(
-                    OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(directory.join("events.jsonl"))
-                        .await?,
-                ),
-                _lock: lock,
-            }),
-            None => None,
-        };
-        // Reopening an uncertain complete prefix is an explicit recovery
-        // decision. Sync the validated prefix before exposing a healthy writer;
-        // a previous failed sync is not silently upgraded to a durable receipt.
-        if let Some(backend) = &durable {
-            backend.file.get_ref().sync_data().await?;
-            // Persist the journal and blob directory names before any event can
-            // acknowledge a durable image reference or queue intent.
-            File::open(&directory).await?.sync_all().await?;
-            if let Some(parent) = directory.parent() {
-                File::open(parent).await?.sync_all().await?;
-            }
-        }
-        let (events, _) = broadcast::channel(512);
-        Ok(Self {
-            inner: Arc::new(StoreInner {
-                id,
-                directory,
-                writer: Arc::new(Mutex::new(SessionWriter {
-                    durable,
-                    next_sequence: records
-                        .last()
-                        .map_or(1, |record| record.sequence.saturating_add(1)),
-                    records,
-                    health: WriterHealth::Healthy,
-                    closed: false,
-                    #[cfg(test)]
-                    fault: None,
-                })),
-                events,
-                blobs: Default::default(),
-            }),
-        })
+    /// Run `work` on the writer in FIFO order on the blocking pool.
+    async fn with_writer<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&mut Writer) -> T + Send + 'static,
+    ) -> Result<T, SessionError> {
+        let mut writer = self.inner.writer.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || work(&mut writer))
+            .await
+            .map_err(|error| SessionError::Io(std::io::Error::other(error.to_string())))
     }
 
     #[must_use]
     pub fn id(&self) -> SessionId {
-        self.inner.id
+        self.inner.shared.id
     }
 
     #[must_use]
@@ -422,19 +618,19 @@ impl SessionStore {
 
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<EventRecord> {
-        self.inner.events.subscribe()
+        self.inner.shared.events.subscribe()
     }
 
     /// A consistent snapshot of all successfully committed events, including ephemeral sessions.
     pub async fn records(&self) -> Vec<EventRecord> {
-        self.inner.writer.lock().await.records.clone()
+        self.inner.shared.read().records.clone()
     }
 
     /// Committed records, refused while an accepted append needs recovery (reopen first).
     pub async fn reconciled_records(&self) -> Result<Vec<EventRecord>, SessionError> {
-        let writer = self.inner.writer.lock().await;
-        writer.require_healthy()?;
-        Ok(writer.records.clone())
+        let state = self.inner.shared.read();
+        state.require_healthy()?;
+        Ok(state.records.clone())
     }
 
     /// Visit a consistent committed suffix without cloning event payloads.
@@ -443,11 +639,11 @@ impl SessionStore {
         sequence: u64,
         visit: impl FnOnce(&[EventRecord]),
     ) {
-        let writer = self.inner.writer.lock().await;
-        let start = writer
+        let state = self.inner.shared.read();
+        let start = state
             .records
             .partition_point(|record| record.sequence <= sequence);
-        visit(&writer.records[start..]);
+        visit(&state.records[start..]);
     }
 
     /// Accept and await one append; dropping this waiter does not cancel persistence.
@@ -459,6 +655,49 @@ impl SessionStore {
         self.accept_append(agent, event).await?.committed().await
     }
 
+    /// Accept and await several events committed in one transaction.
+    pub async fn append_all(
+        &self,
+        events: Vec<(AgentId, SessionEvent)>,
+    ) -> Result<Vec<EventRecord>, SessionError> {
+        self.commit_batch(events, None).await
+    }
+
+    /// Commit `event` with the events `follow` builds from its sequence, in one
+    /// transaction; a response and the records that reference it land together.
+    pub async fn append_then(
+        &self,
+        agent: AgentId,
+        event: SessionEvent,
+        follow: impl FnOnce(u64) -> Vec<(AgentId, SessionEvent)> + Send + 'static,
+    ) -> Result<Vec<EventRecord>, SessionError> {
+        self.commit_batch(vec![(agent, event)], Some(Box::new(follow)))
+            .await
+    }
+
+    async fn commit_batch(
+        &self,
+        events: Vec<(AgentId, SessionEvent)>,
+        follow: Option<Follow>,
+    ) -> Result<Vec<EventRecord>, SessionError> {
+        let entries = events
+            .into_iter()
+            .map(|(agent, event)| Pending {
+                agent,
+                queue_attempt: None,
+                event,
+            })
+            .collect();
+        let (identities, committed) = self.accept(entries, follow).await?;
+        let identity = *identities.last().expect("appends carry at least one entry");
+        committed.await.unwrap_or_else(|_| {
+            Err(SessionError::AppendIndeterminate(AppendRecovery {
+                identity,
+                reason: "accepted writer lost its receipt; recovery is required".into(),
+            }))
+        })
+    }
+
     /// Validate and accept one append; an error means it was not accepted.
     pub async fn accept_append(
         &self,
@@ -468,129 +707,122 @@ impl SessionStore {
         self.accept_append_bound(agent, None, event).await
     }
 
-    /// Acceptance linearizes after validation under the writer mutex; an owned task
-    /// then holds it through write, flush, sync and publication. `queue_attempt`
-    /// binds a queued model or user-message event to its intent.
+    /// Acceptance validates and encodes in FIFO order on the writer thread; the
+    /// commit completes there regardless of the caller. `queue_attempt` binds a
+    /// queued model or user-message event to its intent.
     pub(crate) async fn accept_append_bound(
         &self,
         agent: AgentId,
         queue_attempt: Option<QueueAttemptId>,
         event: SessionEvent,
     ) -> Result<AcceptedAppend, SessionError> {
-        if agent.session() != self.id() {
+        let (mut identities, committed) = self
+            .accept(
+                vec![Pending {
+                    agent,
+                    queue_attempt,
+                    event,
+                }],
+                None,
+            )
+            .await?;
+        Ok(AcceptedAppend {
+            identity: identities.pop().expect("one identity per entry"),
+            committed,
+        })
+    }
+
+    async fn accept(
+        &self,
+        entries: Vec<Pending>,
+        follow: Option<Follow>,
+    ) -> Result<
+        (
+            Vec<AppendIdentity>,
+            oneshot::Receiver<Result<Vec<EventRecord>, SessionError>>,
+        ),
+        SessionError,
+    > {
+        if entries
+            .iter()
+            .any(|entry| entry.agent.session() != self.id())
+        {
             return Err(SessionError::WrongSession);
         }
-        // Attempt binding is validated against the journal below; only the
-        // inherent identity of queue events is adopted here.
-        let queue_attempt = queue_attempt.or(event.queue_attempt());
-        let mut writer = self.inner.writer.clone().lock_owned().await;
-        writer.require_healthy()?;
-        if writer.closed {
-            return Err(SessionError::Closed);
-        }
-        let record = EventRecord {
-            id: EventId::generate()?,
-            queue_attempt,
-            version: SESSION_FORMAT_VERSION,
-            sequence: writer.next_sequence,
-            timestamp_millis: Utc::now().timestamp_millis(),
-            agent,
-            event,
-        };
-        queue::validate_queue_record(&writer.records, &record)?;
-        request::validate_compaction(&writer.records, &record)?;
-        if matches!(record.event, SessionEvent::ModelRequested { .. }) {
-            request::validate_request(&writer.records, &record)?;
-        }
-        // Serialization failure is definite rejection, before any write.
-        let mut bytes = serde_json::to_vec(&record)?;
-        bytes.push(b'\n');
-        let identity = record.append_identity();
-        // Pessimistic poison also survives an unexpected task panic/abort. It
-        // cannot be observed until the owned guard is released.
-        writer.health = WriterHealth::NeedsRecovery(AppendRecovery {
-            identity,
-            reason: "accepted append did not finish publication".into(),
-        });
+        let (accepted, acceptance) = oneshot::channel();
         let (committed, receipt) = oneshot::channel();
-        let inner = self.inner.clone();
-        tokio::spawn(async move {
-            let result = writer.write_record(&bytes).await;
-            let result = match result {
-                Ok(()) => {
-                    writer.next_sequence = record.sequence.saturating_add(1);
-                    writer.records.push(record.clone());
-                    let _ = inner.events.send(record.clone());
-                    writer.health = WriterHealth::Healthy;
-                    Ok(record)
-                }
-                Err(error) => {
-                    let recovery = AppendRecovery {
-                        identity,
-                        reason: error.to_string(),
-                    };
-                    writer.health = WriterHealth::NeedsRecovery(recovery.clone());
-                    Err(SessionError::AppendIndeterminate(recovery))
-                }
-            };
-            // A receipt also ends this operation's resource ownership; callers
-            // may drop their last store and immediately reopen after awaiting it.
+        // FIFO admission; the owned task holds the writer through commit and
+        // publication, releasing it before the receipt so an immediate reopen succeeds.
+        let mut writer = self.inner.writer.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            // Release the writer before any report, even when the writer panics, so
+            // a caller that closes and reopens on the answer finds the lock free.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                writer.append(entries, follow, accepted)
+            }));
             drop(writer);
-            drop(inner);
-            let _ = committed.send(result);
+            match result {
+                Ok(Ok(result)) => drop(committed.send(result)),
+                Ok(Err((accepted, error))) => drop(accepted.send(Err(error))),
+                Err(panic) => {
+                    drop(committed);
+                    std::panic::resume_unwind(panic)
+                }
+            }
         });
-        Ok(AcceptedAppend {
-            identity,
-            committed: receipt,
-        })
+        let identities =
+            acceptance
+                .await
+                .map_err(|_| match &self.inner.shared.read().health {
+                    WriterHealth::NeedsRecovery(recovery) => {
+                        SessionError::AppendUnavailable(recovery.clone())
+                    }
+                    WriterHealth::Healthy => SessionError::Closed,
+                })??;
+        Ok((identities, receipt))
     }
 
     /// Await accepted appends and report recovery-required state without closing admission.
     pub async fn drain(&self) -> Result<(), SessionError> {
-        self.inner.writer.lock().await.require_healthy()
+        drop(self.inner.writer.lock().await);
+        self.inner.shared.read().require_healthy()
     }
 
     /// Stop admission and report recovery-required state; the lease lasts until the store drops.
     pub async fn close(&self) -> Result<(), SessionError> {
-        let mut writer = self.inner.writer.lock().await;
-        writer.closed = true;
-        writer.require_healthy()
+        let _writer = self.inner.writer.lock().await;
+        let mut state = self.inner.shared.write();
+        state.closed = true;
+        state.require_healthy()
     }
 
-    pub(crate) async fn remove_job_artifacts(&self, job: JobId) -> Result<(), SessionError> {
-        let directory = self.inner.directory.join("jobs").join(job.to_string());
-        match fs::remove_dir_all(directory).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+    /// The connection job output streams read and write through.
+    pub(crate) fn outputs(&self) -> SharedDb {
+        self.inner.db.clone()
+    }
+
+    pub(crate) async fn remove_job_artifacts(
+        &self,
+        job: crate::identity::JobId,
+    ) -> Result<(), SessionError> {
+        let db = self.outputs();
+        tokio::task::spawn_blocking(move || db.remove_job_output(job.get()))
+            .await
+            .map_err(|error| SessionError::Io(std::io::Error::other(error)))??;
+        Ok(())
     }
 
     /// Store bytes in the content-addressed blob store.
     pub async fn store_blob(&self, bytes: &[u8]) -> Result<crate::media::BlobRef, SessionError> {
         let blob = crate::media::BlobRef::of(bytes);
-        if self.inner.writer.lock().await.durable.is_none() {
-            self.inner
-                .blobs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(blob.sha256, bytes.into());
-            return Ok(blob);
-        }
-        let hash = blob.sha256.to_string();
-        let destination = self.inner.directory.join("blobs").join(&hash);
-        if !fs::try_exists(&destination).await? {
-            atomic_write(&destination, bytes).await?;
-        } else {
-            if fs::read(&destination).await? != bytes {
-                return Err(SessionError::BlobHashMismatch(hash));
-            }
-            File::open(&destination).await?.sync_all().await?;
-            File::open(self.inner.directory.join("blobs"))
-                .await?
-                .sync_all()
-                .await?;
-        }
+        let bytes = bytes.to_vec();
+        self.with_writer(move |writer| {
+            writer.db.lock().execute(
+                "INSERT INTO blob (sha256, bytes) VALUES (?1, ?2) ON CONFLICT (sha256) DO NOTHING",
+                db::params![blob.sha256.to_bytes().to_vec(), bytes],
+            )
+        })
+        .await??;
         Ok(blob)
     }
 
@@ -605,35 +837,21 @@ impl SessionStore {
             MediaError::HashMismatch => SessionError::BlobHashMismatch(blob.sha256.to_string()),
             error => invalid_data(error),
         };
-        let length = usize::try_from(blob.bytes)
+        usize::try_from(blob.bytes)
             .ok()
             .filter(|&length| length <= limit)
             .ok_or_else(|| invalid(MediaError::TooLarge))?;
-        let stored = self
-            .inner
-            .blobs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&blob.sha256)
-            .cloned();
-        let bytes = match stored {
-            Some(bytes) => bytes.to_vec(),
-            None => {
-                // The path comes from the parsed digest, never an untrusted string.
-                let path = self
-                    .inner
-                    .directory
-                    .join("blobs")
-                    .join(blob.sha256.to_string());
-                let mut file = fs::File::open(path).await?;
-                crate::bounded_io::read_bounded(&mut file, length)
-                    .await
-                    .map_err(|error| match error {
-                        crate::bounded_io::BoundedReadError::Io(error) => SessionError::Io(error),
-                        error => invalid_data(error),
-                    })?
-            }
-        };
+        let key = blob.sha256.to_bytes().to_vec();
+        let bytes = self
+            .with_writer(move |writer| {
+                writer.db.lock().query_row(
+                    "SELECT bytes FROM blob WHERE sha256 = ?1",
+                    db::params![key],
+                    |row| Ok(row.get::<Vec<u8>>(0)?),
+                )
+            })
+            .await??
+            .ok_or_else(|| SessionError::Io(std::io::Error::from(std::io::ErrorKind::NotFound)))?;
         if crate::media::BlobDigest::of(&bytes) != blob.sha256 {
             return Err(invalid(MediaError::HashMismatch));
         }
@@ -741,41 +959,6 @@ fn invalid_data(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> S
     SessionError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
-fn parse_lines(bytes: &[u8]) -> Result<Vec<EventRecord>, SessionError> {
-    #[derive(Deserialize)]
-    struct Header {
-        version: u16,
-    }
-
-    bytes
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            // Check the header before deserializing the version-specific event
-            // body. An old assistant enum must report a version mismatch, not
-            // a misleading missing item/block field error, regardless of JSON
-            // object field order.
-            let header: Header = serde_json::from_slice(line)?;
-            if header.version != SESSION_FORMAT_VERSION {
-                return Err(SessionError::UnsupportedVersion(header.version));
-            }
-            Ok(serde_json::from_slice(line)?)
-        })
-        .collect()
-}
-
-async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), SessionError> {
-    Ok(crate::fs::atomic_write(
-        path,
-        bytes,
-        crate::fs::AtomicWriteOptions {
-            sync_parent: true,
-            ..Default::default()
-        },
-    )
-    .await?)
-}
-
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error("model request template must not contain conversation history")]
@@ -792,6 +975,8 @@ pub enum SessionError {
     Io(#[from] std::io::Error),
     #[error("session JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Database(DbError),
     #[error("session identifier generation failed: {0}")]
     Random(#[from] getrandom::Error),
     #[error("could not allocate a unique session identifier")]
@@ -799,278 +984,25 @@ pub enum SessionError {
     #[error("session {0} is already open")]
     AlreadyOpen(SessionId),
     #[error("unsupported session version {0}")]
-    UnsupportedVersion(u16),
-    #[error("invalid event sequence: expected {expected}, found {actual}")]
-    InvalidSequence { expected: u64, actual: u64 },
+    UnsupportedVersion(i64),
     #[error("event belongs to another session")]
     WrongSession,
-    #[error("duplicate event identity {0}")]
-    DuplicateEvent(EventId),
     #[error("invalid queue journal record: {0}")]
     InvalidQueue(&'static str),
-    #[error("duplicate job {0}")]
-    DuplicateJob(JobId),
-    #[error("unknown job {0}")]
-    UnknownJob(JobId),
-    #[error("duplicate or invalid terminal event for job {0}")]
-    DuplicateTerminal(JobId),
-    #[error("artifact path is unsafe")]
-    UnsafeArtifactPath,
-    #[error("file is too large for this platform")]
-    FileTooLarge,
     #[error("blob `{0}` failed its content hash check")]
     BlobHashMismatch(String),
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    async fn fresh() -> (tempfile::TempDir, SessionStore, SessionId, AgentId) {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let id = store.id();
-        (root, store, id, AgentId::root(id))
-    }
-
-    #[tokio::test]
-    async fn accepted_append_survives_lost_waiter_at_every_boundary_and_close_drains() {
-        for boundary in [AppendBoundary::Write, AppendBoundary::Publication] {
-            let (root, store, id, agent) = fresh().await;
-            let mut events = store.subscribe();
-            let (reached, resume) = store.pause_append_at(boundary).await;
-            let accepted = store.accept_append(agent.clone(), SessionEvent::AgentInterrupted);
-            let accepted = accepted.await.unwrap();
-            let identity = accepted.identity();
-            reached.await.unwrap();
-            assert!(
-                events.try_recv().is_err(),
-                "publication must follow durable IO"
-            );
-            drop(accepted);
-            let closing = tokio::spawn({
-                let store = store.clone();
-                async move { store.close().await }
-            });
-            tokio::task::yield_now().await;
-            assert!(!closing.is_finished(), "close must drain accepted work");
-            resume.send(()).unwrap();
-            closing.await.unwrap().unwrap();
-            let record = events.recv().await.unwrap();
-            assert_eq!(record.sequence, identity.sequence);
-            assert_eq!(store.records().await, vec![record.clone()]);
-            let closed = store.append(agent, SessionEvent::AgentCompleted).await;
-            assert!(matches!(closed, Err(SessionError::Closed)));
-            drop(store);
-            let (_, replay) = SessionStore::open(root.path(), id).await.unwrap();
-            assert_eq!(replay, vec![record]);
+impl From<DbError> for SessionError {
+    fn from(error: DbError) -> Self {
+        match error {
+            DbError::Unsupported(version) => Self::UnsupportedVersion(version),
+            error => Self::Database(error),
         }
-    }
-
-    /// Failed and lost (panicking) accepted writers both poison the store with
-    /// the exact recovery identity; reopen reconciles the durable prefix. A
-    /// partial write is likewise repaired without reusing the lost event id.
-    #[tokio::test]
-    async fn failures_poison_the_writer_and_reopen_reconciles_the_complete_prefix() {
-        let cases = AppendBoundary::ALL
-            .into_iter()
-            .flat_map(|boundary| {
-                [AppendFaultAction::Fail, AppendFaultAction::Panic].map(|action| (boundary, action))
-            })
-            .chain([(AppendBoundary::Write, AppendFaultAction::PartialWrite)]);
-        for (boundary, action) in cases {
-            let partial = matches!(action, AppendFaultAction::PartialWrite);
-            let (root, store, id, agent) = fresh().await;
-            store.inner.writer.lock().await.fault = Some(AppendFault { boundary, action });
-            let accepted = store.accept_append(agent.clone(), SessionEvent::AgentInterrupted);
-            let accepted = accepted.await.unwrap();
-            let identity = accepted.identity();
-            let recovery_is = |result: Result<_, SessionError>, indeterminate: bool| match result {
-                Err(SessionError::AppendIndeterminate(recovery)) if indeterminate => {
-                    recovery.identity == identity
-                }
-                Err(SessionError::AppendUnavailable(recovery)) if !indeterminate => {
-                    recovery.identity == identity
-                }
-                _ => false,
-            };
-            assert!(recovery_is(accepted.committed().await.map(drop), true));
-            assert!(store.records().await.is_empty());
-            assert!(recovery_is(
-                store.reconciled_records().await.map(drop),
-                false
-            ));
-            let retry = store
-                .append(agent.clone(), SessionEvent::AgentCompleted)
-                .await;
-            assert!(recovery_is(retry.map(drop), false));
-            assert!(matches!(
-                store.close().await,
-                Err(SessionError::AppendUnavailable(_))
-            ));
-            drop(store);
-            let (reopened, replay) = SessionStore::open(root.path(), id).await.unwrap();
-            let durable = matches!(boundary, AppendBoundary::Sync | AppendBoundary::Publication);
-            assert!(replay.len() <= 1);
-            if partial || durable {
-                let expected = usize::from(durable);
-                assert_eq!(
-                    replay.len(),
-                    expected,
-                    "flushed complete record resolves the attempt"
-                );
-            }
-            assert_eq!(reopened.reconciled_records().await.unwrap(), replay);
-            let next = reopened
-                .append(agent, SessionEvent::AgentCompleted)
-                .await
-                .unwrap();
-            assert_eq!(next.sequence, replay.len() as u64 + 1);
-            if partial {
-                assert_eq!(next.sequence, identity.sequence);
-                assert_ne!(next.id, identity.event);
-                let records = reopened.records().await;
-                assert!(!records.iter().any(|record| record.id == identity.event));
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn acknowledged_append_releases_owned_store_before_immediate_reopen() {
-        for _ in 0..32 {
-            let (root, store, id, agent) = fresh().await;
-            store
-                .append(agent, SessionEvent::AgentInterrupted)
-                .await
-                .unwrap();
-            drop(store);
-            let (_, records) = SessionStore::open(root.path(), id).await.unwrap();
-            assert_eq!(records.len(), 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn append_and_resume_complete_prefix() {
-        let (root, store, id, agent) = fresh().await;
-        store
-            .append(agent.clone(), SessionEvent::AgentInterrupted)
-            .await
-            .unwrap();
-        let path = root.path().join(id.to_string()).join("events.jsonl");
-        let mut file = OpenOptions::new().append(true).open(&path).await.unwrap();
-        file.write_all(b"{incomplete").await.unwrap();
-        file.flush().await.unwrap();
-        drop(file);
-        // A competing opener must not repair a journal whose owner is still alive.
-        let before = fs::read(&path).await.unwrap();
-        assert!(matches!(
-            SessionStore::open(root.path(), id).await,
-            Err(SessionError::AlreadyOpen(locked)) if locked == id
-        ));
-        assert_eq!(fs::read(&path).await.unwrap(), before);
-        // Model a descriptor briefly inherited by a concurrently spawned process.
-        let inherited_lock = {
-            let writer = store.inner.writer.lock().await;
-            let Some(backend) = &writer.durable else {
-                panic!("durable store required");
-            };
-            backend._lock.0.try_clone().unwrap()
-        };
-        drop(store);
-        let (store, records) = SessionStore::open(root.path(), id).await.unwrap();
-        drop(inherited_lock);
-        assert_eq!(records.len(), 1);
-        assert_eq!(store.records().await, records);
-        let appended = store
-            .append(agent, SessionEvent::AgentCompleted)
-            .await
-            .unwrap();
-        assert_eq!(store.records().await, vec![records[0].clone(), appended]);
-        assert!(fs::read_to_string(path).await.unwrap().ends_with('\n'));
-    }
-
-    #[tokio::test]
-    async fn unsupported_event_versions_are_rejected() {
-        let (root, store, id, agent) = fresh().await;
-        let path = store.directory().join("events.jsonl");
-        let record = store
-            .append(agent, SessionEvent::AgentInterrupted)
-            .await
-            .unwrap();
-        drop(store);
-        let mut record = serde_json::to_value(record).unwrap();
-        for version in [1, 2, SESSION_FORMAT_VERSION + 1] {
-            // The old flat enum cannot deserialize as an item. Put the body
-            // before the version so field ordering cannot obscure the error.
-            let mut ordered = serde_json::Map::new();
-            ordered.insert(
-                "event".into(),
-                serde_json::json!({
-                    "type": "message_committed",
-                    "message": {"role": "assistant", "content": [
-                        {"type": "reasoning", "text": "old", "opaque": {"signature": "old"}}
-                    ]}
-                }),
-            );
-            record.as_object_mut().unwrap().remove("event");
-            record["version"] = version.into();
-            ordered.extend(record.as_object().unwrap().clone());
-            let archive = format!("{}\n", serde_json::to_string(&ordered).unwrap());
-            fs::write(&path, &archive).await.unwrap();
-            assert!(matches!(
-                SessionStore::open(root.path(), id).await,
-                Err(SessionError::UnsupportedVersion(found)) if found == version
-            ));
-            assert!(matches!(
-                SessionStore::read_records(root.path(), id).await,
-                Err(SessionError::UnsupportedVersion(found)) if found == version
-            ));
-            // Unsupported archives fail closed without being rewritten.
-            assert_eq!(fs::read(&path).await.unwrap(), archive.as_bytes());
-        }
-        // A genuine old record shape has no durable event or queue identity; the
-        // version header alone rejects it, and version three itself requires the
-        // identity: there is no permissive v2 fallback.
-        let old = format!(
-            r#"{{"version":2,"sequence":1,"timestamp_millis":0,"agent":{{"session":"{id}","path":[]}},"event":{{"type":"agent_completed"}}}}
-"#
-        );
-        assert!(matches!(
-            parse_lines(old.as_bytes()),
-            Err(SessionError::UnsupportedVersion(2))
-        ));
-        let v3 = old.replace("\"version\":2", "\"version\":3");
-        assert!(matches!(
-            parse_lines(v3.as_bytes()),
-            Err(SessionError::Json(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn ephemeral_store_keeps_events_and_images_out_of_the_journal() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create_ephemeral(root.path()).await.unwrap();
-        let directory = store.directory().to_path_buf();
-        let agent = AgentId::root(store.id());
-        store
-            .append(agent, SessionEvent::AgentInterrupted)
-            .await
-            .unwrap();
-        assert_eq!(store.records().await.len(), 1);
-        let png = crate::tests::png(b"image");
-        let image = store
-            .store_image(Some("image.png".to_owned()), &png)
-            .await
-            .unwrap();
-        let limit = crate::media::MAX_IMAGE_BYTES as usize;
-        assert_eq!(
-            store.read_blob(&image.blob, limit).await.unwrap(),
-            png.bytes()
-        );
-        for journal in ["events.jsonl", "session.lock"] {
-            assert!(!fs::try_exists(directory.join(journal)).await.unwrap());
-        }
-        let mut blobs = fs::read_dir(directory.join("blobs")).await.unwrap();
-        assert!(blobs.next_entry().await.unwrap().is_none());
     }
 }
+
+#[cfg(test)]
+pub(crate) mod fixture;
+#[cfg(test)]
+mod tests;

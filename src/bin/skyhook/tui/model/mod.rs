@@ -272,8 +272,8 @@ mod tests {
     use skyhook::identity::SessionId;
     use skyhook::job::{JobRole, JobState};
     use skyhook::provider::protocol::{
-        AssistantItem, BlockKind, ContentDelta, ItemKind, Message, ModelRequest, ReplayEnvelope,
-        ResponseEvent, ToolCall, ToolResult, UserContent,
+        AssistantItem, BlockKind, ContentDelta, ItemKind, Message, ReplayEnvelope, ResponseEvent,
+        ToolCall, ToolResult, UserContent,
     };
     use skyhook::session::{EventRecord, ModelPurpose, SessionEvent};
 
@@ -296,7 +296,6 @@ mod tests {
             RuntimeEvent::Record(Box::new(EventRecord {
                 id: skyhook::identity::EventId::generate().unwrap(),
                 queue_attempt: None,
-                version: 1,
                 sequence,
                 timestamp_millis: sequence as i64 * 1000,
                 agent: agent.clone(),
@@ -416,26 +415,26 @@ mod tests {
         agent: &AgentId,
         context: Option<u64>,
     ) -> u64 {
-        let template = ModelRequest {
-            model: "fixture-model".into(),
-            system: vec![],
-            history: Vec::new(),
-            tail: Vec::new(),
-            history_lifetime: Default::default(),
-            tools: vec![],
-            response_schema: None,
-            reasoning: None,
-            max_output_tokens: Some(100),
-            correlation: None,
-            blobs: Default::default(),
-        };
         let context = context.unwrap_or_else(|| {
-            let provider = "fixture".into();
-            record(
-                snapshot,
-                agent,
-                SessionEvent::ModelContext { provider, template },
-            )
+            let profile = skyhook::session::ProfileSnapshot {
+                name: "fixture".into(),
+                profile: skyhook::provider::profile::ModelProfile::new(
+                    "fixture",
+                    "fixture-model",
+                    None,
+                    128_000,
+                    100,
+                    false,
+                ),
+            };
+            let context = skyhook::session::ModelContext {
+                purpose: ModelPurpose::Agent,
+                profile,
+                system: vec![],
+                tools: vec![],
+                response_schema: None,
+            };
+            record(snapshot, agent, SessionEvent::ModelContext { context })
         });
         let text = "original request".into();
         let message = Message::User(vec![UserContent::Text { text }]);

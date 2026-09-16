@@ -61,10 +61,9 @@ impl SessionRuntime {
         let mut input = ModelRequest {
             model: input.model.clone(),
             system: input.system.clone(),
-            history: projected
-                .iter()
-                .map(|(_, message)| message.clone())
-                .collect(),
+            history: crate::session::merge_tool_results(
+                projected.iter().map(|(_, message)| message.clone()),
+            ),
             // A fresh snapshot replaces the input's state tail, when its state mode sends one.
             tail: if input.tail.is_empty() {
                 Vec::new()
@@ -108,14 +107,14 @@ impl SessionRuntime {
         summary_request.tail.push(directive);
         // The checkpoint replaces this history once the summary completes.
         summary_request.history_lifetime = HistoryLifetime::Detached;
-        let provider_name = records
+        let profile = records
             .iter()
             .find_map(|record| {
                 if record.sequence == context
                     && &record.agent == agent
-                    && let SessionEvent::ModelContext { provider, .. } = &record.event
+                    && let SessionEvent::ModelContext { context } = &record.event
                 {
-                    Some(provider.clone())
+                    Some(context.profile.clone())
                 } else {
                     None
                 }
@@ -126,8 +125,13 @@ impl SessionRuntime {
             .append(
                 agent.clone(),
                 SessionEvent::ModelContext {
-                    provider: provider_name,
-                    template,
+                    context: crate::session::ModelContext {
+                        purpose: ModelPurpose::Compaction,
+                        profile,
+                        system: template.system,
+                        tools: template.tools,
+                        response_schema: template.response_schema,
+                    },
                 },
             )
             .await?;
@@ -251,6 +255,7 @@ impl SessionRuntime {
                 message.strip_bound_reasoning();
                 (!message.is_content_free()).then_some(message)
             }));
+        compacted.history = crate::session::merge_tool_results(compacted.history);
         if !compacted.tail.is_empty() {
             let runtime = prompt::runtime_state_with_todos(
                 &self.jobs,
@@ -266,6 +271,7 @@ impl SessionRuntime {
         if after_tokens >= before_tokens {
             self.store.append(agent.clone(), SessionEvent::CompactionSkipped {
                 request: requested.sequence,
+                attempt: *model_attempt,
                 reason: "continuation and retained messages do not reduce context; continuing with original history".into(),
             }).await?;
             return Ok(());
@@ -288,6 +294,7 @@ impl SessionRuntime {
                         .map(|source| source.into_sequence())
                         .collect(),
                     request: requested.sequence,
+                    attempt: *model_attempt,
                     before_tokens,
                     after_tokens,
                     max_context,
@@ -398,7 +405,9 @@ mod tests {
         fixture.add_history(20_000).await;
         // A separate owner keeps the idle root command loop from consuming this
         // notification independently of the compaction under test.
-        let owner = agent.child(99);
+        let workspace = fixture.workspace.path();
+        let store = &runtime.store;
+        let owner = crate::session::fixture::start_child(store, agent, 99, None, workspace).await;
         let spec = JobSpec {
             background: true,
             ..JobSpec::test(owner.clone(), "background-research")
@@ -473,7 +482,9 @@ mod tests {
             todo("Verify the resulting fix", TodoStatus::Pending),
         ];
         runtime.todos.replace(agent, original).await.unwrap();
-        let child = agent.child(1);
+        let workspace = fixture.workspace.path();
+        let store = &runtime.store;
+        let child = crate::session::fixture::start_child(store, agent, 1, None, workspace).await;
         let child_todos = vec![todo("Independent delegated work", TodoStatus::InProgress)];
         let todos = &runtime.todos;
         todos.replace(&child, child_todos.clone()).await.unwrap();
@@ -508,6 +519,8 @@ mod tests {
         let agent = &fixture.session.root;
         let arguments = json!({"path":"evidence.txt", "literal":null});
         let output = "evidence\n".repeat(400);
+        let workspace = fixture.workspace.path();
+        crate::session::fixture::start_child(&runtime.store, agent, 99, None, workspace).await;
         let lease = runtime.jobs.create(JobSpec {
             arguments: arguments.clone(),
             output_schema: Some(json!({"type":"object","properties":{"content":{"type":"string","x-skyhook-truncatable":true}}})),

@@ -286,6 +286,7 @@ async fn pruning_before_creation_rejects_parent_without_event_or_identity_gap() 
 #[tokio::test]
 async fn indeterminate_creation_does_not_publish_map_or_retry_append() {
     let (_root, jobs, agent) = crate::job::tests::runtime().await;
+    let sequence = jobs.store().records().await.len() as u64 + 1;
     jobs.store()
         .fail_append_at(AppendBoundary::Publication)
         .await;
@@ -297,7 +298,7 @@ async fn indeterminate_creation_does_not_publish_map_or_retry_append() {
     let JobError::Session(SessionError::AppendIndeterminate(recovery)) = error else {
         panic!("expected explicit recovery-required creation failure: {error}");
     };
-    assert_eq!(recovery.identity.sequence, 1);
+    assert_eq!(recovery.identity.sequence, sequence);
     let retried = jobs.create(JobSpec::test(agent, "not-retried")).await;
     assert!(
         matches!(retried, Err(JobError::Session(SessionError::AppendUnavailable(ref later))) if later == &recovery)
@@ -345,8 +346,8 @@ async fn prune_create_race_is_linearized_under_bounded_stress() {
 async fn cancelled_prune_finishes_membership_and_artifact_cleanup() {
     let (_root, jobs, agent) = crate::job::tests::runtime().await;
     let id = claimed(&jobs, &agent, "pruned").await;
-    let directory = jobs.output_directory(id);
-    assert!(directory.exists());
+    let output = jobs.output(id);
+    assert!(output.test_document().is_some());
     let operation = jobs.operation(id).await.unwrap().lock_owned().await;
     let pruning = prune(&jobs);
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -361,5 +362,5 @@ async fn cancelled_prune_finishes_membership_and_artifact_cleanup() {
     drop(operation);
     jobs.drain_creations().await;
     assert!(matches!(jobs.metadata(id).await, Err(JobError::Unknown(job)) if job == id));
-    assert!(!directory.exists());
+    assert!(output.test_document().is_none());
 }

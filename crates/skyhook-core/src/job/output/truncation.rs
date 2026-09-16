@@ -7,18 +7,18 @@ const ANNOTATION: &str = "x-skyhook-truncatable";
 
 /// The projected view, with its truncated fields listed under `truncated`.
 pub(super) fn project(
-    directory: &Path,
+    saved: &Saved,
     schema: &Value,
     cancellation: &super::super::CancellationToken,
     annotated: &BTreeSet<String>,
     replacements: &BTreeMap<String, Value>,
 ) -> Result<serde_json::Map<String, Value>, ToolError> {
-    let mut document: Value = serde_json::from_reader(BufReader::new(std::fs::File::open(
-        directory.join("document.json"),
-    )?))?;
+    let mut document = saved
+        .document
+        .clone()
+        .ok_or_else(|| ToolError::Failed("saved output document is missing".into()))?;
     let mut projection = Projection {
-        directory,
-        stored_fields: fields(directory)?,
+        saved,
         truncated: Vec::new(),
         cancellation,
         annotated,
@@ -38,8 +38,7 @@ pub(super) fn project(
 }
 
 struct Projection<'a> {
-    directory: &'a Path,
-    stored_fields: Vec<String>,
+    saved: &'a Saved,
     truncated: Vec<OutputTruncation>,
     cancellation: &'a super::super::CancellationToken,
     annotated: &'a BTreeSet<String>,
@@ -65,9 +64,9 @@ impl Projection<'_> {
         if (self.annotated.contains(field) || applicable.is_annotated())
             && (value.is_string() || value.is_array() || value.is_object())
         {
-            let path = materialize_field(self.directory, field, value, self.cancellation)?;
+            let mut source = materialize_field(self.saved, field, value, self.cancellation)?;
             let mut bytes = Vec::new();
-            std::fs::File::open(&path)?
+            (&mut source)
                 .take((FIELD_BYTES + 1) as u64)
                 .read_to_end(&mut bytes)?;
             let (prefix, end, shortened) = if value.is_string() {
@@ -79,7 +78,7 @@ impl Projection<'_> {
             };
             *value = prefix;
             if shortened {
-                let index = reader::LineIndex::load(&path, self.cancellation)?;
+                let index = source.index(self.cancellation)?;
                 let line = 1 + bytes[..end].iter().filter(|&&b| b == b'\n').count();
                 let offset = bytes[..end]
                     .iter()
@@ -87,7 +86,7 @@ impl Projection<'_> {
                     .map_or(end, |last| end - last - 1);
                 self.truncated.push(OutputTruncation {
                     field: field.into(),
-                    total_lines: index.total_lines(),
+                    total_lines: index.total_lines,
                     next: OutputContinuation {
                         start: line,
                         offset,
@@ -97,13 +96,9 @@ impl Projection<'_> {
             return Ok(());
         }
         // Storage offloading does not grant permission to truncate a field.
-        if self.stored_fields.iter().any(|stored| stored == field) {
-            let path = field_file(self.directory, field);
-            *value = if value.is_string() {
-                Value::String(std::fs::read_to_string(path)?)
-            } else {
-                serde_json::from_reader(BufReader::new(std::fs::File::open(path)?))?
-            };
+        // Stored fields were validated as UTF-8 or JSON when saved.
+        if self.saved.fields.iter().any(|stored| stored == field) {
+            load_field(self.saved, value, field)?;
         }
         match value {
             Value::Object(map) => {
@@ -456,8 +451,9 @@ mod tests {
     ) -> (tempfile::TempDir, JobManager, JobId) {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::create(root.path()).await.unwrap();
+        let agent = crate::session::fixture::started(&store, root.path()).await;
         let manager = JobManager::new(store.clone());
-        let mut spec = JobSpec::test(crate::identity::AgentId::root(store.id()), "annotated");
+        let mut spec = JobSpec::test(agent, "annotated");
         spec.output_schema = Some(schema);
         let id = manager.test_create(spec).await;
         let output = ToolOutput::new(value);

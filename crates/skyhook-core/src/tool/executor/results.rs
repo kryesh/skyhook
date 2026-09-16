@@ -224,7 +224,6 @@ mod tests {
     use crate::{
         job::{JobRole, JobSpec},
         provider::protocol::{AssistantContent, Message},
-        session::SessionEvent,
         tool::ToolRegistryBuilder,
     };
 
@@ -281,13 +280,11 @@ mod tests {
                 ..JobSpec::test(runtime.agent.clone(), "delegate")
             };
             let job = created(&runtime, spec).await;
-            let started = SessionEvent::AgentStarted {
-                parent: Some(runtime.agent.clone()),
-                owner_job: Some(job),
-                model_profile: "test".into(),
-                max_context: None,
-                location: ExecutionLocation::root(runtime.root.path().to_owned()),
-            };
+            let started = crate::session::fixture::child_started(
+                Some(runtime.agent.clone()),
+                Some(job),
+                ExecutionLocation::root(runtime.root.path().to_owned()),
+            );
             runtime.store.append(child.clone(), started).await.unwrap();
             runtime
                 .jobs
@@ -301,7 +298,7 @@ mod tests {
                 Message::Assistant(vec![AssistantContent::text("answer", 0, text.clone())]);
             let sequence = runtime
                 .jobs
-                .commit_child_message(&child, job, message, text.clone(), true)
+                .commit_child_message(&child, job, message, text.clone(), true, |_| Vec::new())
                 .await
                 .unwrap();
             complete(&runtime, job, serde_json::json!(text)).await;

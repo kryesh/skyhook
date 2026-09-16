@@ -196,38 +196,58 @@ pub(super) mod tests {
     pub(crate) async fn resume_request(
         request: &crate::provider::protocol::ModelRequest,
     ) -> crate::provider::protocol::ModelRequest {
-        use crate::{
-            identity::AgentId,
-            session::{ModelPurpose, SessionEvent, SessionStore, reconstruct_model_request},
-        };
+        use crate::session::{ModelPurpose, SessionEvent, SessionStore, reconstruct_model_request};
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::create(directory.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
-        let mut template = request.clone();
-        (template.history, template.tail) = (Vec::new(), Vec::new());
-        template.history_lifetime = Default::default();
+        let agent = crate::session::fixture::started(&store, directory.path()).await;
+        // The journal derives model settings from the profile and correlation from the agent.
+        let mut expected = request.clone();
+        let max_output = request.max_output_tokens.unwrap_or(4096);
+        expected.max_output_tokens = Some(max_output);
+        expected.correlation = Some(agent.to_string());
+        let profile = crate::session::ProfileSnapshot {
+            name: "native-replay-test".into(),
+            profile: crate::provider::profile::ModelProfile::new(
+                "native-replay-test",
+                request.model.clone(),
+                request.reasoning.clone(),
+                max_output.saturating_add(128_000),
+                max_output,
+                true,
+            ),
+        };
         let context = store
             .append(
                 agent.clone(),
                 SessionEvent::ModelContext {
-                    provider: "native-replay-test".into(),
-                    template,
+                    context: crate::session::ModelContext {
+                        purpose: ModelPurpose::Agent,
+                        profile,
+                        system: request.system.clone(),
+                        tools: request.tools.clone(),
+                        response_schema: request.response_schema.clone(),
+                    },
                 },
             )
             .await
             .unwrap();
         let mut history = Vec::new();
         for message in &request.history {
-            let record = store
-                .append(
-                    agent.clone(),
-                    SessionEvent::MessageCommitted {
-                        message: message.clone(),
-                    },
-                )
-                .await
-                .unwrap();
-            history.push(record.sequence);
+            // Tool results commit one per call.
+            let messages = match message {
+                crate::provider::protocol::Message::Tool(results) => results
+                    .iter()
+                    .map(|result| crate::provider::protocol::Message::Tool(vec![result.clone()]))
+                    .collect(),
+                message => vec![message.clone()],
+            };
+            for message in messages {
+                let record = store
+                    .append(agent.clone(), SessionEvent::MessageCommitted { message })
+                    .await
+                    .unwrap();
+                history.push(record.sequence);
+            }
         }
         let call = store
             .append(
@@ -245,8 +265,11 @@ pub(super) mod tests {
         let id = store.id();
         drop(store);
         let (_store, records) = SessionStore::open(directory.path(), id).await.unwrap();
-        let (_, resumed) = reconstruct_model_request(&records, call.sequence).unwrap();
-        assert_eq!(&resumed, request);
+        let (_, mut resumed) = reconstruct_model_request(&records, call.sequence).unwrap();
+        assert_eq!(resumed, expected);
+        // Restore the caller's request-only settings the journal derives from its profile.
+        resumed.correlation.clone_from(&request.correlation);
+        resumed.max_output_tokens = request.max_output_tokens;
         resumed
     }
 

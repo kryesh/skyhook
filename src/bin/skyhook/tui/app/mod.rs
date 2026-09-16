@@ -33,7 +33,9 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers as M, MouseButton, MouseEventKind,
 };
 use ratatui::layout::Rect;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use skyhook::media::Attachment;
 use skyhook::{
     agent::{AgentActivity, ObservationSnapshot, ObservedEvent, RuntimeEvent, SessionHandle},

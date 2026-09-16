@@ -86,38 +86,35 @@ impl SessionRuntime {
         error: String,
         kind: crate::session::ModelFailureKind,
     ) -> Result<(), HarnessError> {
+        // Observed usage and the attempt's outcome commit together.
+        let mut events = Vec::new();
         if usage != Usage::default() {
-            self.record_model_usage(agent, request, usage).await?;
+            let request = Some(request);
+            events.push((agent.clone(), SessionEvent::Usage { request, usage }));
         }
-        self.store
-            .append(
-                agent.clone(),
-                SessionEvent::ModelFailed {
-                    request,
-                    attempt,
-                    error,
-                    kind,
-                },
-            )
-            .await?;
+        let failed = SessionEvent::ModelFailed {
+            request,
+            attempt,
+            error,
+            kind,
+        };
+        events.push((agent.clone(), failed));
+        self.store.append_all(events).await?;
+        self.usage.lock().await.accumulate(usage);
         Ok(())
     }
 
-    /// Journal the terminal stop reason of a decoded response so an audit can tell
-    /// an ordinary end of turn from a truncation, refusal, or abort.
-    pub(super) async fn record_response_completed(
+    /// Close an attempt cancelled before it produced an outcome.
+    pub(super) async fn record_attempt_interrupted(
         &self,
         agent: &AgentId,
         request: u64,
-        stop_reason: crate::provider::protocol::StopReason,
+        attempt: u64,
     ) -> Result<(), HarnessError> {
         self.store
             .append(
                 agent.clone(),
-                SessionEvent::ResponseCompleted {
-                    request,
-                    stop_reason,
-                },
+                SessionEvent::ModelAttemptInterrupted { request, attempt },
             )
             .await?;
         Ok(())
@@ -772,14 +769,11 @@ mod tests {
         impl ProviderContext for FailingProvider {
             fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
                 let correlation = request.correlation.as_ref().unwrap();
-                let session = correlation.split(':').next().unwrap();
-                let path = self.session_root.join(session).join("events.jsonl");
+                let session = correlation.split(':').next().unwrap().parse().unwrap();
+                let root = self.session_root.clone();
                 Box::pin(async move {
-                    let journal = fs::read_to_string(path).await.unwrap();
-                    let records = journal
-                        .lines()
-                        .map(|line| serde_json::from_str::<EventRecord>(line).unwrap())
-                        .collect::<Vec<_>>();
+                    // A separate reader sees only committed transactions.
+                    let records = SessionStore::read_records(&root, session).await.unwrap();
                     let SessionEvent::ModelAttemptStarted {
                         request: sequence,
                         attempt: 1,

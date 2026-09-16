@@ -75,22 +75,16 @@ impl App {
         }
     }
     pub(super) fn set_title(&self, title: &str) {
-        let Some(session) = self.session() else {
+        let Some(session) = self.session().cloned() else {
             return;
         };
-        let path = session.directory().join("ui.json");
         let title = crate::tui::format::brief(title, 100);
-        if !path.exists() {
-            let notices = self.root_notifier();
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = state::atomic_write(
-                    &path,
-                    &serde_json::to_vec(&json!({"title":title})).unwrap_or_default(),
-                ) {
-                    notices.send(format!("Could not save session title: {e}"));
-                }
-            });
-        }
+        let notices = self.root_notifier();
+        tokio::spawn(async move {
+            if let Err(e) = session.set_title(title).await {
+                notices.send(format!("Could not save session title: {e}"));
+            }
+        });
     }
     /// Invariant: at most one creation or switch is in flight. A switch never
     /// starts while another switch or a creation is pending (the latter defers

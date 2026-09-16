@@ -5,16 +5,7 @@ use super::*;
 impl Harness {
     pub async fn new_session(&self) -> Result<SessionHandle, HarnessError> {
         let store = SessionStore::create(&self.inner.session_root).await?;
-        let root = AgentId::root(store.id());
-        let started = store
-            .append(
-                root.clone(),
-                SessionEvent::SessionStarted {
-                    targets: self.inner.target_definitions.clone(),
-                },
-            )
-            .await?;
-        let runtime = SessionRuntime::build(self.inner.clone(), store, vec![started]).await?;
+        let runtime = SessionRuntime::build(self.inner.clone(), store, Vec::new()).await?;
         runtime.start_root(None).await
     }
 
@@ -23,6 +14,7 @@ impl Harness {
         let root = AgentId::root(id);
         let selection = crate::session::agent_selection(&records, &root);
         let runtime = SessionRuntime::build(self.inner.clone(), store, records).await?;
+        runtime.settle_interrupted_work().await?;
         runtime.start_root(selection).await
     }
 }
@@ -60,6 +52,22 @@ impl SessionHandle {
 
     pub fn directory(&self) -> &Path {
         self.runtime.store.directory()
+    }
+
+    /// Name the session once; later titles leave the first in place.
+    pub async fn set_title(&self, title: String) -> Result<(), HarnessError> {
+        let records = self.runtime.store.records().await;
+        if records
+            .iter()
+            .any(|record| matches!(record.event, SessionEvent::TitleSet { .. }))
+        {
+            return Ok(());
+        }
+        self.runtime
+            .store
+            .append(self.root.clone(), SessionEvent::TitleSet { title })
+            .await?;
+        Ok(())
     }
 
     /// Persist a host-facing status without adding it to the agent's model context.
@@ -373,6 +381,207 @@ mod tests {
         assert_eq!(session.runtime.store.records().await, durable);
     }
 
+    /// A crash can leave an attempt without an outcome and a committed call
+    /// without a result. Resume settles both once, before any agent runs.
+    #[tokio::test]
+    async fn resume_settles_interrupted_attempts_and_calls_exactly_once() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let requests = Requests::default();
+        let provider = scripted_provider(&requests, [answer("first")]);
+        let harness = test_harness(root.path(), &sessions, provider).await;
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(session.prompt("hello").await.unwrap(), "first");
+        let store = &session.runtime.store;
+        let records = store.records().await;
+        let context = events!(&records, SessionEvent::ModelContext { .. } => ());
+        assert_eq!(context.len(), 1);
+        let context = records
+            .iter()
+            .find(|record| matches!(record.event, SessionEvent::ModelContext { .. }))
+            .unwrap()
+            .sequence;
+        // What a process killed mid-turn leaves behind.
+        let call = ToolCall::new("orphan", "read", json!({"path": "file"})).unwrap();
+        let assistant = Message::Assistant(vec![AssistantContent::tool_call("orphan", 0, call)]);
+        let root_agent = session.root.clone();
+        store
+            .append(
+                root_agent.clone(),
+                SessionEvent::MessageCommitted { message: assistant },
+            )
+            .await
+            .unwrap();
+        let request = SessionEvent::ModelRequested {
+            context,
+            history: Vec::new(),
+            tail: Vec::new(),
+            history_lifetime: Default::default(),
+            purpose: crate::session::ModelPurpose::Agent,
+        };
+        let request = store.append(root_agent.clone(), request).await.unwrap();
+        let attempt = SessionEvent::ModelAttemptStarted {
+            request: request.sequence,
+            attempt: 1,
+        };
+        store.append(root_agent, attempt).await.unwrap();
+        let id = session.id();
+        shutdown_session(session).await;
+
+        for resume in 0..2 {
+            let resumed = harness.resume_session(id).await.unwrap();
+            let records = resumed.runtime.store.records().await;
+            assert_eq!(
+                count!(&records, SessionEvent::SessionResumed),
+                1,
+                "resume {resume}"
+            );
+            let interrupted = events!(&records,
+                SessionEvent::ModelAttemptInterrupted { request, attempt } => (*request, *attempt));
+            assert_eq!(interrupted, [(request.sequence, 1)]);
+            let results = events!(&records,
+                SessionEvent::MessageCommitted { message: Message::Tool(results) } => results.clone());
+            assert_eq!(results.len(), 1);
+            assert_eq!(
+                (results[0][0].call_id.as_str(), results[0][0].is_error),
+                ("orphan", true)
+            );
+            shutdown_session(resumed).await;
+        }
+    }
+
+    /// A resumed agent keeps its journaled prompt, tools and capabilities. Live
+    /// configuration narrows them: a pinned tool it no longer allows is shown but
+    /// never executed, a newly allowed capability is not granted, and a lower
+    /// depth limit applies.
+    #[tokio::test]
+    async fn resumed_agents_keep_their_journaled_contract_and_config_only_narrows_it() {
+        use crate::tool::policy::{Capability, CapabilitySet};
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let requests = Requests::default();
+        let provider = scripted_provider(&requests, [answer("first")]);
+        let harness = test_harness(root.path(), &sessions, provider).await;
+        let session = harness.new_session().await.unwrap();
+        session.prompt("hello").await.unwrap();
+        let id = session.id();
+        shutdown_session(session).await;
+        let original = requests.lock().unwrap()[0].clone();
+
+        let mut narrowed = CapabilitySet::default();
+        narrowed.remove(Capability::Write);
+        narrowed.insert(Capability::Targets);
+        let write = json!({"path": "must-not-exist", "content": "unsafe"});
+        let responses = [
+            response(vec![tool_call(0, "write", "write", write)]),
+            answer("done"),
+        ];
+        let provider = scripted_provider(&requests, responses);
+        let resumed = test_builder(root.path(), &sessions, provider, false)
+            .capabilities(narrowed)
+            // A lowered depth limit narrows the resumed root instead of refusing it.
+            .max_child_depth(0)
+            .build()
+            .await
+            .unwrap()
+            .resume_session(id)
+            .await
+            .unwrap();
+        assert_eq!(resumed.prompt("write it").await.unwrap(), "done");
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured[1].tools, original.tools);
+        assert_eq!(captured[1].system, original.system);
+        let Some(Message::Tool(results)) = request_history(&captured[2]).last() else {
+            panic!("expected the write result");
+        };
+        assert!(results[0].is_error);
+        assert!(
+            results[0]
+                .result
+                .to_string()
+                .contains("unavailable in this session")
+        );
+        assert!(!root.path().join("must-not-exist").exists());
+        let records = resumed.runtime.store.records().await;
+        assert_eq!(count!(&records, SessionEvent::ModelChanged { .. }), 0);
+        shutdown_session(resumed).await;
+    }
+
+    /// A retained child accepts owner input after a restart: its loop starts again
+    /// under its journaled contract and continues its own history.
+    #[tokio::test]
+    async fn retained_children_resume_after_the_session_restarts() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let requests = Requests::default();
+        let delegate = tool_call(0, "delegate", "agent", json!({"prompt": "work"}));
+        let responses = [
+            response(vec![delegate]),
+            answer("child done"),
+            answer("root done"),
+        ];
+        let provider = scripted_provider(&requests, responses);
+        let harness = test_harness(root.path(), &sessions, provider).await;
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
+        let records = session.runtime.store.records().await;
+        let job = events!(&records, SessionEvent::JobCreated { job, tool, .. } if tool == "agent" => *job)
+            [0];
+        let id = session.id();
+        shutdown_session(session).await;
+
+        let responses = [answer("child resumed"), answer("root again")];
+        let provider = scripted_provider(&requests, responses);
+        let harness = test_harness(root.path(), &sessions, provider).await;
+        let resumed = harness.resume_session(id).await.unwrap();
+        resumed.runtime.jobs.send(job, json!("more")).await.unwrap();
+        let finished = terminal(&resumed, job).await;
+        assert_eq!(finished.state, crate::job::JobState::Completed);
+        let captured = requests.lock().unwrap().clone();
+        let child = captured
+            .iter()
+            .rev()
+            .find(|request| request.correlation.as_deref() != Some(&resumed.root.to_string()))
+            .expect("the child made a request after the restart");
+        let history = serde_json::to_string(request_history(child)).unwrap();
+        assert!(history.contains("work") && history.contains("child done"));
+        assert!(history.contains("Owner input"));
+        shutdown_session(resumed).await;
+    }
+
+    #[tokio::test]
+    async fn session_title_is_set_once_and_listed_without_decoding() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let requests = Requests::default();
+        let provider = scripted_provider(&requests, [answer("done")]);
+        let harness = test_harness(root.path(), &sessions, provider).await;
+        let session = harness.new_session().await.unwrap();
+        session.prompt("list me by my first prompt").await.unwrap();
+        let summary = SessionStore::summary(&sessions, session.id())
+            .await
+            .unwrap();
+        assert_eq!(summary.title, None);
+        assert_eq!(
+            summary.preview.as_deref(),
+            Some("list me by my first prompt")
+        );
+        assert_eq!(summary.model.as_deref(), Some("test"));
+        session.set_title("first title".into()).await.unwrap();
+        session.set_title("second title".into()).await.unwrap();
+        let summary = SessionStore::summary(&sessions, session.id())
+            .await
+            .unwrap();
+        assert_eq!(summary.title.as_deref(), Some("first title"));
+        let records = session.runtime.store.records().await;
+        assert_eq!(summary.entries, records.len() as u64);
+        assert_eq!(
+            summary.last_millis,
+            records.last().unwrap().timestamp_millis
+        );
+        shutdown_session(session).await;
+    }
+
     #[tokio::test]
     async fn compaction_resume_restores_todos_and_the_first_provider_request() {
         let root = tempfile::tempdir().unwrap();
@@ -403,7 +612,7 @@ mod tests {
         let todos = &session.runtime.todos;
         let root_todos = vec![todo("Inspect queue", TodoStatus::InProgress)];
         todos.replace(&session.root, root_todos).await.unwrap();
-        let child = session.root.child(1);
+        let child = start_child(&session, 1, None).await;
         let child_todos = vec![todo("Independent child work", TodoStatus::InProgress)];
         todos.replace(&child, child_todos.clone()).await.unwrap();
         // Exceed the retention tail; only the high-usage response triggers the checkpoint.

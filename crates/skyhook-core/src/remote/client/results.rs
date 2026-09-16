@@ -78,7 +78,6 @@ impl Artifact {
             .checked_add(data.len() as u64)
             .ok_or_else(|| std::io::Error::other("artifact offset overflow"))?;
         writer.write_all(data).await?;
-        writer.flush().await?;
         self.state = if finished {
             ArtifactState::Finished(writer.finish().await?)
         } else {
@@ -248,6 +247,12 @@ mod tests {
     use crate::tool::ToolError;
     use base64::Engine as _;
 
+    fn read(source: &mut crate::job::output::Source) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(source, &mut bytes).unwrap();
+        bytes
+    }
+
     fn artifact(
         field: &str,
         kind: CaptureKind,
@@ -281,11 +286,11 @@ mod tests {
                 CaptureKind::Json,
             ),
         ] {
-            let directory = tempfile::tempdir().unwrap();
-            let job = crate::identity::JobId::new(1).unwrap();
-            let pending =
-                crate::job::output::PendingCapture::create(job, directory.path(), field, kind)
-                    .unwrap();
+            let runtime = crate::tests::TestRuntime::new().await;
+            let spec = crate::job::JobSpec::test(runtime.agent.clone(), "artifact");
+            let job = runtime.jobs.test_create(spec).await;
+            let output = runtime.jobs.output(job);
+            let pending = crate::job::output::PendingCapture::create(&output, field, kind).unwrap();
             let state = ArtifactState::Receiving(pending.open_async());
             let mut artifact = Artifact {
                 kind,
@@ -308,10 +313,10 @@ mod tests {
             assert!(capture.matches(job, field));
             assert_eq!(capture.kind(), kind);
             // Exactly one field: no absent sibling streams are manufactured.
-            let fields = transfer_fields(directory.path()).unwrap();
+            let mut fields = transfer_fields(&output).unwrap();
             assert_eq!(fields.len(), 1);
             assert_eq!(fields[0].0, field);
-            assert_eq!(std::fs::read(&fields[0].2).unwrap(), bytes);
+            assert_eq!(read(&mut fields[0].2), bytes);
             assert!(artifact.receive(kind, end, b"", true).await.is_err());
         }
     }
@@ -320,6 +325,9 @@ mod tests {
     async fn terminal_result_carries_only_referenced_proofs_on_success_and_failure() {
         for failed in [false, true] {
             let runtime = crate::tests::TestRuntime::new().await;
+            // The fixture context runs as job 1.
+            let spec = crate::job::JobSpec::test(runtime.agent.clone(), "remote");
+            runtime.jobs.test_create(spec).await;
             let context = super::super::tests::fixture_context(&runtime);
             let job = context.job();
             let (sender, receiver) = oneshot::channel();
@@ -398,12 +406,12 @@ mod tests {
             assert_eq!(stored.blob, crate::media::BlobRef::of(png.bytes()));
             assert_eq!(output.captures.len(), 1);
             assert_eq!(output.captures[0].kind(), CaptureKind::Unknown);
-            let fields = transfer_fields(&runtime.jobs.output_directory(job)).unwrap();
+            let mut fields = transfer_fields(&runtime.jobs.output(job)).unwrap();
             assert_eq!(fields.len(), 3);
             let partial = fields
-                .iter()
+                .iter_mut()
                 .find(|(field, _, _)| field == "/result/custom~1partial");
-            assert_eq!(std::fs::read(&partial.unwrap().2).unwrap(), b"{\"key\":");
+            assert_eq!(read(&mut partial.unwrap().2), b"{\"key\":");
         }
     }
 
@@ -412,17 +420,16 @@ mod tests {
         for complete in [true, false] {
             let runtime = crate::tests::TestRuntime::new().await;
             let payload = "line\n".repeat(250_000);
-            let source = runtime.root.path().join("payload.txt");
-            tokio::fs::write(&source, &payload).await.unwrap();
-            // No result/index exists for this small, unfinished JSON capture.
-            let captures = runtime.root.path().join("remote-captures");
-            let partial = crate::job::output::register_capture(
-                &captures,
+            let source = payload.clone().into_bytes();
+            // The worker's own session: no result exists for its small, unfinished JSON capture.
+            let remote = crate::tests::TestRuntime::new().await;
+            let spec = crate::job::JobSpec::test(remote.agent.clone(), "remote");
+            let captures = remote.jobs.output(remote.jobs.test_create(spec).await);
+            captures.test_capture(
                 "/result/custom~1partial",
                 crate::job::output::CaptureKind::Json,
-            )
-            .unwrap();
-            std::fs::write(partial, b"{\"key\":").unwrap();
+                b"{\"key\":",
+            );
             let mut builder = crate::tool::ToolRegistryBuilder::default();
             builder.register_dynamic("remote_fixture", "remote fixture", serde_json::json!({"type":"object","properties":{},"additionalProperties":false}), crate::tool::ToolOptions::default().output_schema(serde_json::to_value(schemars::schema_for!(crate::tool::builtins::ProcessOutput)).unwrap()), move |context, _| {
                 let source = source.clone();
@@ -439,10 +446,11 @@ mod tests {
                         if complete {
                             let fields = crate::job::output::transfer_fields(&captures).unwrap();
                             assert_eq!(fields.len(), 1);
-                            for (field, kind, path) in fields {
-                                crate::remote::protocol::write_artifact(&peer, RequestId::FIRST, field, kind, &path).await.unwrap();
+                            for (field, kind, source) in fields {
+                                crate::remote::protocol::write_artifact(&peer, RequestId::FIRST, field, kind, source).await.unwrap();
                             }
-                            crate::remote::protocol::write_artifact(&peer,RequestId::FIRST,"/result/stdout".into(),crate::job::output::CaptureKind::Text,&source).await.unwrap();
+                            let payload = crate::job::output::Source::Memory(std::io::Cursor::new(source));
+                            crate::remote::protocol::write_artifact(&peer,RequestId::FIRST,"/result/stdout".into(),crate::job::output::CaptureKind::Text,payload).await.unwrap();
                             write_frame(&mut *peer.lock().await,&Response::Tool {request_id:RequestId::FIRST,result:Ok(RemoteToolOutput { streams: Default::default(),value:serde_json::json!({"stdout":"","exit_code":0}),images:Vec::new()})}).await.unwrap();
                         } else {
                             write_frame(&mut *peer.lock().await,&Response::ToolArtifact {request_id:RequestId::FIRST,field:"/result/stdout".into(),kind:crate::job::output::CaptureKind::Text,offset:0,data:b"retained prefix\n".to_vec(),finished:false}).await.unwrap();

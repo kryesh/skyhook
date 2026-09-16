@@ -3,98 +3,79 @@ use super::*;
 use grep_matcher::Matcher as _;
 use std::{
     collections::VecDeque,
-    fs::File,
-    io::{BufRead, Seek, SeekFrom},
+    io::{BufRead, Cursor, Seek, SeekFrom},
 };
 
-const INDEX_STRIDE: usize = 256;
+const READ_AHEAD: usize = 256 * 1024;
 
-#[derive(Default, Serialize, Deserialize)]
-pub(super) struct LineIndex {
-    version: u8,
-    bytes: u64,
-    newlines: usize,
-    last_start: u64,
-    checkpoints: Vec<u64>,
+/// A pageable field: a stored capture, or a value rendered on demand.
+pub(crate) enum Source {
+    Capture(CaptureReader),
+    Memory(Cursor<Vec<u8>>),
 }
 
-impl LineIndex {
-    pub(super) fn load(
-        path: &Path,
+/// The readable extent observed when a page starts; later appends are left for
+/// the next page.
+pub(super) struct LineIndex {
+    bytes: u64,
+    pub(super) total_lines: usize,
+}
+
+impl Source {
+    pub(super) fn index(
+        &mut self,
         cancellation: &super::super::CancellationToken,
-    ) -> Result<Self, ToolError> {
+    ) -> Result<LineIndex, ToolError> {
         check_cancelled(cancellation)?;
-        let mut file = File::open(path)?;
-        let length = file.metadata()?.len();
-        let index_path = path.with_extension("lines.json");
-        let mut index: Self = File::open(&index_path)
-            .ok()
-            .and_then(|file| serde_json::from_reader(BufReader::new(file)).ok())
-            .filter(|index: &Self| {
-                index.version == 1
-                    && index.bytes <= length
-                    && index.checkpoints.len() == index.newlines / INDEX_STRIDE + 1
-                    && index.checkpoints.first() == Some(&0)
-            })
-            .unwrap_or_else(|| Self {
-                version: 1,
-                checkpoints: vec![0],
-                ..Self::default()
-            });
-        let changed = index.bytes != length || !index_path.exists();
-        file.seek(SeekFrom::Start(index.bytes))?;
-        let mut buffer = [0; 64 * 1024];
-        while index.bytes < length {
-            check_cancelled(cancellation)?;
-            let maximum = (length - index.bytes).min(buffer.len() as u64) as usize;
-            let count = file.read(&mut buffer[..maximum])?;
-            if count == 0 {
-                return Err(ToolError::Failed(
-                    "saved output changed while indexing".into(),
-                ));
-            }
-            for (offset, &byte) in buffer[..count].iter().enumerate() {
-                if byte == b'\n' {
-                    index.newlines += 1;
-                    index.last_start = index.bytes + offset as u64 + 1;
-                    if index.newlines.is_multiple_of(INDEX_STRIDE) {
-                        index.checkpoints.push(index.last_start);
-                    }
+        Ok(match self {
+            Self::Capture(capture) => {
+                let extent = capture
+                    .db
+                    .capture_extent(capture.capture)
+                    .map_err(std::io::Error::other)?;
+                LineIndex {
+                    bytes: extent.bytes,
+                    total_lines: usize::try_from(extent.newlines).unwrap_or(usize::MAX)
+                        + usize::from(extent.bytes > 0 && !extent.ends_line),
                 }
             }
-            index.bytes += count as u64;
-        }
-        if changed {
-            let mut saved =
-                tempfile::NamedTempFile::new_in(path.parent().expect("field directory"))?;
-            {
-                let mut writer = std::io::BufWriter::new(&mut saved);
-                serde_json::to_writer(&mut writer, &index)?;
-                writer.flush()?;
+            Self::Memory(cursor) => {
+                let bytes = cursor.get_ref();
+                LineIndex {
+                    bytes: bytes.len() as u64,
+                    total_lines: bytes.iter().filter(|&&byte| byte == b'\n').count()
+                        + usize::from(bytes.last().is_some_and(|&byte| byte != b'\n')),
+                }
             }
-            saved.flush()?;
-            saved.persist(index_path).map_err(|error| error.error)?;
-        }
-        Ok(index)
+        })
     }
 
-    pub(super) fn total_lines(&self) -> usize {
-        self.newlines + usize::from(self.last_start < self.bytes)
+    /// A position at or before the start of one-based `line`, and its line number.
+    fn checkpoint(&self, line: usize) -> Result<(u64, usize), ToolError> {
+        match self {
+            Self::Capture(capture) => {
+                let (offset, line) = capture
+                    .db
+                    .capture_line(capture.capture, line as u64)
+                    .map_err(std::io::Error::other)?;
+                Ok((offset, usize::try_from(line).unwrap_or(usize::MAX)))
+            }
+            Self::Memory(_) => Ok((0, 1)),
+        }
     }
 
     fn seek_line(
-        &self,
-        reader: &mut BufReader<File>,
+        reader: &mut BufReader<Self>,
+        index: &LineIndex,
         line: usize,
         cancellation: &super::super::CancellationToken,
     ) -> Result<(), ToolError> {
-        let checkpoint = ((line - 1) / INDEX_STRIDE).min(self.checkpoints.len() - 1);
-        reader.seek(SeekFrom::Start(self.checkpoints[checkpoint]))?;
-        let mut current = checkpoint * INDEX_STRIDE + 1;
-        while current < line && reader.stream_position()? < self.bytes {
+        let (offset, mut current) = reader.get_ref().checkpoint(line)?;
+        reader.seek(SeekFrom::Start(offset))?;
+        while current < line && reader.stream_position()? < index.bytes {
             check_cancelled(cancellation)?;
             let remaining =
-                (self.bytes - reader.stream_position()?).min(usize::MAX as u64) as usize;
+                (index.bytes - reader.stream_position()?).min(usize::MAX as u64) as usize;
             let buffer = reader.fill_buf()?;
             let buffer = &buffer[..buffer.len().min(remaining)];
             if buffer.is_empty() {
@@ -110,6 +91,97 @@ impl LineIndex {
             reader.consume(count);
         }
         Ok(())
+    }
+}
+
+impl Read for Source {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Capture(capture) => capture.read(buffer),
+            Self::Memory(cursor) => cursor.read(buffer),
+        }
+    }
+}
+
+impl Seek for Source {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        match self {
+            Self::Capture(capture) => capture.seek(position),
+            Self::Memory(cursor) => cursor.seek(position),
+        }
+    }
+}
+
+/// Reads one capture's chunks on demand, holding the connection only per fetch.
+pub(crate) struct CaptureReader {
+    db: crate::session::SharedDb,
+    capture: i64,
+    position: u64,
+    cached: (u64, Vec<u8>),
+}
+
+impl CaptureReader {
+    pub(super) fn new(db: crate::session::SharedDb, capture: i64) -> Self {
+        Self {
+            db,
+            capture,
+            position: 0,
+            cached: (0, Vec::new()),
+        }
+    }
+}
+
+impl Read for CaptureReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let (start, data) = &self.cached;
+        if self.position < *start || self.position >= start + data.len() as u64 {
+            let chunks = self
+                .db
+                .capture_chunks(self.capture, self.position, READ_AHEAD)
+                .map_err(std::io::Error::other)?;
+            let Some(first) = chunks.first() else {
+                return Ok(0);
+            };
+            let start = first.0;
+            let mut data = Vec::new();
+            for (offset, chunk) in chunks {
+                if offset != start + data.len() as u64 {
+                    return Err(std::io::Error::other("saved output changed while reading"));
+                }
+                data.extend_from_slice(&chunk);
+            }
+            self.cached = (start, data);
+        }
+        let (start, data) = &self.cached;
+        if self.position < *start {
+            return Err(std::io::Error::other("saved output changed while reading"));
+        }
+        let available = data
+            .get((self.position - start) as usize..)
+            .unwrap_or_default();
+        let count = available.len().min(buffer.len());
+        buffer[..count].copy_from_slice(&available[..count]);
+        self.position += count as u64;
+        Ok(count)
+    }
+}
+
+impl Seek for CaptureReader {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let target = match position {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+            SeekFrom::End(delta) => self
+                .db
+                .capture_extent(self.capture)
+                .map_err(std::io::Error::other)?
+                .bytes
+                .checked_add_signed(delta),
+        };
+        self.position = target.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid capture seek")
+        })?;
+        Ok(self.position)
     }
 }
 
@@ -155,7 +227,7 @@ fn invalid_offset() -> ToolError {
 }
 
 fn seek_offset(
-    reader: &mut BufReader<File>,
+    reader: &mut BufReader<Source>,
     offset: usize,
     end: u64,
     cancellation: &super::super::CancellationToken,
@@ -186,7 +258,7 @@ fn seek_offset(
 }
 
 fn read_piece(
-    reader: &mut BufReader<File>,
+    reader: &mut BufReader<Source>,
     end: u64,
     maximum: usize,
 ) -> Result<Vec<u8>, ToolError> {
@@ -241,34 +313,31 @@ fn fit_line(
 }
 
 pub(super) fn page(
-    path: &Path,
+    source: Option<Source>,
     selection: &Selection,
     limit: usize,
     terminal: bool,
     cancellation: &super::super::CancellationToken,
 ) -> Result<OutputPreview, ToolError> {
-    let index = match LineIndex::load(path, cancellation) {
-        Ok(index) => index,
-        Err(ToolError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(empty(
-                selection,
-                if terminal { Some(0) } else { None },
-                terminal,
-            ));
-        }
-        Err(error) => return Err(error),
+    let Some(mut source) = source else {
+        return Ok(empty(
+            selection,
+            if terminal { Some(0) } else { None },
+            terminal,
+        ));
     };
-    let mut reader = BufReader::new(File::open(path)?);
-    if selection.start > index.total_lines() {
+    let index = source.index(cancellation)?;
+    let mut reader = BufReader::with_capacity(64 * 1024, source);
+    if selection.start > index.total_lines {
         if selection.offset != 0 {
             return Err(invalid_offset());
         }
-        return Ok(empty(selection, Some(index.total_lines()), terminal));
+        return Ok(empty(selection, Some(index.total_lines), terminal));
     }
     if selection.matcher.is_some() {
         return search(reader, &index, selection, limit, terminal, cancellation);
     }
-    index.seek_line(&mut reader, selection.start, cancellation)?;
+    Source::seek_line(&mut reader, &index, selection.start, cancellation)?;
     seek_offset(&mut reader, selection.offset, index.bytes, cancellation)?;
     let mut line = selection.start;
     let mut offset = selection.offset;
@@ -332,7 +401,7 @@ pub(super) fn page(
     let exhausted = reader.stream_position()? == index.bytes;
     Ok(response(
         selection,
-        Some(index.total_lines()),
+        Some(index.total_lines),
         lines,
         if exhausted && terminal {
             None
@@ -343,7 +412,7 @@ pub(super) fn page(
 }
 
 fn search(
-    mut reader: BufReader<File>,
+    mut reader: BufReader<Source>,
     index: &LineIndex,
     selection: &Selection,
     limit: usize,
@@ -352,10 +421,10 @@ fn search(
 ) -> Result<OutputPreview, ToolError> {
     let matcher = selection.matcher.as_ref().expect("search matcher");
     // Validate independently of whether the starting line matches.
-    index.seek_line(&mut reader, selection.start, cancellation)?;
+    Source::seek_line(&mut reader, index, selection.start, cancellation)?;
     seek_offset(&mut reader, selection.offset, index.bytes, cancellation)?;
     let mut line = selection.start.saturating_sub(selection.context).max(1);
-    index.seek_line(&mut reader, line, cancellation)?;
+    Source::seek_line(&mut reader, index, line, cancellation)?;
     let mut lookahead = VecDeque::<(String, bool)>::new();
     let mut after = 0;
     let mut lines = Vec::new();
@@ -441,7 +510,7 @@ fn search(
     }
     Ok(response(
         selection,
-        Some(index.total_lines()),
+        Some(index.total_lines),
         lines,
         if exhausted {
             None
@@ -465,11 +534,8 @@ mod tests {
         }
     }
 
-    fn saved(text: &str) -> (tempfile::TempDir, PathBuf) {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("field.txt");
-        std::fs::write(&path, text).unwrap();
-        (directory, path)
+    fn saved(text: &str) -> Option<Source> {
+        Some(Source::Memory(Cursor::new(text.as_bytes().to_vec())))
     }
 
     #[test]
@@ -480,8 +546,14 @@ mod tests {
             "b".repeat(4000),
             "🦀\"\\".repeat(4000)
         );
-        let (_directory, path) = saved(&text);
-        let first = page(&path, &selection(1, 0), 100, true, &Default::default()).unwrap();
+        let first = page(
+            saved(&text),
+            &selection(1, 0),
+            100,
+            true,
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(first.lines.len(), 1);
         assert_eq!(first.next.unwrap().start, 2);
         assert_eq!(first.next.unwrap().offset, 0);
@@ -489,11 +561,11 @@ mod tests {
         let mut reconstructed = String::new();
         let mut previous = 1;
         for _ in 0..100 {
-            let view = page(&path, &query, 100, true, &Default::default()).unwrap();
+            let view = page(saved(&text), &query, 100, true, &Default::default()).unwrap();
             assert!(serde_json::to_vec(&view).unwrap().len() <= PAGE_BYTES);
             assert_eq!(
                 view,
-                page(&path, &query, 100, true, &Default::default()).unwrap()
+                page(saved(&text), &query, 100, true, &Default::default()).unwrap()
             );
             for (index, row) in view.lines.iter().enumerate() {
                 let number = (query.start + index) as u64;
@@ -513,23 +585,20 @@ mod tests {
 
     #[test]
     fn live_search_defers_unfinished_context_and_resumes_without_duplicates() {
-        let (_directory, path) = saved("before\nERROR\npar");
         let mut query = selection(1, 0);
         query.matcher = Some(std::sync::Arc::new(
             crate::tool::builtins::search::output_matcher("ERROR").unwrap(),
         ));
         query.context = 1;
-        let first = page(&path, &query, 100, false, &Default::default()).unwrap();
+        let live = "before\nERROR\npar";
+        let first = page(saved(live), &query, 100, false, &Default::default()).unwrap();
         assert_eq!(first.lines.len(), 1);
         assert_eq!(first.lines[0], "before");
         assert_eq!(first.next.unwrap().start, 2);
-        let mut output = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        write!(output, "tial\nlast\n").unwrap();
+        // The producer appends before the next page is read.
+        let text = format!("{live}tial\nlast\n");
         query.start = 2;
-        let rest = page(&path, &query, 100, true, &Default::default()).unwrap();
+        let rest = page(saved(&text), &query, 100, true, &Default::default()).unwrap();
         assert_eq!(
             rest.lines
                 .iter()
@@ -540,7 +609,7 @@ mod tests {
         assert!(rest.next.is_none());
         query.start = 3;
         query.offset = 1;
-        let rest = page(&path, &query, 100, true, &Default::default()).unwrap();
+        let rest = page(saved(&text), &query, 100, true, &Default::default()).unwrap();
         assert_eq!(rest.lines[0], "artial");
     }
 }

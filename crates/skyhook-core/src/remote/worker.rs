@@ -72,6 +72,31 @@ where
         .tempdir()?;
     let store = SessionStore::create_ephemeral(temporary.path()).await?;
     let worker_agent = AgentId::root(store.id());
+    let workspace = std::fs::canonicalize(".")?;
+    // Worker jobs belong to a tool-only root agent; each request carries its exact capabilities.
+    store
+        .append_all(vec![
+            (
+                worker_agent.clone(),
+                crate::session::SessionEvent::SessionStarted {
+                    targets: Vec::new(),
+                    capabilities: crate::tool::policy::Capability::ALL.to_vec(),
+                    max_child_depth: 0,
+                },
+            ),
+            (
+                worker_agent.clone(),
+                crate::session::SessionEvent::AgentStarted {
+                    parent: None,
+                    owner_job: None,
+                    profile: None,
+                    available_depth: 0,
+                    capabilities: crate::tool::policy::Capability::ALL.to_vec(),
+                    location: crate::execution::ExecutionLocation::root(workspace.clone()),
+                },
+            ),
+        ])
+        .await?;
     let jobs = JobManager::new(store.clone());
     let mut builder = ToolRegistryBuilder::default();
     register_worker_tools(&mut builder, store.clone())?;
@@ -84,7 +109,7 @@ where
             next_id: AtomicU64::new(1),
         }),
         jobs.clone(),
-        std::fs::canonicalize(".")?,
+        workspace,
     )
     .with_authorization_root(authorization_root)
     .with_process_environment(services.environment.clone());
@@ -134,10 +159,10 @@ where
                             };
                             let mut result = externalize_result(result, &store).await;
                             if let Some(job) = captured_job {
-                                let directory = store.directory().join("jobs").join(job.to_string());
-                                match crate::job::output::transfer_fields(&directory) {
-                                    Ok(fields) => for (field, kind, path) in fields {
-                                        if let Err(error) = super::protocol::write_artifact(&output, request_id, field, kind, &path).await {
+                                let saved = executor.jobs().output(job);
+                                match tokio::task::spawn_blocking(move || crate::job::output::transfer_fields(&saved)).await.map_err(|error| crate::tool::ToolError::Failed(error.to_string())).and_then(|fields| fields) {
+                                    Ok(fields) => for (field, kind, source) in fields {
+                                        if let Err(error) = super::protocol::write_artifact(&output, request_id, field, kind, source).await {
                                             return (request_id, Err(error));
                                         }
                                     },

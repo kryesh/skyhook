@@ -32,10 +32,6 @@ impl ModelRequestTemplate {
     pub(crate) fn to_request(&self) -> ModelRequest {
         self.0.clone()
     }
-
-    pub(crate) fn into_request(self) -> ModelRequest {
-        self.0
-    }
 }
 
 #[cfg(test)]
@@ -87,6 +83,6 @@ mod tests {
         let mut raw = request();
         raw.history_lifetime = HistoryLifetime::Ending;
         let template = ModelRequestTemplate::try_from(raw).unwrap();
-        assert_eq!(template.into_request(), request());
+        assert_eq!(template.to_request(), request());
     }
 }

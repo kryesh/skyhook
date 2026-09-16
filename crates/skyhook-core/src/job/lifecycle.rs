@@ -65,6 +65,7 @@ impl JobManager {
                     output_schema: spec.output_schema.clone(),
                     accepts_input: spec.accepts_input,
                     background: spec.background,
+                    authorization_scope: spec.authorization_scope,
                     location: spec.location.clone(),
                 },
             )
@@ -201,21 +202,16 @@ impl JobManager {
                     let captures = output.take_captures();
                     (Some(output.value), output.images, captures)
                 });
-            let directory = manager.output_directory(id);
+            let saved = manager.output(id);
             // Captures have independent pointer/type metadata. A failed tool need not
             // produce a result, and unfinished JSON captures are not valid result trees.
             let document = serde_json::json!({"capture_complete":capture_complete, "result":output, "error":error});
             tokio::task::spawn_blocking(move || {
-                output::save_completed(&directory, id, &document, captures)
+                output::save_completed(&saved, &document, captures)
             })
             .await
             .map_err(|e| JobError::Internal(e.to_string()))?
-            .map_err(SessionError::from)?;
-            let output_path = Some(
-                std::path::PathBuf::from("jobs")
-                    .join(id.to_string())
-                    .join("document.json"),
-            );
+            .map_err(|e| JobError::Internal(e.to_string()))?;
             manager.inner
                 .store
                 .append(
@@ -223,7 +219,6 @@ impl JobManager {
                     SessionEvent::JobFinished {
                         job: id,
                         state,
-                        output_path,
                         error: error.clone(),
                         images: images.clone(),
                         denial: denial.clone(),
@@ -354,15 +349,15 @@ mod tests {
         for unreadable in [false, true] {
             let (_root, jobs, agent) = super::super::tests::runtime().await;
             let id = jobs.test_create(JobSpec::test(agent, "capture")).await;
-            let directory = jobs.output_directory(id);
+            let output = jobs.output(id);
             let field = "/result/stdout";
-            let mut writer = PendingCapture::create(id, &directory, field, CaptureKind::Text)
+            let mut writer = PendingCapture::create(&output, field, CaptureKind::Text)
                 .unwrap()
                 .open();
             writer.write_all(b"partial \xff output").unwrap();
             let capture = writer.finish().unwrap();
             if unreadable {
-                std::fs::remove_file(output::field_file(&directory, field)).unwrap();
+                output.test_delete_capture(&capture);
             }
             let product =
                 ToolOutput::new(serde_json::json!({"exit_code": 0})).with_captures(vec![capture]);
@@ -424,13 +419,10 @@ mod tests {
                 .await
                 .unwrap();
             if tool == "blocked" {
-                let jobs_directory = jobs.store().directory().join("jobs");
-                tokio::fs::write(
-                    jobs_directory.join(running.job.to_string()),
-                    b"not a directory",
-                )
-                .await
-                .unwrap();
+                jobs.store().outputs().test_batch(
+                    "CREATE TEMP TRIGGER reject_output BEFORE INSERT ON job_output \
+                     BEGIN SELECT RAISE(ABORT, 'injected output fault'); END;",
+                );
                 release.add_permits(1);
             }
             let wait =

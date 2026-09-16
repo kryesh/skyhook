@@ -2,16 +2,16 @@
 //! IO completion is not JSON validity or terminal publication. Validate first,
 //! then install the existing compact document/fields references in one owner.
 use super::*;
-use std::{fs::File, io};
+use std::io;
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 /// Persist a terminal product, referencing only its explicitly completed captures.
-/// JSON containers retain empty-container external references; JSON scalars are
-/// decoded inline (the legacy reference format cannot distinguish a JSON-encoded
-/// string from raw Text), so their sidecars stay discoverable but unreferenced.
+/// JSON containers retain empty-container references; JSON scalars are decoded
+/// inline (a reference cannot distinguish a JSON-encoded string from raw Text),
+/// so their captures stay discoverable but unreferenced.
 /// Existing null/bool/number fields always remain authoritative. Known kinds can
 /// install a missing field; Unknown kinds reference only an existing string or
 /// container shape. Byte validity alone must never reinterpret text as JSON.
@@ -19,20 +19,24 @@ fn invalid(message: impl Into<String>) -> io::Error {
 /// A receipt that fails binding, byte, or pointer validation never fails the
 /// terminal product: it stays unreferenced, so discovery reports that capture
 /// as incomplete while the job's real outcome is still published. Only failures
-/// persisting the document, its references, or registrations are errors. This
-/// does not add a multi-file transaction to the document/fields.json path.
+/// persisting the document, its references, or registrations are errors.
 pub(crate) fn save_completed(
-    directory: &Path,
-    job: JobId,
+    output: &Output,
     document: &Value,
     completed: Vec<CompletedCapture>,
-) -> io::Result<()> {
+) -> Result<(), ToolError> {
     // An unreadable inventory leaves every receipt unbound (and so incomplete).
-    let registered = captures::available_captures(directory, false)
-        .map(|captures| {
-            captures
-                .into_iter()
-                .map(|capture| (capture.field, capture.kind))
+    let saved = Saved::load(output).ok();
+    let registered = saved
+        .as_ref()
+        .map(|saved| {
+            saved
+                .captures
+                .values()
+                .map(|capture| {
+                    let kind = CaptureKind::parse(&capture.kind);
+                    (capture.pointer.clone(), (capture.id, kind))
+                })
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
@@ -43,29 +47,30 @@ pub(crate) fn save_completed(
     let bound = completed
         .iter()
         .enumerate()
-        .filter(|(index, capture)| {
+        .filter_map(|(index, capture)| {
             let field = capture.field();
-            capture.belongs_to(job, directory)
-                && registered.get(field) == Some(&capture.kind())
+            let &(id, kind) = registered.get(field)?;
+            (capture.belongs_to(output.job, id)
+                && kind == capture.kind()
                 // Every receipt for a duplicate or overlapping field is unbound:
                 // neither can be referenced without shadowing the other.
                 && fields.iter().enumerate().all(|(other, candidate)| {
-                    other == *index
+                    other == index
                         || (*candidate != field
                             && !nested(candidate, field)
                             && !nested(field, candidate))
-                })
+                }))
+            .then_some((id, capture))
         })
-        .map(|(_, capture)| capture)
         .collect::<Vec<_>>();
 
     let mut document = document.clone();
     let mut references = BTreeSet::new();
     let mut kinds = Vec::new();
-    for capture in bound {
+    for (id, capture) in bound {
         let field = capture.field();
-        let Some((kind, value)) = admitted_value(&document, directory, capture).ok().flatten()
-        else {
+        let Some(saved) = &saved else { break };
+        let Some((kind, value)) = admitted_value(&document, saved, capture).ok().flatten() else {
             continue;
         };
         if install(&mut document, field, value.clone()).is_err() {
@@ -74,14 +79,16 @@ pub(crate) fn save_completed(
         if kind == CaptureKind::Text || value.is_array() || value.is_object() {
             references.insert(field.to_owned());
         }
-        kinds.push((field.to_owned(), kind));
+        kinds.push((id, kind));
     }
-    // Legacy Unknown registrations are normalized only for admitted receipts.
-    // Known kinds retain their original registration.
-    for (field, kind) in kinds {
-        register_capture(directory, &field, kind)?;
+    // Unknown registrations resolve only for admitted receipts.
+    for (id, kind) in kinds {
+        output
+            .db
+            .resolve_capture_kind(id, kind.as_str())
+            .map_err(database)?;
     }
-    save_inner(directory, &document, Some(&references))
+    save_document(output, &document, &references)
 }
 
 fn nested(field: &str, ancestor: &str) -> bool {
@@ -95,22 +102,26 @@ fn nested(field: &str, ancestor: &str) -> bool {
 /// is a persistence failure, so the caller publishes both as incomplete.
 fn admitted_value(
     document: &Value,
-    directory: &Path,
+    saved: &Saved,
     capture: &CompletedCapture,
 ) -> io::Result<Option<(CaptureKind, Value)>> {
     let field = capture.field();
-    let path = field_file(directory, field);
+    let source = || {
+        saved
+            .capture(field)
+            .ok_or_else(|| invalid("completed capture is missing"))
+    };
     Ok(Some(match (capture.kind(), document.pointer(field)) {
         // A terminal primitive historically abandons the raw capture, even
         // when the sender completed its bytes. Do not parse or replace it.
         (_, Some(Value::Null | Value::Bool(_) | Value::Number(_))) => return Ok(None),
         (CaptureKind::Text, _) | (CaptureKind::Unknown, Some(Value::String(_))) => {
-            validate_utf8(File::open(&path)?, &mut [0; 64 * 1024])?;
+            validate_utf8(source()?, &mut [0; 64 * 1024])?;
             (CaptureKind::Text, Value::String(String::new()))
         }
         (CaptureKind::Json, _)
         | (CaptureKind::Unknown, Some(Value::Object(_) | Value::Array(_))) => {
-            (CaptureKind::Json, validated_json_reference(&path)?)
+            (CaptureKind::Json, validated_json_reference(source()?)?)
         }
         // Historical Unknown is only a hint. Scalars and missing
         // fields never referenced its bytes; retain that distinction.
@@ -120,8 +131,8 @@ fn admitted_value(
 
 /// Validate JSON without constructing its container tree. Scalars are then
 /// decoded inline; only the scalar string case can allocate proportional bytes.
-fn validated_json_reference(path: &Path) -> io::Result<Value> {
-    let mut source = BufReader::new(File::open(path)?);
+fn validated_json_reference(source: Source) -> io::Result<Value> {
+    let mut source = BufReader::new(source);
     let first = loop {
         let buffer = source.fill_buf()?;
         if buffer.is_empty() {

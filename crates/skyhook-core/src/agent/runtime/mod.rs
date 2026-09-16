@@ -9,7 +9,7 @@ use std::{
     },
 };
 
-use futures_util::{StreamExt as _, future::join_all};
+use futures_util::StreamExt as _;
 use serde_json::json;
 use tokio::{
     fs,
@@ -572,10 +572,14 @@ mod tests {
             .default_model_profile("test")
     }
 
-    pub(super) async fn bounded<T>(future: impl Future<Output = T>) -> T {
-        tokio::time::timeout(Duration::from_secs(10), future)
-            .await
-            .expect("test synchronization timed out")
+    #[track_caller]
+    pub(super) fn bounded<T>(future: impl Future<Output = T>) -> impl Future<Output = T> {
+        let caller = std::panic::Location::caller();
+        async move {
+            tokio::time::timeout(Duration::from_secs(10), future)
+                .await
+                .unwrap_or_else(|_| panic!("test synchronization timed out at {caller}"))
+        }
     }
 
     pub(super) async fn until(
@@ -598,6 +602,17 @@ mod tests {
     pub(super) async fn terminal(session: &SessionHandle, job: JobId) -> crate::job::JobEnvelope {
         until(session, job, |job| job.state.is_terminal()).await;
         session.runtime.jobs.wait(job, None, true).await.unwrap()
+    }
+
+    /// Journal the start of the root's child `index`, as the agent tool would.
+    pub(super) async fn start_child(
+        session: &SessionHandle,
+        index: u32,
+        owner: Option<JobId>,
+    ) -> AgentId {
+        let workspace = session.runtime.harness.workspace.clone();
+        let store = &session.runtime.store;
+        crate::session::fixture::start_child(store, &session.root, index, owner, &workspace).await
     }
 
     /// A running Agent-role job owning retained children and their questions.
@@ -740,10 +755,7 @@ mod tests {
         let store = SessionStore::create_ephemeral(&root.join("sessions"))
             .await
             .unwrap();
-        let targets = harness.inner.target_definitions.clone();
-        let started = SessionEvent::SessionStarted { targets };
-        let started = store.append(AgentId::root(store.id()), started).await;
-        let runtime = SessionRuntime::build(harness.inner.clone(), store, vec![started.unwrap()])
+        let runtime = SessionRuntime::build(harness.inner.clone(), store, Vec::new())
             .await
             .unwrap();
         runtime.start_root(None).await.unwrap()

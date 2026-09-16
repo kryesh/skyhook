@@ -20,7 +20,13 @@ pub(super) struct AgentContext {
     pub projected: Vec<(u64, Message)>,
     pub meter: TokenMeter,
     pub provider: Box<dyn ProviderContext>,
+    /// Pinned tools the live registry no longer provides as journaled.
+    pub unavailable_tools: std::sync::Arc<std::collections::HashSet<String>>,
     checkpoint: Option<u64>,
+    /// The last journal sequence reflected in `projected`.
+    through: u64,
+    /// Checkpoint and retained messages, which precede later commits in `projected`.
+    prefix: usize,
 }
 
 impl AgentContext {
@@ -42,26 +48,60 @@ impl AgentContext {
         Ok(Self {
             profile,
             template,
+            prefix: history_prefix(&projected, records, agent),
             projected,
             meter,
             provider,
+            unavailable_tools: Default::default(),
             checkpoint: checkpoint(records, agent),
+            through: records.last().map_or(0, |record| record.sequence),
         })
     }
 
     /// The journal remains authoritative, including compactions committed externally.
-    pub fn refresh(
+    /// Only records committed since the last refresh are visited, unless one of them
+    /// replaces this agent's history.
+    pub async fn refresh(
         &mut self,
-        records: &[EventRecord],
+        store: &crate::session::SessionStore,
         agent: &AgentId,
     ) -> Result<(), HarnessError> {
-        let projected = project_history(records, agent)?;
-        let checkpoint = checkpoint(records, agent);
-        if self.checkpoint != checkpoint {
+        let (mut compacted, mut through, mut committed) = (false, self.through, Vec::new());
+        store
+            .visit_records_after(self.through, |records| {
+                for record in records.iter().filter(|record| &record.agent == agent) {
+                    match &record.event {
+                        SessionEvent::Compaction { .. } => compacted = true,
+                        SessionEvent::MessageCommitted { message } => {
+                            committed.push((record.sequence, message.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+                through = records.last().map_or(through, |record| record.sequence);
+            })
+            .await;
+        if compacted {
+            let records = store.records().await;
+            self.projected = project_history(&records, agent)?;
+            self.prefix = history_prefix(&self.projected, &records, agent);
             self.meter = TokenMeter::default();
-            self.checkpoint = checkpoint;
+            self.checkpoint = checkpoint(&records, agent);
+            self.through = records.last().map_or(0, |record| record.sequence);
+            return Ok(());
         }
-        self.projected = projected;
+        // The turn pushes its own commits as it makes them; other producers'
+        // commits interleave, so later history is kept in journal order.
+        let suffix = &self.projected[self.prefix..];
+        let known: std::collections::HashSet<_> =
+            suffix.iter().map(|(sequence, _)| *sequence).collect();
+        for (sequence, message) in committed {
+            if !known.contains(&sequence) && !message.is_content_free() {
+                self.projected.push((sequence, message));
+            }
+        }
+        self.projected[self.prefix..].sort_by_key(|(sequence, _)| *sequence);
+        self.through = through;
         Ok(())
     }
 
@@ -73,11 +113,9 @@ impl AgentContext {
     /// `needs_compaction` decides.
     pub fn request(&self, runtime: UserContent) -> ModelRequest {
         let mut request = ModelRequest {
-            history: self
-                .projected
-                .iter()
-                .map(|(_, message)| message.clone())
-                .collect(),
+            history: crate::session::merge_tool_results(
+                self.projected.iter().map(|(_, message)| message.clone()),
+            ),
             // The caller commits persisted state to history before sending.
             tail: match self.profile.state_mode {
                 StateMode::None => Vec::new(),
@@ -113,6 +151,23 @@ impl AgentContext {
     }
 }
 
+/// The projected checkpoint and the retained messages at or before its frontier.
+fn history_prefix(projected: &[(u64, Message)], records: &[EventRecord], agent: &AgentId) -> usize {
+    let frontier = records.iter().rev().find_map(|record| match &record.event {
+        SessionEvent::Compaction { checkpoint } if &record.agent == agent => {
+            Some(checkpoint.frontier)
+        }
+        _ => None,
+    });
+    frontier.map_or(0, |frontier| {
+        1 + projected
+            .iter()
+            .skip(1)
+            .take_while(|(sequence, _)| *sequence <= frontier)
+            .count()
+    })
+}
+
 fn checkpoint(records: &[EventRecord], agent: &AgentId) -> Option<u64> {
     records
         .iter()
@@ -132,13 +187,12 @@ pub(in crate::agent) fn recorded_context(
         .iter()
         .filter_map(|record| match &record.event {
             SessionEvent::AgentStarted {
-                max_context: Some(capacity),
+                profile: Some(profile),
                 ..
             }
-            | SessionEvent::ModelChanged {
-                max_context: capacity,
-                ..
-            } => Some((&record.agent, *capacity)),
+            | SessionEvent::ModelChanged { profile } => {
+                Some((&record.agent, profile.profile.max_context))
+            }
             _ => None,
         })
         .collect();
@@ -171,7 +225,9 @@ pub(in crate::agent) fn recorded_context(
             continue;
         };
         let current = ModelRequest {
-            history: history.into_iter().map(|(_, message)| message).collect(),
+            history: crate::session::merge_tool_results(
+                history.into_iter().map(|(_, message)| message),
+            ),
             tail,
             ..request
         };
@@ -295,7 +351,10 @@ mod tests {
             projected: vec![],
             meter: super::TokenMeter::default(),
             provider,
+            unavailable_tools: Default::default(),
             checkpoint: None,
+            through: 0,
+            prefix: 0,
         }
     }
 

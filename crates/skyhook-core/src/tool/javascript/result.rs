@@ -96,7 +96,8 @@ mod tests {
             );
         }
         let runtime = TestRuntime::new().await;
-        let job = crate::identity::JobId::new(1).unwrap();
+        let spec = crate::job::JobSpec::test(runtime.agent.clone(), "script");
+        let job = runtime.jobs.test_create(spec).await;
         let proof = console(&runtime, job).await.finish_nonempty().unwrap();
         assert!(proof.is_none());
         assert_codec(

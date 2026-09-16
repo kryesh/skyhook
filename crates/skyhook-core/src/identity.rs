@@ -22,6 +22,11 @@ macro_rules! random_id {
             pub const fn from_bytes(bytes: [u8; 16]) -> Self {
                 Self(bytes)
             }
+
+            #[must_use]
+            pub const fn to_bytes(self) -> [u8; 16] {
+                self.0
+            }
         }
 
         impl fmt::Display for $name {

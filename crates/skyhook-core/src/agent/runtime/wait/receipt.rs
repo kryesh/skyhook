@@ -52,13 +52,11 @@ pub(super) mod tests {
         };
         let id = runtime.jobs.create(spec).await.unwrap().into_test_id();
         let child = session.root.child(123);
-        let started = SessionEvent::AgentStarted {
-            parent: Some(session.root.clone()),
-            owner_job: Some(id),
-            model_profile: "child".into(),
-            max_context: None,
-            location: crate::execution::ExecutionLocation::root(root.to_path_buf()),
-        };
+        let started = crate::session::fixture::child_started(
+            Some(session.root.clone()),
+            Some(id),
+            crate::execution::ExecutionLocation::root(root.to_path_buf()),
+        );
         runtime.store.append(child.clone(), started).await.unwrap();
         runtime
             .jobs
@@ -77,7 +75,8 @@ pub(super) mod tests {
         let message = Message::Assistant(vec![AssistantContent::text("fixture-reply", 0, text)]);
         let jobs = &session.runtime.jobs;
         // Fixture progress stands in for a non-terminal child reply: it wakes the owner.
-        let committed = jobs.commit_child_message(child, job, message, text.to_owned(), true);
+        let committed =
+            jobs.commit_child_message(child, job, message, text.to_owned(), true, |_| Vec::new());
         committed.await.unwrap()
     }
 

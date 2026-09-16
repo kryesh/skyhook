@@ -131,13 +131,8 @@ mod tests {
 
     async fn started(jobs: &JobManager, agent: &AgentId, owner: JobId, target: &str) {
         let location = ExecutionLocation::named(target, format!("/{target}/work").into());
-        let event = SessionEvent::AgentStarted {
-            parent: None,
-            owner_job: Some(owner),
-            model_profile: "test".into(),
-            max_context: None,
-            location: location.clone(),
-        };
+        let event =
+            crate::session::fixture::child_started(agent.parent(), Some(owner), location.clone());
         jobs.test_append(agent.clone(), event).await;
         jobs.set_agent_location(owner, location).await.unwrap();
     }
@@ -172,7 +167,7 @@ mod tests {
     async fn active_progress_is_recursive_exclusive_and_location_filtered() {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::create(directory.path()).await.unwrap();
-        let root = AgentId::root(store.id());
+        let root = crate::session::fixture::started(&store, directory.path()).await;
         let child = root.child(1);
         let grandchild = child.child(1);
         let great_grandchild = grandchild.child(1);
@@ -257,7 +252,7 @@ mod tests {
     async fn progress_survives_retained_resume_and_replay() {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::create(directory.path()).await.unwrap();
-        let root = AgentId::root(store.id());
+        let root = crate::session::fixture::started(&store, directory.path()).await;
         let child = root.child(1);
         let jobs = JobManager::new(store.clone());
         let spec = JobSpec {

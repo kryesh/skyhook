@@ -256,38 +256,15 @@ fn register_child_agent(
                 // Associate immediately so a failed first turn is selectable for retry
                 // even when it never emitted visible assistant text.
                 runtime.jobs.set_child_agent(context.job(), child.clone()).await.map_err(|error| tool_error(&error))?;
-                // Only this live child session may opt its terminal job into resumption.
-                // Keep a weak runtime reference: jobs must not retain their own manager.
-                let resume_runtime = Arc::downgrade(&runtime);
-                let resume_child = child.clone();
-                let resume_sender = sender.clone();
-                let authorization = context.job_subject().clone();
-                let execution_location = context.execution_location().clone();
-                let caller_location = context.caller_location().clone();
-                runtime.jobs.set_resume_handler(context.job(), Arc::new(move |value, input| {
-                    let runtime = resume_runtime.upgrade();
-                    let child = resume_child.clone();
-                    let sender = resume_sender.clone();
-                    let authorization = authorization.clone();
-                    let execution_location = execution_location.clone();
-                    let caller_location = caller_location.clone();
-                    Box::pin(async move {
-                        let runtime = runtime.ok_or_else(runtime_unavailable)?;
-                        if runtime.shutting_down.load(std::sync::atomic::Ordering::Acquire) {
-                            return Err(ToolError::Cancelled);
-                        }
-                        let context = crate::tool::ToolContext::new(
-                            authorization, execution_location, caller_location, input, runtime.jobs.clone(),
-                        );
-                        let content = value.into_iter().map(|value| UserContent::ParentInput {
-                            text: format!("Owner input: {value}"),
-                        }).collect();
-                        let text = run_child_request(
-                            &runtime, &context, &child, &sender, content,
-                        ).await?;
-                        Ok(crate::tool::ToolOutput::new(json!(text)))
-                    })
-                })).await.map_err(|error| tool_error(&error))?;
+                // Only this child session may opt its terminal job into resumption.
+                let handler = child_resume_handler(
+                    Arc::downgrade(&runtime),
+                    child.clone(),
+                    context.job_subject().clone(),
+                    context.execution_location().clone(),
+                    context.caller_location().clone(),
+                );
+                runtime.jobs.set_resume_handler(context.job(), handler).await.map_err(|error| tool_error(&error))?;
                 run_child_request(
                     &runtime, &context, &child, &sender,
                     vec![UserContent::Text { text: input.prompt }],
@@ -296,6 +273,64 @@ fn register_child_agent(
         },
     )?;
     Ok(())
+}
+
+/// Resume a retained child with owner input. A child whose loop is gone, such as
+/// after a restart, is started again under its journaled contract. The runtime
+/// reference is weak: jobs must not retain their own manager.
+pub(super) fn child_resume_handler(
+    runtime: Weak<SessionRuntime>,
+    child: crate::identity::AgentId,
+    authorization: crate::tool::authorization::AuthorizationSubject,
+    execution_location: crate::execution::ExecutionLocation,
+    caller_location: crate::execution::ExecutionLocation,
+) -> crate::job::ResumeHandler {
+    Arc::new(move |value, input| {
+        let runtime = runtime.upgrade();
+        let child = child.clone();
+        let authorization = authorization.clone();
+        let execution_location = execution_location.clone();
+        let caller_location = caller_location.clone();
+        Box::pin(async move {
+            let runtime = runtime.ok_or_else(runtime_unavailable)?;
+            if runtime
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(ToolError::Cancelled);
+            }
+            let sender = match runtime.agent_sender(&child) {
+                Some(sender) => sender,
+                None => runtime
+                    .spawn_agent(AgentLaunch {
+                        id: child.clone(),
+                        owner_job: Some(authorization.job),
+                        // The journaled contract supplies the profile, depth and location.
+                        model_profile: String::new(),
+                        todos: None,
+                        available_depth: 0,
+                        location: execution_location.clone(),
+                    })
+                    .await
+                    .map_err(|error| tool_error(&error))?,
+            };
+            let context = crate::tool::ToolContext::new(
+                authorization,
+                execution_location,
+                caller_location,
+                input,
+                runtime.jobs.clone(),
+            );
+            let content = value
+                .into_iter()
+                .map(|value| UserContent::ParentInput {
+                    text: format!("Owner input: {value}"),
+                })
+                .collect();
+            let text = run_child_request(&runtime, &context, &child, &sender, content).await?;
+            Ok(crate::tool::ToolOutput::new(json!(text)))
+        })
+    })
 }
 
 async fn run_child_request(

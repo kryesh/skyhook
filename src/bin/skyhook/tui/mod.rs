@@ -75,7 +75,7 @@ pub async fn run(
         return Err("Skyhook requires an interactive terminal. Run skyhook in a terminal; redirected input/output is not supported.".into());
     }
     let config = super::launch::load_config(&request.config, true).await?;
-    let (saved, warning) = state::load();
+    let (saved, warning) = state::load(&request.config.workspace);
     let model =
         super::launch::select_model(&config, request.model.as_deref(), saved.model.as_deref())?;
     let (interaction, mut prompts) = UiInteraction::new();

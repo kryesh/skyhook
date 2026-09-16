@@ -272,8 +272,9 @@ impl App {
         self.remembered_model = Some(model.to_owned());
         let remembered = model.to_owned();
         let notices = self.root_notifier();
+        let workspace = self.launch.workspace.clone();
         tokio::task::spawn_blocking(move || {
-            if let Err(error) = state::remember(&remembered) {
+            if let Err(error) = state::remember(&workspace, &remembered) {
                 notices.send(format!("Could not save model selection: {error}"));
             }
         });

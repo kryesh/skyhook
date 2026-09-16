@@ -283,7 +283,6 @@ mod tests {
         let record = |sequence: u64, event: SessionEvent| EventRecord {
             id: crate::identity::EventId::from_bytes([sequence as u8; 16]),
             queue_attempt: None,
-            version: crate::session::SESSION_FORMAT_VERSION,
             sequence,
             timestamp_millis: 0,
             agent: agent.clone(),
@@ -355,7 +354,6 @@ mod tests {
         hub.send(RuntimeEvent::Record(Box::new(EventRecord {
             id: crate::identity::EventId::generate().unwrap(),
             queue_attempt: None,
-            version: crate::session::SESSION_FORMAT_VERSION,
             sequence,
             timestamp_millis: 0,
             agent: agent.clone(),

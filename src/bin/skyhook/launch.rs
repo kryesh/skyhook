@@ -89,12 +89,10 @@ impl Launch {
     pub async fn create(&self, resume: Option<SessionId>) -> Result<SessionHandle, String> {
         let mut model = self.model.clone();
         if let Some(id) = resume {
-            let records = SessionStore::read_records(&self.sessions, id)
+            let summary = SessionStore::summary(&self.sessions, id)
                 .await
                 .map_err(|e| e.to_string())?;
-            if let Some(m) =
-                skyhook::session::agent_selection(&records, &skyhook::identity::AgentId::root(id))
-            {
+            if let Some(m) = summary.model {
                 model = self.model.config().select_model(&m).map_err(|_| {
                     format!(
                         "Model profile {m} is missing. Restore it in the configuration before resuming."
@@ -362,7 +360,7 @@ mod tests {
             launch
                 .sessions
                 .join(id.to_string())
-                .join("events.jsonl")
+                .join("session.db")
                 .is_file()
         );
         assert!(!configured.join(id.to_string()).exists());

@@ -12,8 +12,14 @@ impl SessionRuntime {
         let definitions = prior_records
             .iter()
             .find_map(|record| match &record.event {
-                SessionEvent::SessionStarted { targets } => Some(targets.clone()),
+                SessionEvent::SessionStarted { targets, .. } => Some(targets.clone()),
                 _ => None,
+            })
+            // A new session journals its start, with these targets, alongside its root.
+            .or_else(|| {
+                prior_records
+                    .is_empty()
+                    .then(|| harness.target_definitions.clone())
             })
             .ok_or_else(|| {
                 HarnessError::Initialization("session start event is missing".to_owned())
@@ -25,7 +31,9 @@ impl SessionRuntime {
             }
         }
         let authorization =
-            crate::tool::authorization::AuthorizationCoordinator::new(harness.policy.clone());
+            crate::tool::authorization::AuthorizationCoordinator::new(harness.policy.clone())
+                .journaled(store.clone())
+                .await;
         let remote = RemoteManager::new(
             harness.shim_catalog.clone(),
             harness.sensitive_prompts.clone(),
@@ -106,9 +114,40 @@ impl SessionRuntime {
         runtime_slot
             .set(Arc::downgrade(&runtime))
             .map_err(|_| HarnessError::Initialization("runtime already set".to_owned()))?;
+        runtime.install_retained_children().await;
         runtime.forward_store_events();
         runtime.forward_job_completions();
         Ok(runtime)
+    }
+
+    /// Close what a stopped process left open, in one transaction, before any agent
+    /// resumes: attempts without an outcome, and committed calls without a result.
+    pub(super) async fn settle_interrupted_work(&self) -> Result<(), HarnessError> {
+        let work = self.store.interrupted_work().await?;
+        if work.attempts.is_empty() && work.calls.is_empty() {
+            return Ok(());
+        }
+        let root = AgentId::root(self.store.id());
+        let mut events = vec![(root, SessionEvent::SessionResumed)];
+        events.extend(work.attempts.into_iter().map(|(agent, request, attempt)| {
+            (
+                agent,
+                SessionEvent::ModelAttemptInterrupted { request, attempt },
+            )
+        }));
+        events.extend(work.calls.into_iter().map(|(agent, call_id, name)| {
+            let result = ToolResult {
+                call_id,
+                name,
+                result: json!({"error": "interrupted while the session was not running"}),
+                images: Vec::new(),
+                is_error: true,
+            };
+            let message = Message::Tool(vec![result]);
+            (agent, SessionEvent::MessageCommitted { message })
+        }));
+        self.store.append_all(events).await?;
+        Ok(())
     }
 
     pub(super) async fn start_root(

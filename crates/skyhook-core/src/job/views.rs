@@ -339,13 +339,21 @@ mod tests {
 
     #[tokio::test]
     async fn active_launches_stop_at_agent_boundaries_and_prefer_the_nearest_call() {
-        let (_root, jobs, agent) = super::super::tests::runtime().await;
-        let child_agent = agent.child(1);
-        let origin = |message, call_id: &str| crate::session::ModelCallOrigin {
-            message,
-            call_id: call_id.into(),
+        let (root, jobs, agent) = super::super::tests::runtime().await;
+        // Origins name committed assistant calls.
+        let call = async |agent: &AgentId, id: &str| {
+            let call = crate::provider::protocol::ToolCall::new(id, "agent", serde_json::json!({}))
+                .unwrap();
+            let message = crate::provider::protocol::Message::Assistant(vec![
+                crate::provider::protocol::AssistantItem::tool_call(id, 0, call),
+            ]);
+            let event = crate::session::SessionEvent::MessageCommitted { message };
+            crate::session::ModelCallOrigin {
+                message: jobs.test_append(agent.clone(), event).await,
+                call_id: id.into(),
+            }
         };
-        let (root_origin, child_origin) = (origin(1, "delegate"), origin(2, "child-script"));
+        let root_origin = call(&agent, "delegate").await;
         let spec = |agent: &AgentId, tool, parent, origin| JobSpec {
             parent,
             origin,
@@ -354,6 +362,11 @@ mod tests {
         let owner = jobs
             .test_lease(spec(&agent, "agent", None, Some(root_origin.clone())))
             .await;
+        let store = jobs.store();
+        let child_agent =
+            crate::session::fixture::start_child(store, &agent, 1, Some(owner.id()), root.path())
+                .await;
+        let child_origin = call(&child_agent, "child-script").await;
         let host = jobs
             .test_lease(spec(&child_agent, "host-started", Some(owner.id()), None))
             .await;

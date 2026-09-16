@@ -61,6 +61,7 @@ impl JobManager {
         message: Message,
         text: String,
         wake_owner: bool,
+        follow: impl FnOnce(u64) -> Vec<(AgentId, SessionEvent)> + Send + 'static,
     ) -> Result<u64, JobError> {
         // Refuse a projection that replay could not reproduce (including reasoning).
         if visible_text(&message).as_deref() != Some(text.as_str()) {
@@ -106,8 +107,13 @@ impl JobManager {
             let record = manager
                 .inner
                 .store
-                .append(child.clone(), SessionEvent::MessageCommitted { message })
-                .await?;
+                .append_then(
+                    child.clone(),
+                    SessionEvent::MessageCommitted { message },
+                    follow,
+                )
+                .await?
+                .swap_remove(0);
             let mut jobs = manager.inner.jobs.lock().await;
             let entry = jobs.get_mut(&job).ok_or(JobError::Unknown(job))?;
             entry.child = Some(child);
@@ -202,26 +208,17 @@ mod tests {
     async fn child_job(
         background: bool,
     ) -> (tempfile::TempDir, JobManager, AgentId, AgentId, JobId) {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let owner = AgentId::root(store.id());
-        let child = owner.child(1);
-        let manager = JobManager::new(store);
+        let session = crate::session::fixture::MemorySession::new().await;
+        let owner = session.agent.clone();
+        let manager = JobManager::new(session.store.clone());
         let spec = JobSpec {
             background,
             ..JobSpec::test(owner.clone(), "agent")
         };
         let job = manager.test_create(spec).await;
-        let started = SessionEvent::AgentStarted {
-            parent: Some(owner.clone()),
-            owner_job: Some(job),
-            model_profile: "test".into(),
-            max_context: None,
-            location: ExecutionLocation::root(".".into()),
-        };
-        manager.test_append(child.clone(), started).await;
+        let child = session.start_child(&owner, 1, Some(job)).await;
         manager.transition(job, JobState::Running).await.unwrap();
-        (root, manager, owner, child, job)
+        (session.root, manager, owner, child, job)
     }
 
     fn assistant(text: &str) -> Message {
@@ -242,7 +239,7 @@ mod tests {
     async fn commit(manager: &JobManager, child: &AgentId, job: JobId, text: &str) -> u64 {
         let message = assistant(text);
         manager
-            .commit_child_message(child, job, message, text.into(), true)
+            .commit_child_message(child, job, message, text.into(), true, |_| Vec::new())
             .await
             .unwrap()
     }
@@ -289,6 +286,9 @@ mod tests {
         let mut wakes = manager.subscribe_completions();
         let first = commit(&manager, &child, job, "first").await;
         assert_eq!(wakes.recv().await.unwrap().agent, owner);
+        let receipt = manager.pending_delivery(&owner).await.unwrap();
+        assert_eq!(sequences(&receipt), vec![first]);
+        ack(receipt).await;
         let second = commit(&manager, &child, job, "second").await;
         assert_eq!(wakes.recv().await.unwrap().job, job);
         finish(&manager, job).await;
@@ -296,9 +296,8 @@ mod tests {
         assert!(manager.has_pending(&owner).await);
         let receipt = manager.pending_delivery(&owner).await.unwrap();
         assert!(receipt.envelopes().is_empty());
-        assert_eq!(sequences(&receipt), vec![first, second]);
-        let acknowledgement = notification(&receipt.messages()[..1], &[]);
-        receipt.commit(acknowledgement).await.unwrap();
+        assert_eq!(sequences(&receipt), vec![second]);
+        drop(receipt);
         let restored = manager.test_replay().await;
         let receipt = restored.pending_delivery(&owner).await.unwrap();
         assert_eq!(sequences(&receipt), [second]);
@@ -340,12 +339,9 @@ mod tests {
             text: "visible".into(),
         };
         assert_eq!(receipt.messages(), &[expected]);
+        // The notification and its acknowledgement rows commit together.
         let message = notification(receipt.messages(), &[]);
-        drop(receipt);
-        // Simulate a crash after parent history append but before in-memory ACK.
-        manager
-            .test_append(owner.clone(), SessionEvent::MessageCommitted { message })
-            .await;
+        receipt.commit(message).await.unwrap();
         let restored = manager.test_replay().await;
         assert!(!restored.has_pending(&owner).await);
         assert_eq!(
@@ -414,7 +410,14 @@ mod tests {
         let mut wakes = manager.subscribe_completions();
         let message = assistant("terminal answer");
         let sequence = manager
-            .commit_child_message(&child, job, message, "terminal answer".into(), false)
+            .commit_child_message(
+                &child,
+                job,
+                message,
+                "terminal answer".into(),
+                false,
+                |_| Vec::new(),
+            )
             .await
             .unwrap();
         // Durable and deliverable, but the owner is not woken for it on its own.
@@ -487,8 +490,14 @@ mod tests {
         let receipt = manager.pending_delivery(&owner).await.unwrap();
         let mut wakes = manager.subscribe_completions();
         let message = assistant("survives");
-        let mut pending =
-            Box::pin(manager.commit_child_message(&child, job, message, "survives".into(), true));
+        let mut pending = Box::pin(manager.commit_child_message(
+            &child,
+            job,
+            message,
+            "survives".into(),
+            true,
+            |_| Vec::new(),
+        ));
         // Poll through the internal spawn, then cancel the caller while the spawned
         // transaction is waiting on the receipt's delivery gate.
         assert!(
@@ -523,8 +532,14 @@ mod tests {
             (owner.clone(), "visible"),
         ] {
             let message = assistant("visible");
-            let result =
-                manager.commit_child_message(&author, job, message, projection.into(), true);
+            let result = manager.commit_child_message(
+                &author,
+                job,
+                message,
+                projection.into(),
+                true,
+                |_| Vec::new(),
+            );
             assert!(result.await.is_err());
         }
         assert_eq!(manager.store().records().await.len(), before);
@@ -534,26 +549,6 @@ mod tests {
         assert_eq!(manager.last_agent_message(job).await.unwrap(), None);
         assert!(!manager.has_pending(&owner).await);
         assert!(wakes.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn legacy_runtime_ack_supported_but_user_text_and_wrong_owner_ignored() {
-        let (_root, manager, owner, child, job) = child_job(false).await;
-        commit(&manager, &child, job, "reply").await;
-        finish(&manager, job).await;
-        let receipt = manager.pending_delivery(&owner).await.unwrap();
-        let messages = serde_json::to_string(receipt.messages()).unwrap();
-        let text = format!("<skyhook_agent_messages>\n{messages}\n</skyhook_agent_messages>");
-        let user_text = Message::User(vec![UserContent::Text { text: text.clone() }]);
-        receipt.commit(user_text).await.unwrap();
-        let message = runtime_text(text.clone());
-        manager
-            .test_append(child, SessionEvent::MessageCommitted { message })
-            .await;
-        assert!(manager.test_replay().await.has_pending(&owner).await);
-        let receipt = manager.pending_delivery(&owner).await.unwrap();
-        receipt.commit(runtime_text(text)).await.unwrap();
-        assert!(!manager.test_replay().await.has_pending(&owner).await);
     }
 
     #[tokio::test]
@@ -583,35 +578,6 @@ mod tests {
         assert!(messages::batch_size(receipt.messages()) < DELIVERY_BATCH_BYTES);
         ack(receipt).await;
         assert!(manager.has_pending(&owner).await);
-    }
-
-    #[tokio::test]
-    async fn legacy_completed_result_acknowledges_only_exact_last_source_reply() {
-        for result in ["final reply", "final rep"] {
-            let (_root, manager, owner, child, job) = child_job(true).await;
-            let first = commit(&manager, &child, job, "earlier undelivered report").await;
-            let last = commit(&manager, &child, job, "final reply").await;
-            manager
-                .test_finish(job, serde_json::json!("final reply"))
-                .await;
-            // Old final replies were delivered as lifecycle `result`, without a
-            // message discriminator/source sequence or the new last_message field.
-            let message =
-                job_events(serde_json::json!([{"id":job, "state":"completed", "result":result}]));
-            manager
-                .test_append(owner.clone(), SessionEvent::MessageCommitted { message })
-                .await;
-            let restored = manager.test_replay().await;
-            let receipt = restored.pending_delivery(&owner).await.unwrap();
-            assert!(receipt.envelopes().is_empty());
-            let expected = if result == "final reply" {
-                vec![first]
-            } else {
-                vec![first, last]
-            };
-            assert_eq!(sequences(&receipt), expected);
-            assert_eq!(restored.last_agent_message(job).await.unwrap(), Some(last));
-        }
     }
 
     #[tokio::test]

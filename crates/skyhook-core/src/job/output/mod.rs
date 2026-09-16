@@ -9,12 +9,13 @@ mod reader;
 pub use captures::CaptureKind;
 pub(crate) use captures::{
     AsyncCapture, CaptureWriter, CompletedCapture, PendingCapture, TextCaptureField,
-    register_capture,
 };
+pub(crate) use reader::Source;
 mod truncation;
 use super::{JobError, JobManager, JobRole, JobState, OutputPresentation};
 use crate::{
     identity::JobId,
+    session::{CaptureRow, SharedDb},
     tool::{ToolError, policy::CapabilitySet},
 };
 use base64::Engine as _;
@@ -25,7 +26,6 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{BufRead, BufReader, Read, Write},
-    path::{Path, PathBuf},
 };
 
 pub(crate) const PAGE_BYTES: usize = 8 * 1024;
@@ -53,6 +53,79 @@ fn capture_notice(output: &mut serde_json::Map<String, Value>, complete: Option<
     }
 }
 
+fn database(error: crate::session::DbError) -> ToolError {
+    ToolError::Io(std::io::Error::other(error))
+}
+
+/// One job's output rows in the session database. Every operation locks the
+/// connection briefly, so call it off async worker threads for anything large.
+#[derive(Clone)]
+pub(crate) struct Output {
+    db: SharedDb,
+    job: JobId,
+}
+
+/// A snapshot of the saved document and capture registrations. Capture bytes stay
+/// in the database and are read live, so an open capture can still grow.
+pub(crate) struct Saved {
+    output: Output,
+    /// Compact terminal document; referenced fields are emptied placeholders.
+    document: Option<Value>,
+    /// Pointers the document references, in pointer order.
+    fields: Vec<String>,
+    captures: BTreeMap<String, CaptureRow>,
+}
+
+impl Saved {
+    pub(crate) fn load(output: &Output) -> Result<Self, ToolError> {
+        let job = output.job.get();
+        let saved = output.db.output(job).map_err(database)?;
+        let captures = output.db.captures(job).map_err(database)?;
+        let (document, fields) = match saved {
+            Some((document, fields)) => (Some(serde_json::from_str(&document)?), fields),
+            None => (None, Vec::new()),
+        };
+        Ok(Self {
+            output: output.clone(),
+            document,
+            fields,
+            captures: captures
+                .into_iter()
+                .map(|capture| (capture.pointer.clone(), capture))
+                .collect(),
+        })
+    }
+
+    /// Any registered capture at `field`, complete or not.
+    fn capture(&self, field: &str) -> Option<Source> {
+        self.captures.get(field).map(|capture| {
+            Source::Capture(reader::CaptureReader::new(
+                self.output.db.clone(),
+                capture.id,
+            ))
+        })
+    }
+
+    /// The bytes of a referenced field, which the document stores as a placeholder.
+    fn stored(&self, field: &str) -> Option<Source> {
+        self.fields
+            .iter()
+            .any(|stored| stored == field)
+            .then(|| self.capture(field))
+            .flatten()
+    }
+
+    /// All bytes of the capture at `field`, if one is registered.
+    pub(crate) fn bytes(&self, field: &str) -> Result<Option<Vec<u8>>, ToolError> {
+        let Some(mut source) = self.capture(field) else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
+        source.read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
+    }
+}
+
 /// Presentation provenance for a script's full, independently saved return value.
 /// Pointers are rooted at /result/value. Child jobs own their native output ranges;
 /// annotated script fields own ranges in this job instead.
@@ -65,12 +138,20 @@ pub(crate) struct ScriptPresentation {
 }
 
 impl ScriptPresentation {
-    fn load(directory: &Path) -> Result<Self, ToolError> {
-        match std::fs::File::open(directory.join("presentation.json")) {
-            Ok(file) => Ok(serde_json::from_reader(BufReader::new(file))?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error.into()),
-        }
+    fn load(output: &Output) -> Result<Self, ToolError> {
+        let rows = output.db.presentation(output.job.get()).map_err(database)?;
+        Ok(Self {
+            jobs: rows
+                .children
+                .into_iter()
+                .map(|(field, child)| {
+                    JobId::new(child)
+                        .map(|child| (field, child))
+                        .map_err(|error| ToolError::Failed(error.to_string()))
+                })
+                .collect::<Result<_, _>>()?,
+            fields: rows.fields.into_iter().collect(),
+        })
     }
 }
 
@@ -122,132 +203,128 @@ struct Selection {
     offset: usize,
 }
 
-pub(crate) fn field_file(directory: &Path, field: &str) -> PathBuf {
-    directory.join(format!(
-        "field-{}.txt",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(field.as_bytes()))
-    ))
+fn escape_pointer(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
 }
 
-/// Persist a compact structured tree with file-backed large strings.
-pub(crate) fn save(directory: &Path, document: &Value) -> std::io::Result<()> {
-    save_inner(directory, document, None)
-}
-
-// The legacy writer can recognize already-present field files. New terminal
-// products instead name exactly the validated completed captures they reference.
-fn save_inner(
-    directory: &Path,
+/// Persist a compact document whose referenced and large strings live in captures.
+/// `referenced` names completed captures the document installs; other strings over
+/// 4 KiB are offloaded into new text captures, unless an unreferenced raw capture
+/// already owns that pointer.
+fn save_document(
+    output: &Output,
     document: &Value,
-    external_refs: Option<&BTreeSet<String>>,
-) -> std::io::Result<()> {
-    std::fs::create_dir_all(directory)?;
+    referenced: &BTreeSet<String>,
+) -> Result<(), ToolError> {
+    let registered = output
+        .db
+        .captures(output.job.get())
+        .map_err(database)?
+        .into_iter()
+        .map(|capture| (capture.pointer, capture.id))
+        .collect::<BTreeMap<_, _>>();
     let mut document = document.clone();
-    let mut fields = Vec::<String>::new();
+    let mut fields = Vec::new();
     fn visit(
-        directory: &Path,
+        output: &Output,
+        registered: &BTreeMap<String, i64>,
+        referenced: &BTreeSet<String>,
         field: &str,
         value: &mut Value,
-        fields: &mut Vec<String>,
-        external_refs: Option<&BTreeSet<String>>,
-    ) -> std::io::Result<()> {
-        let path = field_file(directory, field);
-        let referenced = external_refs.map_or_else(|| path.exists(), |refs| refs.contains(field));
+        fields: &mut Vec<i64>,
+    ) -> Result<(), ToolError> {
+        if referenced.contains(field)
+            && let Some(&capture) = registered.get(field)
+        {
+            match value {
+                Value::String(text) => text.clear(),
+                Value::Object(map) => map.clear(),
+                Value::Array(items) => items.clear(),
+                _ => return Ok(()),
+            }
+            fields.push(capture);
+            return Ok(());
+        }
         match value {
-            Value::String(text) => {
-                // Do not overwrite or adopt an unreferenced raw capture merely
-                // because the ordinary result happens to use the same pointer.
-                if referenced || (text.len() > 4096 && !path.exists()) {
-                    register_capture(directory, field, CaptureKind::Text)?;
-                    if !path.exists() {
-                        let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
-                        file.write_all(text.as_bytes())?;
-                        file.flush()?;
-                    }
-                    fields.push(field.to_owned());
-                    text.clear();
-                }
+            // Do not overwrite or adopt an unreferenced raw capture merely
+            // because the ordinary result happens to use the same pointer.
+            Value::String(text) if text.len() > 4096 && !registered.contains_key(field) => {
+                let mut writer = PendingCapture::create(output, field, CaptureKind::Text)?.open();
+                writer.write_all(text.as_bytes())?;
+                fields.push(writer.finish()?.capture_id());
+                text.clear();
             }
             Value::Object(map) => {
-                if referenced {
-                    register_capture(directory, field, CaptureKind::Json)?;
-                    fields.push(field.to_owned());
-                    map.clear();
-                    return Ok(());
-                }
                 for (key, value) in map {
-                    visit(
-                        directory,
-                        &format!("{field}/{}", key.replace('~', "~0").replace('/', "~1")),
-                        value,
-                        fields,
-                        external_refs,
-                    )?;
+                    let child = format!("{field}/{}", escape_pointer(key));
+                    visit(output, registered, referenced, &child, value, fields)?;
                 }
             }
             Value::Array(items) => {
-                if referenced {
-                    register_capture(directory, field, CaptureKind::Json)?;
-                    fields.push(field.to_owned());
-                    items.clear();
-                } else {
-                    for (index, value) in items.iter_mut().enumerate() {
-                        visit(
-                            directory,
-                            &format!("{field}/{index}"),
-                            value,
-                            fields,
-                            external_refs,
-                        )?;
-                    }
+                for (index, value) in items.iter_mut().enumerate() {
+                    let child = format!("{field}/{index}");
+                    visit(output, registered, referenced, &child, value, fields)?;
                 }
             }
             _ => {}
         }
         Ok(())
     }
-    visit(directory, "", &mut document, &mut fields, external_refs)?;
-    for (name, value) in [
-        ("fields.json", serde_json::to_value(fields)?),
-        ("document.json", document),
-    ] {
-        let mut file = tempfile::NamedTempFile::new_in(directory)?;
-        serde_json::to_writer(&mut file, &value)?;
-        file.flush()?;
-        file.persist(directory.join(name)).map_err(|e| e.error)?;
-    }
-    Ok(())
+    visit(
+        output,
+        &registered,
+        referenced,
+        "",
+        &mut document,
+        &mut fields,
+    )?;
+    output
+        .db
+        .save_output(
+            output.job.get(),
+            &serde_json::to_string(&document)?,
+            &fields,
+        )
+        .map_err(database)
 }
 
-fn fields(directory: &Path) -> Result<Vec<String>, ToolError> {
-    Ok(serde_json::from_reader(BufReader::new(
-        std::fs::File::open(directory.join("fields.json"))?,
-    ))?)
-}
-fn hydrate(directory: &Path, mut value: Value, maximum: u64) -> Result<Value, ToolError> {
-    for field in fields(directory)? {
-        if std::fs::metadata(field_file(directory, &field))?.len() > maximum {
+/// Install referenced fields no larger than `maximum` bytes into the document.
+fn hydrate(saved: &Saved, mut value: Value, maximum: u64) -> Result<Value, ToolError> {
+    for field in &saved.fields {
+        if saved
+            .captures
+            .get(field)
+            .is_some_and(|capture| capture.bytes > maximum)
+        {
             continue;
         }
-        hydrate_field(directory, &mut value, &field)?;
+        hydrate_field(saved, &mut value, field)?;
     }
     Ok(value)
 }
-fn hydrate_field(directory: &Path, value: &mut Value, field: &str) -> Result<(), ToolError> {
+
+fn hydrate_field(saved: &Saved, value: &mut Value, field: &str) -> Result<(), ToolError> {
     let target = value
         .pointer_mut(field)
         .ok_or_else(|| ToolError::Failed("invalid saved output field".into()))?;
-    let path = field_file(directory, field);
+    load_field(saved, target, field)
+}
+
+/// Replace a stored field's placeholder with its bytes.
+fn load_field(saved: &Saved, target: &mut Value, field: &str) -> Result<(), ToolError> {
+    let bytes = saved
+        .bytes(field)?
+        .ok_or_else(|| ToolError::Failed("saved output field is missing".into()))?;
     *target = if target.is_string() {
-        Value::String(String::from_utf8_lossy(&std::fs::read(path)?).into_owned())
+        Value::String(String::from_utf8_lossy(&bytes).into_owned())
     } else {
-        serde_json::from_reader(BufReader::new(std::fs::File::open(path)?))?
+        serde_json::from_slice(&bytes)?
     };
     Ok(())
 }
 
 fn render(
-    directory: &Path,
+    saved: &Saved,
     field: &str,
     value: &Value,
     out: &mut impl Write,
@@ -256,12 +333,14 @@ fn render(
     if cancellation.is_cancelled() {
         return Err(ToolError::Cancelled);
     }
-    if (value.is_array() || value.is_object()) && field_file(directory, field).exists() {
-        std::io::copy(&mut std::fs::File::open(field_file(directory, field))?, out)?;
-    } else if value.is_string() && field_file(directory, field).exists() {
+    if let Some(mut source) = saved.stored(field) {
+        if !value.is_string() {
+            std::io::copy(&mut source, out)?;
+            return Ok(());
+        }
         out.write_all(b"\"")?;
-        let mut input = BufReader::new(std::fs::File::open(field_file(directory, field))?);
-        // Escape a file-backed string incrementally rather than hydrating it.
+        let mut input = BufReader::new(source);
+        // Escape a stored string incrementally rather than hydrating it.
         loop {
             if cancellation.is_cancelled() {
                 return Err(ToolError::Cancelled);
@@ -282,44 +361,33 @@ fn render(
             input.consume(length);
         }
         out.write_all(b"\"")?;
-    } else {
-        match value {
-            Value::Object(map) => {
-                out.write_all(b"{\n")?;
-                for (index, (key, value)) in map.iter().enumerate() {
-                    if index > 0 {
-                        out.write_all(b",\n")?;
-                    }
-                    serde_json::to_writer(&mut *out, key)?;
-                    out.write_all(b": ")?;
-                    render(
-                        directory,
-                        &format!("{field}/{}", key.replace('~', "~0").replace('/', "~1")),
-                        value,
-                        out,
-                        cancellation,
-                    )?;
+        return Ok(());
+    }
+    match value {
+        Value::Object(map) => {
+            out.write_all(b"{\n")?;
+            for (index, (key, value)) in map.iter().enumerate() {
+                if index > 0 {
+                    out.write_all(b",\n")?;
                 }
-                out.write_all(b"\n}")?;
+                serde_json::to_writer(&mut *out, key)?;
+                out.write_all(b": ")?;
+                let child = format!("{field}/{}", escape_pointer(key));
+                render(saved, &child, value, out, cancellation)?;
             }
-            Value::Array(items) => {
-                out.write_all(b"[\n")?;
-                for (index, value) in items.iter().enumerate() {
-                    if index > 0 {
-                        out.write_all(b",\n")?;
-                    }
-                    render(
-                        directory,
-                        &format!("{field}/{index}"),
-                        value,
-                        out,
-                        cancellation,
-                    )?;
-                }
-                out.write_all(b"\n]")?;
-            }
-            _ => serde_json::to_writer(out, value)?,
+            out.write_all(b"\n}")?;
         }
+        Value::Array(items) => {
+            out.write_all(b"[\n")?;
+            for (index, value) in items.iter().enumerate() {
+                if index > 0 {
+                    out.write_all(b",\n")?;
+                }
+                render(saved, &format!("{field}/{index}"), value, out, cancellation)?;
+            }
+            out.write_all(b"\n]")?;
+        }
+        _ => serde_json::to_writer(out, value)?,
     }
     Ok(())
 }
@@ -367,15 +435,20 @@ impl JobManager {
         if presentation.jobs.is_empty() && presentation.fields.is_empty() {
             return Ok(());
         }
-        let directory = self.output_directory(job);
-        tokio::task::spawn_blocking(move || -> Result<(), ToolError> {
-            std::fs::create_dir_all(&directory)?;
-            let mut file = tempfile::NamedTempFile::new_in(&directory)?;
-            serde_json::to_writer(&mut file, &presentation)?;
-            file.flush()?;
-            file.persist(directory.join("presentation.json"))
-                .map_err(|error| error.error)?;
-            Ok(())
+        let output = self.output(job);
+        let rows = crate::session::Presentation {
+            children: presentation
+                .jobs
+                .into_iter()
+                .map(|(field, child)| (field, child.get()))
+                .collect(),
+            fields: presentation.fields.into_iter().collect(),
+        };
+        tokio::task::spawn_blocking(move || {
+            output
+                .db
+                .save_presentation(output.job.get(), &rows)
+                .map_err(database)
         })
         .await
         .map_err(|error| ToolError::Failed(error.to_string()))?
@@ -387,12 +460,11 @@ impl JobManager {
         }
     }
 
-    pub(crate) fn output_directory(&self, id: JobId) -> PathBuf {
-        self.inner
-            .store
-            .directory()
-            .join("jobs")
-            .join(id.to_string())
+    pub(crate) fn output(&self, id: JobId) -> Output {
+        Output {
+            db: self.inner.store.outputs(),
+            job: id,
+        }
     }
 
     #[cfg(test)]
@@ -416,7 +488,7 @@ impl JobManager {
 
     /// Host inspection never acknowledges an agent's pending notification.
     ///
-    /// When file-backed captures exist, the view includes `captures`, an array of
+    /// When stored captures exist, the view includes `captures`, an array of
     /// `{field, kind, complete}` descriptors. `field` is an explicit output-query
     /// JSON Pointer; `kind` is `text`, `json`, or `unknown` (streamed transport data
     /// whose type is not known yet). Live or recovered unfinished captures have
@@ -442,7 +514,7 @@ impl JobManager {
             .map_err(|error| ToolError::Failed(error.to_string()))?
             .state
             .is_terminal();
-        let directory = self.output_directory(job);
+        let output = self.output(job);
         tokio::task::spawn_blocking(move || {
             fn visit(value: &Value, pointer: String, paths: &mut Vec<String>) {
                 paths.push(pointer.clone());
@@ -465,25 +537,23 @@ impl JobManager {
                 }
             }
             let mut paths = Vec::new();
-            let document_path = directory.join("document.json");
-            if terminal && document_path.exists() {
-                let mut document: Value =
-                    serde_json::from_reader(BufReader::new(std::fs::File::open(document_path)?))?;
+            let saved = Saved::load(&output)?;
+            if terminal && let Some(mut document) = saved.document.clone() {
                 // Containers have selectable descendants; large text captures
                 // do not need to be loaded merely to enumerate their pointers.
-                for field in fields(&directory)? {
+                for field in &saved.fields {
                     if document
-                        .pointer(&field)
+                        .pointer(field)
                         .is_some_and(|value| value.is_object() || value.is_array())
                     {
-                        hydrate_field(&directory, &mut document, &field)?;
+                        hydrate_field(&saved, &mut document, field)?;
                     }
                 }
                 if let Some(result) = document.get("result") {
                     visit(result, "/result".into(), &mut paths);
                 }
             }
-            for capture in captures::available_captures(&directory, terminal)? {
+            for capture in captures::available_captures(&saved, terminal)? {
                 if !paths.contains(&capture.field) {
                     paths.push(capture.field);
                 }
@@ -498,7 +568,7 @@ impl JobManager {
     /// presentation. Any explicit selection (including `context: 0`) suppresses
     /// hydration. A present JSON null is not an absent capture.
     ///
-    /// Metadata/images belong to the initial job snapshot; capture files remain
+    /// Metadata/images belong to the initial job snapshot; captures remain
     /// live reads and can advance while up to four pages are read concurrently.
     /// A failed initial inspection is returned; individual page failures are
     /// embedded as `{error}` in that capture's `output`. This never acknowledges
@@ -625,13 +695,12 @@ impl JobManager {
         let mut view = envelope.presented_for(capabilities, viewer, detailed)?;
         let map = view.as_object_mut().expect("job envelope is an object");
         map.remove("output");
-        let directory = self.output_directory(args.job);
-        let capture_directory = directory.clone();
-        let captures = tokio::task::spawn_blocking(move || {
-            captures::available_captures(&capture_directory, terminal)
-        })
-        .await
-        .map_err(|error| ToolError::Failed(error.to_string()))??;
+        let output = self.output(args.job);
+        let saved =
+            tokio::task::spawn_blocking(move || Saved::load(&output).map(std::sync::Arc::new))
+                .await
+                .map_err(|error| ToolError::Failed(error.to_string()))??;
+        let captures = captures::available_captures(&saved, terminal)?;
         let incomplete_capture = terminal
             && captures.iter().any(|capture| {
                 !capture.complete
@@ -646,16 +715,15 @@ impl JobManager {
         if !captures.is_empty() {
             map.insert("captures".into(), serde_json::to_value(&captures)?);
         }
-        let document_path = directory.join("document.json");
-        let structured = !explicit && terminal && document_path.exists();
+        let structured = !explicit && terminal && saved.document.is_some();
         let mut presented_question = false;
+        let mut question_page = None;
         if structured {
-            let presentation_directory = directory.clone();
-            let script_presentation = tokio::task::spawn_blocking(move || {
-                ScriptPresentation::load(&presentation_directory)
-            })
-            .await
-            .map_err(|error| ToolError::Failed(error.to_string()))??;
+            let presentation_output = saved.output.clone();
+            let script_presentation =
+                tokio::task::spawn_blocking(move || ScriptPresentation::load(&presentation_output))
+                    .await
+                    .map_err(|error| ToolError::Failed(error.to_string()))??;
             let mut children = BTreeMap::new();
             let mut replacements = BTreeMap::new();
             for (field, child) in script_presentation.jobs {
@@ -684,11 +752,11 @@ impl JobManager {
                 }
                 replacements.insert(field, children[&child].clone());
             }
-            let directory = directory.clone();
+            let projected = saved.clone();
             let cancellation = args.cancellation.clone().unwrap_or_default();
             let view = tokio::task::spawn_blocking(move || {
                 truncation::project(
-                    &directory,
+                    &projected,
                     &output_schema,
                     &cancellation,
                     &script_presentation.fields,
@@ -707,22 +775,20 @@ impl JobManager {
                 let key =
                     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(&bytes));
                 let field = format!("/questions/{key}");
-                let path = field_file(&directory, &field);
-                tokio::fs::create_dir_all(&directory).await?;
-                if !path.exists() {
-                    tokio::fs::write(path, bytes).await?;
-                }
                 if args.field.is_none() {
                     selection.field = field.clone();
                 }
                 presented_question = selection.field == field;
+                if presented_question {
+                    question_page = Some(bytes);
+                }
             }
         }
         if !structured && !map.contains_key("question") {
-            if !explicit && !question && document_path.exists() {
+            if !explicit && !question && saved.document.is_some() {
                 selection.field = String::new();
             }
-            let directory = directory.clone();
+            let paged = saved.clone();
             let c = selection.clone();
             let cancellation = args.cancellation.clone().unwrap_or_default();
             // A whole-result query always resolves to "/result" or "" here.
@@ -733,18 +799,21 @@ impl JobManager {
             } else {
                 tokio::task::spawn_blocking(move || {
                     let closed = terminal || c.field.starts_with("/questions/");
-                    let path = ensure_field_file(&directory, &c.field, &cancellation)?;
-                    reader::page(&path, &c, limit, closed, &cancellation)
+                    let source = match question_page {
+                        Some(bytes) => Some(Source::Memory(std::io::Cursor::new(bytes))),
+                        None => field_source(&paged, &c.field, &cancellation)?,
+                    };
+                    reader::page(source, &c, limit, closed, &cancellation)
                 })
                 .await
                 .map_err(|e| ToolError::Failed(e.to_string()))??
             };
             if terminal {
-                let complete = tokio::fs::read(&document_path)
-                    .await
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                    .and_then(|v| v.get("capture_complete").and_then(Value::as_bool));
+                let complete = saved
+                    .document
+                    .as_ref()
+                    .and_then(|document| document.get("capture_complete"))
+                    .and_then(Value::as_bool);
                 capture_notice(map, complete);
             }
             map.insert("preview".into(), serde_json::to_value(&page)?);
@@ -794,87 +863,108 @@ impl JobManager {
         if !envelope.state.is_terminal() {
             return Ok(());
         }
-        let path = self.output_directory(envelope.id).join("document.json");
-        match tokio::fs::read(path).await {
-            Ok(bytes) => {
-                let value: Value =
-                    serde_json::from_slice(&bytes).map_err(crate::session::SessionError::from)?;
-                let directory = self.output_directory(envelope.id);
-                let mut value =
-                    tokio::task::spawn_blocking(move || hydrate(&directory, value, maximum))
-                        .await
-                        .map_err(|e| JobError::Internal(e.to_string()))?
-                        .map_err(|e| JobError::Internal(e.to_string()))?;
-                envelope.output = value.get_mut("result").map(Value::take);
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) => {}
-            Err(error) => return Err(crate::session::SessionError::from(error).into()),
+        let output = self.output(envelope.id);
+        let value = tokio::task::spawn_blocking(move || {
+            let saved = Saved::load(&output)?;
+            saved
+                .document
+                .clone()
+                .map(|document| hydrate(&saved, document, maximum))
+                .transpose()
+        })
+        .await
+        .map_err(|e| JobError::Internal(e.to_string()))?
+        .map_err(|e| JobError::Internal(e.to_string()))?;
+        if let Some(mut value) = value {
+            envelope.output = value.get_mut("result").map(Value::take);
         }
         Ok(())
     }
 }
 
-fn ensure_field_file(
-    directory: &Path,
+/// The pageable bytes of `field`: a registered capture, or a rendering of the value
+/// the saved document holds there. `None` when neither exists yet.
+fn field_source(
+    saved: &Saved,
     field: &str,
     cancellation: &super::CancellationToken,
-) -> Result<PathBuf, ToolError> {
-    let path = field_file(directory, field);
-    if !path.exists() && directory.join("document.json").exists() {
-        let mut document: Value = serde_json::from_reader(BufReader::new(std::fs::File::open(
-            directory.join("document.json"),
-        )?))?;
-        if document.pointer(field).is_none() {
-            // Offloaded containers hide their descendants in the compact document.
-            // Only load the selected ancestor, not unrelated large output fields.
-            if let Some(ancestor) = fields(directory)?.into_iter().find(|stored| {
-                field
-                    .strip_prefix(stored.as_str())
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-            }) {
-                hydrate_field(directory, &mut document, &ancestor)?;
-            }
-        }
-        if field.is_empty() {
-            // Whole-output pages contain the public document, not internal capture metadata.
-            let output = document.as_object_mut().expect("saved output document");
-            output.remove("capture_complete");
-        }
-        let value = document.pointer(field).ok_or_else(|| {
-            ToolError::InvalidArguments("field does not exist in this result".into())
-        })?;
-        return materialize_field(directory, field, value, cancellation);
+) -> Result<Option<Source>, ToolError> {
+    if let Some(source) = saved.capture(field) {
+        return Ok(Some(source));
     }
-    Ok(path)
+    let Some(mut document) = saved.document.clone() else {
+        return Ok(None);
+    };
+    if document.pointer(field).is_none() {
+        // Stored containers hide their descendants in the compact document.
+        // Only load the selected ancestor, not unrelated large output fields.
+        if let Some(ancestor) = saved.fields.iter().find(|stored| {
+            field
+                .strip_prefix(stored.as_str())
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        }) {
+            hydrate_field(saved, &mut document, ancestor)?;
+        }
+    }
+    if field.is_empty() {
+        // Whole-output pages contain the public document, not internal capture metadata.
+        let output = document.as_object_mut().expect("saved output document");
+        output.remove("capture_complete");
+    }
+    let value = document
+        .pointer(field)
+        .ok_or_else(|| ToolError::InvalidArguments("field does not exist in this result".into()))?;
+    materialize_field(saved, field, value, cancellation).map(Some)
 }
 
-// Projection already owns the resolved value; do not reopen its document for
-// every annotated field. Keep the same renderer for stable pagination positions.
+// Projection already owns the resolved value; keep the same renderer for stable
+// pagination positions.
 fn materialize_field(
-    directory: &Path,
+    saved: &Saved,
     field: &str,
     value: &Value,
     cancellation: &super::CancellationToken,
-) -> Result<PathBuf, ToolError> {
-    let path = field_file(directory, field);
-    if !path.exists() {
-        let mut file = tempfile::NamedTempFile::new_in(directory)?;
-        {
-            let mut writer = std::io::BufWriter::new(file.as_file_mut());
-            if let Some(text) = value.as_str() {
-                writer.write_all(text.as_bytes())?;
-            } else {
-                render(directory, field, value, &mut writer, cancellation)?;
-            }
-            writer.flush()?;
-        }
-        file.persist(&path).map_err(|e| ToolError::Io(e.error))?;
+) -> Result<Source, ToolError> {
+    if let Some(source) = saved.stored(field) {
+        return Ok(source);
     }
-    Ok(path)
+    let write = |out: &mut dyn Write| -> Result<(), ToolError> {
+        match value.as_str() {
+            Some(text) => Ok(out.write_all(text.as_bytes())?),
+            None => render(saved, field, value, &mut &mut *out, cancellation),
+        }
+    };
+    // Only a value enclosing stored fields can be large; render it to the
+    // database once rather than into memory on every page.
+    let encloses_stored = saved.fields.iter().any(|stored| {
+        field.is_empty()
+            || stored
+                .strip_prefix(field)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    });
+    let db = &saved.output.db;
+    let job = saved.output.job.get();
+    if encloses_stored {
+        if let Some(capture) = db.rendering(job, field).map_err(database)? {
+            return Ok(Source::Capture(reader::CaptureReader::new(
+                db.clone(),
+                capture,
+            )));
+        }
+        // A concurrent page may be rendering it; fall back to memory then.
+        if let Ok(pending) = PendingCapture::rendering(&saved.output, field) {
+            let mut writer = pending.open();
+            write(&mut writer)?;
+            let capture = writer.finish()?.capture_id();
+            return Ok(Source::Capture(reader::CaptureReader::new(
+                db.clone(),
+                capture,
+            )));
+        }
+    }
+    let mut bytes = Vec::new();
+    write(&mut bytes)?;
+    Ok(Source::Memory(std::io::Cursor::new(bytes)))
 }
 
 pub(crate) fn view_schema(capabilities: &CapabilitySet) -> Value {
@@ -916,46 +1006,99 @@ pub(crate) fn view_schema(capabilities: &CapabilitySet) -> Value {
     schema
 }
 
-pub(crate) fn presentation_size(directory: &Path) -> usize {
-    let Ok(metadata) = std::fs::metadata(directory.join("document.json")) else {
+pub(crate) fn presentation_size(output: &Output) -> usize {
+    let Ok(saved) = Saved::load(output) else {
         return PAGE_BYTES;
     };
-    let Ok(fields) = fields(directory) else {
+    let Some(document) = &saved.document else {
         return PAGE_BYTES;
     };
-    fields.iter().fold(
-        usize::try_from(metadata.len()).unwrap_or(PAGE_BYTES),
-        |total, field| {
-            total.saturating_add(std::fs::metadata(field_file(directory, field)).map_or(
-                PAGE_BYTES,
-                |m| {
-                    usize::try_from(m.len())
-                        .unwrap_or(PAGE_BYTES)
-                        .saturating_mul(6)
-                },
-            ))
-        },
-    )
+    let compact = serde_json::to_vec(document).map_or(PAGE_BYTES, |bytes| bytes.len());
+    saved.fields.iter().fold(compact, |total, field| {
+        total.saturating_add(saved.captures.get(field).map_or(PAGE_BYTES, |capture| {
+            usize::try_from(capture.bytes)
+                .unwrap_or(PAGE_BYTES)
+                .saturating_mul(6)
+        }))
+    })
 }
 
+/// Captures a remote worker streams separately from its result frame.
 pub(crate) fn transfer_fields(
-    directory: &Path,
-) -> Result<Vec<(String, CaptureKind, PathBuf)>, ToolError> {
-    captures::available_captures(directory, true)?
+    output: &Output,
+) -> Result<Vec<(String, CaptureKind, Source)>, ToolError> {
+    let saved = Saved::load(output)?;
+    Ok(captures::available_captures(&saved, true)?
         .into_iter()
-        .filter_map(|capture| {
-            let path = field_file(directory, &capture.field);
-            match std::fs::metadata(&path) {
-                // Unreferenced/unfinished captures have no result value to carry
-                // their bytes, even when they fit in a normal result frame.
-                Ok(meta) if !capture.complete || meta.len() > PAGE_BYTES as u64 => {
-                    Some(Ok((capture.field, capture.kind, path)))
-                }
-                Ok(_) => None,
-                Err(error) => Some(Err(error.into())),
-            }
+        .filter(|capture| {
+            // Unreferenced/unfinished captures have no result value to carry
+            // their bytes, even when they fit in a normal result frame.
+            !capture.complete || saved.captures[&capture.field].bytes > PAGE_BYTES as u64
         })
-        .collect()
+        .filter_map(|capture| {
+            let source = saved.capture(&capture.field)?;
+            Some((capture.field, capture.kind, source))
+        })
+        .collect())
+}
+
+#[cfg(test)]
+impl Output {
+    /// Register `field` holding `bytes`, as an unfinished producer leaves it,
+    /// replacing any capture already there.
+    pub(crate) fn test_capture(&self, field: &str, kind: CaptureKind, bytes: &[u8]) {
+        if let Some(existing) = Saved::load(self).unwrap().captures.get(field) {
+            self.db.delete_capture(existing.id).unwrap();
+        }
+        let mut writer = PendingCapture::create(self, field, kind).unwrap().open();
+        writer.write_all(bytes).unwrap();
+        writer.flush().unwrap();
+        // Keep the row: dropping a writer only deletes abandoned builtin text captures.
+        drop(writer);
+    }
+
+    pub(crate) fn test_bytes(&self, field: &str) -> Option<Vec<u8>> {
+        Saved::load(self).unwrap().bytes(field).unwrap()
+    }
+
+    /// The compact saved document, if the job has finished.
+    pub(crate) fn test_document(&self) -> Option<Value> {
+        Saved::load(self).unwrap().document
+    }
+
+    pub(crate) fn test_fields(&self) -> Vec<String> {
+        Saved::load(self).unwrap().fields
+    }
+
+    pub(crate) fn test_delete_capture(&self, capture: &CompletedCapture) {
+        self.db.delete_capture(capture.capture_id()).unwrap();
+    }
+}
+
+/// A running job's output for synchronous tests, with the runtime that owns it.
+#[cfg(test)]
+pub(crate) struct TestOutput {
+    pub output: Output,
+    _manager: JobManager,
+    _root: tempfile::TempDir,
+    _runtime: tokio::runtime::Runtime,
+}
+
+#[cfg(test)]
+impl TestOutput {
+    pub(crate) fn new() -> Self {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (root, manager, job) = runtime.block_on(tests::fixture(None));
+        Self {
+            output: manager.output(job),
+            _manager: manager,
+            _root: root,
+            _runtime: runtime,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1013,10 +1156,7 @@ mod tests {
             tool::ToolOutput,
         };
         let (_root, manager, id) = fixture(None).await;
-        let blob = BlobRef {
-            sha256: "ab".repeat(32).parse().unwrap(),
-            bytes: 1,
-        };
+        let blob: BlobRef = manager.store().store_blob(b"image").await.unwrap();
         let images = ["first", "second"]
             .map(|name| ImageRef {
                 file: Some(name.into()),
@@ -1029,12 +1169,9 @@ mod tests {
             .finish(id, JobOutcome::Completed(output))
             .await
             .unwrap();
-        let path = register_capture(
-            &manager.output_directory(id),
-            "/result/raw",
-            CaptureKind::Text,
-        );
-        std::fs::write(path.unwrap(), b"line").unwrap();
+        manager
+            .output(id)
+            .test_capture("/result/raw", CaptureKind::Text, b"line");
         let whole = manager
             .present_output_with(
                 OutputArgs::new(id),
@@ -1110,8 +1247,7 @@ mod tests {
         // The canonical product preserves established presentation policy; it
         // is not a new raw/lossless payload channel.
         assert_eq!(product.view(), &host_view);
-        let saved = tokio::fs::read(manager.output_directory(id).join("document.json")).await;
-        let saved: Value = serde_json::from_slice(&saved.unwrap()).unwrap();
+        let saved = manager.output(id).test_document().unwrap();
         assert_eq!(saved["result"], raw);
     }
 
@@ -1126,8 +1262,6 @@ mod tests {
             } else {
                 "/result/events~1custom/nested~0key"
             };
-            let path =
-                register_capture(&manager.output_directory(id), field, CaptureKind::Json).unwrap();
             assert!(
                 host(&manager, OutputArgs::new(id))
                     .await
@@ -1135,7 +1269,8 @@ mod tests {
                     .is_none()
             );
             let bytes = "{\"partial\":"; // Deliberately unfinished JSON.
-            std::fs::write(&path, bytes).unwrap();
+            let output = manager.output(id);
+            output.test_capture(field, CaptureKind::Json, bytes.as_bytes());
             for terminal in [false, true] {
                 if terminal {
                     let outcome = match outcome {
@@ -1162,7 +1297,7 @@ mod tests {
                     assert!(view.get("result").is_none(), "{outcome}");
                 }
             }
-            assert_eq!(std::fs::read_to_string(path).unwrap(), bytes);
+            assert_eq!(output.test_bytes(field).unwrap(), bytes.as_bytes());
         }
     }
 
@@ -1175,10 +1310,10 @@ mod tests {
         }}));
         let id = manager.test_create(spec).await;
         manager.transition(id, JobState::Running).await.unwrap();
-        let directory = manager.output_directory(id);
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = register_capture(&directory, "/result/console", CaptureKind::Text).unwrap();
-        std::fs::write(path, "console\n".repeat(150)).unwrap();
+        let console = "console\n".repeat(150);
+        manager
+            .output(id)
+            .test_capture("/result/console", CaptureKind::Text, console.as_bytes());
         let mut query = field_args(id, "/result/console");
         query.start = Some(101);
         let lines = |page: &Value| page["preview"]["lines"].as_array().unwrap().len();

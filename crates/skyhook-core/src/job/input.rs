@@ -20,6 +20,33 @@ impl JobManager {
         }
     }
 
+    /// Restored agent jobs whose child can resume but has no live handler yet.
+    pub(crate) async fn retained_children(&self) -> Vec<RetainedChild> {
+        self.inner
+            .jobs
+            .lock()
+            .await
+            .iter()
+            .filter_map(|(id, entry)| {
+                let retained = entry.role == crate::job::JobRole::Agent
+                    && entry.accepts_input
+                    && entry.resume.is_none()
+                    && !entry.cancellation.is_cancelled()
+                    && entry.state != JobState::Cancelled;
+                retained.then_some(())?;
+                Some(RetainedChild {
+                    job: *id,
+                    owner: entry.agent.clone(),
+                    parent: entry.parent,
+                    scope: entry.authorization_scope,
+                    child: entry.child.clone()?,
+                    location: entry.location.clone(),
+                    cancellation: entry.cancellation.clone(),
+                })
+            })
+            .collect()
+    }
+
     /// Record the agent identity as soon as it is launched, including turns that
     /// fail before producing visible assistant text.
     pub(crate) async fn set_child_agent(&self, id: JobId, child: AgentId) -> Result<(), JobError> {
@@ -205,22 +232,8 @@ impl JobManager {
                     },
                 )
                 .await?;
-            // Old saved results must not masquerade as the new invocation's output.
-            // Reset before the live job becomes Running: a failure leaves it
-            // terminal and still resumable rather than cancelling it for good.
-            let directory = manager.output_directory(id);
-            output::save(&directory, &serde_json::json!({"result":null}))
-                .map_err(SessionError::from)?;
-            let mut files = tokio::fs::read_dir(&directory)
-                .await
-                .map_err(SessionError::from)?;
-            while let Some(file) = files.next_entry().await.map_err(SessionError::from)? {
-                if file.file_name().to_string_lossy().starts_with("field-") {
-                    tokio::fs::remove_file(file.path())
-                        .await
-                        .map_err(SessionError::from)?;
-                }
-            }
+            // The running transition starts a new output generation, so old saved
+            // results cannot masquerade as the new invocation's output.
             let (input, receiver) = mpsc::channel(JOB_INPUT_CAPACITY);
             let (notify, cancellation) = {
                 let mut jobs = manager.inner.jobs.lock().await;
@@ -464,23 +477,5 @@ mod tests {
         let result = settled(&jobs, lease.id()).await;
         assert_eq!(result.state, JobState::Completed);
         assert_eq!(result.output, Some(serde_json::json!("not lost")));
-    }
-
-    #[tokio::test]
-    async fn failed_retained_reset_keeps_the_job_resumable() {
-        let (_root, jobs, agent) = super::super::tests::runtime().await;
-        let (lease, calls) = retained(&jobs, &agent).await;
-        let id = lease.id();
-        jobs.test_finish(id, serde_json::json!("previous")).await;
-        // A directory at a capture-file name deterministically rejects remove_file.
-        let fault = jobs.output_directory(id).join("field-reset-fault");
-        std::fs::create_dir(&fault).unwrap();
-        assert!(jobs.send(id, serde_json::json!("resume")).await.is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(jobs.metadata(id).await.unwrap().state, JobState::Completed);
-        std::fs::remove_dir(&fault).unwrap();
-        jobs.send(id, serde_json::json!("resume")).await.unwrap();
-        jobs.drain_supervisors().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

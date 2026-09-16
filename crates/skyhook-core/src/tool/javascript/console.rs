@@ -1,4 +1,4 @@
-//! Disk-backed per-script console capture with consuming finalization.
+//! Database-backed per-script console capture with consuming finalization.
 
 use crate::job::output::{CaptureWriter, CompletedCapture};
 

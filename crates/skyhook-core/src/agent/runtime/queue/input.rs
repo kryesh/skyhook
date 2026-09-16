@@ -45,8 +45,10 @@ impl<'a> PreparedModelSelection<'a> {
         let selection = match name {
             Some(name) if profile != context.profile => {
                 let system = context.template.system().to_vec();
+                // The tools stay pinned across a model change.
+                let tools = Some(context.template.to_request().tools);
                 let replacement = runtime
-                    .open_agent_context(agent, profile.clone(), system, capabilities, false)
+                    .open_agent_context(agent, profile.clone(), system, capabilities, tools, false)
                     .await?;
                 if !profile.supports_images && replacement.contains_images() {
                     return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
@@ -99,8 +101,10 @@ impl<'a> PreparedModelSelection<'a> {
             return Ok(());
         };
         let event = SessionEvent::ModelChanged {
-            model_profile: selected.name.clone(),
-            max_context: selected.profile.max_context,
+            profile: crate::session::ProfileSnapshot {
+                name: selected.name.clone(),
+                profile: selected.profile.clone(),
+            },
         };
         self.accept(claim, event).await?.committed().await?;
         // No await between installation and its routing projection. The exact

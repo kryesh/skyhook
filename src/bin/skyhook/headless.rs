@@ -12,7 +12,7 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = launch::load_config(&request.config, false).await?;
     // Model memory is shared with terminal launches, but UI settings are never read.
-    let (saved, state_warning) = super::tui::state::load();
+    let (saved, state_warning) = super::tui::state::load(&request.config.workspace);
     let model = launch::select_model(&config, request.model.as_deref(), saved.model.as_deref())?;
     let launch = Launch::from_request(&request.config, model, None).await?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -46,7 +46,8 @@ pub async fn run(
             }
             if request.resume.is_none()
                 && saved.model.as_deref() != Some(launch.model.name())
-                && let Err(error) = super::tui::state::remember(launch.model.name())
+                && let Err(error) =
+                    super::tui::state::remember(&launch.workspace, launch.model.name())
             {
                 session
                     .record_status(
@@ -288,31 +289,30 @@ mod tests {
         let mut config = read(&f, "config/skyhook/config.toml");
         config.push_str("\n[models.second]\nprovider='test'\nmodel='second-model'\nmax_context=128000\nmax_output=4096\n");
         fs::write(f.path("config/skyhook/config.toml"), config).unwrap();
-        fs::create_dir_all(f.path("state/skyhook")).unwrap();
-        fs::write(f.path("state/skyhook/ui.json"), r#"{"model":"second"}"#).unwrap();
+        fs::create_dir_all(f.path(".skyhook")).unwrap();
+        fs::write(f.path(".skyhook/state.json"), r#"{"model":"second"}"#).unwrap();
         let saved = f.script("return 'saved';", &[]);
         assert!(saved.status.success());
-        assert!(f.journal(&saved).contains(r#""model_profile":"second""#));
+        assert!(f.journal(&saved).contains(r#""profile":{"name":"second""#));
         let explicit = f.script("return 'explicit';", &["-m", "first"]);
         assert!(explicit.status.success());
-        assert!(f.journal(&explicit).contains(r#""model_profile":"first""#));
+        assert!(
+            f.journal(&explicit)
+                .contains(r#""profile":{"name":"first""#)
+        );
         let remembered: serde_json::Value =
-            serde_json::from_str(&read(&f, "state/skyhook/ui.json")).unwrap();
+            serde_json::from_str(&read(&f, ".skyhook/state.json")).unwrap();
         assert_eq!(remembered["model"], "first");
         let id = std::str::from_utf8(&saved.stdout).unwrap().trim();
         let resumed = f.script("return 'resume-model';", &["--resume", id, "-m", "first"]);
         assert!(resumed.status.success());
-        let journal = f.journal(&resumed);
-        let records: Vec<skyhook::session::EventRecord> = journal
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+        let records = f.records(&resumed);
         let root = skyhook::identity::AgentId::root(id.parse().unwrap());
         assert_eq!(
             skyhook::session::agent_selection(&records, &root).unwrap(),
             "second"
         );
-        fs::write(f.path("state/skyhook/ui.json"), "invalid JSON").unwrap();
+        fs::write(f.path(".skyhook/state.json"), "invalid JSON").unwrap();
         let warning = f.script("return 'warning';", &[]);
         assert!(warning.status.success());
         assert!(f.journal(&warning).contains("Could not read UI state"));

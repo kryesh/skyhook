@@ -67,8 +67,8 @@ pub(crate) struct OutputTruncation {
 }
 
 /// A manager-produced projection, with attachments from the same job snapshot
-/// as its state and presentation metadata. Saved files remain append-only/live
-/// reads; this product does not claim an atomic filesystem snapshot.
+/// as its state and presentation metadata. Captures remain append-only live
+/// reads; this product does not claim an atomic snapshot of them.
 #[derive(Clone, Debug)]
 pub struct PresentedOutput {
     pub state: JobState,

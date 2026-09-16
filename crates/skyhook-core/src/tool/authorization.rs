@@ -42,11 +42,14 @@ struct PendingApproval {
 pub(crate) struct AuthorizationCoordinator {
     policy: Arc<dyn Policy>,
     state: Arc<Mutex<ApprovalState>>,
+    /// Session grants are journaled so a resumed session keeps them.
+    journal: Option<crate::session::SessionStore>,
 }
 
 #[derive(Default)]
 struct ApprovalState {
-    grants: Vec<ApprovalGrant>,
+    /// Each grant with the sequence that journaled it, if any.
+    grants: Vec<(Option<u64>, ApprovalGrant)>,
     pending: HashMap<ApprovalGrant, PendingApproval>,
     next_pending: u64,
 }
@@ -56,13 +59,58 @@ impl AuthorizationCoordinator {
         Self {
             policy,
             state: Arc::new(Mutex::new(ApprovalState::default())),
+            journal: None,
         }
+    }
+
+    /// Journal grants to `store`, starting from those it already holds.
+    pub async fn journaled(mut self, store: crate::session::SessionStore) -> Self {
+        let mut grants = Vec::new();
+        for record in store.records().await {
+            match record.event {
+                crate::session::SessionEvent::ApprovalGranted { grant, .. } => {
+                    grants.push((Some(record.sequence), grant));
+                }
+                crate::session::SessionEvent::ApprovalRevoked { grant } => {
+                    grants.retain(|(sequence, _)| *sequence != Some(grant));
+                }
+                _ => {}
+            }
+        }
+        self.state.lock().await.grants = grants;
+        self.journal = Some(store);
+        self
     }
 
     pub async fn revoke(&self, predicate: impl Fn(&ApprovalGrant) -> bool) {
         let mut state = self.state.lock().await;
-        state.grants.retain(|grant| !predicate(grant));
+        let mut revoked = Vec::new();
+        state.grants.retain(|(sequence, grant)| {
+            let keep = !predicate(grant);
+            if !keep && let Some(sequence) = sequence {
+                revoked.push(*sequence);
+            }
+            keep
+        });
         state.pending.retain(|grant, _| !predicate(grant));
+        if let Some(store) = &self.journal
+            && !revoked.is_empty()
+        {
+            let root = crate::identity::AgentId::root(store.id());
+            let events = revoked
+                .into_iter()
+                .map(|grant| {
+                    (
+                        root.clone(),
+                        crate::session::SessionEvent::ApprovalRevoked { grant },
+                    )
+                })
+                .collect();
+            // Revocation already applies in memory. A lost record restores the grant
+            // on resume, but route grants name target revisions, so a redefined
+            // target still needs approval.
+            let _ = store.append_all(events).await;
+        }
     }
 
     pub async fn authorize(
@@ -91,7 +139,7 @@ impl AuthorizationCoordinator {
                 !state
                     .grants
                     .iter()
-                    .any(|grant| grant.covers(use_.capability, &use_.resource))
+                    .any(|(_, grant)| grant.covers(use_.capability, &use_.resource))
             });
             if permissions.is_empty() {
                 return Ok(());
@@ -120,6 +168,7 @@ impl AuthorizationCoordinator {
                 proposals.clone(),
             );
             let coordinator = self.clone();
+            let (agent, job) = (subject.agent.clone(), subject.job);
             // Finalization belongs to the decision, not to any individual waiter.
             let task = tokio::spawn(async move {
                 let result = tokio::spawn(decision).await.unwrap_or_else(|error| {
@@ -127,7 +176,7 @@ impl AuthorizationCoordinator {
                         "authorization policy failed: {error}"
                     )))
                 });
-                coordinator.finish_pending(id, &result).await;
+                coordinator.finish_pending(id, agent, job, &result).await;
                 result
             });
             let future = async move {
@@ -156,20 +205,43 @@ impl AuthorizationCoordinator {
     async fn finish_pending(
         &self,
         id: u64,
+        agent: AgentId,
+        job: JobId,
         result: &Result<Vec<ApprovalGrant>, AuthorizationError>,
     ) {
         let mut state = self.state.lock().await;
+        let mut accepted = Vec::new();
         if let Ok(grants) = result {
             for grant in grants {
                 let current = state
                     .pending
                     .iter()
                     .any(|(proposal, pending)| pending.id == id && proposal.permits(grant));
-                if current && !state.grants.contains(grant) {
-                    state.grants.push(grant.clone());
+                let known = state.grants.iter().any(|(_, known)| known == grant);
+                if current && !known && !accepted.contains(grant) {
+                    accepted.push(grant.clone());
                 }
             }
         }
+        let sequences = match &self.journal {
+            Some(store) if !accepted.is_empty() => {
+                let events = accepted
+                    .iter()
+                    .map(|grant| {
+                        let grant = grant.clone();
+                        let event = crate::session::SessionEvent::ApprovalGranted { job, grant };
+                        (agent.clone(), event)
+                    })
+                    .collect();
+                match store.append_all(events).await {
+                    Ok(records) => records.iter().map(|record| Some(record.sequence)).collect(),
+                    // An unjournaled grant is not kept; later requests ask again.
+                    Err(_) => Vec::new(),
+                }
+            }
+            _ => accepted.iter().map(|_| None).collect(),
+        };
+        state.grants.extend(sequences.into_iter().zip(accepted));
         state.pending.retain(|_, pending| pending.id != id);
     }
 
@@ -285,6 +357,35 @@ mod tests {
             .authorize(subject, "tool".to_owned(), vec![permission], arguments)
             .await
             .map(drop)
+    }
+
+    #[tokio::test]
+    async fn journaled_grants_survive_a_resumed_coordinator_until_revoked() {
+        let session = crate::session::fixture::MemorySession::new().await;
+        let jobs = crate::job::JobManager::new(session.store.clone());
+        let spec = crate::job::JobSpec::test(session.agent.clone(), "tool");
+        let job = jobs.create(spec).await.unwrap();
+        let mut subject = subject(CancellationToken::new());
+        (subject.agent, subject.job) = (session.agent.clone(), job.id());
+        let resource = ResourceId::custom("plugin", ["server", "operation"]).unwrap();
+        let policy = Arc::new(CountingPolicy::default());
+        let journaled = async || {
+            AuthorizationCoordinator::new(policy.clone())
+                .journaled(session.store.clone())
+                .await
+        };
+        authorize(&journaled().await, &subject, &resource)
+            .await
+            .unwrap();
+        // A resumed session's coordinator starts from the journal, not the policy.
+        let resumed = journaled().await;
+        authorize(&resumed, &subject, &resource).await.unwrap();
+        assert_eq!(policy.calls.load(Ordering::SeqCst), 1);
+        resumed.revoke(|_| true).await;
+        authorize(&journaled().await, &subject, &resource)
+            .await
+            .unwrap();
+        assert_eq!(policy.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

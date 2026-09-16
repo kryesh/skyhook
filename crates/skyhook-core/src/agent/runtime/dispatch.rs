@@ -11,6 +11,10 @@ struct PreparedAgentLaunch {
     sender: AgentSender,
     todos: Option<Vec<TodoItem>>,
     available_depth: usize,
+    /// Journaled before: resume under that contract without starting it again.
+    resumed: bool,
+    /// The session's first agent, which commits the session start with it.
+    first: bool,
 }
 
 impl PreparedAgentLaunch {
@@ -21,30 +25,63 @@ impl PreparedAgentLaunch {
         let AgentLaunch {
             id,
             owner_job,
-            model_profile,
+            mut model_profile,
             todos,
-            available_depth,
-            location,
+            mut available_depth,
+            mut location,
         } = launch;
+        // An agent that started before resumes under its journaled contract. Live
+        // configuration may narrow its capabilities but never widen them.
+        let records = runtime.store.records().await;
+        let first = records.is_empty();
+        let recorded = recorded_contract(&records, &id, &runtime.harness.capabilities);
+        drop(records);
+        let resumed = recorded.is_some();
         if id.depth() > runtime.harness.max_child_depth {
             return Err(HarnessError::ChildDepth);
         }
         let remaining_depth = runtime.harness.max_child_depth.saturating_sub(id.depth());
+        if let Some(recorded) = &recorded {
+            // A lowered live limit narrows a resumed agent rather than refusing it.
+            available_depth = recorded.available_depth.min(remaining_depth);
+            location.clone_from(&recorded.location);
+            model_profile.clone_from(&recorded.profile.name);
+        }
         if available_depth > remaining_depth {
             return Err(HarnessError::ChildDepth);
         }
-        let capabilities = runtime.harness.capabilities.for_agent(available_depth);
-        let (profile, system) = runtime
-            .resolve_agent(
-                &model_profile,
-                &id,
-                &location,
-                available_depth,
-                &capabilities,
-            )
-            .await?;
+        let allowed = runtime.harness.capabilities.for_agent(available_depth);
+        let capabilities = match &recorded {
+            Some(recorded) => recorded
+                .capabilities
+                .iter()
+                .filter(|capability| allowed.contains(*capability))
+                .collect(),
+            None => allowed,
+        };
+        let (profile, system, tools) = match recorded {
+            Some(RecordedContract {
+                profile,
+                system: Some(system),
+                tools,
+                ..
+            }) => (profile.profile, system, tools),
+            recorded => {
+                let (live, system) = runtime
+                    .resolve_agent(
+                        &model_profile,
+                        &id,
+                        &location,
+                        available_depth,
+                        &capabilities,
+                    )
+                    .await?;
+                let profile = recorded.map_or(live, |recorded| recorded.profile.profile);
+                (profile, system, None)
+            }
+        };
         let context = runtime
-            .open_agent_context(&id, profile, system, &capabilities, true)
+            .open_agent_context(&id, profile, system, &capabilities, tools, true)
             .await?;
         let (tx, rx) = mpsc::channel(AGENT_CHANNEL_CAPACITY);
         let sender = AgentSender::new(tx);
@@ -63,6 +100,8 @@ impl PreparedAgentLaunch {
             sender,
             todos,
             available_depth,
+            resumed,
+            first,
         })
     }
 
@@ -73,20 +112,35 @@ impl PreparedAgentLaunch {
             sender,
             todos,
             available_depth,
+            resumed,
+            first,
         } = self;
-        runtime
-            .store
-            .append(
-                agent_loop.id.clone(),
-                SessionEvent::AgentStarted {
-                    parent: agent_loop.id.parent(),
-                    owner_job: agent_loop.owner_job,
-                    model_profile: agent_loop.model_profile.clone(),
-                    max_context: Some(agent_loop.context.profile.max_context),
-                    location: agent_loop.location.clone(),
-                },
-            )
-            .await?;
+        if !resumed {
+            let started = SessionEvent::AgentStarted {
+                parent: agent_loop.id.parent(),
+                owner_job: agent_loop.owner_job,
+                profile: Some(crate::session::ProfileSnapshot {
+                    name: agent_loop.model_profile.clone(),
+                    profile: agent_loop.context.profile.clone(),
+                }),
+                available_depth: u32::try_from(available_depth).unwrap_or(u32::MAX),
+                capabilities: agent_loop.capabilities.iter().collect(),
+                location: agent_loop.location.clone(),
+            };
+            let harness = &runtime.harness;
+            // Every entry references an agent, so the session starts with its root.
+            let session = first.then(|| SessionEvent::SessionStarted {
+                targets: harness.target_definitions.clone(),
+                capabilities: harness.capabilities.iter().collect(),
+                max_child_depth: u32::try_from(harness.max_child_depth).unwrap_or(u32::MAX),
+            });
+            let events = session.into_iter().chain([started]);
+            let id = &agent_loop.id;
+            runtime
+                .store
+                .append_all(events.map(|event| (id.clone(), event)).collect())
+                .await?;
+        }
         if let Some(job) = agent_loop.owner_job {
             runtime
                 .jobs
@@ -232,12 +286,16 @@ impl SessionRuntime {
         Ok((profile, system))
     }
 
+    /// Open a context offering the live tool surface, or `pinned` tools journaled
+    /// earlier. A pinned tool whose live definition differs or is gone stays
+    /// visible to the model but is unavailable to call.
     pub(super) async fn open_agent_context(
         &self,
         agent: &AgentId,
         profile: ModelProfile,
         system: Vec<SystemSegment>,
         capabilities: &CapabilitySet,
+        pinned: Option<Vec<crate::provider::protocol::ToolDefinition>>,
         restore_meter: bool,
     ) -> Result<AgentContext, HarnessError> {
         let factory = self
@@ -245,33 +303,149 @@ impl SessionRuntime {
             .providers
             .get(&profile.provider)
             .ok_or_else(|| HarnessError::UnknownProvider(profile.provider.clone()))?;
+        let live = self
+            .executor
+            .clone()
+            .with_capabilities(capabilities.clone())
+            .surface_for_agent(agent)
+            .definitions();
+        let (tools, unavailable) = match pinned {
+            // A pinned tool the live surface no longer offers cannot run. One it still
+            // offers runs against its live definition, which validates the arguments.
+            Some(pinned) => {
+                let unavailable = pinned
+                    .iter()
+                    .filter(|tool| !live.iter().any(|live| live.name == tool.name))
+                    .map(|tool| tool.name.clone())
+                    .collect();
+                (pinned, unavailable)
+            }
+            None => (live, Default::default()),
+        };
         let template = ModelRequest {
             model: profile.model.clone(),
             system,
             history: Vec::new(),
             tail: Vec::new(),
             history_lifetime: Default::default(),
-            tools: self
-                .executor
-                .clone()
-                .with_capabilities(capabilities.clone())
-                .surface_for_agent(agent)
-                .definitions(),
+            tools,
             reasoning: profile.reasoning.clone(),
             response_schema: None,
             max_output_tokens: Some(profile.max_output),
             correlation: Some(agent.to_string()),
             blobs: Default::default(),
         };
-        AgentContext::open(
+        let mut context = AgentContext::open(
             agent,
             profile,
             template.try_into()?,
             factory.as_ref(),
             &self.store.records().await,
             restore_meter,
-        )
+        )?;
+        context.unavailable_tools = Arc::new(unavailable);
+        Ok(context)
     }
+}
+
+impl SessionRuntime {
+    /// Give restored agent jobs a handler that resumes their child, starting it
+    /// again under its journaled contract when its loop is gone.
+    pub(super) async fn install_retained_children(self: &Arc<Self>) {
+        let records = self.store.records().await;
+        for retained in self.jobs.retained_children().await {
+            let live = &self.harness.capabilities;
+            let Some(mut owner) = recorded_contract(&records, &retained.owner, live) else {
+                continue;
+            };
+            // As when the owner itself resumes: its depth never exceeds the live limit.
+            let remaining = self
+                .harness
+                .max_child_depth
+                .saturating_sub(retained.owner.depth());
+            let allowed = live.for_agent(owner.available_depth.min(remaining));
+            owner.capabilities = owner
+                .capabilities
+                .iter()
+                .filter(|capability| allowed.contains(*capability))
+                .collect();
+            let authorization = crate::tool::authorization::AuthorizationSubject {
+                agent: retained.owner,
+                job: retained.job,
+                parent: retained.parent,
+                scope: retained.scope,
+                capabilities: owner.capabilities,
+                cancellation: retained.cancellation,
+            };
+            let handler = super::tools::child_resume_handler(
+                Arc::downgrade(self),
+                retained.child,
+                authorization,
+                retained.location,
+                owner.location,
+            );
+            let _ = self.jobs.set_resume_handler(retained.job, handler).await;
+        }
+    }
+}
+
+/// The contract an agent was journaled under: its start, latest applied profile,
+/// and the prompt and tools of its latest agent model context.
+struct RecordedContract {
+    profile: crate::session::ProfileSnapshot,
+    available_depth: usize,
+    /// The journaled set narrowed to the live configuration, never widened.
+    capabilities: CapabilitySet,
+    location: crate::execution::ExecutionLocation,
+    system: Option<Vec<SystemSegment>>,
+    tools: Option<Vec<crate::provider::protocol::ToolDefinition>>,
+}
+
+fn recorded_contract(
+    records: &[EventRecord],
+    agent: &AgentId,
+    live: &CapabilitySet,
+) -> Option<RecordedContract> {
+    let mut contract: Option<RecordedContract> = None;
+    for record in records.iter().filter(|record| &record.agent == agent) {
+        match &record.event {
+            SessionEvent::AgentStarted {
+                profile: Some(profile),
+                available_depth,
+                capabilities,
+                location,
+                ..
+            } => {
+                contract = Some(RecordedContract {
+                    profile: profile.clone(),
+                    available_depth: *available_depth as usize,
+                    capabilities: capabilities
+                        .iter()
+                        .copied()
+                        .filter(|capability| live.contains(*capability))
+                        .collect(),
+                    location: location.clone(),
+                    system: None,
+                    tools: None,
+                });
+            }
+            SessionEvent::ModelChanged { profile } => {
+                if let Some(contract) = &mut contract {
+                    contract.profile = profile.clone();
+                }
+            }
+            SessionEvent::ModelContext { context }
+                if context.purpose == crate::session::ModelPurpose::Agent =>
+            {
+                if let Some(contract) = &mut contract {
+                    contract.system = Some(context.system.clone());
+                    contract.tools = Some(context.tools.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    contract
 }
 impl SessionRuntime {
     pub(super) async fn next_child(&self, parent: &AgentId) -> AgentId {

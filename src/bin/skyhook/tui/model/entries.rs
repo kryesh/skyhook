@@ -539,6 +539,7 @@ mod tests {
                 output_schema: None,
                 accepts_input: false,
                 background: false,
+                authorization_scope: None,
                 location: ExecutionLocation::root("/workspace".into()),
             };
             record(&mut snapshot, &agent, created);

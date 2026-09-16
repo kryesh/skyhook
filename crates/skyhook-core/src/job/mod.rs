@@ -142,6 +142,17 @@ pub struct JobCompletion {
     pub job: JobId,
 }
 
+/// A restored agent job: its owner, child and the authority its invocations ran under.
+pub(crate) struct RetainedChild {
+    pub job: JobId,
+    pub owner: AgentId,
+    pub parent: Option<JobId>,
+    pub scope: Option<u64>,
+    pub child: AgentId,
+    pub location: ExecutionLocation,
+    pub cancellation: CancellationToken,
+}
+
 /// Explicitly installed by live child agents; ordinary input-capable tools cannot restart.
 pub(crate) type ResumeHandler = Arc<
     dyn Fn(
@@ -222,9 +233,8 @@ impl JobEntry {
         )
     }
 
-    /// Clear the previous invocation's in-memory projection without touching its
-    /// sidecar artifacts. Live resumption owns file reset before starting work;
-    /// replay must never rewrite an earlier invocation's files while folding it.
+    /// Clear the previous invocation's in-memory projection. Its saved output stays in
+    /// the database under the earlier generation; replay never rewrites it.
     fn clear_invocation_output(&mut self) {
         self.output = None;
         self.images.clear();
@@ -235,7 +245,7 @@ impl JobEntry {
     /// Install all reported-outcome metadata together. Live callers establish
     /// transition validity before publication; replay preserves permissive
     /// historical state/error/denial combinations rather than tightening them.
-    /// Saved result values and captures stay sidecar-backed, not in JobEntry.
+    /// Saved result values and captures stay in the database, not in JobEntry.
     fn apply_finished(
         &mut self,
         state: JobState,
@@ -319,7 +329,10 @@ impl DeliveryState {
     fn event(self, job: JobId) -> SessionEvent {
         match self {
             Self::Claimed => SessionEvent::JobClaimed { job },
-            Self::Injected => SessionEvent::JobInjected { job },
+            Self::Injected => SessionEvent::JobInjected {
+                job,
+                notification: None,
+            },
             Self::Pending => unreachable!("pending delivery has no event"),
         }
     }
@@ -483,7 +496,7 @@ mod tests {
             self.create(spec).await.unwrap().into_test_fixture()
         }
 
-        pub(super) async fn test_create(&self, spec: JobSpec) -> JobId {
+        pub(crate) async fn test_create(&self, spec: JobSpec) -> JobId {
             self.test_lease(spec).await.into_test_id()
         }
 

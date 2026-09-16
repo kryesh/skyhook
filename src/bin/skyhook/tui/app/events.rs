@@ -603,7 +603,14 @@ mod tests {
 
         std::fs::write(app.launch.workspace.join("release"), "").unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !app.projection.jobs[&job].state.is_terminal() {
+            // The live job settles just after its journal commit.
+            while !app.projection.jobs[&job].state.is_terminal()
+                || !session
+                    .inspect_jobs(session.root_agent())
+                    .await
+                    .iter()
+                    .any(|envelope| envelope.id == job && envelope.state.is_terminal())
+            {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 app.snapshot = session.observe().await.snapshot;
                 app.refresh();
@@ -756,7 +763,6 @@ mod tests {
             let record = skyhook::session::EventRecord {
                 id: skyhook::identity::EventId::generate().unwrap(),
                 queue_attempt: None,
-                version: 1,
                 sequence,
                 timestamp_millis: 0,
                 agent: agent.clone(),

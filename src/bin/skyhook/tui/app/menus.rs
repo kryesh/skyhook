@@ -187,38 +187,20 @@ async fn load_sessions(root: PathBuf) -> Result<Vec<Item<SessionId>>, String> {
         else {
             continue;
         };
-        let records = match SessionStore::read_records(&root, id).await {
-            Ok(records) => records,
-            Err(_) => continue,
+        let Ok(summary) = SessionStore::summary(&root, id).await else {
+            continue;
         };
-        let title = tokio::fs::read(entry.path().join("ui.json"))
-            .await
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .and_then(|v| v["title"].as_str().map(str::to_owned))
+        let title = summary
+            .title
             .or_else(|| {
-                records.iter().find_map(|r| {
-                    if let SessionEvent::MessageCommitted {
-                        message: skyhook::provider::protocol::Message::User(blocks),
-                    } = &r.event
-                    {
-                        blocks.iter().find_map(|b| {
-                            if let skyhook::provider::protocol::UserContent::Text { text } = b {
-                                Some(crate::tui::format::brief(text, 100))
-                            } else {
-                                None
-                            }
-                        })
-                    } else {
-                        None
-                    }
-                })
+                summary
+                    .preview
+                    .map(|text| crate::tui::format::brief(&text, 100))
             })
             .unwrap_or_else(|| id.to_string());
-        let timestamp = records.last().map_or(0, |r| r.timestamp_millis);
         sessions.push((
-            timestamp,
-            Item::new(id, title, format!("{} events · {id}", records.len())),
+            summary.last_millis,
+            Item::new(id, title, format!("{} events · {id}", summary.entries)),
         ));
     }
     sessions.sort_by_key(|(timestamp, _)| std::cmp::Reverse(*timestamp));
@@ -1067,7 +1049,14 @@ mod tests {
                         job, state: skyhook::job::JobState::Failed, ..
                     } if job == child_job)
                 });
-                if failures.count() == count {
+                // The live job settles just after its journal commit; a retry
+                // decided before then would find the child still running.
+                let settled = session
+                    .inspect_jobs(session.root_agent())
+                    .await
+                    .iter()
+                    .any(|job| job.id == child_job && job.state == skyhook::job::JobState::Failed);
+                if failures.count() == count && settled {
                     break snapshot;
                 }
                 tokio::task::yield_now().await;

@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// The failure recorded when a provider aborts a response mid-stream.
+const ABORTED: &str = "provider aborted response";
+
 impl SessionRuntime {
     pub(super) async fn run_turn(
         &self,
@@ -57,21 +60,25 @@ impl SessionRuntime {
             let context = match context_sequence {
                 Some(sequence) => sequence,
                 None => {
+                    let context = crate::session::ModelContext {
+                        purpose: crate::session::ModelPurpose::Agent,
+                        profile: crate::session::ProfileSnapshot {
+                            name: model_profile.clone(),
+                            profile: profile.clone(),
+                        },
+                        system: template.system.clone(),
+                        tools: template.tools.clone(),
+                        response_schema: template.response_schema.clone(),
+                    };
                     let record = self
                         .store
-                        .append(
-                            agent.clone(),
-                            SessionEvent::ModelContext {
-                                provider: profile.provider.clone(),
-                                template: template.clone(),
-                            },
-                        )
+                        .append(agent.clone(), SessionEvent::ModelContext { context })
                         .await?;
                     context_sequence = Some(record.sequence);
                     record.sequence
                 }
             };
-            agent_context.refresh(&self.store.records().await, agent)?;
+            agent_context.refresh(&self.store, agent).await?;
             let runtime = prompt::runtime_state_content(
                 &self.jobs,
                 &self.todos,
@@ -147,7 +154,11 @@ impl SessionRuntime {
                     .await?;
                 let invoked = tokio::select! {
                     response = agent_context.provider.invoke(request.clone()) => response,
-                    () = cancellation.cancelled() => return Err(HarnessError::Interrupted),
+                    () = cancellation.cancelled() => {
+                        self.record_attempt_interrupted(agent, requested.sequence, provider_attempt)
+                            .await?;
+                        return Err(HarnessError::Interrupted);
+                    },
                 };
                 let mut response = match invoked {
                     Ok(response) => response,
@@ -196,6 +207,8 @@ impl SessionRuntime {
                         chunk = response.next() => chunk,
                         () = cancellation.cancelled() => {
                             self.record_model_usage(agent, requested.sequence, usage).await?;
+                            self.record_attempt_interrupted(agent, requested.sequence, provider_attempt)
+                                .await?;
                             return Err(HarnessError::Interrupted);
                         },
                     };
@@ -336,6 +349,41 @@ impl SessionRuntime {
             // continues). The answer and the completion envelope then reach the
             // owner in one delivery batch, without relying on any wake timing.
             let working = !response.calls.is_empty();
+            // The message, its usage and its outcome commit in one transaction, so a
+            // crash never leaves a response without the attempt's outcome.
+            let aborted = response.stop_reason == crate::provider::protocol::StopReason::Aborted;
+            let outcome = {
+                let (agent, request) = (agent.clone(), requested.sequence);
+                let (usage, stop_reason) = (response.usage, response.stop_reason.clone());
+                move |message: u64| {
+                    let mut events = Vec::new();
+                    if !aborted || usage != Usage::default() {
+                        events.push(SessionEvent::Usage {
+                            request: Some(request),
+                            usage,
+                        });
+                    }
+                    events.push(if aborted {
+                        SessionEvent::ModelFailed {
+                            request,
+                            attempt: provider_attempt,
+                            error: ABORTED.to_owned(),
+                            kind: crate::session::ModelFailureKind::Error,
+                        }
+                    } else {
+                        SessionEvent::ResponseCompleted {
+                            request,
+                            attempt: provider_attempt,
+                            message: Some(message),
+                            stop_reason,
+                        }
+                    });
+                    events
+                        .into_iter()
+                        .map(|event| (agent.clone(), event))
+                        .collect()
+                }
+            };
             let origin = if let Some(job) = owner_job {
                 self.jobs
                     .commit_child_message(
@@ -344,30 +392,31 @@ impl SessionRuntime {
                         assistant.clone(),
                         response.text.clone(),
                         working,
+                        outcome,
                     )
                     .await?
             } else {
-                self.commit(agent, assistant.clone()).await?
+                self.store
+                    .append_then(
+                        agent.clone(),
+                        SessionEvent::MessageCommitted {
+                            message: assistant.clone(),
+                        },
+                        outcome,
+                    )
+                    .await?[0]
+                    .sequence
             };
+            self.usage.lock().await.accumulate(response.usage);
             agent_context.projected.push((origin, assistant));
-            if response.stop_reason == crate::provider::protocol::StopReason::Aborted {
+            if aborted {
                 // Preserve completed visible/replay content, but never turn a
-                // provider abort into a successful agent turn. The failure
-                // helper records observed usage exactly once before returning.
-                let error = "provider aborted response".to_owned();
-                self.record_model_failure(
-                    agent,
-                    requested.sequence,
-                    provider_attempt,
-                    response.usage,
-                    error.clone(),
-                )
-                .await?;
+                // provider abort into a successful agent turn.
                 self.events.send(RuntimeEvent::ResponseSettled {
                     agent: agent.clone(),
                     request: requested.sequence,
                     message: Some(origin),
-                    error: Some(error),
+                    error: Some(ABORTED.to_owned()),
                 });
                 return Err(HarnessError::ProviderAborted);
             }
@@ -383,10 +432,6 @@ impl SessionRuntime {
                 message: Some(origin),
                 error: None,
             });
-            self.record_model_usage(agent, requested.sequence, response.usage)
-                .await?;
-            self.record_response_completed(agent, requested.sequence, response.stop_reason.clone())
-                .await?;
             agent_context.meter.observe(input_estimate, response.usage);
             // Decide once from the successful completed response, never from an
             // estimate that includes newly produced tool results or queued input.
@@ -410,13 +455,39 @@ impl SessionRuntime {
                     .prepare_question_batch(agent, &response.calls, self.executor.registry())
                     .await;
                 self.activity(agent, AgentActivity::Tools);
-                let results = join_all(response.calls.iter().map(|call| {
-                    self.execute_call(agent, owner_job, call, origin, location, capabilities)
-                }))
-                .await;
-                let tools = Message::Tool(results);
-                let sequence = self.commit(agent, tools.clone()).await?;
-                agent_context.projected.push((sequence, tools));
+                // Each result commits as its call finishes, so a crash keeps every
+                // completed result; history merges them back into call order.
+                let mut calls: futures_util::stream::FuturesUnordered<_> = response
+                    .calls
+                    .iter()
+                    .map(|call| {
+                        if !agent_context.unavailable_tools.contains(call.name()) {
+                            return self
+                                .execute_call(agent, owner_job, call, origin, location, capabilities);
+                        }
+                        // A pinned tool the live registry no longer provides as journaled.
+                        Box::pin(std::future::ready(ToolResult {
+                            call_id: call.id().to_owned(),
+                            name: call.name().to_owned(),
+                            result: json!({"error": format!("tool `{}` is unavailable in this session", call.name())}),
+                            images: Vec::new(),
+                            is_error: true,
+                        }))
+                    })
+                    .collect();
+                // Drain every call even after a failed commit; results that could not
+                // commit are settled as interrupted when the session resumes.
+                let mut committed = Ok(());
+                while let Some(result) = futures_util::StreamExt::next(&mut calls).await {
+                    if committed.is_ok() {
+                        let tools = Message::Tool(vec![result]);
+                        committed = self
+                            .commit(agent, tools.clone())
+                            .await
+                            .map(|sequence| agent_context.projected.push((sequence, tools)));
+                    }
+                }
+                committed?;
             }
             if compact_completed_response {
                 // Checkpoints retain complete tool exchanges. Close the exchange
@@ -430,7 +501,7 @@ impl SessionRuntime {
                     profile.max_context,
                 )
                 .await?;
-                agent_context.refresh(&self.store.records().await, agent)?;
+                agent_context.refresh(&self.store, agent).await?;
                 context_sequence = None;
             }
             provider_attempt = 0;

@@ -343,15 +343,13 @@ mod tests {
         executor: ToolExecutor,
         context: ToolContext,
     ) -> Result<ToolOutput, JsError> {
-        let directory = executor.jobs().output_directory(context.job());
-        let path = crate::job::output::field_file(&directory, "/result/console");
+        let saved = executor.jobs().output(context.job());
         let captured = evaluate_captured(source.into(), executor, context).await;
         let mut output = captured.map_err(|captured| captured.error)?;
-        let console = match tokio::fs::read_to_string(path).await {
-            Ok(console) => console,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => panic!("read finalized console: {error}"),
-        };
+        let console = saved
+            .test_bytes("/result/console")
+            .map(|bytes| String::from_utf8(bytes).expect("console is UTF-8"))
+            .unwrap_or_default();
         output.value["console"] = Value::String(console);
         Ok(output)
     }

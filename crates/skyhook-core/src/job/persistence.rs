@@ -1,11 +1,4 @@
-use crate::{
-    identity::{AgentId, JobId},
-    provider::protocol::{Message, UserContent},
-};
-
-use crate::session::{
-    EventRecord, SessionError, SessionEvent, SessionStore, is_safe_artifact_path,
-};
+use crate::session::{EventRecord, SessionEvent, SessionStore};
 
 use super::{DeliveryState, JobEntry, JobError, JobManager, JobOutcome, JobSpec};
 
@@ -27,6 +20,7 @@ pub(super) async fn restore(
                 name,
                 accepts_input,
                 background,
+                authorization_scope,
                 location,
                 output_schema,
                 ..
@@ -44,7 +38,7 @@ pub(super) async fn restore(
                         output_schema: output_schema.clone(),
                         accepts_input: *accepts_input,
                         background: *background,
-                        authorization_scope: None,
+                        authorization_scope: *authorization_scope,
                         location: location.clone(),
                     },
                     record.timestamp_millis,
@@ -106,30 +100,16 @@ pub(super) async fn restore(
                 {
                     entry.publish_message(*job, record.sequence, text);
                 }
-                acknowledge_message(&mut jobs, &record.agent, message);
             }
             SessionEvent::JobFinished {
                 job,
                 state,
-                output_path,
                 error,
                 images,
                 denial,
             } => {
                 if let Some(entry) = jobs.get_mut(job) {
                     entry.apply_finished(*state, images.clone(), error.clone(), denial.clone());
-                    if let Some(relative) = output_path {
-                        if !is_safe_artifact_path(relative) {
-                            return Err(SessionError::UnsafeArtifactPath.into());
-                        }
-                        if !store.directory().join(relative).is_file() {
-                            return Err(SessionError::from(std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                "missing job output artifact",
-                            ))
-                            .into());
-                        }
-                    }
                 }
             }
             SessionEvent::JobClaimed { job } => {
@@ -137,9 +117,14 @@ pub(super) async fn restore(
                     entry.delivery = DeliveryState::Claimed;
                 }
             }
-            SessionEvent::JobInjected { job } => {
+            SessionEvent::JobInjected { job, .. } => {
                 if let Some(entry) = jobs.get_mut(job) {
                     entry.delivery = DeliveryState::Injected;
+                }
+            }
+            SessionEvent::JobMessageDelivered { job, source, .. } => {
+                if let Some(entry) = jobs.get_mut(job) {
+                    entry.messages.retain(|message| message.message != *source);
                 }
             }
             _ => {}
@@ -157,94 +142,11 @@ pub(super) async fn restore(
     Ok(manager)
 }
 
-/// The committed host-generated notification is the delivery acknowledgement.
-/// Infer it in journal order, so a later retained resume resets delivery normally.
-/// User text/parent input is deliberately not parsed as a host notification.
-pub(super) fn acknowledge_message(
-    jobs: &mut std::collections::HashMap<JobId, JobEntry>,
-    owner: &AgentId,
-    message: &Message,
-) {
-    let Message::User(content) = message else {
-        return;
-    };
-    for block in content {
-        let UserContent::Runtime { text } = block else {
-            continue;
-        };
-        let legacy = text.starts_with("<skyhook_agent_messages>\n");
-        let tag = if legacy {
-            "skyhook_agent_messages"
-        } else {
-            "skyhook_job_events"
-        };
-        let Some(json) = text
-            .strip_prefix(&format!("<{tag}>\n"))
-            .and_then(|text| text.strip_suffix(&format!("\n</{tag}>")))
-        else {
-            continue;
-        };
-        let Ok(envelopes) = serde_json::from_str::<Vec<serde_json::Value>>(json) else {
-            continue;
-        };
-        for envelope in envelopes {
-            let Some(id) = envelope.get("id") else {
-                continue;
-            };
-            let Ok(id) = serde_json::from_value::<JobId>(id.clone()) else {
-                continue;
-            };
-            let Some(entry) = jobs.get_mut(&id) else {
-                continue;
-            };
-            if &entry.agent != owner {
-                continue;
-            }
-            if legacy || envelope.get("kind").and_then(serde_json::Value::as_str) == Some("message")
-            {
-                if let Some(sequence) = envelope.get("message").and_then(serde_json::Value::as_u64)
-                {
-                    entry.messages.retain(|message| message.message != sequence);
-                }
-                // A message item can never acknowledge lifecycle delivery, even if
-                // a malformed envelope also supplies a state.
-                continue;
-            }
-            let Some(state) = envelope.get("state") else {
-                continue;
-            };
-            let Ok(state) = serde_json::from_value::<super::JobState>(state.clone()) else {
-                continue;
-            };
-            if &entry.agent == owner
-                && entry.background
-                && entry.state.presented() == state
-                && entry.deliverable()
-            {
-                // Before independent message delivery, a completed child
-                // notification carried its final visible reply in `result`. That
-                // committed parent history is an ACK for exactly the last source
-                // reply, not for earlier reports absent from parent history.
-                if state == super::JobState::Completed
-                    && envelope.get("kind").is_none()
-                    && envelope.get("last_message").is_none()
-                    && let Some(text) = envelope.get("result").and_then(serde_json::Value::as_str)
-                    && let Some(sequence) = entry.last_agent_message
-                {
-                    entry
-                        .messages
-                        .retain(|message| message.message != sequence || message.text != text);
-                }
-                entry.reserve_delivery(DeliveryState::Injected);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::execution::ExecutionLocation;
+    use crate::identity::JobId;
     use crate::job::{JobRole, JobState, presented_job_schema};
     use crate::{
         job::output,
@@ -265,7 +167,7 @@ mod tests {
     async fn replay_recovers_creation_committed_before_map_publication() {
         let root = tempfile::tempdir().unwrap();
         let store = SessionStore::create(root.path()).await.unwrap();
-        let agent = AgentId::root(store.id());
+        let agent = crate::session::fixture::started(&store, root.path()).await;
         let job = JobId::new(7).unwrap();
         let created = SessionEvent::JobCreated {
             origin: None,
@@ -278,6 +180,7 @@ mod tests {
             output_schema: None,
             accepts_input: false,
             background: false,
+            authorization_scope: None,
             location: ExecutionLocation::root(".".into()),
         };
         let accepted = store.accept_append(agent.clone(), created).await.unwrap();
@@ -365,12 +268,9 @@ mod tests {
                 .transition(lease.id(), JobState::Running)
                 .await
                 .unwrap();
-            let directory = manager.output_directory(lease.id());
-            std::fs::write(
-                output::register_capture(&directory, field, kind).unwrap(),
-                bytes,
-            )
-            .unwrap();
+            manager
+                .output(lease.id())
+                .test_capture(field, kind, bytes.as_bytes());
             leases.push(lease);
         }
         drop(leases);
@@ -407,12 +307,11 @@ mod tests {
         crate::media::ImageRef {
             file: Some("historical-image".into()),
             format: crate::media::ImageFormat::Png,
-            blob: crate::media::BlobRef {
-                sha256: "ab".repeat(32).parse().unwrap(),
-                bytes: 1,
-            },
+            blob: crate::media::BlobRef::of(OUTCOME_IMAGE),
         }
     }
+
+    const OUTCOME_IMAGE: &[u8] = b"historical image";
 
     async fn stored_projection(jobs: &JobManager, id: JobId) -> serde_json::Value {
         let entries = jobs.inner.jobs.lock().await;
@@ -431,6 +330,7 @@ mod tests {
     async fn outcome_application_live_replay_and_interrupted_cancellation_matrix() {
         for case in 0..8 {
             let (root, jobs, agent) = super::super::tests::runtime().await;
+            jobs.store().store_blob(OUTCOME_IMAGE).await.unwrap();
             let spec = JobSpec {
                 accepts_input: true,
                 ..JobSpec::test(agent, "outcome")
@@ -444,7 +344,7 @@ mod tests {
             let question = serde_json::json!({"question":"partial"});
             jobs.request_input(id, question).await.unwrap();
             let result = || {
-                ToolOutput::new(serde_json::json!({"result":"sidecar"}))
+                ToolOutput::new(serde_json::json!({"result":"saved"}))
                     .with_images(vec![outcome_image()])
             };
             let failed = |message: &str, output| JobOutcome::Failed {
@@ -493,10 +393,8 @@ mod tests {
             // Projection application must not replace the saved payload by an
             // in-memory question or materialize it into the stored entry.
             if matches!(case, 0 | 2) {
-                let document = std::fs::read(jobs.output_directory(id).join("document.json"));
-                let document: serde_json::Value =
-                    serde_json::from_slice(&document.unwrap()).unwrap();
-                assert_eq!(document["result"], serde_json::json!({"result":"sidecar"}));
+                let document = jobs.output(id).test_document().unwrap();
+                assert_eq!(document["result"], serde_json::json!({"result":"saved"}));
             }
             let mut projection = projection;
             let replay = reopen(jobs, &root.path().join("sessions")).await;

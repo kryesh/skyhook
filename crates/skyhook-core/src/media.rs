@@ -28,6 +28,16 @@ impl BlobDigest {
         use sha2::Digest as _;
         Self(sha2::Sha256::digest(bytes).into())
     }
+
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 32] {
+        self.0
+    }
 }
 
 impl FromStr for BlobDigest {
@@ -408,13 +418,10 @@ mod tests {
             assert!(!serde_json::to_string(&request).unwrap().contains("blobs"));
             if durable {
                 let limit = MAX_IMAGE_BYTES as usize;
-                let path = store
-                    .directory()
-                    .join("blobs")
-                    .join(image.blob.sha256.to_string());
-                tokio::fs::write(&path, b"changed").await.unwrap();
+                let digest = image.blob.sha256;
+                store.corrupt_blob(digest, Some(b"changed".to_vec())).await;
                 assert!(store.read_blob(&image.blob, limit).await.is_err());
-                tokio::fs::remove_file(&path).await.unwrap();
+                store.corrupt_blob(digest, None).await;
                 assert!(store.read_blob(&image.blob, limit).await.is_err());
             }
         }

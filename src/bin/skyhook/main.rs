@@ -236,7 +236,6 @@ mod tests {
                 .env("PATH", "/usr/bin:/bin")
                 .env("HOME", self.root.path())
                 .env("XDG_CONFIG_HOME", self.path("config"))
-                .env("XDG_STATE_HOME", self.path("state"))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -259,26 +258,29 @@ mod tests {
                     .args(extra),
             )
         }
+        /// Saved job outputs and captures as text.
         pub(crate) fn artifacts(&self, output: &Output) -> String {
-            fn collect(path: &std::path::Path, text: &mut String) {
-                for entry in fs::read_dir(path).unwrap() {
-                    let path = entry.unwrap().path();
-                    if path.is_dir() {
-                        collect(&path, text);
-                    } else {
-                        text.push_str(&fs::read_to_string(path).unwrap_or_default());
-                    }
-                }
-            }
-            let id = std::str::from_utf8(&output.stdout).unwrap().trim();
-            let mut text = String::new();
-            collect(
-                &self.path(&format!(".skyhook/sessions/{id}/jobs")),
-                &mut text,
-            );
-            text
+            let id = std::str::from_utf8(&output.stdout)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let sessions = self.path(".skyhook/sessions");
+            on_thread(async move {
+                let text = skyhook::session::SessionStore::read_output_text(&sessions, id).await;
+                text.unwrap().concat()
+            })
         }
+        /// Records as JSON lines.
         pub(crate) fn journal(&self, output: &Output) -> String {
+            let records = self.records(output);
+            let lines = records
+                .iter()
+                .map(|record| serde_json::to_string(record).unwrap());
+            lines.map(|line| line + "\n").collect()
+        }
+        /// The committed records of the session whose id `output` printed.
+        pub(crate) fn records(&self, output: &Output) -> Vec<skyhook::session::EventRecord> {
             assert!(
                 output.stderr.is_empty(),
                 "stderr: {}",
@@ -288,10 +290,26 @@ mod tests {
             let id = stdout
                 .strip_suffix('\n')
                 .expect("session id ends with newline");
-            let _: skyhook::identity::SessionId =
+            let id: skyhook::identity::SessionId =
                 id.parse().expect("stdout contains only one session ID");
-            fs::read_to_string(self.path(&format!(".skyhook/sessions/{id}/events.jsonl"))).unwrap()
+            let sessions = self.path(".skyhook/sessions");
+            on_thread(async move {
+                let records = skyhook::session::SessionStore::read_records(&sessions, id).await;
+                records.unwrap()
+            })
         }
+    }
+
+    /// Run `future` on its own thread's runtime, outside any test runtime.
+    fn on_thread<T: Send + 'static>(future: impl Future<Output = T> + Send + 'static) -> T {
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(future)
+        })
+        .join()
+        .unwrap()
     }
 
     pub(crate) fn output(command: &mut ProcessCommand) -> Output {

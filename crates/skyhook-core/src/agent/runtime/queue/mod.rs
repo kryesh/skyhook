@@ -648,7 +648,7 @@ mod tests {
 
     pub(super) async fn model_changes(session: &SessionHandle) -> Vec<String> {
         let records = session.runtime.store.records().await;
-        events!(records, SessionEvent::ModelChanged { model_profile, .. } => model_profile.clone())
+        events!(records, SessionEvent::ModelChanged { profile } => profile.name.clone())
     }
 
     pub(super) async fn stop(session: &SessionHandle) {

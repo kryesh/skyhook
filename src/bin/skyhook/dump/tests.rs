@@ -20,7 +20,7 @@ fn successful_config(output: &Output) -> toml::Value {
 fn no_session(f: &Fixture) {
     assert!(!f.path(".skyhook/sessions").exists());
     assert!(!f.path("project/.skyhook/sessions").exists());
-    assert!(!f.path("state/skyhook/ui.json").exists());
+    assert!(!f.path(".skyhook/state.json").exists());
 }
 
 #[test]
@@ -216,7 +216,7 @@ fn dump_config_does_not_resolve_secrets_start_mcp_or_load_terminal_state() {
     let mut text = fs::read_to_string(&path).unwrap();
     text.push_str("\n[mcp.trap]\ntransport='stdio'\nstart_command=['/bin/sh','-c','touch SHOULD_NOT_EXIST']\n");
     fs::write(&path, text).unwrap();
-    write(&f.path("state/skyhook/ui.json"), "malformed saved state");
+    write(&f.path(".skyhook/state.json"), "malformed saved state");
     let output = f
         .bare_command()
         .args(["--dump", "config"])
@@ -230,7 +230,7 @@ fn dump_config_does_not_resolve_secrets_start_mcp_or_load_terminal_state() {
     assert!(!f.path("SHOULD_NOT_EXIST").exists());
     assert!(!f.path(".skyhook/sessions").exists());
     assert_eq!(
-        fs::read_to_string(f.path("state/skyhook/ui.json")).unwrap(),
+        fs::read_to_string(f.path(".skyhook/state.json")).unwrap(),
         "malformed saved state"
     );
 }

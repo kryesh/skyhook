@@ -70,7 +70,7 @@ the lifetime: Anthropic places a cache breakpoint on the last history block unle
 (ending history is still marked, since cache reads land only at breakpoints), OpenAI protocols rely on
 automatic prefix caching with the tail sent last, and Codex records no WebSocket continuation for a
 request with a tail or non-continuing history.
-Session journals use format version 3; there is no compatibility or migration layer for earlier layouts.
+Session databases use format version 4; there is no compatibility or migration layer for earlier layouts.
 
 Source: [session module](https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src/session)
 and [agent module](https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src/agent).

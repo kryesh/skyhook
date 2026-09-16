@@ -13,10 +13,7 @@
   `ResponseAssembler` validates lifecycles and supplies ordered snapshots to both the runtime and
   observation/UI layers. Cumulative usage snapshots replace earlier values, and response termination
   carries a stop reason rather than a truncation boolean. Legacy unindexed delta events are removed.
-  Completed assistant messages persist nested items/blocks with their IDs and positions. Session
-  journals now use format version 3; earlier journals are rejected with an explicit unsupported-version
-  error rather than guessing the missing block boundaries. Start a new session after this upgrade.
-  Reasoning
+  Completed assistant messages persist nested items/blocks with their IDs and positions. Reasoning
   replay payloads retain provider/endpoint/protocol/model provenance: incompatible private reasoning
   is omitted from outgoing requests, not deleted from the stored transcript.
   Input images are encoded or rejected explicitly, never silently dropped. Protocols without
@@ -47,8 +44,9 @@
 - `tool::ToolRegistryBuilder` supports typed and JSON-based tools, while `tool::executor::ToolExecutor`
   turns every invocation into a supervised job. Typed registrations generate both input and output
   schemas; compact result shapes are included in model and script documentation.
-- `session::SessionStore` persists a versioned append-only JSONL log, content-addressed attachment and image blobs, job
-  outputs, and line-addressable job output.
+- `session::SessionStore` persists each session in one SQLite database (`session.db`): a normalized
+  append-only ledger committed one transaction per step, content-addressed blobs, and job outputs
+  with line-addressable captures.
 - `agent::Harness` owns model profiles and policy; each `agent::SessionHandle` owns an isolated agent tree
   and registry.
 

@@ -707,11 +707,9 @@ mod tests {
             assert_eq!(results[0].result["result"], "yes");
             assert_eq!(results[1].result["result"], json!({"value":2}));
         }
-        let journal = session.runtime.store.directory().join("events.jsonl");
-        let events = std::fs::read_to_string(journal).unwrap();
-        for kind in ["question_opened", "question_resolved"] {
-            assert_eq!(events.lines().filter(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["event"]["type"] == kind).count(), 2);
-        }
+        let records = session.runtime.store.records().await;
+        assert_eq!(count!(&records, SessionEvent::QuestionOpened { .. }), 2);
+        assert_eq!(count!(&records, SessionEvent::QuestionResolved { .. }), 2);
         assert_eq!(*backgrounds.lock().unwrap(), [false]);
         shutdown_session(session).await;
 
@@ -766,6 +764,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let session = hanging_session(&root).await;
         let owner = owner(&session).await;
+        start_child(&session, 1, Some(owner)).await;
         let (executor, jobs) = (&session.runtime.executor, &session.runtime.jobs);
         let waiting_with = |count: usize| {
             move |job: &JobEnvelope| {
@@ -814,6 +813,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let session = hanging_session(&root).await;
         let owner = owner(&session).await;
+        start_child(&session, 1, Some(owner)).await;
         let jobs = &session.runtime.jobs;
         let mut asks = Vec::new();
         for _ in 0..2 {
@@ -890,6 +890,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let session = hanging_session(&root).await;
         let owner = owner(&session).await;
+        start_child(&session, 1, Some(owner)).await;
         let jobs = &session.runtime.jobs;
         // A live ask job with a full input mailbox and no retained-agent resume handler.
         let spec = JobSpec {

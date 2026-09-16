@@ -202,10 +202,11 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_completed_parent_cancels_descendants_and_late_starts() {
-        let (_root, jobs, agent) = crate::job::tests::runtime().await;
+        let (root, jobs, agent) = crate::job::tests::runtime().await;
         let parent = jobs
             .test_lease(JobSpec::test(agent.clone(), "script"))
             .await;
+        crate::session::fixture::start_child(jobs.store(), &agent, 1, None, root.path()).await;
         let child_lease = jobs
             .test_lease(child(parent.id(), agent.child(1), "agent"))
             .await;

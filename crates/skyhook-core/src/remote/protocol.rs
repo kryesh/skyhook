@@ -318,13 +318,20 @@ pub(crate) async fn write_artifact<W: AsyncWrite + Unpin>(
     request_id: RequestId,
     field: String,
     kind: crate::job::output::CaptureKind,
-    path: &std::path::Path,
+    mut input: crate::job::output::Source,
 ) -> std::io::Result<()> {
-    let mut input = tokio::fs::File::open(path).await?;
     let mut buffer = vec![0; 64 * 1024];
     let mut offset = 0;
     loop {
-        let length = input.read(&mut buffer).await?;
+        // Capture reads query the session database; keep them off the runtime.
+        let length;
+        (input, buffer, length) = tokio::task::spawn_blocking(move || {
+            let length = std::io::Read::read(&mut input, &mut buffer);
+            (input, buffer, length)
+        })
+        .await
+        .map_err(std::io::Error::other)?;
+        let length = length?;
         write_frame(
             &mut *writer.lock().await,
             &Response::ToolArtifact {

@@ -567,7 +567,6 @@ mod tests {
         let record = EventRecord {
             id: skyhook::identity::EventId::generate().unwrap(),
             queue_attempt: None,
-            version: 1,
             sequence,
             timestamp_millis: sequence as i64 * 1000,
             agent: app.selected.clone(),

@@ -89,9 +89,9 @@ shows the choice for the next message; reply footers identify the model that act
 Resumed sessions retain their last applied model. `/models` remains an alias for `/model`.
 Restore a missing recorded model profile before resuming rather than substituting another model.
 
-The interface stores the last submitted model in `$XDG_STATE_HOME/skyhook/ui.json`, falling back
-to `~/.local/state/skyhook/ui.json`. Writes are atomic and do not rewrite the model configuration.
-Session titles are stored separately from conversation history in each session's `ui.json`.
+The interface stores the last submitted model in the workspace's `.skyhook/state.json`, beside its
+sessions. Writes are atomic and do not rewrite the model configuration.
+Session titles are recorded in each session's database alongside its history.
 
 The bottom bar uses this format:
 

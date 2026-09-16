@@ -617,6 +617,19 @@ mod tests {
             .await
         };
         reached(3).await;
+        // Observed activity trails the journal; interrupt once the parent is seen waiting.
+        bounded(async {
+            while !matches!(
+                session.observe().await.snapshot.activity.get(&session.root),
+                Some(
+                    crate::agent::AgentActivity::Tools
+                        | crate::agent::AgentActivity::WaitingChildren
+                )
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
         let original_jobs = session.runtime.jobs.list(&session.root).await;
         assert_eq!(original_jobs.len(), 2);
         // Interrupt the children, not the waiting parent.

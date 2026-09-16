@@ -241,7 +241,7 @@ impl Projection {
                 .push(record.sequence);
             match &record.event {
                 SessionEvent::AgentStarted {
-                    model_profile,
+                    profile,
                     location,
                     owner_job,
                     ..
@@ -254,7 +254,10 @@ impl Projection {
                         } else {
                             format!("agent {}", agent_label(&record.agent))
                         },
-                        model: model_profile.clone(),
+                        model: profile
+                            .as_ref()
+                            .map(|profile| profile.name.clone())
+                            .unwrap_or_default(),
                         target: location.target.clone(),
                         owner: *owner_job,
                         lifecycle: AgentLifecycle::Active,
@@ -314,9 +317,9 @@ impl Projection {
                 SessionEvent::AgentCompleted | SessionEvent::AgentInterrupted => {
                     self.complete_agent(&record.agent);
                 }
-                SessionEvent::ModelChanged { model_profile, .. } => {
+                SessionEvent::ModelChanged { profile } => {
                     if let Some(agent) = self.agents.iter_mut().find(|a| a.id == record.agent) {
-                        agent.model.clone_from(model_profile);
+                        agent.model.clone_from(&profile.name);
                     }
                 }
                 SessionEvent::Usage { usage, .. } => {
@@ -337,8 +340,8 @@ impl Projection {
                             .records
                             .get(context)
                             .and_then(|record| match &record.event {
-                                SessionEvent::ModelContext { template, .. } => {
-                                    Some(template.model.clone())
+                                SessionEvent::ModelContext { context } => {
+                                    Some(context.profile.profile.model.clone())
                                 }
                                 _ => None,
                             });
@@ -681,8 +684,9 @@ mod tests {
         SessionEvent::AgentStarted {
             parent: None,
             owner_job,
-            model_profile: "test".into(),
-            max_context: None,
+            profile: None,
+            available_depth: 0,
+            capabilities: Vec::new(),
             location: ExecutionLocation::root("/workspace".into()),
         }
     }

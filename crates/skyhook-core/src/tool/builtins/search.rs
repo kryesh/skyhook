@@ -470,23 +470,22 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
 
-    fn pending_capture(directory: &Path) -> PendingCapture {
-        let job = crate::identity::JobId::new(1).unwrap();
+    fn pending_capture(output: &crate::job::output::TestOutput) -> PendingCapture {
         let kind = crate::job::output::CaptureKind::Json;
-        PendingCapture::create(job, directory, "/result/test", kind).unwrap()
+        PendingCapture::create(&output.output, "/result/test", kind).unwrap()
     }
 
     /// Runs a blocking walker into a fresh capture and decodes what it wrote.
     fn captured<T: serde::de::DeserializeOwned, R>(
         walk: impl FnOnce(PendingCapture, &crate::job::CancellationToken) -> Result<R, ToolError>,
     ) -> Result<T, ToolError> {
-        let directory = tempfile::tempdir()?;
+        let output = crate::job::output::TestOutput::new();
         walk(
-            pending_capture(directory.path()),
+            pending_capture(&output),
             &crate::job::CancellationToken::new(),
         )?;
-        let file = crate::job::output::field_file(directory.path(), "/result/test");
-        Ok(serde_json::from_reader(std::fs::File::open(file)?)?)
+        let bytes = output.output.test_bytes("/result/test").unwrap();
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
     fn search(root: &Path, path: &Path, args: Value) -> Vec<SearchMatch> {
@@ -516,7 +515,8 @@ mod tests {
         let args: SearchArgs = serde_json::from_value(json!({"pattern":"needle"})).unwrap();
         let cancellation = crate::job::CancellationToken::new();
         cancellation.cancel();
-        let capture = pending_capture(root.path());
+        let output = crate::job::output::TestOutput::new();
+        let capture = pending_capture(&output);
         let result = search_blocking(root.path(), &input, &args, capture, &cancellation);
         assert!(matches!(result, Err(ToolError::Cancelled)));
     }

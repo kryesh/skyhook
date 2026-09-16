@@ -9,17 +9,12 @@ use std::{
 pub struct SavedState {
     pub model: Option<String>,
 }
-pub fn state_path() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
-        })
-        .join("skyhook/ui.json")
+/// UI state lives with the workspace's sessions.
+pub fn state_path(workspace: &Path) -> PathBuf {
+    workspace.join(".skyhook/state.json")
 }
-pub fn load() -> (SavedState, Option<String>) {
-    match std::fs::read(state_path()) {
+pub fn load(workspace: &Path) -> (SavedState, Option<String>) {
+    match std::fs::read(state_path(workspace)) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(state) => (state, None),
             Err(error) => (
@@ -45,15 +40,15 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     temp.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
-pub fn remember(model: &str) -> std::io::Result<()> {
-    update(|state| state.model = Some(model.into()))
+pub fn remember(workspace: &Path, model: &str) -> std::io::Result<()> {
+    update(workspace, |state| state.model = Some(model.into()))
 }
-fn update(edit: impl FnOnce(&mut SavedState)) -> std::io::Result<()> {
+fn update(workspace: &Path, edit: impl FnOnce(&mut SavedState)) -> std::io::Result<()> {
     static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = WRITER.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut state, _) = load();
+    let (mut state, _) = load(workspace);
     edit(&mut state);
-    atomic_write(&state_path(), &serde_json::to_vec(&state)?)
+    atomic_write(&state_path(workspace), &serde_json::to_vec(&state)?)
 }
 
 #[cfg(test)]
@@ -65,7 +60,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let blocker = root.path().join("not-a-directory");
         std::fs::write(&blocker, b"preserved").unwrap();
-        assert!(atomic_write(&blocker.join("ui.json"), b"replacement").is_err());
+        assert!(atomic_write(&blocker.join("state.json"), b"replacement").is_err());
         assert_eq!(std::fs::read(blocker).unwrap(), b"preserved");
     }
 }

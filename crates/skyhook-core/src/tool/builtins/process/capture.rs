@@ -43,7 +43,7 @@ impl Capture {
         }
         self.pending.drain(..consumed);
         // This await first transfers all decoded text to the shared writer,
-        // before that writer can suspend on filesystem IO.
+        // before that writer can suspend on storage IO.
         self.writer.write_text(&text).await?;
         Ok(())
     }
@@ -62,16 +62,15 @@ impl Capture {
 mod tests {
     use super::*;
     use crate::{
-        identity::JobId,
         job::output::{CaptureKind, TextCaptureField},
         tests::TestRuntime,
     };
 
-    /// Writes `chunks` into a fresh stdout capture; returns the file text, if published.
-    async fn written(runtime: &TestRuntime, id: u64, chunks: &[&[u8]]) -> Option<String> {
-        let job = JobId::new(id).unwrap();
-        let path =
-            crate::job::output::field_file(&runtime.jobs.output_directory(job), "/result/stdout");
+    /// Writes `chunks` into a fresh stdout capture; returns the stored text, if published.
+    async fn written(runtime: &TestRuntime, chunks: &[&[u8]]) -> Option<String> {
+        let spec = crate::job::JobSpec::test(runtime.agent.clone(), "capture");
+        let job = runtime.jobs.test_create(spec).await;
+        let output = runtime.jobs.output(job);
         let writer = runtime
             .jobs
             .pending_capture(
@@ -87,14 +86,14 @@ mod tests {
             capture.write_bytes(chunk).await.unwrap();
         }
         let published = capture.finish().await.unwrap().is_some();
-        assert_eq!(published, path.exists());
-        published.then(|| std::fs::read_to_string(&path).unwrap())
+        let bytes = output.test_bytes("/result/stdout");
+        assert_eq!(published, bytes.is_some());
+        bytes.map(|bytes| String::from_utf8(bytes).unwrap())
     }
 
     #[tokio::test]
     async fn decoder_matches_lossy_utf8_at_every_chunk_boundary() {
         let runtime = TestRuntime::new().await;
-        let mut id = 0;
         let corpus: &[&[u8]] = &[
             b"",
             b"plain\ntext",
@@ -108,17 +107,15 @@ mod tests {
         for bytes in corpus {
             let expected = (!bytes.is_empty()).then(|| String::from_utf8_lossy(bytes).into_owned());
             for split in 0..=bytes.len() {
-                id += 1;
                 let (head, tail) = bytes.split_at(split);
                 assert_eq!(
-                    written(&runtime, id, &[head, tail]).await,
+                    written(&runtime, &[head, tail]).await,
                     expected,
                     "split {split} of {bytes:?}"
                 );
             }
-            id += 1;
             let single: Vec<&[u8]> = bytes.chunks(1).collect();
-            assert_eq!(written(&runtime, id, &single).await, expected);
+            assert_eq!(written(&runtime, &single).await, expected);
         }
     }
 }
