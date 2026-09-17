@@ -6,7 +6,7 @@ mod response;
 
 pub use message::{
     AssistantBlock, AssistantContent, AssistantItem, BlockContent, BlockKind, ItemKind, Message,
-    ReplayEnvelope, ToolCall, ToolCallError, ToolResult, UserContent,
+    ReplayEnvelope, ToolCall, ToolCallError, ToolResult, UserContent, visible_text,
 };
 pub use request::{HistoryLifetime, ModelRequest, ResponseSchema, SystemSegment, ToolDefinition};
 #[cfg(test)]

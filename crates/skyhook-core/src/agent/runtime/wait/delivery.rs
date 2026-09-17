@@ -327,6 +327,86 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
+    /// A reasoning model's working turn is `reasoning` + a blank text separator +
+    /// its calls. The blank block stays in the child's history for replay, but the
+    /// turn answered nothing, so it must publish no reply, wake nobody and leave no
+    /// delivery behind. Otherwise the owner collects one blank child message per
+    /// child turn, which is what a raw `is_empty` projection check produced.
+    #[tokio::test]
+    async fn blank_child_turn_publishes_no_reply_and_never_wakes_the_owner() {
+        const FINAL: &str = "child-final-answer-after-blank";
+        let mut child_tool = call("blank-turn-tool", "script", json!({"source":"return 42;"}));
+        child_tool.position = 2;
+        let blank = vec![
+            AssistantContent::reasoning("thought", 0, "private reasoning", None),
+            AssistantContent::text("blank", 1, "\n\n"),
+            child_tool,
+        ];
+        let launch = json!({"prompt":"child task", "model":"child", "name":"blank", "bg":true});
+        let tracking = Tracking::responses(vec![
+            ("root", vec![call("launch", "agent", launch)]),
+            ("child", blank.clone()),
+            ("root", vec![call("waiting", "wait", json!({}))]),
+            ("child", vec![AssistantContent::text("final", 0, FINAL)]),
+            ("root", vec![answer()]),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let runtime = &session.runtime;
+        let turn = prompt(&session);
+        tracking.pass(0).await;
+        tracking.request(1).await;
+        let job = running_job(&session, &session.root, "agent").await;
+        let (child, _) = only_child(&session);
+        // Park the owner in an indefinite wait: only a wake produces its next request.
+        tracking.pass(2).await;
+        running_job(&session, &session.root, "wait").await;
+        let mut wakes = runtime.jobs.subscribe_completions();
+
+        // The blank turn lands, and the child's next request proves it moved on.
+        tracking.release(1);
+        tracking.request(3).await;
+        assert_eq!(
+            drain_wakes(&mut wakes, job),
+            0,
+            "a blank turn woke the owner"
+        );
+        assert!(!runtime.jobs.has_pending(&session.root).await);
+        assert!(
+            !tracking.requested_from(4),
+            "the owner left its wait for a blank turn"
+        );
+        let records = runtime.store.records().await;
+        // The blank block is still committed to the child's own history for replay.
+        let committed = records
+            .iter()
+            .filter(|record| record.agent == child)
+            .filter(|record| {
+                matches!(&record.event, SessionEvent::MessageCommitted { message: Message::Assistant(content) } if content == &blank)
+            });
+        assert_eq!(committed.count(), 1);
+        let delivered = |records: &[crate::session::EventRecord]| {
+            records
+                .iter()
+                .filter(|record| matches!(&record.event, SessionEvent::JobMessageDelivered { .. }))
+                .count()
+        };
+        assert_eq!(delivered(&records), 0, "a blank turn was delivered");
+
+        // Only the real answer reaches the owner, once, with its completion.
+        tracking.release(3);
+        child_completed(&session, job).await;
+        let woken = tracking.request(4).await;
+        assert_reason(&woken, "waiting", "event");
+        assert_eq!(drain_wakes(&mut wakes, job), 1);
+        let replies = agent_messages(&woken);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0]["text"], FINAL);
+        tracking.release(4);
+        bounded(turn).await.unwrap().unwrap();
+        assert_eq!(delivered(&runtime.store.records().await), 1);
+        session.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn intermediate_child_replies_wake_parent_or_reach_request_boundary_once() {
         for parent_already_waiting in [true, false] {

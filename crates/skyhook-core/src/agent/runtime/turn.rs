@@ -600,14 +600,9 @@ fn finish_response(
         });
     }
     debug_assert_eq!(usage, final_usage);
-    let text = blocks
-        .iter()
-        .flat_map(|item| &item.blocks)
-        .filter_map(|block| match &block.content {
-            BlockContent::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<String>();
+    // A whitespace-only response is no response: the blank text block stays in
+    // `blocks` for replay, but it must not read as an answer to this turn.
+    let text = crate::provider::protocol::visible_text(&blocks);
     let calls = blocks
         .iter()
         .flat_map(|item| &item.blocks)
@@ -797,11 +792,14 @@ mod tests {
     #[tokio::test]
     async fn blank_text_responses_are_committed_and_complete_the_turn() {
         // Some providers return empty or whitespace text on a non-final turn. That
-        // is ordinary content: it encodes, so it must not be treated as a failure.
+        // is ordinary content: it encodes and must stay in history, so it must not be
+        // treated as a failure. It is not an answer, though: the projection
+        // (`provider::protocol::visible_text`) normalizes blank text away, so the turn
+        // completes with no text rather than with the blank string itself.
         for text in ["", "   "] {
             let (root, _requests, session) =
                 scripted_session([response(vec![AssistantContent::text("answer", 0, text)])]).await;
-            assert_eq!(session.prompt("hello").await.unwrap(), text);
+            assert_eq!(session.prompt("hello").await.unwrap(), "");
             let sessions = root.path().join("sessions");
             let id = session.id();
             session.shutdown().await.unwrap();

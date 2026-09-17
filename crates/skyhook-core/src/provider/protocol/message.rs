@@ -84,6 +84,31 @@ pub struct AssistantItem {
 /// Migration alias; assistant content is now an item, never a flat block.
 pub type AssistantContent = AssistantItem;
 
+/// The visible reply an assistant response projects: its text blocks concatenated,
+/// with a whitespace-only projection normalized to none.
+///
+/// Blank text is content that must be kept for replay (see
+/// [`Message::is_content_free`]), but it is not an answer. Providers routinely emit a
+/// whitespace-only text block alongside tool calls — typically a `"\n\n"` separator
+/// sent as `content` beside `reasoning_content`, a strictly empty delta already being
+/// dropped by the Chat decoder — and a reasoning model does so on nearly every working
+/// turn. Every consumer that asks "did this response say
+/// anything?" must therefore normalize here rather than test `is_empty` on a raw
+/// concatenation, or a child agent publishes a blank reply to its parent per turn.
+#[must_use]
+pub fn visible_text(items: &[AssistantItem]) -> String {
+    let text: String = items
+        .iter()
+        .flat_map(|item| &item.blocks)
+        .filter_map(|block| block.content.text_content())
+        .collect();
+    if text.trim().is_empty() {
+        String::new()
+    } else {
+        text
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AssistantBlock {
     pub id: String,
@@ -406,6 +431,59 @@ mod content_free_tests {
         assert!(!Message::Assistant(vec![signed]).is_content_free());
         let visible = AssistantItem::text("answer", 0, "hello");
         assert!(!Message::Assistant(vec![visible]).is_content_free());
+    }
+}
+
+#[cfg(test)]
+mod visible_text_tests {
+    use super::*;
+
+    fn tool_call() -> AssistantItem {
+        AssistantItem::tool_call(
+            "call",
+            1,
+            ToolCall::new("call", "tool", serde_json::json!({})).unwrap(),
+        )
+    }
+
+    /// The shape a reasoning model emits on a working turn: private reasoning, a
+    /// blank text block, and the calls. That turn answered nothing, so it must
+    /// project no visible text and stay distinct from a real reply.
+    #[test]
+    fn whitespace_only_response_projects_no_visible_text() {
+        for blank in ["", "\n\n", " ", "\t\n ", "\r\n"] {
+            let items = vec![
+                AssistantItem::reasoning("thought", 0, "private", None),
+                AssistantItem::text("blank", 1, blank),
+                tool_call(),
+            ];
+            assert_eq!(visible_text(&items), "", "blank text {blank:?}");
+            // Blank text remains content for replay; only the projection normalizes.
+            assert!(!Message::Assistant(items).is_content_free());
+        }
+    }
+
+    /// Real text is projected byte for byte, including surrounding whitespace, so a
+    /// child reply keeps matching the assistant text committed to history.
+    #[test]
+    fn substantive_text_is_projected_verbatim_across_blocks() {
+        let items = vec![
+            AssistantItem::reasoning("thought", 0, "private", None),
+            AssistantItem::text("first", 1, "\n\nanswer\n"),
+            AssistantItem::text("second", 2, " continued\n\n"),
+            tool_call(),
+        ];
+        assert_eq!(visible_text(&items), "\n\nanswer\n continued\n\n");
+    }
+
+    #[test]
+    fn reasoning_and_calls_alone_project_nothing() {
+        let items = vec![
+            AssistantItem::reasoning("thought", 0, "private reasoning", None),
+            tool_call(),
+        ];
+        assert_eq!(visible_text(&items), "");
+        assert_eq!(visible_text(&[]), "");
     }
 }
 

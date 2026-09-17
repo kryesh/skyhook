@@ -2,24 +2,17 @@
 //! lifecycle delivery. There is deliberately no second message-publication event.
 use super::delivery::DELIVERY_BATCH_BYTES;
 use super::*;
-use crate::provider::protocol::BlockContent;
 
 const MESSAGE_BATCH_COUNT: usize = 128;
 
+/// The child reply this record projects, normalized exactly as the turn that
+/// produced it projected its own response text, so live publication and replay agree
+/// and a whitespace-only turn publishes nothing either way.
 pub(super) fn visible_text(message: &Message) -> Option<String> {
     let Message::Assistant(items) = message else {
         return None;
     };
-    Some(
-        items
-            .iter()
-            .flat_map(|item| &item.blocks)
-            .filter_map(|block| match &block.content {
-                BlockContent::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect(),
-    )
+    Some(crate::provider::protocol::visible_text(items))
 }
 
 impl JobEntry {
@@ -28,9 +21,12 @@ impl JobEntry {
             || (self.background && self.deliverable() && self.delivery == DeliveryState::Pending)
     }
 
-    pub(super) fn publish_message(&mut self, id: JobId, sequence: u64, text: String) {
+    /// Queue a child reply for delivery, reporting whether it was published. A blank
+    /// turn is not a reply, and what is never published must never wake the owner, so
+    /// callers take the wake decision from this answer rather than re-deriving it.
+    pub(super) fn publish_message(&mut self, id: JobId, sequence: u64, text: String) -> bool {
         if text.is_empty() {
-            return;
+            return false;
         }
         self.last_agent_message = Some(sequence);
         self.messages.push(AgentMessage {
@@ -39,6 +35,7 @@ impl JobEntry {
             message: sequence,
             text,
         });
+        true
     }
 }
 
@@ -117,9 +114,8 @@ impl JobManager {
             let mut jobs = manager.inner.jobs.lock().await;
             let entry = jobs.get_mut(&job).ok_or(JobError::Unknown(job))?;
             entry.child = Some(child);
-            let visible = !text.is_empty();
-            entry.publish_message(job, record.sequence, text);
-            if visible && wake_owner {
+            let published = entry.publish_message(job, record.sequence, text);
+            if published && wake_owner {
                 // Foreground child replies are just as deliverable as background ones.
                 let _ = manager
                     .inner
@@ -520,6 +516,81 @@ mod tests {
                 .text,
             "survives"
         );
+    }
+
+    /// The live shape a reasoning model produces on a working turn: private
+    /// reasoning plus a blank text separator before its calls. History keeps that
+    /// block for replay, but a blank turn answered nothing, so it must publish no
+    /// reply, wake nobody, and leave no delivery for replay to resurrect.
+    /// Otherwise a parent collects one empty child message per child turn.
+    #[tokio::test]
+    async fn whitespace_only_child_reply_commits_history_without_publishing_or_waking() {
+        for blank in ["", "\n\n", " \t\n"] {
+            let (_root, manager, owner, child, job) = child_job(true).await;
+            let before = manager.store().records().await.len();
+            let mut wakes = manager.subscribe_completions();
+            let items = vec![
+                AssistantContent::reasoning("thought", 0, "private reasoning", None),
+                AssistantContent::text("blank", 1, blank),
+            ];
+            // A turn publishes its normalized projection, which a blank turn empties.
+            let projection = crate::provider::protocol::visible_text(&items);
+            assert_eq!(projection, "", "blank text {blank:?}");
+            manager
+                .commit_child_message(
+                    &child,
+                    job,
+                    Message::Assistant(items),
+                    projection,
+                    true,
+                    |_| Vec::new(),
+                )
+                .await
+                .unwrap();
+            // Committed to history, but not as a reply.
+            assert_eq!(manager.store().records().await.len(), before + 1);
+            assert_eq!(manager.last_agent_message(job).await.unwrap(), None);
+            assert!(!manager.has_pending(&owner).await);
+            assert!(wakes.try_recv().is_err(), "blank reply woke the owner");
+            assert!(
+                manager
+                    .pending_delivery(&owner)
+                    .await
+                    .unwrap()
+                    .messages()
+                    .is_empty()
+            );
+            // Replay derives publication from the same record, so it must agree.
+            // (A replayed background job is deliverable as interrupted, which is
+            // lifecycle delivery, not a reply, so assert on the reply itself.)
+            let replayed = manager.test_replay().await;
+            assert_eq!(replayed.last_agent_message(job).await.unwrap(), None);
+            assert!(
+                replayed
+                    .pending_delivery(&owner)
+                    .await
+                    .unwrap()
+                    .messages()
+                    .is_empty()
+            );
+        }
+    }
+
+    /// A projection the journal could not reproduce is refused, so a caller cannot
+    /// smuggle raw blank text past normalization and publish it as a reply.
+    #[tokio::test]
+    async fn unnormalized_blank_projection_is_refused() {
+        let (_root, manager, owner, child, job) = child_job(true).await;
+        let before = manager.store().records().await.len();
+        let message = Message::Assistant(vec![AssistantContent::text("blank", 0, "\n\n")]);
+        let result = manager
+            .commit_child_message(&child, job, message, "\n\n".into(), true, |_| Vec::new())
+            .await;
+        // Specifically the projection guard, not an association failure.
+        let failure = result.unwrap_err().to_string();
+        assert!(failure.contains("does not match"), "unexpected: {failure}");
+        assert_eq!(manager.store().records().await.len(), before);
+        assert!(!manager.has_pending(&owner).await);
     }
 
     #[tokio::test]

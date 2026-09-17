@@ -131,14 +131,7 @@ impl SessionRuntime {
                 "summarizer returned a tool call; no tools were executed".into(),
             ));
         }
-        let text: String = blocks
-            .iter()
-            .flat_map(|item| &item.blocks)
-            .filter_map(|block| match &block.content {
-                BlockContent::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
+        let text = crate::provider::protocol::visible_text(&blocks);
         compaction::continuation(&text).map_err(HarnessError::Compaction)
     }
 }
