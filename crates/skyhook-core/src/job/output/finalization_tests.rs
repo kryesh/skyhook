@@ -235,3 +235,25 @@ async fn unrelated_capture_is_neither_adopted_nor_overwritten_by_ordinary_result
         b"abandoned raw bytes"
     );
 }
+
+/// Notification budgeting needs an upper bound on presented bytes. A capture-backed
+/// field is spliced into presentation as a page at most, so a large one must not be
+/// budgeted at six times its stored size — that overestimate is what used to defer a
+/// finished job's completion to a turn of its own. (Inline, untruncatable content is
+/// presented whole and is covered end-to-end by the delivery batch tests.)
+#[tokio::test]
+async fn presentation_size_budgets_a_large_capture_as_one_page() {
+    let (_root, _manager, output, _other) = outputs().await;
+    let capture = completed(
+        &output,
+        "/result/text",
+        CaptureKind::Text,
+        &vec![b's'; 6 * PAGE_BYTES],
+    );
+    save_completed(&output, &complete_document(), vec![capture]).unwrap();
+    let estimate = presentation_size(&output);
+    assert!(
+        estimate <= 2 * PAGE_BYTES,
+        "capture-backed output estimated at {estimate} bytes"
+    );
+}

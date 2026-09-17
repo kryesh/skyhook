@@ -2,7 +2,26 @@
 
 use super::*;
 
-pub(super) const DELIVERY_BATCH_BYTES: usize = 8192;
+/// Aggregate child-reply bytes one notification may carry.
+///
+/// This is a batching bound, not a size guarantee: a single oversized reply is
+/// always admitted, so no cap here can bound a notification. What it does decide
+/// is how many *separate* owner turns a burst of pending work costs, because every
+/// deferred item waits for another model request. Concentrating replies costs the
+/// owner only ordering, so the bound is several output pages rather than one:
+/// receiving four page-sized replies must not cost four requests.
+pub(super) const MESSAGE_BATCH_BYTES: usize = 4 * output::PAGE_BYTES;
+
+/// Aggregate lifecycle-envelope bytes one notification may carry, budgeted
+/// separately from replies.
+///
+/// Envelopes and replies are not substitutes. A completed child agent's envelope is
+/// metadata referencing a reply the owner is already reading, and a question envelope
+/// is small, but a tool or script completion presents its result, which can be large.
+/// Sharing one budget let reply content starve that metadata for a whole turn (and,
+/// for a reply larger than the batch, indefinitely), so each side has its own
+/// allowance and envelopes are costed by the bytes they really present.
+pub(super) const LIFECYCLE_BATCH_BYTES: usize = 4 * output::PAGE_BYTES;
 
 /// A non-destructive snapshot serialized against publication, claims and resumption.
 /// Dropping a receipt before committing leaves its messages and jobs pending.
@@ -306,10 +325,8 @@ impl JobManager {
         let delivery = self.inner.delivery_operation.clone().lock_owned().await;
         let jobs = self.inner.jobs.lock().await;
         let messages = messages::pending_messages(&jobs, owner);
-        let through = messages.last().map_or(0, |message| message.message);
-        let remaining = DELIVERY_BATCH_BYTES.saturating_sub(messages::batch_size(&messages));
         let envelopes = self
-            .pending_ids(&jobs, owner, through, remaining, !messages.is_empty())
+            .pending_ids(&jobs, owner, &messages)
             .into_iter()
             .map(|id| jobs[&id].envelope(id))
             .collect();
@@ -322,14 +339,18 @@ impl JobManager {
         })
     }
 
+    /// Lifecycle envelopes to present alongside `messages`, within their own
+    /// budget. Replies never consume it, so a completion is deferred only behind
+    /// other completions; `messages` still decides ordering (a completion must not
+    /// overtake the replies of its own job) and pinning (below).
     pub(super) fn pending_ids(
         &self,
         jobs: &HashMap<JobId, JobEntry>,
         owner: &AgentId,
-        messages_through: u64,
-        mut remaining: usize,
-        has_messages: bool,
+        messages: &[AgentMessage],
     ) -> Vec<JobId> {
+        let messages_through = messages.last().map_or(0, |message| message.message);
+        let mut remaining = LIFECYCLE_BATCH_BYTES;
         let mut ids = jobs
             .iter()
             .filter(|(_, entry)| {
@@ -347,19 +368,34 @@ impl JobManager {
         let mut pending = Vec::new();
         for id in ids {
             let entry = &jobs[&id];
-            let metadata =
-                serde_json::to_vec(&entry.metadata(id)).map_or(8192, |bytes| bytes.len());
-            let estimate = output::presentation_size(&self.output(id));
-            let cost = if entry.state == JobState::Completed && estimate <= output::CONTENT_BYTES {
-                estimate
+            let metadata = serde_json::to_vec(&entry.metadata(id))
+                .map_or(output::PAGE_BYTES, |bytes| bytes.len());
+            // A completed child agent presents its result by reference to the visible
+            // reply, so its envelope costs metadata whatever the child wrote.
+            let referenced = entry.role == JobRole::Agent
+                && entry.state == JobState::Completed
+                && entry.last_agent_message.is_some();
+            // Cost the bytes this envelope will actually present, unsaturated: an
+            // untruncatable result is presented whole, so a budget that capped its
+            // cost would admit several of them and bound nothing.
+            let cost = if referenced {
+                metadata.saturating_add(128)
+            } else {
+                output::presentation_size(&self.output(id))
                     .saturating_add(metadata)
                     .saturating_add(128)
-                    .min(8192)
-            } else {
-                8192
             };
-            if cost > remaining && (has_messages || !pending.is_empty()) {
-                // A smaller later completion may fit the shared remaining budget.
+            // A reply in this batch pins the completion that only references it, even
+            // when earlier completions have exhausted the budget: deferring it would
+            // spend a whole owner turn on metadata about content the owner has just
+            // read. The pre-filter above admits this job only when the batch carries
+            // every reply it has pending, so the pinned message is the referenced one.
+            let pinned = referenced && messages.iter().any(|message| message.id == id);
+            if !pinned && cost > remaining && !pending.is_empty() {
+                // A smaller later completion may fit the remaining budget. A single
+                // envelope larger than the whole budget is still admitted when it is
+                // first, so an untruncatable result cannot stall delivery — that is
+                // the one case where a notification exceeds this bound.
                 continue;
             }
             pending.push(id);
@@ -377,7 +413,7 @@ impl JobManager {
             let pending = {
                 let jobs = manager.inner.jobs.lock().await;
                 manager
-                    .pending_ids(&jobs, &owner, 0, DELIVERY_BATCH_BYTES, false)
+                    .pending_ids(&jobs, &owner, &[])
                     .into_iter()
                     .map(|id| (id, jobs[&id].agent.clone(), jobs[&id].envelope(id)))
                     .collect::<Vec<_>>()

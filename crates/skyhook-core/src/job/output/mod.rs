@@ -1006,6 +1006,14 @@ pub(crate) fn view_schema(capabilities: &CapabilitySet) -> Value {
     schema
 }
 
+/// Upper bound on the bytes automatic presentation would emit for this output, used
+/// to budget notification batches.
+///
+/// Inline document content is counted whole because presentation shortens only
+/// schema-annotated fields (see `truncation`), so an untruncatable field really does
+/// reach the model at full size. A capture-backed field instead reaches it as a page
+/// at most, so its stored size is counted only up to `PAGE_BYTES`: `bytes * 6`
+/// covers JSON escaping of a small capture, while a large one is spliced bounded.
 pub(crate) fn presentation_size(output: &Output) -> usize {
     let Ok(saved) = Saved::load(output) else {
         return PAGE_BYTES;
@@ -1019,6 +1027,7 @@ pub(crate) fn presentation_size(output: &Output) -> usize {
             usize::try_from(capture.bytes)
                 .unwrap_or(PAGE_BYTES)
                 .saturating_mul(6)
+                .min(PAGE_BYTES)
         }))
     })
 }
