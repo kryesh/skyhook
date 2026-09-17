@@ -69,7 +69,9 @@ settings with any other request. Providers decide prompt-cache placement from `h
 the lifetime: Anthropic places a cache breakpoint on the last history block unless it is detached
 (ending history is still marked, since cache reads land only at breakpoints), OpenAI protocols rely on
 automatic prefix caching with the tail sent last, and Codex records no WebSocket continuation for a
-request with a tail or non-continuing history.
+request with a tail or non-continuing history. Chat Completions and Responses append a runtime-only
+tail message to the final tool output or user message rather than sending a separate user message,
+which models read as the user speaking again after every tool call.
 Session databases use format version 4; there is no compatibility or migration layer for earlier layouts.
 
 Source: [session module](https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src/session)

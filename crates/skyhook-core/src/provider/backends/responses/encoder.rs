@@ -2,7 +2,7 @@
 use super::*;
 use crate::media::AttachmentRef;
 use crate::provider::backends::common::{
-    attachment_text, image_url, invalid, opaque_payload, tool_text,
+    attach_runtime_tail, attachment_text, image_url, invalid, opaque_payload, tool_text,
 };
 use crate::provider::protocol::{BlockContent, Message, ModelRequest, UserContent};
 
@@ -32,9 +32,17 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<EncodedRequest, ProviderE
     }
     // Cache hints need no wire field: OpenAI automatically caches matching
     // prefixes, and history precedes the per-request tail so the tail never
-    // breaks the cached history prefix.
+    // breaks the cached history prefix. Runtime state joins the final history turn,
+    // so only that turn is re-read.
     let mut input = Vec::new();
-    for message in request.messages() {
+    for (index, message) in request.messages().enumerate() {
+        if index >= request.history.len()
+            && attach_runtime_tail(&mut input, message, "input_text", |item| {
+                (item["type"] == "function_call_output").then(|| &mut item["output"])
+            })
+        {
+            continue;
+        }
         match message {
             Message::User(parts) => {
                 let content = parts
@@ -445,5 +453,28 @@ mod tests {
         assert_eq!(&replayed[..input.len()], input.as_slice());
         assert_eq!(replayed[5]["content"][0]["text"], "42");
         assert_eq!(replayed[6]["content"][0]["text"], "thanks");
+    }
+
+    #[test]
+    fn runtime_tail_joins_the_final_tool_output_or_user_turn() {
+        let state = Message::User(vec![UserContent::Runtime {
+            text: "<skyhook_state>".into(),
+        }]);
+        let mut req = request("gpt-5");
+        req.history = vec![tool_result(json!(1), vec![], false)];
+        let without_tail = encode(&req).unwrap().input;
+        req.tail = vec![state.clone()];
+        let input = encode(&req).unwrap().input;
+        assert_eq!(input.len(), 1);
+        let output = without_tail[0]["output"].as_str().unwrap();
+        assert_eq!(input[0]["output"], format!("{output}\n\n<skyhook_state>"));
+        req.history = vec![user("hi")];
+        let input = encode(&req).unwrap().input;
+        assert_eq!(
+            input,
+            vec![
+                json!({"role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_text","text":"<skyhook_state>"}]})
+            ]
+        );
     }
 }

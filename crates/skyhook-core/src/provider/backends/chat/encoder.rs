@@ -5,7 +5,9 @@ use crate::provider::{
     ProviderError,
     backends::{
         ChatReasoningReplay,
-        common::{attachment_text, image_url, invalid, opaque_payload, tool_text},
+        common::{
+            attach_runtime_tail, attachment_text, image_url, invalid, opaque_payload, tool_text,
+        },
     },
     protocol::{BlockContent, Message, ModelRequest, UserContent},
 };
@@ -21,12 +23,20 @@ pub(crate) fn encode(
     }
     // Cache hints need no wire field: OpenAI automatically caches matching
     // prefixes, and history precedes the per-request tail so the tail never
-    // breaks the cached history prefix.
+    // breaks the cached history prefix. Runtime state joins the final history turn,
+    // so only that turn is re-read.
     let mut messages = Vec::new();
     for segment in &request.system {
         messages.push(json!({"role": "system", "content": segment.text}));
     }
-    for message in request.messages() {
+    for (index, message) in request.messages().enumerate() {
+        if index >= request.history.len()
+            && attach_runtime_tail(&mut messages, message, "text", |item| {
+                (item["role"] == "tool").then(|| &mut item["content"])
+            })
+        {
+            continue;
+        }
         match message {
             Message::User(parts) => {
                 let mut content = Vec::new();
@@ -424,5 +434,49 @@ mod tests {
                 assert_eq!(messages[0]["reasoning"], "private");
             }
         }
+    }
+
+    #[test]
+    fn runtime_tail_joins_the_final_turn_instead_of_posing_as_the_user() {
+        let state = || {
+            Message::User(vec![UserContent::Runtime {
+                text: "<skyhook_state>".into(),
+            }])
+        };
+        let call = AssistantItem::tool_call("c", 0, inspect("call", json!({})));
+        let result = Message::Tool(vec![ToolResult {
+            call_id: "call".into(),
+            name: "inspect".into(),
+            result: json!("ok"),
+            images: vec![],
+            is_error: false,
+        }]);
+        let mut req = history(vec![call]);
+        req.history.push(result);
+        let without_tail = encode(&req, ChatReasoningReplay::Unsupported).unwrap();
+        req.tail = vec![state()];
+        let body = encode(&req, ChatReasoningReplay::Unsupported).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0], without_tail["messages"][0]);
+        let tool = without_tail["messages"][1]["content"].as_str().unwrap();
+        assert_eq!(messages[1]["content"], format!("{tool}\n\n<skyhook_state>"));
+        // A user turn gains a part; an instruction or an assistant turn keeps its own message.
+        let mut req = request("test-model");
+        req.tail = vec![state()];
+        let body = encode(&req, ChatReasoningReplay::Unsupported).unwrap();
+        assert_eq!(
+            body["messages"],
+            json!([{"role":"user","content":[{"type":"text","text":"hello"},{"type":"text","text":"<skyhook_state>"}]}])
+        );
+        req.tail.push(Message::User(vec![UserContent::Compaction {
+            text: "compact".into(),
+        }]));
+        let body = encode(&req, ChatReasoningReplay::Unsupported).unwrap();
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        let mut req = history(vec![AssistantItem::text("t", 0, "done")]);
+        req.tail = vec![state()];
+        let body = encode(&req, ChatReasoningReplay::Unsupported).unwrap();
+        assert_eq!(body["messages"][1]["role"], "user");
     }
 }

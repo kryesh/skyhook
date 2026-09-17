@@ -4,7 +4,7 @@ use crate::{
     media::{ImageRef, MediaError, TextRef},
     provider::{
         ProviderError, ProviderErrorKind,
-        protocol::{ModelRequest, ToolResult},
+        protocol::{Message, ModelRequest, ToolResult, UserContent},
     },
 };
 use serde_json::{Value, json};
@@ -53,6 +53,50 @@ pub(crate) fn tool_text(tool: &ToolResult) -> String {
     let mut value = json!({"result":tool.result,"is_error":tool.is_error});
     omit_null_fields(&mut value);
     value.to_string()
+}
+
+/// Attach a runtime-only tail message to the last encoded item when that item is a
+/// user turn or a tool output. Sent as its own user message, each request's state
+/// reads to the model as the user speaking again after every tool call. Returns false
+/// when the message must be encoded standalone.
+pub(crate) fn attach_runtime_tail(
+    items: &mut [Value],
+    message: &Message,
+    text_type: &str,
+    tool_output: fn(&mut Value) -> Option<&mut Value>,
+) -> bool {
+    let Message::User(parts) = message else {
+        return false;
+    };
+    let texts: Option<Vec<&str>> = parts
+        .iter()
+        .map(|part| match part {
+            UserContent::Runtime { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let (Some(texts), Some(last)) = (texts.filter(|texts| !texts.is_empty()), items.last_mut())
+    else {
+        return false;
+    };
+    if last["role"] == "user"
+        && let Some(content) = last["content"].as_array_mut()
+    {
+        content.extend(
+            texts
+                .into_iter()
+                .map(|text| json!({"type": text_type, "text": text})),
+        );
+        return true;
+    }
+    if let Some(Value::String(output)) = tool_output(last) {
+        for text in texts {
+            output.push_str("\n\n");
+            output.push_str(text);
+        }
+        return true;
+    }
+    false
 }
 
 pub(crate) fn opaque_payload<'a>(
