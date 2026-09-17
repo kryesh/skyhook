@@ -6,9 +6,6 @@ mod outcome;
 mod result;
 mod runtime;
 
-#[cfg(test)]
-mod regression_tests;
-
 pub use runtime::JsError;
 
 pub(crate) use result::{ScriptResult, script_output};

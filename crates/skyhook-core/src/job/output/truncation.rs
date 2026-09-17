@@ -449,9 +449,7 @@ mod tests {
         schema: Value,
         error: Option<String>,
     ) -> (tempfile::TempDir, JobManager, JobId) {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let agent = crate::session::fixture::started(&store, root.path()).await;
+        let (root, store, agent) = crate::session::fixture::on_disk().await;
         let manager = JobManager::new(store.clone());
         let mut spec = JobSpec::test(agent, "annotated");
         spec.output_schema = Some(schema);

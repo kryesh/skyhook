@@ -1099,3 +1099,340 @@ fn kind(event: &SessionEvent) -> &'static str {
         SessionEvent::AgentFailed { .. } => "agent_failed",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // Encode -> decode round trip of every session event kind.
+    use serde_json::json;
+
+    use crate::{
+        execution::ExecutionLocation,
+        identity::{JobId, QueueAttemptId},
+        job::{JobRole, JobState},
+        media::{AttachmentRef, ImageFormat, ImageRef, TextRef},
+        provider::protocol::{
+            AssistantItem, HistoryLifetime, Message, ReplayEnvelope, ResponseSchema, StopReason,
+            SystemSegment, ToolCall, ToolDefinition, Usage, UserContent,
+        },
+        session::{
+            CompactionCheckpoint, ModelCallOrigin, ModelContext, ModelFailureKind, ModelPurpose,
+            QueueIntent, QueueSettlement, SessionEvent,
+            db::tests::{Fixture, result, user},
+            fixture::{child_started, profile},
+        },
+    };
+
+    #[test]
+    fn every_event_kind_round_trips() {
+        let mut fixture = Fixture::new();
+        let root = fixture.start("/workspace");
+        macro_rules! one {
+            ($event:expr $(,)?) => {
+                fixture.one(root.clone(), $event)
+            };
+        }
+        let image = fixture.blob(crate::tests::png(b"image").bytes());
+        let notes = fixture.blob(b"notes");
+        let png = ImageRef {
+            file: Some("image.png".into()),
+            format: ImageFormat::Png,
+            blob: image,
+        };
+        let agent_context = ModelContext {
+            purpose: ModelPurpose::Agent,
+            profile: profile(),
+            system: vec![SystemSegment {
+                text: "system".into(),
+                cache: true,
+            }],
+            tools: vec![ToolDefinition {
+                name: "read".into(),
+                description: "read a file".into(),
+                input_schema: json!({"type": "object"}),
+            }],
+            response_schema: None,
+        };
+        let context = one!(SessionEvent::ModelContext {
+            context: agent_context.clone(),
+        });
+        let prompt = one!(SessionEvent::MessageCommitted {
+            message: Message::User(vec![
+                UserContent::Text {
+                    text: "look".into(),
+                },
+                UserContent::Attachment {
+                    attachment: AttachmentRef::Image(png.clone()),
+                },
+                UserContent::Attachment {
+                    attachment: AttachmentRef::Text(TextRef {
+                        file: None,
+                        blob: notes,
+                    }),
+                },
+                UserContent::Runtime {
+                    text: "state".into(),
+                },
+                UserContent::ParentInput {
+                    text: "parent".into(),
+                },
+            ]),
+        });
+        let request = one!(SessionEvent::ModelRequested {
+            context,
+            history: vec![prompt],
+            tail: vec![user("tail")],
+            history_lifetime: HistoryLifetime::Ending,
+            purpose: ModelPurpose::Agent,
+        });
+        one!(SessionEvent::ModelAttemptStarted {
+            request,
+            attempt: 1
+        });
+        one!(SessionEvent::ModelFailed {
+            request,
+            attempt: 1,
+            error: "lost".into(),
+            kind: ModelFailureKind::Error,
+        });
+        one!(SessionEvent::ModelRecoveryScheduled {
+            request,
+            attempt: 2,
+            max_attempts: Some(3),
+            delay_millis: 1000,
+            error: "lost".into(),
+        });
+        one!(SessionEvent::ModelAttemptStarted {
+            request,
+            attempt: 2
+        });
+        let replay = ReplayEnvelope {
+            version: 1,
+            protocol: "responses".into(),
+            model: "model".into(),
+            scope: "reasoning".into(),
+            payload: json!({"encrypted": "opaque"}),
+            conversation_bound: true,
+        };
+        let assistant = one!(SessionEvent::MessageCommitted {
+            message: Message::Assistant(vec![
+                AssistantItem::reasoning("reason", 0, "thinking", Some(replay)),
+                AssistantItem::text("answer", 1, "text"),
+                AssistantItem::tool_call(
+                    "call-a",
+                    2,
+                    ToolCall::new("a", "read", json!({"path": "a"})).unwrap(),
+                ),
+                AssistantItem::tool_call(
+                    "call-b",
+                    3,
+                    ToolCall::new("b", "read", json!({"path": "b"})).unwrap(),
+                ),
+            ]),
+        });
+        one!(SessionEvent::Usage {
+            request: Some(request),
+            usage: Usage {
+                input_tokens: 10,
+                cached_input_tokens: 2,
+                output_tokens: 3,
+            },
+        });
+        one!(SessionEvent::ResponseCompleted {
+            request,
+            attempt: 2,
+            message: Some(assistant),
+            stop_reason: StopReason::Other("custom".into()),
+        });
+        let job = JobId::new(1).unwrap();
+        one!(SessionEvent::JobCreated {
+            job,
+            parent: None,
+            origin: Some(ModelCallOrigin {
+                message: assistant,
+                call_id: "b".into(),
+            }),
+            tool: "read".into(),
+            role: JobRole::Tool,
+            name: Some("reader".into()),
+            arguments: json!({"path": "b"}),
+            output_schema: Some(json!({"type": "object"})),
+            accepts_input: false,
+            background: true,
+            authorization_scope: Some(7),
+            location: ExecutionLocation::named("build", "/srv".into()),
+        });
+        one!(SessionEvent::JobStateChanged {
+            job,
+            state: JobState::Running,
+        });
+        one!(result("b", "read", vec![png.clone()]));
+        one!(result("a", "read", Vec::new()));
+        one!(SessionEvent::JobFinished {
+            job,
+            state: JobState::Interrupted,
+            error: Some("stopped".into()),
+            images: vec![png.clone()],
+            denial: Some(crate::tool::Denial::permission_denied()),
+        });
+        one!(SessionEvent::JobFinished {
+            job,
+            state: JobState::Cancelled,
+            error: None,
+            images: Vec::new(),
+            denial: None,
+        });
+        let resource =
+            crate::tool::policy::ResourceId::custom("plugin", ["server", "tool"]).unwrap();
+        let grant = one!(SessionEvent::ApprovalGranted {
+            job,
+            grant: crate::tool::policy::ApprovalGrant::descendants(
+                crate::tool::policy::Capability::Mcp,
+                resource,
+            ),
+        });
+        one!(SessionEvent::ApprovalRevoked { grant });
+        one!(SessionEvent::JobClaimed { job });
+        let notification = Some(prompt);
+        one!(SessionEvent::JobInjected { job, notification });
+        one!(SessionEvent::JobMessageDelivered {
+            job,
+            source: assistant,
+            notification: prompt,
+        });
+        one!(SessionEvent::QuestionOpened {
+            job,
+            question_id: "q".into(),
+            questions: json!([{"question": "why?"}]),
+        });
+        one!(SessionEvent::QuestionResolved {
+            job,
+            question_id: "q".into(),
+            answers: json!(["because"]),
+        });
+        let attempt = QueueAttemptId::from_bytes([9; 16]);
+        let intent = QueueIntent {
+            attempt,
+            content: vec![UserContent::Text {
+                text: "queued".into(),
+            }],
+            model: Some("test".into()),
+        };
+        one!(SessionEvent::QueueIntent {
+            intent: intent.clone(),
+        });
+        let message = Message::User(intent.content.clone());
+        let bound = [
+            SessionEvent::ModelChanged { profile: profile() },
+            SessionEvent::MessageCommitted { message },
+        ];
+        let bound = bound.map(|event| (root.clone(), Some(attempt), event));
+        fixture.commit(bound.into()).unwrap();
+        let event = fixture.records.last().unwrap().id;
+        one!(SessionEvent::QueueSettlement {
+            attempt,
+            settlement: QueueSettlement::Committed { event },
+        });
+        one!(SessionEvent::QueueAcknowledged { attempt });
+        one!(SessionEvent::TodosReplaced {
+            items: vec![crate::agent::TodoItem {
+                text: "todo".into(),
+                status: crate::agent::TodoStatus::InProgress,
+            }],
+        });
+        one!(SessionEvent::TodosReplaced { items: Vec::new() });
+        // A compaction summary request and its checkpoint.
+        let frontier = fixture.records.len() as u64;
+        let summary_context = one!(SessionEvent::ModelContext {
+            context: ModelContext {
+                purpose: ModelPurpose::Compaction,
+                tools: Vec::new(),
+                response_schema: Some(ResponseSchema {
+                    name: "summary".into(),
+                    schema: json!({"type": "object"}),
+                }),
+                ..agent_context
+            },
+        });
+        let summary = one!(SessionEvent::ModelRequested {
+            context: summary_context,
+            history: vec![prompt, assistant],
+            tail: vec![user("summarize")],
+            history_lifetime: HistoryLifetime::Detached,
+            purpose: ModelPurpose::Compaction,
+        });
+        one!(SessionEvent::ModelAttemptStarted {
+            request: summary,
+            attempt: 1,
+        });
+        let checkpoint = one!(SessionEvent::Compaction {
+            checkpoint: CompactionCheckpoint {
+                schema_version: 2,
+                previous: None,
+                frontier,
+                message: Message::User(vec![UserContent::Compaction {
+                    text: "summary".into(),
+                }]),
+                todos: vec![crate::agent::TodoItem {
+                    text: "kept".into(),
+                    status: crate::agent::TodoStatus::Pending,
+                }],
+                retained: vec![prompt],
+                request: summary,
+                attempt: 1,
+                max_context: 128_000,
+                before_tokens: 100,
+                after_tokens: 10,
+            },
+        });
+        one!(SessionEvent::ModelRequested {
+            context,
+            history: vec![checkpoint, prompt],
+            tail: Vec::new(),
+            history_lifetime: HistoryLifetime::Continuing,
+            purpose: ModelPurpose::Agent,
+        });
+        one!(SessionEvent::CompactionFailed {
+            request: None,
+            attempt: None,
+            error: "no request".into(),
+        });
+        // A child agent with an owner job and its own events.
+        let child = root.child(1);
+        let owner = JobId::new(2).unwrap();
+        one!(SessionEvent::JobCreated {
+            job: owner,
+            parent: None,
+            origin: None,
+            tool: "agent".into(),
+            role: JobRole::Agent,
+            name: None,
+            arguments: json!({"prompt": "work"}),
+            output_schema: None,
+            accepts_input: true,
+            background: false,
+            authorization_scope: None,
+            location: ExecutionLocation::root("/workspace".into()),
+        });
+        let location = ExecutionLocation::root("/workspace".into());
+        let failed = SessionEvent::AgentFailed {
+            error: "failed".into(),
+        };
+        let started = child_started(Some(root.clone()), Some(owner), location);
+        let child_events = [started, failed].map(|event| (child.clone(), None, event));
+        fixture.commit(child_events.into()).unwrap();
+        for event in [
+            SessionEvent::Status {
+                message: "status".into(),
+            },
+            SessionEvent::TitleSet {
+                title: "title".into(),
+            },
+            SessionEvent::SessionResumed,
+            SessionEvent::AgentCompleted,
+            SessionEvent::AgentInterrupted,
+        ] {
+            one!(event);
+        }
+        fixture.assert_round_trip();
+    }
+}

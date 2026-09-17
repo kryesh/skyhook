@@ -170,7 +170,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     pub(super) use crate::agent::runtime::tests::{
-        count, events, summary_json, test_builder, todo,
+        count, events, summary_json, test_builder, todo, usage,
     };
     use crate::agent::runtime::{HarnessError, SessionHandle, TurnContext, compaction, prompt};
     use crate::{
@@ -308,14 +308,6 @@ mod tests {
         counter
             .try_update(Ordering::SeqCst, Ordering::SeqCst, decrement)
             .is_ok()
-    }
-
-    pub(super) fn usage(input_tokens: u64, cached_input_tokens: u64, output_tokens: u64) -> Usage {
-        Usage {
-            input_tokens,
-            cached_input_tokens,
-            output_tokens,
-        }
     }
 
     pub(super) struct Fixture {

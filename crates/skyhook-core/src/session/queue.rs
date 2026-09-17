@@ -132,10 +132,8 @@ mod tests {
 
     #[tokio::test]
     async fn intent_message_settlement_and_acknowledgement_survive_reopen() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
+        let (root, store, agent) = crate::session::fixture::on_disk().await;
         let id = store.id();
-        let agent = crate::session::fixture::started(&store, root.path()).await;
         let intent = new_intent();
         let attempt = intent.attempt;
         let event = SessionEvent::QueueIntent {

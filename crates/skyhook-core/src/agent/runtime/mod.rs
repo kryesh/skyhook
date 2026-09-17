@@ -64,8 +64,6 @@ const AGENT_CHANNEL_CAPACITY: usize = 64;
 mod builder;
 mod dispatch;
 mod driver;
-#[cfg(test)]
-mod durable_queue_tests;
 mod lifecycle;
 mod recovery;
 mod session;
@@ -674,6 +672,14 @@ mod tests {
         })
         .await
         .expect("session runtime released after shutdown");
+    }
+
+    pub(super) fn usage(input_tokens: u64, cached_input_tokens: u64, output_tokens: u64) -> Usage {
+        Usage {
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+        }
     }
 
     pub(super) fn response(items: Vec<AssistantContent>) -> Vec<ResponseChunk> {

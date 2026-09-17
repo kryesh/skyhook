@@ -165,9 +165,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_progress_is_recursive_exclusive_and_location_filtered() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(directory.path()).await.unwrap();
-        let root = crate::session::fixture::started(&store, directory.path()).await;
+        let (_directory, store, root) = crate::session::fixture::on_disk().await;
         let child = root.child(1);
         let grandchild = child.child(1);
         let great_grandchild = grandchild.child(1);
@@ -250,9 +248,7 @@ mod tests {
 
     #[tokio::test]
     async fn progress_survives_retained_resume_and_replay() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(directory.path()).await.unwrap();
-        let root = crate::session::fixture::started(&store, directory.path()).await;
+        let (_directory, store, root) = crate::session::fixture::on_disk().await;
         let child = root.child(1);
         let jobs = JobManager::new(store.clone());
         let spec = JobSpec {

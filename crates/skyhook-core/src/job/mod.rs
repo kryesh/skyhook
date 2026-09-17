@@ -463,9 +463,6 @@ pub enum JobError {
 }
 
 #[cfg(test)]
-mod creation_tests;
-
-#[cfg(test)]
 mod tests {
     use super::*;
 

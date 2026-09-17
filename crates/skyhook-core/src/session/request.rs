@@ -452,9 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn projection_drops_content_free_assistant_messages_from_older_journals() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(directory.path()).await.unwrap();
-        let agent = crate::session::fixture::started(&store, directory.path()).await;
+        let (_directory, store, agent) = crate::session::fixture::on_disk().await;
         // A journal written before the commit guard existed: an assistant message
         // with no content at all, which no provider can encode.
         for event in [
@@ -493,9 +491,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_preserves_context_boundaries_and_image_payloads() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(directory.path()).await.unwrap();
-        let agent = crate::session::fixture::started(&store, directory.path()).await;
+        let (directory, store, agent) = crate::session::fixture::on_disk().await;
         let child = agent.child(1);
         let child_start =
             crate::session::fixture::agent_started(Some(agent.clone()), directory.path());

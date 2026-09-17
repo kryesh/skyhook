@@ -153,7 +153,7 @@ mod tests {
     use super::*;
     use crate::agent::runtime::tests::{
         bounded, cloned_provider, count, enqueue_prompts, events, owner, summary_json,
-        test_builder, test_harness, tool_call,
+        test_builder, test_harness, tool_call, usage,
     };
     use crate::provider::{
         CodexWebSocketError, ProviderContext, ProviderError, ProviderErrorKind, ProviderFuture,
@@ -404,11 +404,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn failed_partial_text_and_complete_tool_block_are_discarded_before_retry() {
-        let observed_usage = Usage {
-            input_tokens: 71,
-            cached_input_tokens: 13,
-            output_tokens: 5,
-        };
+        let observed_usage = usage(71, 13, 5);
         let mut partial = vec![Ok(ResponseChunk::UsageUpdated {
             usage: observed_usage,
         })];

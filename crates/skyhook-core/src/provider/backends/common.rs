@@ -241,9 +241,7 @@ pub(super) mod tests {
         request: &crate::provider::protocol::ModelRequest,
     ) -> crate::provider::protocol::ModelRequest {
         use crate::session::{ModelPurpose, SessionEvent, SessionStore, reconstruct_model_request};
-        let directory = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(directory.path()).await.unwrap();
-        let agent = crate::session::fixture::started(&store, directory.path()).await;
+        let (directory, store, agent) = crate::session::fixture::on_disk().await;
         // The journal derives model settings from the profile and correlation from the agent.
         let mut expected = request.clone();
         let max_output = request.max_output_tokens.unwrap_or(4096);

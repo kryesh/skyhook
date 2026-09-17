@@ -165,9 +165,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_recovers_creation_committed_before_map_publication() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(root.path()).await.unwrap();
-        let agent = crate::session::fixture::started(&store, root.path()).await;
+        let (root, store, agent) = crate::session::fixture::on_disk().await;
         let job = JobId::new(7).unwrap();
         let created = SessionEvent::JobCreated {
             origin: None,

@@ -594,11 +594,7 @@ mod tests {
         summary["todo_reconciliation"] = json!(["Inspection finished"]);
         summary["todos"] = json!(reconciled);
         let mut completed = answer("checkpoint installed");
-        let usage = Usage {
-            input_tokens: 48_000,
-            cached_input_tokens: 2_000,
-            output_tokens: 1_200,
-        };
+        let usage = usage(48_000, 2_000, 1_200);
         completed.insert(completed.len() - 1, ResponseChunk::UsageUpdated { usage });
         let responses = [completed, answer(summary.to_string()), answer("resumed")];
         let provider = scripted_provider(&requests, responses);
