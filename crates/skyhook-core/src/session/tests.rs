@@ -40,6 +40,65 @@ async fn accepted_append_survives_lost_waiter_and_close_drains() {
     assert_eq!(replay.last(), Some(&record));
 }
 
+/// An in-flight append's pessimistic poison is not a failure: reconciled reads
+/// wait for publication instead of reporting recovery.
+#[tokio::test]
+async fn reconciled_records_wait_out_in_flight_append() {
+    for boundary in AppendBoundary::ALL {
+        let (_root, store, _id, agent) = fresh().await;
+        let (reached, resume) = store.pause_append_at(boundary).await;
+        let accepted = store
+            .accept_append(agent.clone(), SessionEvent::AgentInterrupted)
+            .await
+            .unwrap();
+        reached.await.unwrap();
+        let reading = tokio::spawn({
+            let store = store.clone();
+            async move { store.reconciled_records().await }
+        });
+        let draining = tokio::spawn({
+            let store = store.clone();
+            async move { store.drain().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !reading.is_finished(),
+            "{boundary:?}: read must wait for publication"
+        );
+        assert!(
+            !draining.is_finished(),
+            "{boundary:?}: drain must wait for publication"
+        );
+        resume.send(()).unwrap();
+        let record = accepted.committed().await.unwrap();
+        let records = reading.await.unwrap().unwrap();
+        assert_eq!(records.last(), Some(&record), "{boundary:?}");
+        draining.await.unwrap().unwrap();
+    }
+}
+
+/// A writer lost before acceptance leaves nothing durable and must not blame
+/// another append's recovery; the store keeps accepting afterwards.
+#[tokio::test]
+async fn writer_lost_before_acceptance_is_not_a_recovery() {
+    let (_root, store, _id, agent) = fresh().await;
+    let lost = store
+        .append_then(agent.clone(), SessionEvent::AgentInterrupted, |_| {
+            panic!("injected loss before acceptance")
+        })
+        .await;
+    assert!(
+        matches!(lost, Err(SessionError::Io(_))),
+        "unexpected result: {lost:?}"
+    );
+    let before = store.reconciled_records().await.unwrap().len();
+    store
+        .append(agent, SessionEvent::AgentCompleted)
+        .await
+        .unwrap();
+    assert_eq!(store.reconciled_records().await.unwrap().len(), before + 1);
+}
+
 /// Failures after acceptance poison the writer with the exact recovery identity;
 /// reopening resolves the append from what the database actually committed.
 #[tokio::test]

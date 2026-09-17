@@ -627,7 +627,9 @@ impl SessionStore {
     }
 
     /// Committed records, refused while an accepted append needs recovery (reopen first).
+    /// Waits out in-flight appends: their pessimistic poison lasts until publication.
     pub async fn reconciled_records(&self) -> Result<Vec<EventRecord>, SessionError> {
+        let _writer = self.inner.writer.lock().await;
         let state = self.inner.shared.read();
         state.require_healthy()?;
         Ok(state.records.clone())
@@ -770,21 +772,20 @@ impl SessionStore {
                 }
             }
         });
-        let identities =
-            acceptance
-                .await
-                .map_err(|_| match &self.inner.shared.read().health {
-                    WriterHealth::NeedsRecovery(recovery) => {
-                        SessionError::AppendUnavailable(recovery.clone())
-                    }
-                    WriterHealth::Healthy => SessionError::Closed,
-                })??;
+        // A dropped sender means the writer was lost before acceptance, so nothing
+        // is durable. Health cannot explain it: a prior poison is reported through
+        // the channel, and any poison seen now belongs to a later in-flight append.
+        let identities = acceptance.await.map_err(|_| {
+            SessionError::Io(std::io::Error::other(
+                "session writer lost before accepting the append",
+            ))
+        })??;
         Ok((identities, receipt))
     }
 
     /// Await accepted appends and report recovery-required state without closing admission.
     pub async fn drain(&self) -> Result<(), SessionError> {
-        drop(self.inner.writer.lock().await);
+        let _writer = self.inner.writer.lock().await;
         self.inner.shared.read().require_healthy()
     }
 
