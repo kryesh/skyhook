@@ -471,19 +471,25 @@ impl SessionRuntime {
             .map(|agent| agent.sender.clone())
     }
 
-    pub(super) fn begin_turn(&self, id: &AgentId) -> CancellationToken {
+    /// Register this agent's turn cancellation, or decline once stopping. Checked
+    /// under the `agents` write lock: a token minted before `interrupt_tree`'s
+    /// snapshot is cancelled by it, and none can be minted after.
+    pub(super) fn begin_turn(&self, id: &AgentId) -> Option<CancellationToken> {
         let cancellation = CancellationToken::new();
         let mut agents = self
             .agents
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.shutting_down.load(Ordering::Acquire) {
+            return None;
+        }
         let agent = agents.get_mut(id).expect("running agents are registered");
         agent
             .control
             .retryable_interrupt
             .store(false, Ordering::Release);
         agent.cancellation = cancellation.clone();
-        cancellation
+        Some(cancellation)
     }
 }
 

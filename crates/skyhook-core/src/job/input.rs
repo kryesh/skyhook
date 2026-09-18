@@ -241,7 +241,7 @@ impl JobManager {
                 entry.state = JobState::Running;
                 entry.input = input;
                 entry.clear_invocation_output();
-                entry.delivery = DeliveryState::Pending;
+                entry.pend_delivery();
                 // An interrupted foreground invocation still has its original waiter.
                 // Do not turn it into a background result merely because it resumed.
                 if !suspended {
@@ -299,7 +299,7 @@ impl JobManager {
                 entry.state = JobState::WaitingInput;
                 entry.output = Some(output);
                 entry.error = None;
-                entry.delivery = DeliveryState::Pending;
+                entry.pend_delivery();
                 entry.background = true;
                 entry.notify.clone()
             };
@@ -342,7 +342,7 @@ impl JobManager {
                 let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
                 entry.state = JobState::Running;
                 entry.output = None;
-                entry.delivery = DeliveryState::Pending;
+                entry.pend_delivery();
                 entry.notify.clone()
             };
             notify.notify_waiters();

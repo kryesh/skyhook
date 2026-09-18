@@ -17,8 +17,16 @@ pub(super) fn visible_text(message: &Message) -> Option<String> {
 
 impl JobEntry {
     pub(super) fn has_pending(&self) -> bool {
-        !self.messages.is_empty()
-            || (self.background && self.deliverable() && self.delivery == DeliveryState::Pending)
+        self.pending_since(0)
+    }
+
+    /// Whether anything still pending became pending after stamp `floor`.
+    pub(super) fn pending_since(&self, floor: u64) -> bool {
+        (!self.messages.is_empty() && self.message_stamp > floor)
+            || (self.background
+                && self.deliverable()
+                && self.delivery == DeliveryState::Pending
+                && self.delivery_stamp > floor)
     }
 
     /// Queue a child reply for delivery, reporting whether it was published. A blank
@@ -29,6 +37,7 @@ impl JobEntry {
             return false;
         }
         self.last_agent_message = Some(sequence);
+        self.message_stamp = super::next_pending_stamp();
         self.messages.push(AgentMessage {
             id,
             name: self.name.clone(),

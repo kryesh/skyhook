@@ -29,7 +29,8 @@ including while queued or running; an omitted target inherits the calling agent'
 Agent rows show their own token totals and context usage in the same compact format as the
 bottom-right session summary: output · input (uncached) · context.
 Status messages, including interruptions and errors, appear as distinct rows in the conversation
-log and are saved with the session. They are excluded from the model’s context.
+log and are saved with the session. An interruption row is recorded only when something was
+actually interrupted. They are excluded from the model’s context.
 Completed final replies show their recorded model ID in a muted footer below the answer.
 The composer always sends to the root agent. While root is busy, Enter queues a follow-up
 for its next model request, without interrupting the current request or tools. It does not wait
@@ -61,7 +62,8 @@ Transient retries reuse that request; older logs can contain separate request ro
 Full request bodies remain in the session journal for reconstruction but are not rendered in the UI.
 Startup warnings appear directly in the conversation log rather than a separate diagnostics page.
 Job output is paged and searchable without acknowledging the agent's pending notifications. Select a job
-and press `o` for output fields, regex search, and the next page; `c` requests cancellation.
+and press `o` for output fields, regex search, and the next page; `c` requests cancellation
+(useful for background jobs, since interrupting already cancels the foreground tool).
 Intermediate child-agent messages and terminal job notifications appear as expandable **Job event**
 cards in the conversation. Agent-message cards show the job identity/name, source message sequence,
 and readable progress text when expanded, rather than raw runtime envelopes. They retain their
@@ -129,8 +131,8 @@ The command palette and `/help` also list these shortcuts. `Ctrl+X` is a leader:
 | `Home`, `End` in content | Beginning, latest |
 | `/`, `n`, `N` in content | Search, next/previous match |
 | `[`, `]` in content | Previous/next inspector tab |
-| `Esc` | Close local UI, dismiss/cancel prompts, otherwise interrupt work |
-| `Ctrl+C` | Clear draft, otherwise interrupt/quit |
+| `Esc` | Close local UI, dismiss/cancel prompts, otherwise interrupt work, cancelling the running foreground tool |
+| `Ctrl+C` | Clear draft, otherwise interrupt (as `Esc`)/quit |
 | `Ctrl+X Q` | Quit |
 
 The `Ctrl+X` preview stays open until the next key; `Esc` cancels it. It shows Model

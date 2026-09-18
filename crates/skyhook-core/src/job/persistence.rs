@@ -75,7 +75,7 @@ pub(super) async fn restore(
                     ) && *state == super::JobState::Running
                     {
                         entry.clear_invocation_output();
-                        entry.delivery = DeliveryState::Pending;
+                        entry.pend_delivery();
                         // Match live retained reset: an interrupted foreground
                         // invocation still owns its original waiter.
                         if entry.state != super::JobState::Interrupted {
@@ -87,7 +87,7 @@ pub(super) async fn restore(
                             && *state == super::JobState::Running)
                     {
                         entry.output = None;
-                        entry.delivery = DeliveryState::Pending;
+                        entry.pend_delivery();
                         entry.background = true;
                     }
                     entry.state = *state;

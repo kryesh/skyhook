@@ -14,7 +14,10 @@ an instruction continues the same history without adding a synthetic user or par
 message.
 Children do not need `receive()` to read these updates. Every visible child text reply,
 including text-only and final replies, is delivered independently through the background-job
-event path and wakes `wait`, without waiting for the child job to finish. Message events carry
+event path, without waiting for the child job to finish. `wait` resolves when the agent can act:
+while the agent has other foreground work outstanding it keeps waiting, and the next model request
+then carries every accumulated event together; otherwise any pending event resolves it. Each
+notification resolves a given caller's `wait` once, and `wait` never consumes content. Message events carry
 `kind: "message"`, the child job `id`, source `message` sequence, optional `name`, and `text`.
 Completion is determined separately by the agent's remaining work and queued inputs, not by
 message delivery. A completed child notification references its `last_message` instead of

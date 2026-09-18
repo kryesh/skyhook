@@ -17,7 +17,13 @@ Unacknowledged background questions/completions wake their owner for another tur
 waits for owned work; root background services remain managed by the live session. On resume,
 unfinished jobs become interrupted and job identifiers continue monotonically; this does not add
 service survival across harness restarts. `SessionHandle::interrupt` stops active provider streams
-and cancels jobs across the session's agent tree.
+and cancels the foreground tool, script and question jobs that hold each interrupted turn; the
+cancelled calls are recorded as error results. Delegated child agents are left interrupted but
+retained, and `/retry` restarts them; an agent whose only live work is delegated children or background
+jobs is left waiting. Background jobs keep running, except any launched by a cancelled script, which are
+cancelled with it. `job_cancel` and shutdown remain the final,
+non-resumable paths. Once shutdown is requested no agent begins another model request; a child
+reply still pending at that moment stays in the journal and is presented after resume.
 
 ## Conversation compaction
 

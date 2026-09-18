@@ -158,6 +158,15 @@ impl JobManager {
         self.wait_inner(id, None, WaitMode::Foreground).await
     }
 
+    /// Block until `id` is terminal and no longer retained for resumption, i.e. no
+    /// longer live. Non-claiming and without hydrating output: a readiness edge
+    /// for a `wait` deferring to foreground work, not a result collection.
+    pub(crate) async fn wait_settled(&self, id: JobId) -> Result<(), JobError> {
+        self.wait_inner(id, None, WaitMode::Terminal)
+            .await
+            .map(drop)
+    }
+
     /// Transfer observes the same readiness as foreground execution without
     /// acknowledging either completion or question delivery.
     pub(crate) async fn wait_foreground_for_transfer(

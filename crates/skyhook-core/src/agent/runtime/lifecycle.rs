@@ -177,31 +177,31 @@ impl SessionRuntime {
     /// Interrupt current turns without cancelling their owner jobs. This is the
     /// retryable session-interrupt path; explicit job/tree cancellation remains in
     /// `interrupt_tree` below.
+    ///
+    /// Retained child agents are spared and restarted by `continue`. Foreground
+    /// non-agent jobs have no resume point and are cancelled: the tool drain never
+    /// observes the agent token, and job tokens descend from parent jobs, so the
+    /// turn cannot unwind otherwise. Cancelling a script cancels what it launched.
     pub(super) async fn interrupt_turns(&self, root: &AgentId) -> usize {
         let targets = self
             .agents
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|(agent, _)| {
+            .keys()
+            .filter(|agent| {
                 agent.session() == root.session() && agent.path().starts_with(root.path())
             })
-            .map(|(id, agent)| {
-                (
-                    id.clone(),
-                    agent.cancellation.clone(),
-                    agent.control.retryable_interrupt.clone(),
-                )
-            })
+            .cloned()
             .collect::<Vec<_>>();
         let activity = self.events.observe().snapshot.activity;
         let mut interrupted = 0;
-        for (agent, cancellation, retryable) in &targets {
+        for agent in &targets {
+            let work = self.jobs.live_work(agent).await;
             match activity.get(agent) {
-                // Preserve actual waits, not every agent with background jobs:
-                // an agent may be making a model request while its jobs run.
+                // Preserve a genuine wait on work an interrupt keeps: retained
+                // children, which `continue` restarts, or background jobs.
                 Some(AgentActivity::Tools | AgentActivity::WaitingChildren)
-                    if self.jobs.has_running(agent).await =>
+                    if work.any && work.blocking.is_empty() =>
                 {
                     continue;
                 }
@@ -211,8 +211,32 @@ impl SessionRuntime {
                 ) => continue,
                 _ => {}
             }
+            // Read the turn's token only now: the agent may have begun a new turn
+            // while the awaits above ran, and a stale token would leave that turn
+            // live while its jobs are cancelled below.
+            let Some((cancellation, retryable)) = self
+                .agents
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(agent)
+                .map(|live| {
+                    (
+                        live.cancellation.clone(),
+                        live.control.retryable_interrupt.clone(),
+                    )
+                })
+            else {
+                continue;
+            };
+            // Order is load-bearing: mark and cancel the turn before its jobs. A job
+            // cancelled first would let the drain finish and reach an uncancelled
+            // request boundary, starting a fresh model request.
             retryable.store(true, Ordering::Release);
             cancellation.cancel();
+            for job in work.blocking {
+                // Commits an error result, which `continue` then resumes from.
+                let _ = self.jobs.cancel(job).await;
+            }
             self.activity(agent, AgentActivity::Interrupted);
             interrupted += 1;
         }

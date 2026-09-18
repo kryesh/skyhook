@@ -37,7 +37,17 @@ struct AgentWake {
     batch: std::sync::Mutex<EventBatch>,
     ready_input_revision: AtomicU64,
     observed_input: AtomicU64,
-    observed: AtomicU64,
+}
+
+impl AgentWake {
+    /// The latest scheduled wake revision; differs from the released one while a
+    /// coalescing window is open.
+    fn scheduled(&self) -> u64 {
+        self.batch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .revision
+    }
 }
 
 #[derive(Default)]
@@ -58,7 +68,6 @@ impl AgentSender {
                 batch: std::sync::Mutex::new(EventBatch::default()),
                 ready_input_revision: AtomicU64::new(0),
                 observed_input: AtomicU64::new(0),
-                observed: AtomicU64::new(0),
             }),
         }
     }
@@ -178,9 +187,6 @@ impl AgentSender {
     }
 
     pub(super) fn begin_request(&self) {
-        self.wake
-            .observed
-            .store(*self.wake.revision.borrow(), Ordering::Release);
         self.wake.observed_input.store(
             self.wake.ready_input_revision.load(Ordering::Acquire),
             Ordering::Release,
@@ -231,18 +237,44 @@ impl SessionRuntime {
             .agent_sender(context.agent())
             .ok_or_else(|| ToolError::Failed("calling agent is not active".into()))?;
         let mut revision = sender.wake.revision.subscribe();
+        let timeout = async || match deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending().await,
+        };
         loop {
             if context.is_cancelled() {
                 return Err(ToolError::Cancelled);
             }
-            // Only released batches are visible. A stale completion signal
-            // must not count as an event if its output was already claimed.
+            // The agent cannot act while its foreground work is outstanding, so that
+            // takes precedence; the next request carries every event together. Such
+            // work can park in a wait later, so each new event re-evaluates.
+            let parked = self.jobs.parked(context.agent());
+            let state = self.jobs.wait_state(context.agent(), context.job()).await;
+            if let Some(holding) = state.holding {
+                tokio::select! {
+                    biased;
+                    () = context.cancelled() => return Err(ToolError::Cancelled),
+                    _ = self.jobs.wait_settled(holding) => continue,
+                    () = parked => continue,
+                    changed = revision.changed() => {
+                        if changed.is_err() { return Err(ToolError::Cancelled); }
+                        continue;
+                    }
+                    () = timeout() => return Ok(WaitOutput { reason: WakeReason::Timeout }),
+                }
+            }
+            // Level-triggered, so nothing that landed earlier is lost; a script's
+            // floor (what it was last shown) stops it being told twice. Waiting for
+            // any open batch to release first keeps a burst in one report.
             let released = *revision.borrow_and_update();
-            if sender.wake.ready_input_revision.load(Ordering::Acquire)
-                != sender.wake.observed_input.load(Ordering::Acquire)
-                || (released != sender.wake.observed.load(Ordering::Acquire)
-                    && self.jobs.has_pending(context.agent()).await)
-            {
+            let ready_input = sender.wake.ready_input_revision.load(Ordering::Acquire);
+            let input = ready_input != sender.wake.observed_input.load(Ordering::Acquire)
+                && state.seen_input != Some(ready_input);
+            let settled = released == sender.wake.scheduled();
+            if (state.unseen || input) && settled {
+                self.jobs
+                    .set_wait_floor(context.job(), (state.stamp, ready_input))
+                    .await;
                 return Ok(WaitOutput {
                     reason: WakeReason::Event,
                 });
@@ -253,12 +285,7 @@ impl SessionRuntime {
                 changed = revision.changed() => {
                     if changed.is_err() { return Err(ToolError::Cancelled); }
                 }
-                () = async {
-                    match deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending().await,
-                    }
-                } => return Ok(WaitOutput { reason: WakeReason::Timeout }),
+                () = timeout() => return Ok(WaitOutput { reason: WakeReason::Timeout }),
             }
         }
     }
@@ -669,12 +696,7 @@ mod tests {
         let turn = prompt(&session);
         tracking.pass(0).await;
         running_job(&session, &session.root, "wait").await;
-        let prompt = QueuedPrompt {
-            text: "queued-wake-marker".into(),
-            attachments: vec![],
-            options: PromptOptions::default(),
-            token: QueuedPromptToken::new().unwrap(),
-        };
+        let prompt = queued("queued-wake-marker");
         let queued = tokio::spawn({
             let session = session.clone();
             async move { enqueue_prompts(&session, vec![prompt]).await.pop().unwrap() }
@@ -686,6 +708,246 @@ mod tests {
         assert!(messages.contains("queued-wake-marker"));
         tracking.release(1);
         assert_reason(&tracking.pass(2).await, "again", "timeout");
+        bounded(turn).await.unwrap().unwrap();
+        session.shutdown().await.unwrap();
+    }
+
+    fn queued(text: &str) -> QueuedPrompt {
+        QueuedPrompt {
+            text: text.into(),
+            attachments: vec![],
+            options: PromptOptions::default(),
+            token: QueuedPromptToken::new().unwrap(),
+        }
+    }
+
+    /// A foreground call inside a background script does not hold the agent, so a
+    /// later `wait` resolves on an event while that call is still running.
+    #[tokio::test]
+    async fn waits_do_not_defer_to_work_inside_a_background_script() {
+        let sleeper = json!({"source":"await tool.exec({argv:['sleep','30']});", "bg":true});
+        let tracking = Tracking::new(vec![
+            ("root", call("bg", "script", sleeper)),
+            ("root", call("hold", "wait", json!({"timeout":null}))),
+            ("root", answer()),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let turn = prompt(&session);
+        tracking.pass(0).await;
+        let exec = running_job(&session, &session.root, "exec").await;
+        tracking.pass(1).await;
+        running_job(&session, &session.root, "wait").await;
+        let queued = tokio::spawn({
+            let session = session.clone();
+            async move {
+                enqueue_prompts(&session, vec![queued("bg-marker")])
+                    .await
+                    .pop()
+                    .unwrap()
+            }
+        });
+        let request = tracking.request(2).await;
+        bounded(queued).await.unwrap().unwrap();
+        assert_reason(&request, "hold", "event");
+        let state = session.runtime.jobs.snapshot(exec).await.unwrap().state;
+        assert_eq!(state, JobState::Running);
+        tracking.release(2);
+        bounded(turn).await.unwrap().unwrap();
+        session.shutdown().await.unwrap();
+    }
+
+    /// A wait deferring to a script must wake when that script parks in its own
+    /// wait, not sleep until the script ends.
+    #[tokio::test]
+    async fn a_deferring_wait_wakes_when_its_holder_parks() {
+        let first = json!({"source":"return await tool.wait({timeout:30});"});
+        let second = json!({"source":"await tool.exec({argv:['sleep','1']}); \
+            await tool.wait({timeout:30}); return await tool.wait({timeout:3});"});
+        let tracking = Tracking::responses(vec![
+            (
+                "root",
+                vec![
+                    call("first", "script", first),
+                    AssistantContent::tool_call(
+                        "second",
+                        1,
+                        ToolCall::new("second", "script", second).unwrap(),
+                    ),
+                ],
+            ),
+            ("root", vec![answer()]),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let turn = prompt(&session);
+        tracking.pass(0).await;
+        running_job(&session, &session.root, "exec").await;
+        let queued = tokio::spawn({
+            let session = session.clone();
+            async move {
+                enqueue_prompts(&session, vec![queued("park-marker")])
+                    .await
+                    .pop()
+                    .unwrap()
+            }
+        });
+        let scripts = async || {
+            let jobs = session.runtime.jobs.list(&session.root).await;
+            jobs.into_iter()
+                .filter(|job| job.tool == "script")
+                .collect::<Vec<_>>()
+        };
+        let finished = bounded(async {
+            loop {
+                if let Some(done) = scripts()
+                    .await
+                    .into_iter()
+                    .find(|job| job.state.is_terminal())
+                {
+                    return done.id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        // The first to finish is the deferring script, told about the input while
+        // the other is still parked in its second wait.
+        let others = scripts().await.into_iter().filter(|job| job.id != finished);
+        assert!(others.into_iter().all(|job| job.state == JobState::Running));
+        let output = session
+            .runtime
+            .jobs
+            .wait(finished, None, false)
+            .await
+            .unwrap()
+            .output;
+        let value = output.as_ref().map(|output| &output["value"]);
+        assert_eq!(value, Some(&json!({"reason":"event"})), "{output:?}");
+        tracking.request(1).await;
+        bounded(queued).await.unwrap().unwrap();
+        tracking.release(1);
+        bounded(turn).await.unwrap().unwrap();
+        session.shutdown().await.unwrap();
+    }
+
+    /// What a script was shown depends only on what was pending when it looked, not
+    /// on when the wake revision catches up: a notification becomes pending before
+    /// its wake is forwarded, and must not be reported to the same script twice.
+    #[tokio::test]
+    async fn a_script_is_shown_each_pending_notification_once() {
+        let (_root, session) = start(&Tracking::new(vec![])).await;
+        let (jobs, root) = (&session.runtime.jobs, &session.root);
+        let script = JobSpec {
+            role: crate::job::JobRole::Script,
+            ..JobSpec::test(root.clone(), "script")
+        };
+        let script = jobs.test_create(script).await;
+        let hosted = || JobSpec {
+            parent: Some(script),
+            ..JobSpec::test(root.clone(), "wait")
+        };
+        complete_background(&session, root, "first").await;
+        let first = jobs.test_create(hosted()).await;
+        let state = jobs.wait_state(root, first).await;
+        assert!(state.unseen);
+        jobs.set_wait_floor(first, (state.stamp, 0)).await;
+        let second = jobs.test_create(hosted()).await;
+        assert!(!jobs.wait_state(root, second).await.unseen);
+        complete_background(&session, root, "second").await;
+        assert!(jobs.wait_state(root, second).await.unseen);
+        // A model caller has no script floor: its request boundary consumes instead.
+        let model = jobs.test_create(JobSpec::test(root.clone(), "wait")).await;
+        assert!(jobs.wait_state(root, model).await.unseen);
+        session.shutdown().await.unwrap();
+    }
+
+    /// Waits must not defer to each other: both wake on the same event.
+    #[tokio::test]
+    async fn concurrent_waits_do_not_defer_to_each_other() {
+        let second = ToolCall::new("second", "wait", json!({"timeout":null})).unwrap();
+        let tracking = Tracking::responses(vec![
+            (
+                "root",
+                vec![
+                    call("first", "wait", json!({"timeout":null})),
+                    AssistantContent::tool_call("second", 1, second),
+                ],
+            ),
+            ("root", vec![answer()]),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let turn = prompt(&session);
+        tracking.pass(0).await;
+        bounded(async {
+            while session
+                .runtime
+                .jobs
+                .list(&session.root)
+                .await
+                .iter()
+                .filter(|job| job.tool == "wait" && job.state == JobState::Running)
+                .count()
+                < 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let prompt = queued("concurrent-wake-marker");
+        let queued = tokio::spawn({
+            let session = session.clone();
+            async move { enqueue_prompts(&session, vec![prompt]).await.pop().unwrap() }
+        });
+        let request = tracking.request(1).await;
+        bounded(queued).await.unwrap().unwrap();
+        assert_reason(&request, "first", "event");
+        assert_reason(&request, "second", "event");
+        tracking.release(1);
+        bounded(turn).await.unwrap().unwrap();
+        session.shutdown().await.unwrap();
+    }
+
+    /// Queued input stays unconsumed while a script runs; it must still wake the
+    /// script's waits only once.
+    #[tokio::test]
+    async fn queued_input_does_not_respin_a_script_wait() {
+        let source = "const first = await tool.wait({timeout:60}); \
+            const second = await tool.wait({timeout:1}); return [first, second];";
+        let tracking = Tracking::new(vec![
+            ("root", call("run", "script", json!({"source": source}))),
+            ("root", answer()),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let turn = prompt(&session);
+        tracking.pass(0).await;
+        let script = running_job(&session, &session.root, "script").await;
+        running_job(&session, &session.root, "wait").await;
+        let prompt = queued("queued-respin-marker");
+        let queued = tokio::spawn({
+            let session = session.clone();
+            async move { enqueue_prompts(&session, vec![prompt]).await.pop().unwrap() }
+        });
+        let request = tracking.request(1).await;
+        bounded(queued).await.unwrap().unwrap();
+        let output = session
+            .runtime
+            .jobs
+            .wait(script, None, false)
+            .await
+            .unwrap()
+            .output;
+        let expected = json!([{"reason":"event"}, {"reason":"timeout"}]);
+        assert_eq!(
+            output.as_ref().map(|output| &output["value"]),
+            Some(&expected),
+            "{output:?}"
+        );
+        let history = serde_json::to_string(&request.messages().collect::<Vec<_>>()).unwrap();
+        assert_eq!(
+            history.matches("queued-respin-marker").count(),
+            1,
+            "{history}"
+        );
+        tracking.release(1);
         bounded(turn).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
     }
@@ -758,6 +1020,105 @@ mod tests {
         assert_eq!(state, JobState::Cancelled);
         tracking.release(1);
         bounded(turn).await.unwrap().unwrap();
+        session.shutdown().await.unwrap();
+    }
+
+    /// Observed activity trails the journal; interrupting earlier races the guard.
+    async fn running_tools(session: &SessionHandle, agent: &AgentId) {
+        bounded(async {
+            while !matches!(
+                session.observe().await.snapshot.activity.get(agent),
+                Some(AgentActivity::Tools)
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_unblocks_an_agent_held_by_a_foreground_script_wait() {
+        let source = json!({"source":"await tool.wait({timeout:30}); return 'late';"});
+        let tracking = Tracking::new(vec![
+            ("root", call("blocked", "script", source)),
+            ("root", answer()),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let turn = prompt(&session);
+        tracking.pass(0).await;
+        let script = running_job(&session, &session.root, "script").await;
+        let waiting = running_job(&session, &session.root, "wait").await;
+        running_tools(&session, &session.root).await;
+        assert_eq!(bounded(session.interrupt()).await, 1);
+        assert!(bounded(turn).await.unwrap().is_err());
+        for job in [script, waiting] {
+            let state = session.runtime.jobs.snapshot(job).await.unwrap().state;
+            assert_eq!(state, JobState::Cancelled, "job {job:?}");
+        }
+        // The unwinding turn must not reach another request boundary.
+        assert!(!tracking.requested_from(1));
+        let resumed = tokio::spawn({
+            let session = session.clone();
+            async move { session.continue_turn().await }
+        });
+        let history = tracking.request(1).await;
+        let history = serde_json::to_string(&history.messages().collect::<Vec<_>>()).unwrap();
+        assert!(history.contains("cancel"), "{history}");
+        tracking.release(1);
+        assert_eq!(bounded(resumed).await.unwrap().unwrap(), "done");
+        session.shutdown().await.unwrap();
+    }
+
+    /// A model-delegated child is retained while the script blocking the same turn
+    /// is cancelled. (A child the script launched would die with it.)
+    #[tokio::test]
+    async fn interrupt_cancels_blocking_tools_and_retains_delegated_children() {
+        let delegate = json!({"prompt":"work", "model":"child", "name":"kid"});
+        let blocked = json!({"source":"await tool.wait({timeout:30});"});
+        let tracking = Tracking::responses(vec![
+            (
+                "root",
+                vec![
+                    call("kid", "agent", delegate),
+                    AssistantContent::tool_call(
+                        "blocked",
+                        1,
+                        ToolCall::new("blocked", "script", blocked).unwrap(),
+                    ),
+                ],
+            ),
+            ("child", vec![call("child-hold", "wait", json!({}))]),
+            ("root", vec![answer()]),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let turn = prompt(&session);
+        tracking.pass(0).await;
+        let script = running_job(&session, &session.root, "script").await;
+        let delegated = running_job(&session, &session.root, "agent").await;
+        tracking.request(1).await;
+        let (child, _) = only_child(&session);
+        tracking.release(1);
+        running_job(&session, &child, "wait").await;
+        running_tools(&session, &session.root).await;
+        assert_eq!(bounded(session.interrupt()).await, 2);
+        let state = async |job| session.runtime.jobs.snapshot(job).await.unwrap().state;
+        // Both outcomes are journaled asynchronously; settle before comparing.
+        let settled = async |job, want| {
+            bounded(async {
+                while state(job).await != want {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+        };
+        settled(script, JobState::Cancelled).await;
+        settled(delegated, JobState::Interrupted).await;
+        assert!(!tracking.requested_from(2));
+        // A suspended child keeps the parent's `agent` call waiting for `continue`;
+        // cancelling it releases the turn, which ends without another request.
+        session.cancel_job(delegated).await.unwrap();
+        assert!(bounded(turn).await.unwrap().is_err());
+        assert!(!tracking.requested_from(2));
         session.shutdown().await.unwrap();
     }
 

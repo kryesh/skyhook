@@ -426,10 +426,13 @@ impl App {
         let Some(session) = self.session().cloned() else {
             return;
         };
-        // Record the action immediately, before any subsequent prompt can be submitted.
-        self.root_notifier().send("Interrupted");
+        // Recorded from the resolved count, so a press that stopped nothing leaves
+        // no journal entry claiming otherwise. The row follows the interrupt round
+        // trip, so input submitted within it can be journaled first.
+        let (id, tx) = (session.id(), self.tx.clone());
         tokio::spawn(async move {
-            session.interrupt().await;
+            let count = session.interrupt().await;
+            let _ = tx.send(Work::Interrupted { session: id, count });
         });
     }
     pub(super) fn prompt_history(&mut self, forward: bool) {

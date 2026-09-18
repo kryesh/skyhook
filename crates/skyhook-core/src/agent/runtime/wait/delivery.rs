@@ -109,6 +109,171 @@ mod tests {
         count
     }
 
+    /// A reply released by shutdown's own cancellation must not start a new turn;
+    /// it stays journaled for resume.
+    #[tokio::test]
+    async fn shutdown_stops_before_a_pending_child_reply_starts_another_turn() {
+        const REPLY: &str = "pending-child-reply";
+        let launch = json!({"prompt":"child task", "model":"child", "bg":true});
+        let tracking = Tracking::responses(vec![
+            (
+                "root",
+                vec![
+                    call("delegate", "agent", launch),
+                    AssistantContent::tool_call(
+                        "hold",
+                        1,
+                        ToolCall::new("hold", "wait", json!({"timeout":1})).unwrap(),
+                    ),
+                ],
+            ),
+            // Never released: the root is parked in `invoke` when shutdown lands.
+            ("root", vec![answer()]),
+            (
+                "child",
+                vec![
+                    AssistantContent::text("child-reply", 0, REPLY),
+                    AssistantContent::tool_call(
+                        "child-hold",
+                        1,
+                        ToolCall::new("child-hold", "wait", json!({})).unwrap(),
+                    ),
+                ],
+            ),
+            // Spare, so the bug fails an assertion rather than panicking the provider.
+            ("root", vec![answer()]),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let turn = prompt(&session);
+        tracking.pass(0).await;
+        tracking.request(1).await;
+        tracking.pass(2).await;
+        bounded(async {
+            while !session.runtime.jobs.has_pending(&session.root).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        bounded(session.shutdown()).await.unwrap();
+        bounded(session.root_tx.closed()).await;
+        assert!(
+            !tracking.requested_from(3),
+            "stop must not start another turn for a pending reply"
+        );
+        let records = session.runtime.store.records().await;
+        let root_said = records.iter().any(|record| {
+            record.agent == session.root
+                && matches!(&record.event, SessionEvent::MessageCommitted { message }
+                    if serde_json::to_string(message).unwrap_or_default().contains(REPLY))
+        });
+        assert!(!root_said, "the reply must stay pending, not be presented");
+        let child_said = records.iter().any(|record| {
+            record.agent != session.root
+                && matches!(&record.event, SessionEvent::MessageCommitted { message }
+                    if serde_json::to_string(message).unwrap_or_default().contains(REPLY))
+        });
+        assert!(child_said, "the child's own commit must survive for resume");
+        assert!(bounded(turn).await.unwrap().is_err());
+    }
+
+    /// The reported session: a script's foreground `tool.agent(...)`, then waits.
+    /// The pending reply resolves the first wait at once instead of sleeping out its
+    /// timeout, the script is not told twice (the root is busy in its drain, so
+    /// nothing consumes the reply meanwhile), and the model still gets it once.
+    #[tokio::test]
+    async fn script_wait_reports_a_pending_child_reply_once() {
+        const FINAL: &str = "readme-first-lines";
+        let source = "const answer = await tool.agent({prompt:'read', model:'child', name:'read-readme'}); \
+            const first = await tool.wait({timeout:60}); \
+            const second = await tool.wait({timeout:1}); \
+            return [first, second];";
+        let tracking = Tracking::responses(vec![
+            (
+                "root",
+                vec![call("run", "script", json!({"source": source}))],
+            ),
+            ("child", vec![AssistantContent::text("final", 0, FINAL)]),
+            ("root", vec![answer()]),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let turn = prompt(&session);
+        tracking.pass(0).await;
+        let script = running_job(&session, &session.root, "script").await;
+        tracking.pass(1).await;
+        let request = tracking.request(2).await;
+        let output = session
+            .runtime
+            .jobs
+            .wait(script, None, false)
+            .await
+            .unwrap()
+            .output;
+        let expected = json!([{"reason":"event"}, {"reason":"timeout"}]);
+        assert_eq!(
+            output.as_ref().map(|output| &output["value"]),
+            Some(&expected),
+            "{output:?}"
+        );
+        let history = serde_json::to_string(&request.messages().collect::<Vec<_>>()).unwrap();
+        assert_eq!(history.matches(FINAL).count(), 1, "{history}");
+        tracking.release(2);
+        bounded(turn).await.unwrap().unwrap();
+        session.shutdown().await.unwrap();
+    }
+
+    /// A `wait` beside a foreground child keeps waiting through the child's progress;
+    /// the next request carries progress and answer together.
+    #[tokio::test]
+    async fn outstanding_foreground_work_defers_wait_resolution() {
+        const PROGRESS: &str = "foreground-progress";
+        const FINAL: &str = "foreground-final";
+        let delegate = json!({"prompt":"work", "model":"child", "name":"kid"});
+        let waiting = ToolCall::new("waiting", "wait", json!({"timeout":30})).unwrap();
+        let hold = ToolCall::new("child-hold", "wait", json!({"timeout":1})).unwrap();
+        let tracking = Tracking::responses(vec![
+            (
+                "root",
+                vec![
+                    call("kid", "agent", delegate),
+                    AssistantContent::tool_call("waiting", 1, waiting),
+                ],
+            ),
+            (
+                "child",
+                vec![
+                    AssistantContent::text("progress", 0, PROGRESS),
+                    AssistantContent::tool_call("child-hold", 1, hold),
+                ],
+            ),
+            ("child", vec![AssistantContent::text("final", 0, FINAL)]),
+            ("root", vec![answer()]),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let turn = prompt(&session);
+        tracking.pass(0).await;
+        let wait = running_job(&session, &session.root, "wait").await;
+        tracking.pass(1).await;
+        // A second after the progress, an undeferred wait would have resolved.
+        tracking.request(2).await;
+        let state = session.runtime.jobs.snapshot(wait).await.unwrap().state;
+        assert_eq!(
+            state,
+            JobState::Running,
+            "the foreground child still holds the turn"
+        );
+        tracking.release(2);
+        let request = tracking.request(3).await;
+        assert_reason(&request, "waiting", "event");
+        let history = serde_json::to_string(&request.messages().collect::<Vec<_>>()).unwrap();
+        assert!(
+            history.contains(PROGRESS) && history.contains(FINAL),
+            "{history}"
+        );
+        tracking.release(3);
+        bounded(turn).await.unwrap().unwrap();
+        session.shutdown().await.unwrap();
+    }
+
     /// A completing child's answer and its completion envelope are one wake: the
     /// answer is published without a wake and the job completion carries both.
     #[tokio::test]

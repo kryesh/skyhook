@@ -280,25 +280,6 @@ impl QuestionCoordinator {
         }
     }
 
-    // A foreground ask inside a background script does not block the owning
-    // agent either. Stop at the agent boundary: its launch mode belongs to its
-    // parent, not to this agent's own question interaction.
-    async fn is_effectively_background(&self, mut job: JobId) -> Result<bool, HarnessError> {
-        loop {
-            let envelope = self.jobs.snapshot(job).await?;
-            if envelope.role == crate::job::JobRole::Agent {
-                return Ok(false);
-            }
-            if self.jobs.is_background(job).await? {
-                return Ok(true);
-            }
-            match envelope.parent {
-                Some(parent) => job = parent,
-                None => return Ok(false),
-            }
-        }
-    }
-
     async fn present_root_questions(
         &self,
         agent: AgentId,
@@ -307,7 +288,8 @@ impl QuestionCoordinator {
     ) {
         let mut background = false;
         for ask in &batch {
-            match self.is_effectively_background(ask.context.job()).await {
+            // A foreground ask inside a background script does not block the agent.
+            match self.jobs.is_effectively_background(ask.context.job()).await {
                 Ok(true) => {
                     background = true;
                     break;

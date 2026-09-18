@@ -63,10 +63,12 @@ impl ObservationSnapshot {
             return;
         }
         self.revision = update.revision;
-        self.reduce(update.event);
+        self.reduce(update.event, true);
     }
 
-    fn reduce(&mut self, event: RuntimeEvent) {
+    /// `live` is false only while replaying history on open, where records are the
+    /// sole source of activity. Live, the driver also emits activity directly.
+    fn reduce(&mut self, event: RuntimeEvent, live: bool) {
         match event {
             RuntimeEvent::Record(record) => {
                 if self.records.contains_key(&record.sequence) {
@@ -108,7 +110,18 @@ impl ObservationSnapshot {
                         } else {
                             AgentActivity::Working
                         };
-                        self.activity.insert(record.agent.clone(), activity);
+                        // Live, every attempt site emits this activity itself before
+                        // appending, and a late-forwarded record would regress newer
+                        // state (a root blocked in `Tools` shown as working). Only the
+                        // journal-only `Reconnecting` needs the record to end it.
+                        if !live
+                            || matches!(
+                                self.activity.get(&record.agent),
+                                None | Some(AgentActivity::Reconnecting { .. })
+                            )
+                        {
+                            self.activity.insert(record.agent.clone(), activity);
+                        }
                     }
                     SessionEvent::ModelRequested { .. }
                         if matches!(
@@ -228,7 +241,7 @@ impl RuntimeEvents {
     pub fn new(records: &[EventRecord]) -> Self {
         let mut snapshot = ObservationSnapshot::default();
         for record in records {
-            snapshot.reduce(RuntimeEvent::Record(Box::new(record.clone())));
+            snapshot.reduce(RuntimeEvent::Record(Box::new(record.clone())), false);
         }
         snapshot.context = super::runtime::recorded_context(records);
         Self {
@@ -258,7 +271,7 @@ impl RuntimeEvents {
             return;
         }
         state.revision += 1;
-        state.reduce(event.clone());
+        state.reduce(event.clone(), true);
         let _ = self.updates.send(ObservedEvent {
             revision: state.revision,
             event: event.clone(),
@@ -313,6 +326,45 @@ mod tests {
         ];
         let snapshot = RuntimeEvents::new(&records).observe().snapshot;
         assert_eq!(snapshot.activity.get(&agent), Some(&AgentActivity::Working));
+    }
+
+    /// A late-forwarded attempt record must not regress newer live activity, but
+    /// still ends a journal-only `Reconnecting`.
+    #[test]
+    fn a_late_attempt_record_does_not_regress_newer_live_activity() {
+        use crate::session::{EventRecord, SessionEvent};
+        let agent = AgentId::root(SessionId::from_bytes([4; 16]));
+        let attempt = |sequence: u64| {
+            RuntimeEvent::Record(Box::new(EventRecord {
+                id: crate::identity::EventId::from_bytes([sequence as u8; 16]),
+                queue_attempt: None,
+                sequence,
+                timestamp_millis: 0,
+                agent: agent.clone(),
+                event: SessionEvent::ModelAttemptStarted {
+                    request: 1,
+                    attempt: sequence,
+                },
+            }))
+        };
+        let activity = |activity| RuntimeEvent::Activity {
+            agent: agent.clone(),
+            activity,
+        };
+        let hub = RuntimeEvents::new(&[]);
+        hub.send(activity(AgentActivity::Working));
+        hub.send(activity(AgentActivity::Tools));
+        hub.send(attempt(1));
+        let observed = hub.observe().snapshot;
+        assert_eq!(observed.activity.get(&agent), Some(&AgentActivity::Tools));
+        let recovering = AgentActivity::Reconnecting {
+            attempt: 1,
+            max_attempts: None,
+        };
+        hub.send(activity(recovering));
+        hub.send(attempt(2));
+        let observed = hub.observe().snapshot;
+        assert_eq!(observed.activity.get(&agent), Some(&AgentActivity::Working));
     }
 
     fn emit(hub: &RuntimeEvents, agent: &AgentId, event: ResponseEvent) {

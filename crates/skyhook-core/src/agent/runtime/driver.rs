@@ -193,7 +193,16 @@ impl SessionRuntime {
             }
             // Register before claiming/persisting a queued message: interrupt must
             // not be lost while a commit is in flight.
-            let cancellation = self.begin_turn(&id);
+            let Some(cancellation) = self.begin_turn(&id) else {
+                // Stopping outranks whatever was queued: `Shutdown` can sit behind a
+                // `JobsReady`, so the flag, not the command, decides. A pending reply
+                // stays journaled for resume.
+                let _ = self
+                    .store
+                    .append(id.clone(), SessionEvent::AgentInterrupted)
+                    .await;
+                break;
+            };
             if let Some(sender) = self.agent_sender(&id) {
                 // Every input/notification path shares the same delivery gate.
                 let _ = sender.flush_events(&cancellation).await;

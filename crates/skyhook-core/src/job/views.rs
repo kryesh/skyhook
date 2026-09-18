@@ -2,6 +2,94 @@
 
 use super::*;
 
+/// An agent's live work, as an interrupt and a `wait` each need to see it.
+#[derive(Default)]
+pub(crate) struct LiveWork {
+    /// Any live job, retained children and background work included.
+    pub(crate) any: bool,
+    /// Foreground non-agent jobs. They hold the turn and have no resume point, so an
+    /// interrupt cancels them; retained children and background work survive it.
+    pub(crate) blocking: Vec<JobId>,
+    /// A foreground job, child agents included, that is not itself parked in a
+    /// `wait`. While one exists the agent cannot act, so a `wait` defers to it.
+    pub(crate) holding: Option<JobId>,
+}
+
+/// What a `wait` needs to decide, resolved in one pass over the job map.
+pub(crate) struct WaitState {
+    pub(crate) holding: Option<JobId>,
+    /// Something is pending that this caller has not been shown yet.
+    pub(crate) unseen: bool,
+    /// The input revision this caller was last shown, if it is a script.
+    pub(crate) seen_input: Option<u64>,
+    /// What to record as the caller's floor if it reports now.
+    pub(crate) stamp: u64,
+}
+
+fn classify(jobs: &HashMap<JobId, JobEntry>, owner: &AgentId) -> LiveWork {
+    // A job parked in a `wait`, and the same agent's jobs hosting it, are waiting
+    // for events rather than doing work. Deferring to them would make concurrent
+    // waits each sleep until the other ended.
+    let mut parked = std::collections::HashSet::new();
+    for (id, _) in jobs
+        .iter()
+        .filter(|(_, entry)| &entry.agent == owner && entry.awaiting_events && entry.live())
+    {
+        let mut next = Some(*id);
+        while let Some(job) = next.filter(|job| parked.insert(*job)) {
+            next = jobs
+                .get(&job)
+                .and_then(|entry| entry.parent)
+                .filter(|host| jobs.get(host).is_some_and(|host| &host.agent == owner));
+        }
+    }
+    let mut work = LiveWork::default();
+    for (id, entry) in jobs
+        .iter()
+        .filter(|(_, entry)| &entry.agent == owner && entry.live())
+    {
+        work.any = true;
+        if effectively_background(jobs, *id) {
+            continue;
+        }
+        if entry.role != JobRole::Agent {
+            work.blocking.push(*id);
+        }
+        if !parked.contains(id) {
+            work.holding.get_or_insert(*id);
+        }
+    }
+    work
+}
+
+/// Whether `id` or any ancestor launched by the same agent is background: a
+/// foreground call inside a background script does not hold the agent either.
+/// Stops at the agent boundary, whose launch mode belongs to the parent agent.
+fn effectively_background(jobs: &HashMap<JobId, JobEntry>, id: JobId) -> bool {
+    let mut next = jobs.get(&id);
+    while let Some(entry) = next {
+        if entry.background {
+            return true;
+        }
+        next = entry
+            .parent
+            .and_then(|parent| jobs.get(&parent))
+            .filter(|parent| parent.agent == entry.agent);
+    }
+    false
+}
+
+fn pending(jobs: &HashMap<JobId, JobEntry>, owner: &AgentId) -> bool {
+    jobs.values()
+        .any(|entry| &entry.agent == owner && entry.has_pending())
+}
+
+/// The script hosting a `wait`: what persists across its successive waits.
+fn script_host(jobs: &HashMap<JobId, JobEntry>, caller: JobId) -> Option<JobId> {
+    let host = jobs.get(&caller)?.parent?;
+    (jobs.get(&host)?.role == JobRole::Script).then_some(host)
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq)]
 pub struct JobEnvelope {
     pub id: JobId,
@@ -258,12 +346,7 @@ impl JobManager {
 
     /// Whether a child message or completion/question is ready, without reserving it.
     pub(crate) async fn has_pending(&self, owner: &AgentId) -> bool {
-        self.inner
-            .jobs
-            .lock()
-            .await
-            .values()
-            .any(|entry| &entry.agent == owner && entry.has_pending())
+        pending(&*self.inner.jobs.lock().await, owner)
     }
 
     /// Associate an agent job with the child's actual workspace and target.
@@ -284,7 +367,63 @@ impl JobManager {
             .lock()
             .await
             .values()
-            .any(|entry| &entry.agent == owner && (!entry.state.is_terminal() || entry.suspended()))
+            .any(|entry| &entry.agent == owner && entry.live())
+    }
+
+    pub(crate) async fn live_work(&self, owner: &AgentId) -> LiveWork {
+        classify(&*self.inner.jobs.lock().await, owner)
+    }
+
+    /// Mark `caller` parked and resolve its decision under one lock, so concurrent
+    /// waits classify each other consistently.
+    pub(crate) async fn wait_state(&self, owner: &AgentId, caller: JobId) -> WaitState {
+        let mut jobs = self.inner.jobs.lock().await;
+        if let Some(entry) = jobs.get_mut(&caller)
+            && !std::mem::replace(&mut entry.awaiting_events, true)
+        {
+            self.parked_signal(owner).notify_waiters();
+        }
+        let floor = script_host(&jobs, caller).and_then(|host| jobs.get(&host)?.wait_floor);
+        let since = floor.map_or(0, |(stamp, _)| stamp);
+        WaitState {
+            holding: classify(&jobs, owner).holding,
+            unseen: jobs
+                .values()
+                .any(|entry| &entry.agent == owner && entry.pending_since(since)),
+            seen_input: floor.map(|(_, input)| input),
+            stamp: current_pending_stamp(),
+        }
+    }
+
+    /// Resolves once one of `owner`'s jobs next parks in a `wait`. Take it before
+    /// `wait_state` so a park in between is not missed.
+    pub(crate) fn parked(&self, owner: &AgentId) -> tokio::sync::futures::OwnedNotified {
+        self.parked_signal(owner).notified_owned()
+    }
+
+    fn parked_signal(&self, owner: &AgentId) -> Arc<Notify> {
+        self.inner
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(owner.clone())
+            .or_default()
+            .clone()
+    }
+
+    pub(crate) async fn set_wait_floor(&self, caller: JobId, floor: (u64, u64)) {
+        let mut jobs = self.inner.jobs.lock().await;
+        if let Some(host) = script_host(&jobs, caller).and_then(|host| jobs.get_mut(&host)) {
+            host.wait_floor = Some(floor);
+        }
+    }
+
+    pub(crate) async fn is_effectively_background(&self, id: JobId) -> Result<bool, JobError> {
+        let jobs = self.inner.jobs.lock().await;
+        if !jobs.contains_key(&id) {
+            return Err(JobError::Unknown(id));
+        }
+        Ok(effectively_background(&jobs, id))
     }
 
     pub async fn is_background(&self, id: JobId) -> Result<bool, JobError> {

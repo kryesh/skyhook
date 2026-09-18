@@ -52,6 +52,19 @@ pub use supervisor::JobLease;
 
 const JOB_INPUT_CAPACITY: usize = 32;
 
+/// Orders what becomes pending for delivery. Taken under the jobs lock at each
+/// transition, so a wait floor snapshotted under that lock covers exactly what was
+/// visible to the wait, whatever order the wake forwarding later catches up in.
+static PENDING_STAMP: AtomicU64 = AtomicU64::new(0);
+
+fn next_pending_stamp() -> u64 {
+    PENDING_STAMP.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+fn current_pending_stamp() -> u64 {
+    PENDING_STAMP.load(Ordering::Relaxed)
+}
+
 /// Semantic execution role, independent of extensible tool names.
 #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -190,6 +203,17 @@ struct JobEntry {
     child: Option<AgentId>,
     messages: Vec<AgentMessage>,
     last_agent_message: Option<u64>,
+    /// Pending stamp and input revision a `wait` hosted by this script last
+    /// reported. A script never reaches the request boundary that consumes a model
+    /// caller's events, so this is what keeps it from being told twice.
+    wait_floor: Option<(u64, u64)>,
+    /// When the current delivery last became pending.
+    delivery_stamp: u64,
+    /// When the newest queued message was published; messages are delivered
+    /// oldest first, so it stays queued while any older one does.
+    message_stamp: u64,
+    /// A `wait` parked for agent events: not work other waits should defer to.
+    awaiting_events: bool,
     background: bool,
     authorization_scope: Option<u64>,
     location: ExecutionLocation,
@@ -225,6 +249,10 @@ impl JobEntry {
                 child: None,
                 messages: Vec::new(),
                 last_agent_message: None,
+                wait_floor: None,
+                awaiting_events: false,
+                delivery_stamp: next_pending_stamp(),
+                message_stamp: 0,
                 background: spec.background,
                 authorization_scope: spec.authorization_scope,
                 location: spec.location,
@@ -260,7 +288,7 @@ impl JobEntry {
         self.denial = denial;
         // A reported outcome is a new delivery even after an earlier question
         // was claimed/injected. Only explicit cancellation retires resumption.
-        self.delivery = DeliveryState::Pending;
+        self.pend_delivery();
         if state == JobState::Cancelled {
             self.resume = None;
         }
@@ -268,6 +296,17 @@ impl JobEntry {
 
     fn suspended(&self) -> bool {
         self.state == JobState::Interrupted && self.resume.is_some()
+    }
+
+    /// Not finished, or finished but retained for resumption. `active_states`
+    /// deliberately differs: it presents a suspended job by its retained state.
+    fn live(&self) -> bool {
+        !self.state.is_terminal() || self.suspended()
+    }
+
+    fn pend_delivery(&mut self) {
+        self.delivery = DeliveryState::Pending;
+        self.delivery_stamp = next_pending_stamp();
     }
 
     fn deliverable(&self) -> bool {
@@ -350,6 +389,9 @@ struct JobManagerInner {
     creation_operation: Arc<tokio::sync::RwLock<()>>,
     next_id: AtomicU64,
     completions: broadcast::Sender<JobCompletion>,
+    /// Per agent, fires when one of its jobs newly parks in a `wait`, releasing
+    /// that agent's waits deferring to it.
+    parked: std::sync::Mutex<HashMap<AgentId, Arc<Notify>>>,
 }
 
 #[derive(Clone)]
@@ -421,6 +463,7 @@ impl JobManager {
                 creation_operation: Arc::default(),
                 next_id: AtomicU64::new(next_id),
                 completions,
+                parked: std::sync::Mutex::default(),
             }),
         }
     }

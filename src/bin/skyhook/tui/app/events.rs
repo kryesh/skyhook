@@ -62,6 +62,10 @@ pub enum Work {
         agent: AgentId,
         message: String,
     },
+    Interrupted {
+        session: SessionId,
+        count: usize,
+    },
     Stopped,
     HighlightsReady,
 }
@@ -108,6 +112,15 @@ impl App {
                 result,
             } if Some(session) == self.session_id() => {
                 self.queue_committed(id, generation, submission, revision, result);
+            }
+            Work::Interrupted { session, count } if Some(session) == self.session_id() => {
+                if count > 0 {
+                    // Journal the status only for an interruption that happened.
+                    self.root_notifier().send("Interrupted");
+                } else {
+                    // UI-only: nothing was stopped, so nothing is recorded.
+                    self.toast("Nothing to interrupt");
+                }
             }
             Work::Done { session, result } if Some(session) == self.session_id() => {
                 self.operation = false;
