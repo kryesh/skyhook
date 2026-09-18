@@ -86,6 +86,52 @@ pub(super) fn native_enrichment(previous: &Value, terminal: &Value) -> bool {
 }
 
 impl Decoder {
+    /// Some servers finish a reasoning item only when the whole response ends.
+    /// Once a later item starts, earlier reasoning is complete for display, so
+    /// its streamed blocks close now; the item still awaits its snapshot.
+    pub(super) fn close_superseded_reasoning(
+        &mut self,
+        next: usize,
+        chunks: &mut Vec<ResponseChunk>,
+    ) -> Result<(), ProviderError> {
+        let open: Vec<(usize, usize, String)> = self
+            .items
+            .iter()
+            .filter(|(id, item)| **id != next && item.snapshot().is_none())
+            .filter_map(|(id, item)| Some((*id, item.reasoning().ok()?)))
+            .flat_map(|(id, reasoning)| {
+                reasoning
+                    .parts
+                    .iter()
+                    .filter(|(_, part)| part.ended().is_none() && !part.streamed().is_empty())
+                    .map(move |(position, part)| (id, *position, part.streamed().to_owned()))
+            })
+            .collect();
+        for (id, position, text) in open {
+            self.close_part(id, position, BlockContent::Reasoning { text }, chunks)?;
+            self.items
+                .get_mut(&id)
+                .expect("open item")
+                .reasoning_mut()?
+                .shown_early
+                .insert(position);
+        }
+        Ok(())
+    }
+
+    /// Whether a reasoning part (or the part its namespace migrated to) was
+    /// closed for display when a later item started.
+    pub(super) fn shown_early(&self, id: usize, position: usize) -> bool {
+        self.items[&id].reasoning().is_ok_and(|reasoning| {
+            let target = reasoning
+                .aliases
+                .get(&position)
+                .copied()
+                .unwrap_or(position);
+            reasoning.shown_early.contains(&target)
+        })
+    }
+
     pub(super) fn end_reasoning(
         &mut self,
         id: usize,
@@ -114,20 +160,27 @@ impl Decoder {
                 !(supplied.contains_key(position) && supplied.contains_key(&(position ^ 1)))
             });
         for (position, content) in &supplied {
-            let item = &self.items[&id];
-            let mut target = item
-                .reasoning()?
+            let sibling = position ^ 1;
+            let is_content = position & 1 == 1;
+            let reasoning = self.items[&id].reasoning()?;
+            // Some servers send one reasoning text as both summary and content;
+            // an unstreamed namespace does not repeat its sibling's text.
+            if supplied.get(&sibling) == Some(content)
+                && !reasoning.parts.contains_key(position)
+                && (is_content || reasoning.parts.contains_key(&sibling))
+            {
+                continue;
+            }
+            let mut target = reasoning
                 .aliases
                 .get(position)
                 .copied()
                 .unwrap_or(*position);
-            if !item.reasoning()?.parts.contains_key(&target)
-                && !supplied.contains_key(&(position ^ 1))
-            {
+            if !reasoning.parts.contains_key(&target) && !supplied.contains_key(&sibling) {
                 // A snapshot can move the same readable text from summary to
                 // content (or vice versa). Reuse its live block, but do not
                 // collapse independently supplied summary/content namespaces.
-                if let Some(other) = item.reasoning()?.parts.get(&(position ^ 1)) {
+                if let Some(other) = reasoning.parts.get(&sibling) {
                     let text_matches = match content {
                         BlockContent::Reasoning { text } => other
                             .ended()
@@ -135,7 +188,7 @@ impl Decoder {
                         _ => false,
                     };
                     if text_matches {
-                        target = position ^ 1;
+                        target = sibling;
                         self.items
                             .get_mut(&id)
                             .expect("checked item")
@@ -144,6 +197,10 @@ impl Decoder {
                             .insert(*position, target);
                     }
                 }
+            }
+            // Displayed when a later item started; the snapshot is the replay.
+            if self.shown_early(id, target) {
+                continue;
             }
             self.close_part(id, target, content.clone(), chunks)?;
         }
@@ -329,7 +386,6 @@ mod tests {
         for native in [json!({"type":"reasoning", "id":"r"}), empty()] {
             assert_display(vec![terminal(native.clone())], &native, &[]);
         }
-        // Explicitly supplied namespaces remain distinct even for equal text.
         let native = item(
             json!([{"type":"summary_text", "text":"same"}, {"type":"summary_text", "text":"brief"}]),
             json!([{"type":"reasoning_text", "text":"same"}, {"type":"output_text", "text":"details"}]),
@@ -339,7 +395,6 @@ mod tests {
             &native,
             &[
                 ("summary_0", "same"),
-                ("content_0", "same"),
                 ("summary_1", "brief"),
                 ("content_1", "details"),
             ],
@@ -414,11 +469,16 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_supplied_plaintext_and_aliases_fail() {
-        for conflicting in [
-            json!({"type":"reasoning_text", "text":"different"}),
-            json!({"type":"reasoning_text", "text":"visible", "reasoning":"different"}),
-            json!({"type":"reasoning_text", "text":7}),
+    fn final_plaintext_supersedes_deltas_but_conflicting_aliases_fail() {
+        for (conflicting, valid) in [
+            // The final snapshot is authoritative over streamed deltas.
+            (json!({"type":"reasoning_text", "text":"different"}), true),
+            // Aliases within one snapshot must still agree and be text.
+            (
+                json!({"type":"reasoning_text", "text":"visible", "reasoning":"different"}),
+                false,
+            ),
+            (json!({"type":"reasoning_text", "text":7}), false),
         ] {
             let mut decoder = Decoder::new("model".into());
             feed(
@@ -426,19 +486,15 @@ mod tests {
                 vec![snapshot("added", empty()), content_delta("visible")],
             )
             .unwrap();
-            assert!(
-                decoder
-                    .feed(terminal(item(Value::Null, json!([conflicting]))))
-                    .is_err()
-            );
+            let result = decoder.feed(terminal(item(Value::Null, json!([conflicting.clone()]))));
+            assert_eq!(result.is_ok(), valid, "{conflicting}");
         }
     }
 
     #[test]
     fn migrated_namespace_splits_when_both_namespaces_become_explicit() {
         for content in [false, true] {
-            // Equal and distinct text both create a second namespace, at either
-            // item.done or terminal; repeated snapshots must stay idempotent.
+            // Distinct text adds a namespace at item.done or terminal; equal text does not.
             for (new_text, split_at_done) in [
                 ("original", false),
                 ("new namespace", false),
@@ -465,11 +521,16 @@ mod tests {
                     ]);
                 }
                 events.push(terminal(native.clone()));
-                assert_display(
-                    events,
-                    &native,
-                    &[("summary_0", summary), ("content_0", text)],
-                );
+                let expected: &[(&str, &str)] = if summary == text {
+                    if content {
+                        &[("content_0", text)]
+                    } else {
+                        &[("summary_0", summary)]
+                    }
+                } else {
+                    &[("summary_0", summary), ("content_0", text)]
+                };
+                assert_display(events, &native, expected);
             }
             // Splitting cannot rewrite the original streamed text.
             let (summary, text) = if content {
@@ -494,12 +555,13 @@ mod tests {
 
     #[test]
     fn codex_omitted_output_uses_done_plaintext_without_accepting_conflicts() {
-        // Codex may omit terminal output entirely, but received done text must agree.
+        // Codex may omit terminal output entirely. Done text supersedes deltas,
+        // but two final texts must agree.
         for (content, done_text, valid) in [
             (None, "native", true),
             (Some("native"), "native", true),
             (Some("different"), "native", false),
-            (None, "changed", false),
+            (None, "changed", true),
         ] {
             let mut decoder = Decoder::codex("model".into());
             let result = feed(
@@ -561,5 +623,122 @@ mod tests {
             .unwrap();
             assert!(decoder.feed(terminal(final_item)).is_err());
         }
+    }
+
+    /// A proxy streams only the summary, then its final snapshot repeats the
+    /// same text as reasoning content. It is displayed once.
+    #[test]
+    fn a_summary_repeated_as_content_is_displayed_once() {
+        let summary_event = |name: &str, value_key: &str, value: Value| {
+            event(name, "summary_index", value_key, value)
+        };
+        let text = "User wants me to call run.\n";
+        let native = readable(Some(text), Some(text));
+        assert_display(
+            vec![
+                snapshot("added", empty()),
+                summary_event(
+                    "reasoning_summary_part.added",
+                    "part",
+                    json!({"type":"summary_text", "text":""}),
+                ),
+                summary_event("reasoning_summary_text.delta", "delta", json!(text)),
+                summary_event("reasoning_summary_text.done", "text", json!(text)),
+                snapshot("done", native.clone()),
+                terminal(native.clone()),
+            ],
+            &native,
+            &[("summary_0", text)],
+        );
+    }
+
+    /// A server that sends reasoning's `output_item.done` only at the end of
+    /// the response: the reasoning display closes when the answer starts.
+    #[test]
+    fn reasoning_display_closes_when_a_later_item_starts() {
+        let reasoning = json!({"id":"rs","type":"reasoning","summary":[],"content":[],
+            "encrypted_content":"","status":"in_progress"});
+        let finished = json!({"id":"rs","type":"reasoning","summary":[],
+            "content":[{"type":"reasoning_text","text":"think"}],"status":"completed"});
+        let message = json!({"id":"msg","type":"message","role":"assistant","content":[]});
+        let answer = json!({"id":"msg","type":"message","role":"assistant",
+            "content":[{"type":"output_text","text":"answer"}]});
+        let mut decoder = Decoder::new("model".into());
+        let mut chunks = Vec::new();
+        for event in [
+            json!({"type":"response.output_item.added","item":reasoning}),
+            json!({"type":"response.reasoning_text.delta","item_id":"rs","delta":"think"}),
+            json!({"type":"response.output_item.added","item":message}),
+            json!({"type":"response.content_part.added","item_id":"msg",
+                "part":{"type":"output_text","text":""}}),
+            json!({"type":"response.output_text.delta","item_id":"msg","delta":"answer"}),
+            json!({"type":"response.output_item.done","item":finished}),
+            json!({"type":"response.output_item.done","item":answer}),
+            json!({"type":"response.completed","response":{"status":"completed",
+                "output":[finished, answer]}}),
+        ] {
+            chunks.extend(decoder.feed(event).unwrap());
+        }
+        let position =
+            |wanted: &dyn Fn(&ResponseChunk) -> bool| chunks.iter().position(wanted).unwrap();
+        let reasoning_closed = position(
+            &|chunk| matches!(chunk, ResponseChunk::BlockEnded { item, .. } if item == "rs"),
+        );
+        let answer_started = position(
+            &|chunk| matches!(chunk, ResponseChunk::ItemStarted { id, .. } if id == "msg"),
+        );
+        assert!(reasoning_closed < answer_started);
+        let mut assembler = ResponseAssembler::default();
+        for chunk in &chunks {
+            assembler.push(chunk).unwrap();
+        }
+        let (items, _, _) = assembler.finish().unwrap();
+        assert_eq!(items[0].blocks.len(), 1);
+        assert_eq!(
+            items[0].blocks[0].content,
+            BlockContent::Reasoning {
+                text: "think".into()
+            }
+        );
+        // The replay is still the item's final snapshot.
+        assert_eq!(items[0].replay.as_ref().unwrap().payload, finished);
+    }
+
+    /// A late final-text event for reasoning already closed for display may
+    /// differ from what streamed (e.g. trimmed); it must not fail the response.
+    #[test]
+    fn late_final_text_for_reasoning_shown_early_is_ignored() {
+        let reasoning = json!({"id":"rs","type":"reasoning","summary":[],"content":[]});
+        let finished = json!({"id":"rs","type":"reasoning","summary":[],
+            "content":[{"type":"reasoning_text","text":"think"}]});
+        let message = json!({"id":"msg","type":"message","role":"assistant","content":[]});
+        let answer = json!({"id":"msg","type":"message","role":"assistant",
+            "content":[{"type":"output_text","text":"answer"}]});
+        let mut decoder = Decoder::new("model".into());
+        let mut assembler = ResponseAssembler::default();
+        for event in [
+            json!({"type":"response.output_item.added","item":reasoning}),
+            json!({"type":"response.reasoning_text.delta","item_id":"rs","delta":"think "}),
+            json!({"type":"response.output_item.added","item":message}),
+            json!({"type":"response.reasoning_text.done","item_id":"rs","text":"think"}),
+            json!({"type":"response.content_part.added","item_id":"msg",
+                "part":{"type":"output_text","text":""}}),
+            json!({"type":"response.output_text.delta","item_id":"msg","delta":"answer"}),
+            json!({"type":"response.output_item.done","item":finished}),
+            json!({"type":"response.output_item.done","item":answer}),
+            json!({"type":"response.completed","response":{"status":"completed",
+                "output":[finished, answer]}}),
+        ] {
+            for chunk in decoder.feed(event).unwrap() {
+                assembler.push(&chunk).unwrap();
+            }
+        }
+        let (items, _, _) = assembler.finish().unwrap();
+        assert_eq!(
+            items[0].blocks[0].content,
+            BlockContent::Reasoning {
+                text: "think ".into()
+            }
+        );
     }
 }

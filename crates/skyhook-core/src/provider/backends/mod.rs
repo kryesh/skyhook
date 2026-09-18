@@ -228,10 +228,11 @@ impl ProviderContext for NativeContext {
             }
             common::filter_reasoning_scope(&mut request, &provider.scope);
             let (body, decoder) = match provider.protocol {
-                Protocol::Chat { reasoning_replay } => (
-                    chat::encode(&request, reasoning_replay)?,
-                    Decoder::Chat(chat::Decoder::new(request.model)),
-                ),
+                Protocol::Chat { reasoning_replay } => {
+                    let body = chat::encode(&request, reasoning_replay)?;
+                    let decoder = chat::Decoder::new(request.model).for_request(&body);
+                    (body, Decoder::Chat(decoder))
+                }
                 Protocol::Responses => (
                     responses::encode(&request)?.into_wire(),
                     Decoder::Responses(responses::Decoder::new(request.model)),
@@ -624,7 +625,7 @@ mod tests {
                     complete(&mut *foreign_context, request(model, history)).await.finish().unwrap();
                     assert_eq!(serde_json::to_vec(&assistant).unwrap(), serialized);
                     let requests = server.await.unwrap();
-                    assert_eq!(requests[0]["n"], 1);
+                    assert!(requests[0].get("n").is_none());
                     let assistant = &requests[1]["messages"][1];
                     assert_eq!(assistant["content"], "checking");
                     for candidate in ["reasoning_content", "reasoning"] {

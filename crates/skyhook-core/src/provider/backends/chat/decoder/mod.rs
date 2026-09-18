@@ -30,6 +30,12 @@ pub(crate) struct Decoder {
     visible_id: Option<usize>,
     ended: BTreeSet<usize>,
     tool_ids: BTreeMap<u64, usize>,
+    last_tool: Option<u64>,
+    tools_discarded: bool,
+    /// The server's response ID, from which missing call IDs are derived.
+    response_id: Option<String>,
+    /// Digest of the encoded request, distinguishing otherwise identical turns.
+    request_digest: String,
     finish_reason: Option<StopReason>,
     usage: Usage,
     raw_prompt_tokens: u64,
@@ -45,12 +51,23 @@ impl Decoder {
             visible_id: None,
             ended: BTreeSet::new(),
             tool_ids: BTreeMap::new(),
+            last_tool: None,
+            tools_discarded: false,
+            response_id: None,
+            request_digest: String::new(),
             finish_reason: None,
             usage: Usage::default(),
             raw_prompt_tokens: 0,
             done: false,
             failed: false,
         }
+    }
+
+    /// Bind the decoder to the request it decodes the response of.
+    pub(crate) fn for_request(mut self, body: &serde_json::Value) -> Self {
+        use sha2::{Digest, Sha256};
+        self.request_digest = hex(&Sha256::digest(body.to_string().as_bytes()));
+        self
     }
 
     pub(crate) fn decode(&mut self, event: &SseEvent) -> Result<Vec<ResponseChunk>, ProviderError> {
@@ -68,22 +85,49 @@ impl Decoder {
 
     fn decode_event(&mut self, event: &SseEvent) -> Result<Vec<ResponseChunk>, ProviderError> {
         if self.done {
-            return Err(ProviderError::protocol("Chat data received after [DONE]"));
+            return Ok(Vec::new());
         }
-        let Some(wire::Chunk { choices, usage, .. }) = native::decode(event)? else {
-            let stop_reason = self
-                .finish_reason
-                .clone()
-                .ok_or_else(|| ProviderError::protocol("Chat [DONE] before finish_reason"))?;
+        let Some(wire::Chunk { id, choice, usage }) = native::decode(event)? else {
+            let mut chunks = Vec::new();
+            if self.finish_reason.is_none() {
+                // Without a finish reason, tool calls are not provably complete.
+                let stop = if self.tool_ids.is_empty() {
+                    StopReason::EndTurn
+                } else {
+                    StopReason::Other("missing_finish_reason".into())
+                };
+                self.settle(stop, &mut chunks)?;
+            }
             self.done = true;
-            return Ok(vec![ResponseChunk::ResponseEnded { stop_reason }]);
+            chunks.push(ResponseChunk::ResponseEnded {
+                stop_reason: self.finish_reason.clone().expect("settled above"),
+            });
+            return Ok(chunks);
         };
+        if self.response_id.is_none() {
+            self.response_id = id;
+        }
         let mut chunks = Vec::new();
-        if let Some(choice) = choices.first() {
+        if let Some(mut choice) = choice {
+            let message = choice.message.take().or_else(|| {
+                choice.text.take().map(|text| wire::Delta {
+                    content: Some(text),
+                    ..Default::default()
+                })
+            });
+            if let Some(message) = message
+                && choice.delta.is_noop()
+            {
+                choice.delta = if self.blocks.is_empty() {
+                    message
+                } else {
+                    self.unstreamed(message)
+                };
+            }
             if self.finish_reason.is_some() {
                 // Generation has ended, but the stream may still carry metadata,
-                // usage, or repeated empty choice envelopes. Ignore only deltas
-                // that carry no output, independently of the provider or usage.
+                // usage, or repeated empty choice envelopes. Output after the
+                // end would be silently lost, so it remains an error.
                 if !choice.delta.is_noop() {
                     return Err(ProviderError::protocol(
                         "Chat output received after finish_reason",
@@ -92,43 +136,71 @@ impl Decoder {
             } else {
                 self.delta(&choice.delta, &mut chunks)?;
             }
-            if let Some(reason) = choice.finish_reason.as_deref() {
-                let stop_reason = match reason {
-                    "stop" => StopReason::EndTurn,
-                    "length" => StopReason::MaxTokens,
-                    "abort" => StopReason::Aborted,
-                    "tool_calls" if !self.tool_ids.is_empty() => StopReason::ToolUse,
-                    "tool_calls" => {
-                        return Err(ProviderError::protocol(
-                            "Chat finished tool_calls without any tool calls",
-                        ));
-                    }
-                    "content_filter" => StopReason::ContentFilter,
-                    _ => {
-                        return Err(ProviderError::protocol("Unsupported Chat finish_reason"));
-                    }
-                };
-                if let Some(previous) = &self.finish_reason {
-                    if previous != &stop_reason {
-                        return Err(ProviderError::protocol("Conflicting Chat finish_reason"));
-                    }
+            if let Some(reason) = choice
+                .finish_reason
+                .as_deref()
+                .filter(|reason| !reason.is_empty())
+            {
+                let stop_reason = self.classify_finish(reason);
+                if self.finish_reason.is_none() {
+                    self.settle(stop_reason, &mut chunks)?;
                 } else {
-                    self.end_blocks(
-                        &mut chunks,
-                        matches!(
-                            stop_reason,
-                            StopReason::MaxTokens | StopReason::Aborted | StopReason::ContentFilter
-                        ),
-                    )?;
-                    self.finish_reason = Some(stop_reason);
+                    self.revise(stop_reason, &mut chunks);
                 }
             }
         }
         if let Some(usage) = usage {
-            self.update_usage(usage, &mut chunks)?;
+            self.update_usage(usage, &mut chunks);
         }
-        // Keepalives do not complete a stream; EOF still requires finish_reason.
+        // Keepalives do not complete a stream; EOF still requires a finish.
         Ok(chunks)
+    }
+
+    fn classify_finish(&self, reason: &str) -> StopReason {
+        let has_tools = !self.tool_ids.is_empty();
+        match reason.to_ascii_lowercase().as_str() {
+            "stop" | "eos" | "end_turn" | "stop_sequence" | "tool_calls" | "function_call"
+            | "tool_use"
+                if has_tools =>
+            {
+                StopReason::ToolUse
+            }
+            "stop_sequence" => StopReason::StopSequence,
+            "stop" | "eos" | "end_turn" | "tool_calls" | "function_call" | "tool_use" => {
+                StopReason::EndTurn
+            }
+            "length" | "max_tokens" | "max_output_tokens" | "model_length" => StopReason::MaxTokens,
+            "abort" | "aborted" | "cancelled" | "canceled" => StopReason::Aborted,
+            "content_filter" | "safety" | "refusal" => StopReason::ContentFilter,
+            _ => StopReason::Other(reason.into()),
+        }
+    }
+
+    /// Settle the stop reason. Unknown or missing reasons discard tool calls.
+    fn settle(
+        &mut self,
+        stop_reason: StopReason,
+        chunks: &mut Vec<ResponseChunk>,
+    ) -> Result<(), ProviderError> {
+        let discard_tools = !stop_reason.authorizes_tools();
+        self.end_blocks(chunks, discard_tools)?;
+        self.tools_discarded = discard_tools;
+        self.finish_reason = Some(stop_reason);
+        Ok(())
+    }
+
+    /// A later abnormal reason retracts tool calls; nothing revives them.
+    fn revise(&mut self, stop_reason: StopReason, chunks: &mut Vec<ResponseChunk>) {
+        if stop_reason.authorizes_tools() || self.tools_discarded || self.tool_ids.is_empty() {
+            return;
+        }
+        for (id, block) in self.blocks.iter().enumerate() {
+            if matches!(block, Block::Tool { .. }) {
+                chunks.push(ResponseChunk::ItemDiscarded { id: id.to_string() });
+            }
+        }
+        self.tools_discarded = true;
+        self.finish_reason = Some(stop_reason);
     }
 
     pub(crate) fn finish(&mut self) -> Result<Vec<ResponseChunk>, ProviderError> {
@@ -147,6 +219,10 @@ impl Decoder {
         self.done = true;
         Ok(vec![ResponseChunk::ResponseEnded { stop_reason }])
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -207,7 +283,7 @@ pub(super) mod tests {
         })
     }
 
-    pub(super) fn assert_post_finish_rejected(packet: Value) {
+    fn assert_post_finish_rejected(packet: Value) {
         let mut decoder = Decoder::new("test-model".into());
         decoder.decode(&delta(json!({"content":"answer"}))).unwrap();
         decoder.decode(&end("stop")).unwrap();
@@ -260,7 +336,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn post_finish_rejects_substantive_malformed_or_conflicting_packets() {
+    fn post_finish_output_is_rejected() {
         let mut packets = Vec::new();
         let mut with_delta = |field: &str, value: Value, finish: Option<&str>| {
             let mut packet = phantom_usage_chunk();
@@ -270,46 +346,51 @@ pub(super) mod tests {
             }
             packets.push(packet);
         };
+        // Output after the finish would be silently lost, so it is rejected,
+        // including on a repeated finish.
         for field in ["content", "refusal", "reasoning_content", "reasoning"] {
-            for value in [json!("late"), json!(0), json!(false), json!([]), json!({})] {
-                with_delta(field, value, None);
-            }
-            // A repeated finish cannot carry substantive output either.
+            with_delta(field, json!("late"), None);
+            with_delta(field, json!([{"type":"text","text":"late"}]), None);
             with_delta(field, json!("late"), Some("stop"));
         }
-        for role in [
-            json!(""),
-            json!("user"),
-            json!("system"),
-            json!(false),
-            json!({}),
-        ] {
-            with_delta("role", role, None);
-        }
         let call = json!([{"index":0,"id":"call","function":{"name":"inspect","arguments":"{}"}}]);
-        for calls in [
-            json!({}),
-            json!(""),
-            json!([{}]),
-            json!([{"index":0}]),
-            call.clone(),
-        ] {
-            with_delta("tool_calls", calls, None);
-        }
+        with_delta("tool_calls", call.clone(), None);
         with_delta("tool_calls", call, Some("stop"));
-        for finish in [
-            "length",
-            "abort",
-            "content_filter",
-            "tool_calls",
-            "function_call",
-            "",
+        with_delta("function_call", json!({"name":"inspect"}), None);
+        packets.into_iter().for_each(assert_post_finish_rejected);
+    }
+
+    #[test]
+    fn post_finish_placeholders_and_conflicting_finishes_are_ignored() {
+        let mut packets = Vec::new();
+        for field in [
+            "content",
+            "refusal",
+            "reasoning_content",
+            "reasoning",
+            "role",
         ] {
+            for value in [json!(0), json!(false), json!({}), json!("")] {
+                let mut packet = phantom_usage_chunk();
+                packet["choices"][0]["delta"][field] = value;
+                packets.push(packet);
+            }
+        }
+        for finish in ["length", "abort", "content_filter", "tool_calls", ""] {
             let mut packet = phantom_usage_chunk();
             packet["choices"][0]["finish_reason"] = json!(finish);
             packets.push(packet);
         }
-        packets.into_iter().for_each(assert_post_finish_rejected);
+        for packet in packets {
+            let (items, usage, stop) = decode(vec![
+                delta(json!({"content":"answer"})),
+                end("stop"),
+                event(packet),
+                done(),
+            ]);
+            assert_eq!((stop, usage), (StopReason::EndTurn, USAGE));
+            assert_eq!(contents(&items), [&text("answer")]);
+        }
     }
 
     #[test]
@@ -390,9 +471,12 @@ pub(super) mod tests {
                         };
                         assert!(!chunks.iter().any(ended), "{packet}");
                         if with_done {
-                            assert!(decoder.decode(&done()).is_err(), "{packet}");
+                            let chunks = decoder.decode(&done()).unwrap();
+                            assert!(chunks.iter().any(ended), "{packet}");
+                            decoder.finish().unwrap();
+                        } else {
+                            assert!(decoder.finish().is_err(), "{packet}");
                         }
-                        assert!(decoder.finish().is_err(), "{packet}");
                     }
                 }
             }
@@ -400,7 +484,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn noop_metadata_and_repeated_finish_cannot_cross_done_boundary() {
+    fn packets_after_done_are_ignored() {
         let mut packets = noop_packets();
         packets.push(phantom_usage_chunk());
         packets.push(json!({"choices":[{"finish_reason":"stop"}]}));
@@ -409,8 +493,8 @@ pub(super) mod tests {
             for frame in [delta(json!({"content":"answer"})), end("stop"), done()] {
                 decoder.decode(&frame).unwrap();
             }
-            assert!(decoder.decode(&event(packet.clone())).is_err(), "{packet}");
-            assert!(decoder.finish().is_err(), "{packet}");
+            assert!(decoder.decode(&event(packet.clone())).unwrap().is_empty());
+            assert!(decoder.finish().unwrap().is_empty(), "{packet}");
         }
     }
 
@@ -463,16 +547,78 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn rejects_premature_eof_done_and_post_terminal_data() {
+    fn rejects_premature_eof_and_post_terminal_data() {
         assert!(Decoder::new("gpt-5".into()).finish().is_err());
         let mut decoder = Decoder::new("gpt-5".into());
         decoder
             .decode(&delta(json!({"content":"partial"})))
             .unwrap();
-        assert!(decoder.decode(&done()).is_err());
         assert!(decoder.finish().is_err());
+        // [DONE] without a finish reason keeps text but discards tools.
+        let (items, _, stop) = decode(vec![delta(json!({"content":"answer"})), done()]);
+        assert_eq!(
+            (stop, contents(&items)),
+            (StopReason::EndTurn, vec![&text("answer")])
+        );
+        let tool = json!({"tool_calls":[{"index":0,"id":"c","function":{"name":"list","arguments":"{}"}}]});
+        let (items, _, stop) = decode(vec![
+            delta(json!({"content":"partial"})),
+            delta(tool),
+            done(),
+        ]);
+        assert_eq!(stop, StopReason::Other("missing_finish_reason".into()));
+        assert_eq!(contents(&items), [&text("partial")]);
         let mut decoder = Decoder::new("gpt-5".into());
         decoder.decode(&end("stop")).unwrap();
         assert!(decoder.decode(&delta(json!({"content":"late"}))).is_err());
+    }
+
+    #[test]
+    fn only_normal_finish_reasons_keep_tools_executable() {
+        let tool = || {
+            delta(
+                json!({"tool_calls":[{"index":0,"id":"c","function":{"name":"run","arguments":"{}"}}]}),
+            )
+        };
+        for reason in [
+            "stop",
+            "tool_calls",
+            "STOP",
+            "eos",
+            "end_turn",
+            "tool_use",
+            "function_call",
+        ] {
+            let (items, _, stop) = decode(vec![tool(), end(reason)]);
+            assert_eq!((stop, items.len()), (StopReason::ToolUse, 1), "{reason}");
+        }
+        for (reason, expected) in [
+            ("length", StopReason::MaxTokens),
+            ("MAX_TOKENS", StopReason::MaxTokens),
+            ("aborted", StopReason::Aborted),
+            ("canceled", StopReason::Aborted),
+            ("SAFETY", StopReason::ContentFilter),
+            ("error", StopReason::Other("error".into())),
+            ("incomplete", StopReason::Other("incomplete".into())),
+        ] {
+            let (items, _, stop) =
+                decode(vec![delta(json!({"content":"text"})), tool(), end(reason)]);
+            assert_eq!(stop, expected, "{reason}");
+            assert_eq!(contents(&items), [&text("text")], "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_later_abnormal_finish_retracts_tools() {
+        let tool = || {
+            delta(
+                json!({"tool_calls":[{"index":0,"id":"c","function":{"name":"run","arguments":"{}"}}]}),
+            )
+        };
+        let (items, _, stop) = decode(vec![tool(), end("stop"), end("length"), done()]);
+        assert_eq!((stop, items.len()), (StopReason::MaxTokens, 0));
+        // A later normal reason cannot revive discarded tools.
+        let (items, _, stop) = decode(vec![tool(), end("length"), end("stop"), done()]);
+        assert_eq!((stop, items.len()), (StopReason::MaxTokens, 0));
     }
 }

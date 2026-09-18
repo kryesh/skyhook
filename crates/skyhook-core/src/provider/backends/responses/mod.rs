@@ -63,6 +63,9 @@ struct ReasoningState {
     parts: BTreeMap<usize, Part>,
     // Snapshot namespace migrations resolve to the original display block ID.
     aliases: BTreeMap<usize, usize>,
+    // Parts closed for display when a later item started, before this item's
+    // snapshot arrived; the snapshot still supplies the replay.
+    shown_early: BTreeSet<usize>,
     snapshot: Option<Value>,
 }
 

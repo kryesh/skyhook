@@ -1,59 +1,33 @@
-//! Validate cumulative counters without erasing late cached-token refinements.
+//! Merge cumulative counters without erasing late cached-token refinements.
 use super::super::wire;
 use super::Decoder;
-use crate::provider::{
-    ProviderError,
-    protocol::{ResponseChunk, Usage},
-};
+use crate::provider::protocol::{ResponseChunk, Usage};
 
 impl Decoder {
-    pub(super) fn update_usage(
-        &mut self,
-        usage: wire::Usage,
-        chunks: &mut Vec<ResponseChunk>,
-    ) -> Result<(), ProviderError> {
-        // Prompt totals are monotone, but uncached input may fall when a
-        // later packet refines the cached-token breakdown.
-        let prompt = usage.prompt_tokens;
-        let usage = decode_usage(usage, self.usage.cached_input_tokens)?;
-        if prompt < self.raw_prompt_tokens
-            || usage.cached_input_tokens < self.usage.cached_input_tokens
-            || usage.output_tokens < self.usage.output_tokens
-        {
-            return Err(ProviderError::protocol("Chat usage counters regressed"));
-        }
+    /// Cumulative counters: missing or smaller late values keep the previous
+    /// total, and cached tokens are clamped to the prompt.
+    pub(super) fn update_usage(&mut self, usage: wire::Usage, chunks: &mut Vec<ResponseChunk>) {
+        let prompt = usage
+            .prompt_tokens
+            .unwrap_or(self.raw_prompt_tokens)
+            .max(self.raw_prompt_tokens);
+        let output_tokens = usage
+            .completion_tokens
+            .unwrap_or(self.usage.output_tokens)
+            .max(self.usage.output_tokens);
+        let cached_input_tokens = usage
+            .cached_tokens
+            .unwrap_or(self.usage.cached_input_tokens)
+            .max(self.usage.cached_input_tokens)
+            .min(prompt);
         self.raw_prompt_tokens = prompt;
-        self.usage = usage;
-        chunks.push(ResponseChunk::UsageUpdated { usage });
-        Ok(())
+        self.usage = Usage {
+            input_tokens: prompt - cached_input_tokens,
+            cached_input_tokens,
+            output_tokens,
+        };
+        chunks.push(ResponseChunk::UsageUpdated { usage: self.usage });
     }
-}
-
-fn decode_usage(value: wire::Usage, previous_cached: u64) -> Result<Usage, ProviderError> {
-    let input_tokens = value.prompt_tokens;
-    let output_tokens = value.completion_tokens;
-    if let Some(total) = value.total_tokens
-        && input_tokens.checked_add(output_tokens) != Some(total)
-    {
-        return Err(ProviderError::protocol(
-            "Chat usage total_tokens does not match prompt + completion",
-        ));
-    }
-    // Missing/null cache details do not erase a previously reported breakdown.
-    let cached_input_tokens = value
-        .prompt_tokens_details
-        .and_then(|details| details.cached_tokens)
-        .unwrap_or(previous_cached);
-    if cached_input_tokens > input_tokens {
-        return Err(ProviderError::protocol(
-            "Chat cached_tokens exceeds prompt_tokens",
-        ));
-    }
-    Ok(Usage {
-        input_tokens: input_tokens - cached_input_tokens,
-        cached_input_tokens,
-        output_tokens,
-    })
 }
 
 #[cfg(test)]
@@ -86,18 +60,16 @@ mod tests {
     }
 
     #[test]
-    fn invalid_usage_is_rejected_during_generation_after_finish_and_on_repeated_finish() {
+    fn loose_usage_is_merged_monotonically_at_every_stage() {
         for usage in [
-            json!({}),
+            // Mismatched totals, string counters, and alternate key names.
+            json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":1}),
+            json!({"prompt_tokens":"100","completion_tokens":10.0}),
+            json!({"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":80}),
+            // Regressions and missing counters keep the previous totals.
+            json!({"prompt_tokens":99,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":79}}),
             json!({"prompt_tokens":100}),
-            json!({"prompt_tokens":"100","completion_tokens":10}),
-            json!({"prompt_tokens":100,"completion_tokens":-1}),
-            json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":109}),
-            json!({"prompt_tokens":100,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":101}}),
-            json!({"prompt_tokens":100,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":-1}}),
-            json!({"prompt_tokens":99,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":80}}),
-            json!({"prompt_tokens":100,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":80}}),
-            json!({"prompt_tokens":100,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":79}}),
+            json!({"completion_tokens":-1, "prompt_tokens":100}),
         ] {
             for stage in 0..3 {
                 let mut decoder = Decoder::new("test-model".into());
@@ -113,13 +85,17 @@ mod tests {
                     packet["choices"][0]["finish_reason"] = json!("length");
                 }
                 packet["usage"] = usage.clone();
-                assert!(
-                    decoder.decode(&event(packet)).is_err(),
-                    "stage {stage}: {usage}"
-                );
-                assert!(decoder.finish().is_err());
+                decoder.decode(&event(packet)).unwrap();
+                assert_eq!(decoder.usage, USAGE, "stage {stage}: {usage}");
             }
         }
+        // Cached tokens never exceed the prompt.
+        let mut decoder = Decoder::new("test-model".into());
+        let packet = json!({"usage":{"prompt_tokens":10,"completion_tokens":1,
+            "prompt_tokens_details":{"cached_tokens":50}}});
+        decoder.decode(&event(packet)).unwrap();
+        assert_eq!(decoder.usage.cached_input_tokens, 10);
+        assert_eq!(decoder.usage.input_tokens, 0);
     }
 
     #[test]

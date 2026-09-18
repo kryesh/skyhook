@@ -26,8 +26,16 @@ pub(crate) fn encode(
     // breaks the cached history prefix. Runtime state joins the final history turn,
     // so only that turn is re-read.
     let mut messages = Vec::new();
-    for segment in &request.system {
-        messages.push(json!({"role": "system", "content": segment.text}));
+    // One leading system message: many open-model chat templates reject
+    // repeated or non-leading system turns.
+    if !request.system.is_empty() {
+        let text = request
+            .system
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        messages.push(json!({"role": "system", "content": text}));
     }
     for (index, message) in request.messages().enumerate() {
         if index >= request.history.len()
@@ -77,14 +85,10 @@ pub(crate) fn encode(
                             // reasoning (including foreign summaries) is not provenance.
                             BlockContent::Reasoning { .. } => {}
                             BlockContent::ToolCall(call) => {
-                                if !valid_name(call.name()) {
-                                    return Err(invalid(
-                                        "Chat tool calls require a valid function name",
-                                    ));
-                                }
+                                // Results pair by call ID, so sanitizing an invalid name is safe.
                                 calls.push(json!({
                                     "id": call.id(), "type": "function",
-                                    "function": {"name": call.name(), "arguments": serde_json::to_string(call.arguments()).expect("JSON object serialization cannot fail")}
+                                    "function": {"name": wire_name(call.name()), "arguments": serde_json::to_string(call.arguments()).expect("JSON object serialization cannot fail")}
                                 }));
                             }
                         }
@@ -93,7 +97,8 @@ pub(crate) fn encode(
                 // Preserve reasoning-only turns when the selected profile can
                 // replay their provider-bound state; never turn thoughts into content.
                 if !text.is_empty() || !calls.is_empty() || !reasoning.is_empty() {
-                    let mut message = json!({"role": "assistant", "content": if text.is_empty() { Value::Null } else { Value::String(text) }});
+                    // Some chat templates fail on null or missing content.
+                    let mut message = json!({"role": "assistant", "content": text});
                     if !calls.is_empty() {
                         message["tool_calls"] = Value::Array(calls);
                     }
@@ -132,13 +137,13 @@ pub(crate) fn encode(
     let mut body = serde_json::to_value(wire::Request {
         model: &request.model,
         messages,
-        n: 1,
         stream: true,
         stream_options: wire::StreamOptions {
             include_usage: true,
         },
     })
     .map_err(|_| invalid("Unable to serialize Chat request"))?;
+    flatten_text_content(&mut body["messages"]);
     if let Some(effort) = &request.reasoning {
         if !matches!(
             effort.as_str(),
@@ -170,9 +175,11 @@ pub(crate) fn encode(
                     "Chat function parameters must be a JSON Schema object",
                 ));
             }
-            tools.push(json!({"type": "function", "function": {
-                "name": tool.name, "description": tool.description, "parameters": tool.input_schema
-            }}));
+            let mut function = json!({"name": tool.name, "parameters": tool.input_schema});
+            if !tool.description.is_empty() {
+                function["description"] = json!(tool.description);
+            }
+            tools.push(json!({"type": "function", "function": function}));
         }
         body["tools"] = Value::Array(tools);
     }
@@ -195,6 +202,48 @@ pub(crate) fn encode(
         }});
     }
     Ok(body)
+}
+
+/// A historical tool-call name within the Chat function-name alphabet:
+/// invalid characters become `_` and the name is capped at 64 bytes.
+fn wire_name(name: &str) -> String {
+    if valid_name(name) {
+        return name.to_owned();
+    }
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    if sanitized.is_empty() {
+        "_".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+/// Text-only user content is sent as a plain string, which every compatible
+/// server and chat template accepts; image turns keep the parts array.
+fn flatten_text_content(messages: &mut Value) {
+    for message in messages.as_array_mut().into_iter().flatten() {
+        let Some(parts) = message["content"].as_array() else {
+            continue;
+        };
+        if parts.iter().all(|part| part["type"] == "text") {
+            let text = parts
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            message["content"] = Value::String(text);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +342,7 @@ mod tests {
         let result: Value = serde_json::from_str(messages[3]["content"].as_str().unwrap()).unwrap();
         assert_eq!(result, json!({"result":{"ok":false},"is_error":true}));
         assert_eq!(messages[4]["content"][1]["image_url"]["url"], image_url);
+        assert!(messages[4]["content"].is_array());
         // Tool schemas are preserved without strict response-schema restrictions.
         assert_eq!(body["tools"][0]["function"]["name"], "inspect");
         assert_eq!(body["tools"][0]["function"]["parameters"], schema);
@@ -306,14 +356,20 @@ mod tests {
                 valid.then(|| json!(effort))
             );
         }
-        // A completed call still obeys chat-specific name restrictions.
-        let call = ToolCall::new("call", "vendor.tool/雪", json!({"x-vendor": [null, 1]})).unwrap();
-        let request = history(vec![AssistantItem::tool_call("item", 0, call)]);
-        let error = encode(&request, ChatReasoningReplay::Unsupported).unwrap_err();
-        assert_eq!(
-            error.kind,
-            crate::provider::ProviderErrorKind::InvalidRequest
-        );
+        let long = "x".repeat(80);
+        for (name, expected) in [
+            ("vendor.tool/雪", "vendor_tool__".to_owned()),
+            (long.as_str(), "x".repeat(64)),
+        ] {
+            let call = ToolCall::new("call", name, json!({"x-vendor": [null, 1]})).unwrap();
+            let request = history(vec![AssistantItem::tool_call("item", 0, call)]);
+            let body = encode(&request, ChatReasoningReplay::Unsupported).unwrap();
+            let call = &body["messages"][0]["tool_calls"][0];
+            assert_eq!(
+                (&call["id"], &call["function"]["name"]),
+                (&json!("call"), &json!(expected))
+            );
+        }
     }
 
     #[test]
@@ -368,10 +424,10 @@ mod tests {
             let body = encode(&request, policy).unwrap();
             assert_eq!(body["messages"].as_array().unwrap().len(), 1);
             let message = &body["messages"][0];
-            assert!(message["content"].is_null());
+            assert_eq!(message["content"], "");
             assert_eq!(message[field], "first second");
             assert!(message.get(absent).is_none());
-            assert_eq!(body["n"], 1);
+            assert!(body.get("n").is_none());
         }
         let unsupported = encode(&original, ChatReasoningReplay::Unsupported).unwrap();
         assert_eq!(unsupported["messages"], json!([]));
@@ -467,7 +523,7 @@ mod tests {
         let body = encode(&req, ChatReasoningReplay::Unsupported).unwrap();
         assert_eq!(
             body["messages"],
-            json!([{"role":"user","content":[{"type":"text","text":"hello"},{"type":"text","text":"<skyhook_state>"}]}])
+            json!([{"role":"user","content":"hello\n\n<skyhook_state>"}])
         );
         req.tail.push(Message::User(vec![UserContent::Compaction {
             text: "compact".into(),
@@ -478,5 +534,35 @@ mod tests {
         req.tail = vec![state()];
         let body = encode(&req, ChatReasoningReplay::Unsupported).unwrap();
         assert_eq!(body["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn requests_use_the_minimal_widely_accepted_shape() {
+        let mut request = request("model");
+        request.system = ["one", "two"]
+            .map(|text| SystemSegment {
+                text: text.into(),
+                cache: false,
+            })
+            .to_vec();
+        request.tools = vec![ToolDefinition {
+            name: "inspect".into(),
+            description: String::new(),
+            input_schema: json!({"type":"object"}),
+        }];
+        request
+            .history
+            .push(Message::Assistant(vec![AssistantItem::tool_call(
+                "call",
+                0,
+                inspect("call-a", json!({})),
+            )]));
+        let body = encode(&request, ChatReasoningReplay::Unsupported).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[0], json!({"role":"system","content":"one\n\ntwo"}));
+        assert_eq!(messages[1], json!({"role":"user","content":"hello"}));
+        assert_eq!(messages[2]["content"], "");
+        assert!(body["tools"][0]["function"].get("description").is_none());
+        assert!(body.get("n").is_none());
     }
 }

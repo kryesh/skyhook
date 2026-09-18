@@ -1,4 +1,4 @@
-//! Native item shapes and strict field/argument validation.
+//! Native item shapes and field/argument validation.
 use super::*;
 
 pub(super) fn protocol(message: impl Into<String>) -> ProviderError {
@@ -25,6 +25,14 @@ pub(super) fn array<'a>(value: &'a Value, key: &str) -> Result<&'a Vec<Value>, P
         .get(key)
         .and_then(Value::as_array)
         .ok_or_else(|| protocol(format!("missing or invalid {key}")))
+}
+
+/// Items of a type this protocol does not represent (hosted tools, future
+/// types) are ignored; items without a type are malformed.
+pub(super) fn is_foreign(item: &Value) -> bool {
+    item.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| !matches!(kind, "message" | "reasoning" | "function_call"))
 }
 
 pub(super) fn kind(item: &Value) -> Result<ItemKind, ProviderError> {
@@ -67,42 +75,45 @@ pub(super) fn final_parts(item: &Value) -> Result<Vec<BlockContent>, ProviderErr
 
 fn parts_for_kind(item: &Value, kind: ItemKind) -> Result<Vec<BlockContent>, ProviderError> {
     match kind {
-        ItemKind::Text => {
-            if string(item, "role")? != "assistant" {
-                return Err(protocol("output message role is not assistant"));
-            }
-            array(item, "content")?
-                .iter()
-                .map(|part| {
-                    let text = match string(part, "type")? {
-                        "output_text" => string(part, "text")?,
-                        "refusal" => string(part, "refusal")?,
-                        _ => return Err(protocol("unsupported message content")),
-                    };
-                    Ok(BlockContent::Text { text: text.into() })
-                })
-                .collect()
+        ItemKind::Text if item.get("role").is_some_and(|role| role != "assistant") => {
+            Err(protocol("output message role is not assistant"))
         }
+        // Content parts other than text and refusals carry nothing representable.
+        ItemKind::Text => array(item, "content")?
+            .iter()
+            .filter_map(|part| {
+                let text = match part.get("type").and_then(Value::as_str)? {
+                    "output_text" => string(part, "text"),
+                    "refusal" => string(part, "refusal"),
+                    _ => return None,
+                };
+                Some(text.map(|text| BlockContent::Text { text: text.into() }))
+            })
+            .collect(),
         ItemKind::Reasoning => Ok(reasoning_parts(item)?.into_values().collect()),
         ItemKind::ToolCall => Ok(vec![BlockContent::ToolCall(function_call(item)?)]),
     }
 }
 
 pub(super) fn function_call(item: &Value) -> Result<ToolCall, ProviderError> {
-    let arguments = arguments(string(item, "arguments")?)?;
+    let arguments = item_arguments(item)?;
     let id = string(item, "call_id")?;
     let name = string(item, "name")?;
     ToolCall::new(id, name, Value::Object(arguments)).map_err(|error| protocol(error.to_string()))
 }
 
-/// Executable function arguments must decode to an object, not an arbitrary JSON value.
+/// A function item's arguments.
+pub(super) fn item_arguments(
+    item: &Value,
+) -> Result<serde_json::Map<String, Value>, ProviderError> {
+    crate::provider::backends::common::arguments_field(item.get("arguments"))
+        .ok_or_else(|| protocol("function arguments must be a JSON object"))
+}
+
+/// Executable function arguments must decode to an object.
 pub(super) fn arguments(text: &str) -> Result<serde_json::Map<String, Value>, ProviderError> {
-    let value: Value =
-        serde_json::from_str(text).map_err(|_| protocol("invalid function arguments JSON"))?;
-    let Value::Object(arguments) = value else {
-        return Err(protocol("function arguments must be a JSON object"));
-    };
-    Ok(arguments)
+    crate::provider::backends::common::parse_tool_arguments(text)
+        .ok_or_else(|| protocol("function arguments must be a JSON object"))
 }
 
 impl ItemKind {
@@ -145,11 +156,20 @@ mod tests {
     #[test]
     fn function_arguments_require_a_json_object() {
         let mut item = json!({"type":"function_call", "call_id":"call", "name":"lookup"});
-        for args in ["", "not json", "[]", "null"] {
+        for args in ["not json", "[]", "1", "\"[]\""] {
             item["arguments"] = json!(args);
             assert_eq!(
                 final_parts(&item).unwrap_err().kind,
                 ProviderErrorKind::Protocol
+            );
+        }
+        for args in [json!(""), json!("null"), Value::Null] {
+            item["arguments"] = args;
+            assert_eq!(
+                final_parts(&item).unwrap(),
+                vec![BlockContent::ToolCall(
+                    ToolCall::new("call", "lookup", json!({})).unwrap()
+                )]
             );
         }
         item["arguments"] = json!(r#"{"query":"rust"}"#);

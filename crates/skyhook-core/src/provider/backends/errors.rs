@@ -1,8 +1,8 @@
 //! Backend-private interpretation of native HTTP and streaming errors.
 use crate::provider::{ProviderError, ProviderErrorKind};
 
-/// Classify HTTP and in-stream errors identically without exposing server-controlled
-/// messages, URLs, credentials, prompts, or unknown error identifiers.
+/// Classify HTTP and in-stream errors identically. Diagnostics carry the
+/// status, known codes, and an excerpt of the server's message.
 pub(super) fn classify_error(status: Option<u16>, native: &serde_json::Value) -> ProviderError {
     let error = native
         .get("error")
@@ -71,6 +71,7 @@ pub(super) fn classify_error(status: Option<u16>, native: &serde_json::Value) ->
     if let Some(code) = safe_error_code(native) {
         message.push_str(&format!(" [code={code}]"));
     }
+    append_server_message(&mut message, native);
     ProviderError {
         kind,
         message,
@@ -78,8 +79,43 @@ pub(super) fn classify_error(status: Option<u16>, native: &serde_json::Value) ->
     }
 }
 
-/// Only known machine identifiers may enter diagnostics. Unknown values can be
-/// reflected prompts, credentials, or arbitrary server text, not error codes.
+pub(super) fn append_server_message(message: &mut String, native: &serde_json::Value) {
+    if let Some(excerpt) = server_message(native) {
+        message.push_str(": ");
+        message.push_str(&excerpt);
+    }
+}
+
+/// The server's own explanation, from the common error envelope shapes:
+/// `{"error":{"message"}}`, `{"error":"text"}`, `{"message"}`, or `{"detail"}`,
+/// or a bare string for bodies that were not JSON.
+fn server_message(native: &serde_json::Value) -> Option<String> {
+    let error = native.get("error");
+    [
+        error.and_then(|error| error.get("message")),
+        error,
+        native.get("message"),
+        native.get("detail"),
+        Some(native),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(serde_json::Value::as_str)
+    .and_then(excerpt)
+}
+
+/// The server's message as one line.
+fn excerpt(text: &str) -> Option<String> {
+    let out = text
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!out.is_empty()).then_some(out)
+}
+
+/// Known machine identifiers, tagged as `[code=…]`; the server's own text is
+/// carried separately by `append_server_message`.
 pub(super) fn safe_error_code(native: &serde_json::Value) -> Option<&str> {
     let error = native
         .get("error")
@@ -136,22 +172,36 @@ mod tests {
                 assert_eq!(recovery.is_some(), retryable, "HTTP {status}");
             }
         }
-        // Diagnostics preserve status and known codes but not server text.
         for (status, native, expected) in [
             (
                 Some(503),
-                json!({"error": {"code":"server_error", "message":"private prompt and credential"}}),
-                "provider HTTP 503 error [code=server_error]",
+                json!({"error": {"code":"server_error", "message":"upstream\n\tunavailable"}}),
+                "provider HTTP 503 error [code=server_error]: upstream unavailable",
             ),
             (
                 Some(429),
-                json!({"error": {"code":"sk-private-credential", "message":"private prompt"}}),
+                json!({"error": {"code":"sk-private-credential"}}),
                 "provider HTTP 429 error",
             ),
             (
                 None,
-                json!({"error":{"message":"secret"}}),
-                "provider stream error",
+                json!({"error":{"message":"slow down"}}),
+                "provider stream error: slow down",
+            ),
+            (
+                Some(502),
+                json!("<html>Bad gateway</html>"),
+                "provider HTTP 502 error: <html>Bad gateway</html>",
+            ),
+            (
+                Some(400),
+                json!({"detail":"model not loaded"}),
+                "provider HTTP 400 error: model not loaded",
+            ),
+            (
+                Some(400),
+                json!({"error":"bad field"}),
+                "provider HTTP 400 error: bad field",
             ),
         ] {
             assert_eq!(classify_error(status, &native).message, expected);
@@ -185,10 +235,44 @@ mod tests {
             for status in [None, Some(400)] {
                 let error = classify_error(status, &native);
                 assert_eq!(error.kind, expected);
-                assert!(!error.message.contains("secret") && !error.message.contains("unknown"));
+                assert!(!error.message.contains("[code=unknown"));
             }
         }
         let unauthorized = classify_error(Some(401), &json!({}));
         assert_eq!(unauthorized.kind, ProviderErrorKind::Authentication);
+    }
+
+    /// A proxy rejection nesting an upstream error: the reason must survive.
+    #[test]
+    fn nested_proxy_rejection_is_diagnosable() {
+        let native = json!({"error":{"message":"proxy.BadRequestError: UpstreamException - {\"message\":\"The model returned the following errors: tools.0.custom.strict: Extra inputs are not permitted\"}. Received Model Group=vendor.model-family-5\nAvailable Model Group Fallbacks=None","type":null,"param":null,"code":"400"}});
+        let error = classify_error(Some(400), &native);
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        assert!(
+            error
+                .message
+                .starts_with("provider HTTP 400 error: proxy.BadRequestError")
+        );
+        assert!(
+            error
+                .message
+                .contains("tools.0.custom.strict: Extra inputs are not permitted")
+        );
+        assert!(
+            error
+                .message
+                .contains("Model Group=vendor.model-family-5 Available")
+        );
+    }
+
+    #[test]
+    fn excerpts_are_single_line_and_complete() {
+        assert_eq!(
+            excerpt("\u{1b}[31mred\u{0}\r\n  text").as_deref(),
+            Some("[31mred text")
+        );
+        assert_eq!(excerpt(" \n\t"), None);
+        let long = "é".repeat(1000);
+        assert_eq!(excerpt(&long).as_deref(), Some(long.as_str()));
     }
 }

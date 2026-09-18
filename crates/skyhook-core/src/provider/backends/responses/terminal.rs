@@ -36,7 +36,10 @@ impl Decoder {
             })
             .collect();
         let mut seen = BTreeSet::new();
-        for native in output {
+        for native in output
+            .iter()
+            .filter(|native| !super::native::is_foreign(native))
+        {
             let native = NativeItem::parse(native)?;
             // Stable native IDs take precedence over terminal array
             // position. Regenerated IDs require unique semantic evidence.
@@ -93,6 +96,7 @@ impl Decoder {
         let stop_reason = match outcome {
             TerminalOutcome::MaxTokens => StopReason::MaxTokens,
             TerminalOutcome::ContentFilter => StopReason::ContentFilter,
+            TerminalOutcome::Incomplete => StopReason::Other("incomplete".into()),
             TerminalOutcome::Completed
                 if self
                     .items

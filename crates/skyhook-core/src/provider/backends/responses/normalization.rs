@@ -17,6 +17,7 @@ pub(super) enum TerminalOutcome {
     Completed,
     MaxTokens,
     ContentFilter,
+    Incomplete,
 }
 
 /// Only consumed fields are interpreted here. Native snapshots stay borrowed
@@ -170,12 +171,7 @@ impl Decoder {
                     .as_ref()
                     .and_then(|part| arguments(part.streamed()).ok()),
             };
-            return observed.is_some()
-                && observed
-                    == native
-                        .get("arguments")
-                        .and_then(Value::as_str)
-                        .and_then(|text| arguments(text).ok());
+            return observed.is_some() && observed == super::native::item_arguments(native).ok();
         }
         if item.parts().next().is_none() {
             return false;
@@ -250,6 +246,13 @@ impl Decoder {
     ) -> Result<NormalizedEvent<'a>, ProviderError> {
         let wire = optional_index(event, "output_index")?;
         let name = string(event, "type")?;
+        if matches!(
+            name,
+            "response.output_item.added" | "response.output_item.done"
+        ) && event.get("item").is_some_and(super::native::is_foreign)
+        {
+            return Ok(NormalizedEvent::Ignored);
+        }
         if name == "response.output_item.added" {
             let index = self.vacant_index(wire)?;
             let native =
@@ -396,14 +399,15 @@ impl Decoder {
                 ))
             }
             "error" => Err(api_error(event.get("error").unwrap_or(event))),
-            other => {
-                let name: String = other
-                    .chars()
-                    .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_'))
-                    .take(96)
-                    .collect();
-                Err(protocol(format!("unsupported event: {name}")))
-            }
+            // A top-level event ending the response abnormally must not be
+            // mistaken for progress, or the stream would appear to stall.
+            "response.aborted"
+            | "response.cancelled"
+            | "response.canceled"
+            | "response.error"
+            | "response.interrupted" => Err(protocol(format!("response ended abnormally: {name}"))),
+            // New event types (hosted tools, progress, ...) carry nothing we use.
+            _ => Ok(NormalizedEvent::Ignored),
         }
     }
 
@@ -416,16 +420,15 @@ impl Decoder {
             .get("response")
             .ok_or_else(|| protocol("missing final response"))?;
         let outcome = match string(response, "status")? {
-            "incomplete" => {
-                let details = response
-                    .get("incomplete_details")
-                    .ok_or_else(|| protocol("missing incomplete details"))?;
-                match string(details, "reason")? {
-                    "max_output_tokens" => TerminalOutcome::MaxTokens,
-                    "content_filter" => TerminalOutcome::ContentFilter,
-                    _ => return Err(protocol("unsupported incomplete reason")),
-                }
-            }
+            "incomplete" => match response
+                .get("incomplete_details")
+                .and_then(|details| details.get("reason"))
+                .and_then(Value::as_str)
+            {
+                Some("max_output_tokens") => TerminalOutcome::MaxTokens,
+                Some("content_filter") => TerminalOutcome::ContentFilter,
+                _ => TerminalOutcome::Incomplete,
+            },
             "completed" if name == "response.completed" => TerminalOutcome::Completed,
             _ => return Err(protocol("terminal response status disagrees with event")),
         };
@@ -598,19 +601,232 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lifecycle_events_require_a_response_and_unknown_or_failed_events_are_errors() {
+    fn lifecycle_events_require_a_response_and_failed_events_are_errors() {
         for tag in ["response.queued", "response.in_progress"] {
             let mut decoder = Decoder::new("model".into());
             let event = json!({"type":tag, "response":{"x-vendor":true}});
             assert!(decoder.feed(event).unwrap().is_empty());
             assert!(decoder.feed(json!({"type":tag})).is_err());
         }
+        let failed = json!({"type":"response.failed", "response":{"error":{"code":"invalid_request_error"}}});
+        assert!(Decoder::new("model".into()).feed(failed).is_err());
+    }
+
+    #[test]
+    fn unknown_events_and_output_item_types_are_ignored() {
+        let hosted = json!({"type":"web_search_call", "id":"ws_1", "status":"completed"});
+        let mut decoder = Decoder::new("model".into());
         for event in [
-            json!({"type":"response.failed", "response":{"error":{"code":"invalid_request_error"}}}),
             json!({"type":"response.future_unknown"}),
+            json!({"type":"response.output_item.added", "output_index":0, "item":hosted}),
+            json!({"type":"response.web_search_call.in_progress", "output_index":0, "item_id":"ws_1"}),
+            json!({"type":"response.output_item.done", "output_index":0, "item":hosted}),
         ] {
-            assert!(Decoder::new("model".into()).feed(event).is_err());
+            assert!(decoder.feed(event).unwrap().is_empty());
         }
+        let output = json!([hosted, {"type":"message", "id":"msg", "role":"assistant",
+            "content":[{"type":"output_text", "text":"answer"}, {"type":"output_audio"}]}]);
+        let chunks = decoder
+            .feed(json!({"type":"response.completed",
+                "response":{"status":"completed", "output":output}}))
+            .unwrap();
+        assert!(chunks.contains(&ResponseChunk::ResponseEnded {
+            stop_reason: StopReason::EndTurn
+        }));
+        // Incomplete for an unnamed reason ends without executable tools.
+        let (items, _, stop) = assemble(vec![
+            added(0, function("fc_1", "call_1", "")),
+            done(0, function("fc_1", "call_1", "{}")),
+            json!({"type":"response.incomplete",
+                "response":{"status":"incomplete", "output":[function("fc_1", "call_1", "{}")]}}),
+        ])
+        .unwrap();
+        assert_eq!(
+            (stop, items.len()),
+            (StopReason::Other("incomplete".into()), 0)
+        );
+    }
+
+    #[test]
+    fn untyped_items_and_abnormal_top_level_events_fail() {
+        let untyped = json!({"id":"fc_1", "call_id":"call_1", "name":"lookup", "arguments":"{}"});
+        assert!(
+            Decoder::new("model".into())
+                .feed(added(0, untyped.clone()))
+                .is_err()
+        );
+        assert!(
+            Decoder::new("model".into())
+                .feed(json!({"type":"response.completed",
+                    "response":{"status":"completed", "output":[untyped]}}))
+                .is_err()
+        );
+        for name in ["response.aborted", "response.cancelled", "response.error"] {
+            assert!(
+                Decoder::new("model".into())
+                    .feed(json!({"type":name}))
+                    .is_err(),
+                "{name}"
+            );
+        }
+        // Sub-events of hosted tools are not the response ending.
+        let hosted = json!({"type":"response.web_search_call.failed", "item_id":"ws_1"});
+        assert!(
+            Decoder::new("model".into())
+                .feed(hosted)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_final_item_without_arguments_keeps_the_streamed_ones() {
+        let streamed = |final_arguments: Option<Value>, done_event: bool| {
+            let mut final_item = function("fc_1", "call_1", "");
+            match final_arguments {
+                Some(arguments) => final_item["arguments"] = arguments,
+                None => {
+                    final_item.as_object_mut().unwrap().remove("arguments");
+                }
+            }
+            let mut events = vec![
+                added(0, function("fc_1", "call_1", "")),
+                json!({"type":"response.function_call_arguments.delta", "output_index":0,
+                    "item_id":"fc_1", "delta":"{\"path\":\"/etc\"}"}),
+            ];
+            if done_event {
+                events.push(json!({"type":"response.function_call_arguments.done",
+                    "output_index":0, "item_id":"fc_1", "arguments":"{\"path\":\"/etc\"}"}));
+            }
+            events.extend([done(0, final_item.clone()), completed(vec![final_item])]);
+            let (items, _, stop) = assemble(events).unwrap();
+            assert_eq!(stop, StopReason::ToolUse);
+            match &items[0].blocks[0].content {
+                BlockContent::ToolCall(call) => Value::Object(call.arguments().clone()),
+                other => panic!("expected a tool call: {other:?}"),
+            }
+        };
+        // Missing, blank, and placeholder values that decode to `{}`.
+        for final_arguments in [
+            None,
+            Some(json!("")),
+            Some(json!("  ")),
+            Some(json!("{}")),
+            Some(json!("null")),
+            Some(json!("\"\"")),
+            Some(Value::Null),
+            Some(json!({})),
+        ] {
+            for done_event in [false, true] {
+                assert_eq!(
+                    streamed(final_arguments.clone(), done_event),
+                    json!({"path":"/etc"}),
+                    "{final_arguments:?}"
+                );
+            }
+        }
+        // Arguments sent as a decoded object are the call's input.
+        assert_eq!(
+            streamed(Some(json!({"path":"/etc"})), false),
+            json!({"path":"/etc"})
+        );
+    }
+
+    #[test]
+    fn object_arguments_are_accepted_and_conflicting_arguments_fail() {
+        let item = |arguments: Value| {
+            json!({"type":"function_call", "id":"fc_1", "call_id":"call_1",
+                "name":"lookup", "arguments":arguments, "status":"completed"})
+        };
+        // Terminal-only output with object arguments.
+        let (items, _, _) = assemble(vec![completed(vec![item(json!({"path":"/etc"}))])]).unwrap();
+        match &items[0].blocks[0].content {
+            BlockContent::ToolCall(call) => {
+                assert_eq!(
+                    Value::Object(call.arguments().clone()),
+                    json!({"path":"/etc"})
+                )
+            }
+            other => panic!("expected a tool call: {other:?}"),
+        }
+        // Other non-string types are not arguments.
+        for arguments in [json!([1]), json!(5), json!(true)] {
+            assert!(
+                assemble(vec![completed(vec![item(arguments.clone())])]).is_err(),
+                "{arguments}"
+            );
+        }
+        // Two complete, different statements of the input conflict.
+        let events = vec![
+            added(0, function("fc_1", "call_1", "")),
+            json!({"type":"response.function_call_arguments.delta", "output_index":0,
+                "item_id":"fc_1", "delta":"{\"path\":\"/etc\"}"}),
+            done(0, function("fc_1", "call_1", "{\"path\":\"/tmp\"}")),
+        ];
+        assert!(assemble(events).is_err());
+    }
+
+    #[test]
+    fn placeholder_arguments_done_is_ignored_before_or_after_real_arguments() {
+        let delta = |text: &str| {
+            json!({"type":"response.function_call_arguments.delta", "output_index":0,
+                "item_id":"fc_1", "delta":text})
+        };
+        let args_done = |text: &str| {
+            json!({"type":"response.function_call_arguments.done", "output_index":0,
+                "item_id":"fc_1", "arguments":text})
+        };
+        let real = function("fc_1", "call_1", "{\"p\":1}");
+        for events in [
+            vec![delta("{\"p\":1}"), args_done("{\"p\":1}"), args_done("{}")],
+            vec![args_done("{}"), delta("{\"p\":1}")],
+            vec![args_done("{}")],
+        ] {
+            let mut all = vec![added(0, function("fc_1", "call_1", ""))];
+            all.extend(events);
+            all.extend([done(0, real.clone()), completed(vec![real.clone()])]);
+            let (items, _, _) = assemble(all).unwrap();
+            match &items[0].blocks[0].content {
+                BlockContent::ToolCall(call) => {
+                    assert_eq!(Value::Object(call.arguments().clone()), json!({"p":1}))
+                }
+                other => panic!("expected a tool call: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn output_messages_must_be_from_the_assistant() {
+        let mut item = message("msg", "hello");
+        item["role"] = json!("user");
+        assert!(assemble(vec![completed(vec![item.clone()])]).is_err());
+        item.as_object_mut().unwrap().remove("role");
+        assert!(assemble(vec![completed(vec![item])]).is_ok());
+    }
+
+    #[test]
+    fn truncated_streamed_arguments_are_discarded_on_an_abnormal_stop() {
+        let mut final_item = function("fc_1", "call_1", "");
+        final_item.as_object_mut().unwrap().remove("arguments");
+        let prefix = || {
+            vec![
+                added(0, function("fc_1", "call_1", "")),
+                json!({"type":"response.function_call_arguments.delta", "output_index":0,
+                    "item_id":"fc_1", "delta":"{\"path\":"}),
+                done(0, final_item.clone()),
+            ]
+        };
+        let mut events = prefix();
+        events.push(
+            json!({"type":"response.incomplete", "response":{"status":"incomplete",
+            "incomplete_details":{"reason":"max_output_tokens"}, "output":[final_item.clone()]}}),
+        );
+        let (items, _, stop) = assemble(events).unwrap();
+        assert_eq!((stop, items.len()), (StopReason::MaxTokens, 0));
+        // A normal stop cannot execute a call whose input never completed.
+        let mut events = prefix();
+        events.push(completed(vec![final_item.clone()]));
+        assert!(assemble(events).is_err());
     }
 
     #[test]

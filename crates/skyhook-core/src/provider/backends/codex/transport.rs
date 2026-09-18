@@ -640,13 +640,13 @@ pub(super) mod tests {
             ),
             (
                 text(
-                    json!({"type":"error","error":{"code":"invalid_api_key","message":"Bearer SECRET"}}),
+                    json!({"type":"error","error":{"code":"invalid_api_key","message":"bad key"}}),
                 ),
                 ProviderErrorKind::Authentication,
             ),
             (
                 text(
-                    json!({"type":"response.failed","response":{"error":{"code":"request_cancelled","message":"SECRET"}}}),
+                    json!({"type":"response.failed","response":{"error":{"code":"request_cancelled","message":"cancelled"}}}),
                 ),
                 ProviderErrorKind::Response,
             ),

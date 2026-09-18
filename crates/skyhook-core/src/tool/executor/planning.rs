@@ -87,7 +87,7 @@ impl ToolExecutor {
         kind: InvocationKind,
         agent: &AgentId,
         name: &str,
-        arguments: Value,
+        mut arguments: Value,
         parent: Option<JobId>,
         authorization_scope: Option<u64>,
     ) -> Result<PreparedInvocation, ExecutionError> {
@@ -99,6 +99,10 @@ impl ToolExecutor {
         let spec = tool
             .spec(&self.capabilities, agent)
             .ok_or_else(|| ToolError::InvalidArguments(format!("tool `{name}` is unavailable")))?;
+        // Only model output is repaired; host and script callers must match exactly.
+        if matches!(kind, InvocationKind::Model) {
+            crate::tool::coerce::coerce_arguments(&spec.input_schema, &mut arguments);
+        }
         spec.validate_arguments(&arguments)?;
         validate_invocation(&spec, kind)?;
         let original_arguments = arguments.clone();

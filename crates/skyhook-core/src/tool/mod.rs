@@ -1,6 +1,7 @@
 //! Tool registration, authorization, execution, and built-in capabilities.
 
 pub(crate) mod authorization;
+mod coerce;
 mod context;
 pub(crate) use context::StreamEnd;
 pub mod executor;

@@ -64,7 +64,7 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<EncodedRequest, ProviderE
                         },
                     })
                     .collect::<Result<Vec<_>, ProviderError>>()?;
-                input.push(json!({"role":"user", "content":content}));
+                input.push(json!({"type":"message", "role":"user", "content":content}));
             }
             Message::Assistant(items) => {
                 for item in items {
@@ -87,8 +87,11 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<EncodedRequest, ProviderE
                     }
                     for part in &item.blocks {
                         match &part.content {
+                            // `type` is optional in the spec, but some servers
+                            // cannot identify an assistant item without it.
                             BlockContent::Text { text } => input.push(json!({
-                                "role":"assistant", "content":[{"type":"output_text", "text":text}]
+                                "type":"message", "role":"assistant",
+                                "content":[{"type":"output_text", "text":text}]
                             })),
                             BlockContent::ToolCall(call) => {
                                 input.push(json!({"type":"function_call", "call_id":call.id(),
@@ -115,7 +118,7 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<EncodedRequest, ProviderE
                             content
                                 .push(json!({"type":"input_image", "image_url":image_url(request, image)?}));
                         }
-                        input.push(json!({"role":"user", "content":content}));
+                        input.push(json!({"type":"message", "role":"user", "content":content}));
                     }
                 }
             }
@@ -431,6 +434,11 @@ mod tests {
         let reasoning = input.iter().filter(|item| item["type"] == "reasoning");
         assert_eq!(reasoning.count(), 1);
         assert_eq!(input[1], native_reasoning);
+        // Assistant items are typed: some servers cannot identify them otherwise.
+        assert_eq!(
+            (&input[2]["type"], &input[2]["role"]),
+            (&json!("message"), &json!("assistant"))
+        );
         assert_eq!(
             input[2]["content"][0],
             json!({"type":"output_text", "text":"checking"})
@@ -473,7 +481,7 @@ mod tests {
         assert_eq!(
             input,
             vec![
-                json!({"role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_text","text":"<skyhook_state>"}]})
+                json!({"type":"message","role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_text","text":"<skyhook_state>"}]})
             ]
         );
     }

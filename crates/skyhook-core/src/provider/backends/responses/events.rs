@@ -16,6 +16,7 @@ impl Decoder {
                 wire,
                 native,
             } => {
+                self.close_superseded_reasoning(index, &mut chunks)?;
                 self.start(index, native, &mut chunks)?;
                 self.items.get_mut(&index).expect("started item").wire_index = wire;
             }
@@ -56,6 +57,10 @@ impl Decoder {
                         return Ok(chunks);
                     }
                 };
+                // A placeholder `done` carries no input; the final item decides.
+                if arguments.is_empty() {
+                    return Ok(chunks);
+                }
                 self.validate_arguments(id, &arguments)?;
                 let item = self
                     .items
@@ -76,7 +81,11 @@ impl Decoder {
                 part: (id, position),
                 content,
             } => {
-                self.close_part(id, position, content, &mut chunks)?;
+                // Reasoning already closed for display ignores its late final
+                // text; the item's snapshot supplies the replay.
+                if !self.shown_early(id, position) {
+                    self.close_part(id, position, content, &mut chunks)?;
+                }
             }
             NormalizedEvent::PartAdded {
                 part: (id, position),

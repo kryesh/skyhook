@@ -1,82 +1,54 @@
-//! Parse native SSE envelopes and validate Chat wire shapes before state changes.
+//! Parse native SSE envelopes into the one Chat choice this codec follows.
 use super::super::wire;
 use crate::provider::{
     ProviderError,
-    backends::{errors, transport::SseEvent},
+    backends::{common::lenient_u64, errors, transport::SseEvent},
 };
 use serde_json::Value;
 
+/// `None` marks `[DONE]`. Chunks that carry no recognizable choice or usage
+/// decode as empty, so vendor keepalives and metadata packets are harmless.
 pub(super) fn decode(event: &SseEvent) -> Result<Option<wire::Chunk>, ProviderError> {
-    if let Some(name) = event.event.as_deref()
-        && !name.is_empty()
-        && name != "message"
-        && name != "error"
-    {
-        return Err(ProviderError::protocol("Unsupported Chat SSE event"));
-    }
+    let is_error_event = event.event.as_deref() == Some("error");
     if event.data.trim() == "[DONE]" {
-        if event.event.as_deref() == Some("error") {
+        if is_error_event {
             return Err(ProviderError::protocol("Chat error event contained [DONE]"));
         }
         return Ok(None);
     }
     let value: Value = serde_json::from_str(&event.data)
         .map_err(|_| ProviderError::protocol("Invalid Chat SSE JSON"))?;
-    if value.get("error").is_some_and(|value| !value.is_null())
-        || event.event.as_deref() == Some("error")
-    {
+    if value.get("error").is_some_and(|value| !value.is_null()) || is_error_event {
         return Err(errors::classify_error(None, &value));
     }
-    // Serde structs can deserialize positional arrays. Wire chunks, choices,
-    // and usage must be objects even when absent/null containers are allowed.
-    if !value.is_object()
-        || value
-            .get("choices")
-            .and_then(Value::as_array)
-            .is_some_and(|choices| choices.iter().any(|choice| !choice.is_object()))
-        || value
-            .get("usage")
-            .is_some_and(|usage| !usage.is_null() && !usage.is_object())
-    {
-        return Err(ProviderError::protocol("Invalid Chat chunk shape"));
-    }
-    let wire::Chunk {
-        object,
-        choices,
-        usage,
-    } = serde_json::from_value(value)
-        .map_err(|_| ProviderError::protocol("Invalid Chat chunk shape"))?;
-    if object
-        .as_deref()
-        .is_some_and(|kind| kind != "chat.completion.chunk")
-    {
-        return Err(ProviderError::protocol("Expected chat.completion.chunk"));
-    }
-    if choices.len() > 1 {
-        return Err(ProviderError::protocol(
-            "Chat codec supports exactly one choice",
-        ));
-    }
-    for choice in &choices {
-        if choice.message.is_some() || choice.text.is_some() {
-            return Err(ProviderError::protocol(
-                "Expected Chat streaming delta, not full output",
-            ));
-        }
-        if !matches!(
-            choice.index,
-            wire::ChoiceIndex::Missing | wire::ChoiceIndex::Number(0)
-        ) {
-            return Err(ProviderError::protocol(
-                "Chat choice index must be zero or absent",
-            ));
-        }
-    }
-    Ok(Some(wire::Chunk {
-        object,
-        choices,
-        usage,
-    }))
+    // Follow choice zero; servers may omit its index or send extra choices.
+    let choice = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| {
+            choices
+                .iter()
+                .filter(|choice| choice.is_object())
+                .find(|choice| match choice.get("index") {
+                    None | Some(Value::Null) => true,
+                    Some(index) => lenient_u64(index) == Some(0),
+                })
+        })
+        .map(|choice| {
+            serde_json::from_value::<wire::Choice>(choice.clone())
+                .map_err(|_| ProviderError::protocol("Invalid Chat choice shape"))
+        })
+        .transpose()?;
+    let usage = value
+        .get("usage")
+        .filter(|usage| usage.is_object())
+        .and_then(wire::Usage::from_value);
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(str::to_owned);
+    Ok(Some(wire::Chunk { id, choice, usage }))
 }
 
 #[cfg(test)]
@@ -85,69 +57,63 @@ mod tests {
     use crate::provider::protocol::StopReason;
     use serde_json::{Value, json};
 
-    /// Rejects `packet` before content, after content, and after a normal finish.
-    fn assert_rejected_at_every_stage(packet: Value) {
+    /// Decodes `packet` before content, after content, and after a normal
+    /// finish without producing output or failing the stream.
+    fn assert_ignored_at_every_stage(packet: Value) {
         for stage in 0..3 {
             let mut decoder = Decoder::new("test-model".into());
             let prefix = [delta(json!({"content":"answer"})), end("stop")];
             for frame in prefix.into_iter().take(stage) {
                 decoder.decode(&frame).unwrap();
             }
+            let chunks = decoder.decode(&event(packet.clone())).unwrap();
             assert!(
-                decoder.decode(&event(packet.clone())).is_err(),
+                chunks.iter().all(|chunk| matches!(
+                    chunk,
+                    crate::provider::protocol::ResponseChunk::UsageUpdated { .. }
+                )),
                 "{stage}: {packet}"
             );
-            assert!(decoder.finish().is_err());
         }
     }
 
     #[test]
-    fn invalid_choices_are_rejected_before_and_after_finish() {
-        let indices = [
-            Value::Null,
-            json!("0"),
-            json!(1),
-            json!(-1),
-            json!(0.5),
-            json!(true),
-        ];
-        let mut choices: Vec<_> = indices
-            .into_iter()
-            .map(|index| json!([{"index":index,"delta":{}}]))
-            .collect();
-        choices.extend([
-            json!([{"delta":{}},{"delta":{}}]),
-            json!([{"index":0,"delta":{}},{"index":0,"delta":{}}]),
-            json!([{"index":0,"delta":{}},{"index":1,"delta":{}}]),
-        ]);
-        for choices in choices {
-            assert_rejected_at_every_stage(json!({ "choices": choices }));
-            let mut packet = phantom_usage_chunk();
-            packet["choices"] = choices;
-            assert_post_finish_rejected(packet);
+    fn choice_zero_is_selected_leniently() {
+        for choices in [
+            json!([{"index":null,"delta":{"content":"answer"}}]),
+            json!([{"index":"0","delta":{"content":"answer"}}]),
+            json!([{"index":0.0,"delta":{"content":"answer"}}]),
+            json!([{"index":1,"delta":{"content":"other"}},{"index":0,"delta":{"content":"answer"}}]),
+            json!([{"delta":{"content":"answer"}},{"delta":{"content":"other"}}]),
+            json!([null, {"index":0,"delta":{"content":"answer"}}]),
+        ] {
+            let (items, _, _) = decode(vec![event(json!({"choices":choices})), end("stop")]);
+            assert_eq!(contents(&items), [&text("answer")], "{choices}");
+        }
+        for index in [json!(1), json!(-1), json!(0.5), json!(true)] {
+            assert_ignored_at_every_stage(
+                json!({"choices":[{"index":index,"delta":{"content":"x"}}]}),
+            );
         }
     }
 
     #[test]
-    fn malformed_known_chunk_choice_and_delta_values_still_fail() {
+    fn malformed_placeholders_are_ignored_but_errors_are_not() {
         let mut packets = vec![
             Value::Null,
             json!(false),
             json!(0),
             json!(""),
             json!([]),
-            json!([[], null]),
             json!({"choices":[[0, {}, null]]}),
             json!({"usage":[1, 1, 2]}),
+            json!({"object":"chat.completion"}),
         ];
         for value in [json!(false), json!(0), json!(""), json!({})] {
             packets.push(json!({ "choices": value }));
-        }
-        for value in [Value::Null, json!(false), json!(0), json!(""), json!([])] {
-            packets.push(json!({ "choices": [value] }));
-        }
-        for value in [json!(false), json!(0), json!(""), json!([])] {
             packets.push(json!({"choices":[{"delta":value}]}));
+            packets.push(json!({"choices":[{"finish_reason":value}]}));
+            packets.push(json!({ "usage": value }));
         }
         for field in [
             "role",
@@ -163,64 +129,50 @@ mod tests {
                 packets.push(packet);
             }
         }
-        for value in [
-            json!(false),
-            json!(0),
-            json!([]),
-            json!({}),
-            json!("unknown"),
-        ] {
-            packets.push(json!({"choices":[{"finish_reason":value}]}));
-        }
-        // Empty choices do not bypass usage or native error validation.
+        packets.into_iter().for_each(assert_ignored_at_every_stage);
         for choices in [None, Some(Value::Null), Some(json!([]))] {
-            for mut packet in [
-                json!({"usage":false}),
-                json!({"usage":[]}),
-                json!({"usage":{}}),
-                json!({"usage":{"prompt_tokens":null,"completion_tokens":1}}),
-                json!({"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":3}}),
-                json!({"usage":{"prompt_tokens":1,"completion_tokens":1,"prompt_tokens_details":[]}}),
-                json!({"error":{"type":"server_error","message":"secret"}}),
-            ] {
-                if let Some(choices) = &choices {
-                    packet["choices"] = choices.clone();
-                }
-                packets.push(packet);
+            let mut packet = json!({"error":{"type":"server_error","message":"upstream"}});
+            if let Some(choices) = &choices {
+                packet["choices"] = choices.clone();
             }
+            let mut decoder = Decoder::new("test-model".into());
+            assert!(decoder.decode(&event(packet)).is_err());
+            assert!(decoder.finish().is_err());
         }
-        packets.into_iter().for_each(assert_rejected_at_every_stage);
+        let mut decoder = Decoder::new("test-model".into());
+        let invalid = crate::provider::backends::transport::SseEvent {
+            event: None,
+            data: "{not json".into(),
+        };
+        assert!(decoder.decode(&invalid).is_err());
     }
 
     #[test]
-    fn non_stream_choice_output_is_not_silently_ignored() {
-        for field in ["message", "text"] {
-            for value in [
-                json!(""),
-                json!("answer"),
-                json!({"role":"assistant","content":"answer"}),
-                json!({}),
-                json!(false),
-            ] {
-                for delta_value in [None, Some(Value::Null), Some(json!({}))] {
-                    let mut choice = json!({});
-                    choice[field] = value.clone();
-                    if let Some(value) = delta_value {
-                        choice["delta"] = value;
-                    }
-                    assert_rejected_at_every_stage(json!({ "choices": [choice] }));
-                }
-            }
+    fn non_stream_choice_output_is_decoded() {
+        for choice in [
+            json!({"message":{"role":"assistant","content":"answer"}}),
+            json!({"message":{"content":"answer"}, "delta":null}),
+            json!({"text":"answer", "delta":{}}),
+        ] {
+            let mut choice = choice;
+            choice["finish_reason"] = json!("stop");
+            let (items, _, stop) = decode(vec![event(json!({ "choices": [choice] }))]);
+            assert_eq!(stop, StopReason::EndTurn);
+            assert_eq!(contents(&items), [&text("answer")]);
         }
-        let null_output = || event(json!({"choices":[{"message":null,"text":null}]}));
-        let (items, _, stop) = decode(vec![
-            null_output(),
-            delta(json!({"content":"answer"})),
-            end("stop"),
-            null_output(),
-        ]);
-        assert_eq!(stop, StopReason::EndTurn);
-        assert_eq!(contents(&items), [&text("answer")]);
+        let (items, _, _) = decode(vec![event(
+            json!({"choices":[{"finish_reason":"tool_calls",
+            "message":{"tool_calls":[{"id":"c","type":"function","function":{"name":"one","arguments":"{}"}}]}}]}),
+        )]);
+        assert_eq!(items.len(), 1);
+        // Two calls without IDs in one message stay two calls.
+        let (items, _, _) = decode(vec![event(
+            json!({"choices":[{"finish_reason":"tool_calls",
+            "message":{"tool_calls":[
+                {"type":"function","function":{"name":"a","arguments":"{}"}},
+                {"type":"function","function":{"name":"b","arguments":"{}"}}]}}]}),
+        )]);
+        assert_eq!(items.len(), 2);
     }
 
     #[test]
@@ -244,17 +196,96 @@ mod tests {
     }
 
     #[test]
-    fn native_in_band_errors_are_classified_without_exposing_server_text() {
+    fn native_in_band_errors_are_classified_with_server_text() {
         use crate::provider::ProviderErrorKind;
-        let error = json!({"type":"exceed_context_size_error","code":400,"message":"secret prompt and API key"});
+        let error =
+            json!({"type":"exceed_context_size_error","code":400,"message":"prompt too long"});
         let mut named = event(error.clone());
         named.event = Some("error".into());
         for frame in [event(json!({ "error": error })), named] {
             let mut decoder = Decoder::new("test-model".into());
             let error = decoder.decode(&frame).unwrap_err();
             assert_eq!(error.kind, ProviderErrorKind::ContextWindowExceeded);
-            assert!(!error.message.contains("secret"));
+            assert!(error.message.ends_with(": prompt too long"));
             assert!(decoder.finish().is_err());
+        }
+    }
+
+    #[test]
+    fn full_message_beside_streamed_deltas_is_not_duplicated() {
+        let (items, _, stop) = decode(vec![
+            delta(json!({"content":"hello"})),
+            event(
+                json!({"choices":[{"delta":{},"message":{"content":"hello"},"finish_reason":"stop"}]}),
+            ),
+        ]);
+        assert_eq!(
+            (stop, contents(&items)),
+            (StopReason::EndTurn, vec![&text("hello")])
+        );
+        let call = json!([{"index":0,"id":"c","function":{"name":"run","arguments":"{\"a\":1}"}}]);
+        let (items, _, stop) = decode(vec![
+            delta(json!({"tool_calls":call})),
+            event(
+                json!({"choices":[{"delta":{},"message":{"tool_calls":call},"finish_reason":"tool_calls"}]}),
+            ),
+        ]);
+        assert_eq!((stop, items.len()), (StopReason::ToolUse, 1));
+    }
+
+    #[test]
+    fn full_message_after_streamed_deltas_adds_only_what_is_missing() {
+        let call =
+            json!([{"id":"c","type":"function","function":{"name":"run","arguments":"{\"a\":1}"}}]);
+        let full = |message: Value, finish: &str| {
+            event(json!({"choices":[{"delta":{},"message":message,"finish_reason":finish}]}))
+        };
+        // Only reasoning streamed: the answer and tool call come from the message.
+        let (items, _, stop) = decode(vec![
+            delta(json!({"reasoning_content":"thinking"})),
+            full(json!({"content":"answer","tool_calls":call}), "tool_calls"),
+        ]);
+        assert_eq!(stop, StopReason::ToolUse);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[1].blocks[0].content, text("answer"));
+        // A repeat that adds a tool call adds just the call.
+        let (items, _, _) = decode(vec![
+            delta(json!({"content":"answer"})),
+            full(json!({"content":"answer","tool_calls":call}), "tool_calls"),
+        ]);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].blocks[0].content, text("answer"));
+        // Text the stream did not finish is completed.
+        let (items, _, _) = decode(vec![
+            delta(json!({"content":"hel"})),
+            full(json!({"content":"hello"}), "stop"),
+        ]);
+        assert_eq!(contents(&items), [&text("hello")]);
+        // A message that differs from the stream (trimmed, reformatted, or
+        // with different calls) leaves the streamed content as it is.
+        for (streamed, message, expected) in [
+            (
+                json!({"content":"\n\nHello"}),
+                json!({"content":"Hello"}),
+                text("\n\nHello"),
+            ),
+            (
+                json!({"content":"answer"}),
+                json!({"content":"other"}),
+                text("answer"),
+            ),
+        ] {
+            let (items, _, _) = decode(vec![delta(streamed), full(message, "stop")]);
+            assert_eq!(contents(&items), [&expected]);
+        }
+        let streamed_call = json!({"tool_calls":[{"index":0,"id":"c","function":{"name":"run","arguments":"{\"a\":1}"}}]});
+        let message = json!({"tool_calls":[{"id":"c","type":"function","function":{"name":"run","arguments":"{\"a\":2}"}}]});
+        let (items, _, _) = decode(vec![delta(streamed_call), full(message, "tool_calls")]);
+        match &items[0].blocks[0].content {
+            crate::provider::protocol::BlockContent::ToolCall(call) => {
+                assert_eq!(Value::Object(call.arguments().clone()), json!({"a":1}))
+            }
+            other => panic!("expected a tool call: {other:?}"),
         }
     }
 }

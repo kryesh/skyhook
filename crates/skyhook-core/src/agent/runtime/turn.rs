@@ -584,14 +584,9 @@ fn finish_response(
     usage: Usage,
 ) -> Result<FoldedResponse, HarnessError> {
     let (mut blocks, final_usage, stop_reason) = assembler.finish()?;
-    // A terminal limit/filter/abort does not authorize execution, even if a
-    // backend completed valid arguments before learning the final stop reason.
-    if matches!(
-        stop_reason,
-        crate::provider::protocol::StopReason::MaxTokens
-            | crate::provider::protocol::StopReason::ContentFilter
-            | crate::provider::protocol::StopReason::Aborted
-    ) {
+    // Only a normal finish authorizes execution, even if a backend completed
+    // valid arguments before learning the final stop reason.
+    if !stop_reason.authorizes_tools() {
         blocks.retain(|item| {
             !item
                 .blocks
@@ -896,6 +891,8 @@ mod tests {
             StopReason::MaxTokens,
             StopReason::ContentFilter,
             StopReason::Aborted,
+            StopReason::Other("pause_turn".into()),
+            StopReason::Other("unknown".into()),
         ];
         for stop_reason in reasons {
             let mut assembler = ResponseAssembler::default();

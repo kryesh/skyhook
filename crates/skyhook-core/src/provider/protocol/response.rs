@@ -72,6 +72,14 @@ pub enum StopReason {
     Other(String),
 }
 
+impl StopReason {
+    /// Only a normal finish authorizes executing the response's tool calls.
+    #[must_use]
+    pub fn authorizes_tools(&self) -> bool {
+        matches!(self, Self::ToolUse | Self::EndTurn | Self::StopSequence)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Usage {
     /// Non-cached input tokens (including cache creation). Total prompt tokens

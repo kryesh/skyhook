@@ -7,13 +7,52 @@ use crate::{
         protocol::{Message, ModelRequest, ToolResult, UserContent},
     },
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 pub(crate) fn invalid(message: impl Into<String>) -> ProviderError {
     ProviderError {
         retry_after: None,
         kind: ProviderErrorKind::InvalidRequest,
         message: message.into(),
+    }
+}
+
+/// Tool-argument text as a JSON object: empty or null is `{}`, and a
+/// double-encoded object is unwrapped. Anything else is `None`.
+pub(crate) fn parse_tool_arguments(raw: &str) -> Option<Map<String, Value>> {
+    if raw.trim().is_empty() {
+        return Some(Map::new());
+    }
+    match serde_json::from_str::<Value>(raw).ok()? {
+        Value::Object(object) => Some(object),
+        Value::String(inner) => parse_tool_arguments(&inner),
+        Value::Null => Some(Map::new()),
+        _ => None,
+    }
+}
+
+/// A tool-arguments field: JSON text, or the decoded object some servers send.
+/// Missing or null is `{}`; any other type is `None`.
+pub(crate) fn arguments_field(value: Option<&Value>) -> Option<Map<String, Value>> {
+    match value {
+        None | Some(Value::Null) => Some(Map::new()),
+        Some(Value::String(text)) => parse_tool_arguments(text),
+        Some(Value::Object(object)) => Some(object.clone()),
+        Some(_) => None,
+    }
+}
+
+/// Read a non-negative counter that some servers encode as a float or string.
+pub(crate) fn lenient_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64().or_else(|| {
+            number
+                .as_f64()
+                .filter(|float| float.fract() == 0.0 && *float >= 0.0 && *float <= u64::MAX as f64)
+                .map(|float| float as u64)
+        }),
+        Value::String(text) => lenient_u64(&serde_json::from_str(text.trim()).ok()?),
+        _ => None,
     }
 }
 
@@ -176,6 +215,43 @@ pub(super) mod tests {
     use crate::provider::protocol::{
         AssistantBlock, AssistantItem, BlockContent, Message, ModelRequest, ResponseChunk, ToolCall,
     };
+
+    #[test]
+    fn tool_arguments_tolerate_empty_null_and_double_encoded_objects() {
+        for raw in ["", "  ", "null", "\"\"", "{}"] {
+            assert_eq!(parse_tool_arguments(raw), Some(Map::new()), "{raw:?}");
+        }
+        let object = json!({"cmd":"ls","n":[1,{"x":null}]});
+        assert_eq!(
+            parse_tool_arguments(&object.to_string()).map(Value::Object),
+            Some(object.clone())
+        );
+        let double = Value::String(object.to_string()).to_string();
+        assert_eq!(
+            parse_tool_arguments(&double).map(Value::Object),
+            Some(object)
+        );
+        for raw in ["{\"cmd\":", "[]", "1", "\"text\"", "\"[1]\""] {
+            assert_eq!(parse_tool_arguments(raw), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn counters_accept_integral_floats_and_numeric_strings() {
+        for (value, expected) in [
+            (json!(7), Some(7)),
+            (json!(7.0), Some(7)),
+            (json!("7"), Some(7)),
+            (json!(" 12 "), Some(12)),
+            (json!(7.5), None),
+            (json!(-1), None),
+            (json!("-1"), None),
+            (json!("seven"), None),
+            (json!(null), None),
+        ] {
+            assert_eq!(lenient_u64(&value), expected, "{value}");
+        }
+    }
 
     #[test]
     fn replay_binding_and_filtering_include_text_tool_and_late_enrichment() {

@@ -67,8 +67,11 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
                     "Anthropic tools require a nonempty name and object input_schema",
                 ));
             }
-            tools.push(json!({"name":tool.name, "description":tool.description,
-                "input_schema":tool.input_schema}));
+            let mut native = json!({"name":tool.name, "input_schema":tool.input_schema});
+            if !tool.description.is_empty() {
+                native["description"] = json!(tool.description);
+            }
+            tools.push(native);
         }
         body["tools"] = Value::Array(tools);
     }

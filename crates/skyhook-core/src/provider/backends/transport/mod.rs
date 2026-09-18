@@ -155,8 +155,10 @@ async fn status_error(
         }
     })
     .await;
-    let native: Option<Value> = serde_json::from_slice(&body).ok();
-    let mut error = classify_error(Some(status), &native.unwrap_or(Value::Null));
+    // Non-JSON bodies (proxy HTML, plain text) still carry the explanation.
+    let native = serde_json::from_slice(&body)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into_owned()));
+    let mut error = classify_error(Some(status), &native);
     error.retry_after = retry_after;
     error
 }
@@ -428,37 +430,50 @@ pub(crate) mod tests {
         server.no_more_requests().await;
     }
 
+    /// The explanation a rejection body carries: its error message, or the text.
+    fn server_text(body: &str) -> String {
+        serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|value| value["error"]["message"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| body.to_owned())
+    }
+
     #[tokio::test]
-    async fn http_rejections_are_classified_sanitized_and_not_replayed() {
+    async fn http_rejections_are_classified_with_their_message_and_not_replayed() {
         use ProviderErrorKind::*;
-        let secret = r#"{"error":{"message":"secret prompt"}}"#;
+        let rejected_body = r#"{"error":{"message":"upstream rejected the request"}}"#;
         let json = "Content-Type: application/json\r\n";
         for (status, headers, body, kind) in [
-            ("408 Request Timeout", "Retry-After: 0\r\n", secret, Timeout),
-            ("500 Internal Server Error", "", secret, Response),
-            ("502 Bad Gateway", "", secret, Response),
+            (
+                "408 Request Timeout",
+                "Retry-After: 0\r\n",
+                rejected_body,
+                Timeout,
+            ),
+            ("500 Internal Server Error", "", rejected_body, Response),
+            ("502 Bad Gateway", "", rejected_body, Response),
             (
                 "503 Service Unavailable",
                 "Retry-After: 0\r\n",
-                "reflected secret",
+                "upstream unavailable",
                 Response,
             ),
-            ("504 Gateway Timeout", "", secret, Timeout),
-            ("400 Bad Request", json, secret, InvalidRequest),
-            ("401 Unauthorized", json, secret, Authentication),
-            ("403 Forbidden", json, secret, Authentication),
-            ("404 Not Found", json, secret, InvalidRequest),
-            ("200 OK", json, secret, Protocol),
+            ("504 Gateway Timeout", "", rejected_body, Timeout),
+            ("400 Bad Request", json, rejected_body, InvalidRequest),
+            ("401 Unauthorized", json, rejected_body, Authentication),
+            ("403 Forbidden", json, rejected_body, Authentication),
+            ("404 Not Found", json, rejected_body, InvalidRequest),
+            ("200 OK", json, rejected_body, Protocol),
             (
                 "400 Bad Request",
                 "",
-                r#"{"error":{"code":400,"type":"exceed_context_size_error","message":"secret prompt"}}"#,
+                r#"{"error":{"code":400,"type":"exceed_context_size_error","message":"prompt too long"}}"#,
                 ContextWindowExceeded,
             ),
             (
                 "429 Too Many Requests",
                 "Retry-After: 120\r\n",
-                r#"{"error":{"code":"rate_limit_exceeded","message":"private prompt or secret"}}"#,
+                r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#,
                 RateLimited,
             ),
         ] {
@@ -472,7 +487,12 @@ pub(crate) mod tests {
                 error.recovery().is_some(),
                 matches!(kind, Timeout | Response | RateLimited)
             );
-            assert!(!error.message.contains("secret") && !error.message.contains("attempt"));
+            assert!(!error.message.contains("attempt"));
+            // Rejections carry the server's explanation verbatim.
+            if kind != Protocol {
+                let expected = format!(": {}", server_text(body));
+                assert!(error.message.ends_with(&expected), "{}", error.message);
+            }
             if kind == RateLimited {
                 assert_eq!(error.retry_after, Some(Duration::from_secs(120)));
                 assert!(error.message.contains("429"));

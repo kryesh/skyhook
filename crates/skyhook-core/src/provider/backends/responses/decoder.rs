@@ -184,18 +184,7 @@ impl Decoder {
             }
             return Ok(());
         }
-        let streamed = part.streamed();
-        if !streamed.is_empty() {
-            let valid = match &content {
-                BlockContent::Text { text } | BlockContent::Reasoning { text } => text == streamed,
-                BlockContent::ToolCall(call) => {
-                    arguments(streamed).ok().as_ref() == Some(call.arguments())
-                }
-            };
-            if !valid {
-                return Err(protocol("final content disagrees with streamed deltas"));
-            }
-        }
+        // The final content is authoritative when it disagrees with the deltas.
         *part = Part::Completed(content.clone());
         let item = &self.items[&id];
         chunks.push(ResponseChunk::BlockEnded {
@@ -265,23 +254,23 @@ impl Decoder {
         let call = match native::function_call(native) {
             Ok(call) => call,
             Err(error) => {
-                if !terminal && arguments(string(native, "arguments")?).is_err() {
+                if !terminal && native::item_arguments(native).is_err() {
                     if state.snapshot().is_some() {
                         return Err(protocol("duplicate final output item"));
                     }
-                    self.items
-                        .get_mut(&id)
-                        .expect("checked item")
-                        .function_mut()?
-                        .phase = FunctionPhase::Provisional(native.clone());
-                    return Ok(());
+                    return self.mark_provisional(id, native);
                 }
                 return Err(error);
             }
         };
+        // Placeholder final arguments must not erase streamed ones.
+        let omitted = call.arguments().is_empty();
         match &state.phase {
             FunctionPhase::Completed { call: old, .. } => {
-                if old != &call {
+                // A repeated snapshot omitting arguments agrees on identity alone.
+                let same =
+                    old == &call || (omitted && old.id() == call.id() && old.name() == call.name());
+                if !same {
                     return Err(protocol("conflicting final output item"));
                 }
                 return Ok(());
@@ -294,6 +283,15 @@ impl Decoder {
             }
             FunctionPhase::Streaming(_) => {}
         }
+        let call = if omitted {
+            match self.streamed_arguments(id, call) {
+                Ok(call) => call,
+                Err(_) if !terminal => return self.mark_provisional(id, native),
+                Err(error) => return Err(error),
+            }
+        } else {
+            call
+        };
         if self.items.iter().any(|(other_id, other)| {
             *other_id != id
                 && other
@@ -330,6 +328,37 @@ impl Decoder {
         Ok(())
     }
 
+    /// Hold an unusable call until the stop reason decides: an abnormal stop
+    /// discards it, a normal one fails.
+    fn mark_provisional(&mut self, id: usize, native: &Value) -> Result<(), ProviderError> {
+        self.items
+            .get_mut(&id)
+            .expect("checked item")
+            .function_mut()?
+            .phase = FunctionPhase::Provisional(native.clone());
+        Ok(())
+    }
+
+    /// Arguments from `arguments.done` or deltas, for a final item without them.
+    fn streamed_arguments(&self, id: usize, call: ToolCall) -> Result<ToolCall, ProviderError> {
+        let state = self.items[&id].function()?;
+        let recovered = match &state.streaming()?.final_arguments {
+            Some(FinalArguments::Object(object)) => Some(object.clone()),
+            Some(FinalArguments::Incomplete(text)) => Some(arguments(text)?),
+            None => match state.part.as_ref().map(Part::streamed) {
+                Some(text) if !text.trim().is_empty() => Some(arguments(text)?),
+                _ => None,
+            },
+        };
+        match recovered {
+            Some(object) if !object.is_empty() => {
+                ToolCall::new(call.id(), call.name(), Value::Object(object))
+                    .map_err(|error| protocol(error.to_string()))
+            }
+            _ => Ok(call),
+        }
+    }
+
     pub(super) fn validate_arguments(
         &self,
         id: usize,
@@ -345,10 +374,12 @@ impl Decoder {
                 return Err(protocol("conflicting final function arguments"));
             }
         }
-        // A completed part implies a completed phase, rejected by `streaming()` above.
+        // Final arguments may repair unparseable deltas, but two complete,
+        // different statements of the input are a conflict, not a choice.
         if let Some(Part::Streaming { text, .. }) = &state.part
-            && !text.is_empty()
-            && arguments(text).ok().as_ref() != Some(value)
+            && let Ok(streamed) = arguments(text)
+            && !streamed.is_empty()
+            && &streamed != value
         {
             return Err(protocol("final function arguments disagree with deltas"));
         }
@@ -365,11 +396,11 @@ impl Decoder {
 
 pub(super) fn api_error(error: &Value) -> ProviderError {
     let kind = super::super::errors::classify_error(None, error).kind;
-    // Keep useful machine diagnostics, but never arbitrary upstream messages.
     let mut message = format!("Responses request failed ({kind:?})");
     if let Some(code) = super::super::errors::safe_error_code(error) {
         message.push_str(&format!(" [code={code}]"));
     }
+    super::super::errors::append_server_message(&mut message, error);
     ProviderError {
         kind,
         message,
@@ -518,8 +549,7 @@ mod tests {
             ("code", "server_error", ProviderErrorKind::Response),
             ("code", "unknown_error_SECRET", ProviderErrorKind::Response),
         ] {
-            let error =
-                api_error(&json!({field: identifier, "message": "SECRET prompt credential"}));
+            let error = api_error(&json!({field: identifier, "message": "rejected"}));
             assert_eq!(error.kind, kind);
             let prefix = format!("Responses request failed ({kind:?})");
             assert!(error.message.starts_with(&prefix));
@@ -527,6 +557,7 @@ mod tests {
                 error.message.contains("[code="),
                 !identifier.contains("SECRET")
             );
+            assert!(error.message.ends_with(": rejected"));
             assert!(!error.message.contains("SECRET"));
         }
     }
@@ -586,7 +617,7 @@ mod tests {
             let error = decoder
                 .feed(json!({"type":"error", "code":code,"message":"details"}))
                 .unwrap_err();
-            assert!(!error.message.contains("details"));
+            assert!(error.message.ends_with(": details"));
             assert_eq!(error.kind, kind);
         }
         let terminal = sse(Some("response.completed"), completed(vec![]).to_string());

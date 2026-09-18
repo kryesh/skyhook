@@ -1,5 +1,9 @@
 //! Validation and conversion of native Anthropic content fields.
-use crate::provider::{ProviderError, protocol::ToolCall};
+use crate::provider::{
+    ProviderError,
+    backends::common::{arguments_field, lenient_u64, parse_tool_arguments},
+    protocol::ToolCall,
+};
 use serde_json::Value;
 
 pub(super) fn protocol(message: impl Into<String>) -> ProviderError {
@@ -31,18 +35,36 @@ pub(super) fn validate_thinking(value: &Value) -> Result<(), ProviderError> {
     Ok(())
 }
 
+/// The call's input from the start block and any streamed JSON. A streamed
+/// placeholder (`""`, `{}`, `null`) never erases start input, and two
+/// different non-empty inputs are a conflict rather than a choice.
 pub(super) fn tool_content(
     native: &Value,
     partial_json: Option<&str>,
 ) -> Result<ToolCall, ProviderError> {
-    let arguments = if let Some(partial_json) = partial_json {
-        serde_json::from_str::<Value>(partial_json)
-            .map_err(|_| protocol("invalid tool input JSON"))?
-    } else {
-        native["input"].clone()
+    let initial = initial_input(native)?;
+    let streamed = partial_json
+        .map(|json| parse_tool_arguments(json).ok_or_else(|| protocol("invalid tool input JSON")))
+        .transpose()?;
+    let arguments = match streamed {
+        Some(streamed) if initial.is_empty() => streamed,
+        Some(streamed) if streamed.is_empty() || streamed == initial => initial,
+        Some(_) => return Err(protocol("streamed tool input conflicts with start input")),
+        None => initial,
     };
-    ToolCall::new(string(native, "id")?, string(native, "name")?, arguments)
-        .map_err(|error| protocol(error.to_string()))
+    ToolCall::new(
+        string(native, "id")?,
+        string(native, "name")?,
+        Value::Object(arguments),
+    )
+    .map_err(|error| protocol(error.to_string()))
+}
+
+/// A `tool_use` start block's input.
+pub(super) fn initial_input(
+    native: &Value,
+) -> Result<serde_json::Map<String, Value>, ProviderError> {
+    arguments_field(native.get("input")).ok_or_else(|| protocol("invalid tool input"))
 }
 
 pub(super) fn index(value: &Value) -> Result<usize, ProviderError> {
@@ -63,35 +85,13 @@ pub(super) fn append(value: &mut Value, field: &str, suffix: &str) -> Result<(),
     }
 }
 
-pub(super) fn reject_citations(value: &Value) -> Result<(), ProviderError> {
-    if let Some(citations) = value.get("citations").filter(|value| !value.is_null())
-        && !citations.as_array().is_some_and(Vec::is_empty)
-    {
-        return Err(protocol(
-            "citations cannot be represented by the response protocol",
-        ));
-    }
-    Ok(())
-}
-
-pub(super) fn counter(
-    value: &Value,
-    key: &str,
-    previous: u64,
-    required: bool,
-) -> Result<u64, ProviderError> {
+/// Cumulative counters: missing or smaller late values keep the previous total.
+pub(super) fn counter(value: &Value, key: &str, previous: u64) -> Result<u64, ProviderError> {
     match value.get(key) {
-        Some(number) => {
-            let next = number
-                .as_u64()
-                .ok_or_else(|| protocol(format!("invalid usage counter {key}")))?;
-            if next < previous {
-                return Err(protocol(format!("usage counter {key} decreased")));
-            }
-            Ok(next)
-        }
-        None if required => Err(protocol(format!("missing usage counter {key}"))),
-        None => Ok(previous),
+        None | Some(Value::Null) => Ok(previous),
+        Some(number) => lenient_u64(number)
+            .map(|next| next.max(previous))
+            .ok_or_else(|| protocol(format!("invalid usage counter {key}"))),
     }
 }
 
@@ -109,14 +109,48 @@ mod tests {
         for (id, name, input) in [
             ("", "tool", json!({})),
             ("call", "", json!({})),
-            ("call", "tool", Value::Null),
             ("call", "tool", json!([])),
             ("call", "tool", json!(1)),
-            ("call", "tool", json!("{}")),
+            ("call", "tool", json!("[1]")),
         ] {
             let error = tool_content(&tool_block(id, name, input), None).unwrap_err();
             assert_eq!(error.kind, crate::provider::ProviderErrorKind::Protocol);
         }
+    }
+
+    #[test]
+    fn empty_missing_and_encoded_inputs_are_objects() {
+        let block = tool_block("call", "list_jobs", json!({}));
+        for partial in [None, Some(""), Some("  ")] {
+            let call = tool_content(&block, partial).unwrap();
+            assert!(call.arguments().is_empty());
+        }
+        for input in [Value::Null, json!("{}"), json!("")] {
+            let call = tool_content(&tool_block("call", "tool", input), None).unwrap();
+            assert!(call.arguments().is_empty());
+        }
+        // Streamed placeholders or an identical restatement keep start input.
+        let started = tool_block("call", "tool", json!({"x":1}));
+        for partial in ["", "{}", "null", "\"\"", "{\"x\":1}"] {
+            let call = tool_content(&started, Some(partial)).unwrap();
+            assert_eq!(
+                Value::Object(call.arguments().clone()),
+                json!({"x":1}),
+                "{partial}"
+            );
+        }
+        // Two different inputs conflict.
+        assert!(tool_content(&started, Some("{\"x\":2}")).is_err());
+    }
+
+    #[test]
+    fn counters_are_monotone_and_lenient() {
+        let usage = json!({"a":5, "b":"9", "c":2});
+        assert_eq!(counter(&usage, "a", 3).unwrap(), 5);
+        assert_eq!(counter(&usage, "b", 3).unwrap(), 9);
+        assert_eq!(counter(&usage, "c", 3).unwrap(), 3);
+        assert_eq!(counter(&usage, "missing", 4).unwrap(), 4);
+        assert!(counter(&json!({"a":"x"}), "a", 0).is_err());
     }
 
     #[test]
