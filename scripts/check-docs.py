@@ -73,7 +73,7 @@ def check_book(book, site_root="/"):
 
 def check_readmes():
     errors = []
-    for relative in ("README.md", "crates/skyhook-core/README.md"):
+    for relative in ("README.md",):
         source = ROOT / relative
         # The entry-point READMEs use inline Markdown links without spaces in URLs.
         for link in re.findall(r"\]\(([^\s)]+)(?:\s+[^)]*)?\)", source.read_text(encoding="utf-8")):

@@ -696,7 +696,7 @@ mod tests {
 
     async fn fixture_skills() -> HostSkills {
         let workspace =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/skill-workspace");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/skill-workspace");
         HostSkills::discover_from(&workspace, None).await
     }
 

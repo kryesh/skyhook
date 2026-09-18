@@ -50,13 +50,13 @@
 - `agent::Harness` owns model profiles and policy; each `agent::SessionHandle` owns an isolated agent tree
   and registry.
 
-The CLI package is `skyhook-agent`; the source-only core package is `skyhook-agent-core`
-with Rust crate name `skyhook`. The terminal is a host of the same core used by embedders,
+The `skyhook-agent` package holds the `skyhook` library crate and the CLI binary. The terminal
+is a host of the same library used by embedders,
 not a provider-specific agent implementation.
 
 See [embedding](embedding.md) for host observation and replay contracts,
 [remote transport and shims](remote-transport-and-shims.md) for backend boundaries, and
 [jobs and agents](../scripting/jobs-and-agents.md) for delegation behavior.
 
-Source: [core library](https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src)
+Source: [library](https://github.com/kryesh/skyhook/tree/main/src)
 and [CLI](https://github.com/kryesh/skyhook/tree/main/src/bin/skyhook).

@@ -162,11 +162,6 @@ mod tests {
     fn cli_binary() -> &'static std::path::Path {
         static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         BINARY.get_or_init(|| {
-            let features = if cfg!(feature = "embed-shims") {
-                "tui,embed-shims"
-            } else {
-                "tui"
-            };
             let output = ProcessCommand::new(env!("CARGO"))
                 .current_dir(env!("CARGO_MANIFEST_DIR"))
                 .args([
@@ -176,9 +171,8 @@ mod tests {
                     concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
                     "--bin",
                     "skyhook",
-                    "--no-default-features",
                     "--features",
-                    features,
+                    "tui",
                     "--message-format=json",
                 ])
                 .output()

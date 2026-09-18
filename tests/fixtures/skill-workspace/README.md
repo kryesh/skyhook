@@ -23,25 +23,25 @@ the tests rather than checked into the repository.
 Run the skill tests with:
 
 ```sh
-cargo test -p skyhook-agent-core tool::builtins::skills::tests
+cargo nextest run tool::builtins::skills::tests
 ```
 
 Remote skill-transfer tests verify caller-workspace routing, host-owned reads, and
 write authorization without requiring SSH:
 
 ```sh
-cargo test -p skyhook-agent-core tool::builtins::skill_transfer::tests
+cargo nextest run tool::builtins::skill_transfer::tests
 ```
 
 The disposable loopback SSH integration verifies direct and native-jump connections,
 shim-owned nested connections, shared SSH authentication, and duplex stream transfer.
 Run it on Linux with `sshd`, `ssh-keygen`, and a locally built `linux-ssh` shim; it does
-not use configured lab targets. This native, shim-only build does not enable embedded
-shims and does not require Zig or extra Rust musl targets:
+not use configured lab targets. This native, shim-only build does not require Zig or extra
+Rust musl targets:
 
 ```sh
-cargo build -p skyhook-agent --bin linux-ssh --no-default-features --features shim-bin
+cargo build --bin linux-ssh --features shim-bin
 SKYHOOK_TEST_SHIM="$PWD/target/debug/linux-ssh" \
-  cargo test -p skyhook-agent-core \
-  native_jumps_and_shim_owned_connections_share_a_lazy_central_agent -- --ignored --nocapture
+  cargo nextest run --run-ignored only \
+  native_jumps_and_shim_owned_connections_share_a_lazy_central_agent --no-capture
 ```

@@ -4,8 +4,8 @@ Skyhook is a provider-neutral coding-agent harness with a programmable JavaScrip
 runtime. A tool is registered once and is then available through the model tool protocol and as a
 lazy builder inside `script`.
 
-The workspace contains the source-only `skyhook-agent-core` library package (whose Rust crate is
-named `skyhook`) and the installable `skyhook-agent` CLI package. The core does not depend on a
+The `skyhook-agent` package contains the `skyhook` library crate and the `skyhook` CLI binary.
+The library does not depend on a
 provider-specific response type; native backends implement OpenAI Chat Completions and Responses,
 Anthropic Messages, and Codex/ChatGPT subscription behind a common provider API.
 

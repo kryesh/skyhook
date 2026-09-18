@@ -287,8 +287,7 @@ mod tests {
 
     #[test]
     fn example_config_stays_valid() {
-        let config: Config =
-            toml::from_str(include_str!("../../../../config.example.toml")).unwrap();
+        let config: Config = toml::from_str(include_str!("../../config.example.toml")).unwrap();
         assert!(config.providers.contains_key("codex"));
         assert!(!config.models.is_empty());
     }

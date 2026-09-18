@@ -1,6 +1,6 @@
 # Embedding
 
-The `skyhook-agent-core` package exposes the `skyhook` Rust crate. Embedding hosts supply
+The `skyhook-agent` package exposes the `skyhook` Rust library crate. Embedding hosts supply
 configuration, a workspace, model selection, and interaction handlers rather than depending
 on terminal UI state. See [library architecture](architecture.md) for the provider, registry,
 and session ownership boundaries.
@@ -74,5 +74,5 @@ tail message to the final tool output or user message rather than sending a sepa
 which models read as the user speaking again after every tool call.
 Session databases use format version 4; there is no compatibility or migration layer for earlier layouts.
 
-Source: [session module](https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src/session)
-and [agent module](https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src/agent).
+Source: [session module](https://github.com/kryesh/skyhook/tree/main/src/session)
+and [agent module](https://github.com/kryesh/skyhook/tree/main/src/agent).

@@ -24,20 +24,15 @@ workflows, or embed its Rust core in your own application.
 
 ## Install
 
-Requires **Rust 1.88 or newer**. The default build embeds static Linux SSH shims for
-x86_64 and aarch64, so it also requires [Zig](https://ziglang.org/download/) on `PATH`
-and both Rust musl targets:
+Requires **Rust 1.88 or newer** and [just](https://github.com/casey/just). SSH support
+embeds static Linux shims for x86_64 and aarch64, which are cross-compiled with
+[Zig](https://ziglang.org/download/) (install it separately and put it on `PATH`):
 
 ```sh
-rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-cargo install --git https://github.com/kryesh/skyhook skyhook-agent --locked
-```
-
-For a **local-only build**, without Zig or the extra targets:
-
-```sh
-cargo install --git https://github.com/kryesh/skyhook skyhook-agent --locked \
-  --no-default-features --features tui
+git clone https://github.com/kryesh/skyhook.git && cd skyhook
+just setup                 # cargo-zigbuild, cargo-nextest, mdBook, musl targets
+just build-shims-release   # omit for a local-only build without SSH support
+just build-release         # produces target/release/skyhook
 ```
 
 Configure a provider and model, then start a session. If you already have a
@@ -62,20 +57,21 @@ For automation, see [headless execution](docs/src/guide/headless.md) and
 
 ## Development
 
-The workspace contains the `skyhook-agent` CLI package and
-[`skyhook-agent-core`](crates/skyhook-core), whose Rust library crate is named
-`skyhook`. The core owns the provider, tool, job, session, and agent runtimes.
+The `skyhook-agent` package is a single library crate named `skyhook`, which owns the
+provider, tool, job, session, and agent runtimes, plus two binaries: the `skyhook` CLI
+(feature `tui`) and the `linux-ssh` remote shim (feature `shim-bin`).
 
 Use [just](https://github.com/casey/just) for common tasks; run `just` to list them:
 
 ```sh
-just build-local  # Debug CLI without embedded SSH shims; no Zig required
-just test         # Core and CLI tests without rebuilding embedded shims
-just lint         # Clippy with warnings denied
-just fmt-check    # Check Rust formatting
-just build        # Debug CLI with embedded shims; requires Zig and musl targets
-just release      # Release CLI with embedded shims
-just shim         # Native Linux SSH shim only
+just setup               # Install cargo-zigbuild, cargo-nextest, mdBook, and musl targets
+just build-shims         # Cross-compile debug SSH shims into target/shims (requires Zig)
+just build-shims-release # Cross-compile size-optimised SSH shims into target/shims
+just build               # Debug CLI using whatever is in target/shims
+just build-release       # Release CLI embedding whatever is in target/shims
+just test                # nextest suite plus doctests
+just lint                # Clippy with warnings denied
+just fmt-check           # Check Rust formatting
 ```
 
 The documentation uses the installed [mdBook](https://rust-lang.github.io/mdBook/):

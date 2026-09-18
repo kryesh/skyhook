@@ -229,7 +229,7 @@ mod tests {
                 TargetRouter::new(targets.unwrap(), manager.clone(), authorization.clone());
             let mut builder = ToolRegistryBuilder::default();
             let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tests/fixtures/skill-workspace");
+                .join("tests/fixtures/skill-workspace");
             let skills = super::super::skills::HostSkills::discover(&fixtures).await;
             let (store, jobs) = (runtime.store.clone(), runtime.jobs.clone());
             super::super::register_coding_tools(&mut builder, store, jobs, skills, router.clone())
