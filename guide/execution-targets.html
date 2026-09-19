@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-67539886.js";
+            window.path_to_searchindex_js = "../searchindex-b114b291.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -299,9 +299,8 @@ across tools and workspace-specific pooled connections; reconnecting an unchange
 prompt again. Changing a target or any hop in its route invalidates the affected approval.</p>
 <p>JavaScript remains host-owned while nested targeted tools inherit their caller’s location. The
 <code>agent</code> tool also accepts a named target or <code>root</code>.
-Remote agent state machines, providers, approvals, message history, and canonical session logging
-remain host-owned. The shim retains only live remote tool/process execution state and unclaimed
-background-job results; its worker store is ephemeral.</p>
+Agents, providers, approvals, and the session log stay on the host; a shim only runs tools and
+processes.</p>
 <p>For shim selection and catalog injection, see
 <a href="../development/remote-transport-and-shims.html">remote transport and shims</a>.</p>
 

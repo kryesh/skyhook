@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-67539886.js";
+            window.path_to_searchindex_js = "../searchindex-b114b291.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -217,8 +217,8 @@ updated with the same tool:</p>
 ]});
 </code></pre>
 <p>Lists persist with the session, including completed and interrupted child lists. Resume preserves
-recorded statuses. Host interfaces can read all current lists through <code>SessionHandle::todos()</code>
-and observe <code>SessionEvent::TodosReplaced</code> through the existing runtime event subscription.
+recorded statuses. Host interfaces observe <code>SessionEvent::TodosReplaced</code> through the existing
+runtime event subscription.
 The public <code>TodoItem</code>, <code>TodoStatus</code>, and <code>TodoSnapshot</code> types live in <code>skyhook::agent</code>.</p>
 <h2 id="per-request-state-snapshot"><a class="header" href="#per-request-state-snapshot">Per-request state snapshot</a></h2>
 <p>Unless the model profile’s <a href="../configuration/providers-and-models.html"><code>state_mode</code></a> is <code>none</code>,

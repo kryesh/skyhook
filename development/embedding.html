@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-67539886.js";
+            window.path_to_searchindex_js = "../searchindex-b114b291.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -181,7 +181,7 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="embedding"><a class="header" href="#embedding">Embedding</a></h1>
-<p>The <code>skyhook-agent-core</code> package exposes the <code>skyhook</code> Rust crate. Embedding hosts supply
+<p>The <code>skyhook-agent</code> package exposes the <code>skyhook</code> Rust library crate. Embedding hosts supply
 configuration, a workspace, model selection, and interaction handlers rather than depending
 on terminal UI state. See <a href="architecture.html">library architecture</a> for the provider, registry,
 and session ownership boundaries.</p>
@@ -199,8 +199,7 @@ load <code>.env</code>. That startup behavior belongs to the CLI.</p>
 <h2 id="embedded-shim-catalog"><a class="header" href="#embedded-shim-catalog">Embedded shim catalog</a></h2>
 <p>The CLI injects its embedded shim catalog into the core harness. Shims are selected by protocol,
 platform, and architecture; artifact names follow <code>platform-protocol-arch</code> (for example,
-<code>linux-ssh-aarch64</code>). The naming scheme allows an optional <code>.exe</code> suffix for future platforms,
-but no Windows transport is implemented. Library embedders receive an empty catalog by default
+<code>linux-ssh-aarch64</code>). Library embedders receive an empty catalog by default
 and can provide their own <code>EmbeddedShimCatalog</code> through <code>HarnessBuilder</code>; selecting a combination
 without a supplied shim returns an unsupported-platform error.</p>
 <h2 id="reconstructing-model-calls"><a class="header" href="#reconstructing-model-calls">Reconstructing model calls</a></h2>
@@ -240,12 +239,13 @@ history, <code>ending</code> when compaction replaces it after this agent reques
 reaches the compaction threshold), or <code>detached</code> for compaction summaries, which share no request
 settings with any other request. Providers decide prompt-cache placement from <code>history</code>, <code>tail</code>, and
 the lifetime: Anthropic places a cache breakpoint on the last history block unless it is detached
-(ending history is still marked, since cache reads land only at breakpoints), OpenAI protocols rely on
-automatic prefix caching with the tail sent last, and Codex records no WebSocket continuation for a
-request with a tail or non-continuing history.
-Session journals use format version 3; there is no compatibility or migration layer for earlier layouts.</p>
-<p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src/session">session module</a>
-and <a href="https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src/agent">agent module</a>.</p>
+(ending history is still marked, since cache reads land only at breakpoints), and OpenAI protocols rely on
+automatic prefix caching with the tail sent last. Chat Completions and Responses append a runtime-only
+tail message to the final tool output or user message rather than sending a separate user message,
+which models read as the user speaking again after every tool call.
+Session databases use format version 5; there is no compatibility or migration layer for earlier layouts.</p>
+<p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/src/session">session module</a>
+and <a href="https://github.com/kryesh/skyhook/tree/main/src/agent">agent module</a>.</p>
 
                     </main>
 

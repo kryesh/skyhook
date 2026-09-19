@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-67539886.js";
+            window.path_to_searchindex_js = "searchindex-b114b291.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-8b14bb79.js"></script>
@@ -184,8 +184,8 @@
 <p>Skyhook is a provider-neutral coding-agent harness with a programmable JavaScript orchestration
 runtime. A tool is registered once and is then available through the model tool protocol and as a
 lazy builder inside <code>script</code>.</p>
-<p>The workspace contains the source-only <code>skyhook-agent-core</code> library package (whose Rust crate is
-named <code>skyhook</code>) and the installable <code>skyhook-agent</code> CLI package. The core does not depend on a
+<p>The <code>skyhook-agent</code> package contains the <code>skyhook</code> library crate and the <code>skyhook</code> CLI binary.
+The library does not depend on a
 provider-specific response type; native backends implement OpenAI Chat Completions and Responses,
 Anthropic Messages, and Codex/ChatGPT subscription behind a common provider API.</p>
 <p>This book covers installation, everyday use, configuration, scripting, the tool contracts,

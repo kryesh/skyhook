@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-67539886.js";
+            window.path_to_searchindex_js = "../searchindex-b114b291.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -181,80 +181,25 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="documentation-and-publishing"><a class="header" href="#documentation-and-publishing">Documentation and publishing</a></h1>
-<h2 id="authoring-and-local-preview"><a class="header" href="#authoring-and-local-preview">Authoring and local preview</a></h2>
-<p>The book uses the installed <code>mdbook</code> executable and its default HTML theme. There is no
-version pin, downloader, custom preprocessor, or theme bootstrap. An installed <code>just</code> provides
-the task interface; direct mdBook commands work too.</p>
-<pre><code class="language-sh">just docs                 # mdbook build docs
-just docs-serve           # mdbook serve docs
+<p>The book uses the installed <code>mdbook</code> with its default theme. Sources live in <code>docs/src</code>,
+navigation in <code>docs/src/SUMMARY.md</code>, configuration in <code>docs/book.toml</code>; generated output is
+<code>docs/book</code> (ignored, never committed to the source branch).</p>
+<pre><code class="language-sh">just docs          # mdbook build docs
+just docs-serve    # mdbook serve docs, normally http://localhost:3000
+just pages-build   # build, then add .nojekyll for GitHub Pages
 </code></pre>
-<p>Open the address printed by <code>mdbook serve</code> (normally <a href="http://localhost:3000">http://localhost:3000</a>).
-The book sources live in <code>docs/src</code>, navigation in <code>docs/src/SUMMARY.md</code>, and configuration in
-<code>docs/book.toml</code>. Generated output is <code>docs/book</code>, ignored by <code>docs/.gitignore</code>.
-Do not commit generated output to the source branch. Keep secrets out of <code>docs/src</code>: mdBook
-copies non-Markdown assets, including ignored files, into local preview output. Git ignore rules
-are not an asset filter for <code>just docs</code> or <code>just docs-serve</code>.</p>
-<p>Use relative chapter links such as <code>../guide/headless.md</code> inside the book. Link to repository
-source files using <code>https://github.com/kryesh/skyhook/blob/main/...</code> or <code>tree/main/...</code>, not paths
-outside the book: those relative paths would break on the published site. The configuration
-overview includes the root <code>config.example.toml</code> at build time so it stays the single source
-of truth. Repository and edit links in the book also point to GitHub.</p>
-<p>Check links after editing:</p>
-<pre><code class="language-sh">just docs-check
-# Equivalently:
-mdbook build docs
-python3 scripts/check-docs.py
+<p>Keep secrets out of <code>docs/src</code>: mdBook copies every non-Markdown file there into the output,
+ignored or not. Use relative chapter links such as <code>../guide/headless.md</code> inside the book, and
+<code>https://github.com/kryesh/skyhook/blob/main/...</code> for repository files. The configuration
+overview includes the root <code>config.example.toml</code> at build time.</p>
+<h2 id="publishing"><a class="header" href="#publishing">Publishing</a></h2>
+<pre><code class="language-sh">just pages-publish [remote] [branch]   # defaults: origin, pages
 </code></pre>
-<p>The checker requires Python 3.11+ and uses only the standard library. It validates rendered local
-links and anchors, plus root README relative links; it does not fetch external URLs.
-Code examples are documentation, not commands that the documentation build executes.</p>
-<h2 id="prepare-the-pages-artifact"><a class="header" href="#prepare-the-pages-artifact">Prepare the Pages artifact</a></h2>
-<p>The planned canonical URL is <a href="https://kryesh.github.io/skyhook/">https://kryesh.github.io/skyhook/</a>. Building documentation locally
-does not publish that site or establish that it is already available.</p>
-<pre><code class="language-sh">just pages-build
-</code></pre>
-<p>This builds <code>docs/book</code> and adds <code>.nojekyll</code>, so GitHub Pages serves the generated static HTML
-without Jekyll processing. To do the same directly:</p>
-<pre><code class="language-sh">mdbook build docs
-touch docs/book/.nojekyll
-</code></pre>
-<h2 id="publish-manually"><a class="header" href="#publish-manually">Publish manually</a></h2>
-<p>Publishing requires Git, an installed mdBook/just toolchain, push access to the destination
-repository, and a <strong>clean, committed source checkout</strong>. Review and commit source changes first.
-The recipe builds the book from an isolated checkout of the committed source revision, then
-publishes through a separate temporary Git worktree. Ignored local files (including environment
-secrets under <code>docs/src</code>) and stale local <code>docs/book</code> output are not inputs to publication.
-It never force-pushes, refuses destinations containing the project’s source files, skips unchanged
-output, and removes obsolete published files. It does not change your configured remotes, local
-branches, or remote-tracking refs, or switch your working checkout to the publication branch.
-<code>just docs</code>, <code>just docs-serve</code>, and <code>just pages-build</code> still build your working tree for local
-preview; only the publishing recipe uses an isolated committed-source build.</p>
-<pre><code class="language-sh">just pages-publish [remote] [branch]
-</code></pre>
-<p>The default remote is <code>origin</code> and default branch is <strong><code>pages</code></strong>, not <code>gh-pages</code>. Choose the
-GitHub remote explicitly if <code>origin</code> points elsewhere. For example, if your GitHub remote is
-named <code>github</code>:</p>
-<pre><code class="language-sh">just pages-publish github
-# Or specify both the remote and publication branch:
-just pages-publish github pages
-</code></pre>
-<p>Inspect <code>git remote -v</code> and use the intended existing remote name; do not assume <code>origin</code>
-is the public GitHub repository. The public source repository is
-<a href="https://github.com/kryesh/skyhook">https://github.com/kryesh/skyhook</a>.</p>
-<p>In that GitHub repository’s <strong>Settings → Pages</strong>, choose <strong>Deploy from a branch</strong>, select
-<strong><code>pages</code></strong> (or the branch explicitly chosen above), and select <strong><code>/ (root)</code></strong>. The recipe
-publishes the contents of the built book at that branch’s root. Publication and GitHub’s deployment
-must complete before the canonical site becomes available.</p>
-<p>There is no new automatic workflow or assumed hosted-runner bootstrap. A CI runner with the
-required tools already installed can invoke the same <code>just docs-check</code> and <code>just pages-build</code>
-recipes; authenticated publishing can likewise reuse the explicit publishing recipe.</p>
-<h2 id="test-publishing-changes"><a class="header" href="#test-publishing-changes">Test publishing changes</a></h2>
-<p>Run the publishing regression tests without contacting a server or executing a real push:</p>
-<pre><code class="language-sh">bash scripts/test-pages-publish.sh
-</code></pre>
-<p>They use the installed mdBook and just with temporary local Git repositories. Coverage includes
-initial publication, unchanged output, deleted pages, source-branch protection, dirty-checkout
-rejection, fetch isolation, and cleanup after build or push failures.</p>
+<p>The recipe requires a clean checkout, builds the committed sources in a temporary worktree,
+refuses to publish over a branch that contains sources, and pushes without force; your checkout
+and branches are untouched. In the
+GitHub repository’s <strong>Settings → Pages</strong>, choose <strong>Deploy from a branch</strong>, <strong><code>pages</code></strong>, <strong><code>/ (root)</code></strong>.
+The planned canonical URL is <a href="https://kryesh.github.io/skyhook/">https://kryesh.github.io/skyhook/</a>.</p>
 
                     </main>
 

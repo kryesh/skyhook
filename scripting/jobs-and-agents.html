@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-67539886.js";
+            window.path_to_searchindex_js = "../searchindex-b114b291.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -193,7 +193,10 @@ an instruction continues the same history without adding a synthetic user or par
 message.
 Children do not need <code>receive()</code> to read these updates. Every visible child text reply,
 including text-only and final replies, is delivered independently through the background-job
-event path and wakes <code>wait</code>, without waiting for the child job to finish. Message events carry
+event path, without waiting for the child job to finish. <code>wait</code> resolves when the agent can act:
+while the agent has other foreground work outstanding it keeps waiting, and the next model request
+then carries every accumulated event together; otherwise any pending event resolves it. Each
+notification resolves a given caller’s <code>wait</code> once, and <code>wait</code> never consumes content. Message events carry
 <code>kind: "message"</code>, the child job <code>id</code>, source <code>message</code> sequence, optional <code>name</code>, and <code>text</code>.
 Completion is determined separately by the agent’s remaining work and queued inputs, not by
 message delivery. A completed child notification references its <code>last_message</code> instead of

@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-67539886.js";
+            window.path_to_searchindex_js = "../searchindex-b114b291.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -181,30 +181,21 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="installation"><a class="header" href="#installation">Installation</a></h1>
-<h2 id="full-install-with-ssh-support"><a class="header" href="#full-install-with-ssh-support">Full install with SSH support</a></h2>
-<p>Rust 1.88 or newer is required. Default installs build static Linux SSH shims from source,
-including for debug builds. Install <a href="https://ziglang.org/download/">Zig</a> and both Rust musl
-targets first. Make <code>zig</code> available on <code>PATH</code>, or set <code>CARGO_ZIGBUILD_ZIG_PATH</code> to its executable:</p>
-<pre><code class="language-sh">zig version
-rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-cargo install --git https://github.com/kryesh/skyhook skyhook-agent --locked
-</code></pre>
-<p>The executable is <code>skyhook</code>. Installation uses the GitHub source repository, not crates.io.
-The build support uses the <code>cargo-zigbuild</code> Rust library with your installed Zig; you do not
-need the <code>cargo zigbuild</code> CLI, Cross, Docker, or Podman.</p>
-<h2 id="local-only-install"><a class="header" href="#local-only-install">Local-only install</a></h2>
-<p>Without Zig or the extra musl targets:</p>
-<pre><code class="language-sh">cargo install --git https://github.com/kryesh/skyhook skyhook-agent --locked --no-default-features --features tui
-</code></pre>
-<p>SSH use from this build returns an explicit missing-shim error. The <code>tui</code> feature enables
-the interactive binary and its UI dependencies; the same binary also supports headless execution.</p>
-<h2 id="install-from-a-checkout"><a class="header" href="#install-from-a-checkout">Install from a checkout</a></h2>
+<p>Skyhook is built from a source checkout with <a href="https://github.com/casey/just">just</a>. Rust 1.88 or
+newer is required. SSH support needs static Linux shims, which are cross-compiled with
+<a href="https://ziglang.org/download/">Zig</a>; install Zig yourself and make <code>zig</code> available on <code>PATH</code> (or
+set <code>CARGO_ZIGBUILD_ZIG_PATH</code>). <code>just setup</code> installs the remaining Rust-side tooling
+(<code>cargo-zigbuild</code>, <code>cargo-nextest</code>, mdBook) and both musl targets.</p>
 <pre><code class="language-sh">git clone https://github.com/kryesh/skyhook.git
 cd skyhook
-cargo install --path . --locked
-# Or local-only:
-cargo install --path . --locked --no-default-features --features tui
+just setup
+just build-shims-release   # stage static SSH shims into target/shims
+just build-release         # target/release/skyhook, with the staged shims embedded
 </code></pre>
+<p>The executable is <code>skyhook</code>. Release builds embed whatever is in <code>target/shims</code> at compile time;
+debug builds (<code>just build</code>) read that directory live. Skip the shim step for a local-only build:
+SSH use from such a build returns an explicit missing-shim error. The <code>tui</code> feature enables the
+<code>skyhook</code> binary and its UI dependencies; the same binary also supports headless execution.</p>
 <p>See <a href="../development/setup.html">development setup</a> for contributor commands and
 <a href="../development/remote-transport-and-shims.html#embedded-shim-builds">embedded shim builds</a>
 for the build matrix, artifact layout, and native shim-only builds.</p>

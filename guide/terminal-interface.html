@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-67539886.js";
+            window.path_to_searchindex_js = "../searchindex-b114b291.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -209,7 +209,8 @@ including while queued or running; an omitted target inherits the calling agent�
 Agent rows show their own token totals and context usage in the same compact format as the
 bottom-right session summary: output · input (uncached) · context.
 Status messages, including interruptions and errors, appear as distinct rows in the conversation
-log and are saved with the session. They are excluded from the model’s context.
+log and are saved with the session. An interruption row is recorded only when something was
+actually interrupted. They are excluded from the model’s context.
 Completed final replies show their recorded model ID in a muted footer below the answer.
 The composer always sends to the root agent. While root is busy, Enter queues a follow-up
 for its next model request, without interrupting the current request or tools. It does not wait
@@ -219,6 +220,8 @@ composer; merely opening the queue or deleting an item does not pause it. Interr
 submission or delivery errors, and session-start failures also pause queue delivery. <code>/resume</code>
 clears that pause, as does normal composer Enter (even with an empty draft); slash commands
 do not automatically resume the queue. There is no standalone <code>/pause</code> command.
+Queued input lives only in the running interface: it is not saved with the session, and
+input still waiting when you switch sessions stays queued, paused, for the session you open.
 <code>/retry</code> continues failed or interrupted turns without duplicating their original prompts.
 After a session interruption it resumes all interrupted children automatically, regardless of
 which agent is selected. Parents with pending waits stay in those waits rather than starting
@@ -239,7 +242,8 @@ Transient retries reuse that request; older logs can contain separate request ro
 Full request bodies remain in the session journal for reconstruction but are not rendered in the UI.
 Startup warnings appear directly in the conversation log rather than a separate diagnostics page.
 Job output is paged and searchable without acknowledging the agent’s pending notifications. Select a job
-and press <code>o</code> for output fields, regex search, and the next page; <code>c</code> requests cancellation.
+and press <code>o</code> for output fields, regex search, and the next page; <code>c</code> requests cancellation
+(useful for background jobs, since interrupting already cancels the foreground tool).
 Intermediate child-agent messages and terminal job notifications appear as expandable <strong>Job event</strong>
 cards in the conversation. Agent-message cards show the job identity/name, source message sequence,
 and readable progress text when expanded, rather than raw runtime envelopes. They retain their
@@ -264,9 +268,14 @@ Tool follow-ups, retries, compaction, and <code>/retry</code> retain the active 
 shows the choice for the next message; reply footers identify the model that actually answered.
 Resumed sessions retain their last applied model. <code>/models</code> remains an alias for <code>/model</code>.
 Restore a missing recorded model profile before resuming rather than substituting another model.</p>
-<p>The interface stores the last submitted model in <code>$XDG_STATE_HOME/skyhook/ui.json</code>, falling back
-to <code>~/.local/state/skyhook/ui.json</code>. Writes are atomic and do not rewrite the model configuration.
-Session titles are stored separately from conversation history in each session’s <code>ui.json</code>.</p>
+<p>The interface stores the last submitted model and the sidebar setting in the workspace’s
+<code>.skyhook/state.json</code>, beside its sessions. Writes are atomic and do not rewrite the model
+configuration.
+Session titles are recorded in each session’s database alongside its history.</p>
+<p>A sidebar beside the conversation lists each configured MCP server with its startup status and the
+viewed agent’s todos. It is shown by default; <code>Ctrl+X B</code> or <code>/sidebar</code> toggles it. Terminals
+narrower than 100 columns, or having no servers and no todos to list, hide it without changing the
+saved setting.</p>
 <p>The bottom bar uses this format:</p>
 <pre><code class="language-text">default · openai       8.4k · 200k(31.2k) · 42% (54k/128k)
 </code></pre>
@@ -289,6 +298,7 @@ state; it is not cumulative usage. Missing context data appears as <code>—</co
 <tr><td><code>Ctrl+X I</code>, <code>/queue</code></td><td>Edit queued follow-ups</td></tr>
 <tr><td><code>Ctrl+X T</code>, <code>/details</code></td><td>Toggle tool details</td></tr>
 <tr><td><code>Ctrl+X F</code>, <code>@</code></td><td>Attach a workspace file</td></tr>
+<tr><td><code>Ctrl+X B</code>, <code>/sidebar</code></td><td>Toggle the sidebar</td></tr>
 <tr><td><code>Ctrl+X R</code>, <code>/attention</code></td><td>Reopen pending questions and permissions</td></tr>
 <tr><td><code>/requests</code>, <code>/jobs</code></td><td>Requests, jobs</td></tr>
 <tr><td><code>Ctrl+X ↑</code>, <code>Ctrl+X ↓</code></td><td>Parent, first child</td></tr>
@@ -301,8 +311,8 @@ state; it is not cumulative usage. Missing context data appears as <code>—</co
 <tr><td><code>Home</code>, <code>End</code> in content</td><td>Beginning, latest</td></tr>
 <tr><td><code>/</code>, <code>n</code>, <code>N</code> in content</td><td>Search, next/previous match</td></tr>
 <tr><td><code>[</code>, <code>]</code> in content</td><td>Previous/next inspector tab</td></tr>
-<tr><td><code>Esc</code></td><td>Close local UI, dismiss/cancel prompts, otherwise interrupt work</td></tr>
-<tr><td><code>Ctrl+C</code></td><td>Clear draft, otherwise interrupt/quit</td></tr>
+<tr><td><code>Esc</code></td><td>Close local UI, dismiss/cancel prompts, otherwise interrupt work, cancelling the running foreground tool</td></tr>
+<tr><td><code>Ctrl+C</code></td><td>Clear draft, otherwise interrupt (as <code>Esc</code>)/quit</td></tr>
 <tr><td><code>Ctrl+X Q</code></td><td>Quit</td></tr>
 </tbody>
 </table>

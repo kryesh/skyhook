@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-67539886.js";
+            window.path_to_searchindex_js = "searchindex-b114b291.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-8b14bb79.js"></script>
@@ -182,8 +182,8 @@
 <p>Skyhook is a provider-neutral coding-agent harness with a programmable JavaScript orchestration
 runtime. A tool is registered once and is then available through the model tool protocol and as a
 lazy builder inside <code>script</code>.</p>
-<p>The workspace contains the source-only <code>skyhook-agent-core</code> library package (whose Rust crate is
-named <code>skyhook</code>) and the installable <code>skyhook-agent</code> CLI package. The core does not depend on a
+<p>The <code>skyhook-agent</code> package contains the <code>skyhook</code> library crate and the <code>skyhook</code> CLI binary.
+The library does not depend on a
 provider-specific response type; native backends implement OpenAI Chat Completions and Responses,
 Anthropic Messages, and Codex/ChatGPT subscription behind a common provider API.</p>
 <p>This book covers installation, everyday use, configuration, scripting, the tool contracts,
@@ -196,30 +196,21 @@ publication is a separate step from building this book locally.</p>
 <p>Skyhook is licensed under <a href="https://github.com/kryesh/skyhook/blob/main/LICENSE">AGPL-3.0-only</a>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="installation"><a class="header" href="#installation">Installation</a></h1>
-<h2 id="full-install-with-ssh-support"><a class="header" href="#full-install-with-ssh-support">Full install with SSH support</a></h2>
-<p>Rust 1.88 or newer is required. Default installs build static Linux SSH shims from source,
-including for debug builds. Install <a href="https://ziglang.org/download/">Zig</a> and both Rust musl
-targets first. Make <code>zig</code> available on <code>PATH</code>, or set <code>CARGO_ZIGBUILD_ZIG_PATH</code> to its executable:</p>
-<pre><code class="language-sh">zig version
-rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-cargo install --git https://github.com/kryesh/skyhook skyhook-agent --locked
-</code></pre>
-<p>The executable is <code>skyhook</code>. Installation uses the GitHub source repository, not crates.io.
-The build support uses the <code>cargo-zigbuild</code> Rust library with your installed Zig; you do not
-need the <code>cargo zigbuild</code> CLI, Cross, Docker, or Podman.</p>
-<h2 id="local-only-install"><a class="header" href="#local-only-install">Local-only install</a></h2>
-<p>Without Zig or the extra musl targets:</p>
-<pre><code class="language-sh">cargo install --git https://github.com/kryesh/skyhook skyhook-agent --locked --no-default-features --features tui
-</code></pre>
-<p>SSH use from this build returns an explicit missing-shim error. The <code>tui</code> feature enables
-the interactive binary and its UI dependencies; the same binary also supports headless execution.</p>
-<h2 id="install-from-a-checkout"><a class="header" href="#install-from-a-checkout">Install from a checkout</a></h2>
+<p>Skyhook is built from a source checkout with <a href="https://github.com/casey/just">just</a>. Rust 1.88 or
+newer is required. SSH support needs static Linux shims, which are cross-compiled with
+<a href="https://ziglang.org/download/">Zig</a>; install Zig yourself and make <code>zig</code> available on <code>PATH</code> (or
+set <code>CARGO_ZIGBUILD_ZIG_PATH</code>). <code>just setup</code> installs the remaining Rust-side tooling
+(<code>cargo-zigbuild</code>, <code>cargo-nextest</code>, mdBook) and both musl targets.</p>
 <pre><code class="language-sh">git clone https://github.com/kryesh/skyhook.git
 cd skyhook
-cargo install --path . --locked
-# Or local-only:
-cargo install --path . --locked --no-default-features --features tui
+just setup
+just build-shims-release   # stage static SSH shims into target/shims
+just build-release         # target/release/skyhook, with the staged shims embedded
 </code></pre>
+<p>The executable is <code>skyhook</code>. Release builds embed whatever is in <code>target/shims</code> at compile time;
+debug builds (<code>just build</code>) read that directory live. Skip the shim step for a local-only build:
+SSH use from such a build returns an explicit missing-shim error. The <code>tui</code> feature enables the
+<code>skyhook</code> binary and its UI dependencies; the same binary also supports headless execution.</p>
 <p>See <a href="#development-setup">development setup</a> for contributor commands and
 <a href="#embedded-shim-builds">embedded shim builds</a>
 for the build matrix, artifact layout, and native shim-only builds.</p>
@@ -312,7 +303,8 @@ including while queued or running; an omitted target inherits the calling agent�
 Agent rows show their own token totals and context usage in the same compact format as the
 bottom-right session summary: output · input (uncached) · context.
 Status messages, including interruptions and errors, appear as distinct rows in the conversation
-log and are saved with the session. They are excluded from the model’s context.
+log and are saved with the session. An interruption row is recorded only when something was
+actually interrupted. They are excluded from the model’s context.
 Completed final replies show their recorded model ID in a muted footer below the answer.
 The composer always sends to the root agent. While root is busy, Enter queues a follow-up
 for its next model request, without interrupting the current request or tools. It does not wait
@@ -322,6 +314,8 @@ composer; merely opening the queue or deleting an item does not pause it. Interr
 submission or delivery errors, and session-start failures also pause queue delivery. <code>/resume</code>
 clears that pause, as does normal composer Enter (even with an empty draft); slash commands
 do not automatically resume the queue. There is no standalone <code>/pause</code> command.
+Queued input lives only in the running interface: it is not saved with the session, and
+input still waiting when you switch sessions stays queued, paused, for the session you open.
 <code>/retry</code> continues failed or interrupted turns without duplicating their original prompts.
 After a session interruption it resumes all interrupted children automatically, regardless of
 which agent is selected. Parents with pending waits stay in those waits rather than starting
@@ -342,7 +336,8 @@ Transient retries reuse that request; older logs can contain separate request ro
 Full request bodies remain in the session journal for reconstruction but are not rendered in the UI.
 Startup warnings appear directly in the conversation log rather than a separate diagnostics page.
 Job output is paged and searchable without acknowledging the agent’s pending notifications. Select a job
-and press <code>o</code> for output fields, regex search, and the next page; <code>c</code> requests cancellation.
+and press <code>o</code> for output fields, regex search, and the next page; <code>c</code> requests cancellation
+(useful for background jobs, since interrupting already cancels the foreground tool).
 Intermediate child-agent messages and terminal job notifications appear as expandable <strong>Job event</strong>
 cards in the conversation. Agent-message cards show the job identity/name, source message sequence,
 and readable progress text when expanded, rather than raw runtime envelopes. They retain their
@@ -367,9 +362,14 @@ Tool follow-ups, retries, compaction, and <code>/retry</code> retain the active 
 shows the choice for the next message; reply footers identify the model that actually answered.
 Resumed sessions retain their last applied model. <code>/models</code> remains an alias for <code>/model</code>.
 Restore a missing recorded model profile before resuming rather than substituting another model.</p>
-<p>The interface stores the last submitted model in <code>$XDG_STATE_HOME/skyhook/ui.json</code>, falling back
-to <code>~/.local/state/skyhook/ui.json</code>. Writes are atomic and do not rewrite the model configuration.
-Session titles are stored separately from conversation history in each session’s <code>ui.json</code>.</p>
+<p>The interface stores the last submitted model and the sidebar setting in the workspace’s
+<code>.skyhook/state.json</code>, beside its sessions. Writes are atomic and do not rewrite the model
+configuration.
+Session titles are recorded in each session’s database alongside its history.</p>
+<p>A sidebar beside the conversation lists each configured MCP server with its startup status and the
+viewed agent’s todos. It is shown by default; <code>Ctrl+X B</code> or <code>/sidebar</code> toggles it. Terminals
+narrower than 100 columns, or having no servers and no todos to list, hide it without changing the
+saved setting.</p>
 <p>The bottom bar uses this format:</p>
 <pre><code class="language-text">default · openai       8.4k · 200k(31.2k) · 42% (54k/128k)
 </code></pre>
@@ -392,6 +392,7 @@ state; it is not cumulative usage. Missing context data appears as <code>—</co
 <tr><td><code>Ctrl+X I</code>, <code>/queue</code></td><td>Edit queued follow-ups</td></tr>
 <tr><td><code>Ctrl+X T</code>, <code>/details</code></td><td>Toggle tool details</td></tr>
 <tr><td><code>Ctrl+X F</code>, <code>@</code></td><td>Attach a workspace file</td></tr>
+<tr><td><code>Ctrl+X B</code>, <code>/sidebar</code></td><td>Toggle the sidebar</td></tr>
 <tr><td><code>Ctrl+X R</code>, <code>/attention</code></td><td>Reopen pending questions and permissions</td></tr>
 <tr><td><code>/requests</code>, <code>/jobs</code></td><td>Requests, jobs</td></tr>
 <tr><td><code>Ctrl+X ↑</code>, <code>Ctrl+X ↓</code></td><td>Parent, first child</td></tr>
@@ -404,8 +405,8 @@ state; it is not cumulative usage. Missing context data appears as <code>—</co
 <tr><td><code>Home</code>, <code>End</code> in content</td><td>Beginning, latest</td></tr>
 <tr><td><code>/</code>, <code>n</code>, <code>N</code> in content</td><td>Search, next/previous match</td></tr>
 <tr><td><code>[</code>, <code>]</code> in content</td><td>Previous/next inspector tab</td></tr>
-<tr><td><code>Esc</code></td><td>Close local UI, dismiss/cancel prompts, otherwise interrupt work</td></tr>
-<tr><td><code>Ctrl+C</code></td><td>Clear draft, otherwise interrupt/quit</td></tr>
+<tr><td><code>Esc</code></td><td>Close local UI, dismiss/cancel prompts, otherwise interrupt work, cancelling the running foreground tool</td></tr>
+<tr><td><code>Ctrl+C</code></td><td>Clear draft, otherwise interrupt (as <code>Esc</code>)/quit</td></tr>
 <tr><td><code>Ctrl+X Q</code></td><td>Quit</td></tr>
 </tbody>
 </table>
@@ -516,7 +517,13 @@ and UI state are described in the <a href="#model-selection-and-ui-state">termin
 waits for owned work; root background services remain managed by the live session. On resume,
 unfinished jobs become interrupted and job identifiers continue monotonically; this does not add
 service survival across harness restarts. <code>SessionHandle::interrupt</code> stops active provider streams
-and cancels jobs across the session’s agent tree.</p>
+and cancels the foreground tool, script and question jobs that hold each interrupted turn; the
+cancelled calls are recorded as error results. Delegated child agents are left interrupted but
+retained, and <code>/retry</code> restarts them; an agent whose only live work is delegated children or background
+jobs is left waiting. Background jobs keep running, except any launched by a cancelled script, which are
+cancelled with it. <code>job_cancel</code> and shutdown remain the final,
+non-resumable paths. Once shutdown is requested no agent begins another model request; a child
+reply still pending at that moment stays in the journal and is presented after resume.</p>
 <h2 id="conversation-compaction"><a class="header" href="#conversation-compaction">Conversation compaction</a></h2>
 <p>After a successful model request completes, Skyhook automatically compacts when the provider’s
 reported <strong>input + cached input + output tokens reach 80% of <code>max_context</code></strong>. The decision
@@ -570,7 +577,7 @@ If todos change during summarization, a fresh attempt uses current history and s
 request still ends with a fresh state block containing current todos and active jobs.</p>
 <p><code>ModelRequest.response_schema</code> optionally supplies a named JSON Schema for final answer text,
 independently of reasoning settings. Native backends transmit it through OpenAI Chat Completions,
-Responses, and Anthropic Messages formats. Codex uses the same Responses codec for WebSocket and
+Responses, and Anthropic Messages formats. Codex uses the same Responses codec over
 HTTP/SSE, including structured output. Models/endpoints must support the requested features; providers
 must reject unsupported constraints instead of silently ignoring them or substituting a prompt.
 Ordinary agent requests have no response schema.</p>
@@ -788,9 +795,8 @@ across tools and workspace-specific pooled connections; reconnecting an unchange
 prompt again. Changing a target or any hop in its route invalidates the affected approval.</p>
 <p>JavaScript remains host-owned while nested targeted tools inherit their caller’s location. The
 <code>agent</code> tool also accepts a named target or <code>root</code>.
-Remote agent state machines, providers, approvals, message history, and canonical session logging
-remain host-owned. The shim retains only live remote tool/process execution state and unclaimed
-background-job results; its worker store is ephemeral.</p>
+Agents, providers, approvals, and the session log stay on the host; a shim only runs tools and
+processes.</p>
 <p>For shim selection and catalog injection, see
 <a href="#remote-transport-and-shims">remote transport and shims</a>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
@@ -1229,8 +1235,7 @@ never retry-sounding text in an upstream message. Authentication, invalid-reques
 protocol errors remain terminal. Upstream error details are sanitized before journaling.</p>
 <p>A valid server <code>Retry-After</code> hint—delay-seconds or an HTTP-date—sets the delay,
 even when it exceeds 30 seconds. Past dates mean no delay; malformed or ambiguous
-headers fall back to the runtime policy. HTTP throttling during a WebSocket handshake
-also honors this delay instead of immediately switching to HTTP.
+headers fall back to the runtime policy.
 Without a valid hint, delays grow exponentially: <strong>1s, 2s, 4s, 8s, 16s, 30s</strong>, then
 remain at 30s. This backoff counts only transient failures of the frozen request;
 rebuilding a request after compaction or validation starts the fallback at 1s again.
@@ -1250,10 +1255,8 @@ remain frozen and retry indefinitely under the shared backoff policy until they
 succeed or are cancelled. Invalid summary/checkpoint retries rebuild against current
 runtime state and remain bounded independently.</p>
 <p>HTTP transports perform one attempt per runtime invocation, with fresh startup and
-read-idle deadlines. There is no additional provider-specific HTTP retry loop. Codex
-WebSocket handshake fallback remains transport negotiation, not another retry budget.
-Recovery clears failed connection and continuation state so the next attempt sends
-full history rather than continuing the interrupted response.</p>
+read-idle deadlines. There is no additional provider-specific HTTP retry loop. Every
+attempt sends full history.</p>
 <p>This prevents duplicate <strong>Skyhook tool execution</strong>, not duplicate provider inference: the
 provider may have processed the interrupted request, and additional usage may be incurred.
 Usage reported before interruption is retained; unreported provider usage remains unknown.
@@ -1320,8 +1323,7 @@ transport delay policy. Cancellation drops the pending request, stream, or runti
 The server may continue work if it does not honor disconnects.</p>
 <p>After successful HTTP headers are accepted, transport/read-idle failures remain transient and
 may retry the frozen request, discarding failed partial output. Malformed SSE/protocol responses
-are permanent; context overflow follows the separate bounded compaction path. Codex uses the
-same attempt count and eligibility, while preserving its WebSocket handshake fallback.
+are permanent; context overflow follows the separate bounded compaction path.
 Aborted or truncated tool generation never makes incomplete arguments executable.</p>
 <h2 id="migrating-older-configurations"><a class="header" href="#migrating-older-configurations">Migrating older configurations</a></h2>
 <p>Migration from Flux is a breaking configuration change: replace <code>openai_compatible</code> with <code>openai</code>,
@@ -1439,7 +1441,8 @@ commands and endpoints remain trusted host configuration.</p>
 <p>Skyhook imports <strong>tools only</strong>, not MCP prompts or resources. At startup it initializes each server
 and discovers its tools, then freezes that catalog for the session lifetime; later catalog-change
 notifications do not add or replace tools. A server that fails startup/discovery is warned about and
-skipped rather than preventing the rest of the harness from starting.</p>
+skipped rather than preventing the rest of the harness from starting. The terminal
+interface’s sidebar shows each server’s startup status.</p>
 <p>Imported tools are exposed both as ordinary model tools and through lazy <code>tool</code> builders inside
 <code>script</code>, using the registered tool name shown in the catalog. Native MCP argument schemas are
 preserved when they can safely coexist with Skyhook’s common tool arguments. If a schema is open
@@ -1498,7 +1501,10 @@ an instruction continues the same history without adding a synthetic user or par
 message.
 Children do not need <code>receive()</code> to read these updates. Every visible child text reply,
 including text-only and final replies, is delivered independently through the background-job
-event path and wakes <code>wait</code>, without waiting for the child job to finish. Message events carry
+event path, without waiting for the child job to finish. <code>wait</code> resolves when the agent can act:
+while the agent has other foreground work outstanding it keeps waiting, and the next model request
+then carries every accumulated event together; otherwise any pending event resolves it. Each
+notification resolves a given caller’s <code>wait</code> once, and <code>wait</code> never consumes content. Message events carry
 <code>kind: "message"</code>, the child job <code>id</code>, source <code>message</code> sequence, optional <code>name</code>, and <code>text</code>.
 Completion is determined separately by the agent’s remaining work and queued inputs, not by
 message delivery. A completed child notification references its <code>last_message</code> instead of
@@ -2094,8 +2100,8 @@ updated with the same tool:</p>
 ]});
 </code></pre>
 <p>Lists persist with the session, including completed and interrupted child lists. Resume preserves
-recorded statuses. Host interfaces can read all current lists through <code>SessionHandle::todos()</code>
-and observe <code>SessionEvent::TodosReplaced</code> through the existing runtime event subscription.
+recorded statuses. Host interfaces observe <code>SessionEvent::TodosReplaced</code> through the existing
+runtime event subscription.
 The public <code>TodoItem</code>, <code>TodoStatus</code>, and <code>TodoSnapshot</code> types live in <code>skyhook::agent</code>.</p>
 <h2 id="per-request-state-snapshot"><a class="header" href="#per-request-state-snapshot">Per-request state snapshot</a></h2>
 <p>Unless the model profile’s <a href="#providers-and-models"><code>state_mode</code></a> is <code>none</code>,
@@ -2153,25 +2159,17 @@ unchanged; transient history does not guarantee exclusion from provider KV cache
 <h1 id="development-setup"><a class="header" href="#development-setup">Development setup</a></h1>
 <h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
 <ul>
-<li>Rust 1.88 or newer and Cargo. Install the toolchain’s <code>rustfmt</code> and <code>clippy</code> components
-for formatting and lint checks.</li>
-<li><a href="https://just.systems/">just</a> on <code>PATH</code> for the repository task interface.</li>
-<li>Zig and the Rust targets <code>x86_64-unknown-linux-musl</code> and <code>aarch64-unknown-linux-musl</code>
-<strong>only for builds embedding the SSH shims</strong>, including normal debug builds.</li>
-<li>An installed <a href="https://rust-lang.github.io/mdBook/">mdBook</a> for documentation work.
-Use the installed executable; the repository does not pin or bootstrap it. Python 3.11+
-is needed only for the documentation link checker, not for building the book.</li>
+<li>Rust 1.88 or newer via rustup, and <a href="https://just.systems/">just</a> on <code>PATH</code>.</li>
+<li><a href="https://ziglang.org/download/">Zig</a> on <code>PATH</code> (or <code>CARGO_ZIGBUILD_ZIG_PATH</code>) <strong>only for
+building the SSH shims</strong>.</li>
 </ul>
 <pre><code class="language-sh">git clone https://github.com/kryesh/skyhook.git
 cd skyhook
-just --list
+just setup
 </code></pre>
-<p>For embedded-shim builds, ensure <code>zig</code> is on <code>PATH</code> (or set <code>CARGO_ZIGBUILD_ZIG_PATH</code>), then:</p>
-<pre><code class="language-sh">rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-</code></pre>
-<p>The build uses the <code>cargo-zigbuild</code> Rust library. A separate <code>cargo zigbuild</code> CLI and container
-engine are not needed. See <a href="#remote-transport-and-shims">remote transport and shims</a> for
-profiles, artifact paths, static validation, and the build matrix.</p>
+<p><code>just setup</code> adds the <code>rustfmt</code> and <code>clippy</code> components and both musl targets, and installs
+<code>cargo-zigbuild</code>, <code>cargo-nextest</code>, and mdBook with <code>cargo install</code>. See
+<a href="#remote-transport-and-shims">remote transport and shims</a> for shim profiles and artifacts.</p>
 <h2 id="common-tasks"><a class="header" href="#common-tasks">Common tasks</a></h2>
 <p>Run these commands from the repository root:</p>
 <div class="table-wrapper">
@@ -2180,119 +2178,51 @@ profiles, artifact paths, static validation, and the build matrix.</p>
 <tr><th>Command</th><th>Purpose</th></tr>
 </thead>
 <tbody>
-<tr><td><code>just build</code></td><td>Normal debug CLI, embedding both Linux SSH shims; requires Zig and both musl targets.</td></tr>
-<tr><td><code>just build-local</code></td><td>Local-only debug CLI without embedding; no Zig or extra musl targets needed.</td></tr>
-<tr><td><code>just release</code></td><td>Release CLI with both embedded shims.</td></tr>
-<tr><td><code>just shim</code></td><td>Native Linux SSH shim only, without cross-compilation or UI dependencies.</td></tr>
-<tr><td><code>just test</code></td><td>Core and CLI tests without embedding shims.</td></tr>
-<tr><td><code>just lint</code></td><td>Workspace Clippy with warnings denied, without embedding shims.</td></tr>
-<tr><td><code>just fmt</code></td><td>Format workspace Rust code.</td></tr>
-<tr><td><code>just fmt-check</code></td><td>Check formatting without edits.</td></tr>
+<tr><td><code>just setup</code></td><td>Install the Rust-side tooling and shim targets.</td></tr>
+<tr><td><code>just build-shims</code></td><td>Cross-compile debug SSH shims into <code>target/shims</code>; requires Zig.</td></tr>
+<tr><td><code>just build-shims-release</code></td><td>Cross-compile size-optimised SSH shims into <code>target/shims</code>; requires Zig.</td></tr>
+<tr><td><code>just build</code></td><td>Debug CLI; reads <code>target/shims</code> live at runtime.</td></tr>
+<tr><td><code>just build-release</code></td><td>Release CLI embedding the current contents of <code>target/shims</code>.</td></tr>
+<tr><td><code>just test</code></td><td>Full nextest suite plus doctests.</td></tr>
+<tr><td><code>just lint</code></td><td>Clippy over all targets and features with warnings denied.</td></tr>
+<tr><td><code>just fmt</code></td><td>Format Rust code.</td></tr>
 <tr><td><code>just docs</code></td><td>Build the mdBook into <code>docs/book</code>.</td></tr>
-<tr><td><code>just docs-check</code></td><td>Build and check rendered local links/anchors and root README links.</td></tr>
 <tr><td><code>just docs-serve</code></td><td>Serve and watch the book locally.</td></tr>
 <tr><td><code>just pages-build</code></td><td>Build the Pages artifact and add <code>.nojekyll</code>.</td></tr>
-<tr><td><code>just pages-publish [remote] [branch]</code></td><td>Publish a clean, committed checkout via a temporary worktree; defaults to <code>origin</code> and <code>pages</code>.</td></tr>
+<tr><td><code>just pages-publish [remote] [branch]</code></td><td>Publish the built book via a temporary worktree, never force-pushing; defaults to <code>origin</code> and <code>pages</code>.</td></tr>
 </tbody>
 </table>
 </div>
-<p>Normal <code>cargo build</code>, <code>cargo test</code>, and debug installs use the default features and therefore
-embed debug-profile shims. Prefer <code>just build-local</code>, <code>just test</code>, and <code>just lint</code> for local
-iteration without that cross-build. A local-only CLI reports an explicit missing-shim error
-if asked to use SSH. <code>just shim</code> alone does not create an embedded CLI catalog.</p>
-<h2 id="direct-cargo-commands"><a class="header" href="#direct-cargo-commands">Direct Cargo commands</a></h2>
-<p>The recipes are a convenience interface, not a replacement build system. Their corresponding
-commands remain available:</p>
-<pre><code class="language-sh">cargo build --locked -p skyhook-agent
-cargo build --locked -p skyhook-agent --no-default-features --features tui
-cargo build --locked --release -p skyhook-agent
-cargo build --locked -p skyhook-agent --bin linux-ssh --no-default-features --features shim-bin
-cargo test --locked -p skyhook-agent-core --all-targets
-cargo test --locked -p skyhook-agent --all-targets --no-default-features --features tui
-cargo clippy --locked --workspace --all-targets --no-default-features --features tui -- -D warnings
-cargo fmt --all
-cargo fmt --all -- --check
-</code></pre>
-<p>The core package is <code>skyhook-agent-core</code> (Rust crate <code>skyhook</code>); the CLI package is
-<code>skyhook-agent</code>. See <a href="#library-architecture">architecture</a> and <a href="#embedding">embedding</a> for the
-library boundaries. <a href="#documentation-and-publishing">Documentation and publishing</a> covers local preview,
-link validation, and the manual GitHub Pages workflow.</p>
+<p>There is no build script and no default feature: a plain <code>cargo build</code> compiles only the
+library. Each binary requires its own feature, <code>tui</code> for <code>skyhook</code> and <code>shim-bin</code> for
+<code>linux-ssh</code>, so pass <code>--features tui</code> (or <code>--all-features</code>) to direct Cargo commands.
+Shims are only ever built by the <code>build-shims*</code> recipes; a CLI built without them reports an
+explicit missing-shim error if asked to use SSH.</p>
+<p>The <code>skyhook-agent</code> package is one library crate named <code>skyhook</code> plus those two binaries. See
+<a href="#library-architecture">architecture</a> and <a href="#embedding">embedding</a> for the library boundaries.
+<a href="#documentation-and-publishing">Documentation and publishing</a> covers local preview and manual GitHub Pages
+publishing.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="documentation-and-publishing"><a class="header" href="#documentation-and-publishing">Documentation and publishing</a></h1>
-<h2 id="authoring-and-local-preview"><a class="header" href="#authoring-and-local-preview">Authoring and local preview</a></h2>
-<p>The book uses the installed <code>mdbook</code> executable and its default HTML theme. There is no
-version pin, downloader, custom preprocessor, or theme bootstrap. An installed <code>just</code> provides
-the task interface; direct mdBook commands work too.</p>
-<pre><code class="language-sh">just docs                 # mdbook build docs
-just docs-serve           # mdbook serve docs
+<p>The book uses the installed <code>mdbook</code> with its default theme. Sources live in <code>docs/src</code>,
+navigation in <code>docs/src/SUMMARY.md</code>, configuration in <code>docs/book.toml</code>; generated output is
+<code>docs/book</code> (ignored, never committed to the source branch).</p>
+<pre><code class="language-sh">just docs          # mdbook build docs
+just docs-serve    # mdbook serve docs, normally http://localhost:3000
+just pages-build   # build, then add .nojekyll for GitHub Pages
 </code></pre>
-<p>Open the address printed by <code>mdbook serve</code> (normally <a href="http://localhost:3000">http://localhost:3000</a>).
-The book sources live in <code>docs/src</code>, navigation in <code>docs/src/SUMMARY.md</code>, and configuration in
-<code>docs/book.toml</code>. Generated output is <code>docs/book</code>, ignored by <code>docs/.gitignore</code>.
-Do not commit generated output to the source branch. Keep secrets out of <code>docs/src</code>: mdBook
-copies non-Markdown assets, including ignored files, into local preview output. Git ignore rules
-are not an asset filter for <code>just docs</code> or <code>just docs-serve</code>.</p>
-<p>Use relative chapter links such as <code>../guide/headless.md</code> inside the book. Link to repository
-source files using <code>https://github.com/kryesh/skyhook/blob/main/...</code> or <code>tree/main/...</code>, not paths
-outside the book: those relative paths would break on the published site. The configuration
-overview includes the root <code>config.example.toml</code> at build time so it stays the single source
-of truth. Repository and edit links in the book also point to GitHub.</p>
-<p>Check links after editing:</p>
-<pre><code class="language-sh">just docs-check
-# Equivalently:
-mdbook build docs
-python3 scripts/check-docs.py
+<p>Keep secrets out of <code>docs/src</code>: mdBook copies every non-Markdown file there into the output,
+ignored or not. Use relative chapter links such as <code>../guide/headless.md</code> inside the book, and
+<code>https://github.com/kryesh/skyhook/blob/main/...</code> for repository files. The configuration
+overview includes the root <code>config.example.toml</code> at build time.</p>
+<h2 id="publishing"><a class="header" href="#publishing">Publishing</a></h2>
+<pre><code class="language-sh">just pages-publish [remote] [branch]   # defaults: origin, pages
 </code></pre>
-<p>The checker requires Python 3.11+ and uses only the standard library. It validates rendered local
-links and anchors, plus root README relative links; it does not fetch external URLs.
-Code examples are documentation, not commands that the documentation build executes.</p>
-<h2 id="prepare-the-pages-artifact"><a class="header" href="#prepare-the-pages-artifact">Prepare the Pages artifact</a></h2>
-<p>The planned canonical URL is <a href="https://kryesh.github.io/skyhook/">https://kryesh.github.io/skyhook/</a>. Building documentation locally
-does not publish that site or establish that it is already available.</p>
-<pre><code class="language-sh">just pages-build
-</code></pre>
-<p>This builds <code>docs/book</code> and adds <code>.nojekyll</code>, so GitHub Pages serves the generated static HTML
-without Jekyll processing. To do the same directly:</p>
-<pre><code class="language-sh">mdbook build docs
-touch docs/book/.nojekyll
-</code></pre>
-<h2 id="publish-manually"><a class="header" href="#publish-manually">Publish manually</a></h2>
-<p>Publishing requires Git, an installed mdBook/just toolchain, push access to the destination
-repository, and a <strong>clean, committed source checkout</strong>. Review and commit source changes first.
-The recipe builds the book from an isolated checkout of the committed source revision, then
-publishes through a separate temporary Git worktree. Ignored local files (including environment
-secrets under <code>docs/src</code>) and stale local <code>docs/book</code> output are not inputs to publication.
-It never force-pushes, refuses destinations containing the project’s source files, skips unchanged
-output, and removes obsolete published files. It does not change your configured remotes, local
-branches, or remote-tracking refs, or switch your working checkout to the publication branch.
-<code>just docs</code>, <code>just docs-serve</code>, and <code>just pages-build</code> still build your working tree for local
-preview; only the publishing recipe uses an isolated committed-source build.</p>
-<pre><code class="language-sh">just pages-publish [remote] [branch]
-</code></pre>
-<p>The default remote is <code>origin</code> and default branch is <strong><code>pages</code></strong>, not <code>gh-pages</code>. Choose the
-GitHub remote explicitly if <code>origin</code> points elsewhere. For example, if your GitHub remote is
-named <code>github</code>:</p>
-<pre><code class="language-sh">just pages-publish github
-# Or specify both the remote and publication branch:
-just pages-publish github pages
-</code></pre>
-<p>Inspect <code>git remote -v</code> and use the intended existing remote name; do not assume <code>origin</code>
-is the public GitHub repository. The public source repository is
-<a href="https://github.com/kryesh/skyhook">https://github.com/kryesh/skyhook</a>.</p>
-<p>In that GitHub repository’s <strong>Settings → Pages</strong>, choose <strong>Deploy from a branch</strong>, select
-<strong><code>pages</code></strong> (or the branch explicitly chosen above), and select <strong><code>/ (root)</code></strong>. The recipe
-publishes the contents of the built book at that branch’s root. Publication and GitHub’s deployment
-must complete before the canonical site becomes available.</p>
-<p>There is no new automatic workflow or assumed hosted-runner bootstrap. A CI runner with the
-required tools already installed can invoke the same <code>just docs-check</code> and <code>just pages-build</code>
-recipes; authenticated publishing can likewise reuse the explicit publishing recipe.</p>
-<h2 id="test-publishing-changes"><a class="header" href="#test-publishing-changes">Test publishing changes</a></h2>
-<p>Run the publishing regression tests without contacting a server or executing a real push:</p>
-<pre><code class="language-sh">bash scripts/test-pages-publish.sh
-</code></pre>
-<p>They use the installed mdBook and just with temporary local Git repositories. Coverage includes
-initial publication, unchanged output, deleted pages, source-branch protection, dirty-checkout
-rejection, fetch isolation, and cleanup after build or push failures.</p>
+<p>The recipe requires a clean checkout, builds the committed sources in a temporary worktree,
+refuses to publish over a branch that contains sources, and pushes without force; your checkout
+and branches are untouched. In the
+GitHub repository’s <strong>Settings → Pages</strong>, choose <strong>Deploy from a branch</strong>, <strong><code>pages</code></strong>, <strong><code>/ (root)</code></strong>.
+The planned canonical URL is <a href="https://kryesh.github.io/skyhook/">https://kryesh.github.io/skyhook/</a>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="library-architecture"><a class="header" href="#library-architecture">Library architecture</a></h1>
 <ul>
@@ -2300,42 +2230,16 @@ rejection, fetch isolation, and cleanup after build or push failures.</p>
 <code>ProviderContext</code>, whose <code>invoke(&amp;mut self, request)</code> returns an asynchronous response stream.
 Adapters live under <code>provider::backends</code> and wire types under <code>provider::protocol</code>.
 Custom providers implement both traits. A request’s correlation must match its context’s identity.
-The common <code>ResponseEvent</code> contract separates output items from independently streamed blocks:
-<code>ItemStarted</code>, <code>BlockStarted</code>, typed <code>BlockDelta</code>, <code>BlockEnded</code>, <code>ItemEnded</code>, <code>UsageUpdated</code>, and
-<code>ResponseEnded</code>. Item/block IDs identify content; explicit positions determine its order.
-Start events declare kinds, block ends contain authoritative final content, and item ends attach
-replay metadata once. Each readable reasoning part is a separate visible block with its own end;
-encrypted-only reasoning items need not create an empty visible section.
-<code>ResponseAssembler</code> validates lifecycles and supplies ordered snapshots to both the runtime and
-observation/UI layers. Cumulative usage snapshots replace earlier values, and response termination
-carries a stop reason rather than a truncation boolean. Legacy unindexed delta events are removed.
-Completed assistant messages persist nested items/blocks with their IDs and positions. Session
-journals now use format version 3; earlier journals are rejected with an explicit unsupported-version
-error rather than guessing the missing block boundaries. Start a new session after this upgrade.
-Reasoning
-replay payloads retain provider/endpoint/protocol/model provenance: incompatible private reasoning
-is omitted from outgoing requests, not deleted from the stored transcript.
-Input images are encoded or rejected explicitly, never silently dropped. Protocols without
-image-bearing tool results adapt images into adjacent user content associated with the tool call.
-Chat Completions also accepts the common <code>reasoning_content</code> / <code>reasoning</code> streaming fields used
-by local Qwen servers, preserving separate visible reasoning blocks and scoped replay envelopes.
-Chat request-side replay uses the provider’s <code>chat_reasoning_replay</code> field selector (default
-<code>reasoning_content</code>);
-other APIs replay their compatible native reasoning state automatically. Null optional extension
-fields are tolerated; unsupported
-nonempty semantic fields fail explicitly. Generated image outputs are not supported.
-Chat streaming compatibility is provider-neutral: absent/null choices and deltas are normalized
-to empty containers, and metadata-only chunks are harmless before <code>[DONE]</code>. After <code>finish_reason</code>,
-usage and no-op deltas (empty/null text, empty tool-call lists, assistant role headers, and null
-extensions) remain accepted, with or without usage; identical finish reasons are idempotent.
-Extra envelope, choice, and usage metadata is ignored. Actual post-finish output, conflicting
-finish reasons, unsupported non-null delta fields, malformed tool calls or usage, and data after
-<code>[DONE]</code> still fail. Metadata never substitutes for a finish reason at EOF or <code>[DONE]</code>.</li>
+Responses stream as <code>ResponseEvent</code>s: items and their blocks start, receive typed deltas, and
+end with authoritative final content; usage snapshots replace earlier values and
+<code>ResponseEnded</code> carries a stop reason. <code>ResponseAssembler</code> validates that lifecycle and supplies
+ordered snapshots to the runtime and to observers. Reasoning replay payloads keep their
+provider/model provenance, so incompatible private reasoning is omitted from requests rather
+than deleted from the transcript. Input images are encoded or rejected explicitly, never
+silently dropped; generated image outputs are not supported.</li>
 <li>Each agent loop owns an <code>AgentContext</code>: projected journal history, model profile and request
-template, token accounting, and its provider handle. Codex contexts have separate WebSocket
-connection and continuation state, with shared authentication tokens. Connection setup failures
-may fall back to HTTP. The provider never internally replays a submitted WebSocket request;
-the runtime can reset the connection and retry an uncommitted response within its recovery budget.
+template, token accounting, and its provider handle. Providers never internally replay a submitted
+request; the runtime retries an uncommitted response within its recovery policy.
 Handles survive turns, retries, questions, and compaction, and are released when the agent exits.
 Model-profile changes prepare a replacement before committing, preserve history, and reset token
 calibration. Equivalent profiles retain their handle. Resuming opens a fresh handle with the
@@ -2343,22 +2247,23 @@ same agent cache identity; compaction clears calibration from the previous histo
 <li><code>tool::ToolRegistryBuilder</code> supports typed and JSON-based tools, while <code>tool::executor::ToolExecutor</code>
 turns every invocation into a supervised job. Typed registrations generate both input and output
 schemas; compact result shapes are included in model and script documentation.</li>
-<li><code>session::SessionStore</code> persists a versioned append-only JSONL log, content-addressed attachment and image blobs, job
-outputs, and line-addressable job output.</li>
+<li><code>session::SessionStore</code> persists each session in one SQLite database (<code>session.db</code>): a normalized
+append-only ledger committed one transaction per step, content-addressed blobs, and job outputs
+with line-addressable captures.</li>
 <li><code>agent::Harness</code> owns model profiles and policy; each <code>agent::SessionHandle</code> owns an isolated agent tree
 and registry.</li>
 </ul>
-<p>The CLI package is <code>skyhook-agent</code>; the source-only core package is <code>skyhook-agent-core</code>
-with Rust crate name <code>skyhook</code>. The terminal is a host of the same core used by embedders,
+<p>The <code>skyhook-agent</code> package holds the <code>skyhook</code> library crate and the CLI binary. The terminal
+is a host of the same library used by embedders,
 not a provider-specific agent implementation.</p>
 <p>See <a href="#embedding">embedding</a> for host observation and replay contracts,
 <a href="#remote-transport-and-shims">remote transport and shims</a> for backend boundaries, and
 <a href="#jobs-and-agents">jobs and agents</a> for delegation behavior.</p>
-<p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src">core library</a>
+<p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/src">library</a>
 and <a href="https://github.com/kryesh/skyhook/tree/main/src/bin/skyhook">CLI</a>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="embedding"><a class="header" href="#embedding">Embedding</a></h1>
-<p>The <code>skyhook-agent-core</code> package exposes the <code>skyhook</code> Rust crate. Embedding hosts supply
+<p>The <code>skyhook-agent</code> package exposes the <code>skyhook</code> Rust library crate. Embedding hosts supply
 configuration, a workspace, model selection, and interaction handlers rather than depending
 on terminal UI state. See <a href="#library-architecture">library architecture</a> for the provider, registry,
 and session ownership boundaries.</p>
@@ -2376,8 +2281,7 @@ load <code>.env</code>. That startup behavior belongs to the CLI.</p>
 <h2 id="embedded-shim-catalog"><a class="header" href="#embedded-shim-catalog">Embedded shim catalog</a></h2>
 <p>The CLI injects its embedded shim catalog into the core harness. Shims are selected by protocol,
 platform, and architecture; artifact names follow <code>platform-protocol-arch</code> (for example,
-<code>linux-ssh-aarch64</code>). The naming scheme allows an optional <code>.exe</code> suffix for future platforms,
-but no Windows transport is implemented. Library embedders receive an empty catalog by default
+<code>linux-ssh-aarch64</code>). Library embedders receive an empty catalog by default
 and can provide their own <code>EmbeddedShimCatalog</code> through <code>HarnessBuilder</code>; selecting a combination
 without a supplied shim returns an unsupported-platform error.</p>
 <h2 id="reconstructing-model-calls"><a class="header" href="#reconstructing-model-calls">Reconstructing model calls</a></h2>
@@ -2417,98 +2321,55 @@ history, <code>ending</code> when compaction replaces it after this agent reques
 reaches the compaction threshold), or <code>detached</code> for compaction summaries, which share no request
 settings with any other request. Providers decide prompt-cache placement from <code>history</code>, <code>tail</code>, and
 the lifetime: Anthropic places a cache breakpoint on the last history block unless it is detached
-(ending history is still marked, since cache reads land only at breakpoints), OpenAI protocols rely on
-automatic prefix caching with the tail sent last, and Codex records no WebSocket continuation for a
-request with a tail or non-continuing history.
-Session journals use format version 3; there is no compatibility or migration layer for earlier layouts.</p>
-<p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src/session">session module</a>
-and <a href="https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src/agent">agent module</a>.</p>
+(ending history is still marked, since cache reads land only at breakpoints), and OpenAI protocols rely on
+automatic prefix caching with the tail sent last. Chat Completions and Responses append a runtime-only
+tail message to the final tool output or user message rather than sending a separate user message,
+which models read as the user speaking again after every tool call.
+Session databases use format version 5; there is no compatibility or migration layer for earlier layouts.</p>
+<p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/src/session">session module</a>
+and <a href="https://github.com/kryesh/skyhook/tree/main/src/agent">agent module</a>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="remote-transport-and-shims"><a class="header" href="#remote-transport-and-shims">Remote transport and shims</a></h1>
-<h2 id="remote-transport-architecture"><a class="header" href="#remote-transport-architecture">Remote transport architecture</a></h2>
-<p>Remote connection protocols use the production <code>ConnectionFactory</code> interface in
-<code>crates/skyhook-core/src/remote/backend.rs</code>. Factories receive the route hops after the destination’s origin and return an owned
-<code>Transport</code> byte stream; the manager performs the common shim handshake and client setup for both
-real backends and test doubles. Protocol selection goes through the backend dispatch layer, rather
-than constructing SSH launchers in the manager or target router.</p>
-<ul>
-<li><code>remote/manager.rs</code> owns splitting routes at SSH origins, workspace connection pooling,
-cancellation, and invalidation.</li>
-<li><code>remote/client/</code> owns shared shim RPC and relayed stream state; <code>remote/transport.rs</code> defines
-the owned asynchronous byte-stream contract.</li>
-<li><code>remote/backends/ssh/</code> contains OpenSSH configuration/bootstrap, process supervision, askpass,
-and session-owned authentication. The public <code>remote::ssh</code> path remains a compatibility export.</li>
-<li><code>remote/protocol.rs</code> is the <strong>shim wire protocol</strong>, not the SSH/WinRM transport interface.</li>
-</ul>
+<h2 id="remote-transport"><a class="header" href="#remote-transport">Remote transport</a></h2>
+<p>The crate-private <code>ConnectionFactory</code> (<code>remote/backend.rs</code>) opens an owned <code>Transport</code> byte stream
+to a route; the manager performs the shim handshake over it, pools one connection per workspace,
+and test doubles implement the same trait. <code>remote/protocol.rs</code> is the shim wire protocol carried over that stream.</p>
 <p>SSH configuration is generated only from target definitions. An SSH process runs on root or on
-the shim of the destination’s <code>origin</code>, whose connection the child stream retains; <code>via</code> hops are
-native <code>ProxyJump</code> hops of that process and share its origin. Each origin runs its own lazy private
-agent. A backend must release its resources during session shutdown. Cancelling one waiter must not terminate a connection startup shared with
-other callers. Adding another protocol still requires its own target configuration,
-authentication, and bootstrap; the abstraction does not make SSH shell commands or ProxyJump
-semantics universal.</p>
+the shim of the destination’s <code>origin</code>; <code>via</code> hops are native <code>ProxyJump</code> hops of that process.
+Cancelling one waiter never terminates a connection startup shared with other callers.</p>
 <h2 id="embedded-shim-builds"><a class="header" href="#embedded-shim-builds">Embedded shim builds</a></h2>
-<p>Build both statically linked Linux SSH shims and the release CLI with
-<code>cargo build --release -p skyhook-agent</code>. This default-feature build requires Zig and both Rust
-musl targets listed below; it does not require a container engine. Zig 0.16.0 was used to validate
-both targets.</p>
-<p>Debug builds (<code>cargo build</code>, <code>cargo test</code>, and <code>cargo install --debug</code>) build the shims with
-Cargo’s <code>dev</code> profile: no optimization or stripping by default, with debug information and
-debug assertions. Release builds keep the size-optimized, stripped <code>shim-release</code> profile.
-Both modes use the same musl targets and static ELF validation, and publish to the same artifact
-filenames in <code>target/shims/</code>. Switching build modes replaces those files with the matching variants;
-debug artifacts and the binaries embedding them are substantially larger.</p>
-<p>The private build matrix is <code>ShimArchitecture</code> in <a href="https://github.com/kryesh/skyhook/blob/main/build.rs"><code>build.rs</code></a>.
-Its single architecture definition generates the supported variants and their architecture labels,
-Rust target triples, and expected ELF machine codes. All built-in shims use the <code>linux-ssh</code> Cargo
-binary; the saved artifacts remain <code>linux-ssh-x86_64</code> and <code>linux-ssh-aarch64</code>. This closed build
-matrix does not restrict the runtime catalog: it discovers embedded filenames and selects by
-protocol, platform, and architecture after probing the remote machine. The catalog also understands executable extensions, such as
-<code>windows-winrm-x86_64.exe</code>, but no Windows build target or WinRM transport is implemented yet.</p>
-<p><code>rust-embed</code> embeds both the file list and bytes in debug and release builds, so installed binaries
-do not need the build-time <code>target/shims/</code> directory. Local-only and rust-analyzer builds skip embedding even
-if artifacts already exist. Shim builds deliberately ignore host Rust flags (including Cargo
-configuration rustflags) to keep the artifacts portable.</p>
-<p>The fixed staging location is <code>&lt;package&gt;/target/shims/</code>, even when <code>CARGO_TARGET_DIR</code> or
-<code>--target-dir</code> redirects compilation elsewhere. It must be writable; intermediate shim builds
-remain isolated under Cargo’s <code>OUT_DIR</code>. The embedder allows a missing staging directory for
-clean-tree tooling, but normal embedding builds must successfully generate and validate their
-shims before the catalog is enabled.</p>
-<p>Generated files are published atomically and unchanged bytes are not rewritten; unrelated
-artifacts are preserved. Remove obsolete artifacts explicitly when changing the build matrix,
-and avoid simultaneous builds writing to the same staging directory.</p>
-<p>Cargo excludes the package’s <code>target/</code> directory from source packages and package-verification
-source comparisons. Staging there therefore avoids the source-modification failure of the old
-source-root <code>shims/</code> location, without requiring local-only verification flags:</p>
-<pre><code class="language-sh">cargo build --release -p skyhook-agent --locked
-cargo package -p skyhook-agent --locked
-</code></pre>
+<p>Shims are built explicitly, never as a side effect of building the CLI. <code>just build-shims</code> builds
+every shim type with Cargo’s <code>dev</code> profile; <code>just build-shims-release</code> uses the size-optimised,
+stripped <code>shim-release</code> profile. The <code>linux-ssh</code> shim is cross-compiled with <code>cargo zigbuild</code> for
+every target in the justfile’s <code>linux_ssh_targets</code> and copied to <code>target/shims/linux-ssh-&lt;arch&gt;</code>,
+replacing the previous variant. New shim types are added to the justfile’s <code>_shims</code> recipe. Debug
+artifacts are substantially larger. Zig 0.16.0 was used to validate both targets; <code>just setup</code>
+installs <code>cargo-zigbuild</code> and the musl targets, but Zig itself must be installed separately.</p>
+<p>The CLI embeds whatever <code>target/shims/</code> contains, via <code>rust-embed</code>, without checking how it got
+there. Debug builds (<code>just build</code>) read the directory live at runtime, so rebuilding shims needs
+no CLI rebuild. Release builds (<code>just build-release</code>) include the bytes at compile time and are
+self-contained; the recipe touches the embedding module first because <code>rust-embed</code> cannot detect
+newly added files. A missing or empty directory yields an empty catalog, and SSH use then
+reports an explicit missing-shim error.</p>
 <h2 id="shim-targets-and-artifacts"><a class="header" href="#shim-targets-and-artifacts">Shim targets and artifacts</a></h2>
-<p>The <code>linux-ssh</code> binary is built from <code>src/bin/linux-ssh</code> for these shim targets:</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Platform</th><th>Protocol</th><th>Architecture</th><th>Rust target</th></tr>
+<tr><th>Platform</th><th>Protocol</th><th>Architecture</th><th>Rust target</th><th>Artifact</th></tr>
 </thead>
 <tbody>
-<tr><td><code>linux</code></td><td><code>ssh</code></td><td><code>x86_64</code></td><td><code>x86_64-unknown-linux-musl</code></td></tr>
-<tr><td><code>linux</code></td><td><code>ssh</code></td><td><code>aarch64</code></td><td><code>aarch64-unknown-linux-musl</code></td></tr>
+<tr><td><code>linux</code></td><td><code>ssh</code></td><td><code>x86_64</code></td><td><code>x86_64-unknown-linux-musl</code></td><td><code>target/shims/linux-ssh-x86_64</code></td></tr>
+<tr><td><code>linux</code></td><td><code>ssh</code></td><td><code>aarch64</code></td><td><code>aarch64-unknown-linux-musl</code></td><td><code>target/shims/linux-ssh-aarch64</code></td></tr>
 </tbody>
 </table>
 </div>
-<p>The resulting static ELF executables are validated, written to the gitignored generated-artifact
-folder as <code>target/shims/linux-ssh-x86_64</code> and <code>target/shims/linux-ssh-aarch64</code>, and embedded in the installed
-<code>skyhook</code> command with <code>rust-embed</code>. Git and the Cargo source package contain source only, not
-prebuilt shim binaries.</p>
-<p>The build support uses the <code>cargo-zigbuild</code> Rust library with the installed Zig executable.
-Install prerequisites as described in <a href="#installation">installation</a>.
-To build just the native Linux SSH shim without Zig or UI dependencies:</p>
-<pre><code class="language-sh">cargo build --bin linux-ssh --no-default-features --features shim-bin
+<p>Git contains source only, not prebuilt shim binaries. To build just a native Linux SSH shim
+without Zig or UI dependencies:</p>
+<pre><code class="language-sh">cargo build --bin linux-ssh --features shim-bin
 </code></pre>
-<p>The contributor interface provides <code>just build</code>, <code>just build-local</code>, <code>just release</code>, and
-<code>just shim</code>; see <a href="#development-setup">development setup</a>. Library hosts inject their own
+<p>See <a href="#development-setup">development setup</a> for the full recipe list. Library hosts inject their own
 <a href="#embedded-shim-catalog">embedded catalog</a>.</p>
-<p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src/remote">remote module</a>
+<p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/src/remote">remote module</a>
 and <a href="https://github.com/kryesh/skyhook/tree/main/src/bin/linux-ssh">shim binary</a>.</p>
 
                     </main>

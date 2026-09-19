@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-67539886.js";
+            window.path_to_searchindex_js = "../searchindex-b114b291.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -183,25 +183,17 @@
                         <h1 id="development-setup"><a class="header" href="#development-setup">Development setup</a></h1>
 <h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
 <ul>
-<li>Rust 1.88 or newer and Cargo. Install the toolchain’s <code>rustfmt</code> and <code>clippy</code> components
-for formatting and lint checks.</li>
-<li><a href="https://just.systems/">just</a> on <code>PATH</code> for the repository task interface.</li>
-<li>Zig and the Rust targets <code>x86_64-unknown-linux-musl</code> and <code>aarch64-unknown-linux-musl</code>
-<strong>only for builds embedding the SSH shims</strong>, including normal debug builds.</li>
-<li>An installed <a href="https://rust-lang.github.io/mdBook/">mdBook</a> for documentation work.
-Use the installed executable; the repository does not pin or bootstrap it. Python 3.11+
-is needed only for the documentation link checker, not for building the book.</li>
+<li>Rust 1.88 or newer via rustup, and <a href="https://just.systems/">just</a> on <code>PATH</code>.</li>
+<li><a href="https://ziglang.org/download/">Zig</a> on <code>PATH</code> (or <code>CARGO_ZIGBUILD_ZIG_PATH</code>) <strong>only for
+building the SSH shims</strong>.</li>
 </ul>
 <pre><code class="language-sh">git clone https://github.com/kryesh/skyhook.git
 cd skyhook
-just --list
+just setup
 </code></pre>
-<p>For embedded-shim builds, ensure <code>zig</code> is on <code>PATH</code> (or set <code>CARGO_ZIGBUILD_ZIG_PATH</code>), then:</p>
-<pre><code class="language-sh">rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-</code></pre>
-<p>The build uses the <code>cargo-zigbuild</code> Rust library. A separate <code>cargo zigbuild</code> CLI and container
-engine are not needed. See <a href="remote-transport-and-shims.html">remote transport and shims</a> for
-profiles, artifact paths, static validation, and the build matrix.</p>
+<p><code>just setup</code> adds the <code>rustfmt</code> and <code>clippy</code> components and both musl targets, and installs
+<code>cargo-zigbuild</code>, <code>cargo-nextest</code>, and mdBook with <code>cargo install</code>. See
+<a href="remote-transport-and-shims.html">remote transport and shims</a> for shim profiles and artifacts.</p>
 <h2 id="common-tasks"><a class="header" href="#common-tasks">Common tasks</a></h2>
 <p>Run these commands from the repository root:</p>
 <div class="table-wrapper">
@@ -210,43 +202,30 @@ profiles, artifact paths, static validation, and the build matrix.</p>
 <tr><th>Command</th><th>Purpose</th></tr>
 </thead>
 <tbody>
-<tr><td><code>just build</code></td><td>Normal debug CLI, embedding both Linux SSH shims; requires Zig and both musl targets.</td></tr>
-<tr><td><code>just build-local</code></td><td>Local-only debug CLI without embedding; no Zig or extra musl targets needed.</td></tr>
-<tr><td><code>just release</code></td><td>Release CLI with both embedded shims.</td></tr>
-<tr><td><code>just shim</code></td><td>Native Linux SSH shim only, without cross-compilation or UI dependencies.</td></tr>
-<tr><td><code>just test</code></td><td>Core and CLI tests without embedding shims.</td></tr>
-<tr><td><code>just lint</code></td><td>Workspace Clippy with warnings denied, without embedding shims.</td></tr>
-<tr><td><code>just fmt</code></td><td>Format workspace Rust code.</td></tr>
-<tr><td><code>just fmt-check</code></td><td>Check formatting without edits.</td></tr>
+<tr><td><code>just setup</code></td><td>Install the Rust-side tooling and shim targets.</td></tr>
+<tr><td><code>just build-shims</code></td><td>Cross-compile debug SSH shims into <code>target/shims</code>; requires Zig.</td></tr>
+<tr><td><code>just build-shims-release</code></td><td>Cross-compile size-optimised SSH shims into <code>target/shims</code>; requires Zig.</td></tr>
+<tr><td><code>just build</code></td><td>Debug CLI; reads <code>target/shims</code> live at runtime.</td></tr>
+<tr><td><code>just build-release</code></td><td>Release CLI embedding the current contents of <code>target/shims</code>.</td></tr>
+<tr><td><code>just test</code></td><td>Full nextest suite plus doctests.</td></tr>
+<tr><td><code>just lint</code></td><td>Clippy over all targets and features with warnings denied.</td></tr>
+<tr><td><code>just fmt</code></td><td>Format Rust code.</td></tr>
 <tr><td><code>just docs</code></td><td>Build the mdBook into <code>docs/book</code>.</td></tr>
-<tr><td><code>just docs-check</code></td><td>Build and check rendered local links/anchors and root README links.</td></tr>
 <tr><td><code>just docs-serve</code></td><td>Serve and watch the book locally.</td></tr>
 <tr><td><code>just pages-build</code></td><td>Build the Pages artifact and add <code>.nojekyll</code>.</td></tr>
-<tr><td><code>just pages-publish [remote] [branch]</code></td><td>Publish a clean, committed checkout via a temporary worktree; defaults to <code>origin</code> and <code>pages</code>.</td></tr>
+<tr><td><code>just pages-publish [remote] [branch]</code></td><td>Publish the built book via a temporary worktree, never force-pushing; defaults to <code>origin</code> and <code>pages</code>.</td></tr>
 </tbody>
 </table>
 </div>
-<p>Normal <code>cargo build</code>, <code>cargo test</code>, and debug installs use the default features and therefore
-embed debug-profile shims. Prefer <code>just build-local</code>, <code>just test</code>, and <code>just lint</code> for local
-iteration without that cross-build. A local-only CLI reports an explicit missing-shim error
-if asked to use SSH. <code>just shim</code> alone does not create an embedded CLI catalog.</p>
-<h2 id="direct-cargo-commands"><a class="header" href="#direct-cargo-commands">Direct Cargo commands</a></h2>
-<p>The recipes are a convenience interface, not a replacement build system. Their corresponding
-commands remain available:</p>
-<pre><code class="language-sh">cargo build --locked -p skyhook-agent
-cargo build --locked -p skyhook-agent --no-default-features --features tui
-cargo build --locked --release -p skyhook-agent
-cargo build --locked -p skyhook-agent --bin linux-ssh --no-default-features --features shim-bin
-cargo test --locked -p skyhook-agent-core --all-targets
-cargo test --locked -p skyhook-agent --all-targets --no-default-features --features tui
-cargo clippy --locked --workspace --all-targets --no-default-features --features tui -- -D warnings
-cargo fmt --all
-cargo fmt --all -- --check
-</code></pre>
-<p>The core package is <code>skyhook-agent-core</code> (Rust crate <code>skyhook</code>); the CLI package is
-<code>skyhook-agent</code>. See <a href="architecture.html">architecture</a> and <a href="embedding.html">embedding</a> for the
-library boundaries. <a href="documentation.html">Documentation and publishing</a> covers local preview,
-link validation, and the manual GitHub Pages workflow.</p>
+<p>There is no build script and no default feature: a plain <code>cargo build</code> compiles only the
+library. Each binary requires its own feature, <code>tui</code> for <code>skyhook</code> and <code>shim-bin</code> for
+<code>linux-ssh</code>, so pass <code>--features tui</code> (or <code>--all-features</code>) to direct Cargo commands.
+Shims are only ever built by the <code>build-shims*</code> recipes; a CLI built without them reports an
+explicit missing-shim error if asked to use SSH.</p>
+<p>The <code>skyhook-agent</code> package is one library crate named <code>skyhook</code> plus those two binaries. See
+<a href="architecture.html">architecture</a> and <a href="embedding.html">embedding</a> for the library boundaries.
+<a href="documentation.html">Documentation and publishing</a> covers local preview and manual GitHub Pages
+publishing.</p>
 
                     </main>
 

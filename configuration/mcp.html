@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-67539886.js";
+            window.path_to_searchindex_js = "../searchindex-b114b291.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -238,7 +238,8 @@ commands and endpoints remain trusted host configuration.</p>
 <p>Skyhook imports <strong>tools only</strong>, not MCP prompts or resources. At startup it initializes each server
 and discovers its tools, then freezes that catalog for the session lifetime; later catalog-change
 notifications do not add or replace tools. A server that fails startup/discovery is warned about and
-skipped rather than preventing the rest of the harness from starting.</p>
+skipped rather than preventing the rest of the harness from starting. The terminal
+interface’s sidebar shows each server’s startup status.</p>
 <p>Imported tools are exposed both as ordinary model tools and through lazy <code>tool</code> builders inside
 <code>script</code>, using the registered tool name shown in the catalog. Native MCP argument schemas are
 preserved when they can safely coexist with Skyhook’s common tool arguments. If a schema is open

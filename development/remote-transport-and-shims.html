@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-67539886.js";
+            window.path_to_searchindex_js = "../searchindex-b114b291.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -181,90 +181,46 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="remote-transport-and-shims"><a class="header" href="#remote-transport-and-shims">Remote transport and shims</a></h1>
-<h2 id="remote-transport-architecture"><a class="header" href="#remote-transport-architecture">Remote transport architecture</a></h2>
-<p>Remote connection protocols use the production <code>ConnectionFactory</code> interface in
-<code>crates/skyhook-core/src/remote/backend.rs</code>. Factories receive the route hops after the destination’s origin and return an owned
-<code>Transport</code> byte stream; the manager performs the common shim handshake and client setup for both
-real backends and test doubles. Protocol selection goes through the backend dispatch layer, rather
-than constructing SSH launchers in the manager or target router.</p>
-<ul>
-<li><code>remote/manager.rs</code> owns splitting routes at SSH origins, workspace connection pooling,
-cancellation, and invalidation.</li>
-<li><code>remote/client/</code> owns shared shim RPC and relayed stream state; <code>remote/transport.rs</code> defines
-the owned asynchronous byte-stream contract.</li>
-<li><code>remote/backends/ssh/</code> contains OpenSSH configuration/bootstrap, process supervision, askpass,
-and session-owned authentication. The public <code>remote::ssh</code> path remains a compatibility export.</li>
-<li><code>remote/protocol.rs</code> is the <strong>shim wire protocol</strong>, not the SSH/WinRM transport interface.</li>
-</ul>
+<h2 id="remote-transport"><a class="header" href="#remote-transport">Remote transport</a></h2>
+<p>The crate-private <code>ConnectionFactory</code> (<code>remote/backend.rs</code>) opens an owned <code>Transport</code> byte stream
+to a route; the manager performs the shim handshake over it, pools one connection per workspace,
+and test doubles implement the same trait. <code>remote/protocol.rs</code> is the shim wire protocol carried over that stream.</p>
 <p>SSH configuration is generated only from target definitions. An SSH process runs on root or on
-the shim of the destination’s <code>origin</code>, whose connection the child stream retains; <code>via</code> hops are
-native <code>ProxyJump</code> hops of that process and share its origin. Each origin runs its own lazy private
-agent. A backend must release its resources during session shutdown. Cancelling one waiter must not terminate a connection startup shared with
-other callers. Adding another protocol still requires its own target configuration,
-authentication, and bootstrap; the abstraction does not make SSH shell commands or ProxyJump
-semantics universal.</p>
+the shim of the destination’s <code>origin</code>; <code>via</code> hops are native <code>ProxyJump</code> hops of that process.
+Cancelling one waiter never terminates a connection startup shared with other callers.</p>
 <h2 id="embedded-shim-builds"><a class="header" href="#embedded-shim-builds">Embedded shim builds</a></h2>
-<p>Build both statically linked Linux SSH shims and the release CLI with
-<code>cargo build --release -p skyhook-agent</code>. This default-feature build requires Zig and both Rust
-musl targets listed below; it does not require a container engine. Zig 0.16.0 was used to validate
-both targets.</p>
-<p>Debug builds (<code>cargo build</code>, <code>cargo test</code>, and <code>cargo install --debug</code>) build the shims with
-Cargo’s <code>dev</code> profile: no optimization or stripping by default, with debug information and
-debug assertions. Release builds keep the size-optimized, stripped <code>shim-release</code> profile.
-Both modes use the same musl targets and static ELF validation, and publish to the same artifact
-filenames in <code>target/shims/</code>. Switching build modes replaces those files with the matching variants;
-debug artifacts and the binaries embedding them are substantially larger.</p>
-<p>The private build matrix is <code>ShimArchitecture</code> in <a href="https://github.com/kryesh/skyhook/blob/main/build.rs"><code>build.rs</code></a>.
-Its single architecture definition generates the supported variants and their architecture labels,
-Rust target triples, and expected ELF machine codes. All built-in shims use the <code>linux-ssh</code> Cargo
-binary; the saved artifacts remain <code>linux-ssh-x86_64</code> and <code>linux-ssh-aarch64</code>. This closed build
-matrix does not restrict the runtime catalog: it discovers embedded filenames and selects by
-protocol, platform, and architecture after probing the remote machine. The catalog also understands executable extensions, such as
-<code>windows-winrm-x86_64.exe</code>, but no Windows build target or WinRM transport is implemented yet.</p>
-<p><code>rust-embed</code> embeds both the file list and bytes in debug and release builds, so installed binaries
-do not need the build-time <code>target/shims/</code> directory. Local-only and rust-analyzer builds skip embedding even
-if artifacts already exist. Shim builds deliberately ignore host Rust flags (including Cargo
-configuration rustflags) to keep the artifacts portable.</p>
-<p>The fixed staging location is <code>&lt;package&gt;/target/shims/</code>, even when <code>CARGO_TARGET_DIR</code> or
-<code>--target-dir</code> redirects compilation elsewhere. It must be writable; intermediate shim builds
-remain isolated under Cargo’s <code>OUT_DIR</code>. The embedder allows a missing staging directory for
-clean-tree tooling, but normal embedding builds must successfully generate and validate their
-shims before the catalog is enabled.</p>
-<p>Generated files are published atomically and unchanged bytes are not rewritten; unrelated
-artifacts are preserved. Remove obsolete artifacts explicitly when changing the build matrix,
-and avoid simultaneous builds writing to the same staging directory.</p>
-<p>Cargo excludes the package’s <code>target/</code> directory from source packages and package-verification
-source comparisons. Staging there therefore avoids the source-modification failure of the old
-source-root <code>shims/</code> location, without requiring local-only verification flags:</p>
-<pre><code class="language-sh">cargo build --release -p skyhook-agent --locked
-cargo package -p skyhook-agent --locked
-</code></pre>
+<p>Shims are built explicitly, never as a side effect of building the CLI. <code>just build-shims</code> builds
+every shim type with Cargo’s <code>dev</code> profile; <code>just build-shims-release</code> uses the size-optimised,
+stripped <code>shim-release</code> profile. The <code>linux-ssh</code> shim is cross-compiled with <code>cargo zigbuild</code> for
+every target in the justfile’s <code>linux_ssh_targets</code> and copied to <code>target/shims/linux-ssh-&lt;arch&gt;</code>,
+replacing the previous variant. New shim types are added to the justfile’s <code>_shims</code> recipe. Debug
+artifacts are substantially larger. Zig 0.16.0 was used to validate both targets; <code>just setup</code>
+installs <code>cargo-zigbuild</code> and the musl targets, but Zig itself must be installed separately.</p>
+<p>The CLI embeds whatever <code>target/shims/</code> contains, via <code>rust-embed</code>, without checking how it got
+there. Debug builds (<code>just build</code>) read the directory live at runtime, so rebuilding shims needs
+no CLI rebuild. Release builds (<code>just build-release</code>) include the bytes at compile time and are
+self-contained; the recipe touches the embedding module first because <code>rust-embed</code> cannot detect
+newly added files. A missing or empty directory yields an empty catalog, and SSH use then
+reports an explicit missing-shim error.</p>
 <h2 id="shim-targets-and-artifacts"><a class="header" href="#shim-targets-and-artifacts">Shim targets and artifacts</a></h2>
-<p>The <code>linux-ssh</code> binary is built from <code>src/bin/linux-ssh</code> for these shim targets:</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Platform</th><th>Protocol</th><th>Architecture</th><th>Rust target</th></tr>
+<tr><th>Platform</th><th>Protocol</th><th>Architecture</th><th>Rust target</th><th>Artifact</th></tr>
 </thead>
 <tbody>
-<tr><td><code>linux</code></td><td><code>ssh</code></td><td><code>x86_64</code></td><td><code>x86_64-unknown-linux-musl</code></td></tr>
-<tr><td><code>linux</code></td><td><code>ssh</code></td><td><code>aarch64</code></td><td><code>aarch64-unknown-linux-musl</code></td></tr>
+<tr><td><code>linux</code></td><td><code>ssh</code></td><td><code>x86_64</code></td><td><code>x86_64-unknown-linux-musl</code></td><td><code>target/shims/linux-ssh-x86_64</code></td></tr>
+<tr><td><code>linux</code></td><td><code>ssh</code></td><td><code>aarch64</code></td><td><code>aarch64-unknown-linux-musl</code></td><td><code>target/shims/linux-ssh-aarch64</code></td></tr>
 </tbody>
 </table>
 </div>
-<p>The resulting static ELF executables are validated, written to the gitignored generated-artifact
-folder as <code>target/shims/linux-ssh-x86_64</code> and <code>target/shims/linux-ssh-aarch64</code>, and embedded in the installed
-<code>skyhook</code> command with <code>rust-embed</code>. Git and the Cargo source package contain source only, not
-prebuilt shim binaries.</p>
-<p>The build support uses the <code>cargo-zigbuild</code> Rust library with the installed Zig executable.
-Install prerequisites as described in <a href="../getting-started/installation.html">installation</a>.
-To build just the native Linux SSH shim without Zig or UI dependencies:</p>
-<pre><code class="language-sh">cargo build --bin linux-ssh --no-default-features --features shim-bin
+<p>Git contains source only, not prebuilt shim binaries. To build just a native Linux SSH shim
+without Zig or UI dependencies:</p>
+<pre><code class="language-sh">cargo build --bin linux-ssh --features shim-bin
 </code></pre>
-<p>The contributor interface provides <code>just build</code>, <code>just build-local</code>, <code>just release</code>, and
-<code>just shim</code>; see <a href="setup.html">development setup</a>. Library hosts inject their own
+<p>See <a href="setup.html">development setup</a> for the full recipe list. Library hosts inject their own
 <a href="embedding.html#embedded-shim-catalog">embedded catalog</a>.</p>
-<p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/crates/skyhook-core/src/remote">remote module</a>
+<p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/src/remote">remote module</a>
 and <a href="https://github.com/kryesh/skyhook/tree/main/src/bin/linux-ssh">shim binary</a>.</p>
 
                     </main>

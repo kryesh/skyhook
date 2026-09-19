@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-67539886.js";
+            window.path_to_searchindex_js = "../searchindex-b114b291.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -195,7 +195,13 @@ and UI state are described in the <a href="terminal-interface.html#model-selecti
 waits for owned work; root background services remain managed by the live session. On resume,
 unfinished jobs become interrupted and job identifiers continue monotonically; this does not add
 service survival across harness restarts. <code>SessionHandle::interrupt</code> stops active provider streams
-and cancels jobs across the session’s agent tree.</p>
+and cancels the foreground tool, script and question jobs that hold each interrupted turn; the
+cancelled calls are recorded as error results. Delegated child agents are left interrupted but
+retained, and <code>/retry</code> restarts them; an agent whose only live work is delegated children or background
+jobs is left waiting. Background jobs keep running, except any launched by a cancelled script, which are
+cancelled with it. <code>job_cancel</code> and shutdown remain the final,
+non-resumable paths. Once shutdown is requested no agent begins another model request; a child
+reply still pending at that moment stays in the journal and is presented after resume.</p>
 <h2 id="conversation-compaction"><a class="header" href="#conversation-compaction">Conversation compaction</a></h2>
 <p>After a successful model request completes, Skyhook automatically compacts when the provider’s
 reported <strong>input + cached input + output tokens reach 80% of <code>max_context</code></strong>. The decision
@@ -249,7 +255,7 @@ If todos change during summarization, a fresh attempt uses current history and s
 request still ends with a fresh state block containing current todos and active jobs.</p>
 <p><code>ModelRequest.response_schema</code> optionally supplies a named JSON Schema for final answer text,
 independently of reasoning settings. Native backends transmit it through OpenAI Chat Completions,
-Responses, and Anthropic Messages formats. Codex uses the same Responses codec for WebSocket and
+Responses, and Anthropic Messages formats. Codex uses the same Responses codec over
 HTTP/SSE, including structured output. Models/endpoints must support the requested features; providers
 must reject unsupported constraints instead of silently ignoring them or substituting a prompt.
 Ordinary agent requests have no response schema.</p>
