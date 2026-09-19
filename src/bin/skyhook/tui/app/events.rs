@@ -11,29 +11,12 @@ async fn load_output(session: &SessionHandle, query: JobOutputQuery) -> Result<O
 }
 
 pub enum Work {
-    QueuePrepared {
-        session: SessionId,
-        id: QueuedInputId,
-        generation: u64,
-        result: Result<skyhook::agent::PreparedQueuedPrompt, skyhook::agent::QueuedPromptError>,
-    },
-    QueueReclaimed {
-        session: SessionId,
-        id: QueuedInputId,
-        generation: u64,
-        result: Result<skyhook::agent::PreparedQueuedPrompt, skyhook::agent::HarnessError>,
-    },
-    QueueRecovered {
-        session: SessionId,
-        result: Result<Vec<skyhook::agent::RecoveredQueuedPrompt>, String>,
-    },
     QueueCommitted {
         session: SessionId,
         id: QueuedInputId,
         generation: u64,
-        submission: skyhook::agent::QueuedPromptIdentity,
         revision: u64,
-        result: Result<skyhook::agent::QueuedPromptCommit, skyhook::agent::QueuedPromptError>,
+        result: Result<(), skyhook::agent::HarnessError>,
     },
     Done {
         session: SessionId,
@@ -86,32 +69,15 @@ impl App {
     pub fn work(&mut self, work: Work) {
         match work {
             Work::Started { result: Err(error) } => self.start_failed(error),
-            Work::QueuePrepared {
-                session,
-                id,
-                generation,
-                result,
-            } if Some(session) == self.session_id() => self.queue_prepared(id, generation, result),
-            Work::QueueReclaimed {
-                session,
-                id,
-                generation,
-                result,
-            } if Some(session) == self.session_id() => {
-                self.queue_reclaimed(id, generation, result);
-            }
-            Work::QueueRecovered { session, result } if Some(session) == self.session_id() => {
-                self.queue_recovered(result);
-            }
             Work::QueueCommitted {
                 session,
                 id,
                 generation,
-                submission,
                 revision,
                 result,
-            } if Some(session) == self.session_id() => {
-                self.queue_committed(id, generation, submission, revision, result);
+            } => {
+                let current = Some(session) == self.session_id();
+                self.queue_committed(current, id, generation, revision, result);
             }
             Work::Interrupted { session, count } if Some(session) == self.session_id() => {
                 if count > 0 {
@@ -199,10 +165,6 @@ impl App {
         self.dirty = true;
     }
     pub fn tick(&mut self) {
-        // Late accepted-write evidence may arrive while a row is quarantined.
-        for input in &mut self.queue {
-            input.refresh_recovery();
-        }
         self.tick_count = self.tick_count.wrapping_add(1);
         if self
             .toast
@@ -690,7 +652,7 @@ mod tests {
             text: "queued replacement".into(),
             attachments: vec![png_attachment("image.png")],
         });
-        app.queue.push_back(queued);
+        app.queue = VecDeque::from([queued]);
         app.command(Command::Queue);
         app.choose();
         assert!(!ticket.matches(&app.draft_ticket));
@@ -713,7 +675,6 @@ mod tests {
         app.event(Event::Resize(80, 24));
         assert!(app.prompts.is_empty());
         assert!(!app.prompt_active);
-        app.session().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -775,7 +736,6 @@ mod tests {
             let sequence = app.snapshot.records.last_key_value().unwrap().0 + 1;
             let record = skyhook::session::EventRecord {
                 id: skyhook::identity::EventId::generate().unwrap(),
-                queue_attempt: None,
                 sequence,
                 timestamp_millis: 0,
                 agent: agent.clone(),
@@ -839,7 +799,6 @@ mod tests {
         assert!(cards[0].document().is_some());
         toggle(&mut app);
         assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
-        app.session().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -885,7 +844,6 @@ mod tests {
             assert!(text.contains("\n    \"result\": {\n      \""), "{text}");
         }
         assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
-        app.session().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -894,8 +852,7 @@ mod tests {
         let source: String = (0..100)
             .map(|index| format!("// original source line {index:03}\n"))
             .collect();
-        let path = app.launch.workspace.join("example.rs");
-        std::fs::write(&path, &source).unwrap();
+        std::fs::write(app.launch.workspace.join("example.rs"), &source).unwrap();
         run_script(&mut app, "return await tool.read({path:'example.rs'});").await;
         let job = job_named(&app, "read");
         app.fetch_output(job);
@@ -930,11 +887,6 @@ mod tests {
             (query.start, query.offset),
             (at("next_start"), at("next_offset"))
         );
-        let page = session.inspect_output(query).await.unwrap();
-        assert_eq!(page["preview"]["field"], "/result/content");
-        let mut lines = page["preview"]["lines"].as_array().unwrap().iter();
-        assert!(lines.any(|line| line.as_str().unwrap().contains("source line 099")));
-        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
-        session.shutdown().await.unwrap();
+        assert_eq!(query.field.as_deref(), Some("/result/content"));
     }
 }

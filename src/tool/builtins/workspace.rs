@@ -3,12 +3,27 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use crate::tool::ToolError;
+use crate::tool::policy::{ApprovalGrant, Capability, PermissionUse, ResourceId};
 use crate::tool::registry::PathKind;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedWorkspacePath {
     pub path: PathBuf,
     pub directory: bool,
+}
+
+impl ResolvedWorkspacePath {
+    /// The permission for this path, proposing a grant over a directory's
+    /// descendants or the exact file.
+    pub(crate) fn permission(&self, capability: Capability, target: &str) -> PermissionUse {
+        let resource = ResourceId::path(target, &self.path);
+        let grant = if self.directory {
+            ApprovalGrant::descendants(capability, resource.clone())
+        } else {
+            ApprovalGrant::exact(capability, resource.clone())
+        };
+        PermissionUse::new(capability, resource).with_grant(grant)
+    }
 }
 
 pub(crate) async fn resolve_for_authorization(
@@ -142,15 +157,7 @@ pub(crate) fn relative_path(workspace: &Path, path: &Path) -> String {
 }
 
 pub(super) async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
-    Ok(crate::fs::atomic_write(
-        path,
-        bytes,
-        crate::fs::AtomicWriteOptions {
-            preserve_permissions: true,
-            sync_parent: true,
-        },
-    )
-    .await?)
+    Ok(crate::fs::atomic_write(path, bytes).await?)
 }
 
 #[cfg(test)]

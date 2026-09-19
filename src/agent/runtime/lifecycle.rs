@@ -102,7 +102,6 @@ impl SessionRuntime {
             startup_warnings,
             router,
             agents: StdRwLock::new(HashMap::new()),
-            queue_state: queue::QueueRuntimeState::default(),
             child_counters: RwLock::new(child_counters),
             questions,
             usage: Mutex::new(usage),
@@ -184,9 +183,7 @@ impl SessionRuntime {
     /// turn cannot unwind otherwise. Cancelling a script cancels what it launched.
     pub(super) async fn interrupt_turns(&self, root: &AgentId) -> usize {
         let targets = self
-            .agents
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .agents()
             .keys()
             .filter(|agent| {
                 agent.session() == root.session() && agent.path().starts_with(root.path())
@@ -214,18 +211,12 @@ impl SessionRuntime {
             // Read the turn's token only now: the agent may have begun a new turn
             // while the awaits above ran, and a stale token would leave that turn
             // live while its jobs are cancelled below.
-            let Some((cancellation, retryable)) = self
-                .agents
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(agent)
-                .map(|live| {
-                    (
-                        live.cancellation.clone(),
-                        live.control.retryable_interrupt.clone(),
-                    )
-                })
-            else {
+            let Some((cancellation, retryable)) = self.agents().get(agent).map(|live| {
+                (
+                    live.cancellation.clone(),
+                    live.control.retryable_interrupt.clone(),
+                )
+            }) else {
                 continue;
             };
             // Order is load-bearing: mark and cancel the turn before its jobs. A job
@@ -245,9 +236,7 @@ impl SessionRuntime {
 
     pub(super) async fn interrupt_tree(&self, root: &AgentId) -> usize {
         let targets = self
-            .agents
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .agents()
             .iter()
             .filter(|(agent, _)| {
                 agent.session() == root.session() && agent.path().starts_with(root.path())

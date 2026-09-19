@@ -177,27 +177,9 @@ impl Policy for HostApprovalPolicy {
         })
     }
 }
-// Preserve the existing UI-only policy API for embedders and test fixtures.
-// Launch uses HostApprovalPolicy with the actual configured capabilities.
-impl Policy for UiInteraction {
-    fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
-        Box::pin(async move {
-            HostApprovalPolicy::new(CapabilitySet::default(), Some(self.clone()))
-                .authorize(request)
-                .await
-        })
-    }
-}
 
 impl QuestionHandler for UiInteraction {
     fn ask(
-        &self,
-        agent: AgentId,
-        questions: Vec<Question>,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, QuestionError>> + Send + 'static>> {
-        self.ask_with_background(agent, questions, false)
-    }
-    fn ask_with_background(
         &self,
         agent: AgentId,
         questions: Vec<Question>,
@@ -245,7 +227,7 @@ pub(crate) mod tests {
             .harness_builder(root.path())
             .unwrap()
             .session_root(root.path().join("sessions"))
-            .policy(Arc::new(ui))
+            .policy(Arc::new(policy(true, Some(ui))))
             .build()
             .await
             .unwrap();
@@ -274,8 +256,8 @@ pub(crate) mod tests {
         ResourceId::workspace(target, std::path::Path::new("item"))
     }
 
-    fn custom(target: &str) -> ResourceId {
-        ResourceId::custom("other", [target, "item"]).unwrap()
+    fn mcp_item(target: &str) -> ResourceId {
+        ResourceId::mcp(target, "item")
     }
 
     fn policy(interactive: bool, ui: Option<UiInteraction>) -> HostApprovalPolicy {
@@ -298,20 +280,20 @@ pub(crate) mod tests {
     #[test]
     fn automatic_approvals_need_no_ui_and_approval_required_operations_deny_without_one() {
         let automatic = [
-            PermissionUse::new(Read, custom("build")),
-            PermissionUse::new(Agents, custom("build")),
+            PermissionUse::new(Read, mcp_item("build")),
+            PermissionUse::new(Agents, mcp_item("build")),
             PermissionUse::new(Write, workspace("root")),
             // Gating-only capabilities must not become human approvals.
-            PermissionUse::new(Interactive, custom("root")),
-            PermissionUse::new(Mcp, custom("root")),
+            PermissionUse::new(Interactive, mcp_item("root")),
+            PermissionUse::new(Mcp, mcp_item("root")),
         ];
         let approvals = [
             PermissionUse::new(Exec, workspace("root")),
-            PermissionUse::new(Targets, custom("root")),
+            PermissionUse::new(Targets, mcp_item("root")),
             PermissionUse::new(Network, ResourceId::network("root", "https://example.com")),
             PermissionUse::new(Network, ResourceId::network("build", "https://example.com")),
             PermissionUse::new(Write, workspace("build")),
-            PermissionUse::new(Write, custom("root")),
+            PermissionUse::new(Write, mcp_item("root")),
         ];
         for interactive in [false, true] {
             let policy = policy(interactive, None);
@@ -423,7 +405,8 @@ pub(crate) mod tests {
         ] {
             let (ui, mut rx) = UiInteraction::new();
             let request = request.clone();
-            let task = tokio::spawn(async move { ui.authorize(request).await });
+            let policy = policy(true, Some(ui));
+            let task = tokio::spawn(async move { policy.authorize(request).await });
             let PromptKind::Approval { reply, .. } = rx.recv().await.unwrap().kind else {
                 panic!("approval");
             };

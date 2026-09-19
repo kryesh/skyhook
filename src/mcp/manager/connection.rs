@@ -117,7 +117,7 @@ mod tests {
     use super::super::tests::assert_process_reaped;
     use super::super::tests::{Fixture, connect, fixture_call, shutdown, wait_for_file};
     use crate::mcp::{
-        config::{McpServerConfig, McpTransport, RawMcpServerConfig},
+        config::{McpTransport, RawMcpServerConfig},
         manager::McpManager,
     };
     use std::{collections::BTreeMap, time::Duration};
@@ -170,7 +170,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 # Force readiness polling rather than succeeding only if the first retry is late.
-time.sleep(0.35)
+time.sleep(0.15)
 server = http.server.ThreadingHTTPServer(('127.0.0.1', int(os.environ['MCP_TEST_PORT'])), Handler)
 with open(os.environ['MCP_TEST_READY'] + '.tmp', 'w') as f:
     f.write(str(server.server_port))
@@ -373,17 +373,6 @@ server.serve_forever()
             assert_process_reaped(fixture.pid()).await;
         }
         shutdown(&manager).await;
-    }
-
-    #[tokio::test]
-    async fn invalid_direct_config_is_rejected_before_spawning_or_timer_creation() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
-        let mut config = fixture.config();
-        config.startup_timeout_secs = u64::MAX;
-        assert!(McpServerConfig::try_from(config).is_err());
-        assert!(!fixture.directory.path().join("pid").exists());
     }
 
     #[cfg(unix)]

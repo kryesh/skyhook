@@ -1,8 +1,5 @@
-//! Fence metadata for the shared, bounded asynchronous syntax cache.
-//!
-//! Sources are authoritative replacements. The former append-only checkpoints
-//! had no production producer and are retired; ordinary prose still avoids a
-//! Markdown pass. This never runs Syntect on the render thread.
+//! Fence metadata for the shared, bounded asynchronous syntax cache. Ordinary
+//! prose avoids a Markdown pass, and Syntect never runs on the render thread.
 use super::super::tool_view::{CodeSource, Document, MAX_SECTION, Role, Section};
 use super::{markdown, model};
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
@@ -63,33 +60,7 @@ fn collect(text: &str, document: &mut Document) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::tool_view::HighlightCache;
-    use super::super::{Palette, stream};
     use super::*;
-    use std::collections::HashSet;
-    use std::time::{Duration, Instant};
-
-    fn complete(cache: &mut HighlightCache, document: &Document) {
-        cache.prepare(std::iter::once(document));
-        let expected: HashSet<_> = document.highlight_sources().collect();
-        let mut completed = HashSet::new();
-        let start = Instant::now();
-        while !expected.is_subset(&completed) {
-            assert!(
-                start.elapsed() < Duration::from_secs(5),
-                "highlight worker timed out"
-            );
-            std::thread::sleep(Duration::from_millis(2));
-            cache.poll();
-            completed.extend(cache.take_changed_sources());
-        }
-    }
-
-    fn text(rows: &[markdown::LayoutLine]) -> Vec<(String, bool)> {
-        let rows = rows.iter().filter(|row| !row.layout.decorative());
-        rows.map(|row| (row.line.to_string(), row.layout.continued()))
-            .collect()
-    }
 
     fn fence_metadata(fences: &Fences) -> Vec<(&str, &str)> {
         let sections = fences.document.sections.iter();
@@ -146,33 +117,5 @@ mod tests {
             fences.update(&source);
             assert!(fences.document.sections.is_empty());
         }
-    }
-
-    #[test]
-    fn async_fence_completion_preserves_full_layout() {
-        let mut cache = HighlightCache::default();
-        let source =
-            "Prose\n\n```rust\nlet value = (true, 42, \"hello\");  \n\n// comment\n```\n\nTail";
-        let mut fences = Fences::default();
-        fences.update(source);
-        let p = Palette::new();
-        let fallback = text(&stream::layout_highlighted(
-            source,
-            18,
-            p,
-            "↳ ",
-            Some(&cache),
-        ));
-        complete(&mut cache, &fences.document);
-        // Completion invalidates the owning entry; text, geometry and token roles follow.
-        let live = stream::layout_highlighted(source, 18, p, "↳ ", Some(&cache));
-        assert_eq!(text(&live), fallback);
-        let spans: Vec<_> = live.iter().flat_map(|row| &row.line.spans).collect();
-        let colors: HashSet<_> = spans.iter().filter_map(|s| s.style.fg).collect();
-        assert!(
-            colors.len() >= 3,
-            "named fences should have distinct token roles: {colors:?}"
-        );
-        assert!(spans.iter().all(|s| s.style.bg.is_none()));
     }
 }

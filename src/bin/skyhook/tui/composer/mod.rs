@@ -15,8 +15,7 @@ use zeroize::Zeroize;
 
 mod layout;
 // Keep the composer facade stable even when callers infer these layout types.
-#[allow(unused_imports)]
-pub use layout::{ComposerLayout, ComposerRow, ComposerSpan};
+pub use layout::ComposerLayout;
 
 const OBJECT: &str = "\u{fffc}";
 

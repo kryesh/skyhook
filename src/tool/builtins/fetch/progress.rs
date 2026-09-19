@@ -256,7 +256,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let refused = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
-        for include_headers in [None, Some(false), Some(true)] {
+        // Each case waits out a one-second body deadline, so they run together.
+        let case = async |include_headers: Option<bool>| {
             let arguments = with_headers(json!({"url":refused}), include_headers);
             let error = fetch(&runtime, &executor, arguments).await.unwrap_err();
             let output = error.into_failure().output.unwrap().value;
@@ -281,7 +282,8 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        }
+        };
+        tokio::join!(case(None), case(Some(false)), case(Some(true)));
     }
 
     #[test]

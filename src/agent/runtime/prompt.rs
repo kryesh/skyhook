@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use chrono::{DateTime, Local};
+use chrono::Local;
 use serde::Serialize;
 
 use crate::{
@@ -114,13 +114,12 @@ pub(super) async fn runtime_state_content(
     capabilities: &CapabilitySet,
     location: &ExecutionLocation,
 ) -> UserContent {
-    let now = Local::now();
     let items = todos
         .inspect(agent, None)
         .await
         .expect("own todo list is always readable")
         .items;
-    runtime_state_with_todos_at(jobs, agent, capabilities, items, location, now).await
+    runtime_state_with_todos(jobs, agent, capabilities, items, location).await
 }
 
 /// Preview a candidate compaction's state without publishing its todos.
@@ -131,28 +130,13 @@ pub(super) async fn runtime_state_with_todos(
     todos: Vec<TodoItem>,
     location: &ExecutionLocation,
 ) -> UserContent {
-    runtime_state_with_todos_at(jobs, agent, capabilities, todos, location, Local::now()).await
-}
-
-async fn runtime_state_with_todos_at(
-    jobs: &JobManager,
-    agent: &AgentId,
-    capabilities: &CapabilitySet,
-    todos: Vec<TodoItem>,
-    location: &ExecutionLocation,
-    now: DateTime<Local>,
-) -> UserContent {
+    let now = Local::now();
     let active_jobs = jobs
         .active_states(agent, capabilities, now.timestamp_millis())
         .await;
-    UserContent::Runtime {
-        text: render_state(
-            &now.format("%Y-%m-%d").to_string(),
-            &active_jobs,
-            &todos,
-            location,
-        ),
-    }
+    let date = now.format("%Y-%m-%d").to_string();
+    let text = render_state(&date, &active_jobs, &todos, location);
+    UserContent::Runtime { text }
 }
 
 /// This presentation is independent of the JSON used by tools and the journal.

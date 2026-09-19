@@ -18,34 +18,28 @@ impl PromptLayout {
         let width = width.saturating_sub(4);
         let body_text = model::clean(&app.prompt_text());
         let body = wrap_plain(&body_text, width as usize);
-        let title_start = match app.prompts.front().map(|prompt| &prompt.kind) {
-            Some(crate::interaction::PromptKind::Questions { questions, .. })
-                if app.question_index() < questions.len() =>
-            {
-                body_text
-                    .split_once('\n')
-                    .map(|(header, _)| wrap_plain(header, width as usize).len())
+        let question = match app.prompts.front().map(|prompt| &prompt.kind) {
+            Some(crate::interaction::PromptKind::Questions { questions, .. }) => {
+                questions.get(app.question_index())
             }
             _ => None,
         };
-        let choices = match app.prompts.front().map(|prompt| &prompt.kind) {
-            Some(crate::interaction::PromptKind::Questions { questions, .. })
-                if app.question_index() < questions.len() =>
-            {
-                questions[app.question_index()]
-                    .options
-                    .iter()
-                    .enumerate()
-                    .map(|(index, option)| {
-                        (
-                            format!("{}: {}", index + 1, option.label),
-                            option.description.clone(),
-                        )
-                    })
-                    .chain(std::iter::once(("Write an answer…".into(), String::new())))
-                    .collect::<Vec<_>>()
-            }
-            _ => app
+        let header = question.and_then(|_| body_text.split_once('\n'));
+        let title_start = header.map(|(header, _)| wrap_plain(header, width as usize).len());
+        let choices = match question {
+            Some(question) => question
+                .options
+                .iter()
+                .enumerate()
+                .map(|(index, option)| {
+                    (
+                        format!("{}: {}", index + 1, option.label),
+                        option.description.clone(),
+                    )
+                })
+                .chain(std::iter::once(("Write an answer…".into(), String::new())))
+                .collect::<Vec<_>>(),
+            None => app
                 .prompt_options()
                 .into_iter()
                 .map(|label| (label, String::new()))
@@ -57,34 +51,22 @@ impl PromptLayout {
         let input = if secret {
             // Never give a password to the renderer. Map source graphemes onto
             // mask bytes before using the same layout as a regular input field.
+            let editor = &app.prompt_input().editor;
+            let mask = |byte| editor.text()[..byte].graphemes(true).count() * "●".len();
             let mut masked = super::super::editor::Editor::default();
-            masked.set("●".repeat(app.prompt_input().editor.text().graphemes(true).count()));
-            let cursor = app.prompt_input().editor.text()[..app.prompt_input().editor.cursor()]
-                .graphemes(true)
-                .count()
-                * "●".len();
-            let anchor = app.prompt_input().editor.anchor().map(|anchor| {
-                app.prompt_input().editor.text()[..anchor]
-                    .graphemes(true)
-                    .count()
-                    * "●".len()
-            });
+            masked.set("●".repeat(editor.text().graphemes(true).count()));
+            let (anchor, cursor) = (editor.anchor().map(mask), mask(editor.cursor()));
             masked.set_selection(anchor, cursor);
             masked.layout(width as usize)
         } else {
             app.prompt_input().editor.layout(width as usize)
         };
-        let input_label = match app.prompts.front().map(|prompt| &prompt.kind) {
-            Some(crate::interaction::PromptKind::Questions { questions, .. }) => {
-                match questions.get(app.question_index()) {
-                    Some(question) if app.prompt_input().choice < question.options.len() => {
-                        "Comment (optional):"
-                    }
-                    Some(_) => "Answer:",
-                    None => "",
-                }
+        let input_label = match question {
+            Some(question) if app.prompt_input().choice < question.options.len() => {
+                "Comment (optional):"
             }
-            _ => "",
+            Some(_) => "Answer:",
+            None => "",
         };
         let input_label = if input_label.is_empty() {
             Vec::new()
@@ -342,14 +324,7 @@ pub(super) fn draw_tree(
         .map(|agent| model::agent_footer_stats(&app.snapshot, &app.projection, &agent.id))
         .collect::<Vec<_>>();
     let stats_columns = AgentStatsColumns::new(agent_stats.iter());
-    let minimum_name_width = tree_agents
-        .iter()
-        .map(|agent| {
-            let indent = (agent.id.depth() as u16 * 4).min(width / 3);
-            indent + 16.max(model::target_suffix(&agent.target).width() as u16 + 8)
-        })
-        .max()
-        .unwrap_or(16);
+    let minimum_name_width = AgentColumnsLayout::minimum_identity_width(tree_agents, width);
     let columns = AgentColumnsLayout::new(
         width.saturating_sub(4),
         minimum_name_width,

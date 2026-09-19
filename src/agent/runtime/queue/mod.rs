@@ -1,384 +1,107 @@
 //! Request-boundary user input mailbox and cancellation ownership.
 
-use std::sync::{MutexGuard, PoisonError, Weak};
+use std::sync::atomic::AtomicU8;
 
 use super::*;
-use crate::{identity::QueueAttemptId, session::AppendIdentity};
 
-mod durable;
 mod input;
 
-/// Durable random submission identity, preserved across process restarts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct QueuedPromptIdentity(pub(crate) QueueAttemptId);
+const PENDING: u8 = 0;
+const CANCELLED: u8 = 1;
+const CLAIMED: u8 = 2;
 
-impl QueuedPromptIdentity {
-    #[must_use]
-    pub fn attempt(&self) -> QueueAttemptId {
-        self.0
-    }
-}
-
-/// Why a queue operation refused an attempt; the journal is left unchanged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum QueueConflict {
-    #[error("unknown queued submission")]
-    Unknown,
-    #[error("only committed submissions may be acknowledged")]
-    Uncommitted,
-    #[error("a committed submission cannot be abandoned")]
-    Committed,
-    #[error("queued submission is held by a live runtime operation")]
-    Held,
-    #[error("queued permit is not reserved by this runtime; recover first")]
-    NotReserved,
-}
-
-/// Shared by every handle for a runtime. The gate serializes durable preparation,
-/// recovery reservations, reclaims, dispatch and retirement. Every attempt this
-/// runtime issued (prepared or recovered) stays listed until it is retired, and
-/// is live exactly while its current token exists.
-#[derive(Default)]
-pub(in crate::agent::runtime) struct QueueRuntimeState {
-    pub(super) gate: Mutex<()>,
-    entries: std::sync::Mutex<std::collections::HashMap<QueuedPromptIdentity, Weak<Authority>>>,
-}
-
-impl QueueRuntimeState {
-    fn entries(
-        &self,
-    ) -> MutexGuard<'_, std::collections::HashMap<QueuedPromptIdentity, Weak<Authority>>> {
-        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn register(&self, token: &QueuedPromptToken) {
-        self.entries()
-            .insert(token.identity(), Arc::downgrade(&token.0));
-    }
-
-    /// Whether this runtime issued the attempt and has not yet retired it.
-    fn issued(&self, identity: QueuedPromptIdentity) -> bool {
-        self.entries().contains_key(&identity)
-    }
-
-    /// Forget a retired attempt; a later reopen owns any journal row it left.
-    fn retire(&self, identity: QueuedPromptIdentity) {
-        self.entries().remove(&identity);
-    }
-
-    /// The live token holding this attempt's authority in this runtime.
-    fn holder(&self, identity: QueuedPromptIdentity) -> Option<Arc<Authority>> {
-        self.entries().get(&identity).and_then(Weak::upgrade)
-    }
-
-    /// Whether `state` is the attempt this runtime registered and still holds.
-    fn holds(&self, state: &Arc<SubmissionState>) -> bool {
-        self.holder(state.identity)
-            .is_some_and(|holder| Arc::ptr_eq(&holder.0, state))
-    }
-}
-
-/// Immutable draft and affine authority to dispatch it. Dropping a durably
-/// prepared permit leaves its journal intent recoverable; it does not discard the draft.
-#[derive(Debug)]
-pub struct PreparedQueuedPrompt {
-    pub(super) content: Vec<UserContent>,
-    pub(super) model: Option<String>,
-    pub(super) token: QueuedPromptToken,
-}
-
-impl PreparedQueuedPrompt {
-    #[must_use]
-    pub fn identity(&self) -> QueuedPromptIdentity {
-        self.token.identity()
-    }
-    #[must_use]
-    pub fn content(&self) -> &[UserContent] {
-        &self.content
-    }
-    #[must_use]
-    pub fn cancellation_handle(&self) -> QueuedPromptCancellation {
-        self.token.cancellation_handle()
-    }
-}
-
-#[derive(Debug)]
-pub struct RecoveredQueuedPrompt {
-    pub submission: QueuedPromptIdentity,
-    pub content: Vec<UserContent>,
-    /// The draft's attachments loaded from the blob store; empty once committed.
-    pub attachments: Vec<crate::media::Attachment>,
-    pub model: Option<String>,
-    pub state: RecoveredQueuedPromptState,
-}
-
-#[derive(Debug)]
-pub enum RecoveredQueuedPromptState {
-    Committed(QueuedPromptCommit),
-    /// A draft saved by a previous process: this exclusive permit reserves it.
-    Retry(PreparedQueuedPrompt),
-    /// Definitely uncommitted and issued by this runtime, whose permit was
-    /// dropped. No permit is minted by a scan: the holder of the attempt's
-    /// cancellation handle regains one with `reclaim_queued_prompt`.
-    Released,
-    /// A live permit, queued input or claim in this runtime still holds it.
-    Unresolved,
-}
-
-/// A submission's single dispatch attempt: claim and cancellation are exclusive.
-#[derive(Debug, Default)]
-enum Phase {
-    #[default]
-    Pending,
-    Cancelled,
-    /// Appends accepted for the attempt, and which of them is the user message.
-    Claimed {
-        appends: Vec<AppendIdentity>,
-        message: Option<AppendIdentity>,
-    },
-}
-
-#[derive(Debug)]
-struct SubmissionState {
-    identity: QueuedPromptIdentity,
-    phase: std::sync::Mutex<Phase>,
-}
-
-impl SubmissionState {
-    fn phase(&self) -> MutexGuard<'_, Phase> {
-        self.phase.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// Dispatch authority for one attempt, alive exactly as long as its token.
-#[derive(Debug)]
-struct Authority(Arc<SubmissionState>);
-
-/// Single-use enqueue permit. Cancellation observers cannot enqueue its identity.
-///
-/// ```compile_fail
-/// use skyhook::agent::QueuedPromptToken;
-/// let permit = QueuedPromptToken::new().unwrap();
-/// let duplicate = permit.clone();
-/// ```
-#[derive(Debug)]
-pub struct QueuedPromptToken(Arc<Authority>);
-
-/// Clonable cancellation observer, never an enqueue permit.
-///
-/// ```compile_fail
-/// use skyhook::agent::QueuedPromptToken;
-/// let permit = QueuedPromptToken::new().unwrap();
-/// let not_a_permit: QueuedPromptToken = permit.cancellation_handle();
-/// ```
-#[derive(Clone, Debug)]
-pub struct QueuedPromptCancellation(Arc<SubmissionState>);
-
-impl QueuedPromptToken {
-    pub fn new() -> Result<Self, HarnessError> {
-        let identity = QueueAttemptId::generate().map_err(|error| {
-            HarnessError::Initialization(format!("queue identity randomness unavailable: {error}"))
-        })?;
-        Ok(Self::with_identity(QueuedPromptIdentity(identity)))
-    }
-
-    fn with_identity(identity: QueuedPromptIdentity) -> Self {
-        Self(Arc::new(Authority(Arc::new(SubmissionState {
-            identity,
-            phase: std::sync::Mutex::default(),
-        }))))
-    }
-
-    /// Re-arm an attempt whose previous token is gone. An unclaimed attempt keeps
-    /// its submission state, so the caller's existing cancellation handle also
-    /// cancels the new permit; a once-claimed attempt starts from fresh state.
-    fn rearm(attempt: &QueuedPromptCancellation) -> Self {
-        let mut phase = attempt.0.phase();
-        if matches!(*phase, Phase::Claimed { .. }) {
-            drop(phase);
-            return Self::with_identity(attempt.identity());
-        }
-        *phase = Phase::Pending;
-        drop(phase);
-        Self(Arc::new(Authority(attempt.0.clone())))
-    }
-
-    #[must_use]
-    pub fn cancellation_handle(&self) -> QueuedPromptCancellation {
-        QueuedPromptCancellation(self.0.0.clone())
-    }
-
-    #[must_use]
-    pub fn identity(&self) -> QueuedPromptIdentity {
-        self.0.0.identity
-    }
-
-    pub(in crate::agent::runtime) fn is_cancelled(&self) -> bool {
-        matches!(*self.0.0.phase(), Phase::Cancelled)
-    }
-}
+/// Clonable handle deciding whether a queued input may still be withdrawn.
+/// Cancellation and the runtime's claim are mutually exclusive.
+#[derive(Clone, Debug, Default)]
+pub struct QueuedPromptCancellation(Arc<AtomicU8>);
 
 impl QueuedPromptCancellation {
-    #[must_use]
-    pub fn identity(&self) -> QueuedPromptIdentity {
-        self.0.identity
-    }
-
-    /// Success guarantees the user message cannot enter history. Failure is not
-    /// proof of commitment: await the typed receipt or reconcile the identity.
+    /// Success guarantees the user message cannot enter history. Failure means
+    /// the runtime already claimed the input: await its receipt.
     #[must_use]
     pub fn cancel(&self) -> bool {
-        let mut phase = self.0.phase();
-        match *phase {
-            Phase::Pending => *phase = Phase::Cancelled,
-            Phase::Cancelled => {}
-            Phase::Claimed { .. } => return false,
-        }
-        true
+        self.transition(CANCELLED) != CLAIMED
     }
 
     #[must_use]
     pub fn is_claimed(&self) -> bool {
-        matches!(*self.0.phase(), Phase::Claimed { .. })
+        self.0.load(Ordering::Acquire) == CLAIMED
     }
 
-    /// Snapshot reconciliation identities after claim, including when the enqueue
-    /// waiter was dropped. Re-query after the runtime drains before recovery.
-    #[must_use]
-    pub fn recovery(&self) -> Option<QueuedPromptRecovery> {
-        self.is_claimed().then(|| {
-            self.recovery_with_reason(
-                "submission claimed; consult receipt or reconcile after runtime drain".into(),
-            )
-        })
+    fn try_claim(&self) -> bool {
+        self.transition(CLAIMED) == PENDING
     }
 
-    fn recovery_with_reason(&self, reason: String) -> QueuedPromptRecovery {
-        let (appends, message) = match &*self.0.phase() {
-            Phase::Claimed { appends, message } => (appends.clone(), *message),
-            Phase::Pending | Phase::Cancelled => (Vec::new(), None),
-        };
-        QueuedPromptRecovery {
-            submission: self.identity(),
-            appends,
-            message,
-            reason,
-        }
-    }
-
-    fn failed(&self, error: HarnessError) -> QueuedPromptError {
-        let recovery = self.recovery_with_reason(error.to_string());
-        // Only an already accepted append, or a write the journal itself
-        // reports as indeterminate, leaves the outcome unknown. Every other
-        // failure happened before anything was written.
-        let uncertain = !recovery.appends.is_empty()
-            || matches!(
-                error,
-                HarnessError::Session(SessionError::AppendIndeterminate(_))
-            );
-        if uncertain {
-            QueuedPromptError::Indeterminate(Box::new(recovery))
-        } else {
-            QueuedPromptError::Rejected(error)
-        }
-    }
-
-    /// Classify a receipt that will never arrive. Winning cancellation proves
-    /// the message cannot enter history; losing it proves only a claim.
-    #[must_use]
-    pub fn lost_receipt(&self) -> QueuedPromptError {
-        if self.cancel() {
-            QueuedPromptError::Rejected(HarnessError::AgentStopped)
-        } else {
-            QueuedPromptError::Indeterminate(Box::new(self.recovery_with_reason(
-                "claimed submission lost its receipt; reconcile before retry".into(),
-            )))
-        }
+    /// Move a pending input to `phase`; returns the phase found.
+    fn transition(&self, phase: u8) -> u8 {
+        let result = self
+            .0
+            .compare_exchange(PENDING, phase, Ordering::AcqRel, Ordering::Acquire);
+        result.unwrap_or_else(|found| found)
     }
 }
 
-/// A known committed user message, after its live projection was installed.
-#[derive(Clone, Debug)]
-pub struct QueuedPromptCommit {
-    pub submission: QueuedPromptIdentity,
-    pub append: AppendIdentity,
-}
-
-/// Retain this record until reopen/replay resolves every accepted append and the
-/// caller's live projection. An empty append list means claim outcome is unknown,
-/// not permission to retry. UI row/generation identity remains caller-owned.
-#[derive(Clone, Debug)]
-pub struct QueuedPromptRecovery {
-    pub submission: QueuedPromptIdentity,
-    pub appends: Vec<AppendIdentity>,
-    /// Accepted user-message append, distinct from model-selection appends.
-    pub message: Option<AppendIdentity>,
-    pub reason: String,
-}
-
-impl std::fmt::Display for QueuedPromptRecovery {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.reason)
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum QueuedPromptError {
-    #[error("queued prompt rejected before acceptance: {0}")]
-    Rejected(HarnessError),
-    #[error("queued prompt requires reconciliation: {0}")]
-    Indeterminate(Box<QueuedPromptRecovery>),
-}
-
-/// One submission to prepare durably. Deliberately not Clone.
-#[derive(Debug)]
+/// One submission for the request-boundary mailbox.
+#[derive(Debug, Default)]
 pub struct QueuedPrompt {
     pub text: String,
     pub attachments: Vec<crate::media::Attachment>,
     pub options: PromptOptions,
-    pub token: QueuedPromptToken,
+    /// Keep a clone to withdraw the input before the runtime claims it.
+    pub cancellation: QueuedPromptCancellation,
 }
 
 pub(super) struct QueuedInput {
-    pub prepared: PreparedQueuedPrompt,
-    pub committed: oneshot::Sender<Result<QueuedPromptCommit, QueuedPromptError>>,
-}
-
-/// A claimed input owns its token, so authority lasts until it settles.
-struct ClaimedInput {
-    input: QueuedInput,
-    /// The journal attempt its appends bind to; `None` for an undurable input.
-    attempt: Option<QueueAttemptId>,
+    pub content: Vec<UserContent>,
+    pub model: Option<String>,
+    pub cancellation: QueuedPromptCancellation,
+    pub committed: oneshot::Sender<Result<(), HarnessError>>,
 }
 
 impl QueuedInput {
-    fn try_claim(self, queue: &QueueRuntimeState) -> Result<ClaimedInput, Self> {
-        let mut phase = self.prepared.token.0.0.phase();
-        let pending = matches!(*phase, Phase::Pending);
-        if pending {
-            *phase = Phase::Claimed {
-                appends: Vec::new(),
-                message: None,
-            };
-        }
-        drop(phase);
-        if !pending {
-            return Err(self);
-        }
-        let attempt = queue
-            .holds(&self.prepared.token.0.0)
-            .then(|| self.prepared.identity().0);
-        Ok(ClaimedInput {
-            input: self,
-            attempt,
-        })
-    }
-
     fn reject(self, error: HarnessError) {
-        let _ = self.prepared.cancellation_handle().cancel();
-        // Release authority before the receipt is observable.
-        drop(self.prepared);
-        let _ = self.committed.send(Err(QueuedPromptError::Rejected(error)));
+        let _ = self.cancellation.cancel();
+        let _ = self.committed.send(Err(error));
+    }
+}
+
+/// Resolves once the input's user message is committed to history, not when
+/// the model turn ends. A closed receipt means the runtime stopped first.
+pub type QueuedPromptReceipt = oneshot::Receiver<Result<(), HarnessError>>;
+
+impl SessionHandle {
+    /// Publish the prompts as one FIFO request-boundary batch, returning one
+    /// receipt per prompt in input order. A prompt that fails validation holds
+    /// back itself and every prompt behind it: their receipts already hold errors.
+    pub async fn enqueue_prompts(&self, prompts: Vec<QueuedPrompt>) -> Vec<QueuedPromptReceipt> {
+        let mut batch = Vec::new();
+        let mut receipts = Vec::new();
+        for prompt in prompts {
+            let (committed, receipt) = oneshot::channel();
+            receipts.push(receipt);
+            let prepared = if self.runtime.shutting_down.load(Ordering::Acquire) {
+                Err(HarnessError::AgentStopped)
+            } else if receipts.len() > batch.len() + 1 {
+                // Dispatching past a rejected prompt would reorder the submissions.
+                Err(HarnessError::Interrupted)
+            } else {
+                self.prepare_prompt(prompt.text, &prompt.attachments, &prompt.options)
+                    .await
+            };
+            match prepared {
+                Ok(content) => batch.push(QueuedInput {
+                    content,
+                    model: prompt.options.model,
+                    cancellation: prompt.cancellation,
+                    committed,
+                }),
+                Err(error) => drop(committed.send(Err(error))),
+            }
+        }
+        if !batch.is_empty() {
+            let _ = self.root_tx.send(AgentCommand::QueuedInputs(batch)).await;
+        }
+        receipts
     }
 }
 
@@ -407,7 +130,9 @@ pub(super) fn reject_pending(
 
 impl SessionRuntime {
     /// Consume every member before allowing a provider request, even if commits
-    /// yield. Interrupts reject the unclaimed remainder with individual receipts.
+    /// yield. An interrupt, or a claimed member that fails, rejects the unclaimed
+    /// remainder. Returns whether anything was consumed and whether a member
+    /// failed: the caller must then `reject_pending` the batches queued behind it.
     pub(super) async fn consume_queued_batch(
         &self,
         agent: &AgentId,
@@ -416,18 +141,21 @@ impl SessionRuntime {
         capabilities: &CapabilitySet,
         cancellation: &CancellationToken,
         inputs: Vec<QueuedInput>,
-    ) -> bool {
-        let mut consumed = false;
+    ) -> (bool, bool) {
+        let (mut consumed, mut failed) = (false, false);
         for input in inputs {
-            if cancellation.is_cancelled() {
+            if failed || cancellation.is_cancelled() {
                 input.reject(HarnessError::Interrupted);
             } else {
-                consumed |= self
+                let claim = input.cancellation.clone();
+                let committed = self
                     .consume_queued_input(agent, context, model_profile, capabilities, input)
                     .await;
+                failed = !committed && claim.is_claimed();
+                consumed |= committed;
             }
         }
-        consumed
+        (consumed, failed)
     }
 
     /// Drain a bounded snapshot of the mailbox, preserving all non-queue commands
@@ -449,7 +177,7 @@ impl SessionRuntime {
             let Ok(command) = rx.try_recv() else { break };
             match command {
                 AgentCommand::QueuedInputs(inputs) => {
-                    consumed |= self
+                    let (committed, failed) = self
                         .consume_queued_batch(
                             turn.agent,
                             context,
@@ -459,6 +187,10 @@ impl SessionRuntime {
                             inputs,
                         )
                         .await;
+                    consumed |= committed;
+                    if failed {
+                        reject_pending(rx, deferred);
+                    }
                 }
                 command => deferred.push_back(command),
             }
@@ -469,110 +201,58 @@ impl SessionRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex as StdMutex};
-
-    use tokio::sync::{Notify, Semaphore};
+    use std::sync::Arc;
 
     use super::super::*;
-    use super::{QueueRuntimeState, QueuedInput, QueuedPromptToken};
-    pub(super) use crate::agent::runtime::tests::{bounded, enqueue_prompts, events, quiet_root};
-    use crate::provider::{
-        ProviderContext, ProviderError, ProviderFuture, ResponseStream,
-        protocol::{StopReason, events_for_content},
+    pub(super) use crate::agent::runtime::tests::{
+        Script, Step, bounded, enqueue_prompts, ephemeral_session, events, quiet_root, response,
     };
 
-    pub(super) struct Tracking {
-        pub(super) requests: StdMutex<Vec<ModelRequest>>,
-        changed: Notify,
-        gates: [Semaphore; 2],
-        first_calls_tool: bool,
-    }
-
-    impl Tracking {
-        pub(super) async fn request(&self, index: usize) -> ModelRequest {
-            bounded(async {
-                loop {
-                    let notified = self.changed.notified();
-                    if let Some(request) = self.requests.lock().unwrap().get(index).cloned() {
-                        return request;
-                    }
-                    notified.await;
-                }
-            })
-            .await
-        }
-
-        pub(super) fn release(&self, index: usize) {
-            self.gates[index].add_permits(1);
-        }
-
-        pub(super) fn count(&self) -> usize {
-            self.requests.lock().unwrap().len()
-        }
-    }
-
-    pub(super) struct Factory(Arc<Tracking>);
-    pub(super) struct Context(Arc<Tracking>);
-
-    impl Provider for Factory {
-        fn open_context(&self, _: String) -> Result<Box<dyn ProviderContext>, ProviderError> {
-            Ok(Box::new(Context(self.0.clone())))
-        }
-    }
-
-    impl ProviderContext for Context {
-        fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
-            let tracking = self.0.clone();
-            let index = {
-                let mut requests = tracking.requests.lock().unwrap();
-                requests.push(request);
-                requests.len() - 1
-            };
-            tracking.changed.notify_one();
-            Box::pin(async move {
-                if let Some(gate) = tracking.gates.get(index) {
-                    gate.acquire().await.unwrap().forget();
-                }
-                let (item, stop_reason) = if index == 0 && tracking.first_calls_tool {
-                    let todo = ToolCall::new("queue-todo", "todo", json!({"items": []})).unwrap();
-                    let item = AssistantContent::tool_call("queue-todo", 0, todo);
-                    (item, StopReason::ToolUse)
-                } else {
-                    let item = AssistantContent::text("text/0", 0, format!("answer-{index}"));
-                    (item, StopReason::EndTurn)
-                };
-                let mut events = events_for_content(&[item]);
-                events.push(ResponseChunk::ResponseEnded { stop_reason });
-                let events = futures_util::stream::iter(events.into_iter().map(Ok));
-                Ok(Box::pin(events) as ResponseStream)
-            })
-        }
+    pub(super) fn count(script: &Script) -> usize {
+        script.requests.lock().unwrap().len()
     }
 
     /// A session with "first" (default), "second" and "third" model profiles.
     pub(super) async fn start(
         first_calls_tool: bool,
-    ) -> (tempfile::TempDir, Arc<Tracking>, Arc<SessionHandle>) {
+    ) -> (tempfile::TempDir, Arc<Script>, Arc<SessionHandle>) {
         let root = tempfile::tempdir().unwrap();
-        let tracking = Arc::new(Tracking {
-            requests: StdMutex::new(Vec::new()),
-            changed: Notify::new(),
-            gates: [Semaphore::new(0), Semaphore::new(0)],
-            first_calls_tool,
-        });
+        // Only the first two responses are gated; request `n` is answered `answer-n`.
+        let answer = |index| {
+            response(vec![AssistantContent::text(
+                "text/0",
+                0,
+                format!("answer-{index}"),
+            )])
+        };
+        let todo = ToolCall::new("queue-todo", "todo", json!({"items": []})).unwrap();
+        let todo = response(vec![AssistantContent::tool_call("queue-todo", 0, todo)]);
+        let first = if first_calls_tool { todo } else { answer(0) };
+        let steps = [Step::new(first).gated(), Step::new(answer(1)).gated()];
+        let steps = steps
+            .into_iter()
+            .chain((2..6).map(|index| Step::new(answer(index))));
+        let tracking = Script::new(steps, &Default::default());
         let profile =
             |model: &str| ModelProfile::new("queue-test", model, None, 128_000, 4096, true);
         let harness = HarnessBuilder::new(root.path())
             .session_root(root.path().join("sessions"))
-            .provider("queue-test", Arc::new(Factory(tracking.clone())))
+            .provider("queue-test", tracking.clone())
             .model_profile("first", profile("first-model"))
             .model_profile("second", profile("second-model"))
             .model_profile("third", profile("third-model"))
+            .model_profile(
+                "blind",
+                ModelProfile {
+                    supports_images: false,
+                    ..profile("blind-model")
+                },
+            )
             .default_model_profile("first")
             .build()
             .await
             .unwrap();
-        let session = Arc::new(harness.new_session().await.unwrap());
+        let session = Arc::new(ephemeral_session(&harness).await);
         (root, tracking, session)
     }
 
@@ -583,8 +263,7 @@ mod tests {
         let session = session.clone();
         tokio::spawn(async move { session.prompt(text).await })
     }
-    pub(super) type Receipt =
-        tokio::task::JoinHandle<Result<QueuedPromptCommit, QueuedPromptError>>;
+    pub(super) type Receipt = tokio::task::JoinHandle<Result<(), HarnessError>>;
 
     /// Enqueues from a task; returns its receipt and the submission's cancellation handle.
     pub(super) fn enqueue(
@@ -594,7 +273,7 @@ mod tests {
         model: Option<&str>,
     ) -> (Receipt, QueuedPromptCancellation) {
         let input = queued(text, attachments, model);
-        let cancellation = input.token.cancellation_handle();
+        let cancellation = input.cancellation.clone();
         let session = session.clone();
         let receipt =
             tokio::spawn(
@@ -612,7 +291,7 @@ mod tests {
     fn enqueue_batch(
         session: &Arc<SessionHandle>,
         inputs: Vec<QueuedPrompt>,
-    ) -> tokio::task::JoinHandle<Vec<Result<QueuedPromptCommit, QueuedPromptError>>> {
+    ) -> tokio::task::JoinHandle<Vec<Result<(), HarnessError>>> {
         let session = session.clone();
         tokio::spawn(async move { enqueue_prompts(&session, inputs).await })
     }
@@ -681,7 +360,7 @@ mod tests {
             options: PromptOptions {
                 model: model.map(str::to_owned),
             },
-            token: QueuedPromptToken::new().unwrap(),
+            cancellation: QueuedPromptCancellation::default(),
         }
     }
 
@@ -699,7 +378,7 @@ mod tests {
             queued("test:image", vec![image], None),
             queued("test:last", vec![], Some("third")),
         ];
-        let tokens = inputs.iter().map(|input| input.token.cancellation_handle());
+        let tokens = inputs.iter().map(|input| input.cancellation.clone());
         let tokens = tokens.collect::<Vec<_>>();
         let enqueue = enqueue_batch(&session, inputs);
         let request = tracking.request(0).await;
@@ -723,46 +402,46 @@ mod tests {
         tracking.release(1);
         bounded(barrier).await.unwrap().unwrap();
         stop(&session).await;
-        assert_eq!(tracking.count(), 2);
+        assert_eq!(count(&tracking), 2);
     }
 
     #[tokio::test]
-    async fn active_batch_is_one_command_and_skips_only_invalid_or_canceled_items() {
-        use HarnessError::{ImageLimit, Interrupted, UnknownModelProfile};
-        use QueuedPromptError::Rejected;
+    async fn active_batch_skips_canceled_items_and_holds_back_everything_behind_a_rejection() {
+        use HarnessError::{ImageLimit, Interrupted};
         let (_root, tracking, session) = start(true).await;
         let turn = prompt(&session, "test:initial");
         tracking.request(0).await;
-        let canceled = QueuedPromptToken::new().unwrap();
-        let canceled_cancel = canceled.cancellation_handle();
+        let canceled = QueuedPromptCancellation::default();
         let oversized = crate::media::Attachment::Image {
             file: None,
             image: crate::tests::png(&vec![0; MAX_IMAGE_BYTES as usize]),
         };
         let inputs = vec![
             queued("test:one", vec![], Some("second")),
-            queued("test:invalid", vec![], Some("missing")),
-            queued("test:two", vec![], None),
             QueuedPrompt {
-                token: canceled,
+                cancellation: canceled.clone(),
                 ..queued("test:canceled", vec![], Some("third"))
             },
+            queued("test:two", vec![], None),
             queued("test:oversized-image", vec![oversized], Some("third")),
+            queued("test:invalid", vec![], Some("missing")),
+            queued("test:behind", vec![], None),
         ];
         let enqueue = enqueue_batch(&session, inputs);
         buffered(&session, 1).await;
-        assert!(canceled_cancel.cancel());
+        assert!(canceled.cancel());
         tracking.release(0);
         let next = tracking.request(1).await;
         let results = bounded(enqueue).await.unwrap();
         assert!(matches!(
             results.as_slice(),
             [
-                Ok(_),
-                Err(Rejected(UnknownModelProfile(_))),
-                Ok(_),
-                Err(Rejected(Interrupted)),
-                Err(Rejected(ImageLimit))
+                Ok(()),
+                Err(Interrupted),
+                Ok(()),
+                Err(ImageLimit),
+                Err(Interrupted),
+                Err(Interrupted)
             ]
         ));
         assert_eq!(next.model, "second-model");
@@ -771,7 +450,7 @@ mod tests {
         tracking.release(1);
         bounded(turn).await.unwrap().unwrap();
         stop(&session).await;
-        assert_eq!(tracking.count(), 2);
+        assert_eq!(count(&tracking), 2);
     }
 
     #[tokio::test]
@@ -794,42 +473,146 @@ mod tests {
             let results = bounded(enqueue).await.unwrap();
             assert_eq!(results.len(), 2);
             assert!(results.iter().all(|result| shutdown && result.is_err()
-                || matches!(
-                    result,
-                    Err(QueuedPromptError::Rejected(HarnessError::Interrupted))
-                )));
+                || matches!(result, Err(HarnessError::Interrupted))));
             let _ = bounded(turn).await.unwrap();
             stop(&session).await;
             assert_eq!(texts(&committed(&session).await), ["test:initial"]);
-            assert_eq!(tracking.count(), 1);
+            assert_eq!(count(&tracking), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_batch_of_a_canceled_input_starts_no_turn_and_journals_nothing() {
+        let (_root, tracking, session) = start(false).await;
+        let input = queued("test:already-canceled", vec![], Some("second"));
+        assert!(input.cancellation.cancel());
+        let results = bounded(enqueue_prompts(&session, vec![input])).await;
+        assert!(matches!(results[..], [Err(HarnessError::Interrupted)]));
+        stop(&session).await;
+        assert_eq!(count(&tracking), 0);
+        assert!(committed(&session).await.is_empty());
+        assert!(model_changes(&session).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claimed_failure_holds_back_the_rest_of_the_batch() {
+        let (_root, tracking, session) = start(false).await;
+        let image = crate::media::Attachment::Image {
+            file: None,
+            image: crate::tests::png(b"unsupported"),
+        };
+        let inputs = vec![
+            queued("test:image", vec![image], Some("blind")),
+            queued("test:behind", vec![], None),
+        ];
+        let results = bounded(enqueue_prompts(&session, inputs)).await;
+        use HarnessError::{ImagesUnsupported, Interrupted};
+        assert!(matches!(
+            results[..],
+            [Err(ImagesUnsupported(_)), Err(Interrupted)]
+        ));
+        stop(&session).await;
+        assert_eq!(count(&tracking), 0);
+        assert!(committed(&session).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claimed_failure_rejects_the_batches_queued_behind_it() {
+        let (_root, tracking, session) = start(false).await;
+        let turn = prompt(&session, "test:initial");
+        tracking.request(0).await;
+        let image = crate::media::Attachment::Image {
+            file: None,
+            image: crate::tests::png(b"unsupported"),
+        };
+        let first = enqueue_batch(
+            &session,
+            vec![
+                queued("test:before", vec![], None),
+                queued("test:image", vec![image], Some("blind")),
+            ],
+        );
+        buffered(&session, 1).await;
+        let later = enqueue_batch(&session, vec![queued("test:later", vec![], None)]);
+        buffered(&session, 2).await;
+        tracking.release(0);
+        use HarnessError::{ImagesUnsupported, Interrupted};
+        let first = bounded(first).await.unwrap();
+        assert!(matches!(first[..], [Ok(()), Err(ImagesUnsupported(_))]));
+        let later = bounded(later).await.unwrap();
+        assert!(matches!(later[..], [Err(Interrupted)]));
+        let next = tracking.request(1).await;
+        assert_eq!(texts(next.messages()), ["test:initial", "test:before"]);
+        tracking.release(1);
+        bounded(turn).await.unwrap().unwrap();
+        stop(&session).await;
+    }
+
+    #[tokio::test]
+    async fn dropped_receipt_still_commits_the_input_exactly_once() {
+        let (_root, tracking, session) = start(false).await;
+        let turn = prompt(&session, "test:initial");
+        tracking.request(0).await;
+        let (waiter, _) = enqueue(&session, "test:dropped", vec![], Some("second"));
+        buffered(&session, 1).await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        tracking.release(0);
+        let next = tracking.request(1).await;
+        let expected = ["test:initial", "test:dropped"];
+        assert_eq!(next.model, "second-model");
+        assert_eq!(texts(next.messages()), expected);
+        tracking.release(1);
+        bounded(turn).await.unwrap().unwrap();
+        stop(&session).await;
+        assert_eq!(texts(&committed(&session).await), expected);
+    }
+
+    #[tokio::test]
+    async fn interrupt_and_shutdown_racing_a_claim_commit_exactly_the_ok_receipts() {
+        for shutdown in [false, true] {
+            let (_root, tracking, session) = start(false).await;
+            let turn = prompt(&session, "test:initial");
+            tracking.request(0).await;
+            let inputs = vec![
+                queued("test:one", vec![], Some("second")),
+                queued("test:two", vec![], Some("third")),
+            ];
+            let claim = inputs[0].cancellation.clone();
+            let enqueue = enqueue_batch(&session, inputs);
+            buffered(&session, 1).await;
+            tracking.release(0);
+            // The claim precedes the commit's awaits: stop while it is in progress.
+            bounded(async {
+                while !claim.is_claimed() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            if shutdown {
+                stop(&session).await;
+            } else {
+                session.interrupt().await;
+            }
+            let results = bounded(enqueue).await.unwrap();
+            let _ = bounded(turn).await.unwrap();
+            stop(&session).await;
+            let accepted = results.iter().filter(|result| result.is_ok()).count();
+            let found = texts(&committed(&session).await);
+            assert_eq!(found[1..], ["test:one", "test:two"][..accepted]);
         }
     }
 
     #[test]
     fn cancellation_and_claim_are_exclusive_across_handles() {
-        let input_for = |token| QueuedInput {
-            prepared: PreparedQueuedPrompt {
-                content: vec![],
-                model: None,
-                token,
-            },
-            committed: oneshot::channel().0,
-        };
-        let pending = QueuedPromptToken::new().unwrap();
-        let cancelled = pending.cancellation_handle();
-        let observer = pending.cancellation_handle();
-        assert!(cancelled.cancel());
-        assert!(observer.cancel());
-        let queue = QueueRuntimeState::default();
-        assert!(input_for(pending).try_claim(&queue).is_err());
-        assert!(!observer.is_claimed());
+        let cancelled = QueuedPromptCancellation::default();
+        let observer = cancelled.clone();
+        assert!(cancelled.cancel() && observer.cancel());
+        assert!(!observer.try_claim() && !observer.is_claimed());
 
-        let claimed = QueuedPromptToken::new().unwrap();
-        let copy = claimed.cancellation_handle();
-        let input = input_for(claimed).try_claim(&queue).ok();
-        let input = input.expect("first claim wins");
-        assert!(copy.is_claimed());
-        assert!(!copy.cancel());
-        drop(input);
+        let claimed = QueuedPromptCancellation::default();
+        let copy = claimed.clone();
+        assert!(claimed.try_claim());
+        assert!(copy.is_claimed() && !copy.cancel() && !copy.try_claim());
     }
 }

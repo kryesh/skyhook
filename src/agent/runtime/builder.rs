@@ -452,6 +452,20 @@ mod tests {
                 &["workspace"],
                 &["user AGENTS.md:\nshared"],
             ),
+            // The first user location holding a file wins; later ones are fallbacks.
+            (
+                &[
+                    ("xdg", "AGENTS.md", "preferred"),
+                    ("home", "AGENTS.md", "fallback"),
+                ],
+                &["xdg", "home"],
+                &["user AGENTS.md:\npreferred"],
+            ),
+            (
+                &[("home", "AGENTS.md", "fallback")],
+                &["xdg", "home"],
+                &["user AGENTS.md:\nfallback"],
+            ),
             // Distinct files with identical contents are not deduplicated.
             (
                 &[
@@ -484,22 +498,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_only_instructions_select_one_location() {
-        let root = tempfile::tempdir().unwrap();
-        let (xdg, home) = (root.path().join("xdg"), root.path().join("home"));
-        let workspace = root.path().join("workspace");
-        std::fs::create_dir(&workspace).unwrap();
-        instruction_file(&xdg, "AGENTS.md", "preferred");
-        instruction_file(&home, "AGENTS.md", "fallback");
-        let directories = [xdg.clone(), home];
-        let loaded = load_agent_instructions_from(&workspace, &directories).await;
-        assert_eq!(loaded.unwrap(), vec!["user AGENTS.md:\npreferred"]);
-        std::fs::remove_file(xdg.join("AGENTS.md")).unwrap();
-        let loaded = load_agent_instructions_from(&workspace, &directories).await;
-        assert_eq!(loaded.unwrap(), vec!["user AGENTS.md:\nfallback"]);
-    }
-
-    #[tokio::test]
     async fn casing_selects_first_existing_for_user_and_workspace() {
         for (index, name) in AGENT_INSTRUCTION_NAMES.iter().enumerate() {
             let root = tempfile::tempdir().unwrap();
@@ -521,81 +519,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_discovery_read_and_utf8_errors_fall_back_without_another_casing() {
-        for case in ["discovery", "read", "utf8"] {
+    async fn a_broken_candidate_fails_its_location_without_trying_another_casing() {
+        use std::io::ErrorKind::{InvalidData, NotFound};
+        // ENOTDIR is a discovery error, unlike a missing candidate; a dangling
+        // symlink is an existing candidate.
+        for (case, kind) in [
+            ("not-a-directory", None),
+            ("directory", None),
+            ("utf8", Some(InvalidData)),
+            #[cfg(unix)]
+            ("dangling", Some(NotFound)),
+        ] {
             let root = tempfile::tempdir().unwrap();
-            let user = root.path().join("user");
-            let fallback = root.path().join("fallback");
+            let (user, fallback) = (root.path().join("user"), root.path().join("fallback"));
+            let broken = user.join("AGENTS.md");
             match case {
-                // ENOTDIR is a discovery error, unlike a missing candidate.
-                "discovery" => std::fs::write(&user, "not a directory").unwrap(),
-                "read" => std::fs::create_dir_all(user.join("AGENTS.md")).unwrap(),
-                _ => instruction_file(&user, "AGENTS.md", [0xff]),
+                "not-a-directory" => std::fs::write(&user, "a file").unwrap(),
+                "directory" => std::fs::create_dir_all(&broken).unwrap(),
+                "utf8" => instruction_file(&user, "AGENTS.md", [0xff]),
+                _ => {
+                    std::fs::create_dir(&user).unwrap();
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink("missing", &broken).unwrap();
+                }
             }
-            if case != "discovery" && !user.join("agents.md").exists() {
+            if user.is_dir() && std::fs::symlink_metadata(user.join("agents.md")).is_err() {
                 instruction_file(&user, "agents.md", "must not load");
             }
-            instruction_file(&fallback, "Agents.md", "fallback");
-            let loaded = load_user_instructions(&[user, fallback]).await.unwrap();
+            // Fatal for a workspace, and for users unless another location loads.
+            let error = load_agent_instructions_from(&user, &[]).await.unwrap_err();
+            assert!(contains_path(&error, broken.clone()), "{case}: {error}");
+            let users = [user, root.path().join("missing"), fallback.clone()];
+            let error = load_user_instructions(&users).await.err().unwrap();
+            assert!(contains_path(&error, broken.clone()), "{case}: {error}");
+            assert!(kind.is_none_or(|kind| kind == error.kind()), "{case}");
+            // Every failing location is reported.
+            instruction_file(&fallback, "Agents.md", [0xfe]);
+            let error = load_user_instructions(&users).await.err().unwrap();
+            assert!(contains_path(&error, broken), "{case}: {error}");
+            assert!(contains_path(&error, fallback.join("Agents.md")));
+            instruction_file(&fallback, "AGENTS.md", "fallback");
+            let loaded = load_user_instructions(&users).await.unwrap();
             assert_eq!(loaded.unwrap().text, "fallback", "{case}");
         }
-    }
-
-    #[tokio::test]
-    async fn user_errors_survive_missing_fallback_and_report_every_path() {
-        let root = tempfile::tempdir().unwrap();
-        let user = root.path().join("user");
-        let fallback = root.path().join("fallback");
-        instruction_file(&user, "AGENTS.md", [0xff]);
-        let missing = [user.clone(), root.path().join("missing")];
-        let error = load_user_instructions(&missing).await.err().unwrap();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(contains_path(&error, user.join("AGENTS.md")));
-        instruction_file(&fallback, "Agents.md", [0xfe]);
-        let error = load_user_instructions(&[user.clone(), fallback.clone()])
-            .await
-            .err()
-            .unwrap();
-        assert!(contains_path(&error, user.join("AGENTS.md")));
-        assert!(contains_path(&error, fallback.join("Agents.md")));
-    }
-
-    #[tokio::test]
-    async fn workspace_errors_are_fatal_without_trying_another_casing() {
-        for invalid_utf8 in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            if invalid_utf8 {
-                instruction_file(root.path(), "AGENTS.md", [0xff]);
-            } else {
-                std::fs::create_dir(root.path().join("AGENTS.md")).unwrap();
-            }
-            if !root.path().join("agents.md").exists() {
-                instruction_file(root.path(), "agents.md", "must not load");
-            }
-            let error = load_agent_instructions_from(root.path(), &[])
-                .await
-                .unwrap_err();
-            assert!(contains_path(&error, root.path().join("AGENTS.md")));
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn dangling_candidate_is_an_error_not_an_alternate_spelling() {
-        use std::os::unix::fs::symlink;
-        let root = tempfile::tempdir().unwrap();
-        let user = root.path().join("user");
-        let fallback = root.path().join("fallback");
-        std::fs::create_dir(&user).unwrap();
-        symlink("missing", user.join("AGENTS.md")).unwrap();
-        if std::fs::symlink_metadata(user.join("agents.md")).is_err() {
-            instruction_file(&user, "agents.md", "must not load");
-        }
-        let error = load_agent_instructions_from(&user, &[]).await.unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-        instruction_file(&fallback, "AGENTS.md", "fallback");
-        let loaded = load_user_instructions(&[user, fallback]).await.unwrap();
-        assert_eq!(loaded.unwrap().text, "fallback");
     }
 
     #[cfg(unix)]

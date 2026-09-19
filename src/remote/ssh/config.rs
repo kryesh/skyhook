@@ -35,6 +35,10 @@ impl SshConfig {
         if route.is_empty() {
             return Err(RemoteError::EmptyRoute);
         }
+        // A route deserialized from the wire has not passed through the registry.
+        if route.iter().any(|hop| hop.validate().is_err()) {
+            return Err(RemoteError::Protocol("unsupported transport route".into()));
+        }
         let directory = tempfile::Builder::new().prefix("skyhook-ssh-").tempdir()?;
         let path = directory.path().join("config");
         let mut file = std::fs::OpenOptions::new()
@@ -182,7 +186,9 @@ pub(crate) fn ssh_command(config: &SshConfig, destination: &str) -> Command {
 
 fn ssh_token(value: &str) -> Result<String, RemoteError> {
     if value.is_empty() || value.chars().any(char::is_control) {
-        return Err(RemoteError::InvalidSshValue);
+        return Err(RemoteError::Ssh(
+            "SSH values cannot be empty or contain control characters".into(),
+        ));
     }
     Ok(format!(
         "\"{}\"",
@@ -260,6 +266,11 @@ mod tests {
             [std::ffi::OsStr::new("-F"), config.path.as_os_str()]
         );
         assert!(args.contains(&std::ffi::OsStr::new("-A")));
+        let mut local = route[0].clone();
+        local.r#type = crate::target::TargetType::Local;
+        let rejected =
+            SshConfig::create(&[local], &managed(), None, Arc::new(RejectSensitivePrompts));
+        assert!(matches!(rejected, Err(RemoteError::Protocol(_))));
 
         let proxy = json!({"type": "ssh", "host": "x", "via": "jump", "ssh": {"options": {"ProxyCommand": "nc %h %p"}}});
         assert!(matches!(

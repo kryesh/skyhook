@@ -58,7 +58,7 @@ mod tests {
                 ResourceId::network("build", origin),
             ),
         ];
-        // Routes, sessions, MCP tools and custom resources are not execution targets.
+        // Routes, sessions and MCP tools are not execution targets.
         for (capability, resource) in [
             (
                 Capability::Targets,
@@ -66,10 +66,6 @@ mod tests {
             ),
             (Capability::Read, ResourceId::session("root")),
             (Capability::Mcp, ResourceId::mcp("root", "tool")),
-            (
-                Capability::Read,
-                ResourceId::custom("extension", ["root", "opaque"]).unwrap(),
-            ),
         ] {
             cases.push((capability, resource.clone(), resource));
         }

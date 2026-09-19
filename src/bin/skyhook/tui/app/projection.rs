@@ -104,7 +104,7 @@ impl App {
             || self.stopping
             || self.operation
             || self.snapshot.revision < self.queue_activity_revision
-            || self.queue.iter().any(|input| input.state.unsettled())
+            || self.queue.iter().any(|input| input.in_flight.is_some())
             || matches!(
                 self.snapshot.activity.get(self.root_agent()),
                 Some(

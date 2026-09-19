@@ -92,9 +92,9 @@ async fn execute(command: &str, protocol: Protocol) -> Result<HeaderValue, Provi
 mod tests {
     use super::*;
     use crate::provider::{
-        Provider,
+        Provider, ProviderTimeouts,
         backends::{
-            ChatReasoningReplay, NativeProvider, OpenAiApi, anthropic_api, openai_compatible,
+            ChatReasoningReplay, NativeProvider, NativeSettings,
             transport::tests::{read_request, reply},
         },
         protocol::ModelRequest,
@@ -113,14 +113,10 @@ mod tests {
     }
 
     fn provider(protocol: Protocol, root: &str, key: Option<String>) -> NativeProvider {
-        match protocol {
-            Protocol::Chat { .. } => {
-                openai_compatible("test", root, OpenAiApi::ChatCompletions, key)
-            }
-            Protocol::Responses => openai_compatible("test", root, OpenAiApi::Responses, key),
-            Protocol::Anthropic => anthropic_api("test", root, key),
-        }
-        .unwrap()
+        NativeSettings::new(root, protocol, ProviderTimeouts::default())
+            .unwrap()
+            .build("test", key)
+            .unwrap()
     }
 
     fn request() -> ModelRequest {
@@ -171,55 +167,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_open_context_and_unpolled_or_invalid_invokes_are_lazy() {
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("executed");
-        let provider = provider(chat(), "http://127.0.0.1:1/v1", None)
-            .with_api_key_command(format!("touch {}; printf secret", quote(&marker)))
-            .unwrap();
-        let mut context = provider.clone().open_context("context".into()).unwrap();
-        assert!(!marker.exists());
-        drop(context.invoke(request()));
-        let mut empty_model = request();
-        empty_model.model.clear();
-        let mut other_context = request();
-        other_context.correlation = Some("different-context".into());
-        for invalid in [empty_model, other_context] {
-            assert!(context.invoke(invalid).await.is_err());
-        }
-        assert!(!marker.exists());
-    }
-
-    #[tokio::test]
-    async fn concurrent_contexts_and_clones_share_one_trimmed_sensitive_header() {
+    async fn command_is_lazy_runs_once_and_overrides_the_direct_key() {
         tokio::time::timeout(Duration::from_secs(10), async {
             for protocol in [chat(), Protocol::Responses, Protocol::Anthropic] {
                 let dir = tempfile::tempdir().unwrap();
                 let count = dir.path().join("count");
                 let (listener, root) = listener().await;
-                let provider = provider(protocol, &root, Some("overridden-direct-key".into()))
+                let direct = provider(protocol, &root, Some("direct-key".into()));
+                let provider = direct
+                    .clone()
                     .with_api_key_command(format!(
-                        "printf x >> {}; sleep 0.05; printf ' \\t  resolved-key  \\r\\n '",
+                        "printf x >> {}; printf ' \\t  resolved-key  \\r\\n '",
                         quote(&count)
                     ))
                     .unwrap();
                 let mut contexts: Vec<_> = (0..8)
                     .map(|i| provider.clone().open_context(i.to_string()).unwrap())
                     .collect();
+                // Neither unpolled nor invalid invocations run the command.
+                drop(contexts[0].invoke(request()));
+                let mut empty_model = request();
+                empty_model.model.clear();
+                let mut other_context = request();
+                other_context.correlation = Some("different-context".into());
+                for invalid in [empty_model, other_context] {
+                    assert!(contexts[0].invoke(invalid).await.is_err());
+                }
+                assert!(!count.exists());
                 let invoke = async {
                     let calls = contexts.iter_mut().map(|context| context.invoke(request()));
                     for result in futures_util::future::join_all(calls).await {
                         drop(result.unwrap());
                     }
-                    // Existing and newly opened contexts reuse cached success.
-                    drop(contexts[0].invoke(request()).await.unwrap());
+                    // Newly opened contexts reuse cached success.
                     let mut later = provider.open_context("later".into()).unwrap();
                     drop(later.invoke(request()).await.unwrap());
+                    let mut direct = direct.open_context("direct".into()).unwrap();
+                    drop(direct.invoke(request()).await.unwrap());
                 };
                 let ((), headers) = tokio::join!(invoke, capture(&listener, 10));
-                for headers in headers {
-                    assert_credential(&headers, protocol, "resolved-key");
+                for headers in &headers[..9] {
+                    assert_credential(headers, protocol, "resolved-key");
                 }
+                assert_credential(&headers[9], protocol, "direct-key");
                 let command = provider.api_key_command.as_ref().unwrap();
                 assert!(command.header(protocol).await.unwrap().is_sensitive());
                 assert_eq!(std::fs::read(&count).unwrap(), b"x");
@@ -230,24 +220,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_headers_are_unchanged_without_a_command() {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            for protocol in [chat(), Protocol::Responses, Protocol::Anthropic] {
-                let (listener, root) = listener().await;
-                let provider = provider(protocol, &root, Some("direct-key".into()));
-                let mut context = provider.open_context("test".into()).unwrap();
-                let (result, headers) =
-                    tokio::join!(context.invoke(request()), capture(&listener, 1));
-                drop(result.unwrap());
-                assert_credential(&headers[0], protocol, "direct-key");
-            }
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn command_failures_are_sanitized_and_can_retry_from_another_clone() {
+    async fn command_failures_are_sanitized_uncached_and_stdin_is_closed() {
         let cases = [
             (
                 "printf private-stdout; printf private-stderr >&2; exit 7",
@@ -266,69 +239,51 @@ mod tests {
                 "head -c 65537 /dev/zero",
                 "API key command output exceeded the size limit",
             ),
+            (
+                "if read value; then printf stdin-open; else exit 1; fi",
+                "API key command exited unsuccessfully",
+            ),
         ];
         let run = async {
-            for protocol in [chat(), Protocol::Responses, Protocol::Anthropic] {
-                for (bad, expected) in cases {
-                    let dir = tempfile::tempdir().unwrap();
-                    let marker = quote(&dir.path().join("attempted"));
-                    let resolver = ApiKeyCommand::new(format!(
-                        "# private-command-text\nif test -e {marker}; then printf retry-key; else touch {marker}; {bad}; fi"
-                    ));
-                    let clone = resolver.clone();
-                    let error = resolver.header(protocol).await.unwrap_err();
-                    assert_eq!(error.kind, ProviderErrorKind::Authentication);
-                    assert_eq!(error.message, expected);
-                    let rendered = format!("{error:?} {error}");
-                    for forbidden in [
-                        "private-command-text",
-                        "private-stdout",
-                        "private-stderr",
-                        "retry-key",
-                    ] {
-                        assert!(!rendered.contains(forbidden));
-                    }
-                    assert!(resolver.header.get().is_none());
-                    let header = clone.header(protocol).await.unwrap();
-                    let expected = match protocol {
-                        Protocol::Anthropic => "retry-key",
-                        _ => "Bearer retry-key",
-                    };
-                    assert_eq!(header.to_str().unwrap(), expected);
-                    assert!(header.is_sensitive());
-                    assert!(resolver.header.get().is_some());
+            // Each header format sees failures without multiplying child processes.
+            let protocols = [chat(), Protocol::Responses, Protocol::Anthropic];
+            for ((bad, expected), protocol) in cases.into_iter().zip(protocols.into_iter().cycle())
+            {
+                let dir = tempfile::tempdir().unwrap();
+                let marker = quote(&dir.path().join("attempted"));
+                let command = format!(
+                    "# private-command-text\nif test -e {marker}; then printf retry-key; else touch {marker}; {bad}; fi"
+                );
+                // The failure reaches invoke before any HTTP request is made.
+                let provider = provider(protocol, "http://127.0.0.1:1/v1", None)
+                    .with_api_key_command(command)
+                    .unwrap();
+                let mut context = provider.open_context("test".into()).unwrap();
+                let Err(error) = context.invoke(request()).await else {
+                    panic!("failed command unexpectedly invoked HTTP")
+                };
+                assert_eq!(error.kind, ProviderErrorKind::Authentication);
+                assert_eq!(error.message, expected);
+                let rendered = format!("{error:?} {error}");
+                for forbidden in ["private-command-text", "private-std", "retry-key"] {
+                    assert!(!rendered.contains(forbidden));
                 }
+                let resolver = provider.api_key_command.as_ref().unwrap();
+                assert!(resolver.header.get().is_none());
+                let header = resolver.clone().header(protocol).await.unwrap();
+                let bearer = !matches!(protocol, Protocol::Anthropic);
+                let retried = if bearer {
+                    "Bearer retry-key"
+                } else {
+                    "retry-key"
+                };
+                assert_eq!(header.to_str().unwrap(), retried);
+                assert!(resolver.header.get().is_some());
             }
         };
         tokio::time::timeout(Duration::from_secs(10), run)
             .await
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn command_failure_reaches_invoke_without_http_or_output_disclosure() {
-        let command = "printf private-output; printf private-error >&2; exit 42 # private-command";
-        let provider = provider(chat(), "http://127.0.0.1:1/v1", None)
-            .with_api_key_command(command.into())
-            .unwrap();
-        let mut context = provider.open_context("test".into()).unwrap();
-        let Err(error) = context.invoke(request()).await else {
-            panic!("failed command unexpectedly invoked HTTP")
-        };
-        assert_eq!(error.kind, ProviderErrorKind::Authentication);
-        assert_eq!(error.message, "API key command exited unsuccessfully");
-    }
-
-    #[tokio::test]
-    async fn command_stdin_is_closed() {
-        let resolver =
-            ApiKeyCommand::new("if read value; then exit 1; else printf stdin-closed; fi".into());
-        let header =
-            tokio::time::timeout(Duration::from_secs(5), resolver.header(Protocol::Anthropic))
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(header, "stdin-closed");
     }
 
     #[cfg(target_os = "linux")]

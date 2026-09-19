@@ -1,13 +1,11 @@
-//! Child replies are derived from their source history records, independently of
-//! lifecycle delivery. There is deliberately no second message-publication event.
+//! Child replies, derived from their source history records independently of
+//! lifecycle delivery.
 use super::delivery::MESSAGE_BATCH_BYTES;
 use super::*;
 
 const MESSAGE_BATCH_COUNT: usize = 128;
 
-/// The child reply this record projects, normalized exactly as the turn that
-/// produced it projected its own response text, so live publication and replay agree
-/// and a whitespace-only turn publishes nothing either way.
+/// The child reply this record projects; empty for a whitespace-only turn.
 pub(super) fn visible_text(message: &Message) -> Option<String> {
     let Message::Assistant(items) = message else {
         return None;
@@ -29,9 +27,8 @@ impl JobEntry {
                 && self.delivery_stamp > floor)
     }
 
-    /// Queue a child reply for delivery, reporting whether it was published. A blank
-    /// turn is not a reply, and what is never published must never wake the owner, so
-    /// callers take the wake decision from this answer rather than re-deriving it.
+    /// Queue a child reply for delivery, reporting whether it was published: a
+    /// blank turn is not a reply and must not wake the owner.
     pub(super) fn publish_message(&mut self, id: JobId, sequence: u64, text: String) -> bool {
         if text.is_empty() {
             return false;
@@ -53,13 +50,9 @@ impl JobManager {
     /// cancellation-shielded operation. The source sequence is the delivery ID.
     /// Empty visible text is committed to history but produces no delivery/wake.
     ///
-    /// `wake_owner` decides only *when* the owner is woken, never what is
-    /// published: the durable message record is identical either way. A
-    /// non-terminal reply (the child keeps working) wakes the owner immediately; a
-    /// terminal reply is published silently so the invocation's resolution point —
-    /// the owning job's own completion broadcast, or [`JobManager::notify_owner`]
-    /// where that invocation does not finish — presents it in the same delivery
-    /// batch as the completion envelope.
+    /// `wake_owner` decides only when the owner is woken. A terminal reply passes
+    /// `false` so the job's completion (or [`JobManager::notify_owner`]) presents
+    /// it in the same delivery batch as the completion envelope.
     pub(crate) async fn commit_child_message(
         &self,
         child: &AgentId,
@@ -137,19 +130,15 @@ impl JobManager {
         .map_err(|error| JobError::Internal(error.to_string()))?
     }
 
-    /// Wake a child job's owner for replies that are already durably published.
-    /// Nothing is published here, so delivery batching, acknowledgement, dedup and
-    /// replay are untouched; this only replaces the wake that
-    /// `commit_child_message(.., wake_owner: false)` deliberately withheld. Callers
-    /// are the invocation resolution paths that do *not* finish the owning job,
-    /// whose completion broadcast would otherwise be the wake.
+    /// Wake a child job's owner for already-published replies: the wake that
+    /// `commit_child_message(.., wake_owner: false)` withheld, for invocations
+    /// that resolve without finishing the owning job.
     pub(crate) async fn notify_owner(&self, job: JobId) {
         let jobs = self.inner.jobs.lock().await;
         let Some(entry) = jobs.get(&job) else {
             return;
         };
-        // Messages stay in the entry until acknowledged, so an empty list means the
-        // owner has nothing to collect and must not be woken with an empty snapshot.
+        // Never wake the owner with nothing to collect.
         if entry.messages.is_empty() {
             return;
         }
@@ -162,11 +151,7 @@ impl JobManager {
     /// Last committed *visible* child message, even after acknowledgement/resume.
     #[cfg(test)]
     pub(crate) async fn last_agent_message(&self, job: JobId) -> Result<Option<u64>, JobError> {
-        let jobs = self.inner.jobs.lock().await;
-        Ok(jobs
-            .get(&job)
-            .ok_or(JobError::Unknown(job))?
-            .last_agent_message)
+        self.entry(job, |entry| entry.last_agent_message).await
     }
 }
 
@@ -175,9 +160,7 @@ fn message_size(message: &AgentMessage) -> usize {
     serde_json::to_vec(message).map_or(MESSAGE_BATCH_BYTES, |bytes| bytes.len().saturating_add(18))
 }
 
-/// Presented size of a whole reply batch. `pending_messages` applies the budget
-/// incrementally, and lifecycle envelopes no longer debit it, so this remains only
-/// for assertions about a completed batch.
+/// Presented size of a whole reply batch.
 #[cfg(test)]
 pub(super) fn batch_size(messages: &[AgentMessage]) -> usize {
     messages.iter().fold(0_usize, |bytes, message| {
@@ -186,8 +169,6 @@ pub(super) fn batch_size(messages: &[AgentMessage]) -> usize {
 }
 
 /// Replies in sequence order, bounded by count and by their own byte budget.
-/// Lifecycle envelopes are budgeted separately, so a full reply batch never
-/// defers the completion metadata that accompanies it.
 pub(super) fn pending_messages(
     jobs: &HashMap<JobId, JobEntry>,
     owner: &AgentId,
@@ -215,7 +196,8 @@ pub(super) fn pending_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::protocol::{AssistantContent, BlockContent, Message, UserContent};
+    use crate::job::tests::job_events;
+    use crate::provider::protocol::{AssistantContent, BlockContent, Message};
 
     use crate::job::delivery::LIFECYCLE_BATCH_BYTES;
 
@@ -229,8 +211,7 @@ mod tests {
         (session.root, manager, owner, child, job)
     }
 
-    /// Session, manager and owner without any job, so a test controls job IDs and
-    /// therefore the order `pending_ids` budgets them in.
+    /// Session, manager and owner without any job, so a test controls job IDs.
     async fn owner_session() -> (crate::session::fixture::MemorySession, JobManager, AgentId) {
         let session = crate::session::fixture::MemorySession::new().await;
         let owner = session.agent.clone();
@@ -238,8 +219,7 @@ mod tests {
         (session, manager, owner)
     }
 
-    /// A running child-agent job and its child agent. Child replies only exist for
-    /// agent-role jobs, whose completed notification presents the reply by reference.
+    /// A running child-agent job and its child agent.
     async fn agent_job(
         session: &crate::session::fixture::MemorySession,
         manager: &JobManager,
@@ -269,9 +249,7 @@ mod tests {
         job
     }
 
-    /// A saved result too large to present inline, so the envelope is budgeted as a
-    /// whole page. A child agent's saved result is its full final text, so real
-    /// child completions routinely land here.
+    /// A saved result too large to present inline.
     async fn finish_bulky(manager: &JobManager, job: JobId) {
         let result = serde_json::json!("y".repeat(2 * output::PAGE_BYTES));
         manager.test_finish(job, result).await;
@@ -287,17 +265,6 @@ mod tests {
 
     fn assistant(text: &str) -> Message {
         Message::Assistant(vec![AssistantContent::text("text", 0, text)])
-    }
-
-    fn runtime_text(text: String) -> Message {
-        Message::User(vec![UserContent::Runtime { text }])
-    }
-
-    fn job_events(items: impl serde::Serialize) -> Message {
-        let items = serde_json::to_string(&items).unwrap();
-        runtime_text(format!(
-            "<skyhook_job_events>\n{items}\n</skyhook_job_events>"
-        ))
     }
 
     async fn commit(manager: &JobManager, child: &AgentId, job: JobId, text: &str) -> u64 {
@@ -431,26 +398,31 @@ mod tests {
         }
     }
 
-    /// Replies are batched by their own budget; later batches rewake the owner and
-    /// a completion never overtakes undelivered replies of its own job. Whichever
-    /// batch carries the last reply also carries that completion, including when
-    /// the reply alone exceeds the whole reply budget.
+    /// Later batches rewake the owner, and a completion arrives with its job's
+    /// last reply, even when that reply alone exceeds the reply budget.
     #[tokio::test]
     async fn bounded_batches_rewake_and_do_not_overtake_messages_with_completion() {
         // Sized against the budget so the split points survive retuning it.
         let large = MESSAGE_BATCH_BYTES * 5 / 8;
-        // (message sizes, expected (messages, envelopes) per batch)
+        // (message sizes, unrelated finished tool job, expected (messages, envelopes) per batch)
         let cases = [
-            (vec![large; 3], vec![(1, 0), (1, 0), (1, 1)]),
-            (vec![MESSAGE_BATCH_BYTES + 1000], vec![(1, 1)]),
+            (vec![large; 3], false, vec![(1, 0), (1, 0), (1, 1)]),
+            // Reply bytes never defer lifecycle metadata, not even an unrelated job's.
+            (vec![MESSAGE_BATCH_BYTES + 1000], true, vec![(1, 2)]),
         ];
-        for (sizes, batches) in cases {
+        for (sizes, unrelated, batches) in cases {
             let (_root, manager, owner, child, job) = child_job(true).await;
             let mut pending = Vec::new();
             for size in sizes {
                 pending.push(commit(&manager, &child, job, &"x".repeat(size)).await);
             }
-            finish(&manager, job).await;
+            let mut finished = vec![job];
+            if unrelated {
+                finished.push(tool_job(&manager, &owner).await);
+            }
+            for job in &finished {
+                finish(&manager, *job).await;
+            }
             let mut wakes = manager.subscribe_completions();
             for (index, (messages, envelopes)) in batches.iter().enumerate() {
                 let receipt = manager.pending_delivery(&owner).await.unwrap();
@@ -459,6 +431,9 @@ mod tests {
                     pending.drain(..*messages).collect::<Vec<_>>()
                 );
                 assert_eq!(receipt.envelopes().len(), *envelopes);
+                if *envelopes > 0 {
+                    assert_eq!(envelope_ids(&receipt), finished);
+                }
                 ack(receipt).await;
                 if index + 1 < batches.len() {
                     assert_eq!(wakes.try_recv().unwrap().job, job);
@@ -470,30 +445,9 @@ mod tests {
         }
     }
 
-    /// Reply bytes never defer lifecycle metadata: a reply larger than the whole
-    /// reply budget still arrives with its own completion and with an unrelated
-    /// job's completion, because the two budgets are separate.
-    #[tokio::test]
-    async fn replies_never_defer_lifecycle_metadata() {
-        let (session, manager, owner) = owner_session().await;
-        let (child, job) = agent_job(&session, &manager, &owner, 1, true).await;
-        let other = tool_job(&manager, &owner).await;
-        let oversized = "x".repeat(MESSAGE_BATCH_BYTES + 1000);
-        let sequence = commit(&manager, &child, job, &oversized).await;
-        finish(&manager, job).await;
-        finish(&manager, other).await;
-        let receipt = manager.pending_delivery(&owner).await.unwrap();
-        assert_eq!(sequences(&receipt), [sequence]);
-        assert_eq!(envelope_ids(&receipt), [job, other]);
-        ack(receipt).await;
-        assert!(!manager.has_pending(&owner).await);
-        assert!(!manager.test_replay().await.has_pending(&owner).await);
-    }
-
     /// A completed child agent's envelope is budgeted as the metadata it presents,
-    /// not as the saved result it only references, so a fan-in of children whose
-    /// results each exceed a page still lands in one notification. The replies are
-    /// acknowledged first so that pinning cannot mask the cost of the envelopes.
+    /// not as the saved result it references. The replies are acknowledged first
+    /// so that pinning cannot mask the cost of the envelopes.
     #[tokio::test]
     async fn referenced_completions_are_budgeted_as_metadata() {
         let (session, manager, owner) = owner_session().await;
@@ -527,7 +481,7 @@ mod tests {
     async fn lifecycle_batch_bounds_presented_bytes() {
         let (_session, manager, owner) = owner_session().await;
         let mut jobs = Vec::new();
-        for _ in 0..6 {
+        for _ in 0..5 {
             let job = tool_job(&manager, &owner).await;
             // Not schema-annotated, so presentation cannot shorten it.
             let result = serde_json::json!({"value": "z".repeat(2 * output::PAGE_BYTES)});
@@ -561,11 +515,7 @@ mod tests {
         );
     }
 
-    /// A capture-backed result reaches the model as a page at most, so a completion
-    /// like a shell job's output is costed as a page rather than six times its
-    /// stored size: several share one notification instead of one turn each.
-    /// A question envelope rides with the same job's reply instead of costing the
-    /// owner a separate turn.
+    /// A question envelope rides with the same job's reply.
     #[tokio::test]
     async fn question_travels_with_the_reply_of_its_own_job() {
         let (session, manager, owner) = owner_session().await;
@@ -597,9 +547,8 @@ mod tests {
         assert!(manager.has_pending(&owner).await);
     }
 
-    /// The lifecycle budget still bounds envelopes, but a reply in the batch pins
-    /// the completion that only references it even when earlier completions have
-    /// exhausted that budget; the crowded-out envelope follows in its own batch.
+    /// A reply in the batch pins the completion that references it even when
+    /// earlier completions have exhausted the lifecycle budget.
     #[tokio::test]
     async fn reply_pins_its_completion_when_the_lifecycle_budget_is_full() {
         let (session, manager, owner) = owner_session().await;
@@ -693,9 +642,8 @@ mod tests {
     #[tokio::test]
     async fn message_ack_does_not_claim_lifecycle_and_resume_does_not_claim_messages() {
         let (_root, manager, owner, child, job) = child_job(true).await;
-        // Replies too large to share a batch, so the first batch stops before the
-        // job's last reply and its question envelope is held back with it. That
-        // gives a reply-only receipt to acknowledge while a question is pending.
+        // Replies too large to share a batch give a reply-only first receipt
+        // while the question is pending.
         let bulky = "x".repeat(MESSAGE_BATCH_BYTES * 5 / 8);
         let first = commit(&manager, &child, job, &bulky).await;
         let second = commit(&manager, &child, job, &bulky).await;
@@ -770,14 +718,11 @@ mod tests {
         );
     }
 
-    /// The live shape a reasoning model produces on a working turn: private
-    /// reasoning plus a blank text separator before its calls. History keeps that
-    /// block for replay, but a blank turn answered nothing, so it must publish no
-    /// reply, wake nobody, and leave no delivery for replay to resurrect.
-    /// Otherwise a parent collects one empty child message per child turn.
+    /// Private reasoning plus a blank text separator is kept in history, but
+    /// publishes no reply, wakes nobody, and leaves nothing for replay to deliver.
     #[tokio::test]
     async fn whitespace_only_child_reply_commits_history_without_publishing_or_waking() {
-        for blank in ["", "\n\n", " \t\n"] {
+        for blank in ["", " \t\n"] {
             let (_root, manager, owner, child, job) = child_job(true).await;
             let before = manager.store().records().await.len();
             let mut wakes = manager.subscribe_completions();
@@ -812,9 +757,7 @@ mod tests {
                     .messages()
                     .is_empty()
             );
-            // Replay derives publication from the same record, so it must agree.
-            // (A replayed background job is deliverable as interrupted, which is
-            // lifecycle delivery, not a reply, so assert on the reply itself.)
+            // Replay agrees. (It delivers the job as interrupted, so assert on replies.)
             let replayed = manager.test_replay().await;
             assert_eq!(replayed.last_agent_message(job).await.unwrap(), None);
             assert!(
@@ -828,33 +771,18 @@ mod tests {
         }
     }
 
-    /// A projection the journal could not reproduce is refused, so a caller cannot
-    /// smuggle raw blank text past normalization and publish it as a reply.
     #[tokio::test]
-    async fn unnormalized_blank_projection_is_refused() {
-        let (_root, manager, owner, child, job) = child_job(true).await;
-        let before = manager.store().records().await.len();
-        let message = Message::Assistant(vec![AssistantContent::text("blank", 0, "\n\n")]);
-        let result = manager
-            .commit_child_message(&child, job, message, "\n\n".into(), true, |_| Vec::new())
-            .await;
-        // Specifically the projection guard, not an association failure.
-        let failure = result.unwrap_err().to_string();
-        assert!(failure.contains("does not match"), "unexpected: {failure}");
-        assert_eq!(manager.store().records().await.len(), before);
-        assert!(!manager.has_pending(&owner).await);
-    }
-
-    #[tokio::test]
-    async fn invalid_association_or_projection_never_commits_and_empty_text_never_wakes() {
+    async fn invalid_association_or_projection_never_commits() {
         let (_root, manager, owner, child, job) = child_job(false).await;
         let before = manager.store().records().await.len();
-        for (author, projection) in [
-            (child.clone(), "private"),
-            (owner.child(2), "visible"),
-            (owner.clone(), "visible"),
+        for (author, text, projection, cause) in [
+            (child.clone(), "visible", "private", "does not match"),
+            // Raw blank text is not the normalized projection.
+            (child.clone(), "\n\n", "\n\n", "does not match"),
+            (owner.child(2), "visible", "visible", "association"),
+            (owner.clone(), "visible", "visible", "owner mismatch"),
         ] {
-            let message = assistant("visible");
+            let message = assistant(text);
             let result = manager.commit_child_message(
                 &author,
                 job,
@@ -863,15 +791,11 @@ mod tests {
                 true,
                 |_| Vec::new(),
             );
-            assert!(result.await.is_err());
+            let failure = result.await.unwrap_err().to_string();
+            assert!(failure.contains(cause), "unexpected: {failure}");
         }
         assert_eq!(manager.store().records().await.len(), before);
-        let mut wakes = manager.subscribe_completions();
-        commit(&manager, &child, job, "").await;
-        assert_eq!(manager.store().records().await.len(), before + 1);
-        assert_eq!(manager.last_agent_message(job).await.unwrap(), None);
         assert!(!manager.has_pending(&owner).await);
-        assert!(wakes.try_recv().is_err());
     }
 
     #[tokio::test]

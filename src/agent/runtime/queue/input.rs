@@ -2,36 +2,22 @@
 
 use super::*;
 
-struct SelectedModel {
-    name: String,
-    profile: ModelProfile,
-    replacement: Option<AgentContext>,
-}
-
-/// A model selection resolved against the destination before any journal
-/// append, so an unsupported profile never opens a provider context.
-struct PreparedModelSelection<'a> {
-    runtime: &'a SessionRuntime,
-    agent: &'a AgentId,
-    context: &'a mut AgentContext,
-    model_profile: &'a mut String,
-    selection: Option<SelectedModel>,
-}
-
-impl<'a> PreparedModelSelection<'a> {
+impl SessionRuntime {
+    /// Switch the agent to profile `name`, if given and different. Everything is
+    /// resolved before the journal append, so a rejected selection changes nothing;
     /// `images` rejects an unsupported profile before any provider context opens.
-    async fn prepare(
-        runtime: &'a SessionRuntime,
-        agent: &'a AgentId,
-        context: &'a mut AgentContext,
-        model_profile: &'a mut String,
+    pub(in crate::agent::runtime) async fn select_model(
+        &self,
+        agent: &AgentId,
+        context: &mut AgentContext,
+        model_profile: &mut String,
         capabilities: &CapabilitySet,
         name: Option<String>,
         images: bool,
-    ) -> Result<Self, HarnessError> {
+    ) -> Result<(), HarnessError> {
         let name = name.filter(|name| name != model_profile);
         let profile = match &name {
-            Some(name) => runtime
+            Some(name) => self
                 .harness
                 .model_profiles
                 .get(name)
@@ -42,134 +28,37 @@ impl<'a> PreparedModelSelection<'a> {
         if images && !profile.supports_images {
             return Err(HarnessError::ImagesUnsupported(profile.model));
         }
-        let selection = match name {
-            Some(name) if profile != context.profile => {
-                let system = context.template.system().to_vec();
-                // The tools stay pinned across a model change.
-                let tools = Some(context.template.to_request().tools);
-                let replacement = runtime
-                    .open_agent_context(agent, profile.clone(), system, capabilities, tools, false)
-                    .await?;
-                if !profile.supports_images && replacement.contains_images() {
-                    return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
-                }
-                let replacement = Some(replacement);
-                Some(SelectedModel {
-                    name,
-                    profile,
-                    replacement,
-                })
-            }
-            Some(name) => Some(SelectedModel {
-                name,
-                profile,
-                replacement: None,
-            }),
-            None => None,
-        };
-        Ok(Self {
-            runtime,
-            agent,
-            context,
-            model_profile,
-            selection,
-        })
-    }
-
-    /// A durable submission binds its appends to the exact intent attempt.
-    // `&mut self`: the provider context is not `Sync`, and the agent loop is `Send`.
-    async fn accept(
-        &mut self,
-        claim: Option<&ClaimedInput>,
-        event: SessionEvent,
-    ) -> Result<crate::session::AcceptedAppend, HarnessError> {
-        let message = matches!(event, SessionEvent::MessageCommitted { .. });
-        let attempt = claim.and_then(|claim| claim.attempt);
-        let accepted = self
-            .runtime
-            .store
-            .accept_append_bound(self.agent.clone(), attempt, event)
-            .await?;
-        if let Some(claim) = claim {
-            claim.accepted(accepted.identity(), message);
-        }
-        Ok(accepted)
-    }
-
-    async fn install(&mut self, claim: Option<&ClaimedInput>) -> Result<(), HarnessError> {
-        let Some(selected) = self.selection.take() else {
+        let Some(name) = name else {
             return Ok(());
         };
-        let event = SessionEvent::ModelChanged {
-            profile: crate::session::ProfileSnapshot {
-                name: selected.name.clone(),
-                profile: selected.profile.clone(),
-            },
-        };
-        self.accept(claim, event).await?.committed().await?;
-        // No await between installation and its routing projection. The exact
-        // prepared context is installed; no config/provider lookup is repeated.
-        if let Some(replacement) = selected.replacement {
-            *self.context = replacement;
+        let mut replacement = None;
+        if profile != context.profile {
+            let system = context.template.system().to_vec();
+            // The tools stay pinned across a model change.
+            let tools = Some(context.template.to_request().tools);
+            let opened = self
+                .open_agent_context(agent, profile.clone(), system, capabilities, tools, false)
+                .await?;
+            if !profile.supports_images && opened.contains_images() {
+                return Err(HarnessError::ImagesUnsupported(profile.model));
+            }
+            replacement = Some(opened);
         }
-        *self.model_profile = selected.name;
-        if let Some(live) = self
-            .runtime
-            .agents
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_mut(self.agent)
-        {
-            live.model_profile.clone_from(self.model_profile);
+        let profile = crate::session::ProfileSnapshot {
+            name: name.clone(),
+            profile,
+        };
+        let event = SessionEvent::ModelChanged { profile };
+        self.store.append(agent.clone(), event).await?;
+        // No await between installation and its routing projection.
+        if let Some(replacement) = replacement {
+            *context = replacement;
+        }
+        *model_profile = name;
+        if let Some(live) = self.agents_mut().get_mut(agent) {
+            live.model_profile.clone_from(model_profile);
         }
         Ok(())
-    }
-}
-
-impl ClaimedInput {
-    fn accepted(&self, identity: crate::session::AppendIdentity, is_message: bool) {
-        if let Phase::Claimed { appends, message } = &mut *self.input.prepared.token.0.0.phase() {
-            appends.push(identity);
-            if is_message {
-                *message = Some(identity);
-            }
-        }
-    }
-
-    /// Settle the claim and publish the receipt, however the caller was dropped.
-    fn settle(self, result: Result<QueuedPromptCommit, HarnessError>) {
-        let QueuedInput {
-            prepared,
-            committed,
-        } = self.input;
-        let result = result.map_err(|error| prepared.cancellation_handle().failed(error));
-        // Release authority before the receipt is observable.
-        drop(prepared);
-        let _ = committed.send(result);
-    }
-}
-
-impl SessionRuntime {
-    pub(in crate::agent::runtime) async fn select_model(
-        &self,
-        agent: &AgentId,
-        context: &mut AgentContext,
-        model_profile: &mut String,
-        capabilities: &CapabilitySet,
-        model: String,
-    ) -> Result<(), HarnessError> {
-        PreparedModelSelection::prepare(
-            self,
-            agent,
-            context,
-            model_profile,
-            capabilities,
-            Some(model),
-            false,
-        )
-        .await?
-        .install(None)
-        .await
     }
 
     pub(in crate::agent::runtime) async fn consume_queued_input(
@@ -184,52 +73,28 @@ impl SessionRuntime {
             input.reject(HarnessError::AgentStopped);
             return false;
         }
-        let mut claim = match input.try_claim(&self.queue_state) {
-            Ok(claim) => claim,
-            Err(input) => {
-                input.reject(HarnessError::Interrupted);
-                return false;
-            }
-        };
-        let draft = &mut claim.input.prepared;
-        let images = draft.content.iter().any(UserContent::is_image);
-        let (model, content) = (draft.model.clone(), std::mem::take(&mut draft.content));
-        // ModelChanged and MessageCommitted retain their event order and
-        // partial-prefix meaning: a failure after ModelChanged is indeterminate.
+        if !input.cancellation.try_claim() {
+            input.reject(HarnessError::Interrupted);
+            return false;
+        }
+        let QueuedInput {
+            content,
+            model,
+            committed,
+            ..
+        } = input;
+        let images = content.iter().any(UserContent::is_image);
+        // ModelChanged precedes the MessageCommitted it applies to.
         let result = async {
-            let mut prepared = PreparedModelSelection::prepare(
-                self,
-                agent,
-                context,
-                model_profile,
-                capabilities,
-                model,
-                images,
-            )
-            .await?;
-            prepared.install(Some(&claim)).await?;
+            self.select_model(agent, context, model_profile, capabilities, model, images)
+                .await?;
             let message = Message::User(content);
             let event = SessionEvent::MessageCommitted {
                 message: message.clone(),
             };
-            let accepted = prepared.accept(Some(&claim), event).await?;
-            let identity = accepted.identity();
-            let record = accepted.committed().await?;
-            prepared.context.projected.push((record.sequence, message));
-            if let Some(attempt) = claim.attempt {
-                let settlement = crate::session::QueueSettlement::Committed {
-                    event: identity.event,
-                };
-                let event = SessionEvent::QueueSettlement {
-                    attempt,
-                    settlement,
-                };
-                self.store.append(agent.clone(), event).await?;
-            }
-            Ok(QueuedPromptCommit {
-                submission: claim.input.prepared.identity(),
-                append: identity,
-            })
+            let record = self.store.append(agent.clone(), event).await?;
+            context.projected.push((record.sequence, message));
+            Ok(())
         }
         .await;
         let consumed = result.is_ok();
@@ -238,7 +103,7 @@ impl SessionRuntime {
             // starts a fresh turn; publishing afterward races the UI's idle check.
             self.activity(agent, AgentActivity::Working);
         }
-        claim.settle(result);
+        let _ = committed.send(result);
         consumed
     }
 }
@@ -291,7 +156,7 @@ mod tests {
         let send = runtime.jobs.send(job, second.clone());
         bounded(send).await.unwrap();
         forwarded(2).await;
-        assert_eq!(tracking.count(), 1);
+        assert_eq!(count(&tracking), 1);
 
         // Keep wakeups out of the script-driven parent loop; the child mailbox stays live.
         let root_inbox = quiet_root(&session);
@@ -320,7 +185,7 @@ mod tests {
         assert_eq!(completed.output, Some(json!("answer-1")));
         drop(root_inbox);
         stop(&session).await;
-        assert_eq!(tracking.count(), 2);
+        assert_eq!(count(&tracking), 2);
     }
 
     #[tokio::test]
@@ -347,7 +212,7 @@ mod tests {
         assert!(!first.is_finished() && !second.is_finished());
         assert!(!first_cancel.is_claimed() && !second_cancel.is_claimed());
         assert_eq!(texts(&committed(&session).await), ["test:initial"]);
-        assert_eq!(tracking.count(), 1);
+        assert_eq!(count(&tracking), 1);
 
         tracking.release(0);
         let next = tracking.request(1).await;
@@ -381,7 +246,7 @@ mod tests {
         bounded(turn).await.unwrap().unwrap();
         stop(&session).await;
         // Queued inputs must not become additional turns.
-        assert_eq!(tracking.count(), 2);
+        assert_eq!(count(&tracking), 2);
         assert_eq!(texts(&committed(&session).await), expected);
     }
 
@@ -402,7 +267,7 @@ mod tests {
         tracking.release(1);
         bounded(turn).await.unwrap().unwrap();
         stop(&session).await;
-        assert_eq!(tracking.count(), 2);
+        assert_eq!(count(&tracking), 2);
     }
 
     #[tokio::test]
@@ -426,7 +291,7 @@ mod tests {
         bounded(turn).await.unwrap().unwrap();
         stop(&session).await;
         assert_eq!(texts(&committed(&session).await), ["test:initial"]);
-        assert_eq!(tracking.count(), 2);
+        assert_eq!(count(&tracking), 2);
     }
 
     #[tokio::test]
@@ -446,27 +311,7 @@ mod tests {
         let last = tracking.request(2).await;
         assert_eq!(texts(last.messages()), ["test:initial", "test:ordinary"]);
         stop(&session).await;
-        assert_eq!(tracking.count(), 3);
-    }
-
-    #[tokio::test]
-    async fn already_canceled_token_never_starts_a_turn() {
-        let (_root, tracking, session) = start(false).await;
-        let prompt = QueuedPrompt {
-            text: "test:already-canceled".into(),
-            attachments: vec![],
-            options: crate::agent::runtime::tests::model("second"),
-            token: QueuedPromptToken::new().unwrap(),
-        };
-        let token_cancel = prompt.token.cancellation_handle();
-        assert!(token_cancel.cancel());
-        let enqueued = enqueue_prompts(&session, vec![prompt]);
-        assert!(bounded(enqueued).await[0].is_err());
-        assert!(!token_cancel.is_claimed());
-        stop(&session).await;
-        assert_eq!(tracking.count(), 0);
-        assert!(texts(&committed(&session).await).is_empty());
-        assert!(model_changes(&session).await.is_empty());
+        assert_eq!(count(&tracking), 3);
     }
 
     #[tokio::test]
@@ -493,14 +338,11 @@ mod tests {
                 options: PromptOptions {
                     model: model.map(str::to_owned),
                 },
-                token: QueuedPromptToken::new().unwrap(),
+                cancellation: QueuedPromptCancellation::default(),
             };
-            let token_cancel = prompt.token.cancellation_handle();
+            let token_cancel = prompt.cancellation.clone();
             let enqueued = enqueue_prompts(&session, vec![prompt]);
             let error = bounded(enqueued).await.pop().unwrap().unwrap_err();
-            let QueuedPromptError::Rejected(error) = error else {
-                panic!("{case}: {error:?}")
-            };
             if case == "model" {
                 assert!(matches!(error, UnknownModelProfile(_)), "{case}");
             } else {
@@ -510,59 +352,7 @@ mod tests {
             assert!(token_cancel.cancel(), "{case}");
             assert_eq!(runtime.store.records().await.len(), before, "{case}");
         }
-        assert_eq!(tracking.count(), 0);
-        stop(&session).await;
-    }
-
-    #[tokio::test]
-    async fn interrupt_and_shutdown_resolve_queued_receipts_without_silent_loss() {
-        for shutdown in [false, true] {
-            let (_root, tracking, session) = start(false).await;
-            let turn = prompt(&session, "test:initial");
-            tracking.request(0).await;
-            let (receipt, token_cancel) = enqueue(&session, "test:lifecycle", vec![], None);
-            buffered(&session, 1).await;
-            assert!(!receipt.is_finished());
-            // Permit continuations, never the interrupted first invocation, to expose the race.
-            tracking.release(1);
-            if shutdown {
-                bounded(session.shutdown()).await.unwrap();
-            } else {
-                bounded(session.interrupt()).await;
-            }
-            let outcome = bounded(receipt).await.unwrap();
-            assert!(bounded(turn).await.unwrap().is_err());
-            stop(&session).await;
-            let texts = texts(&committed(&session).await);
-            let count = texts
-                .iter()
-                .filter(|text| *text == "test:lifecycle")
-                .count();
-            // A successful receipt is one durable message; a failed one accepts nothing.
-            assert_eq!(count, usize::from(outcome.is_ok()));
-            assert!(outcome.is_err() || token_cancel.is_claimed());
-        }
-    }
-
-    #[tokio::test]
-    async fn dropped_enqueue_waiter_does_not_drop_live_projection_or_duplicate_message() {
-        let (_root, tracking, session) = start(false).await;
-        let turn = prompt(&session, "test:initial");
-        tracking.request(0).await;
-        let (waiter, cancellation) =
-            enqueue(&session, "test:dropped-waiter", vec![], Some("second"));
-        buffered(&session, 1).await;
-        waiter.abort();
-        assert!(waiter.await.unwrap_err().is_cancelled());
-        tracking.release(0);
-        let next = tracking.request(1).await;
-        assert_eq!(next.model, "second-model");
-        let expected = ["test:initial", "test:dropped-waiter"];
-        assert_eq!(texts(next.messages()), expected);
-        assert_eq!(cancellation.recovery().unwrap().appends.len(), 2);
-        tracking.release(1);
-        bounded(turn).await.unwrap().unwrap();
-        assert_eq!(texts(&committed(&session).await), expected);
+        assert_eq!(count(&tracking), 0);
         stop(&session).await;
     }
 }

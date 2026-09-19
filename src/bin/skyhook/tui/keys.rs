@@ -84,10 +84,7 @@ impl FromStr for Command {
 type KeySequence = (Option<KeyEvent>, KeyEvent);
 
 fn parse_sequence(value: &str) -> KeySequence {
-    let keys = value
-        .split_whitespace()
-        .map(|key| parse(key).expect("default keybindings are valid"))
-        .collect::<Vec<_>>();
+    let keys = value.split_whitespace().map(parse).collect::<Vec<_>>();
     match keys[..] {
         [key] => (None, key),
         [prefix, key] => (Some(prefix), key),
@@ -164,7 +161,8 @@ impl KeyMap {
             .join("\n")
     }
 }
-fn parse(text: &str) -> Result<KeyEvent, String> {
+/// Bindings are built-in, so an invalid one is a programming error.
+fn parse(text: &str) -> KeyEvent {
     let text = text.to_ascii_lowercase();
     let mut modifiers = M::NONE;
     let mut code = None;
@@ -180,11 +178,10 @@ fn parse(text: &str) -> Result<KeyEvent, String> {
             "enter" => code = Some(KeyCode::Enter),
             "tab" => code = Some(KeyCode::Tab),
             s if s.chars().count() == 1 => code = s.chars().next().map(KeyCode::Char),
-            _ => return Err(format!("Invalid keybinding: {text}")),
+            _ => panic!("Invalid keybinding: {text}"),
         }
     }
-    code.map(|code| KeyEvent::new(code, modifiers))
-        .ok_or_else(|| format!("Invalid keybinding: {text}"))
+    KeyEvent::new(code.expect("keybinding names a key"), modifiers)
 }
 fn display(key: &KeyEvent) -> String {
     let mut result = String::new();
@@ -208,9 +205,7 @@ fn display(key: &KeyEvent) -> String {
 mod tests {
     use super::*;
 
-    fn key(value: &str) -> KeyEvent {
-        parse(value).unwrap()
-    }
+    use super::parse as key;
 
     #[test]
     fn parsing_requires_exact_command_names() {

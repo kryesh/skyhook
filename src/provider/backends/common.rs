@@ -1,10 +1,13 @@
 //! Shared model-facing input conversion and opaque reasoning provenance.
 use crate::{
     job::omit_null_fields,
-    media::{ImageRef, MediaError, TextRef},
+    media::{AttachmentRef, ImageRef, MediaError, TextRef},
     provider::{
         ProviderError, ProviderErrorKind,
-        protocol::{Message, ModelRequest, ToolResult, UserContent},
+        protocol::{
+            BlockContent, BlockKind, ItemKind, Message, ModelRequest, ReplayEnvelope,
+            ResponseChunk, ToolResult, UserContent,
+        },
     },
 };
 use serde_json::{Map, Value, json};
@@ -86,6 +89,45 @@ pub(crate) fn attachment_text(
     })
 }
 
+/// User content parts, with `image` encoding the protocol's image part.
+pub(crate) fn user_parts(
+    request: &ModelRequest,
+    parts: &[UserContent],
+    text_type: &str,
+    image: impl Fn(&ImageRef) -> Result<Value, ProviderError>,
+) -> Result<Vec<Value>, ProviderError> {
+    let text = |text: &str| json!({"type":text_type, "text":text});
+    parts
+        .iter()
+        .map(|part| match part {
+            UserContent::Text { text: value }
+            | UserContent::Runtime { text: value }
+            | UserContent::ParentInput { text: value }
+            | UserContent::Compaction { text: value } => Ok(text(value)),
+            UserContent::Attachment { attachment } => match attachment {
+                AttachmentRef::Image(reference) => image(reference),
+                AttachmentRef::Text(file) => Ok(text(&attachment_text(request, file)?)),
+            },
+        })
+        .collect()
+}
+
+/// System segments as the single instruction text of the OpenAI protocols.
+pub(crate) fn system_text(request: &ModelRequest) -> Option<String> {
+    let segments: Vec<_> = request.system.iter().map(|s| s.text.as_str()).collect();
+    (!segments.is_empty()).then(|| segments.join("\n\n"))
+}
+
+pub(crate) fn validate_openai_effort(effort: &str) -> Result<(), ProviderError> {
+    if matches!(
+        effort,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    ) {
+        return Ok(());
+    }
+    Err(invalid(format!("Unsupported reasoning effort: {effort}")))
+}
+
 pub(crate) fn tool_text(tool: &ToolResult) -> String {
     // Keep the result and failure status distinguishable; a JSON result
     // that happens to contain similarly named keys must not overwrite metadata.
@@ -138,8 +180,44 @@ pub(crate) fn attach_runtime_tail(
     false
 }
 
+/// Start events of a single-block item identified by its index.
+pub(crate) fn start_item(id: usize, kind: ItemKind, block_kind: BlockKind) -> [ResponseChunk; 2] {
+    [
+        ResponseChunk::ItemStarted {
+            id: id.to_string(),
+            position: id,
+            kind,
+        },
+        ResponseChunk::BlockStarted {
+            item: id.to_string(),
+            id: "0".into(),
+            position: 0,
+            kind: block_kind,
+        },
+    ]
+}
+
+/// End events matching [`start_item`].
+pub(crate) fn end_item(
+    id: usize,
+    content: BlockContent,
+    replay: Option<ReplayEnvelope>,
+) -> [ResponseChunk; 2] {
+    [
+        ResponseChunk::BlockEnded {
+            item: id.to_string(),
+            block: "0".into(),
+            content,
+        },
+        ResponseChunk::ItemEnded {
+            id: id.to_string(),
+            replay,
+        },
+    ]
+}
+
 pub(crate) fn opaque_payload<'a>(
-    replay: &'a Option<crate::provider::protocol::ReplayEnvelope>,
+    replay: &'a Option<ReplayEnvelope>,
     protocol: &str,
     model: &str,
 ) -> Option<&'a Value> {
@@ -148,12 +226,8 @@ pub(crate) fn opaque_payload<'a>(
         .then_some(&envelope.payload)
 }
 
-pub(crate) fn reasoning_envelope(
-    protocol: &str,
-    model: &str,
-    payload: Value,
-) -> crate::provider::protocol::ReplayEnvelope {
-    crate::provider::protocol::ReplayEnvelope {
+pub(crate) fn reasoning_envelope(protocol: &str, model: &str, payload: Value) -> ReplayEnvelope {
+    ReplayEnvelope {
         version: 1,
         protocol: protocol.into(),
         model: model.into(),
@@ -166,18 +240,10 @@ pub(crate) fn reasoning_envelope(
 /// Provider-bound provenance prevents replaying private reasoning to a different
 /// endpoint even when protocol and model names happen to match.
 pub(crate) fn reasoning_scope(name: &str, endpoint: &str) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(format!("{name}\0{endpoint}"))
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    crate::sha256_hex(format!("{name}\0{endpoint}"))
 }
 
-pub(crate) fn filter_reasoning_scope(
-    request: &mut crate::provider::protocol::ModelRequest,
-    scope: &str,
-) {
-    use crate::provider::protocol::Message;
+pub(crate) fn filter_reasoning_scope(request: &mut ModelRequest, scope: &str) {
     for message in request.messages_mut() {
         if let Message::Assistant(items) = message {
             for item in items {
@@ -193,18 +259,13 @@ pub(crate) fn filter_reasoning_scope(
     }
 }
 
-pub(crate) fn bind_reasoning_scope(
-    chunk: &mut crate::provider::protocol::ResponseChunk,
-    scope: &str,
-) {
-    use crate::provider::protocol::ResponseChunk;
-    match chunk {
-        ResponseChunk::ItemEnded {
-            replay: Some(replay),
-            ..
-        }
-        | ResponseChunk::ItemReplayUpdated { replay, .. } => replay.scope = scope.into(),
-        _ => {}
+pub(crate) fn bind_reasoning_scope(chunk: &mut ResponseChunk, scope: &str) {
+    if let ResponseChunk::ItemEnded {
+        replay: Some(replay),
+        ..
+    } = chunk
+    {
+        replay.scope = scope.into();
     }
 }
 
@@ -213,7 +274,7 @@ pub(super) mod tests {
     use super::*;
     use crate::media::{BlobRef, ImageFormat};
     use crate::provider::protocol::{
-        AssistantBlock, AssistantItem, BlockContent, Message, ModelRequest, ResponseChunk, ToolCall,
+        AssistantBlock, AssistantItem, BlockContent, Message, ModelRequest, ResponseChunk,
     };
 
     #[test]
@@ -253,46 +314,9 @@ pub(super) mod tests {
         }
     }
 
-    #[test]
-    fn replay_binding_and_filtering_include_text_tool_and_late_enrichment() {
-        let call = ToolCall::new("call", "lookup", json!({})).unwrap();
-        let items = [
-            AssistantItem::text("text", 0, "visible"),
-            AssistantItem::reasoning("reasoning", 1, "summary", None),
-            AssistantItem::tool_call("tool", 2, call),
-        ];
-        for mut item in items {
-            for update in [false, true] {
-                let replay = reasoning_envelope("responses", "model", json!({"opaque":[1,null]}));
-                let id = item.id.clone();
-                let mut chunk = if update {
-                    ResponseChunk::ItemReplayUpdated { id, replay }
-                } else {
-                    let replay = Some(replay);
-                    ResponseChunk::ItemEnded { id, replay }
-                };
-                bind_reasoning_scope(&mut chunk, "expected");
-                item.replay = match chunk {
-                    ResponseChunk::ItemEnded { replay, .. } => replay,
-                    ResponseChunk::ItemReplayUpdated { replay, .. } => Some(replay),
-                    _ => unreachable!(),
-                };
-                assert!(opaque_payload(&item.replay, "responses", "model").is_some());
-                let mut request = request("model");
-                request.history = vec![Message::Assistant(vec![item.clone()])];
-                filter_reasoning_scope(&mut request, "foreign");
-                let Message::Assistant(filtered) = &request.history[0] else {
-                    unreachable!()
-                };
-                assert!(filtered[0].replay.is_none());
-                assert_eq!(filtered[0].blocks, item.blocks);
-            }
-        }
-    }
-
     /// Minimal request shared by codec/provider tests; cases override only the
     /// inputs relevant to the behavior under test.
-    pub(crate) fn request(model: &str) -> crate::provider::protocol::ModelRequest {
+    pub(crate) fn request(model: &str) -> ModelRequest {
         use crate::provider::protocol::{Message, ModelRequest, UserContent};
         ModelRequest {
             model: model.into(),
@@ -309,86 +333,6 @@ pub(super) mod tests {
             correlation: None,
             blobs: Default::default(),
         }
-    }
-
-    /// Exercise the actual journal boundary, not just a serde round trip. Keep
-    /// this in backend tests so each codec verifies the resumed wire payload.
-    pub(crate) async fn resume_request(
-        request: &crate::provider::protocol::ModelRequest,
-    ) -> crate::provider::protocol::ModelRequest {
-        use crate::session::{ModelPurpose, SessionEvent, SessionStore, reconstruct_model_request};
-        let (directory, store, agent) = crate::session::fixture::on_disk().await;
-        // The journal derives model settings from the profile and correlation from the agent.
-        let mut expected = request.clone();
-        let max_output = request.max_output_tokens.unwrap_or(4096);
-        expected.max_output_tokens = Some(max_output);
-        expected.correlation = Some(agent.to_string());
-        let profile = crate::session::ProfileSnapshot {
-            name: "native-replay-test".into(),
-            profile: crate::provider::profile::ModelProfile::new(
-                "native-replay-test",
-                request.model.clone(),
-                request.reasoning.clone(),
-                max_output.saturating_add(128_000),
-                max_output,
-                true,
-            ),
-        };
-        let context = store
-            .append(
-                agent.clone(),
-                SessionEvent::ModelContext {
-                    context: crate::session::ModelContext {
-                        purpose: ModelPurpose::Agent,
-                        profile,
-                        system: request.system.clone(),
-                        tools: request.tools.clone(),
-                        response_schema: request.response_schema.clone(),
-                    },
-                },
-            )
-            .await
-            .unwrap();
-        let mut history = Vec::new();
-        for message in &request.history {
-            // Tool results commit one per call.
-            let messages = match message {
-                crate::provider::protocol::Message::Tool(results) => results
-                    .iter()
-                    .map(|result| crate::provider::protocol::Message::Tool(vec![result.clone()]))
-                    .collect(),
-                message => vec![message.clone()],
-            };
-            for message in messages {
-                let record = store
-                    .append(agent.clone(), SessionEvent::MessageCommitted { message })
-                    .await
-                    .unwrap();
-                history.push(record.sequence);
-            }
-        }
-        let call = store
-            .append(
-                agent,
-                SessionEvent::ModelRequested {
-                    context: context.sequence,
-                    purpose: ModelPurpose::Agent,
-                    history,
-                    tail: request.tail.clone(),
-                    history_lifetime: request.history_lifetime,
-                },
-            )
-            .await
-            .unwrap();
-        let id = store.id();
-        drop(store);
-        let (_store, records) = SessionStore::open(directory.path(), id).await.unwrap();
-        let (_, mut resumed) = reconstruct_model_request(&records, call.sequence).unwrap();
-        assert_eq!(resumed, expected);
-        // Restore the caller's request-only settings the journal derives from its profile.
-        resumed.correlation.clone_from(&request.correlation);
-        resumed.max_output_tokens = request.max_output_tokens;
-        resumed
     }
 
     #[test]

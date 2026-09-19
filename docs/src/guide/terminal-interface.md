@@ -40,6 +40,8 @@ composer; merely opening the queue or deleting an item does not pause it. Interr
 submission or delivery errors, and session-start failures also pause queue delivery. `/resume`
 clears that pause, as does normal composer Enter (even with an empty draft); slash commands
 do not automatically resume the queue. There is no standalone `/pause` command.
+Queued input lives only in the running interface: it is not saved with the session, and
+input still waiting when you switch sessions stays queued, paused, for the session you open.
 `/retry` continues failed or interrupted turns without duplicating their original prompts.
 After a session interruption it resumes all interrupted children automatically, regardless of
 which agent is selected. Parents with pending waits stay in those waits rather than starting

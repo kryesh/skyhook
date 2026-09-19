@@ -1,4 +1,4 @@
--- Skyhook session database (application_id 0x534B5948, user_version 4). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 5). Tables are STRICT;
 -- subtype rows key (entry, kind) -> entry(seq, kind). db/mod.rs adds append-only triggers
 -- to tables outside MUTABLE_TABLES. u64 values saturate to i64::MAX.
 
@@ -65,7 +65,6 @@ CREATE TABLE entry (
     'job_created','job_state_changed','job_finished',
     'job_claimed','job_injected','job_message_delivered',
     'question_opened','question_resolved',
-    'queue_intent','queue_settled','queue_acknowledged',
     'approval_granted','approval_revoked')),
   UNIQUE (seq, kind)
 ) STRICT;
@@ -138,7 +137,6 @@ CREATE TABLE model_selection (                   -- ModelChanged only
   entry INTEGER PRIMARY KEY,
   kind TEXT NOT NULL DEFAULT 'model_selected' CHECK (kind = 'model_selected'),
   profile INTEGER NOT NULL REFERENCES model_profile(id),
-  queue_attempt INTEGER REFERENCES queue_attempt(entry),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
 
@@ -285,9 +283,7 @@ CREATE TABLE message_commit (
   entry INTEGER PRIMARY KEY,
   kind TEXT NOT NULL DEFAULT 'message_committed' CHECK (kind = 'message_committed'),
   message INTEGER NOT NULL UNIQUE REFERENCES message(id),
-  queue_attempt INTEGER UNIQUE,
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind),
-  FOREIGN KEY (message, queue_attempt) REFERENCES queue_attempt(message, entry)
+  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
 
 CREATE TABLE todo_item (
@@ -581,57 +577,6 @@ CREATE TABLE question_answer (
   answers TEXT NOT NULL CHECK (json_valid(answers)),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
-
--- ───────────────────────── Queue ─────────────────────────
-
-CREATE TABLE queue_attempt (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'queue_intent' CHECK (kind = 'queue_intent'),
-  public_id BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
-  message INTEGER NOT NULL UNIQUE,
-  role TEXT NOT NULL DEFAULT 'user' CHECK (role = 'user'),
-  model TEXT,                                      -- requested profile name
-  UNIQUE (message, entry),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind),
-  FOREIGN KEY (message, role) REFERENCES message(id, role)
-) STRICT;
-
--- Committed vs NotCommitted derives from a message_commit bound to the attempt.
-CREATE TABLE queue_settlement (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'queue_settled' CHECK (kind = 'queue_settled'),
-  attempt INTEGER NOT NULL UNIQUE REFERENCES queue_attempt(entry),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
-) STRICT;
-
-CREATE TABLE queue_ack (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'queue_acknowledged' CHECK (kind = 'queue_acknowledged'),
-  settlement INTEGER NOT NULL UNIQUE REFERENCES queue_settlement(entry),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
-) STRICT;
-
-CREATE TRIGGER queue_commit_rules BEFORE INSERT ON message_commit
-BEGIN
-  SELECT RAISE(ABORT, 'queue: drafted message committed without its attempt')
-  WHERE NEW.queue_attempt IS NULL
-    AND EXISTS (SELECT 1 FROM queue_attempt WHERE message = NEW.message);
-  SELECT RAISE(ABORT, 'queue: attempt already settled')
-  WHERE NEW.queue_attempt IS NOT NULL
-    AND EXISTS (SELECT 1 FROM queue_settlement WHERE attempt = NEW.queue_attempt);
-END;
-
-CREATE TRIGGER queue_selection_rules BEFORE INSERT ON model_selection
-WHEN NEW.queue_attempt IS NOT NULL
-BEGIN
-  SELECT RAISE(ABORT, 'queue: attempt already settled')
-  WHERE EXISTS (SELECT 1 FROM queue_settlement WHERE attempt = NEW.queue_attempt);
-  SELECT RAISE(ABORT, 'queue: attempt already committed')
-  WHERE EXISTS (SELECT 1 FROM message_commit WHERE queue_attempt = NEW.queue_attempt);
-  SELECT RAISE(ABORT, 'queue: selected profile differs from intent model')
-  WHERE (SELECT name FROM model_profile WHERE id = NEW.profile)
-     IS NOT (SELECT model FROM queue_attempt WHERE entry = NEW.queue_attempt);
-END;
 
 -- ───────────────────────── Approvals ─────────────────────────
 

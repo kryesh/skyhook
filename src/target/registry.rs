@@ -66,7 +66,7 @@ impl TargetDefinition {
         self.via.as_deref().or(self.origin.as_deref())
     }
 
-    fn validate(&self) -> Result<(), TargetError> {
+    pub(crate) fn validate(&self) -> Result<(), TargetError> {
         validate_name(&self.name)?;
         if self.r#type != TargetType::Ssh {
             return Err(TargetError::BuiltinOnly);

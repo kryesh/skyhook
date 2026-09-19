@@ -447,7 +447,7 @@ mod tests {
         fixture.session.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn exhausted_summary_failures_preserve_history_and_never_execute_tools() {
         // Parser field cases live in compaction.rs; this covers rollback and tool contracts.
         for failure in ["truncated", "tool_call", "blank_todo"] {
@@ -485,7 +485,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn invalid_selected_job_retries_without_installing_compaction() {
         let fixture = Fixture::new().await;
         fixture.add_history(20_000).await;

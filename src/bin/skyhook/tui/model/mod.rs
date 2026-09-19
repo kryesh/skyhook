@@ -266,7 +266,7 @@ pub struct EntryView<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tool_view::{Role, Section};
+    use super::super::tool_view::{Role, Run, Section};
     use super::*;
     use skyhook::agent::{ObservationSnapshot, ObservedEvent, RuntimeEvent};
     use skyhook::identity::SessionId;
@@ -276,6 +276,10 @@ mod tests {
         ToolCall, ToolResult, UserContent,
     };
     use skyhook::session::{EventRecord, ModelPurpose, SessionEvent};
+
+    pub(super) fn header_text(runs: &[Run]) -> String {
+        runs.iter().map(Run::text).collect()
+    }
 
     pub(super) fn root(seed: u8) -> AgentId {
         AgentId::root(SessionId::from_bytes([seed; 16]))
@@ -295,7 +299,6 @@ mod tests {
             snapshot,
             RuntimeEvent::Record(Box::new(EventRecord {
                 id: skyhook::identity::EventId::generate().unwrap(),
-                queue_attempt: None,
                 sequence,
                 timestamp_millis: sequence as i64 * 1000,
                 agent: agent.clone(),

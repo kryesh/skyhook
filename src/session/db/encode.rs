@@ -7,15 +7,12 @@ use serde::Serialize;
 
 use super::{Db, DbResult, corrupt, params, rejected};
 use crate::{
-    identity::{AgentId, QueueAttemptId},
+    identity::AgentId,
     media::{AttachmentRef, BlobRef, ImageRef},
     provider::protocol::{
         AssistantItem, BlockContent, Message, StopReason, ToolResult, UserContent,
     },
-    session::{
-        CompactionCheckpoint, EventRecord, ModelContext, ProfileSnapshot, QueueSettlement,
-        SessionEvent,
-    },
+    session::{CompactionCheckpoint, EventRecord, ModelContext, ProfileSnapshot, SessionEvent},
     target::TargetDefinition,
 };
 
@@ -171,54 +168,6 @@ impl Encoder {
     fn subtype(&mut self, db: &Db, record: &EventRecord, agent: i64) -> DbResult<()> {
         let (seq, kind) = (record.sequence, kind(&record.event));
         match &record.event {
-            SessionEvent::QueueIntent { intent } => {
-                let message = self.message(db, &Message::User(intent.content.clone()))?;
-                db.execute(
-                    "INSERT INTO queue_attempt (entry, public_id, message, model) \
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        seq,
-                        intent.attempt.to_bytes().to_vec(),
-                        message,
-                        intent.model.clone()
-                    ],
-                )?;
-            }
-            SessionEvent::QueueSettlement {
-                attempt,
-                settlement,
-            } => {
-                let entry = queue_attempt(db, *attempt, agent)?;
-                let committed = db.query_row(
-                    "SELECT e.public_id FROM message_commit m JOIN entry e ON e.seq = m.entry \
-                     WHERE m.queue_attempt = ?1",
-                    params![entry],
-                    |row| Ok(row.get::<Vec<u8>>(0)?),
-                )?;
-                let consistent = match settlement {
-                    QueueSettlement::Committed { event } => {
-                        committed.as_deref() == Some(&event.to_bytes()[..])
-                    }
-                    QueueSettlement::NotCommitted => committed.is_none(),
-                };
-                if !consistent {
-                    return Err(rejected(
-                        "queue settlement does not identify its exact committed message",
-                    ));
-                }
-                db.execute(
-                    "INSERT INTO queue_settlement (entry, attempt) VALUES (?1, ?2)",
-                    params![seq, entry],
-                )?;
-            }
-            SessionEvent::QueueAcknowledged { attempt } => {
-                // A missing settlement leaves the NOT NULL column empty.
-                db.execute(
-                    "INSERT INTO queue_ack (entry, settlement) VALUES (?1, \
-                     (SELECT s.entry FROM queue_settlement s WHERE s.attempt = ?2))",
-                    params![seq, queue_attempt(db, *attempt, agent)?],
-                )?;
-            }
             SessionEvent::SessionStarted { targets, .. }
             | SessionEvent::TargetsUpserted { targets } => {
                 self.targets(db, seq, kind, targets)?;
@@ -236,36 +185,16 @@ impl Encoder {
             SessionEvent::TodosReplaced { items } => todos(db, seq, kind, items)?,
             SessionEvent::ModelChanged { profile } => {
                 let profile = self.profile(db, profile)?;
-                let attempt = record
-                    .queue_attempt
-                    .map(|attempt| queue_attempt(db, attempt, agent))
-                    .transpose()?;
                 db.execute(
-                    "INSERT INTO model_selection (entry, profile, queue_attempt) \
-                     VALUES (?1, ?2, ?3)",
-                    params![seq, profile, attempt],
+                    "INSERT INTO model_selection (entry, profile) VALUES (?1, ?2)",
+                    params![seq, profile],
                 )?;
             }
             SessionEvent::MessageCommitted { message } => {
-                let (message, attempt) = match record.queue_attempt {
-                    Some(attempt) => {
-                        let entry = queue_attempt(db, attempt, agent)?;
-                        let draft = db.query_row(
-                            "SELECT message FROM queue_attempt WHERE entry = ?1",
-                            params![entry],
-                            |row| Ok(row.get::<i64>(0)?),
-                        )?;
-                        (
-                            draft.ok_or_else(|| corrupt("queue draft is missing"))?,
-                            Some(entry),
-                        )
-                    }
-                    None => (self.message_for(db, agent, message)?, None),
-                };
+                let message = self.message_for(db, agent, message)?;
                 db.execute(
-                    "INSERT INTO message_commit (entry, message, queue_attempt) \
-                     VALUES (?1, ?2, ?3)",
-                    params![seq, message, attempt],
+                    "INSERT INTO message_commit (entry, message) VALUES (?1, ?2)",
+                    params![seq, message],
                 )?;
             }
             SessionEvent::Status { message: text }
@@ -652,16 +581,11 @@ impl Encoder {
     fn targets(&self, db: &Db, seq: u64, kind: &str, targets: &[TargetDefinition]) -> DbResult<()> {
         for definition in targets {
             let target = self.target(db, &definition.name)?;
-            let via = definition
-                .via
-                .as_deref()
-                .map(|name| self.target(db, name))
-                .transpose()?;
-            let origin = definition
-                .origin
-                .as_deref()
-                .map(|name| self.target(db, name))
-                .transpose()?;
+            let named = |name: &Option<String>| {
+                let name = name.as_deref();
+                name.map(|name| self.target(db, name)).transpose()
+            };
+            let (via, origin) = (named(&definition.via)?, named(&definition.origin)?);
             let ssh = &definition.ssh;
             let key = match &ssh.auth {
                 crate::target::TargetAuth::Key { path } => Some(path_bytes(path)),
@@ -991,17 +915,6 @@ fn by_digest(db: &Db, table: &str, digest: Vec<u8>) -> DbResult<i64> {
     .ok_or_else(|| corrupt(format!("{table} row is missing")))
 }
 
-/// An attempt queued by `agent`; another agent's attempt is unknown to it.
-fn queue_attempt(db: &Db, attempt: QueueAttemptId, agent: i64) -> DbResult<i64> {
-    db.query_row(
-        "SELECT q.entry FROM queue_attempt q JOIN entry e ON e.seq = q.entry \
-         WHERE q.public_id = ?1 AND e.agent = ?2",
-        params![attempt.to_bytes().to_vec(), agent],
-        |row| Ok(row.get::<i64>(0)?),
-    )?
-    .ok_or_else(|| rejected("unknown queue attempt"))
-}
-
 fn model_attempt(db: &Db, request: u64, attempt: u64) -> DbResult<i64> {
     db.query_row(
         "SELECT entry FROM model_attempt WHERE request = ?1 AND attempt = ?2",
@@ -1061,9 +974,6 @@ fn compaction_outcome(
 
 fn kind(event: &SessionEvent) -> &'static str {
     match event {
-        SessionEvent::QueueIntent { .. } => "queue_intent",
-        SessionEvent::QueueSettlement { .. } => "queue_settled",
-        SessionEvent::QueueAcknowledged { .. } => "queue_acknowledged",
         SessionEvent::SessionStarted { .. } => "session_started",
         SessionEvent::SessionResumed => "session_resumed",
         SessionEvent::TitleSet { .. } => "title_set",
@@ -1107,7 +1017,7 @@ mod tests {
 
     use crate::{
         execution::ExecutionLocation,
-        identity::{JobId, QueueAttemptId},
+        identity::JobId,
         job::{JobRole, JobState},
         media::{AttachmentRef, ImageFormat, ImageRef, TextRef},
         provider::protocol::{
@@ -1116,7 +1026,7 @@ mod tests {
         },
         session::{
             CompactionCheckpoint, ModelCallOrigin, ModelContext, ModelFailureKind, ModelPurpose,
-            QueueIntent, QueueSettlement, SessionEvent,
+            SessionEvent,
             db::tests::{Fixture, result, user},
             fixture::{child_started, profile},
         },
@@ -1281,8 +1191,7 @@ mod tests {
             images: Vec::new(),
             denial: None,
         });
-        let resource =
-            crate::tool::policy::ResourceId::custom("plugin", ["server", "tool"]).unwrap();
+        let resource = crate::tool::policy::ResourceId::mcp("server", "tool");
         let grant = one!(SessionEvent::ApprovalGranted {
             job,
             grant: crate::tool::policy::ApprovalGrant::descendants(
@@ -1309,30 +1218,6 @@ mod tests {
             question_id: "q".into(),
             answers: json!(["because"]),
         });
-        let attempt = QueueAttemptId::from_bytes([9; 16]);
-        let intent = QueueIntent {
-            attempt,
-            content: vec![UserContent::Text {
-                text: "queued".into(),
-            }],
-            model: Some("test".into()),
-        };
-        one!(SessionEvent::QueueIntent {
-            intent: intent.clone(),
-        });
-        let message = Message::User(intent.content.clone());
-        let bound = [
-            SessionEvent::ModelChanged { profile: profile() },
-            SessionEvent::MessageCommitted { message },
-        ];
-        let bound = bound.map(|event| (root.clone(), Some(attempt), event));
-        fixture.commit(bound.into()).unwrap();
-        let event = fixture.records.last().unwrap().id;
-        one!(SessionEvent::QueueSettlement {
-            attempt,
-            settlement: QueueSettlement::Committed { event },
-        });
-        one!(SessionEvent::QueueAcknowledged { attempt });
         one!(SessionEvent::TodosReplaced {
             items: vec![crate::agent::TodoItem {
                 text: "todo".into(),
@@ -1418,7 +1303,7 @@ mod tests {
             error: "failed".into(),
         };
         let started = child_started(Some(root.clone()), Some(owner), location);
-        let child_events = [started, failed].map(|event| (child.clone(), None, event));
+        let child_events = [started, failed].map(|event| (child.clone(), event));
         fixture.commit(child_events.into()).unwrap();
         for event in [
             SessionEvent::Status {

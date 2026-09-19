@@ -168,8 +168,8 @@ mod tests {
             (&[408, 409, 425, 429, 500, 503, 504][..], true),
         ] {
             for &status in statuses {
-                let recovery = classify_error(Some(status), &json!({})).recovery();
-                assert_eq!(recovery.is_some(), retryable, "HTTP {status}");
+                let error = classify_error(Some(status), &json!({}));
+                assert_eq!(error.is_retryable(), retryable, "HTTP {status}");
             }
         }
         for (status, native, expected) in [

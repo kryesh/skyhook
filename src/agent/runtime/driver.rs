@@ -88,38 +88,47 @@ impl DriverPhase {
 }
 
 impl SessionRuntime {
-    /// Wake a child's owner for a terminal reply published without a wake (see
-    /// `commit_child_message`). Only resolution paths that do NOT finish the owning
-    /// job may call this: a finishing job broadcasts its own completion, which then
-    /// presents reply and completion envelope in one owner delivery batch, while an
-    /// extra earlier wake would split them again. Every resolution path in
-    /// `run_agent` therefore either finishes the invocation through its waiter or
-    /// wakes here:
-    ///
-    /// | resolution path after `run_turn`                    | wakes the owner       |
-    /// |-----------------------------------------------------|-----------------------|
-    /// | Ok, invocation completes with a waiter              | the job's completion  |
-    /// | Ok, callback-free completion (no waiter)            | `wake_owner`          |
-    /// | Ok, deferred queued input or own pending deliveries | `wake_owner`          |
-    /// | Ok, pending deliveries seen after the answer        | `wake_owner`          |
-    /// | Ok, own live jobs (loops back to the mailbox)       | `wake_owner` (tail)   |
-    /// | Err interrupted/cancelled, waiter observes it       | job interrupt/cancel  |
-    /// | Err parked (retained child), waiter observes it     | the job's failure     |
-    /// | Err of any kind with no waiter                      | `wake_owner`          |
-    /// | owner cancellation seen while idle                  | job cancel/`wake_owner`|
-    ///
-    /// A finishing job wakes the owner only for background jobs; a foreground caller
-    /// is already awaiting the tool result and presents pending replies at its own
-    /// next request boundary, in the same request as that result.
-    ///
-    /// Paths that publish no reply of their own (Shutdown, parked or empty JobsReady,
-    /// rejected model, failed input commit, closed mailbox) need no wake: the table
-    /// above leaves no un-woken reply behind at the loop head. `run_turn` wakes for
-    /// the two continues that keep a text-only response's invocation running, and
-    /// `run_child_request` wakes when owner input restarts it instead of finishing.
+    /// Wake a child's owner for a reply published without a wake. Only for paths
+    /// that do not finish the owning job: a finishing job's own completion presents
+    /// reply and completion in one delivery batch, which an earlier wake would split.
     async fn wake_owner(&self, owner_job: Option<JobId>) {
         if let Some(job) = owner_job {
             self.jobs.notify_owner(job).await;
+        }
+    }
+
+    /// Whether queued input or the agent's own pending deliveries keep its
+    /// invocation running. Drains the mailbox into `deferred` to find out.
+    async fn invocation_continues(
+        &self,
+        id: &AgentId,
+        rx: &mut mpsc::Receiver<AgentCommand>,
+        deferred: &mut VecDeque<AgentCommand>,
+    ) -> bool {
+        while let Ok(command) = rx.try_recv() {
+            deferred.push_back(command);
+        }
+        let mut queued = deferred.iter();
+        queued.any(|command| matches!(command, AgentCommand::QueuedInputs(_)))
+            || self.jobs.has_pending(id).await
+    }
+
+    /// Resolve an answered invocation once. Without a waiter nothing finishes the
+    /// owning job, so the owner is woken here instead.
+    async fn complete_invocation(
+        &self,
+        id: &AgentId,
+        owner_job: Option<JobId>,
+        phase: &mut DriverPhase,
+    ) {
+        if let Some(handed) = phase.complete() {
+            let _ = self
+                .store
+                .append(id.clone(), SessionEvent::AgentCompleted)
+                .await;
+            if !handed {
+                self.wake_owner(owner_job).await;
+            }
         }
     }
 
@@ -148,10 +157,7 @@ impl SessionRuntime {
             Some(job) => match self.jobs.cancellation_token(job).await {
                 Ok(token) => token,
                 Err(_) => {
-                    self.agents
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&id);
+                    self.agents_mut().remove(&id);
                     return;
                 }
             },
@@ -210,7 +216,7 @@ impl SessionRuntime {
             let mut pending_events = None;
             let (content, done, selected_model) = match command {
                 AgentCommand::QueuedInputs(inputs) => {
-                    if !self
+                    let (consumed, failed) = self
                         .consume_queued_batch(
                             &id,
                             &mut context,
@@ -219,8 +225,11 @@ impl SessionRuntime {
                             &cancellation,
                             inputs,
                         )
-                        .await
-                    {
+                        .await;
+                    if failed {
+                        queue::reject_pending(&mut rx, &mut deferred);
+                    }
+                    if !consumed {
                         continue;
                     }
                     (Vec::new(), None, None)
@@ -251,31 +260,12 @@ impl SessionRuntime {
                                 && !self.jobs.has_running(&id).await =>
                         {
                             let mut completing = completion_gate.lock().await;
-                            while let Ok(command) = rx.try_recv() {
-                                deferred.push_back(command);
-                            }
-                            if deferred
-                                .iter()
-                                .any(|command| matches!(command, AgentCommand::QueuedInputs(_)))
-                                || self.jobs.has_pending(&id).await
-                            {
-                                // The invocation keeps running instead of resolving,
-                                // so a retained terminal reply gets its wake here.
+                            if self.invocation_continues(&id, &mut rx, &mut deferred).await {
                                 self.wake_owner(owner_job).await;
                                 continue;
                             }
                             *completing = false;
-                            if let Some(handed) = phase.complete() {
-                                let _ = self
-                                    .store
-                                    .append(id.clone(), SessionEvent::AgentCompleted)
-                                    .await;
-                                if !handed {
-                                    // Callback-free completion: no waiter finishes the
-                                    // owning job, so nothing else would wake the owner.
-                                    self.wake_owner(owner_job).await;
-                                }
-                            }
+                            self.complete_invocation(&id, owner_job, &mut phase).await;
                             continue;
                         }
                         _ => continue,
@@ -283,17 +273,15 @@ impl SessionRuntime {
                     (content, None, None)
                 }
             };
-            if let Some(selected) = selected_model.filter(|selected| selected != &model_profile)
-                && let Err(error) = self
-                    .select_model(
-                        &id,
-                        &mut context,
-                        &mut model_profile,
-                        &capabilities,
-                        selected,
-                    )
-                    .await
-            {
+            let selected = self.select_model(
+                &id,
+                &mut context,
+                &mut model_profile,
+                &capabilities,
+                selected_model,
+                false,
+            );
+            if let Err(error) = selected.await {
                 if let Some(done) = done {
                     let _ = done.send(Err((&error).into()));
                 }
@@ -360,21 +348,13 @@ impl SessionRuntime {
                 // gate can continue the loop (including rejected queued input).
                 phase.answered(answer.clone());
             }
-            if child && result.is_ok() {
-                while let Ok(command) = rx.try_recv() {
-                    deferred.push_back(command);
-                }
-                if deferred
-                    .iter()
-                    .any(|command| matches!(command, AgentCommand::QueuedInputs(_)))
-                    || self.jobs.has_pending(&id).await
-                {
-                    // Queued input or the child's own pending deliveries continue
-                    // this invocation, so no job completion will carry the terminal
-                    // reply published during the turn: wake the owner now.
-                    self.wake_owner(owner_job).await;
-                    continue;
-                }
+            if child
+                && result.is_ok()
+                && self.invocation_continues(&id, &mut rx, &mut deferred).await
+            {
+                // No job completion will carry the reply published during the turn.
+                self.wake_owner(owner_job).await;
+                continue;
             }
             // A terminal turn failure is journaled, not only broadcast: the retry
             // affordance is gated on agent activity, which is otherwise lost when
@@ -457,18 +437,7 @@ impl SessionRuntime {
                     continue;
                 }
                 *completing = false;
-                if let Some(handed) = phase.complete() {
-                    let _ = self
-                        .store
-                        .append(id.clone(), SessionEvent::AgentCompleted)
-                        .await;
-                    if !handed {
-                        // Callback-free completion (queued input or a descendant
-                        // wakeup drove this turn): the owning job does not finish
-                        // here, so only this wake reaches the owner.
-                        self.wake_owner(owner_job).await;
-                    }
-                }
+                self.complete_invocation(&id, owner_job, &mut phase).await;
                 // Retain the provider session and full projected history while idle.
                 // A fresh owner request resumes this same child, never a new agent.
                 continue;
@@ -482,10 +451,7 @@ impl SessionRuntime {
         if let Some(job) = owner_job {
             self.jobs.clear_resume_handler(job).await;
         }
-        self.agents
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id);
+        self.agents_mut().remove(&id);
     }
 }
 
@@ -496,7 +462,7 @@ mod tests {
     use crate::job::{JobOutcome, JobSpec, JobState};
     use crate::tool::{ToolOptions, ToolOutput, ToolRegistryBuilder};
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn child_completion_waits_for_background_work_and_returns_its_updated_answer() {
         let final_answer = "child work completed\n".repeat(500);
         let work = json!({"prompt":"work"});
@@ -511,14 +477,14 @@ mod tests {
             answer("root done"),
         ])
         .await;
-        let mut events = session.runtime.events.subscribe();
+        let mut events = session.runtime.events.observe().updates;
         let prompt = session.prompt("delegate");
         tokio::pin!(prompt);
         bounded(async {
             loop {
                 tokio::select! {
                     result = &mut prompt => panic!("parent returned before child work completed: {result:?}"),
-                    event = events.recv() => if matches!(event.unwrap(), RuntimeEvent::TurnCompleted { text, .. } if text == "premature child answer") { break; },
+                    event = events.recv() => if matches!(event.unwrap().event, RuntimeEvent::TurnCompleted { text, .. } if text == "premature child answer") { break; },
                 }
             }
         }).await;
@@ -548,19 +514,17 @@ mod tests {
         assert_eq!(&fields[6..], &["-", "-"]);
         assert!(lines.next().is_none(), "empty todos are omitted");
         let last = requests.last().unwrap();
-        let mut results = request_history(last)
-            .iter()
-            .flat_map(|message| match message {
-                Message::Tool(results) => results.as_slice(),
-                _ => &[],
-            });
+        let mut results = last.history.iter().flat_map(|message| match message {
+            Message::Tool(results) => results.as_slice(),
+            _ => &[],
+        });
         let result = results.find(|result| result.name == "agent").unwrap();
         assert_eq!(result.result["state"], "completed");
         // The automatic tool result must not repeat the final text.
         assert!(result.result.get("result").is_none());
         assert!(result.result.get("truncated").is_none());
         assert!(result.result["last_message"].is_u64());
-        let serialized = serde_json::to_string(&last.messages().collect::<Vec<_>>()).unwrap();
+        let serialized = rendered(last);
         assert_eq!(serialized.matches("premature child answer").count(), 1);
         // The large final message is delivered once, independently of the tool result.
         assert_eq!(serialized.matches("child work completed").count(), 500);
@@ -572,60 +536,32 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn session_resume_restarts_all_interrupted_children_without_restarting_waiting_parent() {
-        #[derive(Clone)]
-        struct TwoChildrenProvider {
-            calls: Arc<AtomicUsize>,
-            release: Arc<tokio::sync::Semaphore>,
-            requests: Requests,
-        }
-        cloned_provider!(TwoChildrenProvider);
-        impl ProviderContext for TwoChildrenProvider {
-            fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
-                let call = self.calls.fetch_add(1, Ordering::SeqCst);
-                self.requests.lock().unwrap().push(request);
-                let release = self.release.clone();
-                let child = |index: usize| {
-                    let arguments = json!({"prompt":format!("child task {index}"), "depth":0});
-                    tool_call(index, &format!("agent-{index}"), "agent", arguments)
-                };
-                Box::pin(async move {
-                    let chunks = match call {
-                        0 => response((0..2).map(child).collect()),
-                        1 | 2 => return Ok(Box::pin(stream::pending()) as ResponseStream),
-                        3 | 4 => {
-                            release.acquire().await.unwrap().forget();
-                            answer("child recovered")
-                        }
-                        _ => answer("parent done"),
-                    };
-                    Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))) as ResponseStream)
-                })
-            }
-        }
-        let root = tempfile::tempdir().unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let child = |index: usize| {
+            let arguments = json!({"prompt":format!("child task {index}"), "depth":0});
+            tool_call(index, &format!("agent-{index}"), "agent", arguments)
+        };
+        // Both children hang mid-stream in their first request, then answer once resumed.
+        let hang = || Step::new(Vec::new()).midstream();
+        let recovered = || Step::new(answer("child recovered")).gated();
+        let steps = [
+            Step::new(response((0..2).map(child).collect())),
+            hang(),
+            hang(),
+            recovered(),
+            recovered(),
+            Step::new(answer("parent done")),
+        ];
         let requests = Requests::default();
-        let provider = Arc::new(TwoChildrenProvider {
-            calls: calls.clone(),
-            release: release.clone(),
-            requests: requests.clone(),
-        });
-        let harness = test_harness(root.path(), &root.path().join("sessions"), provider).await;
+        let provider = Script::new(steps, &requests);
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
         let session = harness.new_session().await.unwrap();
         let parent_session = session.clone();
         let parent = tokio::spawn(async move { parent_session.prompt("delegate").await });
-        let reached = async |count| {
-            bounded(async {
-                while calls.load(Ordering::SeqCst) < count {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-        };
-        reached(3).await;
+        provider.request(2).await;
         // Observed activity trails the journal; interrupt once the parent is seen waiting.
         bounded(async {
             while !matches!(
@@ -635,7 +571,7 @@ mod tests {
                         | crate::agent::AgentActivity::WaitingChildren
                 )
             ) {
-                tokio::task::yield_now().await;
+                poll().await;
             }
         })
         .await;
@@ -644,15 +580,18 @@ mod tests {
         // Interrupt the children, not the waiting parent.
         assert_eq!(session.interrupt().await, 2);
         assert!(!parent.is_finished());
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(!provider.requested_from(3));
         // Resume immediately, even before the child worker journals Interrupted.
         assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
-        reached(5).await;
+        provider.request(4).await;
         // Resume must leave the original parent wait pending.
         assert!(!parent.is_finished());
         let records = session.runtime.store.records().await;
         let interrupted = count!(&records, SessionEvent::JobFinished { state, .. } if *state == JobState::Interrupted);
         assert_eq!(interrupted, 2);
+        // Only an interrupted stream, never an interrupted startup, journals usage.
+        let children = records.iter().filter(|record| record.agent != session.root);
+        assert_eq!(count!(children, SessionEvent::Usage { .. }), 2);
         let root_records = records.iter().filter(|record| record.agent == session.root);
         assert_eq!(count!(root_records, SessionEvent::ModelRequested { .. }), 1);
         // Continuation must not create replacement agents.
@@ -668,47 +607,19 @@ mod tests {
             if content.iter().any(|part| matches!(part, UserContent::ParentInput { .. })))
         };
         for request in &requests.lock().unwrap()[3..5] {
-            let history = request_history(request);
+            let history = &request.history;
             let text = serde_json::to_string(history).unwrap();
             assert_eq!(text.matches("child task").count(), 1);
             assert!(!history.iter().any(parent_input));
         }
-        release.add_permits(2);
+        provider.release(3);
+        provider.release(4);
         assert_eq!(bounded(parent).await.unwrap().unwrap(), "parent done");
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn failed_child_send_preserves_the_parents_pending_wait() {
-        #[derive(Clone)]
-        struct FailChildProvider {
-            script: ScriptedProvider,
-            calls: Arc<AtomicUsize>,
-            aborted: bool,
-        }
-        cloned_provider!(FailChildProvider);
-        impl ProviderContext for FailChildProvider {
-            fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
-                if self.calls.fetch_add(1, Ordering::SeqCst) != 1 {
-                    return self.script.invoke(request);
-                }
-                self.script.requests.lock().unwrap().push(request);
-                let mut chunks = answer("partial child answer");
-                let stop_reason = StopReason::Aborted;
-                *chunks.last_mut().unwrap() = ResponseChunk::ResponseEnded { stop_reason };
-                let aborted = self.aborted;
-                Box::pin(async move {
-                    if !aborted {
-                        return Err(ProviderError {
-                            retry_after: None,
-                            kind: crate::provider::ProviderErrorKind::Authentication,
-                            message: "fixture permanent failure".into(),
-                        });
-                    }
-                    Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))) as ResponseStream)
-                })
-            }
-        }
         for aborted in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let requests = Requests::default();
@@ -728,18 +639,23 @@ mod tests {
                 tools.register_dynamic("wait_fixture", description, schema, options, wait_fixture);
             registered.unwrap();
             let wait = response(vec![tool_call(0, "wait", "wait_fixture", json!({}))]);
-            let responses = [wait, answer("child recovered"), answer("parent done")];
-            let script = scripted_provider(
-                &requests,
-                responses.into_iter().chain([answer("parent done")]),
-            );
-            let calls = Arc::new(AtomicUsize::new(0));
-            let script = script.as_ref().clone();
-            let provider = Arc::new(FailChildProvider {
-                calls,
-                aborted,
-                script,
-            });
+            // The child's first invocation fails outright, or aborts after partial text.
+            let failed = if aborted {
+                let mut chunks = answer("partial child answer");
+                let stop_reason = StopReason::Aborted;
+                *chunks.last_mut().unwrap() = ResponseChunk::ResponseEnded { stop_reason };
+                Step::new(chunks)
+            } else {
+                Step::fail(ProviderError {
+                    retry_after: None,
+                    kind: crate::provider::ProviderErrorKind::Authentication,
+                    message: "fixture permanent failure".into(),
+                })
+            };
+            let answers = ["child recovered", "parent done", "parent done"];
+            let answers = answers.map(|text| Step::new(answer(text)));
+            let steps = [Step::new(wait), failed].into_iter().chain(answers);
+            let provider = Script::new(steps, &requests);
             let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
                 .tools(tools.build())
                 .build()
@@ -758,7 +674,7 @@ mod tests {
                     if let Some(job) = listed.find(running) {
                         break job.id;
                     }
-                    tokio::task::yield_now().await;
+                    poll().await;
                 }
             })
             .await;
@@ -803,7 +719,7 @@ mod tests {
             assert_eq!(count!(root_records, SessionEvent::ModelRequested { .. }), 1);
             let child_records = records.iter().filter(|record| record.agent == child);
             assert_eq!(count!(child_records, SessionEvent::AgentStarted { .. }), 1);
-            let history = request_history(&requests.lock().unwrap()[2]).to_vec();
+            let history = requests.lock().unwrap()[2].history.clone();
             let history = serde_json::to_string(&history).unwrap();
             assert_eq!(history.matches("retain my task").count(), 1);
             assert_eq!(history.matches("try again").count(), 1);
@@ -815,7 +731,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn completed_child_resumes_same_history_and_job_repeatedly() {
         let answers = ["first answer", "second answer", "third answer"].map(answer);
         let (_root, requests, session) = scripted_session(answers).await;
@@ -856,7 +772,7 @@ mod tests {
                     .iter()
                     .all(|request| request.correlation == child_id)
             );
-            let history = request_history(&requests[2]);
+            let history = &requests[2].history;
             let text = serde_json::to_string(history).unwrap();
             let expected = ["remember the initial task", "first answer", "follow-up one"];
             for expected in expected
@@ -881,22 +797,13 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn child_finishes_when_another_waiter_claims_its_last_background_result() {
-        let root = tempfile::tempdir().unwrap();
-        let release = Arc::new(tokio::sync::Semaphore::new(0));
-        let provider = Arc::new(BlockingFirstProvider {
-            calls: Arc::new(AtomicUsize::new(0)),
-            requests: Requests::default(),
-            release: release.clone(),
-        });
-        let harness = test_harness(root.path(), &root.path().join("sessions"), provider).await;
-        let session = harness.new_session().await.unwrap();
-        let (child, sender, job) = retained_child(&session, root.path()).await;
+        let (_root, _requests, session) = scripted_session([answer("initial")]).await;
+        let (child, sender, job) = retained_child(&session).await;
         let (done, received) = oneshot::channel();
-        let mut events = session.runtime.events.subscribe();
+        let mut events = session.runtime.events.observe().updates;
         child_input(&sender, Some(done)).await;
-        release.add_permits(1);
         wait_for_child_answer(&mut events, &child).await;
         claim_completed(&session, job).await;
         assert_eq!(bounded(received).await.unwrap().unwrap(), "initial");
@@ -904,19 +811,9 @@ mod tests {
     }
 
     /// A retained child with an owner job, plus one background job it owns.
-    async fn retained_child(
-        session: &SessionHandle,
-        workspace: &Path,
-    ) -> (AgentId, AgentSender, JobId) {
+    async fn retained_child(session: &SessionHandle) -> (AgentId, AgentSender, JobId) {
         let child = session.root.child(1);
-        let launch = AgentLaunch {
-            id: child.clone(),
-            owner_job: Some(owner(session).await),
-            model_profile: "test".to_owned(),
-            todos: None,
-            available_depth: 0,
-            location: crate::execution::ExecutionLocation::root(workspace.to_path_buf()),
-        };
+        let launch = child_launch(session, child.clone(), Some(owner(session).await));
         let sender = session.runtime.spawn_agent(launch).await.unwrap();
         let spec = JobSpec {
             background: true,
@@ -963,12 +860,12 @@ mod tests {
     }
 
     async fn wait_for_child_answer(
-        events: &mut broadcast::Receiver<RuntimeEvent>,
+        events: &mut broadcast::Receiver<crate::agent::ObservedEvent>,
         child: &AgentId,
     ) {
         bounded(async {
             loop {
-                if matches!(events.recv().await.unwrap(), RuntimeEvent::TurnCompleted { agent, .. } if &agent == child) {
+                if matches!(events.recv().await.unwrap().event, RuntimeEvent::TurnCompleted { agent, .. } if &agent == child) {
                     break;
                 }
             }
@@ -986,14 +883,14 @@ mod tests {
         agents[child].control.completion_gate.clone()
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn pending_rejected_input_preserves_latest_child_answer() {
-        let (root, requests, session) =
+        let (_root, requests, session) =
             scripted_session([answer("old answer"), answer("latest answer")]).await;
         let root_inbox = quiet_root(&session);
-        let (child, sender, background) = retained_child(&session, root.path()).await;
+        let (child, sender, background) = retained_child(&session).await;
         let (done, received) = oneshot::channel();
-        let mut events = session.runtime.events.subscribe();
+        let mut events = session.runtime.events.observe().updates;
         child_input(&sender, Some(done)).await;
         wait_for_child_answer(&mut events, &child).await;
         mailbox_barrier(&sender).await;
@@ -1004,21 +901,17 @@ mod tests {
         child_input(&sender, None).await;
         wait_for_child_answer(&mut events, &child).await;
         // The newer answer's final mailbox check waits for this forwarding window.
-        let token = QueuedPromptToken::new().unwrap();
-        assert!(token.cancellation_handle().cancel());
+        let cancellation = QueuedPromptCancellation::default();
+        assert!(cancellation.cancel());
         let (committed, rejected) = oneshot::channel();
         let text = "cancelled update".to_owned();
-        let content = vec![UserContent::Text { text }];
-        let (model, queued) = (None, AgentCommand::QueuedInputs);
-        let prepared = PreparedQueuedPrompt {
-            content,
-            model,
-            token,
-        };
-        let queued = queued(vec![queue::QueuedInput {
-            prepared,
+        let queued = queue::QueuedInput {
+            content: vec![UserContent::Text { text }],
+            model: None,
+            cancellation,
             committed,
-        }]);
+        };
+        let queued = AgentCommand::QueuedInputs(vec![queued]);
         sender.send(queued).await.unwrap();
         claim_completed(&session, background).await;
         sender.send(AgentCommand::JobsReady).await.unwrap();
@@ -1033,13 +926,13 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn callback_free_child_completion_is_consumed_once_on_empty_wakeups() {
-        let (root, requests, session) =
+        let (_root, requests, session) =
             scripted_session([answer("first"), answer("resumed")]).await;
         let root_inbox = quiet_root(&session);
-        let (child, sender, background) = retained_child(&session, root.path()).await;
-        let mut events = session.runtime.events.subscribe();
+        let (child, sender, background) = retained_child(&session).await;
+        let mut events = session.runtime.events.observe().updates;
         child_input(&sender, None).await;
         wait_for_child_answer(&mut events, &child).await;
         mailbox_barrier(&sender).await;

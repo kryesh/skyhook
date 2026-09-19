@@ -21,15 +21,18 @@ use capture::Capture;
 const PROCESS_CHUNK: usize = 8 * 1024;
 
 pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
-    builder.register_product::<ExecArgs, ProcessOutput, _, _>(
-        "exec",
-        "Run an exact argument vector without shell parsing. Stdin is closed.",
+    let options = || {
         ToolOptions::new(vec![Capability::Exec])
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .target_authentication()
             .named()
             .background()
-            .default_path_argument("cwd", ".", PathAccess::Read, PathKind::Existing),
+            .default_path_argument("cwd", ".", PathAccess::Read, PathKind::Existing)
+    };
+    builder.register_product::<ExecArgs, ProcessOutput, _, _>(
+        "exec",
+        "Run an exact argument vector without shell parsing. Stdin is closed.",
+        options(),
         move |context, args| async move {
             let (program, arguments) = args
                 .argv
@@ -46,12 +49,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
     builder.register_product::<ShellArgs, ProcessOutput, _, _>(
         "shell",
         "Run /bin/sh -lc in the workspace. Stdin is closed.",
-        ToolOptions::new(vec![Capability::Exec])
-            .placement(crate::tool::ToolPlacement::TargetedWorkspace)
-            .target_authentication()
-            .named()
-            .background()
-            .default_path_argument("cwd", ".", PathAccess::Read, PathKind::Existing),
+        options(),
         move |context, args| async move {
             if args.command.is_empty() {
                 return Err(ToolError::InvalidArguments(
@@ -268,7 +266,7 @@ struct ExecArgs {
     /// Program and arguments without shell parsing, for example `["cargo","test"]`.
     argv: Vec<String>,
     /// Working directory.
-    #[serde(default = "default_dot")]
+    #[serde(default = "super::default_dot")]
     cwd: String,
     /// Timeout seconds; omitted/null means no deadline.
     #[schemars(range(min = 1, max = 3600))]
@@ -281,7 +279,7 @@ struct ShellArgs {
     /// Command interpreted by the execution environment's shell.
     command: String,
     /// Working directory.
-    #[serde(default = "default_dot")]
+    #[serde(default = "super::default_dot")]
     cwd: String,
     /// Timeout seconds; omitted/null means no deadline.
     #[schemars(range(min = 1, max = 3600))]
@@ -325,10 +323,6 @@ pub struct ProcessOutput {
     pub stderr: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub timed_out: bool,
-}
-
-fn default_dot() -> String {
-    ".".to_owned()
 }
 
 #[cfg(test)]
@@ -434,7 +428,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_and_timeout_kill_descendants_even_after_the_shell_exits() {
-        for interactive in [false, true] {
+        let cancelled = async |interactive: bool| {
             let runtime = TestRuntime::new().await;
             let jobs = runtime.jobs.clone();
             let executor = executor(&runtime, interactive);
@@ -470,18 +464,21 @@ mod tests {
             assert_eq!(waited.unwrap().state, JobState::Cancelled);
             tokio::time::sleep(Duration::from_millis(400)).await;
             assert!(!runtime.root.path().join("escaped").exists());
-        }
+        };
         // Timeout kills noninteractive descendants that hold the pipes open.
-        let runtime = TestRuntime::new().await;
-        let command = "(sleep 1.5; printf escaped > escaped) & printf ready; exit 0";
-        let arguments = json!({"command":command, "timeout":1});
-        let error = executor(&runtime, false)
-            .run_host(&runtime.agent, "shell", arguments)
-            .await;
-        let error = error.expect_err("descendant-held pipes must time out");
-        assert!(error.to_string().contains("timed out"), "{error}");
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        assert!(!runtime.root.path().join("escaped").exists());
+        let timed_out = async {
+            let runtime = TestRuntime::new().await;
+            let command = "(sleep 1.5; printf escaped > escaped) & printf ready; exit 0";
+            let arguments = json!({"command":command, "timeout":1});
+            let error = executor(&runtime, false)
+                .run_host(&runtime.agent, "shell", arguments)
+                .await;
+            let error = error.expect_err("descendant-held pipes must time out");
+            assert!(error.to_string().contains("timed out"), "{error}");
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            assert!(!runtime.root.path().join("escaped").exists());
+        };
+        tokio::join!(cancelled(false), cancelled(true), timed_out);
     }
 
     // Use a separate session with a real controlling PTY; never change the

@@ -110,7 +110,7 @@ ssh.options can run commands, so it also requires exec."#,
             )
             .argument_permissions(|_, arguments| {
                 let args: TargetAddArgs =
-                    serde_json::from_value(arguments.clone()).map_err(target_error)?;
+                    serde_json::from_value(arguments.clone()).map_err(ToolError::invalid)?;
                 Ok(add_permissions(&args.config.ssh))
             }),
         move |context, args| {
@@ -119,7 +119,7 @@ ssh.options can run commands, so it also requires exec."#,
             async move {
                 let definition =
                     TargetDefinition::from_config(args.name, args.config, TargetSource::Session)
-                        .map_err(target_error)?;
+                        .map_err(ToolError::invalid)?;
                 let added = router
                     .add(definition, context.invocation_subject()?, &store)
                     .await
@@ -142,11 +142,6 @@ fn add_permissions(ssh: &SshOptions) -> Vec<PermissionUse> {
         .filter(|(required, _)| *required)
         .map(|(_, capability)| PermissionUse::new(capability, ResourceId::session("targets")))
         .collect()
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn target_error(error: impl ToString) -> ToolError {
-    ToolError::InvalidArguments(error.to_string())
 }
 
 #[cfg(test)]

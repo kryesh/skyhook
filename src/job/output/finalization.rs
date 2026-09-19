@@ -9,17 +9,12 @@ fn invalid(message: impl Into<String>) -> io::Error {
 }
 
 /// Persist a terminal product, referencing only its explicitly completed captures.
-/// JSON containers retain empty-container references; JSON scalars are decoded
-/// inline (a reference cannot distinguish a JSON-encoded string from raw Text),
-/// so their captures stay discoverable but unreferenced.
-/// Existing null/bool/number fields always remain authoritative. Known kinds can
-/// install a missing field; Unknown kinds reference only an existing string or
-/// container shape. Byte validity alone must never reinterpret text as JSON.
+/// JSON containers are referenced; JSON scalars are decoded inline. Existing
+/// null/bool/number fields remain authoritative. Known kinds can install a missing
+/// field; Unknown kinds reference only an existing string or container shape.
 ///
-/// A receipt that fails binding, byte, or pointer validation never fails the
-/// terminal product: it stays unreferenced, so discovery reports that capture
-/// as incomplete while the job's real outcome is still published. Only failures
-/// persisting the document, its references, or registrations are errors.
+/// A receipt that fails validation never fails the terminal product: its capture
+/// stays unreferenced and is reported incomplete. Only persistence failures are errors.
 pub(crate) fn save_completed(
     output: &Output,
     document: &Value,
@@ -501,11 +496,8 @@ mod tests {
         );
     }
 
-    /// Notification budgeting needs an upper bound on presented bytes. A capture-backed
-    /// field is spliced into presentation as a page at most, so a large one must not be
-    /// budgeted at six times its stored size — that overestimate is what used to defer a
-    /// finished job's completion to a turn of its own. (Inline, untruncatable content is
-    /// presented whole and is covered end-to-end by the delivery batch tests.)
+    /// A capture-backed field is presented as a page at most, so it is budgeted
+    /// as at most a page whatever its stored size.
     #[tokio::test]
     async fn presentation_size_budgets_a_large_capture_as_one_page() {
         let (_root, _manager, output, _other) = outputs().await;

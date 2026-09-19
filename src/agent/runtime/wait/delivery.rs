@@ -111,11 +111,11 @@ mod tests {
 
     /// A reply released by shutdown's own cancellation must not start a new turn;
     /// it stays journaled for resume.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn shutdown_stops_before_a_pending_child_reply_starts_another_turn() {
         const REPLY: &str = "pending-child-reply";
         let launch = json!({"prompt":"child task", "model":"child", "bg":true});
-        let tracking = Tracking::responses(vec![
+        let tracking = tracking_all(vec![
             (
                 "root",
                 vec![
@@ -150,7 +150,7 @@ mod tests {
         tracking.pass(2).await;
         bounded(async {
             while !session.runtime.jobs.has_pending(&session.root).await {
-                tokio::task::yield_now().await;
+                poll().await;
             }
         })
         .await;
@@ -180,14 +180,14 @@ mod tests {
     /// The pending reply resolves the first wait at once instead of sleeping out its
     /// timeout, the script is not told twice (the root is busy in its drain, so
     /// nothing consumes the reply meanwhile), and the model still gets it once.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn script_wait_reports_a_pending_child_reply_once() {
         const FINAL: &str = "readme-first-lines";
         let source = "const answer = await tool.agent({prompt:'read', model:'child', name:'read-readme'}); \
             const first = await tool.wait({timeout:60}); \
             const second = await tool.wait({timeout:1}); \
             return [first, second];";
-        let tracking = Tracking::responses(vec![
+        let tracking = tracking_all(vec![
             (
                 "root",
                 vec![call("run", "script", json!({"source": source}))],
@@ -214,7 +214,7 @@ mod tests {
             Some(&expected),
             "{output:?}"
         );
-        let history = serde_json::to_string(&request.messages().collect::<Vec<_>>()).unwrap();
+        let history = rendered(&request);
         assert_eq!(history.matches(FINAL).count(), 1, "{history}");
         tracking.release(2);
         bounded(turn).await.unwrap().unwrap();
@@ -223,14 +223,14 @@ mod tests {
 
     /// A `wait` beside a foreground child keeps waiting through the child's progress;
     /// the next request carries progress and answer together.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn outstanding_foreground_work_defers_wait_resolution() {
         const PROGRESS: &str = "foreground-progress";
         const FINAL: &str = "foreground-final";
         let delegate = json!({"prompt":"work", "model":"child", "name":"kid"});
         let waiting = ToolCall::new("waiting", "wait", json!({"timeout":30})).unwrap();
         let hold = ToolCall::new("child-hold", "wait", json!({"timeout":1})).unwrap();
-        let tracking = Tracking::responses(vec![
+        let tracking = tracking_all(vec![
             (
                 "root",
                 vec![
@@ -264,7 +264,7 @@ mod tests {
         tracking.release(2);
         let request = tracking.request(3).await;
         assert_reason(&request, "waiting", "event");
-        let history = serde_json::to_string(&request.messages().collect::<Vec<_>>()).unwrap();
+        let history = rendered(&request);
         assert!(
             history.contains(PROGRESS) && history.contains(FINAL),
             "{history}"
@@ -276,11 +276,11 @@ mod tests {
 
     /// A completing child's answer and its completion envelope are one wake: the
     /// answer is published without a wake and the job completion carries both.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn terminal_child_reply_and_completion_reach_the_owner_in_one_batch() {
         const FINAL: &str = "merged-child-final-answer";
         let launch = json!({"prompt":"report", "model":"child", "name":"merged", "bg":true});
-        let tracking = Tracking::responses(vec![
+        let tracking = tracking_all(vec![
             ("root", vec![call("launch", "agent", launch)]),
             ("child", vec![AssistantContent::text("final", 0, FINAL)]),
             ("root", vec![call("waiting", "wait", json!({}))]),
@@ -318,7 +318,7 @@ mod tests {
         // The wake came from the completion, so the owner never ran on the answer
         // alone: three requests total, and the answer is not copied anywhere else.
         assert_eq!(tracking.requests.lock().unwrap().len(), 4);
-        let history = serde_json::to_string(&woken.messages().collect::<Vec<_>>()).unwrap();
+        let history = rendered(&woken);
         assert_eq!(history.matches(FINAL).count(), 1);
         tracking.release(3);
         bounded(turn).await.unwrap().unwrap();
@@ -327,13 +327,13 @@ mod tests {
 
     /// A child that answers while its own work is still running has not resolved its
     /// invocation, so the driver wakes the owner for that answer immediately.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn answering_child_with_live_work_wakes_its_owner_before_completing() {
         const PROGRESS: &str = "child-answer-with-live-work";
         const FINAL: &str = "child-answer-after-live-work";
         let launch = json!({"prompt":"report", "model":"child", "name":"worker", "bg":true});
         let work = json!({"source":"return await receive();", "bg":true});
-        let tracking = Tracking::responses(vec![
+        let tracking = tracking_all(vec![
             ("root", vec![call("launch", "agent", launch)]),
             ("child", vec![call("work", "script", work)]),
             (
@@ -392,7 +392,7 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn no_tool_child_reports_survive_queued_input_and_pending_runtime_events() {
         // (parent already waiting, input is a pending runtime event rather than a send)
         for (waiting, runtime_event) in [(true, false), (false, false), (false, true)] {
@@ -404,7 +404,7 @@ mod tests {
         const A: &str = "child-report-A";
         const B: &str = "child-addendum-B";
         let launch = json!({"prompt":"report", "model":"child", "name":"reporter", "bg":true});
-        let tracking = Tracking::new(vec![
+        let tracking = tracking(vec![
             ("root", call("launch", "agent", launch)),
             ("child", AssistantContent::text("report", 0, A)),
             ("root", call("first-report", "wait", json!({}))),
@@ -432,7 +432,7 @@ mod tests {
             // Occupancy proves forwarding to the child's queue while A's invoke is gated.
             bounded(async {
                 while sender.capacity() != AGENT_CHANNEL_CAPACITY - 1 {
-                    tokio::task::yield_now().await;
+                    poll().await;
                 }
             })
             .await;
@@ -443,10 +443,10 @@ mod tests {
         }
         tracking.release(1);
         let addendum = tracking.request(3).await;
-        let messages = serde_json::to_string(&addendum.messages().collect::<Vec<_>>()).unwrap();
+        let messages = rendered(&addendum);
         assert_eq!(messages.matches("please add an addendum").count(), 1);
         assert!(addendum.messages().any(|message| matches!(message,
-            Message::Assistant(content) if content == &tracking.steps[1].content)));
+            Message::Assistant(content) if content == &[AssistantContent::text("report", 0, A)])));
         if !parent_already_waiting {
             assert!(!tracking.requested_from(4));
             tracking.release(2);
@@ -481,7 +481,7 @@ mod tests {
         let lifecycle = events(&completed);
         assert_eq!(lifecycle.len(), 1);
         assert_child_completion(&lifecycle[0], &delivered[1]);
-        let history = serde_json::to_string(&completed.messages().collect::<Vec<_>>()).unwrap();
+        let history = rendered(&completed);
         // A must not be overwritten or repeated
         assert_eq!(history.matches(A).count(), 1);
         // completion must not repeat B
@@ -497,7 +497,7 @@ mod tests {
     /// turn answered nothing, so it must publish no reply, wake nobody and leave no
     /// delivery behind. Otherwise the owner collects one blank child message per
     /// child turn, which is what a raw `is_empty` projection check produced.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn blank_child_turn_publishes_no_reply_and_never_wakes_the_owner() {
         const FINAL: &str = "child-final-answer-after-blank";
         let mut child_tool = call("blank-turn-tool", "script", json!({"source":"return 42;"}));
@@ -508,7 +508,7 @@ mod tests {
             child_tool,
         ];
         let launch = json!({"prompt":"child task", "model":"child", "name":"blank", "bg":true});
-        let tracking = Tracking::responses(vec![
+        let tracking = tracking_all(vec![
             ("root", vec![call("launch", "agent", launch)]),
             ("child", blank.clone()),
             ("root", vec![call("waiting", "wait", json!({}))]),
@@ -572,7 +572,7 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn intermediate_child_replies_wake_parent_or_reach_request_boundary_once() {
         for parent_already_waiting in [true, false] {
             intermediate_child_reply(parent_already_waiting).await;
@@ -589,7 +589,7 @@ mod tests {
             json!({"prompt":"child task", "model":"child", "name":"child-replier", "bg":true});
         let final_reply = vec![AssistantContent::text("child-final", 0, FINAL)];
         let after_final = vec![call("after-final", "wait", json!({"timeout":1}))];
-        let tracking = Tracking::responses(vec![
+        let tracking = tracking_all(vec![
             ("root", vec![call("child", "agent", launch)]),
             ("child", vec![call("child-wait", "wait", json!({}))]),
             ("root", vec![call("waiting", "wait", json!({}))]),
@@ -623,8 +623,7 @@ mod tests {
         assert_eq!(sent.value["value"], json!({"accepted":true}));
         let child_request = tracking.pass(3).await;
         assert_reason(&child_request, "child-wait", "event");
-        let messages =
-            serde_json::to_string(&child_request.messages().collect::<Vec<_>>()).unwrap();
+        let messages = rendered(&child_request);
         assert_eq!(messages.matches("parent-reply-request-marker").count(), 1);
         // The child committed text WITH a tool call and reached another, gated invoke.
         tracking.request(4).await;
@@ -658,7 +657,7 @@ mod tests {
             "text":REPLY,
         });
         assert_eq!(replies, vec![expected]);
-        let messages = serde_json::to_string(&next.messages().collect::<Vec<_>>()).unwrap();
+        let messages = rendered(&next);
         let copies = messages.matches(REPLY).count();
         // only the runtime envelope should contain the reply
         assert_eq!(copies, 1);
@@ -689,7 +688,7 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn intermediate_child_replies_outlive_a_full_parent_mailbox() {
         let reply_count = AGENT_CHANNEL_CAPACITY + 1;
         let launch = json!({"prompt":"child task", "model":"child", "bg":true});
@@ -701,8 +700,8 @@ mod tests {
         for index in 0..reply_count {
             let text = format!("mailbox-child-reply-{index}");
             let reply = AssistantContent::text(format!("child-reply-{index}"), 0, text);
-            let script = json!({"source":"return 42;"});
-            let mut tool = call(&format!("child-tool-{index}"), "script", script);
+            // Any cheap tool keeps the child working after its reply.
+            let mut tool = call(&format!("child-tool-{index}"), "todo", json!({"items":[]}));
             tool.position = 1;
             steps.push(("child", vec![reply, tool]));
         }
@@ -713,7 +712,7 @@ mod tests {
         steps.push(("root", vec![call("finish-wait", "wait", json!({}))]));
         let parent_completed = steps.len();
         steps.push(("root", vec![answer()]));
-        let tracking = Tracking::responses(steps);
+        let tracking = tracking_all(steps);
         let (_root, session) = start(&tracking).await;
         let runtime = &session.runtime;
         let turn = prompt(&session);
@@ -764,9 +763,9 @@ mod tests {
         bounded(session.root_tx.closed()).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn progress_and_completion_cross_the_same_no_tool_boundary_once() {
-        let tracking = Tracking::new(vec![("root", answer()), ("root", answer())]);
+        let tracking = tracking(vec![("root", answer()), ("root", answer())]);
         let (root, session) = start(&tracking).await;
         let runtime = &session.runtime;
         let turn = prompt(&session);

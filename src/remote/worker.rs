@@ -29,11 +29,6 @@ use crate::{
     },
 };
 
-pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
-    let root = std::fs::canonicalize(".")?;
-    serve_io_at(tokio::io::stdin(), tokio::io::stdout(), root).await
-}
-
 pub async fn serve_with_authorization_root(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let root = std::fs::canonicalize(root)?;
     serve_io_at(tokio::io::stdin(), tokio::io::stdout(), root).await
@@ -115,10 +110,12 @@ where
     .with_process_environment(services.environment.clone());
     let (requests, mut incoming) = mpsc::channel(32);
     let (started_jobs, mut started) = mpsc::channel(32);
-    let reader = tokio::spawn(read_requests(input, requests));
+    let mut reader = tokio::spawn(read_requests(input, requests));
+    // Dropping the task set on return aborts every running request.
     let mut tasks = JoinSet::new();
     let mut active = HashMap::new();
     let mut cancelled = HashSet::new();
+    let result = async {
     loop {
         tokio::select! {
             request = incoming.recv() => {
@@ -126,16 +123,16 @@ where
                     jobs.cancel_all(&worker_agent).await;
                     tasks.abort_all();
                     while tasks.join_next().await.is_some() {}
-                    return match reader.await {
+                    let ended: Result<(), Box<dyn std::error::Error>> = match (&mut reader).await {
                         Ok(Ok(())) => Ok(()),
                         Ok(Err(error)) => Err(error.into()),
                         Err(error) => Err(error.into()),
                     };
+                    return ended;
                 };
                 match request {
                     Request::Tool { request_id, name, arguments, capabilities } => {
                         if active.insert(request_id, None).is_some() {
-                            reader.abort();
                             return Err(format!("duplicate request ID {}", request_id.get()).into());
                         }
                         // Collect an exact set: defaults would restore capabilities the caller lacks.
@@ -207,10 +204,7 @@ where
                         }
                     }
                     control @ (Request::OpenSsh { .. } | Request::StreamData { .. } | Request::StreamEnd { .. } | Request::StreamClose { .. } | Request::StreamAck { .. } | Request::SensitiveAnswer { .. }) => services.handle(control).await?,
-                    Request::Hello { .. } => {
-                        reader.abort();
-                        return Err("received a second hello".into());
-                    }
+                    Request::Hello { .. } => return Err("received a second hello".into()),
                 }
             }
             completed = services.tasks.join_next(), if !services.tasks.is_empty() => {
@@ -221,36 +215,20 @@ where
                     None => unreachable!("nonempty service task set"),
                 };
                 if let Some(error) = error {
-                    reader.abort();
-                    tasks.abort_all();
                     return Err(error);
                 }
             }
             completed = tasks.join_next(), if !tasks.is_empty() => {
                 let (request_id, result) = match completed {
                     Some(Ok(completed)) => completed,
-                    Some(Err(error)) => {
-                        reader.abort();
-                        tasks.abort_all();
-                        return Err(error.into());
-                    }
-                    None => {
-                        reader.abort();
-                        return Err("remote request set ended unexpectedly".into());
-                    }
+                    Some(Err(error)) => return Err(error.into()),
+                    None => return Err("remote request set ended unexpectedly".into()),
                 };
                 active.remove(&request_id);
                 cancelled.remove(&request_id);
-                if let Err(error) = result {
-                    reader.abort();
-                    tasks.abort_all();
-                    return Err(error.into());
-                }
-                if tasks.is_empty()
-                    && let Err(error) = jobs.prune_claimed().await
-                {
-                    reader.abort();
-                    return Err(error.into());
+                result?;
+                if tasks.is_empty() {
+                    jobs.prune_claimed().await?;
                 }
             }
             started_job = started.recv() => {
@@ -265,6 +243,10 @@ where
             }
         }
     }
+    }
+    .await;
+    reader.abort();
+    result
 }
 
 struct ForwardPolicy<W> {
@@ -654,10 +636,7 @@ mod tests {
                     Capability::Read,
                     ResourceId::path("root", "/outside".as_ref()),
                 ),
-                PermissionUse::new(
-                    Capability::Read,
-                    ResourceId::custom("extension", ["root", "opaque"]).unwrap(),
-                ),
+                PermissionUse::new(Capability::Mcp, ResourceId::mcp("root", "tool")),
             ];
             permissions.extend(dynamic.clone());
             expected_permissions.extend(dynamic);
@@ -724,29 +703,30 @@ mod tests {
     async fn tool_requests_execute_concurrently_and_reply_on_completion() {
         let mut worker = Harness::start(std::fs::canonicalize(".").unwrap()).await;
         let shell = |command: &str| serde_json::json!({ "command": command });
-        worker
-            .tool(1, defaults(), "shell", shell("sleep 1; printf slow"))
-            .await;
-        worker
-            .tool(2, defaults(), "shell", shell("printf fast"))
-            .await;
-        assert_eq!(stdout(&worker.recv().await), (2, Ok("fast")));
-        assert_eq!(stdout(&worker.recv().await), (1, Ok("slow")));
+        // The first request can only finish while the second one runs.
+        let flag = tempfile::tempdir().unwrap();
+        let flag = flag.path().join("flag").display().to_string();
+        let wait = format!("while [ ! -e '{flag}' ]; do sleep 0.01; done; printf slow");
+        worker.tool(1, defaults(), "shell", shell(&wait)).await;
+        let touch = format!("touch '{flag}'; printf fast");
+        worker.tool(2, defaults(), "shell", shell(&touch)).await;
+        let mut responses = [worker.recv().await, worker.recv().await];
+        responses.sort_by_key(|response| stdout(response).0);
+        assert_eq!(
+            responses.each_ref().map(stdout),
+            [(1, Ok("slow")), (2, Ok("fast"))]
+        );
 
         worker
             .tool(3, defaults(), "shell", shell("sleep 10; printf cancelled"))
             .await;
         worker
-            .tool(4, defaults(), "shell", shell("sleep 0.1; printf sibling"))
+            .tool(4, defaults(), "shell", shell("printf sibling"))
             .await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(stdout(&worker.recv().await), (4, Ok("sibling")));
         worker.send(Request::Cancel { request_id: id(3) }).await;
-        let mut responses = [worker.recv().await, worker.recv().await];
-        responses.sort_by_key(|response| stdout(response).0);
-        assert!(
-            matches!(stdout(&responses[0]), (3, Err(message)) if message.contains("cancelled"))
-        );
-        assert_eq!(stdout(&responses[1]), (4, Ok("sibling")));
+        let cancelled = worker.recv().await;
+        assert!(matches!(stdout(&cancelled), (3, Err(message)) if message.contains("cancelled")));
 
         worker
             .tool(5, defaults(), "shell", shell("printf reusable"))

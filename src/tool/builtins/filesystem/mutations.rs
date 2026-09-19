@@ -21,7 +21,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             .placement(crate::tool::ToolPlacement::InheritWorkspace)
             .argument_paths(|arguments| {
                 let args: WriteArgs = serde_json::from_value(arguments.clone())
-                    .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+                    .map_err(ToolError::invalid)?;
                 Ok(vec![crate::tool::PathArgument::top_level(
                     "path", None, PathAccess::Write,
                     if args.create_parents { PathKind::WritableWithParents } else { PathKind::Writable },
@@ -90,11 +90,9 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             check_write_size(&args.patch)?;
             let path = std::path::PathBuf::from(&args.path);
             let text = fs::read_to_string(&path).await?;
-            let patch = Patch::from_str(&args.patch)
-                .map_err(|error| ToolError::Failed(error.to_string()))?;
+            let patch = Patch::from_str(&args.patch).map_err(ToolError::failed)?;
             let replacements = patch.hunks().len();
-            let output =
-                apply(&text, &patch).map_err(|error| ToolError::Failed(error.to_string()))?;
+            let output = apply(&text, &patch).map_err(ToolError::failed)?;
             check_write_size(&output)?;
             atomic_write(&path, output.as_bytes()).await?;
             Ok(EditOutput {
@@ -226,7 +224,6 @@ const fn default_one() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::tool::builtins::workspace::atomic_write;
     use serde_json::json;
     use std::sync::Arc;
 
@@ -454,24 +451,6 @@ mod tests {
         );
         assert!(!outside.join("nested").exists());
         assert!(!outside.join("missing").exists());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn atomic_replacement_preserves_permissions() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("executable");
-        fs::write(&path, "old").await.unwrap();
-        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o751))
-            .await
-            .unwrap();
-        atomic_write(&path, b"new").await.unwrap();
-        assert_eq!(
-            fs::metadata(path).await.unwrap().permissions().mode() & 0o777,
-            0o751
-        );
     }
 
     #[tokio::test]

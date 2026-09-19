@@ -112,20 +112,10 @@ impl App {
         }
     }
     pub(super) fn start_failed(&mut self, error: String) {
+        // Keep an explicit script retry separate from composer input.
         let pending = self.start.take_action();
-        if let Some(action) = pending {
-            match action {
-                PendingStart::Input(input) | PendingStart::QueuedInput(input) => {
-                    self.queue.push_front(*input)
-                }
-                PendingStart::Script(path) => {
-                    // Keep an explicit script retry separate from composer input.
-                    self.start = StartState::RetryScript(path);
-                }
-            }
-        }
+        self.park_action(pending);
         self.paused = true;
-        self.refresh_queue_menu();
         self.notice(error);
         if self.stopping {
             self.finish_shutdown();

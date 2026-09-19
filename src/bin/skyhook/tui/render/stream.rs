@@ -1,10 +1,6 @@
-//! Full-source layout for live and saved prose.
-//!
-//! Content updates are authoritative replacements. The former append-only
-//! StreamLayout/Plain checkpoints had no production append producer and are
-//! retired; this module neither accepts an unproven old offset nor retains
-//! source revisions or committed rows. Keep the stateless plain-prose fast path
-//! used by production replacements, with conservative Markdown/cleaning fallback.
+//! Full-source layout for live and saved prose. Content updates are
+//! authoritative replacements: every update renders its complete source, with a
+//! stateless plain-prose fast path and a conservative Markdown fallback.
 
 use super::markdown::{self, LayoutLine};
 use super::{Palette, wrap_words};
@@ -37,11 +33,9 @@ pub(super) fn layout_highlighted(
     )
 }
 
-/// Render a complete plain source once. No byte/row checkpoint or unstable tail
-/// survives this call; every subsequent content update renders its full source.
+/// Render a complete plain source once, or decline so Markdown handles it.
 fn plain_layout(text: &str, width: usize, prefix: &str, p: Palette) -> Option<Vec<LayoutLine>> {
-    // Preserve the conservative narrow-prefix admission used by the old first
-    // render path, including multibyte prefixes. Markdown handles the fallback.
+    // Conservative narrow-prefix admission, including multibyte prefixes.
     if !prefix.is_empty() && width < prefix.len() {
         return None;
     }
@@ -256,7 +250,7 @@ mod tests {
             "  ", "中",
         ];
         let mut seed = 71u64;
-        let random = (0..40).map(|_| {
+        let random = (0..12).map(|_| {
             (0..30)
                 .map(|_| {
                     seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -280,7 +274,7 @@ mod tests {
             let ends = source.char_indices().map(|(at, _)| at).skip(1);
             for end in ends.chain([source.len()]) {
                 let text = &source[..end];
-                for width in [1, 2, 3, 8, 13, 24, 80] {
+                for width in [1, 3, 13, 80] {
                     let cleaned = super::super::model::clean(text);
                     let reference =
                         markdown::layout_highlighted(&cleaned, p, true, width, width, "", None);

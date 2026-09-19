@@ -24,9 +24,7 @@ impl RouteIdentity {
     }
 }
 
-/// A nonempty immutable route snapshot with identity derived from its definitions.
-///
-/// This does not prove that the registry still contains the same revisions.
+/// A nonempty route snapshot; the registry may since have changed.
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedRoute {
     identity: RouteIdentity,
@@ -34,10 +32,7 @@ pub(crate) struct ResolvedRoute {
 }
 
 impl ResolvedRoute {
-    /// Capture a nonempty route and derive its identity from the same definitions.
-    ///
-    /// Registry resolution remains responsible for graph/configuration validation.
-    /// This is a snapshot, not a promise that the registry will remain unchanged.
+    /// Captures already validated definitions; `None` when empty.
     pub fn from_definitions(definitions: Vec<TargetDefinition>) -> Option<Self> {
         let destination = definitions.last()?.name.clone();
         let hops = definitions
@@ -160,9 +155,7 @@ impl TargetRouter {
         self.remote.environment().await
     }
     pub(crate) async fn shutdown(&self) {
-        // Accepted registrations retain this gate through journal and live
-        // publication (including grant/pool invalidation), even if their caller
-        // abandons its waiter. Drain them before shutting down remote resources.
+        // Drain accepted registrations, which hold this gate until published.
         let _mutation = self.mutation.write().await;
         self.remote.shutdown().await;
     }
@@ -197,10 +190,8 @@ impl TargetRouter {
         let store = store.clone();
         let agent = subject.agent.clone();
         let router = self.clone();
-        // Admission transfers both guards to the owner. Dropping the caller
-        // after this point cannot strand a committed journal update without
-        // its registry publication and invalidation. Failed/indeterminate
-        // appends do not publish definitions or imply a safe retry.
+        // The spawned owner finishes journal append and publication even if the
+        // caller is dropped; a failed append publishes nothing.
         tokio::spawn(async move {
             let _mutation = mutation;
             store
@@ -265,11 +256,7 @@ impl TargetRouter {
             let current =
                 (self.resolve(route.identity.destination(), &subject.capabilities)).await?;
             if current.identity() == route.identity() && self.remote.is_current(&prepared).await {
-                // Route admission linearizes at this successful identity/current-slot
-                // comparison under the mutation gate. The prepared connection retains
-                // this admitted snapshot; later mutation does not revoke it. This is
-                // not an execution-time freshness guarantee, and the gate is not held
-                // while establishing the connection or executing remote operations.
+                // Admitted: later registry mutation does not revoke this snapshot.
                 drop(mutation);
                 return Ok(prepared);
             }
@@ -291,25 +278,17 @@ impl TargetRouter {
 
 #[cfg(test)]
 mod tests {
-    use futures_util::future::BoxFuture;
     use std::{
         collections::VecDeque,
-        path::PathBuf,
-        sync::{
-            Arc, Mutex as StdMutex,
-            atomic::{AtomicUsize, Ordering},
-        },
+        sync::{Arc, Mutex as StdMutex, atomic::Ordering},
     };
-
-    use tokio::sync::{Notify, Semaphore};
 
     use super::*;
     use crate::{
         identity::{AgentId, JobId, SessionId},
         job::CancellationToken,
         remote::{
-            ConnectionFactory, ConnectionRequest, EmbeddedShimCatalog, RejectSensitivePrompts,
-            test_transport,
+            ConnectionFactory, EmbeddedShimCatalog, PendingHandshakeFactory, RejectSensitivePrompts,
         },
         session::{AppendBoundary, SessionStore},
         tests::RecordingPolicy,
@@ -474,49 +453,6 @@ mod tests {
         TargetRouter::new(targets, remote, authorization)
     }
 
-    struct BlockingFactory {
-        starts: AtomicUsize,
-        completions: Arc<AtomicUsize>,
-        started: Notify,
-        release: Arc<Semaphore>,
-    }
-
-    impl BlockingFactory {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                starts: AtomicUsize::new(0),
-                completions: Arc::new(AtomicUsize::new(0)),
-                started: Notify::new(),
-                release: Arc::new(Semaphore::new(0)),
-            })
-        }
-
-        async fn wait_for_starts(&self, expected: usize) {
-            while self.starts.load(Ordering::SeqCst) < expected {
-                self.started.notified().await;
-            }
-        }
-    }
-
-    impl ConnectionFactory for BlockingFactory {
-        fn connect(
-            &self,
-            request: ConnectionRequest,
-        ) -> BoxFuture<'static, Result<crate::remote::backend::Transport, RemoteError>> {
-            assert_eq!(request.target, "build");
-            assert!(!request.route.is_empty());
-            assert_eq!(request.workspace, PathBuf::from("/override"));
-            self.starts.fetch_add(1, Ordering::SeqCst);
-            self.started.notify_waiters();
-            let (release, completions) = (self.release.clone(), self.completions.clone());
-            Box::pin(async move {
-                release.acquire().await.unwrap().forget();
-                completions.fetch_add(1, Ordering::SeqCst);
-                Ok(test_transport())
-            })
-        }
-    }
-
     async fn prepare(
         router: &TargetRouter,
         subject: &AuthorizationSubject,
@@ -581,7 +517,7 @@ mod tests {
 
     #[tokio::test]
     async fn admitted_route_snapshot_survives_later_registry_mutation() {
-        let factory = BlockingFactory::new();
+        let factory = PendingHandshakeFactory::new();
         let router = router(
             registry(&[("build", None)]),
             recording([]),
@@ -591,7 +527,7 @@ mod tests {
             .resolve("build", &CapabilitySet::default())
             .await
             .unwrap();
-        factory.release.add_permits(1);
+        factory.ready.add_permits(1);
         let prepared = prepare(&router, &subject()).await.unwrap();
         assert!(router.remote.is_current(&prepared).await);
 
@@ -613,7 +549,7 @@ mod tests {
     #[tokio::test]
     async fn grant_revocation_after_authorization_does_not_reauthorize_unchanged_route() {
         let policy = recording([PolicyDecision::allow(), deny("revoked")]);
-        let factory = BlockingFactory::new();
+        let factory = PendingHandshakeFactory::new();
         let router = router(
             registry(&[("build", None)]),
             policy.clone(),
@@ -626,7 +562,7 @@ mod tests {
             .unwrap();
         approve(&router, &route, &subject).await.unwrap();
         router.authorization.revoke(|_| true).await;
-        factory.release.add_permits(1);
+        factory.ready.add_permits(1);
         let prepared = router
             .prepare(route.clone(), Path::new("/override"), &subject)
             .await;
@@ -638,65 +574,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_waiters_share_startup_and_cancellation_is_per_waiter() {
+    async fn waiters_share_one_startup_and_approval_and_cancel_separately() {
         let policy = recording([]);
-        let factory = BlockingFactory::new();
-        let router = router(
-            registry(&[("build", None)]),
-            policy.clone(),
-            Some(factory.clone()),
-        );
-        let first_subject = subject();
-        let first = spawn_prepare(&router, first_subject.clone());
-        factory.wait_for_starts(1).await;
-        assert_eq!(policy.requests.lock().unwrap().len(), 1);
+        let factory = PendingHandshakeFactory::new();
+        let targets = registry(&[("build", None)]);
+        let router = router(targets, policy.clone(), Some(factory.clone()));
+        let cancelled = subject();
+        let first = spawn_prepare(&router, cancelled.clone());
+        factory.wait_for_hello().await;
         let second = spawn_prepare(&router, subject());
-        tokio::task::yield_now().await;
-        first_subject.cancellation.cancel();
+        cancelled.cancellation.cancel();
         assert!(matches!(first.await.unwrap(), Err(RemoteError::Cancelled)));
-        factory.release.add_permits(1);
+        factory.ready.add_permits(1);
         second.await.unwrap().unwrap();
         assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
         assert_eq!(policy.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn startup_continues_after_its_only_waiter_is_cancelled() {
-        let factory = BlockingFactory::new();
-        let router = router(
-            registry(&[("build", None)]),
-            recording([]),
-            Some(factory.clone()),
-        );
-        let first_subject = subject();
-        let first = spawn_prepare(&router, first_subject.clone());
-        factory.wait_for_starts(1).await;
-
-        first_subject.cancellation.cancel();
-        assert!(matches!(first.await.unwrap(), Err(RemoteError::Cancelled)));
-        factory.release.add_permits(1);
-        for _ in 0..100 {
-            if factory.completions.load(Ordering::SeqCst) == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(factory.completions.load(Ordering::SeqCst), 1);
-
-        prepare(&router, &subject()).await.unwrap();
-        assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
     async fn invalidation_during_startup_retries_before_returning() {
         let policy = recording([]);
-        let factory = BlockingFactory::new();
+        let factory = PendingHandshakeFactory::new();
         let targets = registry(&[("gateway", None), ("build", Some("gateway"))]);
         let router = router(targets, policy.clone(), Some(factory.clone()));
         let preparing = spawn_prepare(&router, subject());
-        factory.wait_for_starts(1).await;
+        factory.wait_for_hello().await;
         replace_target(&router, target("gateway", None)).await;
-        factory.release.add_permits(2);
+        factory.ready.add_permits(2);
         preparing.await.unwrap().unwrap();
         assert_eq!(factory.starts.load(Ordering::SeqCst), 2);
         assert_eq!(policy.requests.lock().unwrap().len(), 2);

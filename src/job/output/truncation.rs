@@ -192,10 +192,6 @@ impl<'a> ApplicableSchemas<'a> {
     }
 }
 
-fn property_field(field: &str, key: &str) -> String {
-    format!("{field}/{}", key.replace('~', "~0").replace('/', "~1"))
-}
-
 fn line_end(bytes: &[u8]) -> usize {
     bytes
         .iter()

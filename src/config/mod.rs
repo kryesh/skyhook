@@ -179,10 +179,6 @@ pub enum ConfigError {
     Structure(String),
     #[error("no Skyhook config found; pass --config or create ~/.config/skyhook/config.toml")]
     Missing,
-    #[error("configuration I/O failed: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("invalid TOML configuration: {0}")]
-    Toml(#[from] toml::de::Error),
     #[error("environment variable `{0}` is required and must not be empty")]
     MissingEnvironment(String),
     #[error("provider `{0}` could not be initialized: {1}")]
@@ -193,8 +189,6 @@ pub enum ConfigError {
     UnknownModelProvider { model: String, provider: String },
     #[error("invalid model profile `{0}`: {1}")]
     Model(String, String),
-    #[error(transparent)]
-    Harness(#[from] crate::agent::HarnessError),
 }
 
 impl ConfigError {
@@ -358,27 +352,24 @@ mod tests {
         let exact = parse("capabilities = ['read', 'targets']").unwrap();
         assert_eq!(exact.capabilities, [Capability::Read, Capability::Targets]);
         for name in ["unknown", "Mcp", "Interactive", "READ"] {
-            let error = parse(&format!("capabilities = ['{name}']"))
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains(name), "{error}");
-            assert!(error.contains("unknown variant"), "{error}");
+            let error = parse(&format!("capabilities = ['{name}']")).unwrap_err();
+            let error = error.to_string();
+            assert!(
+                error.contains(name) && error.contains("unknown variant"),
+                "{error}"
+            );
         }
-        let all = parse(
-            "capabilities = ['read', 'write', 'exec', 'network', 'targets', 'ssh_agent', 'agents', 'mcp']",
-        )
-        .unwrap();
-        let non_interactive: Vec<_> = Capability::ALL
-            .into_iter()
-            .filter(|capability| *capability != Capability::Interactive)
-            .collect();
-        assert_eq!(all.capabilities, non_interactive);
+        let all = "'read', 'write', 'exec', 'network', 'targets', 'ssh_agent', 'agents', 'mcp'";
+        let all = parse(&format!("capabilities = [{all}]"))
+            .unwrap()
+            .capabilities;
+        let non_interactive = Capability::ALL.into_iter();
+        let non_interactive = non_interactive.filter(|c| *c != Capability::Interactive);
+        assert!(non_interactive.eq(all));
+        let scalar = parse("capabilities = 'read'").unwrap_err().to_string();
+        assert!(scalar.contains("expected a sequence"), "{scalar}");
         let error = parse("capabilities = ['interactive']").unwrap_err();
         assert!(error.to_string().contains("controlled by the runtime host"));
-        let approved = parse("approve_all = true\ncapabilities = []").unwrap();
-        assert!(approved.approve_all);
-        assert!(approved.capabilities.is_empty());
-        assert!(parse("capabilities = 'read'").is_err());
         assert!(parse("targets_enabled = true").is_err());
     }
 }

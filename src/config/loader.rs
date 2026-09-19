@@ -358,6 +358,7 @@ mod tests {
         Some(b"approve_all = true\n[providers.bad]\nkind = 'anthropic'\nbase_url = 'relative'"),
         Some(b"approve_all = true\n[providers.bad]\nkind = 'anthropic'\nbase_url = 'https://example.com'\napi_key_command = '  '"),
         Some(b"approve_all = true\n[providers.bad]\nkind = 'openai'\nbase_url = 'https://example.com'\napi = 'responses'\nchat_reasoning_replay = 'reasoning'"),
+        Some(b"approve_all = true\n[targets.a]\ntype = 'ssh'\nhost = 'a'\nvia = 'b'\n[targets.b]\ntype = 'ssh'\nhost = 'b'\nvia = 'a'"), // route cycle
         Some(b""),
     ];
         for bytes in invalid {
@@ -380,6 +381,11 @@ mod tests {
                 "rejected candidate leaked fields: {bytes:?}"
             );
             assert!(resolved.config.providers.is_empty());
+            assert!(resolved.config.targets.entries.is_empty(), "{bytes:?}");
+            // The diagnostic names the actual cause, shown here for the route cycle.
+            let cyclic = bytes.is_some_and(|bytes| bytes.ends_with(b"via = 'a'"));
+            let message = &resolved.report.diagnostics[0].message;
+            assert_eq!(message.contains(CYCLE), cyclic, "{bytes:?}: {message}");
         }
     }
 
@@ -594,28 +600,6 @@ mod tests {
     }
 
     const CYCLE: &str = "target route contains a cycle";
-
-    #[tokio::test]
-    async fn cyclic_xdg_targets_fall_back_without_leaking_fields() {
-        let f = Fixture::new();
-        write(
-            &f.xdg,
-            format!(
-                "approve_all = true\n{}{}",
-                target("a", Some("b")),
-                target("b", Some("a"))
-            ),
-        );
-        write(&f.home, target("home", None));
-        let resolved = f.resolve().await.unwrap();
-        assert_eq!(resolved.report.sources, [f.home]);
-        assert_eq!(resolved.report.diagnostics.len(), 1);
-        assert_eq!(resolved.report.diagnostics[0].path, f.xdg);
-        assert!(resolved.report.diagnostics[0].message.contains(CYCLE));
-        assert!(!resolved.config.approve_all);
-        let names: Vec<_> = resolved.config.targets.entries.keys().collect();
-        assert_eq!(names, ["home"]);
-    }
 
     #[tokio::test]
     async fn explicit_and_merged_target_cycles_are_rejected() {

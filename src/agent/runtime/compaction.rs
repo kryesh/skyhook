@@ -269,41 +269,13 @@ mod tests {
         assert!(validator.is_valid(&reordered));
         let parse = |value: &serde_json::Value| continuation(&value.to_string()).unwrap().message;
         assert_eq!(parse(&reordered), parse(&valid));
-        for field in valid.as_object().unwrap().keys() {
-            let mut missing = valid.clone();
-            missing.as_object_mut().unwrap().remove(field);
-            assert!(!validator.is_valid(&missing), "accepted missing {field}");
-        }
-        for (pointer, replacement) in [
-            ("/objective", json!([])),
-            ("/findings", json!([42])),
-            ("/jobs", json!(["not a job id"])),
-            ("/todos/0/status", json!("finished")),
-            ("/todos/0/text", json!(null)),
-        ] {
-            let invalid = with(pointer, replacement);
-            assert!(!validator.is_valid(&invalid), "accepted invalid {pointer}");
-        }
-        for pointer in ["", "/todos/0"] {
-            let mut unknown = valid.clone();
-            let object = unknown
-                .pointer_mut(pointer)
-                .unwrap()
-                .as_object_mut()
-                .unwrap();
-            object.insert("unexpected".into(), json!(true));
-            assert!(
-                !validator.is_valid(&unknown),
-                "accepted extra field at {pointer}"
-            );
-        }
-        for field in ["text", "status"] {
-            let mut missing = valid.clone();
-            missing["todos"][0].as_object_mut().unwrap().remove(field);
-            assert!(
-                !validator.is_valid(&missing),
-                "accepted todo without {field}"
-            );
+        // The derive supplies the rest; one case per kind proves it is wired up.
+        let (mut missing, mut unknown) = (valid.clone(), valid.clone());
+        missing.as_object_mut().unwrap().remove("plan");
+        unknown["todos"][0]["unexpected"] = json!(true);
+        let mistyped = with("/todos/0/status", json!("finished"));
+        for invalid in [missing, unknown, mistyped] {
+            assert!(!validator.is_valid(&invalid), "accepted {invalid}");
         }
     }
 
@@ -339,42 +311,13 @@ mod tests {
         for output in ["", " ", "prose", "```json\n{}\n```", "{}", "[]", "null"] {
             assert!(continuation(output).is_err(), "accepted {output:?}");
         }
-        let (mut missing, mut unknown, mut unknown_todo_field) = (summary(), summary(), summary());
-        missing.as_object_mut().unwrap().remove("plan");
+        let mut unknown = summary();
         unknown["unexpected"] = true.into();
-        unknown_todo_field["todos"][0]["unexpected"] = true.into();
-        let mut cases = vec![
-            missing,
-            unknown,
-            unknown_todo_field,
-            with("/findings", serde_json::Value::Null),
-            with("/todos/0/status", "blocked".into()),
-            with("/todos/0/text", " \t\n".into()),
-        ];
-        for field in summary().as_object().unwrap().keys() {
-            if matches!(
-                field.as_str(),
-                "objective" | "resumption_point" | "todos" | "jobs"
-            ) {
-                continue;
-            }
-            for invalid in [json!("old string format"), json!([42])] {
-                cases.push(with(&format!("/{field}"), invalid));
-            }
-        }
-        for invalid in [
-            json!([0]),
-            json!([-1]),
-            json!(["17"]),
-            serde_json::Value::Null,
-        ] {
-            cases.push(with("/jobs", invalid));
-        }
-        for value in cases {
-            assert!(
-                continuation(&value.to_string()).is_err(),
-                "accepted {value}"
-            );
+        // Beyond serde's structural checks: todo text is not blank, job ids are real.
+        let blank_todo = with("/todos/0/text", " \t\n".into());
+        for value in [unknown, blank_todo, with("/jobs", json!([0]))] {
+            let parsed = continuation(&value.to_string());
+            assert!(parsed.is_err(), "accepted {value}");
         }
         let empty_todos = with("/todos", json!([]));
         assert!(

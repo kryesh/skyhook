@@ -6,11 +6,11 @@ use super::jobs::{call_entry, job_entry};
 use super::live::{
     reasoning_entry, reasoning_key, response_block_key, response_entries, working_entry,
 };
-use super::notifications::{job_event_entries, job_notification_kind};
+use super::notifications::{is_job_notification, job_event_entries};
 use super::requests::{request_entry, request_running};
-use super::{Entry, EntryKey, EntryView, Projection, Surface, Tab, View, number, pretty};
+use super::{Entry, EntryKey, EntryView, Projection, Surface, Tab, number, pretty};
 use skyhook::agent::ObservationSnapshot;
-use skyhook::identity::{AgentId, JobId};
+use skyhook::identity::JobId;
 use skyhook::provider::protocol::{BlockContent, Message, UserContent};
 use skyhook::session::SessionEvent;
 use std::collections::{HashMap, HashSet};
@@ -22,31 +22,8 @@ enum ToolGroup {
     Notification(u64, usize),
 }
 
-pub fn entries(
-    snapshot: &ObservationSnapshot,
-    projection: &Projection,
-    agent: &AgentId,
-    view: &View,
-    outputs: &OutputStore,
-    thinking: bool,
-    all_details: bool,
-) -> Vec<Entry> {
-    entries_inner(
-        snapshot,
-        projection,
-        EntryView {
-            agent,
-            view,
-            thinking,
-            all_details,
-        },
-        outputs,
-        true,
-    )
-}
-
 /// Shared by retained UI content and fresh export construction.
-pub(super) fn entries_inner(
+pub fn entries(
     snapshot: &ObservationSnapshot,
     projection: &Projection,
     presentation: EntryView<'_>,
@@ -142,11 +119,7 @@ pub(super) fn entries_inner(
             }
             let mut entries = Vec::new();
             let mut tool_groups = HashMap::new();
-            let agent_name = projection
-                .agents
-                .iter()
-                .find(|a| &a.id == agent)
-                .map_or("Agent", |a| a.name.as_str());
+            let agent_name = projection.agent_name(agent);
             for record in &records {
                 let key = EntryKey::Record(record.sequence);
                 match &record.event {
@@ -198,9 +171,7 @@ pub(super) fn entries_inner(
                                         format!("Attachment\n{}", pretty(attachment)),
                                         Surface::User,
                                     ),
-                                    UserContent::Runtime { text }
-                                        if job_notification_kind(text).is_some() =>
-                                    {
+                                    UserContent::Runtime { text } if is_job_notification(text) => {
                                         for entry in job_event_entries(
                                             record.sequence,
                                             i,
@@ -439,11 +410,13 @@ pub(super) fn entries_inner(
 }
 #[cfg(test)]
 mod tests {
+    use super::super::View;
     use super::super::tests::{
         call_record, delta, record, replay, request, result_record, root, update,
     };
     use super::*;
     use skyhook::agent::{AgentActivity, RuntimeEvent};
+    use skyhook::identity::AgentId;
     use skyhook::provider::protocol::{AssistantItem, ToolCall};
 
     fn render(snapshot: &ObservationSnapshot, agent: &AgentId, details: bool) -> Vec<Entry> {
@@ -459,15 +432,13 @@ mod tests {
         let mut projection = Projection::default();
         projection.rebuild(snapshot);
         let (view, outputs) = (View::default(), OutputStore::default());
-        entries(
-            snapshot,
-            &projection,
+        let view = EntryView {
             agent,
-            &view,
-            &outputs,
+            view: &view,
             thinking,
-            details,
-        )
+            all_details: details,
+        };
+        entries(snapshot, &projection, view, &outputs, true)
     }
 
     fn commit(snapshot: &mut ObservationSnapshot, agent: &AgentId, message: Message) -> u64 {
@@ -610,14 +581,14 @@ mod tests {
     }
 
     #[test]
-    fn conversation_projects_mixed_and_legacy_job_events_without_reclassifying_user_text() {
+    fn conversation_projects_mixed_job_events_without_reclassifying_user_text() {
         const RECEIVED: &str = "Agent message received by model";
         let agent = root(2);
         let messages = format!(
-            "<skyhook_agent_messages>\n{}\n</skyhook_agent_messages>",
+            "<skyhook_job_events>\n{}\n</skyhook_job_events>",
             serde_json::json!([
-                {"id":253,"message":6577,"text":"first progress"},
-                {"id":253,"message":6578,"text":"second progress"},
+                {"kind":"message","id":253,"message":6577,"text":"first progress"},
+                {"kind":"message","id":253,"message":6578,"text":"second progress"},
             ]),
         );
         let jobs = format!(
@@ -714,35 +685,6 @@ mod tests {
             panic!("message history changed during rendering");
         };
         assert_eq!(serde_json::to_vec(stored).unwrap(), saved);
-    }
-
-    #[test]
-    fn failed_request_labels_do_not_confuse_http_retries_with_invocations() {
-        for (attempt, error) in [
-            (
-                1,
-                "Timeout: provider HTTP startup timeout (after 3 HTTP attempts)",
-            ),
-            (2, "Protocol: rejected"),
-        ] {
-            let mut snapshot = ObservationSnapshot::default();
-            let agent = root(1);
-            let request = request(&mut snapshot, &agent, None);
-            let error = error.to_string();
-            let failed = SessionEvent::ModelFailed {
-                request,
-                attempt,
-                error: error.clone(),
-                kind: skyhook::session::ModelFailureKind::Error,
-            };
-            record(&mut snapshot, &agent, failed);
-            let entries = render(&snapshot, &agent, false);
-            let failure = entries
-                .iter()
-                .find(|entry| entry.key() == &EntryKey::Retry(request));
-            let label = format!("Request failed · attempt {attempt}\n{error}");
-            assert_eq!(failure.unwrap().text(), label);
-        }
     }
 
     #[test]
@@ -897,35 +839,32 @@ mod tests {
     }
 
     #[test]
-    fn retry_history_displays_finite_and_unbounded_attempts_with_compact_safe_diagnostics() {
-        for (max_attempts, expected) in [(Some(3), "attempt 2 of 3"), (None, "attempt 2")] {
-            let agent = root(1);
-            let mut snapshot = ObservationSnapshot::default();
-            let request = request(&mut snapshot, &agent, None);
-            let error = format!("HTTP 503 overloaded\n\u{1b}[31m{}", "x".repeat(1000));
-            let failed = SessionEvent::ModelFailed {
-                request,
-                attempt: 1,
-                error: error.clone(),
-                kind: skyhook::session::ModelFailureKind::Error,
-            };
-            record(&mut snapshot, &agent, failed);
-            let scheduled = SessionEvent::ModelRecoveryScheduled {
-                request,
-                attempt: 2,
-                max_attempts,
-                delay_millis: 1000,
-                error: error.clone(),
-            };
-            record(&mut snapshot, &agent, scheduled);
-            let cards = render(&snapshot, &agent, false);
-            let text = cards[0].text();
-            assert_eq!((cards.len(), text.lines().count()), (1, 2));
-            assert!(text.contains(expected) && text.contains("HTTP 503 overloaded"));
-            assert!(!text.contains('\u{1b}') && text.chars().count() < 320 && text.ends_with('…'));
-            assert!(max_attempts.is_some() || !text.contains(" of "));
-            assert!(snapshot.records.values().any(|r| matches!(&r.event,
-                SessionEvent::ModelFailed { error: stored, .. } if stored == &error)));
-        }
+    fn retry_card_is_one_compact_safe_entry_and_leaves_the_stored_error_intact() {
+        let agent = root(1);
+        let mut snapshot = ObservationSnapshot::default();
+        let request = request(&mut snapshot, &agent, None);
+        let error = format!("HTTP 503 overloaded\n\u{1b}[31m{}", "x".repeat(1000));
+        let failed = SessionEvent::ModelFailed {
+            request,
+            attempt: 1,
+            error: error.clone(),
+            kind: skyhook::session::ModelFailureKind::Error,
+        };
+        record(&mut snapshot, &agent, failed);
+        let scheduled = SessionEvent::ModelRecoveryScheduled {
+            request,
+            attempt: 2,
+            max_attempts: Some(3),
+            delay_millis: 1000,
+            error: error.clone(),
+        };
+        record(&mut snapshot, &agent, scheduled);
+        let cards = render(&snapshot, &agent, false);
+        let text = cards[0].text();
+        assert_eq!((cards.len(), text.lines().count()), (1, 2));
+        assert!(text.contains("attempt 2 of 3") && text.contains("HTTP 503 overloaded"));
+        assert!(!text.contains('\u{1b}') && text.chars().count() < 320 && text.ends_with('…'));
+        assert!(snapshot.records.values().any(|r| matches!(&r.event,
+            SessionEvent::ModelFailed { error: stored, .. } if stored == &error)));
     }
 }

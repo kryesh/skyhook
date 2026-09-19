@@ -1,149 +1,38 @@
 use super::*;
-use skyhook::agent::{
-    PreparedQueuedPrompt, QueuedPromptCancellation, QueuedPromptCommit, QueuedPromptError,
-    QueuedPromptIdentity, QueuedPromptRecovery, RecoveredQueuedPrompt, RecoveredQueuedPromptState,
-};
-use skyhook::provider::protocol::UserContent;
-
-mod durable;
-pub(super) use durable::QueueScan;
+use skyhook::agent::{HarnessError, PromptOptions, QueuedPrompt, QueuedPromptCancellation};
+use skyhook::session::SessionError;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct QueuedInputId(u64);
 
-/// One composer submission waiting behind the current operation. `submission`
-/// and `model` are display/edit hints; once saved, the immutable content lives
-/// in the session journal under the row's attempt.
+/// One composer submission waiting behind the current operation.
 pub struct QueuedInput {
     pub(super) id: QueuedInputId,
+    /// Advanced by every dispatch and withdrawal, so a late receipt is ignored.
     pub(super) generation: u64,
-    pub(super) state: RowState,
+    /// Held while the row is dispatched and its commit receipt is pending.
+    pub(super) in_flight: Option<QueuedPromptCancellation>,
+    /// The commit outcome is unknown: only the user may send this row again,
+    /// and nothing behind it is dispatched until they edit or remove it.
+    pub(super) unknown: bool,
     pub(super) submission: Submission,
     pub(super) model: String,
-}
-
-/// Where a row's single journal attempt stands. The UI owns cancellation and
-/// recovery evidence, never a second enqueue permit.
-#[derive(Debug, Default)]
-pub(super) enum RowState {
-    /// Not saved to the journal yet.
-    #[default]
-    Unsaved,
-    /// Durable preparation is running; nothing can have been dispatched.
-    Preparing(QueuedPromptCancellation),
-    /// Saved, holding the exclusive dispatch permit.
-    Ready(PreparedQueuedPrompt),
-    /// Dispatched; its commit receipt is pending.
-    InFlight(QueuedPromptCancellation),
-    /// Dispatch was cancelled; the runtime's rejection receipt makes it `Saved`.
-    Withdrawn(QueuedPromptCancellation),
-    /// Saved without a permit; reclaiming the attempt regains one.
-    Saved(QueuedPromptCancellation),
-    /// A reclaim for this saved attempt is running.
-    Reclaiming(QueuedPromptCancellation),
-    /// The journal lists the attempt but cannot resolve it yet.
-    Unresolved(QueuedPromptIdentity),
-    /// Outcome unknown; evidence is kept until the journal resolves it.
-    Recovery {
-        evidence: QueuedPromptRecovery,
-        cancellation: QueuedPromptCancellation,
-    },
-}
-
-impl RowState {
-    pub(super) fn identity(&self) -> Option<QueuedPromptIdentity> {
-        match self {
-            Self::Unsaved => None,
-            Self::Preparing(attempt)
-            | Self::InFlight(attempt)
-            | Self::Withdrawn(attempt)
-            | Self::Saved(attempt)
-            | Self::Reclaiming(attempt) => Some(attempt.identity()),
-            Self::Ready(permit) => Some(permit.identity()),
-            Self::Unresolved(identity) => Some(*identity),
-            Self::Recovery { evidence, .. } => Some(evidence.submission),
-        }
-    }
-
-    /// Dispatched or unresolved: only a receipt or the journal settles it.
-    pub(super) fn unsettled(&self) -> bool {
-        matches!(
-            self,
-            Self::InFlight(_) | Self::Unresolved(_) | Self::Recovery { .. }
-        )
-    }
-
-    /// Saved without live authority: a reclaim or journal scan releases it.
-    fn lacks_authority(&self) -> bool {
-        matches!(
-            self,
-            Self::Saved(_) | Self::Reclaiming(_) | Self::Unresolved(_) | Self::Recovery { .. }
-        )
-    }
-}
-
-impl QueuedInput {
-    /// Recovery evidence is read-only: only an authoritative reconciliation may
-    /// release this row for retry or record it as committed.
-    #[cfg(test)]
-    pub(super) fn recovery(&self) -> Option<&QueuedPromptRecovery> {
-        match &self.state {
-            RowState::Recovery { evidence, .. } => Some(evidence),
-            _ => None,
-        }
-    }
-
-    fn retain_recovery(&mut self, recovery: QueuedPromptRecovery) {
-        match &mut self.state {
-            RowState::Preparing(attempt)
-            | RowState::InFlight(attempt)
-            | RowState::Withdrawn(attempt) => {
-                let cancellation = attempt.clone();
-                self.state = RowState::Recovery {
-                    evidence: recovery,
-                    cancellation,
-                };
-            }
-            RowState::Recovery { evidence, .. } => {
-                // A late/less complete receipt must not erase accepted identities.
-                for append in recovery.appends {
-                    if !evidence.appends.contains(&append) {
-                        evidence.appends.push(append);
-                    }
-                }
-                if evidence.message.is_none() {
-                    evidence.message = recovery.message;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Refresh, but never resolve, uncertainty after the runtime has drained.
-    pub(super) fn refresh_recovery(&mut self) {
-        let RowState::Recovery { cancellation, .. } = &self.state else {
-            return;
-        };
-        if let Some(recovery) = cancellation.recovery() {
-            self.retain_recovery(recovery);
-        }
-    }
 }
 
 pub(super) struct QueueDelivery {
     pub(super) id: QueuedInputId,
     pub(super) generation: u64,
-    pub(super) prepared: PreparedQueuedPrompt,
+    pub(super) prompt: QueuedPrompt,
 }
 
-/// Register each UI queue snapshot atomically as one request-boundary batch.
+/// Register each UI queue snapshot as one request-boundary batch, in order.
 pub(super) async fn queue_dispatcher(
     session: SessionHandle,
     mut rx: mpsc::UnboundedReceiver<Vec<QueueDelivery>>,
     tx: mpsc::UnboundedSender<Work>,
 ) {
-    use futures_util::{StreamExt, stream::FuturesOrdered};
-    let mut pending = FuturesOrdered::new();
+    use futures_util::{StreamExt, stream::FuturesUnordered};
+    let mut pending = FuturesUnordered::new();
     let mut open = true;
     while open || !pending.is_empty() {
         tokio::select! {
@@ -154,35 +43,30 @@ pub(super) async fn queue_dispatcher(
                     while let Ok(more) = rx.try_recv() {
                         deliveries.extend(more);
                     }
-                    let session = session.clone();
-                    pending.push_back(async move {
-                        let ids: Vec<_> = deliveries.iter()
-                            .map(|input| (input.id, input.generation, input.prepared.identity()))
-                            .collect();
-                        let inputs = deliveries.into_iter().map(|input| input.prepared).collect();
-                        // Core promises one ordered receipt per permit.
-                        let results = session.enqueue_prepared_queued_prompts(inputs).await;
-                        let revision = session.observe().await.snapshot.revision;
-                        ids.into_iter().zip(results).map(|((id, generation, submission), result)| {
+                    let (ids, prompts): (Vec<_>, Vec<_>) = deliveries
+                        .into_iter()
+                        .map(|input| ((input.id, input.generation), input.prompt))
+                        .unzip();
+                    let receipts = session.enqueue_prompts(prompts).await;
+                    for ((id, generation), receipt) in ids.into_iter().zip(receipts) {
+                        let session = session.clone();
+                        pending.push(async move {
+                            let result = receipt.await.unwrap_or(Err(HarnessError::AgentStopped));
+                            let revision = session.observe().await.snapshot.revision;
                             Work::QueueCommitted {
-                                session: session.id(), id, generation, submission, revision,
-                                result,
+                                session: session.id(), id, generation, revision, result,
                             }
-                        }).collect::<Vec<_>>()
-                    });
+                        });
+                    }
                 }
                 None => open = false,
             },
             Some(work) = pending.next(), if !pending.is_empty() => {
-                for item in work {
-                    let _ = tx.send(item);
-                }
+                let _ = tx.send(work);
             }
         }
     }
 }
-
-// A draft identity only scopes UI state/notices; it never names a session directory.
 
 impl App {
     pub fn submit(&mut self, submission: Submission) {
@@ -193,7 +77,9 @@ impl App {
         self.advance_draft();
         let queued = self.queued_input(submission);
         if self.busy() || self.paused || !self.queue.is_empty() {
-            self.prepare_queue_input(queued);
+            self.queue.push_back(queued);
+            self.refresh_queue_menu();
+            self.deliver_queue();
             self.dirty = true;
             return;
         }
@@ -216,15 +102,6 @@ impl App {
         }
     }
     pub(super) fn send_input(&mut self, queued: QueuedInput) {
-        if self.queue_requires_recovery() || queued.state.unsettled() {
-            self.queue.push_back(queued);
-            self.paused = true;
-            self.refresh_queue_menu();
-            self.notice(
-                "Queued submission requires reconciliation before new input can be dispatched",
-            );
-            return;
-        }
         let Some(session) = self.session().cloned() else {
             if let Some(queued) = self.select_queued_model(queued) {
                 self.begin_session(PendingStart::Input(Box::new(queued)));
@@ -292,10 +169,9 @@ impl App {
     /// Withdraw every dispatched row that is still cancellable.
     pub(super) fn cancel_queue_delivery(&mut self) {
         for input in &mut self.queue {
-            if let RowState::InFlight(attempt) = &input.state
-                && attempt.cancel()
-            {
-                input.state = RowState::Withdrawn(attempt.clone());
+            if input.in_flight.as_ref().is_some_and(|row| row.cancel()) {
+                input.in_flight = None;
+                input.generation = input.generation.wrapping_add(1);
             }
         }
     }
@@ -308,48 +184,8 @@ impl App {
             *restore_paused = true;
         }
     }
-    pub(super) fn queue_requires_recovery(&self) -> bool {
-        self.queue.iter().any(|input| {
-            matches!(
-                input.state,
-                RowState::Unresolved(_) | RowState::Recovery { .. }
-            )
-        })
-    }
-
-    /// A dead dispatcher cannot provide a receipt. Rows it never claimed are
-    /// definitely safe to retry; claimed rows keep their evidence.
-    fn recover_closed_queue_dispatcher(&mut self) {
-        if !self
-            .queue_sender
-            .as_ref()
-            .is_some_and(|sender| sender.is_closed())
-        {
-            return;
-        }
-        self.queue_sender = None;
-        for input in &mut self.queue {
-            let (RowState::InFlight(attempt) | RowState::Withdrawn(attempt)) = &input.state else {
-                continue;
-            };
-            let attempt = attempt.clone();
-            match attempt.lost_receipt() {
-                QueuedPromptError::Rejected(_) => input.state = RowState::Saved(attempt),
-                QueuedPromptError::Indeterminate(recovery) => input.retain_recovery(*recovery),
-            }
-        }
-        self.paused = true;
-        if self.queue_requires_recovery() {
-            self.notice(
-                "Queued message outcome is unknown; reconciliation is required before retry",
-            );
-        } else {
-            self.notice("Could not deliver queued messages; resume to retry");
-        }
-    }
 
     pub(super) fn deliver_queue(&mut self) {
-        self.recover_closed_queue_dispatcher();
         // Lag recovery replaces the snapshot without replaying each event.
         for record in self.snapshot.records.values() {
             if observe_initial_input(&mut self.initial_input, record) {
@@ -359,14 +195,12 @@ impl App {
         if self.start.is_creating()
             || self.stopping
             || self.switching.is_some()
+            || self.paused
             || self.queue.is_empty()
         {
             return;
         }
         let Some(session) = self.session().cloned() else {
-            if self.paused {
-                return;
-            }
             // Retain the head across creation, then register the entire queue.
             let input = self.queue.pop_front().unwrap();
             self.refresh_queue_menu();
@@ -376,16 +210,31 @@ impl App {
             }
             return;
         };
-        // Rows are saved even while paused, so a paused queue survives reopen.
-        self.prepare_unbound_rows(&session);
-        if self.queue_requires_recovery() || self.queue_scan == QueueScan::Failed {
-            // A pending journal scan may still release these rows.
-            if !matches!(self.queue_scan, QueueScan::Running { .. }) {
-                self.paused = true;
-            }
+        if self.initial_input.is_some() {
             return;
         }
-        if self.paused || self.initial_input.is_some() {
+        let mut deliveries = Vec::new();
+        for input in self.queue.iter_mut().take_while(|input| !input.unknown) {
+            if input.in_flight.is_some() {
+                continue;
+            }
+            let cancellation = QueuedPromptCancellation::default();
+            input.generation = input.generation.wrapping_add(1);
+            input.in_flight = Some(cancellation.clone());
+            deliveries.push(QueueDelivery {
+                id: input.id,
+                generation: input.generation,
+                prompt: QueuedPrompt {
+                    text: input.submission.text.clone(),
+                    attachments: input.submission.attachments.clone(),
+                    options: PromptOptions {
+                        model: Some(input.model.clone()),
+                    },
+                    cancellation,
+                },
+            });
+        }
+        if deliveries.is_empty() {
             return;
         }
         let sender = self.queue_sender.get_or_insert_with(|| {
@@ -393,109 +242,65 @@ impl App {
             tokio::spawn(queue_dispatcher(session, rx, self.tx.clone()));
             tx
         });
-        // Dispatch the ready prefix only: a row still preparing or awaiting
-        // recovery keeps everything behind it in FIFO order.
-        let mut deliveries = Vec::new();
-        for input in &mut self.queue {
-            match std::mem::take(&mut input.state) {
-                RowState::Ready(prepared) => {
-                    input.generation = input.generation.wrapping_add(1);
-                    input.state = RowState::InFlight(prepared.cancellation_handle());
-                    deliveries.push(QueueDelivery {
-                        id: input.id,
-                        generation: input.generation,
-                        prepared,
-                    });
-                }
-                state @ RowState::InFlight(_) => input.state = state,
-                state => {
-                    input.state = state;
-                    break;
-                }
-            }
-        }
-        if deliveries.is_empty() {
-            return;
-        }
-        if let Err(mpsc::error::SendError(deliveries)) = sender.send(deliveries) {
-            // Send failure returns the permits before dispatch. Existing attempts
-            // on that same dead dispatcher still need their own claim check.
-            for delivery in deliveries {
-                if let Some(input) = self.queue.iter_mut().find(|input| input.id == delivery.id) {
-                    input.state = RowState::Ready(delivery.prepared);
-                }
-            }
-            self.recover_closed_queue_dispatcher();
+        if sender.send(deliveries).is_err() {
+            // Nothing reached the runtime: every row is waiting again.
+            self.queue_sender = None;
+            self.pause_queue();
+            self.notice("Could not deliver queued messages; resume to retry");
         }
     }
+    /// `current` is false for a receipt from the session this app switched
+    /// away from: its row could not be withdrawn, so it waited for this.
     pub(super) fn queue_committed(
         &mut self,
+        current: bool,
         id: QueuedInputId,
         generation: u64,
-        submission: QueuedPromptIdentity,
         revision: u64,
-        result: Result<QueuedPromptCommit, QueuedPromptError>,
+        result: Result<(), HarnessError>,
     ) {
-        // Editing, cancellation and retry invalidate old receipts; a removed
-        // row's attempt was already abandoned.
         let Some(index) = self.queue.iter().position(|input| {
-            input.id == id
-                && input.generation == generation
-                && input.state.identity() == Some(submission)
+            input.id == id && input.generation == generation && input.in_flight.is_some()
         }) else {
             return;
         };
         match result {
-            Ok(commit) => {
+            Ok(()) => {
                 let input = self.queue.remove(index).unwrap();
-                self.queue_activity_revision = self.queue_activity_revision.max(revision);
-                self.commit_row(&input);
-                if let Some(session) = self.session().cloned() {
-                    self.acknowledge_attempt(&session, commit.submission);
+                // A row the previous session committed is that session's history.
+                if current {
+                    self.queue_activity_revision = self.queue_activity_revision.max(revision);
+                    self.commit_row(&input);
                 }
             }
-            Err(QueuedPromptError::Rejected(error)) => {
-                let input = &mut self.queue[index];
-                match std::mem::take(&mut input.state) {
-                    // A withdrawn row expected exactly this rejection.
-                    RowState::Withdrawn(attempt) => input.state = RowState::Saved(attempt),
-                    RowState::InFlight(attempt) => {
-                        input.state = RowState::Saved(attempt);
-                        self.pause_queue();
-                        if self.queue_requires_recovery() {
-                            self.notice(format!(
-                                "Queued message was rejected: {error}. Other submissions require reconciliation before retry."
-                            ));
-                        } else {
-                            self.notice(format!(
-                                "Queued message was not submitted: {error}. Resume to retry."
-                            ));
-                        }
-                    }
-                    // A late rejection cannot discharge already retained uncertainty.
-                    state => input.state = state,
+            Err(error) => {
+                let unknown = matches!(
+                    error,
+                    HarnessError::Session(SessionError::AppendIndeterminate(_))
+                );
+                let row = &mut self.queue[index];
+                (row.in_flight, row.unknown) = (None, unknown);
+                self.pause_queue();
+                // A held-back row is reported by whatever held it back.
+                if matches!(error, HarnessError::Interrupted) {
+                    return self.refresh_queue_menu();
                 }
+                self.notice(if unknown {
+                    format!("Queued message may or may not have been submitted: {error}. Check the transcript, then edit or remove it from the queue.")
+                } else {
+                    format!("Queued message was not submitted: {error}. Resume to retry.")
+                });
             }
-            Err(QueuedPromptError::Indeterminate(recovery)) => self.retain_uncertain(
-                index,
-                *recovery,
-                "Queued message outcome is unknown; reconciliation is required before retry",
-            ),
         }
         self.refresh_queue_menu();
-    }
-    /// Keep a row's uncertain outcome as evidence, pause, and say why.
-    fn retain_uncertain(&mut self, index: usize, recovery: QueuedPromptRecovery, notice: &str) {
-        self.queue[index].retain_recovery(recovery);
-        self.pause_queue();
-        self.notice(notice);
     }
     pub(super) fn queued_input(&mut self, submission: Submission) -> QueuedInput {
         self.next_queued_id.0 += 1;
         QueuedInput {
             id: self.next_queued_id,
             generation: 0,
-            state: RowState::Unsaved,
+            in_flight: None,
+            unknown: false,
             submission,
             model: self.model.clone(),
         }
@@ -504,45 +309,32 @@ impl App {
         self.queue
             .iter()
             .map(|queued| {
+                let models = &self.launch.model.config().config().models;
                 Item::new(
                     queued.id,
                     crate::tui::format::brief(&queued.submission.text, 100),
-                    self.launch
-                        .model
-                        .config()
-                        .config()
-                        .models
-                        .get(&queued.model)
-                        .map_or(queued.model.as_str(), |profile| profile.model.as_str()),
+                    match models.get(&queued.model) {
+                        _ if queued.unknown => "outcome unknown",
+                        Some(profile) => profile.model.as_str(),
+                        None => queued.model.as_str(),
+                    },
                 )
             })
             .collect()
     }
-    /// Take a row back into the composer. Its saved attempt, if any, is
-    /// abandoned durably now; the edit becomes a fresh attempt.
+    /// Take a row out of the queue, withdrawing its dispatch if one is pending.
     pub(super) fn remove_queued(&mut self, id: QueuedInputId) -> Option<QueuedInput> {
         let index = self.queue.iter().position(|queued| queued.id == id)?;
-        let attempt = match &self.queue[index].state {
-            RowState::Unsaved => None,
-            RowState::Ready(permit) => Some(permit.cancellation_handle()),
-            RowState::Withdrawn(attempt)
-            | RowState::Saved(attempt)
-            | RowState::Reclaiming(attempt) => Some(attempt.clone()),
-            RowState::Preparing(attempt) | RowState::InFlight(attempt) if attempt.cancel() => {
-                Some(attempt.clone())
-            }
-            _ => {
-                self.notice(
-                    "This message cannot be edited or cancelled: its submission outcome is unresolved",
-                );
-                return None;
-            }
-        };
-        let mut input = self.queue.remove(index).unwrap();
-        input.state = RowState::Unsaved;
-        if let Some(attempt) = attempt {
-            self.abandon(attempt);
+        if self.queue[index]
+            .in_flight
+            .as_ref()
+            .is_some_and(|row| !row.cancel())
+        {
+            self.notice("This message is already being submitted");
+            return None;
         }
+        let mut input = self.queue.remove(index).unwrap();
+        input.in_flight = None;
         Some(input)
     }
     pub(super) fn refresh_queue_menu(&mut self) {
@@ -568,210 +360,285 @@ impl App {
 mod tests {
     use super::super::tests::*;
     use super::*;
-    use skyhook::agent::{HarnessError, QueuedPromptToken};
     use skyhook::identity::EventId;
+    use skyhook::provider::protocol::UserContent;
 
-    type Records = [skyhook::session::EventRecord];
     type Deliveries = mpsc::UnboundedReceiver<Vec<QueueDelivery>>;
 
-    fn commit(app: &App, submission: QueuedPromptIdentity) -> QueuedPromptCommit {
-        QueuedPromptCommit {
-            submission,
-            append: skyhook::session::AppendIdentity {
-                event: EventId::generate().unwrap(),
-                queue_attempt: Some(submission.attempt()),
-                session: app.session_id().unwrap(),
-                sequence: 42,
-            },
-        }
-    }
-
-    fn rejected() -> Result<QueuedPromptCommit, QueuedPromptError> {
-        Err(QueuedPromptError::Rejected(HarnessError::AgentStopped))
-    }
-
-    /// A fixture whose asynchronous queue work and dispatch the test applies
-    /// itself; a failing one rejects every provider turn deterministically.
-    async fn queue_fixture(
-        failing: bool,
-    ) -> (
-        tempfile::TempDir,
-        App,
-        mpsc::UnboundedReceiver<Work>,
-        Deliveries,
-    ) {
-        let (root, mut app) = if failing {
-            permanent_failure_fixture().await
-        } else {
-            fixture().await
-        };
-        let rx = capture_work(&mut app);
-        let deliveries = hold_dispatcher(&mut app);
-        (root, app, rx, deliveries)
-    }
-
-    /// Holding the receiver makes dispatch deterministic without invoking a provider.
-    fn hold_dispatcher(app: &mut App) -> Deliveries {
+    /// A busy fixture whose dispatches the test receives instead of a runtime.
+    async fn queue_fixture() -> (tempfile::TempDir, App, Deliveries) {
+        let (root, mut app) = fixture().await;
         let (tx, rx) = mpsc::unbounded_channel();
         app.queue_sender = Some(tx);
         app.operation = true;
-        rx
+        (root, app, rx)
     }
 
-    fn next_delivery(deliveries: &mut Deliveries) -> QueueDelivery {
-        deliveries.try_recv().unwrap().pop().unwrap()
-    }
-
-    /// Apply work until the condition holds. Nothing in these tests depends on
-    /// a provider turn; preparation and journal scans are the only producers.
-    async fn settle(
-        app: &mut App,
-        rx: &mut mpsc::UnboundedReceiver<Work>,
-        done: impl Fn(&App) -> bool,
-    ) {
-        while !done(app) {
-            let work = recv(rx).await;
-            app.work(work);
+    /// Every notice so far: journaled with a session, otherwise sent back as work.
+    async fn notices(app: &App, rx: &mut mpsc::UnboundedReceiver<Work>) -> Vec<String> {
+        app.status.flush().await;
+        let mut notices = Vec::new();
+        if let Some(session) = app.session() {
+            let records = session.observe().await.snapshot.records;
+            notices.extend(records.values().filter_map(|record| match &record.event {
+                SessionEvent::Status { message } => Some(message.clone()),
+                _ => None,
+            }));
         }
-    }
-
-    /// Poll the journal file until it satisfies the condition, applying any
-    /// work that arrives meanwhile. Reading the file directly never reserves
-    /// a permit, so it cannot race the app's own recovery or abandonment.
-    async fn journal_settles(
-        app: &mut App,
-        rx: &mut mpsc::UnboundedReceiver<Work>,
-        done: impl Fn(&Records) -> bool,
-    ) {
-        let (root, id) = (app.launch.sessions.clone(), app.session_id().unwrap());
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                while let Ok(work) = rx.try_recv() {
-                    app.work(work);
-                }
-                if done(&SessionStore::read_records(&root, id).await.unwrap()) {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        while let Ok(work) = rx.try_recv() {
+            if let Work::StatusFailed { message, .. } = work {
+                notices.push(message);
             }
-        })
-        .await
-        .expect("journal settled");
+        }
+        notices
     }
 
-    fn acknowledged(records: &Records, submission: QueuedPromptIdentity) -> bool {
-        records.iter().any(|record| {
-            matches!(record.event, SessionEvent::QueueAcknowledged { attempt } if attempt == submission.attempt())
-        })
-    }
-
-    fn in_flight(app: &App, index: usize) -> bool {
-        let state = app.queue.get(index).map(|input| &input.state);
-        matches!(state, Some(RowState::InFlight(_)))
-    }
-
-    fn scanning(app: &App) -> bool {
-        matches!(app.queue_scan, QueueScan::Running { .. })
-    }
-
-    fn text_of(prepared: &PreparedQueuedPrompt) -> &str {
-        match &prepared.content()[0] {
-            UserContent::Text { text } => text,
-            other => panic!("unexpected content {other:?}"),
+    fn image_row() -> Submission {
+        // The fixture's model does not support images: a claimed row that fails.
+        Submission {
+            text: "image".into(),
+            attachments: vec![png_attachment("image.png")],
         }
     }
 
-    fn ack(app: &mut App, result: Result<QueuedPromptCommit, QueuedPromptError>) {
-        let input = &app.queue[0];
+    fn texts(batch: &[QueueDelivery]) -> Vec<&str> {
+        batch.iter().map(|row| row.prompt.text.as_str()).collect()
+    }
+
+    fn receipt(app: &mut App, row: &QueueDelivery, result: Result<(), HarnessError>) {
         app.work(Work::QueueCommitted {
             session: app.session_id().unwrap(),
-            id: input.id,
-            generation: input.generation,
-            submission: input.state.identity().unwrap(),
-            revision: 42,
+            id: row.id,
+            generation: row.generation,
+            revision: app.snapshot.revision + 1,
             result,
         });
     }
 
     #[tokio::test]
-    async fn queue_delivery_is_immediate_while_busy_and_cancellation_rejects_stale_acks() {
-        let (_root, mut app, mut rx, mut deliveries) = queue_fixture(false).await;
-        let attachments = vec![png_attachment("pending.png")];
+    async fn busy_submissions_dispatch_in_order_and_leave_on_their_receipt() {
+        let (_root, mut app, mut deliveries) = queue_fixture().await;
         app.submit(Submission {
-            text: "pending".into(),
-            attachments,
+            text: "first".into(),
+            attachments: vec![png_attachment("first.png")],
         });
-        assert_eq!(app.queue.len(), 1);
-        assert!(app.history.is_empty());
-        assert!(matches!(app.queue[0].state, RowState::Preparing(_)));
-        assert!(app.busy());
-        settle(&mut app, &mut rx, |app| in_flight(app, 0)).await;
-        let first = next_delivery(&mut deliveries);
-        let (id, generation) = (app.queue[0].id, app.queue[0].generation);
-        let RowState::InFlight(token) = &app.queue[0].state else {
-            panic!("sent while busy");
-        };
-        let token = token.clone();
-        let submission = token.identity();
-        assert_eq!(first.prepared.identity(), submission);
-        assert_eq!(app.queue[0].state.identity(), Some(submission));
-        app.paused = true;
-        app.cancel_queue_delivery();
-        assert!(token.cancel());
-        assert!(matches!(app.queue[0].state, RowState::Withdrawn(_)));
-        app.queue_committed(id, generation, submission, 0, rejected());
-        assert_eq!(app.queue.len(), 1);
-        assert!(matches!(app.queue[0].state, RowState::Saved(_)));
-        // Resuming reclaims the same durable attempt instead of saving a copy.
-        drop(first);
-        app.paused = false;
-        app.deliver_queue();
-        assert!(matches!(app.queue[0].state, RowState::Reclaiming(_)));
-        assert!(!scanning(&app));
-        let resent = |app: &App| app.queue[0].generation > generation && in_flight(app, 0);
-        settle(&mut app, &mut rx, resent).await;
-        let second = next_delivery(&mut deliveries);
-        assert_eq!((second.id, second.prepared.identity()), (id, submission));
-        assert!(second.generation > 1);
-        assert_eq!(text_of(&second.prepared), "pending");
-        assert!(matches!(
-            second.prepared.content()[1],
-            UserContent::Attachment {
-                attachment: skyhook::media::AttachmentRef::Image(ref image),
-            } if image.file.as_deref() == Some("pending.png")
-        ));
-        // Exactly one saved attempt exists for the row, and it is reserved.
-        let rows = app
-            .session()
-            .unwrap()
-            .recover_queued_prompts()
-            .await
-            .unwrap();
-        assert!(
-            matches!(&rows[..], [row] if matches!(row.state, RecoveredQueuedPromptState::Unresolved))
-        );
-        app.queue_committed(id, generation, submission, 0, Ok(commit(&app, submission)));
-        assert_eq!(app.queue.len(), 1);
-        assert!(app.history.is_empty());
-        let edited = app.remove_queued(id).unwrap();
+        app.submit("second".into());
+        let first = deliveries.try_recv().unwrap();
+        let second = deliveries.try_recv().unwrap();
         assert_eq!(
-            edited.submission.attachments,
-            [png_attachment("pending.png")]
+            (texts(&first), texts(&second)),
+            (vec!["first"], vec!["second"])
         );
-        assert!(app.queue.is_empty());
+        assert_eq!(first[0].prompt.attachments, [png_attachment("first.png")]);
+        assert_eq!(first[0].prompt.options.model.as_deref(), Some("first"));
+        assert!(app.queue.iter().all(|input| input.in_flight.is_some()));
+        assert!(app.history.is_empty());
+
+        receipt(&mut app, &first[0], Ok(()));
+        assert_eq!(app.history, ["first"]);
+        assert_eq!(app.queue.len(), 1);
+        // A commit is not a turn completion, and an idle enqueue stays busy
+        // until the observed activity catches up.
+        assert!(app.operation);
+        app.operation = false;
+        receipt(&mut app, &second[0], Ok(()));
+        assert!(app.queue.is_empty() && app.busy());
+        app.snapshot.revision = app.queue_activity_revision;
+        assert!(!app.busy());
+    }
+
+    #[tokio::test]
+    async fn pause_withdraws_rows_and_resume_dispatches_them_as_one_batch() {
+        let (_root, mut app, mut deliveries) = queue_fixture().await;
+        app.submit("first".into());
+        app.submit("second".into());
+        let stale = deliveries.try_recv().unwrap();
+        deliveries.try_recv().unwrap();
+        app.pause_queue();
+        assert!(app.queue.iter().all(|input| input.in_flight.is_none()));
+        assert!(stale[0].prompt.cancellation.cancel());
+        // Neither outcome of a withdrawn dispatch touches the row.
+        receipt(&mut app, &stale[0], Ok(()));
+        receipt(&mut app, &stale[0], Err(HarnessError::Interrupted));
+        assert_eq!(app.queue.len(), 2);
+        app.tick();
+        assert!(deliveries.try_recv().is_err());
+
+        app.command(Command::Resume);
+        app.tick();
+        let batch = deliveries.try_recv().unwrap();
+        assert_eq!(texts(&batch), ["first", "second"]);
+        assert!(batch[0].generation > stale[0].generation);
+    }
+
+    #[tokio::test]
+    async fn failed_receipt_retains_the_row_and_pauses_the_rows_behind_it() {
+        let (_root, mut app) = fixture().await;
+        let mut rx = capture_work(&mut app);
+        app.paused = true;
+        app.submit(image_row());
+        app.submit("second".into());
+        app.submit("third".into());
+        app.command(Command::Resume);
+        app.tick();
+        // The runtime claims and fails the first row, then holds back the rest.
+        for _ in 0..3 {
+            let work = recv(&mut rx).await;
+            assert!(matches!(work, Work::QueueCommitted { .. }));
+            app.work(work);
+        }
+        assert!(app.paused && app.history.is_empty());
+        assert_eq!(app.queue.len(), 3);
+        assert!(app.queue.iter().all(|input| input.in_flight.is_none()));
+        let notices = notices(&app, &mut rx).await;
+        let failed = notices.iter().filter(|notice| notice.contains("Queued"));
+        assert_eq!(
+            failed.collect::<Vec<_>>(),
+            [
+                "Queued input resumed",
+                "Queued message was not submitted: model `fixture` does not support image inputs. Resume to retry.",
+            ]
+        );
         app.session().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn queue_waits_for_initial_input_and_commit_does_not_finish_original_operation() {
-        let (_root, mut app, mut rx, _deliveries) = queue_fixture(false).await;
+    async fn indeterminate_receipt_is_never_redispatched_and_blocks_the_rows_behind_it() {
+        let (_root, mut app, mut deliveries) = queue_fixture().await;
+        let mut rx = capture_work(&mut app);
+        app.submit("unknown".into());
+        app.submit("behind".into());
+        let unknown = deliveries.try_recv().unwrap();
+        let error = SessionError::AppendIndeterminate(skyhook::session::AppendRecovery {
+            identity: skyhook::session::AppendIdentity {
+                event: EventId::generate().unwrap(),
+                session: app.session_id().unwrap(),
+                sequence: 1,
+            },
+            reason: "lost".into(),
+        });
+        receipt(&mut app, &unknown[0], Err(HarnessError::Session(error)));
+        deliveries.try_recv().unwrap();
+        app.command(Command::Resume);
+        app.tick();
+        assert!(deliveries.try_recv().is_err());
+        assert!(
+            notices(&app, &mut rx)
+                .await
+                .iter()
+                .any(|notice| notice.contains("Check the transcript"))
+        );
+        // Only the user resolves it: removing the row releases the rows behind it.
+        let id = app.queue[0].id;
+        assert_eq!(app.remove_queued(id).unwrap().submission.text, "unknown");
+        app.tick();
+        assert_eq!(texts(&deliveries.try_recv().unwrap()), ["behind"]);
+    }
+
+    #[tokio::test]
+    async fn dead_dispatcher_returns_rows_to_waiting_and_resume_spawns_a_new_one() {
+        let (_root, mut app, deliveries) = queue_fixture().await;
+        let mut rx = capture_work(&mut app);
+        drop(deliveries);
+        app.submit("first".into());
+        assert!(app.paused && app.queue_sender.is_none());
+        assert!(app.queue[0].in_flight.is_none());
+        let notices = notices(&app, &mut rx).await;
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.starts_with("Could not deliver"))
+        );
+        app.command(Command::Resume);
+        app.tick();
+        // The new dispatcher reaches the runtime: the row commits.
+        let work = recv(&mut rx).await;
+        app.work(work);
+        assert!(app.queue.is_empty());
+        assert_eq!(app.history, ["first"]);
+        app.session().unwrap().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn switching_sessions_keeps_every_row_until_its_receipt_arrives() {
+        let (_root, mut app) = fixture().await;
+        let mut rx = capture_work(&mut app);
+        app.status = crate::tui::status::StatusLog::new(app.tx.clone());
+        app.operation = true;
+        app.submit("committed".into());
+        app.submit(image_row());
+        // Both rows are claimed, but neither receipt is seen before the switch.
+        let receipts = [recv(&mut rx).await, recv(&mut rx).await];
+        app.submit("unsent".into());
+        app.switch(None);
+        let ready = next_lifecycle(&mut rx).await;
+        assert!(matches!(ready, Work::SessionReady { result: Ok(None) }));
+        app.set_session(None);
+        assert!(app.paused);
+        let in_flight = app.queue.iter().map(|input| input.in_flight.is_some());
+        assert_eq!(in_flight.collect::<Vec<_>>(), [true, true, false]);
+
+        receipts.into_iter().for_each(|receipt| app.work(receipt));
+        // The old session's commit is not this session's history; its failure is retained.
+        assert!(app.history.is_empty() && app.paused);
+        let queued = app.queue.iter();
+        let queued =
+            queued.map(|input| (input.submission.text.as_str(), input.in_flight.is_some()));
+        assert_eq!(
+            queued.collect::<Vec<_>>(),
+            [("image", false), ("unsent", false)]
+        );
+        let notices = notices(&app, &mut rx).await;
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("was not submitted"))
+        );
+    }
+
+    #[tokio::test]
+    async fn editing_a_dispatched_row_withdraws_it_unless_it_is_already_being_submitted() {
+        let (_root, mut app, mut deliveries) = queue_fixture().await;
+        let mut rx = capture_work(&mut app);
+        app.submit("editable".into());
+        let editable = deliveries.try_recv().unwrap();
+        app.command(Command::Queue);
+        app.choose();
+        assert!(app.queue.is_empty() && app.paused);
+        assert_eq!(app.editor.text(), "editable");
+        assert!(editable[0].prompt.cancellation.cancel());
+
+        app.editor.set("draft".into());
+        app.command(Command::Resume);
+        app.submit("claimed".into());
+        let mut claimed = deliveries.try_recv().unwrap();
+        // The runtime claims an input exactly when cancellation can no longer win.
+        let prompt = claimed.pop().unwrap().prompt;
+        let session = app.session().unwrap().clone();
+        for receipt in session.enqueue_prompts(vec![prompt]).await {
+            receipt.await.unwrap().unwrap();
+        }
+        app.command(Command::Queue);
+        app.choose();
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.editor.text(), "draft");
+        let notices = notices(&app, &mut rx).await;
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("already being submitted"))
+        );
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_waits_for_the_initial_input_to_commit() {
+        let (_root, mut app, mut deliveries) = queue_fixture().await;
         let root = app.root_agent().clone();
         app.initial_input = Some((root.clone(), 0));
         app.submit("followup".into());
         app.tick();
-        assert!(!in_flight(&app, 0));
-        // The initial input commit releases follow-ups before its first request,
-        // including when that request first needs compaction.
+        assert!(deliveries.try_recv().is_err());
         let mut committed = app.snapshot.records.values().next_back().unwrap().clone();
         committed.sequence += 1;
         committed.id = EventId::generate().unwrap();
@@ -793,365 +660,10 @@ mod tests {
         app.initial_input = Some((root, 0));
         app.observe(ObservedEvent {
             revision: app.snapshot.revision + 1,
-            event: RuntimeEvent::Record(Box::new(committed.clone())),
+            event: RuntimeEvent::Record(Box::new(committed)),
         });
         assert!(app.initial_input.is_none());
-        assert!(!observe_initial_input(&mut app.initial_input, &committed));
-        settle(&mut app, &mut rx, |app| in_flight(app, 0)).await;
-        let input = &app.queue[0];
-        let RowState::InFlight(attempt) = &input.state else {
-            panic!("dispatched")
-        };
-        // This unit test synthesizes the ack rather than invoking a provider.
-        assert!(attempt.cancel());
-        let submission = attempt.identity();
-        app.work(Work::QueueCommitted {
-            session: app.session_id().unwrap(),
-            id: input.id,
-            generation: input.generation,
-            submission,
-            revision: app.snapshot.revision + 1,
-            result: Ok(commit(&app, submission)),
-        });
-        assert!(app.queue.is_empty());
-        assert_eq!(app.history, ["followup"]);
-        assert!(
-            app.operation,
-            "commit is not a turn-completion acknowledgement"
-        );
-        app.operation = false;
-        assert!(
-            app.busy(),
-            "wait for observation activity after an idle enqueue"
-        );
-        app.snapshot.revision = app.queue_activity_revision;
-        assert!(!app.busy());
-        app.session().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn queue_failure_retains_row_and_pauses_remaining_deliveries() {
-        let (_root, mut app, mut rx, _deliveries) = queue_fixture(false).await;
-        app.submit("first".into());
-        app.submit("second".into());
-        settle(&mut app, &mut rx, |app| {
-            in_flight(app, 0) && in_flight(app, 1)
-        })
-        .await;
-        let input = &app.queue[0];
-        let RowState::InFlight(attempt) = &input.state else {
-            panic!("dispatched")
-        };
-        assert!(attempt.cancel());
-        let submission = attempt.identity();
-        app.queue_committed(input.id, input.generation, submission, 0, rejected());
-        assert!(app.paused);
-        // The rejected row and the withdrawn one behind it both stay saved.
-        assert_eq!(app.queue.len(), 2);
-        assert!(matches!(app.queue[0].state, RowState::Saved(_)));
-        assert!(matches!(app.queue[1].state, RowState::Withdrawn(_)));
-        assert!(app.history.is_empty());
-
-        app.session().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn closed_dispatcher_before_claim_is_definite_rejection() {
-        let (_root, mut app, mut rx, deliveries) = queue_fixture(false).await;
-        app.submit("unsent".into());
-        settle(&mut app, &mut rx, |app| in_flight(app, 0)).await;
-        let submission = app.queue[0].state.identity().unwrap();
-        // Dropping the channel drops the undispatched permit with it.
-        drop(deliveries);
-        app.deliver_queue();
-        assert!(app.paused);
-        assert!(!app.queue_requires_recovery());
-        assert!(matches!(app.queue[0].state, RowState::Saved(_)));
-        assert!(app.history.is_empty());
-        let mut deliveries = hold_dispatcher(&mut app);
-        app.paused = false;
-        app.deliver_queue();
-        settle(&mut app, &mut rx, |app| in_flight(app, 0)).await;
-        let delivery = next_delivery(&mut deliveries);
-        assert_eq!(text_of(&delivery.prepared), "unsent");
-        assert_eq!(delivery.prepared.identity(), submission);
-        app.session().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn indeterminate_attempt_retains_evidence_and_blocks_edit_cancel_and_new_dispatch_until_reconciled()
-     {
-        let (_root, mut app, mut rx, mut deliveries) = queue_fixture(true).await;
-        app.submit("uncertain".into());
-        settle(&mut app, &mut rx, |app| in_flight(app, 0)).await;
-        let delivery = next_delivery(&mut deliveries);
-        let submission = delivery.prepared.identity();
-        let append = commit(&app, submission).append;
-        // Obtain the core-owned recovery state through the public observer; the
-        // test varies only the public receipt evidence, never its authority.
-        let observer = delivery.prepared.cancellation_handle();
-        let session = app.session().unwrap();
-        let enqueued = session
-            .enqueue_prepared_queued_prompts(vec![delivery.prepared])
-            .await;
-        assert!(enqueued[0].is_ok(), "{enqueued:?}");
-        let mut recovery = observer
-            .recovery()
-            .expect("the runtime claimed the submission");
-        recovery.appends = vec![append];
-        recovery.message = Some(append);
-        recovery.reason = "sync acknowledgement lost".into();
-        let indeterminate = |recovery| Err(QueuedPromptError::Indeterminate(Box::new(recovery)));
-        ack(&mut app, indeterminate(recovery.clone()));
-        assert!(app.queue_requires_recovery());
-        let (id, generation) = (app.queue[0].id, app.queue[0].generation);
-        app.paused = false; // Even a caller bypassing Resume's guard cannot enqueue.
-        app.deliver_queue();
-        assert!(app.paused);
-        assert!(app.remove_queued(id).is_none());
-        app.cancel_queue_delivery();
-        app.submit("later".into());
-        assert!(deliveries.try_recv().is_err());
-        assert_eq!(app.queue.len(), 2);
-        assert_eq!(app.queue[0].generation, generation);
-        assert_eq!(app.queue[0].submission.text, "uncertain");
-        let evidence = app.queue[0].recovery().unwrap();
-        assert_eq!(
-            (evidence.submission, &evidence.appends[..]),
-            (submission, &[append][..])
-        );
-        assert_eq!(evidence.message, Some(append));
-        assert_eq!(evidence.reason, "sync acknowledgement lost");
-        recovery.appends.clear();
-        recovery.message = None;
-        recovery.reason = "less complete late receipt".into();
-        ack(&mut app, indeterminate(recovery));
-        let evidence = app.queue[0].recovery().unwrap();
-        assert_eq!(
-            (&evidence.appends[..], evidence.message),
-            (&[append][..], Some(append))
-        );
-        assert!(app.history.is_empty());
-        // A contradictory late rejection is not reconciliation authority.
-        ack(&mut app, rejected());
-        assert!(app.queue_requires_recovery());
-        // Resume reconciles through the journal, which holds the real commit.
-        app.command(Command::Resume);
-        assert!(scanning(&app));
-        settle(&mut app, &mut rx, |app| !scanning(app)).await;
-        assert!(!app.queue_requires_recovery());
-        assert_eq!(app.history, ["uncertain"]);
-        assert_eq!(app.queue.len(), 1);
-        assert_eq!(app.queue[0].submission.text, "later");
-        app.session().unwrap().shutdown().await.unwrap();
-    }
-
-    /// An unresolved row no longer traps the user: it stays saved in the old
-    /// session's journal and the reopened session offers it again.
-    #[tokio::test]
-    async fn switching_away_keeps_unresolved_rows_saved_for_reopen() {
-        let (_root, mut app, mut rx, mut deliveries) = queue_fixture(false).await;
-        app.submit("unresolved".into());
-        settle(&mut app, &mut rx, |app| in_flight(app, 0)).await;
-        let delivery = next_delivery(&mut deliveries);
-        let submission = delivery.prepared.identity();
-        let recovery = QueuedPromptRecovery {
-            submission,
-            appends: vec![],
-            message: None,
-            reason: "receipt lost".into(),
-        };
-        ack(
-            &mut app,
-            Err(QueuedPromptError::Indeterminate(Box::new(recovery))),
-        );
-        assert!(app.queue_requires_recovery());
-        drop(delivery);
-        let id = app.session_id().unwrap();
-        app.switch(None);
-        assert!(app.switching.is_some(), "the switch proceeds");
-        let work = next_lifecycle(&mut rx).await;
-        assert!(matches!(work, Work::SessionReady { result: Ok(None) }));
-        app.set_session(None);
-        assert!(app.queue.is_empty());
-        let resumed = reopen(&app, id).await;
-        app.set_session(Some(PreparedObservation::subscribe(resumed).await));
-        assert_eq!(app.queue.len(), 1);
-        assert_eq!(app.queue[0].submission.text, "unresolved");
-        let state = &app.queue[0].state;
-        assert!(matches!(state, RowState::Ready(permit) if permit.identity() == submission));
-        app.session().unwrap().shutdown().await.unwrap();
-    }
-
-    /// Lag recovery must not treat a row removed while its abandon is still in
-    /// flight as a journal row the queue forgot.
-    #[tokio::test]
-    async fn lag_resubscribe_does_not_restore_a_row_whose_abandon_is_in_flight() {
-        let (_root, mut app, mut rx, mut deliveries) = queue_fixture(false).await;
-        app.submit("removed".into());
-        settle(&mut app, &mut rx, |app| in_flight(app, 0)).await;
-        // The dispatcher still holds the permit, so the journal cannot resolve it.
-        let held = next_delivery(&mut deliveries);
-        // Removal cancels the dispatch; the abandon it starts has not landed yet.
-        let removed = app.queue.pop_front().unwrap();
-        let RowState::InFlight(attempt) = removed.state else {
-            panic!("dispatched")
-        };
-        assert!(attempt.cancel());
-        app.resubscribe().await;
-        assert!(app.queue.is_empty(), "the removed row was restored");
-        let session = app.session().cloned().unwrap();
-        session.abandon_queued_prompt(&attempt).await.unwrap();
-        drop(held);
-        let retired = |records: &Records| acknowledged(records, attempt.identity());
-        journal_settles(&mut app, &mut rx, retired).await;
-        assert!(app.queue.is_empty());
-        session.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn lost_claimed_dispatcher_receipt_retains_accepted_user_identity_until_reconciled() {
-        let (_root, mut app, mut rx, mut deliveries) = queue_fixture(true).await;
-        app.submit("claimed with lost receipt".into());
-        settle(&mut app, &mut rx, |app| in_flight(app, 0)).await;
-        let delivery = next_delivery(&mut deliveries);
-        let cancellation = delivery.prepared.cancellation_handle();
-        let session = app.session().unwrap();
-        let committed = session
-            .enqueue_prepared_queued_prompts(vec![delivery.prepared])
-            .await;
-        let committed = committed.into_iter().next().unwrap().unwrap();
-        assert!(cancellation.is_claimed());
-        // Simulate the dispatcher exiting after core claim/acceptance but before
-        // publishing Work. The UI cannot use the receipt held by this test.
-        drop(deliveries);
-        app.deliver_queue();
-        assert!(app.queue_requires_recovery());
-        app.queue[0].refresh_recovery();
-        let recovery = app.queue[0].recovery().unwrap();
-        assert_eq!(recovery.submission, committed.submission);
-        assert!(recovery.appends.contains(&committed.append));
-        assert_eq!(recovery.message, Some(committed.append));
-        assert!(app.history.is_empty());
-        // The journal, not the lost receipt, proves the commit on Resume.
-        app.command(Command::Resume);
-        settle(&mut app, &mut rx, |app| !scanning(app)).await;
-        assert_eq!(app.history, ["claimed with lost receipt"]);
-        assert!(app.queue.is_empty());
-        let retired = |records: &Records| acknowledged(records, committed.submission);
-        journal_settles(&mut app, &mut rx, retired).await;
-        app.session().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn reopened_session_restores_saved_drafts_and_acknowledges_committed_rows() {
-        let (_root, mut app, mut rx, mut deliveries) = queue_fixture(false).await;
-        let attachments = vec![png_attachment("draft.png")];
-        let text = "saved draft".into();
-        app.submit(Submission { text, attachments });
-        settle(&mut app, &mut rx, |app| in_flight(app, 0)).await;
-        let held = next_delivery(&mut deliveries);
-        let draft = held.prepared.identity();
-        let session = app.session().cloned().unwrap();
-        // A row committed by core whose client acknowledgement never happened.
-        let options = skyhook::agent::PromptOptions {
-            model: Some("first".into()),
-        };
-        let prompt = skyhook::agent::QueuedPrompt {
-            text: "committed row".into(),
-            attachments: vec![],
-            options,
-            token: QueuedPromptToken::new().unwrap(),
-        };
-        let prepared = session.prepare_queued_prompt(prompt).await.unwrap();
-        let committed = session
-            .enqueue_prepared_queued_prompts(vec![prepared])
-            .await;
-        let committed = committed.into_iter().next().unwrap().unwrap();
-        drop(held);
-        let id = session.id();
-        app.set_session(None);
-        session.shutdown().await.unwrap();
-        drop(session);
-        let resumed = reopen(&app, id).await;
-        app.set_session(Some(PreparedObservation::subscribe(resumed).await));
-        assert!(app.paused);
-        assert_eq!(app.queue.len(), 1);
-        let row = &app.queue[0];
-        assert_eq!(row.submission.text, "saved draft");
-        assert_eq!(row.submission.attachments, [png_attachment("draft.png")]);
-        assert_eq!(row.model, "first");
-        assert!(matches!(&row.state, RowState::Ready(permit) if permit.identity() == draft));
-        assert!(app.history.is_empty());
-        // The committed row is retired durably; the saved draft stays reserved.
-        assert_ne!(committed.submission, draft);
-        journal_settles(&mut app, &mut rx, |records| {
-            acknowledged(records, committed.submission) && !acknowledged(records, draft)
-        })
-        .await;
-        let mut deliveries = hold_dispatcher(&mut app);
-        app.command(Command::Resume);
         app.tick();
-        let delivery = next_delivery(&mut deliveries);
-        assert_eq!(delivery.prepared.identity(), draft);
-        assert_eq!(text_of(&delivery.prepared), "saved draft");
-        app.session().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn editing_or_cancelling_a_saved_row_abandons_its_attempt() {
-        let (_root, mut app, mut rx, mut deliveries) = queue_fixture(false).await;
-        app.submit("edit me".into());
-        settle(&mut app, &mut rx, |app| in_flight(app, 0)).await;
-        let delivery = next_delivery(&mut deliveries);
-        let (id, first) = (delivery.id, delivery.prepared.identity());
-        ack(&mut app, rejected());
-        drop(delivery);
-        let edited = app.remove_queued(id).unwrap();
-        assert_eq!(edited.submission.text, "edit me");
-        assert!(matches!(edited.state, RowState::Unsaved));
-        journal_settles(&mut app, &mut rx, |records| acknowledged(records, first)).await;
-        // Cancelling during preparation discards the permit once it arrives.
-        app.paused = false;
-        app.submit("cancel me".into());
-        let id = app.queue[0].id;
-        let RowState::Preparing(cancellation) = &app.queue[0].state else {
-            panic!("preparing")
-        };
-        let second = cancellation.identity();
-        assert!(app.remove_queued(id).is_some());
-        assert!(app.queue.is_empty());
-        journal_settles(&mut app, &mut rx, |records| {
-            // Either the intent was never written or it was abandoned durably.
-            let attempt = Some(second.attempt());
-            !records.iter().any(|record| record.queue_attempt == attempt)
-                || acknowledged(records, second)
-        })
-        .await;
-        let (root, session) = (&app.launch.sessions, app.session_id().unwrap());
-        let records = SessionStore::read_records(root, session).await.unwrap();
-        let mut events = records.iter().map(|record| &record.event);
-        assert!(!events.any(|event| matches!(event, SessionEvent::MessageCommitted { .. })));
-        assert!(deliveries.try_recv().is_err());
-        app.session().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn paused_rows_are_saved_and_a_removed_dispatch_is_abandoned_at_once() {
-        let (_root, mut app, mut rx, mut deliveries) = queue_fixture(false).await;
-        app.paused = true;
-        app.submit("while paused".into());
-        let ready = |app: &App| matches!(app.queue[0].state, RowState::Ready(_));
-        settle(&mut app, &mut rx, ready).await;
-        let saved = app.queue[0].state.identity().unwrap();
-        app.paused = false;
-        app.deliver_queue();
-        assert!(in_flight(&app, 0));
-        let _held = deliveries.try_recv().unwrap();
-        // Abandoned on removal rather than on a receipt, so an immediate
-        // shutdown cannot bring the message back on reopen.
-        assert!(app.remove_queued(app.queue[0].id).is_some());
-        journal_settles(&mut app, &mut rx, |records| acknowledged(records, saved)).await;
-        app.session().unwrap().shutdown().await.unwrap();
+        assert_eq!(texts(&deliveries.try_recv().unwrap()), ["followup"]);
     }
 }

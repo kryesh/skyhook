@@ -265,16 +265,22 @@ impl JobManager {
         launches
     }
 
-    pub(crate) async fn metadata(&self, id: JobId) -> Result<JobEnvelope, JobError> {
+    /// Read from job `id`'s entry under the jobs lock.
+    pub(super) async fn entry<T>(
+        &self,
+        id: JobId,
+        read: impl FnOnce(&JobEntry) -> T,
+    ) -> Result<T, JobError> {
         let jobs = self.inner.jobs.lock().await;
-        Ok(jobs.get(&id).ok_or(JobError::Unknown(id))?.metadata(id))
+        jobs.get(&id).map(read).ok_or(JobError::Unknown(id))
+    }
+
+    pub(crate) async fn metadata(&self, id: JobId) -> Result<JobEnvelope, JobError> {
+        self.entry(id, |entry| entry.metadata(id)).await
     }
 
     pub async fn snapshot(&self, id: JobId) -> Result<JobEnvelope, JobError> {
-        let mut envelope = {
-            let jobs = self.inner.jobs.lock().await;
-            jobs.get(&id).ok_or(JobError::Unknown(id))?.envelope(id)
-        };
+        let mut envelope = self.entry(id, |entry| entry.envelope(id)).await?;
         self.hydrate_envelope(&mut envelope).await?;
         Ok(envelope)
     }
@@ -283,23 +289,11 @@ impl JobManager {
         &self,
         id: JobId,
     ) -> Result<CancellationToken, JobError> {
-        self.inner
-            .jobs
-            .lock()
-            .await
-            .get(&id)
-            .map(|entry| entry.cancellation.clone())
-            .ok_or(JobError::Unknown(id))
+        self.entry(id, |entry| entry.cancellation.clone()).await
     }
 
     pub(crate) async fn authorization_scope(&self, id: JobId) -> Result<Option<u64>, JobError> {
-        self.inner
-            .jobs
-            .lock()
-            .await
-            .get(&id)
-            .map(|entry| entry.authorization_scope)
-            .ok_or(JobError::Unknown(id))
+        self.entry(id, |entry| entry.authorization_scope).await
     }
 
     pub async fn list(&self, owner: &AgentId) -> Vec<JobEnvelope> {
@@ -427,23 +421,11 @@ impl JobManager {
     }
 
     pub async fn is_background(&self, id: JobId) -> Result<bool, JobError> {
-        self.inner
-            .jobs
-            .lock()
-            .await
-            .get(&id)
-            .map(|entry| entry.background)
-            .ok_or(JobError::Unknown(id))
+        self.entry(id, |entry| entry.background).await
     }
 
     pub async fn images(&self, id: JobId) -> Result<Vec<ImageRef>, JobError> {
-        self.inner
-            .jobs
-            .lock()
-            .await
-            .get(&id)
-            .map(|entry| entry.images.clone())
-            .ok_or(JobError::Unknown(id))
+        self.entry(id, |entry| entry.images.clone()).await
     }
 }
 

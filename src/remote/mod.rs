@@ -2,33 +2,32 @@
 
 mod artifact;
 pub(crate) mod backend;
-pub mod backends;
 mod client;
 mod error;
 mod manager;
 mod prompt;
 mod protocol;
 mod service;
-pub use backends::ssh;
-pub(crate) use backends::ssh::AskpassServer;
+pub mod ssh;
 mod transport;
 pub mod worker;
 
 pub use artifact::{ArtifactError, EmbeddedShim, EmbeddedShimCatalog};
 #[cfg(test)]
 pub(crate) use backend::{ConnectionFactory, ConnectionRequest};
-#[cfg(test)]
-pub(crate) use client::test_transport;
 pub use manager::RemoteError;
+#[cfg(test)]
+pub(crate) use manager::tests::PendingHandshakeFactory;
 pub(crate) use manager::{PreparedConnection, RemoteManager};
 pub use prompt::{
     RejectSensitivePrompts, SecretValue, SensitivePrompt, SensitivePromptError,
     SensitivePromptFuture, SensitivePromptHandler, SensitivePromptKind,
 };
+pub(crate) use ssh::AskpassServer;
 
 pub fn run_askpass_helper(
     socket: &std::path::Path,
     prompt: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    backends::ssh::run_askpass_helper(socket, prompt)
+    ssh::run_askpass_helper(socket, prompt)
 }

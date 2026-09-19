@@ -32,16 +32,3 @@ write authorization without requiring SSH:
 ```sh
 cargo nextest run tool::builtins::skill_transfer::tests
 ```
-
-The disposable loopback SSH integration verifies direct and native-jump connections,
-shim-owned nested connections, shared SSH authentication, and duplex stream transfer.
-Run it on Linux with `sshd`, `ssh-keygen`, and a locally built `linux-ssh` shim; it does
-not use configured lab targets. This native, shim-only build does not require Zig or extra
-Rust musl targets:
-
-```sh
-cargo build --bin linux-ssh --features shim-bin
-SKYHOOK_TEST_SHIM="$PWD/target/debug/linux-ssh" \
-  cargo nextest run --run-ignored only \
-  native_jumps_and_shim_owned_connections_share_a_lazy_central_agent --no-capture
-```

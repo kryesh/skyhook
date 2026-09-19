@@ -137,15 +137,13 @@ pub(super) fn render_row_line(
             column = row
                 .layout
                 .code()
-                .map_or(prefix_width + source_prefix_width, |code| {
-                    code.indent() + code.padding()
-                });
+                .map_or(prefix_width + source_prefix_width, |code| code.body_start());
         }
         let size = grapheme.symbol.width();
         let in_prefix = byte < source_prefix;
         let prefix_clipped = in_prefix && column + size > prefix_width + source_prefix_width;
         let body_end = row.layout.code().map_or(area.width as usize, |code| {
-            (code.indent() + code.width() - code.padding()).min(area.width as usize)
+            code.body_end().min(area.width as usize)
         });
         if !in_prefix && column + size > body_end {
             break;
@@ -337,17 +335,7 @@ mod tests {
         };
         let mut cache = HighlightCache::default();
         let pending = markdown_rows(&input, 80, Some(&cache));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while {
-            cache.prepare(std::iter::once(&document));
-            !cache.is_fully_highlighted(&document)
-        } {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "highlight worker did not finish"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        cache.wait(&document);
         let highlighted = markdown_rows(&input, 80, Some(&cache));
         assert_eq!(copy_rows(&pending), copy_rows(&highlighted));
         let layouts = |rows: &[Row]| {

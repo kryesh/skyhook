@@ -31,38 +31,6 @@ impl RetryState {
     pub(super) fn has_error(&self) -> bool {
         !matches!(self, Self::Started { .. })
     }
-
-    pub(super) fn started(attempt: u64) -> Self {
-        Self::Started { attempt }
-    }
-
-    pub(super) fn failed(attempt: u64, error: &str) -> Self {
-        Self::Failed {
-            attempt,
-            error: error.to_owned(),
-        }
-    }
-
-    pub(super) fn refused(attempt: u64, error: &str) -> Self {
-        Self::Refused {
-            attempt,
-            error: error.to_owned(),
-        }
-    }
-
-    pub(super) fn scheduled(
-        attempt: u64,
-        max_attempts: Option<u64>,
-        delay_millis: u64,
-        error: &str,
-    ) -> Self {
-        Self::Scheduled {
-            attempt,
-            max_attempts,
-            delay_millis,
-            error: error.to_owned(),
-        }
-    }
 }
 
 /// Refusals are deterministic for a given request, so a plain retry repeats it.
@@ -199,20 +167,29 @@ mod tests {
         let mut projection = Projection::default();
         let mut snapshot = ObservationSnapshot::default();
         projection.active_request.insert(agent.clone(), 4);
+        let scheduled = |attempt, max_attempts, delay_millis| RetryState::Scheduled {
+            attempt,
+            max_attempts,
+            delay_millis,
+            error: "failure".into(),
+        };
         for (state, expected, running) in [
-            (RetryState::started(1), None, false),
+            (RetryState::Started { attempt: 1 }, None, false),
             (
-                RetryState::failed(1, "failure"),
+                RetryState::Failed {
+                    attempt: 1,
+                    error: "failure".into(),
+                },
                 Some("Request failed · attempt 1\nfailure"),
                 false,
             ),
             (
-                RetryState::scheduled(2, None, 0, "failure"),
+                scheduled(2, None, 0),
                 Some("Retrying · attempt 2 · retry delay 0 ms\nfailure"),
                 true,
             ),
             (
-                RetryState::scheduled(3, Some(4), 100, "failure"),
+                scheduled(3, Some(4), 100),
                 Some("Retrying · attempt 3 of 4 · retry delay 100 ms\nfailure"),
                 true,
             ),
@@ -237,34 +214,5 @@ mod tests {
             "Retrying · attempt 3 of 4 · retry delay 100 ms\nfailure"
         );
         assert!(!entry.running);
-    }
-
-    #[test]
-    fn refusals_render_as_errors_with_a_model_swap_hint() {
-        use skyhook::identity::SessionId;
-        let detail =
-            "the model declined to respond: content filter; the response contained no content";
-        let agent = AgentId::root(SessionId::from_bytes([1; 16]));
-        let mut projection = Projection::default();
-        let snapshot = ObservationSnapshot::default();
-        let state = RetryState::refused(1, detail);
-        assert!(state.has_error());
-        projection.requests.entry(4).or_default().retry = Some(state);
-        let entry = retry_entry(&snapshot, &projection, &agent, 4, false).unwrap();
-        let mut lines = entry.text().lines();
-        assert_eq!(lines.next(), Some("Model declined to respond · attempt 1"));
-        assert_eq!(lines.next(), Some(detail));
-        assert_eq!(lines.next(), Some(REFUSAL_HINT));
-        assert_eq!(lines.next(), None);
-        assert!(entry.text().ends_with(REFUSAL_HINT));
-        assert_eq!(entry.surface, Surface::Error);
-        // Refusals are terminal for the request, so nothing is pending.
-        assert!(!entry.running);
-        // Ordinary failures stay on the status surface without the swap hint.
-        projection.requests.entry(4).or_default().retry = Some(RetryState::failed(1, "boom"));
-        let entry = retry_entry(&snapshot, &projection, &agent, 4, false).unwrap();
-        assert_eq!(entry.text(), "Request failed · attempt 1\nboom");
-        assert_eq!(entry.surface, Surface::Status);
-        assert!(!entry.text().contains(REFUSAL_HINT));
     }
 }

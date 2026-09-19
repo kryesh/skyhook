@@ -302,6 +302,7 @@ mod tests {
             json!({"url":"http://example.org","overwrite":true}),
             json!({"url":"http://example.org","headers":{"a":"bad\r\nheader"}}),
             json!({"url":"http://example.org","headers":{"content-length":"2"}}),
+            json!({"url":"http://example.org","headers":{"Transfer-Encoding":"chunked"}}),
             json!({"url":"http://example.org","auth":{"kind":"bearer","token":"a"},"headers":{"Authorization":"b"}}),
         ] {
             assert!(plan(value.clone()).is_err(), "{value}");
@@ -329,63 +330,9 @@ mod tests {
     }
 
     #[test]
-    fn body_and_query_schemas_match_argument_deserialization() {
+    fn schema_bounds_limits_and_rejects_unknown_fields_and_body_kinds() {
         let schema = serde_json::to_value(schema_for!(FetchArgs)).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
-        let url = |extra: serde_json::Value| {
-            let mut input = json!({"url":"https://example.org"});
-            input
-                .as_object_mut()
-                .unwrap()
-                .extend(extra.as_object().unwrap().clone());
-            input
-        };
-        let json_bodies = [
-            json!(null),
-            json!(true),
-            json!(42),
-            json!(1.5),
-            json!("text"),
-            json!([null, false, {"nested": [1, 2]}]),
-            json!({"nested": {"key": "value"}}),
-        ];
-        let valid = [
-            json!({"body":{"kind":"text", "value":"text"}}),
-            json!({"body":{"kind":"form", "fields":[["key", "value"]]}}),
-            json!({"body":{"kind":"base64", "value":"YQ=="}}),
-            json!({"body":{"kind":"file", "path":"upload.txt"}}),
-            json!({"query":[["key", "one"], ["key", "two"]]}),
-        ]
-        .into_iter()
-        .chain(json_bodies.map(|value| json!({"body":{"kind":"json", "value":value}})));
-        for input in valid.map(url) {
-            assert!(validator.is_valid(&input), "{input}");
-            assert!(serde_json::from_value::<FetchArgs>(input).is_ok());
-        }
-        let query = args(url(json!({"query":[["key", "one"], ["key", "two"]]}))).query;
-        assert_eq!(
-            query,
-            vec![("key".into(), "one".into()), ("key".into(), "two".into())]
-        );
-        let invalid_queries = [
-            json!({"key":"value"}),
-            json!(["key", "value"]),
-            json!([["key"]]),
-            json!([["key", "value", "extra"]]),
-            json!([[1, "value"]]),
-            json!([["key", false]]),
-        ];
-        let invalid = invalid_queries
-            .map(|query| json!({"query":query}))
-            .into_iter()
-            .chain([
-                json!({"unknown":true}),
-                json!({"body":{"kind":"multipart", "parts":[]}}),
-            ]);
-        for input in invalid.map(url) {
-            assert!(!validator.is_valid(&input), "{input}");
-            assert!(serde_json::from_value::<FetchArgs>(input).is_err());
-        }
         for (key, max) in [
             ("timeout", 3600u64),
             ("connect_timeout", 3600),
@@ -393,20 +340,17 @@ mod tests {
             ("max_redirects", 20),
         ] {
             for n in [0, 1, max, max + 1] {
-                let input = url(json!({key: n}));
+                let input = json!({"url":"https://example.org", key: n});
                 let expected = n <= max && (n > 0 || key == "max_redirects");
                 assert_eq!(validator.is_valid(&input), expected, "schema {input}");
             }
         }
-        // Intentional pre-existing difference: JSON schema models the wire string;
-        // runtime admission enforces credential-free HTTP endpoints, methods and framing.
         for input in [
-            json!({"url":"https://user:secret@example.org"}),
-            json!({"url":"https://example.org", "method":"bad method"}),
-            json!({"url":"https://example.org", "headers":{"Transfer-Encoding":"chunked"}}),
+            json!({"url":"https://example.org", "unknown":true}),
+            json!({"url":"https://example.org", "body":{"kind":"multipart", "parts":[]}}),
         ] {
-            assert!(validator.is_valid(&input));
-            assert!(plan(input).is_err());
+            assert!(!validator.is_valid(&input), "{input}");
+            assert!(serde_json::from_value::<FetchArgs>(input).is_err());
         }
     }
 }

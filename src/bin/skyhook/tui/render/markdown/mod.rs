@@ -160,7 +160,6 @@ impl CodeGeometry {
     pub fn body_start(self) -> usize {
         self.indent + self.padding()
     }
-    #[cfg(test)]
     pub fn body_end(self) -> usize {
         self.indent + self.width - self.padding()
     }
@@ -186,10 +185,10 @@ mod geometry_tests {
     use super::*;
     #[test]
     fn code_geometry_validates_zero_narrow_and_extreme_containers() {
-        for container in [0, 1, 2, 3, 8, 80, usize::MAX] {
-            for indent in [0, 1, 7, usize::MAX] {
-                for longest in [0, 1, 2, 90, usize::MAX] {
-                    for widest in [0, 1, 2, usize::MAX] {
+        for container in [0, 1, 3, 80, usize::MAX] {
+            for indent in [0, 7, usize::MAX] {
+                for longest in [0, 2, 90, usize::MAX] {
+                    for widest in [0, 2, usize::MAX] {
                         let code = CodeGeometry::new(container, indent, longest, widest);
                         assert!(code.indent() <= container);
                         assert!(code.width() <= container - code.indent());

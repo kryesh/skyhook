@@ -41,18 +41,9 @@ pub(crate) async fn open(
     command.process_group(0);
     let mut child = command.spawn().map_err(RemoteError::start)?;
     let process_group = child.id().and_then(|id| i32::try_from(id).ok());
-    let input = child
-        .stdin
-        .take()
-        .ok_or(RemoteError::MissingPipe("stdin"))?;
-    let output = child
-        .stdout
-        .take()
-        .ok_or(RemoteError::MissingPipe("stdout"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or(RemoteError::MissingPipe("stderr"))?;
+    let input = child.stdin.take().expect("stdin was requested as a pipe");
+    let output = child.stdout.take().expect("stdout was requested as a pipe");
+    let mut stderr = child.stderr.take().expect("stderr was requested as a pipe");
     let cancellation = tokio_util::sync::CancellationToken::new();
     let cancelled = cancellation.clone();
     let (sender, completion) = tokio::sync::oneshot::channel();
@@ -121,18 +112,21 @@ impl SshLauncher {
     ) -> Result<Transport, RemoteError> {
         let probe = self.output("uname -s; uname -m", &[]).await?;
         let mut lines = probe.lines();
-        let os = lines.next().ok_or(RemoteError::InvalidProbe)?.trim();
-        let arch = lines.next().ok_or(RemoteError::InvalidProbe)?.trim();
+        let (Some(os), Some(arch)) = (lines.next(), lines.next()) else {
+            return Err(RemoteError::Deployment(
+                "platform probe returned invalid output".into(),
+            ));
+        };
         let shim = catalog.find("ssh", arch, os).ok_or_else(|| {
-            if catalog.is_empty() {
-                RemoteError::MissingShims
+            RemoteError::Deployment(if catalog.is_empty() {
+                "this Skyhook build contains no remote shims (SSH targets are unavailable)".into()
             } else {
-                RemoteError::UnsupportedPlatform {
-                    protocol: "ssh".into(),
-                    arch: arch.into(),
-                    os: os.into(),
-                }
-            }
+                format!(
+                    "no ssh shim is embedded for remote platform {}-{}",
+                    os.trim(),
+                    arch.trim()
+                )
+            })
         })?;
         let hash = shim.sha256();
         let path = format!(".cache/skyhook/shims/{hash}/{}", shim.installed_name());

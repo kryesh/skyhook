@@ -1,17 +1,13 @@
 //! Anthropic Messages request encoding.
-use super::super::common::{anthropic_image, attachment_text, invalid, opaque_payload, tool_text};
+use super::super::common::{anthropic_image, invalid, opaque_payload, tool_text, user_parts};
 use super::native::validate_thinking;
-use crate::media::AttachmentRef;
 use crate::provider::{
     ProviderError,
-    protocol::{BlockContent, HistoryLifetime, Message, ModelRequest, UserContent},
+    protocol::{BlockContent, HistoryLifetime, Message, ModelRequest},
 };
 use serde_json::{Value, json};
 
 pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
-    if request.model.trim().is_empty() {
-        return Err(invalid("Anthropic requires a nonempty model"));
-    }
     let max_tokens = request
         .max_output_tokens
         .filter(|n| *n > 0)
@@ -118,22 +114,8 @@ fn push_message(
 ) -> Result<(), ProviderError> {
     let (role, content) = match message {
         Message::User(items) => {
-            let mut blocks = Vec::new();
-            for item in items {
-                blocks.push(match item {
-                    UserContent::Text { text }
-                    | UserContent::Runtime { text }
-                    | UserContent::ParentInput { text }
-                    | UserContent::Compaction { text } => json!({"type":"text", "text":text}),
-                    UserContent::Attachment { attachment } => match attachment {
-                        AttachmentRef::Image(image) => anthropic_image(request, image)?,
-                        AttachmentRef::Text(text) => {
-                            json!({"type":"text", "text":attachment_text(request, text)?})
-                        }
-                    },
-                });
-            }
-            ("user", blocks)
+            let image = |image: &_| anthropic_image(request, image);
+            ("user", user_parts(request, items, "text", image)?)
         }
         Message::Assistant(items) => {
             let mut blocks = Vec::new();
@@ -180,11 +162,8 @@ fn push_message(
         }
     };
     if content.is_empty() {
-        // An assistant turn that encodes to nothing is skipped, never rejected.
-        // Rejecting is unsafe here: history is append-only and InvalidRequest has
-        // no recovery, so a single such message would fail every later request in
-        // the session permanently. Chat and Responses already drop these silently;
-        // the runtime's pre-commit guard is what catches the underlying bug.
+        // An assistant turn that encodes to nothing is skipped: history is
+        // append-only, so rejecting it would fail every later request.
         if matches!(message, Message::Assistant(_)) {
             return Ok(());
         }
@@ -236,7 +215,7 @@ mod tests {
         media::{AttachmentRef, BlobRef, ImageFormat, ImageRef, TextRef},
         provider::protocol::{
             AssistantBlock, AssistantItem, BlockContent, HistoryLifetime, ItemKind, ReplayEnvelope,
-            ResponseSchema, SystemSegment, ToolCall, ToolDefinition, ToolResult,
+            ResponseSchema, SystemSegment, ToolCall, ToolDefinition, ToolResult, UserContent,
         },
     };
 

@@ -5,14 +5,14 @@ use serde_json::Value;
 
 use crate::{
     execution::ExecutionLocation,
-    identity::{AgentId, EventId, JobId, QueueAttemptId},
+    identity::{AgentId, EventId, JobId},
     job::{JobRole, JobState},
     media::ImageRef,
     provider::{
         profile::ModelProfile,
         protocol::{
             HistoryLifetime, Message, ModelRequest, ResponseSchema, StopReason, SystemSegment,
-            ToolDefinition, Usage, UserContent,
+            ToolDefinition, Usage,
         },
     },
     target::TargetDefinition,
@@ -58,22 +58,6 @@ pub struct ModelCallOrigin {
     pub call_id: String,
 }
 
-/// Immutable accepted submission. Session and destination agent are bound by its record.
-#[derive(Clone, Debug, Serialize, PartialEq)]
-pub struct QueueIntent {
-    pub attempt: QueueAttemptId,
-    pub content: Vec<UserContent>,
-    pub model: Option<String>,
-}
-
-/// Final resolution of an intent; NotCommitted explicitly abandons that attempt.
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum QueueSettlement {
-    Committed { event: EventId },
-    NotCommitted,
-}
-
 /// Shared settings of every request in one model context. History and tail are
 /// journaled per request; provider, model, reasoning and output budget come from
 /// the profile and correlation from the agent.
@@ -110,16 +94,6 @@ impl ModelContext {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
-    QueueIntent {
-        intent: QueueIntent,
-    },
-    QueueSettlement {
-        attempt: QueueAttemptId,
-        settlement: QueueSettlement,
-    },
-    QueueAcknowledged {
-        attempt: QueueAttemptId,
-    },
     /// The session's pinned harness settings; every agent's capabilities are a subset.
     SessionStarted {
         targets: Vec<TargetDefinition>,
@@ -317,23 +291,9 @@ pub enum ModelFailureKind {
     Refusal,
 }
 
-impl SessionEvent {
-    /// The attempt a queue event inherently names.
-    pub(crate) fn queue_attempt(&self) -> Option<QueueAttemptId> {
-        match self {
-            Self::QueueIntent { intent } => Some(intent.attempt),
-            Self::QueueSettlement { attempt, .. } | Self::QueueAcknowledged { attempt } => {
-                Some(*attempt)
-            }
-            _ => None,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct EventRecord {
     pub id: EventId,
-    pub queue_attempt: Option<QueueAttemptId>,
     pub sequence: u64,
     pub timestamp_millis: i64,
     pub agent: AgentId,
@@ -344,7 +304,6 @@ impl EventRecord {
     pub(crate) fn append_identity(&self) -> super::AppendIdentity {
         super::AppendIdentity {
             event: self.id,
-            queue_attempt: self.queue_attempt,
             session: self.agent.session(),
             sequence: self.sequence,
         }

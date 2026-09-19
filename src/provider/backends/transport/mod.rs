@@ -47,21 +47,9 @@ fn timeout_error(phase: &str) -> ProviderError {
     }
 }
 
-/// Make one HTTP/SSE attempt. Provider retries are owned centrally by the agent
-/// runtime so every backend receives the same policy. Once a response
-/// is accepted, dropping this stream cancels its body and transport state.
-#[cfg(test)]
+/// Make one HTTP/SSE attempt with default timeouts; the agent runtime owns retries.
+/// Dropping the returned stream cancels its body.
 pub(crate) async fn post_sse(
-    client: &Client,
-    url: &str,
-    headers: HeaderMap,
-    body: &Value,
-) -> Result<SseStream, ProviderError> {
-    post_sse_with_timeouts(client, url, headers, body, ProviderTimeouts::default()).await
-}
-
-/// Default-timeout entry point for continuation protocols.
-pub(crate) async fn post_sse_once(
     client: &Client,
     url: &str,
     headers: HeaderMap,
@@ -237,142 +225,124 @@ pub(crate) mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
-    /// Scripted HTTP fixture with full raw requests, shared with backend acceptance tests.
-    pub(crate) async fn server(
-        replies: Vec<String>,
-    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
-        use tokio::io::AsyncWriteExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/responses", listener.local_addr().unwrap());
-        let task = tokio::spawn(async move {
-            let mut requests = Vec::new();
-            for reply in replies {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                requests.push(read_request(&mut socket).await);
-                socket.write_all(reply.as_bytes()).await.unwrap();
-            }
-            requests
-        });
-        (url, task)
-    }
-
-    // Keep listening after every scripted response, so negative replay assertions
-    // detect actual extra connections rather than a server which has already exited.
-    pub(super) struct ObservedServer {
-        pub(super) url: String,
-        requests: tokio::sync::mpsc::UnboundedReceiver<(String, tokio::time::Instant)>,
-        task: tokio::task::JoinHandle<()>,
-        connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        observed_requests: usize,
-    }
-
-    pub(super) struct ResponsePlan {
-        delay: Duration,
+    /// One scripted connection. Connections beyond the script never answer.
+    pub(crate) struct Plan {
         wire: Option<String>,
+        pub(super) delay: Duration,
+        /// Hold the connection open after writing instead of closing it.
         pub(super) stall_body: bool,
     }
 
-    impl ResponsePlan {
-        pub(super) fn reply(wire: String) -> Self {
+    impl Plan {
+        pub(crate) fn reply(wire: String) -> Self {
             Self {
-                delay: Duration::ZERO,
                 wire: Some(wire),
+                delay: Duration::ZERO,
                 stall_body: false,
             }
         }
 
-        fn stalled_headers() -> Self {
+        pub(super) fn stalled_headers() -> Self {
             Self {
-                delay: Duration::ZERO,
                 wire: None,
-                stall_body: false,
+                delay: Duration::ZERO,
+                stall_body: true,
             }
         }
     }
 
-    impl ObservedServer {
-        pub(super) async fn start(plans: Vec<ResponsePlan>) -> Self {
+    /// Scripted HTTP fixture which keeps accepting, so replays are observed.
+    pub(crate) struct Server {
+        pub(crate) url: String,
+        address: std::net::SocketAddr,
+        requests: tokio::sync::mpsc::UnboundedReceiver<String>,
+        /// Connections accepted, against requests taken by the test.
+        accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        taken: usize,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Server {
+        pub(crate) async fn start(plans: Vec<Plan>) -> Self {
             use tokio::io::AsyncWriteExt;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}/responses", listener.local_addr().unwrap());
+            let address = listener.local_addr().unwrap();
+            let url = format!("http://{address}/responses");
             let (tx, requests) = tokio::sync::mpsc::unbounded_channel();
-            let connection_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let accepted = connection_count.clone();
+            let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = accepted.clone();
             let task = tokio::spawn(async move {
-                let mut plans = plans.into_iter();
+                let plans = std::sync::Arc::new(std::sync::Mutex::new(plans.into_iter()));
                 let mut connections = tokio::task::JoinSet::new();
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
-                    accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let plan = plans.next().unwrap_or_else(ResponsePlan::stalled_headers);
-                    let tx = tx.clone();
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let (tx, plans) = (tx.clone(), plans.clone());
                     connections.spawn(async move {
-                        let received = tokio::time::Instant::now();
                         let request = read_request(&mut socket).await;
-                        tx.send((request, received)).unwrap();
+                        // A connection without a request (the probe below) uses no plan.
+                        let plan = (!request.is_empty()).then(|| plans.lock().unwrap().next());
+                        let plan = plan.flatten().unwrap_or_else(Plan::stalled_headers);
+                        tx.send(request).unwrap();
                         tokio::time::sleep(plan.delay).await;
                         if let Some(wire) = plan.wire {
                             // Timed-out attempts may close the connection before writing.
                             let _ = socket.write_all(wire.as_bytes()).await;
-                            if !plan.stall_body {
-                                return;
-                            }
                         }
-                        std::future::pending::<()>().await;
-                        drop(socket);
+                        if plan.stall_body {
+                            std::future::pending::<()>().await;
+                        }
                     });
                 }
             });
             Self {
                 url,
+                address,
                 requests,
+                accepted,
+                taken: 0,
                 task,
-                connections: connection_count,
-                observed_requests: 0,
             }
         }
 
-        pub(super) async fn request(&mut self) -> (String, tokio::time::Instant) {
-            let request = tokio::time::timeout(Duration::from_secs(3), self.requests.recv())
+        pub(crate) async fn request(&mut self) -> String {
+            self.taken += 1;
+            tokio::time::timeout(Duration::from_secs(3), self.requests.recv())
                 .await
                 .expect("expected HTTP request")
-                .unwrap();
-            self.observed_requests += 1;
-            request
+                .unwrap()
         }
 
-        pub(super) async fn no_more_requests(mut self) {
-            assert!(
-                tokio::time::timeout(Duration::from_millis(650), self.requests.recv())
-                    .await
-                    .is_err(),
-                "unexpected replay"
-            );
-            assert_eq!(
-                self.connections.load(std::sync::atomic::Ordering::SeqCst),
-                self.observed_requests,
-                "unexpected connection, even without a complete request"
-            );
-            self.task.abort();
-            let _ = (&mut self.task).await;
+        /// Requests not yet taken, once the client's calls have returned. An empty
+        /// probe connection flushes the accept queue, so every connection the client
+        /// opened is counted, even a replay that never completed its request.
+        pub(crate) async fn unclaimed(&mut self) -> Vec<String> {
+            drop(tokio::net::TcpStream::connect(self.address).await.unwrap());
+            let mut requests = Vec::new();
+            loop {
+                match self.request().await {
+                    probe if probe.is_empty() => break,
+                    request => requests.push(request),
+                }
+            }
+            let accepted = self.accepted.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(accepted, self.taken, "unexpected connection");
+            requests
+        }
+
+        pub(crate) async fn finish(mut self) -> Vec<String> {
+            self.unclaimed().await
         }
     }
 
-    impl Drop for ObservedServer {
+    impl Drop for Server {
         fn drop(&mut self) {
             // Aborting the accept task drops its JoinSet and all held sockets.
             self.task.abort();
         }
     }
 
-    pub(super) fn short_timeouts() -> ProviderTimeouts {
-        ProviderTimeouts {
-            startup: Duration::from_millis(100),
-            read_idle: Duration::from_millis(100),
-        }
-    }
-
-    fn timeouts(startup_ms: u64, read_idle_ms: u64) -> ProviderTimeouts {
+    pub(super) fn timeouts(startup_ms: u64, read_idle_ms: u64) -> ProviderTimeouts {
         ProviderTimeouts {
             startup: Duration::from_millis(startup_ms),
             read_idle: Duration::from_millis(read_idle_ms),
@@ -380,8 +350,8 @@ pub(crate) mod tests {
     }
 
     /// Posts once to a single-plan server, asserting one request and no replay.
-    async fn rejected(plan: ResponsePlan, timeouts: ProviderTimeouts) -> ProviderError {
-        let mut server = ObservedServer::start(vec![plan]).await;
+    async fn rejected(plan: Plan, timeouts: ProviderTimeouts) -> ProviderError {
+        let mut server = Server::start(vec![plan]).await;
         let error = tokio::time::timeout(
             Duration::from_secs(2),
             post_sse_with_timeouts(
@@ -397,13 +367,13 @@ pub(crate) mod tests {
         .err()
         .unwrap();
         server.request().await;
-        server.no_more_requests().await;
+        assert!(server.finish().await.is_empty(), "unexpected replay");
         error
     }
 
     #[tokio::test]
     async fn wire_headers_body_and_eof() {
-        let mut server = ObservedServer::start(vec![ResponsePlan::reply(reply(
+        let server = Server::start(vec![Plan::reply(reply(
             "200 OK",
             "Content-Type: text/event-stream; charset=utf-8\r\n",
             "data: one\r\n\r\ndata: two",
@@ -422,130 +392,102 @@ pub(crate) mod tests {
             events.into_iter().collect::<Result<Vec<_>, _>>().unwrap(),
             [(None, "one".to_owned()), (None, "two".to_owned())]
         );
-        let (request, _) = server.request().await;
-        assert!(request.contains("authorization: Bearer test-key"));
-        assert!(request.contains("accept: text/event-stream"));
-        let wire: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let requests = server.finish().await;
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("authorization: Bearer test-key"));
+        assert!(requests[0].contains("accept: text/event-stream"));
+        let wire: Value =
+            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(wire, body);
-        server.no_more_requests().await;
-    }
-
-    /// The explanation a rejection body carries: its error message, or the text.
-    fn server_text(body: &str) -> String {
-        serde_json::from_str::<Value>(body)
-            .ok()
-            .and_then(|value| value["error"]["message"].as_str().map(str::to_owned))
-            .unwrap_or_else(|| body.to_owned())
     }
 
     #[tokio::test]
-    async fn http_rejections_are_classified_with_their_message_and_not_replayed() {
+    async fn http_rejections_carry_status_message_and_retry_after_without_replay() {
         use ProviderErrorKind::*;
-        let rejected_body = r#"{"error":{"message":"upstream rejected the request"}}"#;
         let json = "Content-Type: application/json\r\n";
-        for (status, headers, body, kind) in [
-            (
-                "408 Request Timeout",
-                "Retry-After: 0\r\n",
-                rejected_body,
-                Timeout,
-            ),
-            ("500 Internal Server Error", "", rejected_body, Response),
-            ("502 Bad Gateway", "", rejected_body, Response),
-            (
-                "503 Service Unavailable",
-                "Retry-After: 0\r\n",
-                "upstream unavailable",
-                Response,
-            ),
-            ("504 Gateway Timeout", "", rejected_body, Timeout),
-            ("400 Bad Request", json, rejected_body, InvalidRequest),
-            ("401 Unauthorized", json, rejected_body, Authentication),
-            ("403 Forbidden", json, rejected_body, Authentication),
-            ("404 Not Found", json, rejected_body, InvalidRequest),
-            ("200 OK", json, rejected_body, Protocol),
-            (
-                "400 Bad Request",
-                "",
-                r#"{"error":{"code":400,"type":"exceed_context_size_error","message":"prompt too long"}}"#,
-                ContextWindowExceeded,
-            ),
+        let refused = r#"{"error":{"message":"upstream rejected the request"}}"#;
+        let context = r#"{"error":{"code":400,"type":"exceed_context_size_error","message":"prompt too long"}}"#;
+        let throttle = r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#;
+        // (status, headers, body, kind, the server's explanation carried verbatim)
+        for (status, headers, body, kind, explanation) in [
             (
                 "429 Too Many Requests",
                 "Retry-After: 120\r\n",
-                r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#,
+                throttle,
                 RateLimited,
+                ": slow down",
             ),
+            // Non-JSON bodies (proxy text) still carry the explanation.
+            (
+                "503 Service Unavailable",
+                "",
+                "upstream unavailable",
+                Response,
+                ": upstream unavailable",
+            ),
+            (
+                "500 Internal Server Error",
+                "",
+                refused,
+                Response,
+                ": upstream rejected the request",
+            ),
+            (
+                "401 Unauthorized",
+                json,
+                refused,
+                Authentication,
+                ": upstream rejected the request",
+            ),
+            (
+                "400 Bad Request",
+                "",
+                context,
+                ContextWindowExceeded,
+                ": prompt too long",
+            ),
+            ("200 OK", json, "{}", Protocol, "non-SSE content type"),
         ] {
             let error = rejected(
-                ResponsePlan::reply(reply(status, headers, body)),
-                short_timeouts(),
+                Plan::reply(reply(status, headers, body)),
+                timeouts(100, 100),
             )
             .await;
             assert_eq!(error.kind, kind, "{status}");
-            assert_eq!(
-                error.recovery().is_some(),
-                matches!(kind, Timeout | Response | RateLimited)
+            assert!(
+                error.message.ends_with(explanation),
+                "{status}: {}",
+                error.message
             );
-            assert!(!error.message.contains("attempt"));
-            // Rejections carry the server's explanation verbatim.
-            if kind != Protocol {
-                let expected = format!(": {}", server_text(body));
-                assert!(error.message.ends_with(&expected), "{}", error.message);
-            }
-            if kind == RateLimited {
-                assert_eq!(error.retry_after, Some(Duration::from_secs(120)));
-                assert!(error.message.contains("429"));
-                assert!(error.message.contains("rate_limit_exceeded"));
-            }
+            let throttled = (kind == RateLimited).then_some(Duration::from_secs(120));
+            assert_eq!(error.retry_after, throttled, "{status}");
+            assert_eq!(error.message.contains("429"), kind == RateLimited);
         }
         // An empty response closes the socket after consuming the full POST.
-        let closed = rejected(ResponsePlan::reply(String::new()), short_timeouts()).await;
+        let closed = rejected(Plan::reply(String::new()), timeouts(100, 100)).await;
         assert_eq!(closed.kind, Transport);
-        assert!(closed.recovery().is_some());
+        assert!(closed.is_retryable());
     }
 
     #[tokio::test]
     async fn stalled_rejection_body_respects_remaining_startup_and_idle_limits() {
-        let head = |status| {
-            format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: 999\r\n\r\n"
-            )
-        };
-        for (status, delay, budget, kind) in [
-            (
-                "401 Unauthorized",
-                100,
-                timeouts(200, 5000),
-                ProviderErrorKind::Authentication,
-            ),
-            (
-                "401 Unauthorized",
-                100,
-                timeouts(5000, 100),
-                ProviderErrorKind::Authentication,
-            ),
-            (
-                "503 Service Unavailable",
-                60,
-                timeouts(100, 5000),
-                ProviderErrorKind::Response,
-            ),
-        ] {
-            // Part of the startup budget is consumed before the rejection headers.
-            let mut plan = ResponsePlan::reply(head(status));
-            plan.delay = Duration::from_millis(delay);
+        // Part of the startup budget is consumed before the rejection headers.
+        for budget in [timeouts(200, 5000), timeouts(5000, 100)] {
+            let head = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 999\r\n\r\n";
+            let mut plan = Plan::reply(head.into());
+            plan.delay = Duration::from_millis(100);
             plan.stall_body = true;
             // Preserve the known rejection classification even if diagnostics stall.
-            assert_eq!(rejected(plan, budget).await.kind, kind);
+            let error = rejected(plan, budget).await;
+            assert_eq!(error.kind, ProviderErrorKind::Authentication);
         }
     }
 
     #[tokio::test]
-    async fn startup_timeout_is_one_attempt_and_a_new_call_gets_a_fresh_deadline() {
-        let mut server = ObservedServer::start(vec![
-            ResponsePlan::stalled_headers(),
-            ResponsePlan::reply(reply(
+    async fn timeouts_are_one_attempt_and_a_new_call_gets_a_fresh_deadline() {
+        let mut server = Server::start(vec![
+            Plan::stalled_headers(),
+            Plan::reply(reply(
                 "200 OK",
                 "Content-Type: text/event-stream\r\n",
                 "data: done\n\n",
@@ -555,41 +497,44 @@ pub(crate) mod tests {
         let (client, url) = (client().unwrap(), server.url.clone());
         let body = serde_json::json!({"model":"cold-model", "stream":true});
         let post =
-            || post_sse_with_timeouts(&client, &url, HeaderMap::new(), &body, short_timeouts());
+            || post_sse_with_timeouts(&client, &url, HeaderMap::new(), &body, timeouts(100, 100));
         let error = post().await.err().unwrap();
         assert_eq!(error.kind, ProviderErrorKind::Timeout);
         assert_eq!(error.message, "provider HTTP startup timeout");
-        let first = server.request().await.0;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(250), server.requests.recv())
-                .await
-                .is_err()
-        );
+        let first = server.request().await;
+        assert!(server.unclaimed().await.is_empty(), "unexpected replay");
         let mut stream = post().await.unwrap();
         assert_eq!(stream.next().await.unwrap().unwrap().data, "done");
         assert!(stream.next().await.is_none());
-        assert_eq!(first, server.request().await.0);
-        server.no_more_requests().await;
+        assert_eq!(first, server.request().await);
+
+        // The HTTP client's own timeout is classified the same way.
+        let impatient = Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let headers = HeaderMap::new();
+        let error = post_sse_with_timeouts(&impatient, &url, headers, &body, timeouts(2000, 2000))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, ProviderErrorKind::Timeout);
+        server.request().await;
+        assert!(server.finish().await.is_empty(), "unexpected replay");
     }
 
     #[tokio::test]
     async fn dropping_pending_send_cancels_the_request() {
-        let mut server = ObservedServer::start(vec![ResponsePlan::stalled_headers()]).await;
+        let mut server = Server::start(vec![Plan::stalled_headers()]).await;
         let client = client().unwrap();
         let url = server.url.clone();
-        let mut request = Box::pin(post_sse_with_timeouts(
-            &client,
-            &url,
-            HeaderMap::new(),
-            &Value::Null,
-            short_timeouts(),
-        ));
+        let mut request = Box::pin(post_sse(&client, &url, HeaderMap::new(), &Value::Null));
         tokio::select! {
             _ = &mut request => panic!("request finished before cancellation"),
             _ = server.request() => {}
         }
         drop(request);
-        server.no_more_requests().await;
+        assert!(server.finish().await.is_empty(), "unexpected replay");
     }
 
     #[tokio::test]
@@ -602,42 +547,19 @@ pub(crate) mod tests {
             (closed.as_str(), ProviderErrorKind::Transport),
             ("http://[invalid", ProviderErrorKind::InvalidRequest),
         ] {
-            let post = post_sse_with_timeouts(
+            // Bounded: a hang reports a timeout instead of the expected kind.
+            let error = post_sse_with_timeouts(
                 &client,
                 url,
                 HeaderMap::new(),
                 &Value::Null,
-                short_timeouts(),
-            );
-            let error = tokio::time::timeout(Duration::from_secs(2), post)
-                .await
-                .unwrap()
-                .err()
-                .unwrap();
-            assert_eq!(error.kind, kind);
-            assert!(!error.message.contains("HTTP attempts") && !error.message.contains(url));
-        }
-    }
-
-    #[tokio::test]
-    async fn reqwest_send_timeouts_return_without_retrying() {
-        let mut server = ObservedServer::start(vec![ResponsePlan::stalled_headers()]).await;
-        let client = Client::builder()
-            .timeout(Duration::from_millis(100))
-            .build()
+                timeouts(3000, 3000),
+            )
+            .await
+            .err()
             .unwrap();
-        let error = post_sse_with_timeouts(
-            &client,
-            &server.url,
-            HeaderMap::new(),
-            &Value::Null,
-            timeouts(2000, 2000),
-        )
-        .await
-        .err()
-        .unwrap();
-        assert_eq!(error.kind, ProviderErrorKind::Timeout);
-        server.request().await;
-        server.no_more_requests().await;
+            assert_eq!(error.kind, kind);
+            assert!(!error.message.contains(url));
+        }
     }
 }

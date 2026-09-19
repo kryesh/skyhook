@@ -153,6 +153,12 @@ mod tests {
         tool::{ToolError, ToolOutput, policy::CapabilitySet},
     };
 
+    /// An on-disk runtime, so `reopen` can replay its journal.
+    async fn runtime() -> (tempfile::TempDir, JobManager, crate::identity::AgentId) {
+        let (root, store, agent) = crate::session::fixture::on_disk().await;
+        (root, JobManager::new(store), agent)
+    }
+
     /// Drain owners, drop the manager, and replay the durable journal.
     async fn reopen(jobs: JobManager, root: &std::path::Path) -> JobManager {
         let session = jobs.store().id();
@@ -198,7 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn denial_survives_replay_and_agent_views_hide_pending_authorization() {
-        let (root, jobs, agent) = super::super::tests::runtime().await;
+        let (root, jobs, agent) = runtime().await;
         let capabilities = CapabilitySet::default();
         let job = jobs.test_create(JobSpec::test(agent, "shell")).await;
         jobs.transition(job, JobState::AwaitingApproval)
@@ -226,7 +232,7 @@ mod tests {
             )
         );
         // The persisted terminal event is the source of truth for replay.
-        let restored = reopen(jobs, &root.path().join("sessions")).await;
+        let restored = reopen(jobs, root.path()).await;
         let replayed = restored
             .snapshot(job)
             .await
@@ -238,7 +244,7 @@ mod tests {
 
     #[tokio::test]
     async fn restore_interrupts_active_jobs_and_advances_ids() {
-        let (root, manager, agent) = super::super::tests::runtime().await;
+        let (root, manager, agent) = runtime().await;
         let named = ExecutionLocation::named("build", "/srv/project".into());
         let mut leases = Vec::new();
         // Unfinished registered captures must not be presented as a structured result.
@@ -272,7 +278,7 @@ mod tests {
             leases.push(lease);
         }
         drop(leases);
-        let restored = reopen(manager, &root.path().join("sessions")).await;
+        let restored = reopen(manager, root.path()).await;
         for (job, field, kind, location) in [
             (
                 1,
@@ -327,7 +333,7 @@ mod tests {
     #[tokio::test]
     async fn outcome_application_live_replay_and_interrupted_cancellation_matrix() {
         for case in 0..8 {
-            let (root, jobs, agent) = super::super::tests::runtime().await;
+            let (root, jobs, agent) = runtime().await;
             jobs.store().store_blob(OUTCOME_IMAGE).await.unwrap();
             let spec = JobSpec {
                 accepts_input: true,
@@ -395,7 +401,7 @@ mod tests {
                 assert_eq!(document["result"], serde_json::json!({"result":"saved"}));
             }
             let mut projection = projection;
-            let replay = reopen(jobs, &root.path().join("sessions")).await;
+            let replay = reopen(jobs, root.path()).await;
             let mut replayed = stored_projection(&replay, id).await;
             // Resume handlers are live-only and never replayed.
             projection["resumable"] = false.into();

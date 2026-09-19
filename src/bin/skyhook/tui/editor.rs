@@ -34,8 +34,8 @@ impl EditOutcome {
 }
 
 /// Owns every allocation containing editor text, including history snapshots.
-/// Mutation never permits String to retire an allocation through reallocation.
-/// This covers owned buffers, not caller, allocator, or terminal copies.
+/// There is no `DerefMut`: mutation never lets String retire an unwiped
+/// allocation. This covers owned buffers, not caller, allocator, or terminal copies.
 #[derive(Clone, Default)]
 struct SensitiveText(String);
 
@@ -51,9 +51,7 @@ impl SensitiveText {
         if &self.0[range.clone()] == replacement {
             return false;
         }
-        let new_len = (self.0.len() - range.len())
-            .checked_add(replacement.len())
-            .expect("editor text length overflow");
+        let new_len = self.0.len() - range.len() + replacement.len();
         if new_len > self.0.capacity() {
             // Allocate before copying any secret bytes; the old owner wipes on replacement.
             let mut next = Self(String::with_capacity(new_len));
@@ -66,37 +64,27 @@ impl SensitiveText {
         }
         true
     }
-
-    fn into_string(mut self) -> String {
-        std::mem::take(&mut self.0)
-    }
 }
 
 impl Drop for SensitiveText {
     fn drop(&mut self) {
-        // Initialize spare capacity without growth, so the entire allocation can be
-        // volatile-wiped and safely inspected by tests before it is freed. This also
-        // wipes bytes retired by an in-place deletion, not just the current text.
+        // Fill spare capacity without growth, so the whole allocation is wiped
+        // (including bytes retired by an in-place deletion) and tests can inspect it.
         while self.0.len() < self.0.capacity() {
             self.0.push('\0');
         }
         self.0.as_mut_str().zeroize();
         #[cfg(test)]
-        observe_wipe(self.0.as_bytes());
-        self.0.clear();
+        if !self.0.is_empty() {
+            assert!(self.0.bytes().all(|byte| byte == 0));
+            WIPES.with_borrow_mut(|wipes| wipes.push(self.0.len()));
+        }
     }
 }
 
 #[cfg(test)]
 thread_local! {
     static WIPES: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-#[cfg(test)]
-fn observe_wipe(bytes: &[u8]) {
-    assert!(bytes.iter().all(|&byte| byte == 0));
-    if !bytes.is_empty() {
-        WIPES.with(|wipes| wipes.borrow_mut().push(bytes.len()));
-    }
 }
 
 #[derive(Clone, Default)]
@@ -195,8 +183,7 @@ impl Editor {
     }
     /// Transfer a secret without making an undo copy, and wipe its editing history.
     pub fn take_sensitive(&mut self) -> skyhook::remote::SecretValue {
-        let secret =
-            skyhook::remote::SecretValue::new(std::mem::take(&mut self.text).into_string());
+        let secret = skyhook::remote::SecretValue::new(std::mem::take(&mut self.text.0));
         self.clear_sensitive();
         secret
     }
@@ -364,10 +351,6 @@ mod tests {
         press(editor, KeyCode::Char('-'), M::CONTROL);
     }
 
-    fn take_wipes() -> Vec<usize> {
-        WIPES.with(|wipes| std::mem::take(&mut *wipes.borrow_mut()))
-    }
-
     #[test]
     fn line_deletion_clears_selection_before_insert_copy_and_undo() {
         for shortcut in ['u', 'k'] {
@@ -402,29 +385,30 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_transfers_move_allocations_clear_history_and_wipe_retired_buffers() {
+    fn sensitive_text_wipes_every_retired_allocation_and_transfers_without_copying() {
+        let take_wipes = || WIPES.with_borrow_mut(std::mem::take);
         let mut editor = Editor::default();
         editor.set("old".into());
         take_wipes();
         editor.set("secret".into());
-        assert_eq!(take_wipes(), vec![3], "replaced text is wiped");
+        assert_eq!(take_wipes(), [3], "replaced text is wiped");
         editor.save();
         assert!(!editor.undo.is_empty());
         let allocation = editor.text.as_ptr();
         let secret = editor.take_sensitive();
         assert_eq!(secret.expose(), "secret");
         assert_eq!(secret.expose().as_ptr(), allocation);
-        assert_eq!(take_wipes(), vec![6], "only history is wiped by transfer");
+        assert_eq!(take_wipes(), [6], "only history is wiped by transfer");
         assert!(editor.text.is_empty() && editor.undo.is_empty() && editor.redo.is_empty());
         assert_eq!((editor.cursor, editor.anchor), (0, None));
-        let mut buffer = SensitiveText(String::with_capacity(32));
-        buffer.0.push_str("secret that will be deleted");
-        let capacity = buffer.0.capacity();
-        assert!(buffer.replace_range(1..1, &"q".repeat(capacity + 1)));
-        assert_eq!(take_wipes(), vec![capacity], "growth wipes old capacity");
-        let grown_capacity = buffer.0.capacity();
-        drop(buffer);
-        assert_eq!(take_wipes(), vec![grown_capacity]);
+
+        editor.set("secret that will be deleted".into());
+        let capacity = editor.text.0.capacity();
+        editor.insert(&"q".repeat(capacity + 1));
+        assert_eq!(take_wipes(), [capacity], "growth wipes the old allocation");
+        let grown = editor.text.0.capacity();
+        editor.clear_sensitive();
+        assert!(take_wipes().contains(&grown), "clear wipes full capacity");
     }
 
     #[test]

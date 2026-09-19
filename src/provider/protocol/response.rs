@@ -34,11 +34,6 @@ pub enum ResponseEvent {
         id: String,
         replay: Option<ReplayEnvelope>,
     },
-    /// Enrich opaque replay after item completion, before response completion.
-    ItemReplayUpdated {
-        id: String,
-        replay: ReplayEnvelope,
-    },
     /// Remove an unsafe/provisional item without promoting its partial content.
     ItemDiscarded {
         id: String,
@@ -285,17 +280,6 @@ impl ResponseAssembler {
                 item.replay = replay.clone();
                 item.ended = true;
             }
-            ResponseEvent::ItemReplayUpdated { id, replay } => {
-                let item = self
-                    .items
-                    .values_mut()
-                    .find(|item| item.id == *id)
-                    .filter(|item| item.ended)
-                    .ok_or_else(|| {
-                        ProviderError::protocol("replay update requires a completed item")
-                    })?;
-                item.replay = Some(replay.clone());
-            }
             ResponseEvent::ItemDiscarded { id } => {
                 let position = self
                     .items
@@ -421,7 +405,7 @@ pub fn events_for_content(items: &[AssistantItem]) -> Vec<ResponseEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{ToolCall, replay};
+    use super::super::ToolCall;
     use super::*;
     use serde_json::json;
 
@@ -513,23 +497,6 @@ mod tests {
     }
 
     #[test]
-    fn replay_enrichment_requires_completed_item_and_preserves_content() {
-        let replay = replay();
-        let update = ResponseEvent::ItemReplayUpdated {
-            id: "reason".into(),
-            replay: replay.clone(),
-        };
-        let mut assembler = assembled([start("reason", 0, ItemKind::Reasoning)]);
-        assert!(assembler.push(&update).is_err());
-        for event in [end_item("reason"), update.clone(), end()] {
-            assembler.push(&event).unwrap();
-        }
-        assert!(assembler.push(&update).is_err());
-        let (items, _, _) = assembler.finish().unwrap();
-        assert_eq!(items[0].replay, Some(replay));
-    }
-
-    #[test]
     fn interleaving_orders_items_and_blocks_by_position_not_arrival() {
         let assembler = assembled([
             start("later", 7, ItemKind::Text),
@@ -610,10 +577,6 @@ mod tests {
     // independently of the private live representation.
     #[test]
     fn rejected_transitions_preserve_live_state_and_snapshot() {
-        let replay_update = ResponseEvent::ItemReplayUpdated {
-            id: "i".into(),
-            replay: replay(),
-        };
         let open = || {
             vec![
                 start("i", 0, ItemKind::Text),
@@ -651,7 +614,6 @@ mod tests {
             end_block("i", "b", text("next")),
             end_item("i"),
             end_item("missing"),
-            replay_update,
             discard("missing"),
             end(),
         ];

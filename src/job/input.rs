@@ -58,8 +58,7 @@ impl JobManager {
 
     pub async fn send(&self, id: JobId, mut value: Value) -> Result<(), JobError> {
         loop {
-            // Serialize resumption against finishing and other senders. Once resumed,
-            // subsequent sends use the new invocation's normal input mailbox.
+            // Serialize resumption against finishing and other senders.
             let operation = self.operation(id).await?;
             let guard = operation.lock_owned().await;
             let sender = {
@@ -186,9 +185,8 @@ impl JobManager {
         Ok(resumed)
     }
 
-    /// The operation guard is deliberately held across the state journal and the
-    /// handler launch, so a parent that is waiting sees the job as running rather
-    /// than receiving a stale terminal delivery.
+    /// Holds the operation guard through the handler launch, so a waiting parent
+    /// sees the job running rather than a stale terminal delivery.
     async fn resume_locked(
         &self,
         id: JobId,

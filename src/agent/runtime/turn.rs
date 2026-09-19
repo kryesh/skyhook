@@ -79,15 +79,8 @@ impl SessionRuntime {
                 }
             };
             agent_context.refresh(&self.store, agent).await?;
-            let runtime = prompt::runtime_state_content(
-                &self.jobs,
-                &self.todos,
-                agent,
-                capabilities,
-                location,
-            )
-            .await;
-            let mut request = agent_context.request(runtime);
+            let state = self.runtime_state(&turn).await;
+            let mut request = agent_context.request(state);
             if force_compaction {
                 self.compact_history(
                     &turn,
@@ -111,10 +104,8 @@ impl SessionRuntime {
                 agent_context.projected.push((sequence, state.clone()));
                 request.history.push(state);
             }
-            // Freeze the request across provider recovery. Input/notifications and
-            // model changes remain queued until the next normal request boundary.
-            // Partial streamed output is display-only: only a fully assembled response
-            // below is committed and allowed to execute Skyhook tools.
+            // The request is frozen across provider recovery; input and model changes
+            // wait for the next request boundary.
             let input_estimate = compaction::estimate_request(&request);
             let context_tokens = agent_context.meter.estimate(&request);
             self.store.load_blobs(&mut request).await?;
@@ -160,127 +151,84 @@ impl SessionRuntime {
                         return Err(HarnessError::Interrupted);
                     },
                 };
-                let mut response = match invoked {
-                    Ok(response) => response,
-                    Err(error) => {
-                        self.record_model_failure(
-                            agent,
-                            requested.sequence,
-                            provider_attempt,
-                            Usage::default(),
-                            error.to_string(),
-                        )
-                        .await?;
-                        // The runtime alone applies the unbounded transient retry policy to an
-                        // eligible, uncommitted response; adapters do not own retry counts.
-                        if error.recovery().is_some() {
-                            transient_attempt = transient_attempt.saturating_add(1);
-                            self.schedule_model_recovery(
-                                &turn,
-                                requested.sequence,
-                                recovery::RecoveryAttempt {
-                                    model: provider_attempt,
-                                    transient: transient_attempt,
-                                },
-                                &error,
-                                agent_context.provider.as_mut(),
-                            )
-                            .await?;
-                            continue 'attempts;
+                // The failed stream may own the connection, so it is dropped with this
+                // block before any recovery wait.
+                let streamed = 'stream: {
+                    let mut response = match invoked {
+                        Ok(response) => response,
+                        Err(error) => break 'stream Err((error, Usage::default(), false)),
+                    };
+                    let mut assembler = ResponseAssembler::default();
+                    let mut usage = Usage::default();
+                    let mut saw_content = false;
+                    loop {
+                        let chunk = tokio::select! {
+                            chunk = response.next() => chunk,
+                            () = cancellation.cancelled() => {
+                                self.record_model_usage(agent, requested.sequence, usage).await?;
+                                self.record_attempt_interrupted(agent, requested.sequence, provider_attempt)
+                                    .await?;
+                                return Err(HarnessError::Interrupted);
+                            },
+                        };
+                        let Some(chunk) = chunk else {
+                            break 'stream Ok((assembler, usage));
+                        };
+                        let pushed = chunk.and_then(|chunk| {
+                            assembler.push(&chunk)?;
+                            Ok(chunk)
+                        });
+                        let chunk = match pushed {
+                            Ok(chunk) => chunk,
+                            Err(error) => break 'stream Err((error, usage, saw_content)),
+                        };
+                        saw_content |= !matches!(&chunk, ResponseChunk::UsageUpdated { .. });
+                        if let ResponseChunk::UsageUpdated { usage: value } = &chunk {
+                            usage = *value;
                         }
-                        if error.kind == crate::provider::ProviderErrorKind::ContextWindowExceeded {
+                        self.events.send(RuntimeEvent::ResponseEvent {
+                            agent: agent.clone(),
+                            request: requested.sequence,
+                            event: chunk,
+                        });
+                    }
+                };
+                // Nothing from a failed attempt is committed or executed.
+                let (assembler, usage) = match streamed {
+                    Ok(streamed) => streamed,
+                    Err((error, usage, saw_content)) => {
+                        let attempt = (provider_attempt, &mut transient_attempt);
+                        let Some(error) = self
+                            .recover_model_failure(&turn, requested.sequence, attempt, usage, error)
+                            .await?
+                        else {
+                            continue 'attempts;
+                        };
+                        if !saw_content
+                            && error.kind
+                                == crate::provider::ProviderErrorKind::ContextWindowExceeded
+                        {
                             context_failures += 1;
-                            if context_failures >= compact::MAX_COMPACTION_ATTEMPTS {
-                                return Err(error.into());
+                            if context_failures < compact::MAX_COMPACTION_ATTEMPTS {
+                                force_compaction = true;
+                                continue 'requests;
                             }
-                            force_compaction = true;
-                            continue 'requests;
                         }
                         return Err(error.into());
                     }
                 };
-                let mut assembler = ResponseAssembler::default();
-                let mut usage = Usage::default();
-                let mut saw_content = false;
-                loop {
-                    let chunk = tokio::select! {
-                        chunk = response.next() => chunk,
-                        () = cancellation.cancelled() => {
-                            self.record_model_usage(agent, requested.sequence, usage).await?;
-                            self.record_attempt_interrupted(agent, requested.sequence, provider_attempt)
-                                .await?;
-                            return Err(HarnessError::Interrupted);
-                        },
-                    };
-                    let Some(chunk) = chunk else {
-                        break;
-                    };
-                    let chunk = match chunk.and_then(|chunk| {
-                        assembler.push(&chunk)?;
-                        Ok(chunk)
-                    }) {
-                        Ok(chunk) => chunk,
-                        Err(error) => {
-                            self.record_model_failure(
-                                agent,
-                                requested.sequence,
-                                provider_attempt,
-                                usage,
-                                error.to_string(),
-                            )
-                            .await?;
-                            if error.recovery().is_some() {
-                                transient_attempt = transient_attempt.saturating_add(1);
-                                // The failed stream may own the connection mutex. Drop it
-                                // before resetting or waiting. No assistant message or tools
-                                // from this attempt have been committed/executed.
-                                drop(response);
-                                self.schedule_model_recovery(
-                                    &turn,
-                                    requested.sequence,
-                                    recovery::RecoveryAttempt {
-                                        model: provider_attempt,
-                                        transient: transient_attempt,
-                                    },
-                                    &error,
-                                    agent_context.provider.as_mut(),
-                                )
-                                .await?;
-                                continue 'attempts;
-                            }
-                            if !saw_content
-                                && error.kind
-                                    == crate::provider::ProviderErrorKind::ContextWindowExceeded
-                            {
-                                context_failures += 1;
-                                if context_failures >= compact::MAX_COMPACTION_ATTEMPTS {
-                                    return Err(error.into());
-                                }
-                                force_compaction = true;
-                                continue 'requests;
-                            }
-                            return Err(error.into());
-                        }
-                    };
-                    saw_content |= !matches!(&chunk, ResponseChunk::UsageUpdated { .. });
-                    if let ResponseChunk::UsageUpdated { usage: value } = &chunk {
-                        usage = *value;
-                    }
-                    self.events.send(RuntimeEvent::ResponseEvent {
-                        agent: agent.clone(),
-                        request: requested.sequence,
-                        event: chunk,
-                    });
-                }
                 let response = match finish_response(assembler, usage) {
                     Ok(response) => response,
                     Err(error) => {
+                        let kind = crate::session::ModelFailureKind::Error;
+                        let (request, message) = (requested.sequence, error.to_string());
                         self.record_model_failure(
                             agent,
-                            requested.sequence,
+                            request,
                             provider_attempt,
                             usage,
-                            error.to_string(),
+                            message,
+                            kind,
                         )
                         .await?;
                         return Err(error);
@@ -288,70 +236,46 @@ impl SessionRuntime {
                 };
                 break (requested, response);
             };
-            if response.stop_reason == crate::provider::protocol::StopReason::ContentFilter {
-                // A refusal is a successful response that produced no usable turn.
-                // It is an error state, never conversation history, so nothing is
-                // committed. It is also never retried automatically: refusals are
-                // deterministic for a given request, so the trigger must come from
-                // outside the refused agent (its parent, or a human), optionally
-                // after selecting another model.
-                let error = HarnessError::Refused(refusal_detail(&response));
-                self.record_model_outcome(
-                    agent,
-                    requested.sequence,
-                    provider_attempt,
-                    response.usage,
-                    error.to_string(),
-                    crate::session::ModelFailureKind::Refusal,
-                )
-                .await?;
-                self.events.send(RuntimeEvent::ResponseSettled {
-                    agent: agent.clone(),
-                    request: requested.sequence,
-                    message: None,
-                    error: Some(error.to_string()),
-                });
-                return Err(error);
-            }
+            use crate::{provider::protocol::StopReason, session::ModelFailureKind};
+            let aborted = response.stop_reason == StopReason::Aborted;
             let assistant = Message::Assistant(response.blocks);
-            if assistant.is_content_free() {
-                // The journal is append-only and Anthropic rejects a content-free
-                // assistant message on every subsequent request, so committing one
-                // would make the session permanently unusable. Fail the turn with
-                // nothing committed; an external retry can still continue it.
-                let error =
-                    if response.stop_reason == crate::provider::protocol::StopReason::Aborted {
-                        HarnessError::ProviderAborted
-                    } else {
-                        HarnessError::EmptyResponse
-                    };
+            // A refusal is never history and never retried here: it is deterministic
+            // for a given request. A content-free message would make every later
+            // request unencodable. Either fails the turn with nothing committed.
+            let unusable = if response.stop_reason == StopReason::ContentFilter {
+                let error = HarnessError::Refused(refusal_detail(&response.text));
+                Some((error, ModelFailureKind::Refusal))
+            } else if !assistant.is_content_free() {
+                None
+            } else if aborted {
+                Some((HarnessError::ProviderAborted, ModelFailureKind::Error))
+            } else {
+                Some((HarnessError::EmptyResponse, ModelFailureKind::Error))
+            };
+            if let Some((error, kind)) = unusable {
+                let (request, message) = (requested.sequence, error.to_string());
                 self.record_model_failure(
                     agent,
-                    requested.sequence,
+                    request,
                     provider_attempt,
                     response.usage,
-                    error.to_string(),
+                    message,
+                    kind,
                 )
                 .await?;
                 self.events.send(RuntimeEvent::ResponseSettled {
                     agent: agent.clone(),
-                    request: requested.sequence,
+                    request,
                     message: None,
                     error: Some(error.to_string()),
                 });
                 return Err(error);
             }
-            // A response with tool calls means the child keeps working, so its
-            // progress wakes the owner immediately, as before. A text-only response
-            // is this invocation's answer: publish it durably but silently, so the
-            // wake comes from the invocation's resolution point instead (the owning
-            // job's completion, or an explicit wake wherever the invocation
-            // continues). The answer and the completion envelope then reach the
-            // owner in one delivery batch, without relying on any wake timing.
+            // A working child's progress wakes its owner at once; a text-only answer is
+            // published silently so it arrives with the invocation's resolution.
             let working = !response.calls.is_empty();
             // The message, its usage and its outcome commit in one transaction, so a
             // crash never leaves a response without the attempt's outcome.
-            let aborted = response.stop_reason == crate::provider::protocol::StopReason::Aborted;
             let outcome = {
                 let (agent, request) = (agent.clone(), requested.sequence);
                 let (usage, stop_reason) = (response.usage, response.stop_reason.clone());
@@ -436,15 +360,8 @@ impl SessionRuntime {
             // Decide once from the successful completed response, never from an
             // estimate that includes newly produced tool results or queued input.
             let compact_completed_response = agent_context.needs_compaction(response.usage);
-            let runtime = prompt::runtime_state_content(
-                &self.jobs,
-                &self.todos,
-                agent,
-                capabilities,
-                location,
-            )
-            .await;
-            let current = agent_context.request(runtime);
+            let state = self.runtime_state(&turn).await;
+            let current = agent_context.request(state);
             self.events.send(RuntimeEvent::Context {
                 agent: agent.clone(),
                 tokens: agent_context.meter.estimate(&current),
@@ -490,9 +407,7 @@ impl SessionRuntime {
                 committed?;
             }
             if compact_completed_response {
-                // Checkpoints retain complete tool exchanges. Close the exchange
-                // first, then compact before its results reach the next normal
-                // model request. Text-only final responses compact here too.
+                // The tool exchange is closed first: checkpoints retain whole exchanges.
                 self.compact_history(
                     &turn,
                     agent_context.provider.as_mut(),
@@ -507,36 +422,27 @@ impl SessionRuntime {
             provider_attempt = 0;
             context_failures = 0;
             if response.calls.is_empty() {
-                // Notifications arriving during this provider request must be
-                // processed before returning an answer based on earlier context.
-                // Use the same snapshot/commit/ack boundary for child progress
-                // and terminal/question events, including a shared completion batch.
+                // Events that arrived during the request precede the answer.
                 let (content, messages) = self
                     .pending_event_content(agent, capabilities, location)
                     .await?;
                 if !content.is_empty() {
                     messages.commit().await?;
                     final_text.clear();
-                    // This invocation continues instead of resolving, so the answer
-                    // published silently above has no resolution point to ride on.
-                    // Wake the owner here or it would stay pending until the owner's
-                    // next unrelated boundary.
+                    // The invocation continues, so the silent answer needs its wake now.
                     if let Some(job) = owner_job {
                         self.jobs.notify_owner(job).await;
                     }
                     continue 'requests;
                 }
-                // A response without tools is still a request boundary. Consume
-                // prompts received in flight before completing a one-shot child
-                // (or returning a stale final answer to the root caller).
+                // A response without tools is a request boundary too: consume prompts
+                // received in flight before returning a stale answer.
                 if self
                     .consume_queued_inputs(&turn, agent_context, model_profile, rx, deferred)
                     .await
                 {
                     context_sequence = None;
                     final_text.clear();
-                    // Same reasoning: queued input continues this invocation, so the
-                    // silently published answer needs its wake now.
                     if let Some(job) = owner_job {
                         self.jobs.notify_owner(job).await;
                     }
@@ -551,13 +457,21 @@ impl SessionRuntime {
         }
     }
 }
+impl SessionRuntime {
+    async fn runtime_state(&self, turn: &TurnContext<'_>) -> UserContent {
+        let (agent, capabilities) = (turn.agent, turn.capabilities);
+        prompt::runtime_state_content(&self.jobs, &self.todos, agent, capabilities, turn.location)
+            .await
+    }
+}
+
 /// Bounded excerpt of any partial text a refused response produced.
 const REFUSAL_EXCERPT_LIMIT: usize = 240;
 
 /// Human-readable refusal detail for the journal and for a parent agent. Providers
 /// rarely return refusal prose, so partial visible text is preserved when present.
-fn refusal_detail(response: &FoldedResponse) -> String {
-    let text = response.text.trim();
+fn refusal_detail(text: &str) -> String {
+    let text = text.trim();
     if text.is_empty() {
         return "content filter; the response contained no content".to_owned();
     }
@@ -620,58 +534,70 @@ mod tests {
     use super::*;
     use crate::agent::runtime::tests::*;
 
-    /// A decoded response that ends in a refusal, as a content filter produces.
-    fn refusal(items: Vec<AssistantContent>) -> Vec<ResponseChunk> {
-        let mut events = events_for_content(&items);
-        events.push(ResponseChunk::ResponseEnded {
-            stop_reason: StopReason::ContentFilter,
-        });
+    fn ended(items: &[AssistantContent], stop_reason: StopReason) -> Vec<ResponseChunk> {
+        let mut events = events_for_content(items);
+        events.push(ResponseChunk::ResponseEnded { stop_reason });
         events
     }
 
+    /// A decoded response that ends in a refusal, as a content filter produces.
+    fn refusal(items: Vec<AssistantContent>) -> Vec<ResponseChunk> {
+        ended(&items, StopReason::ContentFilter)
+    }
+
     #[tokio::test]
-    async fn refusal_fails_the_turn_without_committing_history_or_retrying() {
-        // The real shape observed from a refusing provider: a successful stream
-        // whose content is empty, or only an unusable reasoning stub.
-        for response in [
-            refusal(Vec::new()),
-            refusal(vec![AssistantContent::reasoning("thought", 0, "", None)]),
-        ] {
-            let (root, requests, session) = scripted_session([response]).await;
-            let failure = session.prompt("Design feedback").await.unwrap_err();
-            let message = failure.to_string();
-            assert!(
-                message.contains("declined to respond") && message.contains("content filter"),
-                "unexpected failure: {message}"
-            );
-            // A refusal is deterministic, so the runtime must not retry it itself.
-            assert_eq!(requests.lock().unwrap().len(), 1);
+    async fn unusable_responses_fail_the_turn_without_committing_or_retrying() {
+        use crate::session::ModelFailureKind::{Error, Refusal};
+        let call = tool_call(0, "call", "shell", json!({"command":"true"}));
+        let mut incomplete = answer("must not persist");
+        incomplete.truncate(3); // item and block started, item never ended
+        let cases = [
+            // A refusing provider streams nothing, or only an unusable reasoning stub.
+            (refusal(Vec::new()), "content filter", Refusal),
+            (
+                refusal(vec![AssistantContent::reasoning("thought", 0, "", None)]),
+                "declined to respond",
+                Refusal,
+            ),
+            // MaxTokens and Aborted discard tool calls, which can leave nothing at all.
+            (
+                ended(std::slice::from_ref(&call), StopReason::MaxTokens),
+                "no assistant content",
+                Error,
+            ),
+            (
+                ended(&[call], StopReason::Aborted),
+                "provider aborted",
+                Error,
+            ),
+            (response(Vec::new()), "no assistant content", Error),
+            (incomplete, "response ended before all items ended", Error),
+        ];
+        for (chunks, expected, kind) in cases {
+            // The refusal is durable: it must survive a reopen to be continued.
+            let (root, requests) = (tempfile::tempdir().unwrap(), Requests::default());
+            let provider = scripted_provider(&requests, [chunks, answer("must not be requested")]);
             let sessions = root.path().join("sessions");
-            let id = session.id();
-            session.shutdown().await.unwrap();
-            let records = SessionStore::read_records(&sessions, id).await.unwrap();
-            // An error state, never conversation history.
-            assert_eq!(
-                count!(
-                    &records,
-                    SessionEvent::MessageCommitted {
-                        message: Message::Assistant(_)
-                    }
-                ),
-                0
-            );
-            let refusals = events!(
-                &records,
-                SessionEvent::ModelFailed { kind, error, .. }
-                    if *kind == crate::session::ModelFailureKind::Refusal => error.clone()
-            );
-            assert_eq!(refusals.len(), 1);
-            assert!(refusals[0].contains("declined to respond"));
-            // Journaled so a reopened session can still continue the turn.
-            let failed = events!(&records, SessionEvent::AgentFailed { error } => error.clone());
+            let harness = test_harness(root.path(), &sessions, provider).await;
+            let durable = expected == "content filter";
+            let session = match durable {
+                true => harness.new_session().await.unwrap(),
+                false => ephemeral_session(&harness).await,
+            };
+            let failure = session.prompt("hello").await.unwrap_err().to_string();
+            assert!(failure.contains(expected), "unexpected failure: {failure}");
+            assert_eq!(requests.lock().unwrap().len(), 1, "{expected}: retried");
+            let records = session.runtime.store.records().await;
+            // An error state, never conversation history or an executed tool.
+            assert_eq!(assistant_commits(&records), 0);
+            assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 0);
+            let failed = events!(&records, SessionEvent::ModelFailed { kind, error, .. } => (*kind, error.clone()));
             assert_eq!(failed.len(), 1);
-            assert!(failed[0].contains("declined to respond"));
-            assert_eq!(count!(&records, SessionEvent::ModelRequested { .. }), 1);
+            assert_eq!(failed[0].0, kind);
+            assert!(failed[0].1.contains(expected), "{failed:?}");
+            let agent = events!(&records, SessionEvent::AgentFailed { error } => error.clone());
+            assert_eq!(agent.len(), 1);
+            assert!(agent[0].contains(expected), "{agent:?}");
             assert_eq!(
                 count!(&records, SessionEvent::ModelAttemptStarted { .. }),
                 1
@@ -680,13 +606,19 @@ mod tests {
                 count!(&records, SessionEvent::ModelRecoveryScheduled { .. }),
                 0
             );
+            let id = session.id();
+            shutdown_session(session).await;
+            if durable {
+                let reopened = SessionStore::read_records(&sessions, id).await.unwrap();
+                assert_eq!(reopened[..records.len()], records);
+            }
         }
     }
 
     #[tokio::test]
     async fn child_refusal_reports_a_failed_agent_to_its_parent() {
         let work = json!({"prompt":"work"});
-        let (root, _requests, session) = scripted_session([
+        let (_root, _requests, session) = scripted_session([
             response(vec![tool_call(0, "delegate", "agent", work)]),
             // The child refuses; its owner job must fail with that reason.
             refusal(Vec::new()),
@@ -697,10 +629,7 @@ mod tests {
             session.prompt("delegate").await.unwrap(),
             "child could not proceed"
         );
-        let sessions = root.path().join("sessions");
-        let id = session.id();
-        session.shutdown().await.unwrap();
-        let records = SessionStore::read_records(&sessions, id).await.unwrap();
+        let records = session.runtime.store.records().await;
         // The parent sees a failed agent carrying the refusal message.
         let results = events!(
             &records,
@@ -736,52 +665,7 @@ mod tests {
             1
         );
         assert_eq!(count!(&child_records, SessionEvent::AgentFailed { .. }), 1);
-        assert_eq!(
-            count!(
-                &child_records,
-                SessionEvent::MessageCommitted {
-                    message: Message::Assistant(_)
-                }
-            ),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn abnormal_stops_that_strip_their_only_tool_call_fail_instead_of_committing() {
-        // MaxTokens and Aborted discard tool calls, which can leave nothing at all.
-        // Committing that emptiness was a second, independent brick path.
-        for (stop_reason, expected) in [
-            (StopReason::MaxTokens, "no assistant content"),
-            (StopReason::Aborted, "provider aborted"),
-        ] {
-            let call = tool_call(0, "call", "shell", json!({"command":"true"}));
-            let mut events = events_for_content(&[call]);
-            events.push(ResponseChunk::ResponseEnded {
-                stop_reason: stop_reason.clone(),
-            });
-            let (root, _requests, session) = scripted_session([events]).await;
-            let failure = session.prompt("run it").await.unwrap_err();
-            assert!(
-                failure.to_string().contains(expected),
-                "unexpected failure for {stop_reason:?}: {failure}"
-            );
-            let sessions = root.path().join("sessions");
-            let id = session.id();
-            session.shutdown().await.unwrap();
-            let records = SessionStore::read_records(&sessions, id).await.unwrap();
-            assert_eq!(
-                count!(
-                    &records,
-                    SessionEvent::MessageCommitted {
-                        message: Message::Assistant(_)
-                    }
-                ),
-                0
-            );
-            // The stripped call must never have reached execution.
-            assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 0);
-        }
+        assert_eq!(assistant_commits(&child_records), 0);
     }
 
     #[tokio::test]
@@ -792,97 +676,26 @@ mod tests {
         // (`provider::protocol::visible_text`) normalizes blank text away, so the turn
         // completes with no text rather than with the blank string itself.
         for text in ["", "   "] {
-            let (root, _requests, session) =
+            let (_root, _requests, session) =
                 scripted_session([response(vec![AssistantContent::text("answer", 0, text)])]).await;
             assert_eq!(session.prompt("hello").await.unwrap(), "");
-            let sessions = root.path().join("sessions");
-            let id = session.id();
-            session.shutdown().await.unwrap();
-            let records = SessionStore::read_records(&sessions, id).await.unwrap();
-            assert_eq!(
-                count!(
-                    &records,
-                    SessionEvent::MessageCommitted {
-                        message: Message::Assistant(_)
-                    }
-                ),
-                1
-            );
+            let records = session.runtime.store.records().await;
+            assert_eq!(assistant_commits(&records), 1);
             assert_eq!(count!(&records, SessionEvent::ModelFailed { .. }), 0);
             assert_eq!(count!(&records, SessionEvent::AgentFailed { .. }), 0);
         }
     }
 
     #[tokio::test]
-    async fn content_free_response_fails_instead_of_committing_an_unencodable_message() {
-        // Not a refusal, and not merely blank: a response carrying no blocks at all.
-        // Committing it would make every later request unencodable, so the turn fails.
-        let empty = response(Vec::new());
-        let (root, _requests, session) = scripted_session([empty]).await;
-        let failure = session.prompt("hello").await.unwrap_err();
-        assert!(
-            failure.to_string().contains("no assistant content"),
-            "unexpected failure: {failure}"
-        );
-        let sessions = root.path().join("sessions");
-        let id = session.id();
-        session.shutdown().await.unwrap();
-        let records = SessionStore::read_records(&sessions, id).await.unwrap();
-        assert_eq!(
-            count!(
-                &records,
-                SessionEvent::MessageCommitted {
-                    message: Message::Assistant(_)
-                }
-            ),
-            0
-        );
-        // Classified as an ordinary error, not a refusal.
-        assert_eq!(
-            count!(&records, SessionEvent::ModelFailed { kind, .. }
-                if *kind == crate::session::ModelFailureKind::Error),
-            1
-        );
-    }
-
-    #[tokio::test]
     async fn successful_responses_journal_their_terminal_stop_reason() {
-        let (root, _requests, session) = scripted_session([answer("done")]).await;
+        let (_root, _requests, session) = scripted_session([answer("done")]).await;
         assert_eq!(session.prompt("hello").await.unwrap(), "done");
-        let sessions = root.path().join("sessions");
-        let id = session.id();
-        session.shutdown().await.unwrap();
-        let records = SessionStore::read_records(&sessions, id).await.unwrap();
+        let records = session.runtime.store.records().await;
         let reasons = events!(
             &records,
             SessionEvent::ResponseCompleted { stop_reason, .. } => stop_reason.clone()
         );
         assert_eq!(reasons, vec![StopReason::EndTurn]);
-    }
-
-    #[tokio::test]
-    async fn incomplete_native_response_is_not_retried_or_committed() {
-        let mut incomplete = answer("must not persist");
-        incomplete.truncate(3); // item and block started, item never ended
-        let (root, _, session) = scripted_session([incomplete, answer("Recovered")]).await;
-        assert!(session.prompt("Question").await.is_err());
-        session.shutdown().await.unwrap();
-        let sessions = root.path().join("sessions");
-        let records = SessionStore::read_records(&sessions, session.id())
-            .await
-            .unwrap();
-        assert!(records.iter().any(|record| matches!(&record.event,
-            SessionEvent::ModelFailed { error, .. } if error.contains("response ended before all items ended"))));
-        assert_eq!(
-            count!(
-                &records,
-                SessionEvent::MessageCommitted {
-                    message: Message::Assistant(_)
-                }
-            ),
-            0
-        );
-        assert_eq!(count!(&records, SessionEvent::ModelRequested { .. }), 1);
     }
 
     #[test]
@@ -936,7 +749,7 @@ mod tests {
             stop_reason: StopReason::Aborted,
         });
         let (root, requests, session) = scripted_session([chunks]).await;
-        let mut events = session.runtime.events.subscribe();
+        let mut events = session.runtime.events.observe().updates;
         let error = session.prompt("Abort this turn.").await.unwrap_err();
         assert!(
             matches!(error, HarnessError::Agent(error) if error == HarnessError::ProviderAborted.to_string())
@@ -959,7 +772,7 @@ mod tests {
         assert!(!root.path().join("must-not-exist").exists());
         let mut settled = false;
         while let Ok(event) = events.try_recv() {
-            match event {
+            match event.event {
                 RuntimeEvent::ResponseSettled { message, error, .. } => {
                     assert!(message.is_some());
                     assert_eq!(error.as_deref(), Some("provider aborted response"));

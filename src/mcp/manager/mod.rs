@@ -178,42 +178,37 @@ impl McpManager {
         }
         let server = self.servers.get(server).expect("catalog server exists");
         let deadline = tokio::time::Instant::now() + server.timeout;
-        let _permit = tokio::select! {
-            biased;
-            _ = self.closed.cancelled() => return Err(McpError::Closed),
-            _ = cancel.cancelled() => return Err(McpError::Cancelled),
-            _ = tokio::time::sleep_until(deadline) => return Err(McpError::Timeout),
-            permit = server.calls.acquire() => permit.map_err(|_| McpError::Closed)?,
-        };
+        let _permit = guarded(&self.closed, &cancel, deadline, server.calls.acquire())
+            .await?
+            .map_err(|_| McpError::Closed)?;
         if bounded_json_size(&arguments, MAX_RESULT_BYTES).is_none() {
             return Err(McpError::Request("tool arguments exceed size limit".into()));
         }
         let request = ClientRequest::CallToolRequest(CallToolRequest::new(
             CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments),
         ));
-        let handle = tokio::select! {
-            biased;
-            _ = self.closed.cancelled() => return Err(McpError::Closed),
-            _ = cancel.cancelled() => return Err(McpError::Cancelled),
-            _ = tokio::time::sleep_until(deadline) => return Err(McpError::Timeout),
-            result = server.peer.send_cancellable_request(request, PeerRequestOptions::default()) => result.map_err(request_error)?,
-        };
+        let send = server
+            .peer
+            .send_cancellable_request(request, PeerRequestOptions::default());
+        let handle = guarded(&self.closed, &cancel, deadline, send)
+            .await?
+            .map_err(request_error)?;
         let mut handle = CancelOnDrop(Some(handle));
-        let result = tokio::select! {
-            biased;
-            _ = self.closed.cancelled() => Err(McpError::Closed),
-            _ = cancel.cancelled() => Err(McpError::Cancelled),
-            _ = tokio::time::sleep_until(deadline) => Err(McpError::Timeout),
-            response = &mut handle.0.as_mut().expect("active request").rx => match response {
-                Ok(Ok(ServerResult::CallToolResult(result))) => {
-                    if bounded_json_size(&result, MAX_RESULT_BYTES).is_none() {
-                        Err(McpError::Request("tool result exceeds size limit".into()))
-                    } else { Ok(result) }
-                },
-                Ok(Ok(_)) => Err(McpError::Request("unexpected response to tools/call".into())),
-                Ok(Err(error)) => Err(request_error(error)),
-                Err(_) => Err(McpError::Request("transport closed".into())),
-            },
+        let response = &mut handle.0.as_mut().expect("active request").rx;
+        let result = match guarded(&self.closed, &cancel, deadline, response).await {
+            Ok(Ok(Ok(ServerResult::CallToolResult(result)))) => {
+                if bounded_json_size(&result, MAX_RESULT_BYTES).is_none() {
+                    Err(McpError::Request("tool result exceeds size limit".into()))
+                } else {
+                    Ok(result)
+                }
+            }
+            Ok(Ok(Ok(_))) => Err(McpError::Request(
+                "unexpected response to tools/call".into(),
+            )),
+            Ok(Ok(Err(error))) => Err(request_error(error)),
+            Ok(Err(_)) => Err(McpError::Request("transport closed".into())),
+            Err(error) => Err(error),
         };
         if !matches!(
             result,
@@ -237,6 +232,22 @@ impl McpManager {
 impl Drop for McpManager {
     fn drop(&mut self) {
         self.closed.cancel();
+    }
+}
+
+/// Runs `future` until the manager closes, the caller cancels, or the deadline passes.
+async fn guarded<T>(
+    closed: &CancellationToken,
+    cancel: &CancellationToken,
+    deadline: tokio::time::Instant,
+    future: impl Future<Output = T>,
+) -> Result<T, McpError> {
+    tokio::select! {
+        biased;
+        () = closed.cancelled() => Err(McpError::Closed),
+        () = cancel.cancelled() => Err(McpError::Cancelled),
+        () = tokio::time::sleep_until(deadline) => Err(McpError::Timeout),
+        value = future => Ok(value),
     }
 }
 
@@ -408,7 +419,11 @@ for line in sys.stdin:
     // fallbacks. Do not kill by saved PID: a reaped PID can be reused.
 
     pub(super) async fn connect(config: crate::mcp::config::RawMcpServerConfig) -> McpManager {
-        let configs = BTreeMap::from([("fixture".into(), config.try_into().unwrap())]);
+        connect_admitted(config.try_into().unwrap()).await
+    }
+
+    async fn connect_admitted(config: McpServerConfig) -> McpManager {
+        let configs = BTreeMap::from([("fixture".into(), config)]);
         let capabilities = CapabilitySet::default();
         let connect = McpManager::connect(&configs, &capabilities, CancellationToken::new());
         tokio::time::timeout(Duration::from_secs(10), connect)
@@ -563,15 +578,16 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn cancellation_interrupts_an_inflight_call_without_poisoning_session() {
+    async fn cancelled_and_dropped_inflight_calls_notify_the_server_and_keep_the_session() {
         let Some(fixture) = Fixture::new() else {
             return;
         };
-        let manager = connect(fixture.config()).await;
+        let manager = std::sync::Arc::new(connect(fixture.config()).await);
+        let (started, cancelled) = (fixture.path("started"), fixture.path("cancelled"));
         let cancel = CancellationToken::new();
         let call = manager.call("fixture", "slow", Map::new(), cancel.clone());
         let cancel_when_started = async {
-            wait_for_file(&fixture.directory.path().join("started")).await;
+            wait_for_file(Path::new(&started)).await;
             cancel.cancel();
         };
         let (result, ()) = tokio::time::timeout(Duration::from_secs(7), async {
@@ -580,22 +596,18 @@ for line in sys.stdin:
         .await
         .expect("cancellation interrupts the pending tool call");
         assert!(matches!(result, Err(McpError::Cancelled)), "{result:?}");
-        assert!(fixture_call(&manager, "echo").await.is_ok());
-        shutdown(&manager).await;
-    }
+        wait_for_file(Path::new(&cancelled)).await;
+        fixture_call(&manager, "echo").await.unwrap();
 
-    #[tokio::test]
-    async fn dropping_call_future_sends_cancel_and_keeps_session_usable() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
-        let manager = std::sync::Arc::new(connect(fixture.config()).await);
+        // Dropping the caller's future has the same effect as its token.
+        std::fs::remove_file(&started).unwrap();
+        std::fs::remove_file(&cancelled).unwrap();
         let call_manager = manager.clone();
         let task = tokio::spawn(async move { fixture_call(&call_manager, "slow").await });
-        wait_for_file(&fixture.directory.path().join("started")).await;
+        wait_for_file(Path::new(&started)).await;
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        wait_for_file(&fixture.directory.path().join("cancelled")).await;
+        wait_for_file(Path::new(&cancelled)).await;
         fixture_call(&manager, "echo").await.unwrap();
         shutdown(&manager).await;
     }
@@ -605,19 +617,27 @@ for line in sys.stdin:
         let Some(fixture) = Fixture::new() else {
             return;
         };
-        let mut config = fixture.config();
-        config.call_timeout_secs = 1;
-        let manager = connect(config).await;
+        let config = McpServerConfig::try_from(fixture.config()).unwrap();
+        let config = config.with_call_timeout(Duration::from_millis(250));
+        let manager = connect_admitted(config).await;
         let call = fixture_call(&manager, "slow");
         let result = tokio::time::timeout(Duration::from_secs(5), call)
             .await
             .expect("configured timeout must stop a pending call");
-        assert!(
-            fixture.directory.path().join("started").exists(),
-            "call reached server"
-        );
         assert!(matches!(result, Err(McpError::Timeout)), "{result:?}");
-        assert!(fixture_call(&manager, "echo").await.is_ok());
+        // The timed-out call was already sent.
+        wait_for_file(&fixture.directory.path().join("started")).await;
+        // The session stays usable; under load an echo may itself exceed the short timeout.
+        let echo = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match fixture_call(&manager, "echo").await {
+                    Err(McpError::Timeout) => {}
+                    other => break other,
+                }
+            }
+        });
+        let echo = echo.await.expect("session wedged after a timed-out call");
+        assert!(echo.is_ok(), "{echo:?}");
         shutdown(&manager).await;
         // Oversized results are rejected without exposing content.
         let mut config = fixture.config();

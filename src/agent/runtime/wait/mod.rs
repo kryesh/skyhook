@@ -43,10 +43,12 @@ impl AgentWake {
     /// The latest scheduled wake revision; differs from the released one while a
     /// coalescing window is open.
     fn scheduled(&self) -> u64 {
-        self.batch
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .revision
+        self.batch().revision
+    }
+
+    fn batch(&self) -> std::sync::MutexGuard<'_, EventBatch> {
+        let batch = self.batch.lock();
+        batch.unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -111,11 +113,7 @@ impl AgentSender {
     /// Stays synchronous and non-blocking; `send` calls this between
     /// `reserve` and `permit.send` with no await in between.
     fn schedule(&self, input: bool) {
-        let mut batch = self
-            .wake
-            .batch
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut batch = self.wake.batch();
         batch.revision = batch.revision.wrapping_add(1);
         if input {
             batch.input_revision = batch.input_revision.wrapping_add(1);
@@ -146,10 +144,7 @@ impl AgentSender {
                 }
             }
             let Some(wake) = wake.upgrade() else { return };
-            let mut batch = wake
-                .batch
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut batch = wake.batch();
             wake.ready_input_revision
                 .store(batch.input_revision, Ordering::Release);
             batch.activity = None;
@@ -163,12 +158,7 @@ impl AgentSender {
         cancellation: &crate::job::CancellationToken,
     ) -> Result<(), super::HarnessError> {
         let mut revision = self.wake.revision.subscribe();
-        let requested = self
-            .wake
-            .batch
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .revision;
+        let requested = self.wake.scheduled();
         loop {
             if cancellation.is_cancelled() {
                 return Err(super::HarnessError::Interrupted);
@@ -291,134 +281,34 @@ impl SessionRuntime {
     }
 }
 
+// Most tests pause time: journal and job I/O runs in `spawn_blocking`, which holds
+// the paused clock still. A test that spawns a real process must use real time.
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::Arc;
 
     use serde_json::Value;
-    use tokio::sync::{Notify, Semaphore};
 
     use super::super::*;
     use super::{COALESCE_MAX_WINDOW, COALESCE_QUIET_WINDOW};
-    pub(super) use crate::agent::runtime::tests::{bounded, enqueue_prompts};
+    pub(super) use crate::agent::runtime::tests::{
+        Script, Step, bounded, enqueue_prompts, ephemeral_session, poll, rendered, response,
+    };
     use crate::{
         job::{JobOutcome, JobSpec, JobState},
-        provider::{
-            ProviderContext, ProviderError, ProviderFuture, ResponseStream,
-            protocol::{ItemKind, StopReason, events_for_content},
-        },
         tool::ToolOutput,
     };
 
-    pub(super) struct Step {
-        model: &'static str,
-        pub(super) content: Vec<AssistantContent>,
-        gate: Semaphore,
+    /// Gated steps, each served to the named model profile's next request.
+    pub(super) fn tracking_all(steps: Vec<(&'static str, Vec<AssistantContent>)>) -> Arc<Script> {
+        let steps = steps
+            .into_iter()
+            .map(|(model, content)| Step::new(response(content)).model(model).gated());
+        Script::new(steps, &Default::default())
     }
 
-    pub(super) struct Tracking {
-        pub(super) steps: Vec<Step>,
-        pub(super) requests: StdMutex<Vec<(usize, ModelRequest)>>,
-        changed: Notify,
-    }
-
-    impl Tracking {
-        pub(super) fn new(steps: Vec<(&'static str, AssistantContent)>) -> Arc<Self> {
-            let steps = steps.into_iter().map(|(m, c)| (m, vec![c]));
-            Self::responses(steps.collect())
-        }
-
-        pub(super) fn responses(steps: Vec<(&'static str, Vec<AssistantContent>)>) -> Arc<Self> {
-            let steps = steps.into_iter().map(|(model, content)| Step {
-                model,
-                content,
-                gate: Semaphore::new(0),
-            });
-            Arc::new(Self {
-                steps: steps.collect(),
-                requests: StdMutex::new(Vec::new()),
-                changed: Notify::new(),
-            })
-        }
-
-        pub(super) async fn request(&self, step: usize) -> ModelRequest {
-            bounded(async {
-                loop {
-                    let notified = self.changed.notified();
-                    if let Some((_, request)) = self
-                        .requests
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .find(|(id, _)| *id == step)
-                    {
-                        return request.clone();
-                    }
-                    notified.await;
-                }
-            })
-            .await
-        }
-
-        pub(super) fn release(&self, step: usize) {
-            self.steps[step].gate.add_permits(1);
-        }
-
-        /// Waits for a step's request, then lets its response through.
-        pub(super) async fn pass(&self, step: usize) -> ModelRequest {
-            let request = self.request(step).await;
-            self.release(step);
-            request
-        }
-
-        /// Whether any step at or after `step` has been requested.
-        pub(super) fn requested_from(&self, step: usize) -> bool {
-            let requests = self.requests.lock().unwrap();
-            requests.iter().any(|(seen, _)| *seen >= step)
-        }
-    }
-
-    pub(super) struct Factory(Arc<Tracking>);
-    pub(super) struct Context(Arc<Tracking>);
-
-    impl Provider for Factory {
-        fn open_context(&self, _: String) -> Result<Box<dyn ProviderContext>, ProviderError> {
-            Ok(Box::new(Context(self.0.clone())))
-        }
-    }
-
-    impl ProviderContext for Context {
-        fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
-            let tracking = self.0.clone();
-            let step = {
-                let mut requests = tracking.requests.lock().unwrap();
-                let step = tracking
-                    .steps
-                    .iter()
-                    .enumerate()
-                    .position(|(index, step)| {
-                        step.model == request.model
-                            && !requests.iter().any(|(seen, _)| *seen == index)
-                    })
-                    .expect("unexpected extra model request");
-                requests.push((step, request));
-                step
-            };
-            tracking.changed.notify_one();
-            Box::pin(async move {
-                tracking.steps[step].gate.acquire().await.unwrap().forget();
-                let content = tracking.steps[step].content.clone();
-                let stop_reason = if content.iter().any(|item| item.kind == ItemKind::ToolCall) {
-                    StopReason::ToolUse
-                } else {
-                    StopReason::EndTurn
-                };
-                let mut events = events_for_content(&content);
-                events.push(ResponseChunk::ResponseEnded { stop_reason });
-                let events = futures_util::stream::iter(events.into_iter().map(Ok));
-                Ok(Box::pin(events) as ResponseStream)
-            })
-        }
+    pub(super) fn tracking(steps: Vec<(&'static str, AssistantContent)>) -> Arc<Script> {
+        tracking_all(steps.into_iter().map(|(m, c)| (m, vec![c])).collect())
     }
 
     pub(super) fn call(id: &str, name: &str, arguments: Value) -> AssistantContent {
@@ -430,20 +320,20 @@ mod tests {
     }
 
     /// A session whose "root" and "child" profiles are answered by `tracking`.
-    pub(super) async fn start(tracking: &Arc<Tracking>) -> (tempfile::TempDir, Arc<SessionHandle>) {
+    pub(super) async fn start(tracking: &Arc<Script>) -> (tempfile::TempDir, Arc<SessionHandle>) {
         let root = tempfile::tempdir().unwrap();
         let profile =
             |model: &str| ModelProfile::new("wait-test", model, None, 128_000, 4096, true);
         let harness = HarnessBuilder::new(root.path())
             .session_root(root.path().join("sessions"))
-            .provider("wait-test", Arc::new(Factory(tracking.clone())))
+            .provider("wait-test", tracking.clone())
             .model_profile("root", profile("root"))
             .model_profile("child", profile("child"))
             .default_model_profile("root")
             .build()
             .await
             .unwrap();
-        (root, Arc::new(harness.new_session().await.unwrap()))
+        (root, Arc::new(ephemeral_session(&harness).await))
     }
 
     pub(super) fn prompt(
@@ -462,7 +352,7 @@ mod tests {
                 {
                     return job.id;
                 }
-                tokio::task::yield_now().await;
+                poll().await;
             }
         })
         .await
@@ -618,9 +508,9 @@ mod tests {
         assert_eq!(elapsed, COALESCE_MAX_WINDOW);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn positive_timeouts_do_not_wake_on_their_own_jobs() {
-        let tracking = Tracking::new(vec![
+        let tracking = tracking(vec![
             ("root", call("first", "wait", json!({"timeout":1}))),
             ("root", call("second", "wait", json!({"timeout":1}))),
             ("root", answer()),
@@ -638,9 +528,9 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn clustered_background_completions_wake_and_inject_saved_output_once() {
-        let tracking = Tracking::new(vec![
+        let tracking = tracking(vec![
             ("root", call("waiting", "wait", json!({}))),
             ("root", call("again", "wait", json!({"timeout":1}))),
             ("root", answer()),
@@ -667,9 +557,9 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn completion_before_wait_registration_is_not_lost() {
-        let tracking = Tracking::new(vec![
+        let tracking = tracking(vec![
             ("root", call("waiting", "wait", json!({"timeout":1}))),
             ("root", answer()),
         ]);
@@ -685,9 +575,9 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_user_input_wakes_wait_without_consuming_the_input() {
-        let tracking = Tracking::new(vec![
+        let tracking = tracking(vec![
             ("root", call("waiting", "wait", json!({"timeout":null}))),
             ("root", call("again", "wait", json!({"timeout":1}))),
             ("root", answer()),
@@ -704,7 +594,7 @@ mod tests {
         let request = tracking.request(1).await;
         bounded(queued).await.unwrap().unwrap();
         assert_reason(&request, "waiting", "event");
-        let messages = serde_json::to_string(&request.messages().collect::<Vec<_>>()).unwrap();
+        let messages = rendered(&request);
         assert!(messages.contains("queued-wake-marker"));
         tracking.release(1);
         assert_reason(&tracking.pass(2).await, "again", "timeout");
@@ -715,9 +605,7 @@ mod tests {
     fn queued(text: &str) -> QueuedPrompt {
         QueuedPrompt {
             text: text.into(),
-            attachments: vec![],
-            options: PromptOptions::default(),
-            token: QueuedPromptToken::new().unwrap(),
+            ..Default::default()
         }
     }
 
@@ -726,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn waits_do_not_defer_to_work_inside_a_background_script() {
         let sleeper = json!({"source":"await tool.exec({argv:['sleep','30']});", "bg":true});
-        let tracking = Tracking::new(vec![
+        let tracking = tracking(vec![
             ("root", call("bg", "script", sleeper)),
             ("root", call("hold", "wait", json!({"timeout":null}))),
             ("root", answer()),
@@ -758,12 +646,13 @@ mod tests {
 
     /// A wait deferring to a script must wake when that script parks in its own
     /// wait, not sleep until the script ends.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_deferring_wait_wakes_when_its_holder_parks() {
         let first = json!({"source":"return await tool.wait({timeout:30});"});
-        let second = json!({"source":"await tool.exec({argv:['sleep','1']}); \
-            await tool.wait({timeout:30}); return await tool.wait({timeout:3});"});
-        let tracking = Tracking::responses(vec![
+        // Holds the agent for a (virtual) second, then parks in a wait of its own.
+        let second = json!({"source":"await sleep(1000); \
+            await tool.wait({timeout:30}); return await tool.wait({timeout:1});"});
+        let tracking = tracking_all(vec![
             (
                 "root",
                 vec![
@@ -780,7 +669,14 @@ mod tests {
         let (_root, session) = start(&tracking).await;
         let turn = prompt(&session);
         tracking.pass(0).await;
-        running_job(&session, &session.root, "exec").await;
+        let scripts = async || {
+            let jobs = session.runtime.jobs.list(&session.root).await;
+            jobs.into_iter()
+                .filter(|job| job.tool == "script")
+                .collect::<Vec<_>>()
+        };
+        let wait = running_job(&session, &session.root, "wait").await;
+        let deferring = session.runtime.jobs.snapshot(wait).await.unwrap().parent;
         let queued = tokio::spawn({
             let session = session.clone();
             async move {
@@ -790,25 +686,25 @@ mod tests {
                     .unwrap()
             }
         });
-        let scripts = async || {
-            let jobs = session.runtime.jobs.list(&session.root).await;
-            jobs.into_iter()
-                .filter(|job| job.tool == "script")
-                .collect::<Vec<_>>()
-        };
+        // The input's batch has released, yet the wait defers to the busy script.
+        tokio::time::sleep(COALESCE_MAX_WINDOW).await;
+        assert!(
+            scripts()
+                .await
+                .iter()
+                .all(|job| job.state == JobState::Running)
+        );
         let finished = bounded(async {
             loop {
-                if let Some(done) = scripts()
-                    .await
-                    .into_iter()
-                    .find(|job| job.state.is_terminal())
-                {
+                let mut scripts = scripts().await.into_iter();
+                if let Some(done) = scripts.find(|job| job.state.is_terminal()) {
                     return done.id;
                 }
-                tokio::task::yield_now().await;
+                poll().await;
             }
         })
         .await;
+        assert_eq!(Some(finished), deferring);
         // The first to finish is the deferring script, told about the input while
         // the other is still parked in its second wait.
         let others = scripts().await.into_iter().filter(|job| job.id != finished);
@@ -832,9 +728,9 @@ mod tests {
     /// What a script was shown depends only on what was pending when it looked, not
     /// on when the wake revision catches up: a notification becomes pending before
     /// its wake is forwarded, and must not be reported to the same script twice.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_script_is_shown_each_pending_notification_once() {
-        let (_root, session) = start(&Tracking::new(vec![])).await;
+        let (_root, session) = start(&tracking(vec![])).await;
         let (jobs, root) = (&session.runtime.jobs, &session.root);
         let script = JobSpec {
             role: crate::job::JobRole::Script,
@@ -861,10 +757,10 @@ mod tests {
     }
 
     /// Waits must not defer to each other: both wake on the same event.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn concurrent_waits_do_not_defer_to_each_other() {
         let second = ToolCall::new("second", "wait", json!({"timeout":null})).unwrap();
-        let tracking = Tracking::responses(vec![
+        let tracking = tracking_all(vec![
             (
                 "root",
                 vec![
@@ -888,7 +784,7 @@ mod tests {
                 .count()
                 < 2
             {
-                tokio::task::yield_now().await;
+                poll().await;
             }
         })
         .await;
@@ -908,11 +804,11 @@ mod tests {
 
     /// Queued input stays unconsumed while a script runs; it must still wake the
     /// script's waits only once.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn queued_input_does_not_respin_a_script_wait() {
         let source = "const first = await tool.wait({timeout:60}); \
             const second = await tool.wait({timeout:1}); return [first, second];";
-        let tracking = Tracking::new(vec![
+        let tracking = tracking(vec![
             ("root", call("run", "script", json!({"source": source}))),
             ("root", answer()),
         ]);
@@ -941,7 +837,7 @@ mod tests {
             Some(&expected),
             "{output:?}"
         );
-        let history = serde_json::to_string(&request.messages().collect::<Vec<_>>()).unwrap();
+        let history = rendered(&request);
         assert_eq!(
             history.matches("queued-respin-marker").count(),
             1,
@@ -952,10 +848,10 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn parent_input_wakes_wait_and_is_in_the_next_model_request() {
         let launch = json!({"prompt":"child task", "model":"child", "bg":true});
-        let tracking = Tracking::new(vec![
+        let tracking = tracking(vec![
             ("root", call("child", "agent", launch)),
             ("child", call("child-wait", "wait", json!({}))),
             ("root", call("parent-wait", "wait", json!({}))),
@@ -977,7 +873,7 @@ mod tests {
             .unwrap();
         let next = tracking.pass(3).await;
         assert_reason(&next, "child-wait", "event");
-        let messages = serde_json::to_string(&next.messages().collect::<Vec<_>>()).unwrap();
+        let messages = rendered(&next);
         assert_eq!(messages.matches("parent-wake-marker").count(), 1);
         child_completed(&session, child_job).await;
         tracking.release(2);
@@ -986,9 +882,9 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn wait_rejects_invalid_arguments_and_script_waits_do_not_self_wake() {
-        let (_root, session) = start(&Tracking::new(vec![])).await;
+        let (_root, session) = start(&tracking(vec![])).await;
         let invalid = json!([{"timeout":0}, {"timeout":0.125}, {"timeout":-1}, {"timeout":1e300}, {"timeout":"1"}, {"timeout":true}, {"bg":true}, {"bg":false}, {"job":1}, {"wait":1}]);
         for invalid in invalid.as_array().unwrap() {
             let executor = &session.runtime.executor;
@@ -1002,9 +898,9 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancelling_an_indefinite_wait_unblocks_the_agent() {
-        let tracking = Tracking::new(vec![
+        let tracking = tracking(vec![
             ("root", call("waiting", "wait", json!({}))),
             ("root", answer()),
         ]);
@@ -1014,7 +910,7 @@ mod tests {
         let job = running_job(&session, &session.root, "wait").await;
         session.cancel_job(job).await.unwrap();
         let next = tracking.request(1).await;
-        let text = serde_json::to_string(&next.messages().collect::<Vec<_>>()).unwrap();
+        let text = rendered(&next);
         assert!(text.contains("cancel"), "{text}");
         let state = session.runtime.jobs.snapshot(job).await.unwrap().state;
         assert_eq!(state, JobState::Cancelled);
@@ -1030,16 +926,16 @@ mod tests {
                 session.observe().await.snapshot.activity.get(agent),
                 Some(AgentActivity::Tools)
             ) {
-                tokio::task::yield_now().await;
+                poll().await;
             }
         })
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn interrupt_unblocks_an_agent_held_by_a_foreground_script_wait() {
         let source = json!({"source":"await tool.wait({timeout:30}); return 'late';"});
-        let tracking = Tracking::new(vec![
+        let tracking = tracking(vec![
             ("root", call("blocked", "script", source)),
             ("root", answer()),
         ]);
@@ -1062,7 +958,7 @@ mod tests {
             async move { session.continue_turn().await }
         });
         let history = tracking.request(1).await;
-        let history = serde_json::to_string(&history.messages().collect::<Vec<_>>()).unwrap();
+        let history = rendered(&history);
         assert!(history.contains("cancel"), "{history}");
         tracking.release(1);
         assert_eq!(bounded(resumed).await.unwrap().unwrap(), "done");
@@ -1071,11 +967,11 @@ mod tests {
 
     /// A model-delegated child is retained while the script blocking the same turn
     /// is cancelled. (A child the script launched would die with it.)
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn interrupt_cancels_blocking_tools_and_retains_delegated_children() {
         let delegate = json!({"prompt":"work", "model":"child", "name":"kid"});
         let blocked = json!({"source":"await tool.wait({timeout:30});"});
-        let tracking = Tracking::responses(vec![
+        let tracking = tracking_all(vec![
             (
                 "root",
                 vec![
@@ -1106,7 +1002,7 @@ mod tests {
         let settled = async |job, want| {
             bounded(async {
                 while state(job).await != want {
-                    tokio::task::yield_now().await;
+                    poll().await;
                 }
             })
             .await;
@@ -1122,9 +1018,9 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn idle_agent_batches_background_notifications_without_a_wait_call() {
-        let tracking = Tracking::new(vec![("root", answer()); 3]);
+        let tracking = tracking(vec![("root", answer()); 3]);
         let (_root, session) = start(&tracking).await;
         let root = &session.root;
         let initial = prompt(&session);
@@ -1144,8 +1040,7 @@ mod tests {
         });
         tracking.release(1);
         let final_request = tracking.pass(2).await;
-        let messages =
-            serde_json::to_string(&final_request.messages().collect::<Vec<_>>()).unwrap();
+        let messages = rendered(&final_request);
         assert!(messages.contains("idle-batch-barrier"));
         // completed output must not be injected twice
         assert_eq!(events(&final_request), notifications);

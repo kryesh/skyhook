@@ -1,9 +1,9 @@
-//! Native streaming event dispatch, shared by SSE and Codex WebSocket.
+//! Native streaming event dispatch.
 use super::normalization::NormalizedEvent;
 use super::*;
 
 impl Decoder {
-    /// Feed a native Responses event (also used by Codex WebSocket transport).
+    /// Feed a native Responses event.
     pub(crate) fn feed(&mut self, event: Value) -> Result<Vec<ResponseChunk>, ProviderError> {
         if self.completed {
             return Err(protocol("event after terminal response"));

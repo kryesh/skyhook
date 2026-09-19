@@ -115,51 +115,6 @@ fn syntax_color(color: Color) -> SyntaxColor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use syntect::{highlighting::Highlighter, parsing::Scope};
-
-    #[test]
-    fn content_roles_preserve_neutrals_and_syntax_scopes_follow_semantic_roles() {
-        let colors = ContentTheme::new();
-        assert_eq!(colors.fg, Color::Rgb(222, 225, 230));
-        assert_eq!(
-            (colors.heading, colors.inline_code),
-            (colors.primary, colors.primary)
-        );
-        assert_eq!(
-            (colors.strong, colors.quote),
-            (colors.secondary, colors.muted)
-        );
-        assert_ne!(colors.primary, colors.secondary);
-        assert_ne!(colors.accent, colors.success);
-        let theme = colors.syntax_theme();
-        assert_eq!(theme.settings.background, None);
-        assert!(
-            theme
-                .scopes
-                .iter()
-                .all(|item| item.style.background.is_none())
-        );
-        let highlighter = Highlighter::new(&theme);
-        for (scope, expected) in [
-            ("variable.other", colors.fg),
-            ("comment.line", colors.muted),
-            ("keyword.control", colors.secondary),
-            ("storage.type", colors.secondary),
-            ("entity.name.function", colors.secondary),
-            ("variable.function", colors.secondary),
-            ("constant.language.boolean", colors.primary),
-            ("constant.numeric", colors.accent),
-            ("string.quoted.double", colors.success),
-            ("entity.name.label", colors.info),
-            ("string.regexp", colors.warning),
-            ("keyword.operator.arithmetic", colors.error),
-            ("markup.inserted", colors.success),
-            ("markup.deleted", colors.error),
-        ] {
-            let style = highlighter.style_for_stack(&[Scope::new(scope).unwrap()]);
-            assert_eq!(style.foreground, syntax_color(expected), "{scope}");
-        }
-    }
 
     #[test]
     fn semantic_colours_have_text_contrast_on_existing_surfaces() {

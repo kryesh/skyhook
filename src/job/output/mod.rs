@@ -203,8 +203,17 @@ struct Selection {
     offset: usize,
 }
 
-fn escape_pointer(key: &str) -> String {
-    key.replace('~', "~0").replace('/', "~1")
+/// The JSON Pointer of object member `key` under `field`.
+fn property_field(field: &str, key: &str) -> String {
+    format!("{field}/{}", key.replace('~', "~0").replace('/', "~1"))
+}
+
+/// Run blocking output work off the async workers.
+pub(super) async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, ToolError> + Send + 'static,
+) -> Result<T, ToolError> {
+    let joined = tokio::task::spawn_blocking(work).await;
+    joined.map_err(|error| ToolError::Failed(error.to_string()))?
 }
 
 /// Persist a compact document whose referenced and large strings live in captures.
@@ -256,7 +265,7 @@ fn save_document(
             }
             Value::Object(map) => {
                 for (key, value) in map {
-                    let child = format!("{field}/{}", escape_pointer(key));
+                    let child = property_field(field, key);
                     visit(output, registered, referenced, &child, value, fields)?;
                 }
             }
@@ -372,8 +381,7 @@ fn render(
                 }
                 serde_json::to_writer(&mut *out, key)?;
                 out.write_all(b": ")?;
-                let child = format!("{field}/{}", escape_pointer(key));
-                render(saved, &child, value, out, cancellation)?;
+                render(saved, &property_field(field, key), value, out, cancellation)?;
             }
             out.write_all(b"\n}")?;
         }
@@ -444,14 +452,8 @@ impl JobManager {
                 .collect(),
             fields: presentation.fields.into_iter().collect(),
         };
-        tokio::task::spawn_blocking(move || {
-            output
-                .db
-                .save_presentation(output.job.get(), &rows)
-                .map_err(database)
-        })
-        .await
-        .map_err(|error| ToolError::Failed(error.to_string()))?
+        let job = output.job.get();
+        blocking(move || output.db.save_presentation(job, &rows).map_err(database)).await
     }
 
     pub(crate) async fn output_changed(&self, id: JobId) {
@@ -487,14 +489,8 @@ impl JobManager {
     }
 
     /// Host inspection never acknowledges an agent's pending notification.
-    ///
-    /// When stored captures exist, the view includes `captures`, an array of
-    /// `{field, kind, complete}` descriptors. `field` is an explicit output-query
-    /// JSON Pointer; `kind` is `text`, `json`, or `unknown` (streamed transport data
-    /// whose type is not known yet). Live or recovered unfinished captures have
-    /// `complete: false`; they may contain invalid JSON and are exposed only as
-    /// raw pages, never as a synthesized result. Discovery does not select a
-    /// default capture or change explicit field/paging queries.
+    /// Stored captures are listed as `captures: [{field, kind, complete}]`; an
+    /// incomplete capture is exposed only as raw pages, never as a result.
     pub async fn inspect_output(
         &self,
         args: OutputArgs,
@@ -515,17 +511,13 @@ impl JobManager {
             .state
             .is_terminal();
         let output = self.output(job);
-        tokio::task::spawn_blocking(move || {
+        blocking(move || {
             fn visit(value: &Value, pointer: String, paths: &mut Vec<String>) {
                 paths.push(pointer.clone());
                 match value {
                     Value::Object(object) => {
                         for (key, value) in object {
-                            visit(
-                                value,
-                                format!("{pointer}/{}", key.replace('~', "~0").replace('/', "~1")),
-                                paths,
-                            );
+                            visit(value, property_field(&pointer, key), paths);
                         }
                     }
                     Value::Array(array) => {
@@ -561,18 +553,12 @@ impl JobManager {
             Ok(paths)
         })
         .await
-        .map_err(|error| ToolError::Failed(error.to_string()))?
     }
 
     /// Host inspection with automatic pages for captures absent from the whole
     /// presentation. Any explicit selection (including `context: 0`) suppresses
-    /// hydration. A present JSON null is not an absent capture.
-    ///
-    /// Metadata/images belong to the initial job snapshot; captures remain
-    /// live reads and can advance while up to four pages are read concurrently.
-    /// A failed initial inspection is returned; individual page failures are
-    /// embedded as `{error}` in that capture's `output`. This never acknowledges
-    /// pending notifications, and does not recursively hydrate capture pages.
+    /// hydration, and a present JSON null is not an absent capture. A page
+    /// failure is embedded as `{error}` in that capture's `output`.
     pub async fn inspect_output_with_captures(
         &self,
         args: OutputArgs,
@@ -696,10 +682,7 @@ impl JobManager {
         let map = view.as_object_mut().expect("job envelope is an object");
         map.remove("output");
         let output = self.output(args.job);
-        let saved =
-            tokio::task::spawn_blocking(move || Saved::load(&output).map(std::sync::Arc::new))
-                .await
-                .map_err(|error| ToolError::Failed(error.to_string()))??;
+        let saved = blocking(move || Saved::load(&output).map(std::sync::Arc::new)).await?;
         let captures = captures::available_captures(&saved, terminal)?;
         let incomplete_capture = terminal
             && captures.iter().any(|capture| {
@@ -721,9 +704,7 @@ impl JobManager {
         if structured {
             let presentation_output = saved.output.clone();
             let script_presentation =
-                tokio::task::spawn_blocking(move || ScriptPresentation::load(&presentation_output))
-                    .await
-                    .map_err(|error| ToolError::Failed(error.to_string()))??;
+                blocking(move || ScriptPresentation::load(&presentation_output)).await?;
             let mut children = BTreeMap::new();
             let mut replacements = BTreeMap::new();
             for (field, child) in script_presentation.jobs {
@@ -754,7 +735,7 @@ impl JobManager {
             }
             let projected = saved.clone();
             let cancellation = args.cancellation.clone().unwrap_or_default();
-            let view = tokio::task::spawn_blocking(move || {
+            let view = blocking(move || {
                 truncation::project(
                     &projected,
                     &output_schema,
@@ -763,8 +744,7 @@ impl JobManager {
                     &replacements,
                 )
             })
-            .await
-            .map_err(|e| ToolError::Failed(e.to_string()))??;
+            .await?;
             map.extend(view);
         } else if question && let Some(value) = live_question {
             if !explicit {
@@ -797,7 +777,7 @@ impl JobManager {
             let page = if unavailable {
                 reader::empty(&c, None, false)
             } else {
-                tokio::task::spawn_blocking(move || {
+                blocking(move || {
                     let closed = terminal || c.field.starts_with("/questions/");
                     let source = match question_page {
                         Some(bytes) => Some(Source::Memory(std::io::Cursor::new(bytes))),
@@ -805,8 +785,7 @@ impl JobManager {
                     };
                     reader::page(source, &c, limit, closed, &cancellation)
                 })
-                .await
-                .map_err(|e| ToolError::Failed(e.to_string()))??
+                .await?
             };
             if terminal {
                 let complete = saved
@@ -864,7 +843,7 @@ impl JobManager {
             return Ok(());
         }
         let output = self.output(envelope.id);
-        let value = tokio::task::spawn_blocking(move || {
+        let value = blocking(move || {
             let saved = Saved::load(&output)?;
             saved
                 .document
@@ -873,7 +852,6 @@ impl JobManager {
                 .transpose()
         })
         .await
-        .map_err(|e| JobError::Internal(e.to_string()))?
         .map_err(|e| JobError::Internal(e.to_string()))?;
         if let Some(mut value) = value {
             envelope.output = value.get_mut("result").map(Value::take);
@@ -1007,13 +985,8 @@ pub(crate) fn view_schema(capabilities: &CapabilitySet) -> Value {
 }
 
 /// Upper bound on the bytes automatic presentation would emit for this output, used
-/// to budget notification batches.
-///
-/// Inline document content is counted whole because presentation shortens only
-/// schema-annotated fields (see `truncation`), so an untruncatable field really does
-/// reach the model at full size. A capture-backed field instead reaches it as a page
-/// at most, so its stored size is counted only up to `PAGE_BYTES`: `bytes * 6`
-/// covers JSON escaping of a small capture, while a large one is spliced bounded.
+/// to budget notification batches. Inline content counts whole; a capture-backed
+/// field counts as at most a page (`bytes * 6` covers JSON escaping).
 pub(crate) fn presentation_size(output: &Output) -> usize {
     let Ok(saved) = Saved::load(output) else {
         return PAGE_BYTES;

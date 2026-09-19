@@ -148,6 +148,11 @@ impl McpServerConfig {
     pub fn call_timeout(&self) -> Duration {
         self.call_timeout
     }
+    #[cfg(test)]
+    pub(crate) fn with_call_timeout(mut self, timeout: Duration) -> Self {
+        self.call_timeout = timeout;
+        self
+    }
     pub fn transport(&self) -> McpTransport {
         match self.connection {
             McpConnection::Stdio(_) => McpTransport::Stdio,

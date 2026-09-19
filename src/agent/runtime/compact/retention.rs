@@ -194,7 +194,6 @@ mod tests {
             .enumerate()
             .map(|(i, message)| EventRecord {
                 id: crate::identity::EventId::generate().unwrap(),
-                queue_attempt: None,
                 sequence: i as u64 + 1,
                 timestamp_millis: 0,
                 agent: agent.clone(),

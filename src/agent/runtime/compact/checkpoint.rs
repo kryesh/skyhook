@@ -429,8 +429,7 @@ mod tests {
                 fixture.provider.release.notify_one();
                 fixture.provider.started.notified().await;
                 let retry = fixture.provider.requests.lock().unwrap().last().cloned();
-                let retry =
-                    serde_json::to_string(&retry.unwrap().messages().collect::<Vec<_>>()).unwrap();
+                let retry = crate::agent::runtime::tests::rendered(&retry.unwrap());
                 assert!(retry.contains("Verify the fresh finding"));
                 let mut summary = summary_json();
                 summary["todos"] = json!(updated);
@@ -448,8 +447,11 @@ mod tests {
         assert!(!host_launch.contains("background-research"));
         assert_eq!(count!(&records, SessionEvent::JobClaimed { .. }), 0);
         assert_eq!(count!(&records, SessionEvent::JobInjected { .. }), 0);
-        assert_eq!(runtime.jobs.take_pending(&owner).await.unwrap()[0].id, job);
-        assert!(runtime.jobs.take_pending(&owner).await.unwrap().is_empty());
+        {
+            let pending = runtime.jobs.pending_delivery(&owner).await.unwrap();
+            assert!(pending.envelopes().iter().map(|job| job.id).eq([job]));
+        }
+        runtime.jobs.claim(job).await.unwrap();
         let next = fixture.session.prompt("Continue with the current state.");
         next.await.unwrap();
         let requests = fixture.provider.requests.lock().unwrap().clone();
@@ -554,8 +556,14 @@ mod tests {
         assert!(view["result"]["content"].as_str().unwrap().len() < output.len());
         let saved = runtime.jobs.snapshot(lease).await.unwrap().output.unwrap();
         assert_eq!(saved["content"], output);
-        let pending = runtime.jobs.take_pending(&agent.child(99)).await.unwrap();
-        assert!(pending.iter().any(|job| job.id == lease));
+        let pending = runtime.jobs.pending_delivery(&agent.child(99)).await;
+        assert!(
+            pending
+                .unwrap()
+                .envelopes()
+                .iter()
+                .any(|job| job.id == lease)
+        );
         fixture.session.shutdown().await.unwrap();
     }
 }

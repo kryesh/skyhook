@@ -261,6 +261,10 @@ mod tests {
 
     /// A live fake shim transport for manager/router tests, including the real handshake.
     pub(crate) fn test_transport() -> crate::remote::transport::Transport {
+        shim_replying(serde_json::json!({"type":"ready", "version":PROTOCOL_VERSION}))
+    }
+
+    fn shim_replying(ready: serde_json::Value) -> crate::remote::transport::Transport {
         struct FakeShim(tokio::task::JoinHandle<()>);
         impl Drop for FakeShim {
             fn drop(&mut self) {
@@ -271,9 +275,6 @@ mod tests {
         let (client, mut shim) = tokio::io::duplex(4096);
         let owner = FakeShim(tokio::spawn(async move {
             let hello = read_frame::<_, Request>(&mut shim).await;
-            let ready = Response::Ready {
-                version: PROTOCOL_VERSION,
-            };
             if !matches!(
                 hello,
                 Ok(Some(Request::Hello {
@@ -315,6 +316,24 @@ mod tests {
 
     fn allow_all() -> AuthorizationCoordinator {
         AuthorizationCoordinator::new(Arc::new(AllowAll))
+    }
+
+    #[tokio::test]
+    async fn incompatible_worker_handshakes_are_rejected() {
+        let version = PROTOCOL_VERSION - 1;
+        for ready in [
+            serde_json::json!({"type":"ready"}),
+            serde_json::json!({"type":"ready", "version":version}),
+        ] {
+            let prompts = Arc::new(crate::remote::RejectSensitivePrompts);
+            let connection = PooledConnection::from_transport(
+                shim_replying(ready),
+                "test",
+                allow_all(),
+                prompts,
+            );
+            assert!(connection.await.is_err());
+        }
     }
 
     #[tokio::test]
@@ -377,7 +396,7 @@ mod tests {
             tokio::sync::mpsc::channel(1).1,
             runtime.jobs.clone(),
         )
-        .with_test_invocation_authority(allow_all(), "read".into(), serde_json::json!({}))
+        .with_invocation_authority(allow_all(), "read".into(), serde_json::json!({}))
     }
 
     pub(super) fn output(value: &str) -> RemoteToolResult {
@@ -440,36 +459,6 @@ mod tests {
         };
         let (result, ()) = tokio::join!(call, inspect);
         assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn incompatible_worker_handshakes_are_rejected() {
-        for reply in [
-            serde_json::json!({"type":"ready"}),
-            serde_json::json!({"type":"ready", "version": PROTOCOL_VERSION - 1}),
-        ] {
-            let (client, mut server) = tokio::io::duplex(4096);
-            let peer = tokio::spawn(async move {
-                let hello = read_frame::<_, Request>(&mut server).await.unwrap();
-                assert!(matches!(
-                    hello,
-                    Some(Request::Hello {
-                        version: PROTOCOL_VERSION
-                    })
-                ));
-                write_frame(&mut server, &reply).await.unwrap();
-            });
-            let (output, input) = tokio::io::split(client);
-            let transport = crate::remote::transport::Transport {
-                input: Box::new(input),
-                output: Box::new(output),
-                owner: Box::new(()),
-            };
-            let prompts = Arc::new(crate::remote::RejectSensitivePrompts);
-            let result = PooledConnection::from_transport(transport, "test", allow_all(), prompts);
-            assert!(result.await.is_err());
-            peer.await.unwrap();
-        }
     }
 
     #[tokio::test]

@@ -86,7 +86,7 @@ request still ends with a fresh state block containing current todos and active 
 
 `ModelRequest.response_schema` optionally supplies a named JSON Schema for final answer text,
 independently of reasoning settings. Native backends transmit it through OpenAI Chat Completions,
-Responses, and Anthropic Messages formats. Codex uses the same Responses codec for WebSocket and
+Responses, and Anthropic Messages formats. Codex uses the same Responses codec over
 HTTP/SSE, including structured output. Models/endpoints must support the requested features; providers
 must reject unsupported constraints instead of silently ignoring them or substituting a prompt.
 Ordinary agent requests have no response schema.

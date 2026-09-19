@@ -189,25 +189,6 @@ impl UiPrompt {
     pub(super) fn reject(self, error: String) {
         self.request.reject(error);
     }
-
-    #[cfg(test)]
-    fn set_background(&mut self, value: bool) {
-        if let PromptKind::Questions { background, .. } = &mut self.request.kind {
-            *background = value;
-        }
-    }
-    #[cfg(test)]
-    fn push_question(&mut self, question: Question) {
-        if let PromptKind::Questions { questions, .. } = &mut self.request.kind {
-            questions.push(question);
-            self.batch_mut()
-                .unwrap()
-                .drafts
-                .push(QuestionDraft::default());
-        } else {
-            panic!("expected question prompt");
-        }
-    }
 }
 impl Drop for PromptState {
     fn drop(&mut self) {
@@ -580,12 +561,12 @@ impl App {
             (PromptKind::Authentication { .. }, PromptState::Authentication(_)) => {}
             _ => unreachable!("request and draft are constructed together and cannot be replaced"),
         }
-        let prompt = self.prompts.pop_front().unwrap();
-        let choice = prompt.input().choice;
-        match prompt.request.kind {
-            PromptKind::Approval { request, reply } => {
-                let action = approval_items(&request)[choice].value;
-                let answer = match action {
+        let UiPrompt {
+            request, mut state, ..
+        } = self.prompts.pop_front().unwrap();
+        match (request.kind, &mut state) {
+            (PromptKind::Approval { request, reply }, PromptState::Approval(input)) => {
+                let answer = match approval_items(&request)[input.choice].value {
                     ApprovalAction::Allow => ApprovalReply::Allow,
                     ApprovalAction::Deny => ApprovalReply::Deny,
                     ApprovalAction::Grant => ApprovalReply::Grant,
@@ -593,42 +574,28 @@ impl App {
                 };
                 let _ = reply.send(Ok(answer));
             }
-            PromptKind::Questions {
-                questions, reply, ..
-            } => {
-                let mut state = prompt.state;
-                let PromptState::Questions(batch) = &mut state else {
-                    unreachable!("question draft")
-                };
+            (
+                PromptKind::Questions {
+                    questions, reply, ..
+                },
+                PromptState::Questions(batch),
+            ) => {
+                let mut answers = batch
+                    .drafts
+                    .iter_mut()
+                    .map(|draft| draft.answer.take().expect("confirmed answer").into_value());
                 let value = if questions.len() == 1 {
-                    batch.drafts[0]
-                        .answer
-                        .take()
-                        .expect("confirmed answer")
-                        .into_value()
+                    answers.next().unwrap()
                 } else {
-                    Value::Object(
-                        questions
-                            .into_iter()
-                            .zip(&mut batch.drafts)
-                            .map(|(question, draft)| {
-                                (
-                                    question.id,
-                                    draft.answer.take().expect("confirmed answer").into_value(),
-                                )
-                            })
-                            .collect(),
-                    )
+                    let ids = questions.into_iter().map(|question| question.id);
+                    Value::Object(ids.zip(answers).collect())
                 };
                 let _ = reply.send(Ok(value));
             }
-            PromptKind::Authentication { reply, .. } => {
-                let mut state = prompt.state;
-                let PromptState::Authentication(input) = &mut state else {
-                    unreachable!("authentication input")
-                };
+            (PromptKind::Authentication { reply, .. }, PromptState::Authentication(input)) => {
                 let _ = reply.send(Ok(input.editor.take_sensitive()));
             }
+            _ => unreachable!("request and draft are constructed together"),
         }
         self.reset_prompt();
     }
@@ -664,14 +631,6 @@ mod tests {
             })
             .into()
     }
-    /// Append a free-form question to the front question batch.
-    fn push_question(app: &mut App, id: &str, prompt: &str) {
-        app.prompts.front_mut().unwrap().push_question(Question {
-            id: id.into(),
-            prompt: prompt.into(),
-            options: vec![],
-        });
-    }
     fn paste(app: &mut App, text: &str) {
         app.event(Event::Paste(text.into()));
     }
@@ -696,7 +655,6 @@ mod tests {
         child.id = child.id.child(1);
         child.name = "worker".into();
         app.projection.agents.push(child.clone());
-        app.projection.reopen_agent(&child.id);
         app.select(child.id.clone());
         app.editor.set("preserved draft".into());
 
@@ -717,16 +675,17 @@ mod tests {
             assert!(app.focus == focus);
             assert_eq!(app.editor.text(), "preserved draft");
         }
-        app.session().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn question_navigation_preserves_unanswered_drafts_and_clamps() {
         let (_root, mut app) = fixture().await;
-        let mut response = question(&mut app, "Choose".into(), suggestions());
-        for id in ["middle", "last"] {
-            push_question(&mut app, id, id);
-        }
+        let batch = vec![
+            ("answer", "Choose", suggestions()),
+            ("middle", "middle", vec![]),
+            ("last", "last", vec![]),
+        ];
+        let mut response = questions(&mut app, false, batch);
 
         assert!(draw(&mut app).contains("Question 1/3 · ←→ switch · Tab edit"));
         key(&mut app, Left, M::NONE);
@@ -784,20 +743,14 @@ mod tests {
         let input = app.prompt_input_mut();
         assert_eq!((input.choice, input.editor.text()), (1, "comment"));
         assert_eq!(input.editor.cursor(), 6);
-        let ssh = authentication(&mut app, 100);
-        key(&mut app, Esc, M::NONE);
-        assert!(ssh.await.unwrap().is_err());
-        key(&mut app, Right, M::NONE);
-        assert_eq!(app.prompt_input_mut().editor.text(), "draft");
         assert!(confirmed_answers(&app).is_empty());
-        app.session().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn question_navigation_enter_wraps_skips_before_review_and_submit() {
         let (_root, mut app) = fixture().await;
-        let mut response = question(&mut app, "First".into(), vec![]);
-        push_question(&mut app, "last", "Last");
+        let batch = vec![("answer", "First", vec![]), ("last", "Last", vec![])];
+        let mut response = questions(&mut app, false, batch);
 
         app.select_question(2); // Review is a bounded page, not an invalid question index.
         app.prompt_input_mut().choice = 2;
@@ -835,7 +788,6 @@ mod tests {
         press(&mut app, &[Enter, Enter]);
         let value = response.await.unwrap().unwrap();
         assert_eq!(value, json!({"answer": "first", "last": "second revised"}));
-        app.session().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -856,17 +808,20 @@ mod tests {
         key(&mut app, Enter, M::NONE);
         assert_eq!(ssh.await.unwrap().unwrap().expose(), "secret");
         assert!(app.prompts.is_empty());
-        app.session().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn question_comments_survive_ssh_preemption_and_batch_review() {
         let (_root, mut app) = fixture().await;
-        let response = question(&mut app, "Choose".into(), suggestions());
-        push_question(&mut app, "next", "Anything else?");
+        let batch = vec![
+            ("answer", "Choose", suggestions()),
+            ("next", "Anything else?", vec![]),
+        ];
+        let response = questions(&mut app, false, batch);
 
         key(&mut app, Down, M::NONE);
         paste(&mut app, "my comment");
+        // An authentication prompt pre-empts the question and restores its draft.
         let ssh = authentication(&mut app, 100);
         key(&mut app, Esc, M::NONE);
         assert!(ssh.await.unwrap().is_err());
@@ -901,7 +856,6 @@ mod tests {
         app.answer();
         assert!(confirmed_answers(&app).is_empty());
         assert!(pending(&mut response));
-        app.session().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -910,8 +864,11 @@ mod tests {
         for finish in 0..3 {
             app.editor.set("composer draft".into());
             app.focus = Focus::Tree;
-            let answer = question(&mut app, "First question".into(), vec![]);
-            push_question(&mut app, "second", "Second question");
+            let batch = vec![
+                ("answer", "First question", vec![]),
+                ("second", "Second question", vec![]),
+            ];
+            let answer = questions(&mut app, false, batch);
             paste(&mut app, "first answer");
             key(&mut app, Enter, M::NONE);
             paste(&mut app, "unfinished answer");
@@ -969,7 +926,6 @@ mod tests {
                 json!({"answer": "first answer", "second": "unfinished answer"})
             );
         }
-        app.session().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -999,7 +955,6 @@ mod tests {
         chord(&mut app, KeyCode::Char('r'));
         key(&mut app, Enter, M::NONE);
         assert_eq!(answer.await.unwrap().unwrap(), "saved answer");
-        app.session().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1014,9 +969,11 @@ mod tests {
         assert!(response.await.unwrap().is_err());
         assert!(!has_suspended_prompt(&app));
         assert!(app.prompts.is_empty());
-        let cancelled = question(&mut app, "Background question".into(), vec![]);
-        app.prompts.front_mut().unwrap().set_background(true);
-        push_question(&mut app, "second", "Second question");
+        let batch = vec![
+            ("answer", "Background question", vec![]),
+            ("second", "Second question", vec![]),
+        ];
+        let cancelled = questions(&mut app, true, batch);
         paste(&mut app, "partial answer");
         key(&mut app, Enter, M::NONE);
         assert_eq!(confirmed_answers(&app).len(), 1);
@@ -1036,7 +993,6 @@ mod tests {
         assert_eq!(app.queue.len(), 1);
         chord(&mut app, KeyCode::Char('r'));
         assert!(!app.prompt_active);
-        app.session().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]

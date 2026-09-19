@@ -40,6 +40,11 @@ test = false
 bench = false
 doc = false
 
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+required-features = ["tui"]
+
 [profile.dev.package."*"]
 opt-level = 3
 debug = false
@@ -121,7 +126,6 @@ tokio = { version = "1.53.1", features = [
     "sync",
     "time",
 ] }
-tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7.17", features = ["io"] }
 toml = { version = "1.1.4", features = ["preserve_order"] }
 tower-service = "0.3.3"

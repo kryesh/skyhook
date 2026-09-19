@@ -234,7 +234,6 @@ pub struct Observation {
 pub(crate) struct RuntimeEvents {
     inner: Arc<Mutex<ObservationSnapshot>>,
     updates: broadcast::Sender<ObservedEvent>,
-    legacy: broadcast::Sender<RuntimeEvent>,
 }
 
 impl RuntimeEvents {
@@ -247,12 +246,7 @@ impl RuntimeEvents {
         Self {
             inner: Arc::new(Mutex::new(snapshot)),
             updates: broadcast::channel(1024).0,
-            legacy: broadcast::channel(1024).0,
         }
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
-        self.legacy.subscribe()
     }
 
     pub fn observe(&self) -> Observation {
@@ -274,9 +268,8 @@ impl RuntimeEvents {
         state.reduce(event.clone(), true);
         let _ = self.updates.send(ObservedEvent {
             revision: state.revision,
-            event: event.clone(),
+            event,
         });
-        let _ = self.legacy.send(event);
     }
 }
 
@@ -295,7 +288,6 @@ mod tests {
         let agent = AgentId::root(id);
         let record = |sequence: u64, event: SessionEvent| EventRecord {
             id: crate::identity::EventId::from_bytes([sequence as u8; 16]),
-            queue_attempt: None,
             sequence,
             timestamp_millis: 0,
             agent: agent.clone(),
@@ -337,7 +329,6 @@ mod tests {
         let attempt = |sequence: u64| {
             RuntimeEvent::Record(Box::new(EventRecord {
                 id: crate::identity::EventId::from_bytes([sequence as u8; 16]),
-                queue_attempt: None,
                 sequence,
                 timestamp_millis: 0,
                 agent: agent.clone(),
@@ -405,7 +396,6 @@ mod tests {
     fn record(hub: &RuntimeEvents, agent: &AgentId, sequence: u64, event: SessionEvent) {
         hub.send(RuntimeEvent::Record(Box::new(EventRecord {
             id: crate::identity::EventId::generate().unwrap(),
-            queue_attempt: None,
             sequence,
             timestamp_millis: 0,
             agent: agent.clone(),

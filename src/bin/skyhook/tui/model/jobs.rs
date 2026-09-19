@@ -3,14 +3,10 @@
 use crate::tui::app::OutputStore;
 
 use super::super::format::brief;
-#[cfg(test)]
-use super::super::tool_view::Section;
 use super::super::tool_view::{Document, Role, Run};
 use super::{Entry, EntryKey, JobInfo, Projection, View};
 use serde_json::Value;
 use skyhook::identity::AgentId;
-#[cfg(test)]
-use skyhook::job::JobRole;
 use skyhook::job::JobState;
 use skyhook::provider::protocol::ToolResult;
 
@@ -34,11 +30,6 @@ pub(super) fn state_role(state: JobState) -> Role {
         JobState::Failed => Role::Error,
         JobState::Queued | JobState::Cancelled | JobState::Interrupted => Role::Muted,
     }
-}
-
-#[cfg(test)]
-pub(super) fn header_text(runs: &[Run]) -> String {
-    runs.iter().map(Run::text).collect()
 }
 
 pub fn target_suffix(target: &str) -> String {
@@ -211,11 +202,13 @@ pub(super) fn job_entry(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{job_info, root};
+    use super::super::super::tool_view::Section;
+    use super::super::tests::{header_text, job_info, root};
     use super::*;
     use crate::tui::app::OutputStore;
     use crate::tui::tool_view::OutputView;
     use skyhook::execution::ExecutionLocation;
+    use skyhook::job::JobRole;
     use skyhook::provider::protocol::ToolCall;
 
     fn has_code(entry: &Entry, test: impl Fn(&str) -> bool) -> bool {

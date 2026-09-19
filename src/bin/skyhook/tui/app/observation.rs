@@ -12,14 +12,9 @@ pub(super) struct ActiveObservation {
 pub struct PreparedObservation {
     pub(super) active: ActiveObservation,
     snapshot: ObservationSnapshot,
-    recovered: Result<Vec<skyhook::agent::RecoveredQueuedPrompt>, String>,
 }
 impl PreparedObservation {
     pub async fn subscribe(session: SessionHandle) -> Self {
-        let recovered = session
-            .recover_queued_prompts()
-            .await
-            .map_err(|error| error.to_string());
         let observation = session.observe().await;
         Self {
             active: ActiveObservation {
@@ -27,7 +22,6 @@ impl PreparedObservation {
                 receiver: Some(observation.updates),
             },
             snapshot: observation.snapshot,
-            recovered,
         }
     }
 }
@@ -37,25 +31,13 @@ impl App {
         self.observation.as_ref().map(|active| &active.session)
     }
 
-    /// Install a freshly attached session: every journal row is restored.
     pub(super) fn install_observation(&mut self, prepared: Option<PreparedObservation>) {
-        self.install(prepared, true);
-    }
-
-    /// `restore` says whether journal rows the queue does not know are missing
-    /// (restore them) or were removed by the user (leave them to their abandon).
-    fn install(&mut self, prepared: Option<PreparedObservation>, restore: bool) {
-        let (active, snapshot, recovered) = match prepared {
-            Some(PreparedObservation {
-                active,
-                snapshot,
-                recovered,
-            }) => (Some(active), snapshot, recovered),
-            None => (None, ObservationSnapshot::default(), Ok(Vec::new())),
+        let (active, snapshot) = match prepared {
+            Some(PreparedObservation { active, snapshot }) => (Some(active), snapshot),
+            None => (None, ObservationSnapshot::default()),
         };
         self.observation = active;
         self.snapshot = snapshot;
-        self.restore_durable_queue(recovered, restore);
     }
 
     fn receiver_mut(&mut self) -> Option<&mut broadcast::Receiver<ObservedEvent>> {
@@ -89,13 +71,7 @@ impl App {
             return;
         };
         let prepared = PreparedObservation::subscribe(session).await;
-        // The queue already holds this session's rows: as for a requested scan,
-        // unknown rows are restored only after a failed scan.
-        let restore = matches!(
-            self.queue_scan,
-            queue::QueueScan::Failed | queue::QueueScan::Running { restore: true }
-        );
-        self.install(Some(prepared), restore);
+        self.install_observation(Some(prepared));
         self.reset_projection();
     }
 

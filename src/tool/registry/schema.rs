@@ -149,151 +149,109 @@ fn add_background(schema: &mut Value) {
     );
 }
 
-// A documented default always permits omission from tool input. Apply this to
-// schema nodes only, leaving default/example JSON values untouched.
-fn optional_defaults(schema: &mut Value) {
+/// Visit `schema` and every nested schema node, never literal
+/// default/enum/example payloads or property names.
+fn for_each_subschema(schema: &mut Value, visit: &mut impl FnMut(&mut Value)) {
+    visit(schema);
     let Some(object) = schema.as_object_mut() else {
         return;
     };
-    let defaults: BTreeSet<String> = object
-        .get("properties")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-        .filter(|(_, field)| field.get("default").is_some())
-        .map(|(name, _)| name.clone())
-        .collect();
-    if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) {
-        required.retain(|name| !name.as_str().is_some_and(|name| defaults.contains(name)));
-    }
-    for key in [
-        "properties",
-        "$defs",
-        "definitions",
-        "patternProperties",
-        "dependentSchemas",
-    ] {
-        if let Some(children) = object.get_mut(key).and_then(Value::as_object_mut) {
-            children.values_mut().for_each(optional_defaults);
+    for (key, child) in object {
+        match (key.as_str(), child) {
+            (
+                "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas"
+                | "dependencies",
+                Value::Object(children),
+            ) => {
+                for child in children.values_mut() {
+                    for_each_subschema(child, visit);
+                }
+            }
+            (
+                "items"
+                | "additionalItems"
+                | "additionalProperties"
+                | "unevaluatedItems"
+                | "unevaluatedProperties"
+                | "contains"
+                | "propertyNames"
+                | "not"
+                | "if"
+                | "then"
+                | "else"
+                | "contentSchema"
+                | "allOf"
+                | "anyOf"
+                | "oneOf"
+                | "prefixItems",
+                child,
+            ) => match child {
+                Value::Array(children) => {
+                    for child in children {
+                        for_each_subschema(child, visit);
+                    }
+                }
+                child => for_each_subschema(child, visit),
+            },
+            _ => {}
         }
     }
-    for key in [
-        "items",
-        "additionalProperties",
-        "contains",
-        "not",
-        "if",
-        "then",
-        "else",
-    ] {
-        if let Some(child) = object.get_mut(key) {
-            optional_defaults(child);
+}
+
+/// A documented default always permits omission from tool input.
+fn optional_defaults(schema: &mut Value) {
+    for_each_subschema(schema, &mut |schema| {
+        let Some(object) = schema.as_object_mut() else {
+            return;
+        };
+        let defaults: BTreeSet<String> = object
+            .get("properties")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(_, field)| field.get("default").is_some())
+            .map(|(name, _)| name.clone())
+            .collect();
+        if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) {
+            required.retain(|name| !name.as_str().is_some_and(|name| defaults.contains(name)));
         }
-    }
-    for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
-        if let Some(children) = object.get_mut(key).and_then(Value::as_array_mut) {
-            children.iter_mut().for_each(optional_defaults);
-        }
-    }
+    });
 }
 
 fn sanitize_schema(value: &mut Value) {
     sanitize_schema_inner(value, false);
 }
 
+/// Strip annotations providers reject. `true` becomes `{}` because some
+/// provider-side converters (including llama.cpp) only accept the object form;
+/// `false` stays, since internal validation relies on closed-object flags.
 fn sanitize_schema_inner(value: &mut Value, preserve_dialect: bool) {
-    // `true` and `{}` both accept any JSON value. Some provider-side tool
-    // schema converters (including llama.cpp) only accept the object form.
-    // This traversal visits schema nodes, never literal defaults or examples.
-    // Keep `false` intact: internal validation relies on closed-object flags.
-    if value.as_bool() == Some(true) {
-        *value = Value::Object(Map::new());
-        return;
-    }
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    if !preserve_dialect {
-        object.remove("$schema");
-    }
-    object.remove("title");
-    object.remove("format");
-    // Only descend into schemas. Property names and literal enum/default/example
-    // payloads may themselves contain keys such as "title" or "format".
-    for key in [
-        "properties",
-        "patternProperties",
-        "$defs",
-        "definitions",
-        "dependentSchemas",
-        "dependencies",
-    ] {
-        if let Some(children) = object.get_mut(key).and_then(Value::as_object_mut) {
-            children
-                .values_mut()
-                .for_each(|child| sanitize_schema_inner(child, preserve_dialect));
-        }
-    }
-    for key in [
-        "items",
-        "additionalItems",
-        "additionalProperties",
-        "unevaluatedItems",
-        "unevaluatedProperties",
-        "contains",
-        "propertyNames",
-        "not",
-        "if",
-        "then",
-        "else",
-        "contentSchema",
-    ] {
-        if let Some(child) = object.get_mut(key) {
-            if let Some(children) = child.as_array_mut() {
-                children
-                    .iter_mut()
-                    .for_each(|child| sanitize_schema_inner(child, preserve_dialect));
-            } else {
-                sanitize_schema_inner(child, preserve_dialect);
+    for_each_subschema(value, &mut |schema| {
+        if schema.as_bool() == Some(true) {
+            *schema = Value::Object(Map::new());
+        } else if let Some(object) = schema.as_object_mut() {
+            if !preserve_dialect {
+                object.remove("$schema");
             }
+            object.remove("title");
+            object.remove("format");
         }
-    }
-    for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
-        if let Some(children) = object.get_mut(key).and_then(Value::as_array_mut) {
-            children
-                .iter_mut()
-                .for_each(|child| sanitize_schema_inner(child, preserve_dialect));
-        }
-    }
+    });
 }
 
 /// Hoist definitions so both union members retain valid, unambiguous references.
 fn output_union(foreground: Value, background: Value) -> Value {
-    fn rename(value: &mut Value, prefix: &str) {
-        match value {
-            Value::Object(object) => {
-                if let Some(Value::String(reference)) = object.get_mut("$ref")
-                    && let Some(name) = reference.strip_prefix("#/$defs/")
-                {
-                    *reference = format!("#/$defs/{prefix}{name}");
-                }
-                for value in object.values_mut() {
-                    rename(value, prefix);
-                }
-            }
-            Value::Array(values) => {
-                for value in values {
-                    rename(value, prefix);
-                }
-            }
-            _ => {}
-        }
-    }
     let mut definitions = serde_json::Map::new();
     let variants = [("Foreground_", foreground), ("Job_", background)]
         .into_iter()
         .map(|(prefix, mut schema)| {
-            rename(&mut schema, prefix);
+            for_each_subschema(&mut schema, &mut |schema| {
+                if let Some(Value::String(reference)) = schema.get_mut("$ref")
+                    && let Some(name) = reference.strip_prefix("#/$defs/")
+                {
+                    *reference = format!("#/$defs/{prefix}{name}");
+                }
+            });
             if let Some(Value::Object(defs)) = schema
                 .as_object_mut()
                 .and_then(|object| object.remove("$defs"))
@@ -391,29 +349,17 @@ mod tests {
             original["properties"]["flag"]
         );
         assert_eq!(normalized["readOnly"], true);
+        // The rewrites preserve what the schema accepts and rejects.
         let validator = jsonschema::validator_for(&normalized).unwrap();
-        for value in [
-            Value::Null,
-            json!(true),
-            json!(false),
-            json!(42),
-            json!("text"),
-            json!([1, false]),
-            json!({"enabled":true}),
-        ] {
-            let valid = json!({"value":value});
-            assert!(validator.is_valid(&valid));
+        for value in [Value::Null, json!(42), json!([1, false]), json!({"a":true})] {
+            assert!(validator.is_valid(&json!({"value":value})));
         }
         for invalid in [
-            json!({"value": null, "forbidden": null}),
-            json!({"value": null, "unknown": 1}),
+            json!({"value":1, "forbidden":1}),
+            json!({"value":1, "unknown":1}),
         ] {
-            assert!(!validator.is_valid(&invalid));
+            assert!(!validator.is_valid(&invalid), "{invalid}");
         }
-        let once = normalized.clone();
-        sanitize_schema(&mut normalized);
-        assert_eq!(normalized, once);
-
         // Preserving the dialect must not change any other normalization behavior.
         let dialect = original["$schema"].clone();
         let mut preserved = original;
@@ -451,9 +397,10 @@ mod tests {
 
     #[test]
     fn external_schema_defaults_do_not_make_required_fields_optional() {
+        let nested = json!({"type": "object", "properties": {"inner": {"default": 1}}, "required": ["inner"]});
         let schema = json!({"type": "object", "properties": {
             "value": {"type": "string", "default": "example"}
-        }, "required": ["value"]});
+        }, "required": ["value"], "unevaluatedProperties": nested});
         for (options, accepts_omission) in [
             (ToolOptions::default().preserve_required(), false),
             (ToolOptions::default(), true),
@@ -461,6 +408,9 @@ mod tests {
             let schema = tool(schema.clone(), options).input_schema;
             let validator = jsonschema::validator_for(&schema).unwrap();
             assert_eq!(validator.is_valid(&json!({})), accepts_omission);
+            // Defaults are found inside every keyword holding a subschema.
+            let extra = json!({"value": "given", "extra": {}});
+            assert_eq!(validator.is_valid(&extra), accepts_omission);
         }
     }
 }

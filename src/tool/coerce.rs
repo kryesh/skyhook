@@ -442,7 +442,6 @@ fn convert(value: &Value, kind: Kind) -> Option<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::time::{Duration, Instant};
 
     fn coerced(schema: Value, mut arguments: Value) -> Value {
         coerce_arguments(&schema, &mut arguments);
@@ -525,13 +524,14 @@ mod tests {
 
     #[test]
     fn recursive_and_branching_schemas_are_bounded() {
-        let started = Instant::now();
-        let walk_only = |schema: &Value, mut value: Value| {
-            Walk::new(schema, false).coerce_root(&mut value);
-            value
+        // Returns the step budget left once the walk terminates.
+        let steps_left = |schema: &Value, mut value: Value| {
+            let walk = Walk::new(schema, false);
+            walk.coerce_root(&mut value);
+            walk.steps.get()
         };
         let schema = json!({"anyOf":[{"$ref":"#"},{"$ref":"#"}]});
-        walk_only(&schema, json!({"x":"1"}));
+        assert!(steps_left(&schema, json!({"x":"1"})) > 0, "depth-bounded");
         let mut defs = serde_json::Map::new();
         for n in 0..40 {
             let next = format!("#/$defs/D{}", n + 1);
@@ -542,10 +542,9 @@ mod tests {
         }
         defs.insert("D40".into(), json!({"type":"integer"}));
         let chain = json!({"$ref":"#/$defs/D0", "$defs":defs});
-        walk_only(&chain, json!("1"));
+        assert_eq!(steps_left(&chain, json!("1")), 0);
         let looping = json!({"$ref":"#/$defs/Loop", "$defs":{"Loop":{"$ref":"#/$defs/Loop"}}});
-        walk_only(&looping, json!({"x":"1"}));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(steps_left(&looping, json!({"x":"1"})) > 0, "depth-bounded");
     }
 
     #[test]

@@ -279,8 +279,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 let start = row.paragraph_x() as usize + column;
                 let end = start + grapheme.width();
                 let source_end = row.layout.code().map_or(width as usize, |code| {
-                    (row.paragraph_x() as usize + code.indent() + code.width() - code.padding())
-                        .min(width as usize)
+                    (row.paragraph_x() as usize + code.body_end()).min(width as usize)
                 });
                 if start >= source_end {
                     break;
@@ -566,7 +565,6 @@ mod tests {
             .map_or(1, |(sequence, _)| sequence + 1);
         let record = EventRecord {
             id: skyhook::identity::EventId::generate().unwrap(),
-            queue_attempt: None,
             sequence,
             timestamp_millis: sequence as i64 * 1000,
             agent: app.selected.clone(),
@@ -618,7 +616,6 @@ mod tests {
                 assert_eq!(first, Some((app.content_rect.y, scroll)));
             }
         }
-        app.session().as_ref().unwrap().shutdown().await.unwrap();
     }
 
     fn number_is_painted(buffer: &Buffer, color: Color) -> bool {
@@ -711,7 +708,6 @@ mod tests {
             );
             assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
         }
-        app.session().as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -753,6 +749,5 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert!(app.view().scroll.is_none());
         assert!(latest(&app).is_none());
-        app.session().as_ref().unwrap().shutdown().await.unwrap();
     }
 }

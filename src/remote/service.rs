@@ -1,7 +1,7 @@
 //! Private shim control services. These messages never enter tool output or session events.
 use super::{
     SensitivePrompt, SensitivePromptError, SensitivePromptFuture, SensitivePromptHandler,
-    backend::{ProcessEnvironment, WorkerBackends},
+    backend::ProcessEnvironment,
     prompt::PromptAnswer,
     protocol::{PromptId, Request, RequestId, Response, spawn_owned_write, write_frame},
 };
@@ -110,7 +110,7 @@ pub(super) struct WorkerServices<W> {
     pub tasks: tokio::task::JoinSet<std::io::Result<()>>,
     prompts: Arc<dyn SensitivePromptHandler>,
     pub environment: ProcessEnvironment,
-    backends: WorkerBackends,
+    authentication: super::ssh::WorkerAuthentication,
 }
 impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
     pub fn new(output: Arc<Mutex<W>>) -> Result<Self, std::io::Error> {
@@ -120,8 +120,8 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
             answers: answers.clone(),
             next: AtomicU64::new(1),
         });
-        let backends = WorkerBackends::new(prompts.clone())?;
-        let environment = backends.environment().clone();
+        let authentication = super::ssh::WorkerAuthentication::new(prompts.clone())?;
+        let environment = authentication.environment().clone();
         Ok(Self {
             output,
             answers,
@@ -129,7 +129,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
             tasks: tokio::task::JoinSet::new(),
             prompts,
             environment,
-            backends,
+            authentication,
         })
     }
     pub async fn handle(&mut self, request: Request) -> Result<(), std::io::Error> {
@@ -164,15 +164,23 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
                     },
                 );
                 let output = self.output.clone();
-                let agent = self.backends.ssh_agent();
+                let agent = self.authentication.agent();
                 let prompts = self.prompts.clone();
                 self.tasks.spawn(async move {
                     let result = async {
+                        let open = async {
+                            let environment = agent.route_environment(&route).await?;
+                            super::ssh::open(&route, &command, &environment, prompts).await
+                        };
                         let stream = tokio::select! {
-                            stream = super::backend::open_ssh_request(&route, &command, &agent, prompts) => stream?,
+                            stream = open => stream?,
                             () = cancellation.cancelled() => return Ok(()),
                         };
-                        let super::transport::Transport { input: stdin, output: mut stdout, owner: _owner } = stream;
+                        let super::transport::Transport {
+                            input: stdin,
+                            output: mut stdout,
+                            owner: _owner,
+                        } = stream;
                         let output_writer = output.clone();
                         let write = async move {
                             let mut ended = false;
@@ -180,23 +188,48 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
                             while let Some(data) = input.recv().await {
                                 match data {
                                     Some(data) if !ended => {
-                                        stdin.as_mut().expect("open stream").write_all(&data).await?;
-                                        write_frame(&mut *output_writer.lock().await, &Response::StreamAck {channel}).await?;
+                                        stdin
+                                            .as_mut()
+                                            .expect("open stream")
+                                            .write_all(&data)
+                                            .await?;
+                                        write_frame(
+                                            &mut *output_writer.lock().await,
+                                            &Response::StreamAck { channel },
+                                        )
+                                        .await?;
                                     }
-                                    None if !ended => { if let Some(mut stdin) = stdin.take() { stdin.shutdown().await?; } ended = true; }
-                                    _ => return Err(std::io::Error::other("data after stream EOF")),
+                                    None if !ended => {
+                                        if let Some(mut stdin) = stdin.take() {
+                                            stdin.shutdown().await?;
+                                        }
+                                        ended = true;
+                                    }
+                                    _ => {
+                                        return Err(std::io::Error::other("data after stream EOF"));
+                                    }
                                 }
                             }
                             Ok::<(), std::io::Error>(())
                         };
                         let read = async {
-                            let mut bytes = vec![0;32*1024];
+                            let mut bytes = vec![0; 32 * 1024];
                             loop {
-                                let permit = credit.acquire().await.map_err(std::io::Error::other)?;
+                                let permit =
+                                    credit.acquire().await.map_err(std::io::Error::other)?;
                                 let count = stdout.read(&mut bytes).await?;
-                                if count == 0 { break; }
+                                if count == 0 {
+                                    break;
+                                }
                                 permit.forget();
-                                write_frame(&mut *output.lock().await, &Response::StreamData {channel,data:bytes[..count].to_vec()}).await?;
+                                write_frame(
+                                    &mut *output.lock().await,
+                                    &Response::StreamData {
+                                        channel,
+                                        data: bytes[..count].to_vec(),
+                                    },
+                                )
+                                .await?;
                             }
                             Ok::<(), std::io::Error>(())
                         };
@@ -206,8 +239,16 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
                             () = cancellation.cancelled() => {}
                         }
                         Ok::<(), super::RemoteError>(())
-                    }.await;
-                    write_frame(&mut *output.lock().await, &Response::StreamClosed { channel, error: result.err().map(|e| e.to_string()) }).await
+                    }
+                    .await;
+                    write_frame(
+                        &mut *output.lock().await,
+                        &Response::StreamClosed {
+                            channel,
+                            error: result.err().map(|e| e.to_string()),
+                        },
+                    )
+                    .await
                 });
             }
             Request::StreamData { channel, data } => {

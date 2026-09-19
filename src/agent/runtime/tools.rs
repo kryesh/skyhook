@@ -17,10 +17,7 @@ use crate::{
     tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::Capability},
 };
 
-use super::{
-    AgentCommand, AgentLaunch, PreparedQueuedPrompt, QueuedPromptToken, RequestFailure,
-    SessionRuntime, queue::QueuedInput,
-};
+use super::{AgentCommand, AgentLaunch, RequestFailure, SessionRuntime, queue::QueuedInput};
 
 /// Connect only root-eligible MCP servers; adapters enforce per-agent gates later.
 pub(super) async fn connect_mcp(
@@ -219,8 +216,7 @@ fn register_child_agent(
                 }
                 let child = runtime.next_child(context.agent()).await;
                 let model = input.model
-                    .or_else(|| runtime.agents.read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .or_else(|| runtime.agents()
                         .get(context.agent()).map(|agent| agent.model_profile.clone()))
                     .ok_or_else(|| ToolError::Failed("parent agent is no longer running".into()))?;
                 let target = input.target.as_deref().unwrap_or(&context.caller_location().target);
@@ -321,16 +317,33 @@ pub(super) fn child_resume_handler(
                 input,
                 runtime.jobs.clone(),
             );
-            let content = value
-                .into_iter()
-                .map(|value| UserContent::ParentInput {
-                    text: format!("Owner input: {value}"),
-                })
-                .collect();
+            let content = value.iter().map(owner_input).collect();
             let text = run_child_request(&runtime, &context, &child, &sender, content).await?;
             Ok(crate::tool::ToolOutput::new(json!(text)))
         })
     })
+}
+
+fn owner_input(value: &serde_json::Value) -> UserContent {
+    let text = format!("Owner input: {value}");
+    UserContent::ParentInput { text }
+}
+
+/// Start a child turn; the receiver resolves with its answer.
+async fn send_child_input(
+    sender: &super::AgentSender,
+    content: Vec<UserContent>,
+) -> Result<oneshot::Receiver<Result<String, RequestFailure>>, ToolError> {
+    let (done, received) = oneshot::channel();
+    let (model, done) = (None, Some(done));
+    let input = AgentCommand::Input {
+        model,
+        content,
+        done,
+    };
+    let sent = sender.send(input).await;
+    sent.map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?;
+    Ok(received)
 }
 
 async fn run_child_request(
@@ -341,24 +354,14 @@ async fn run_child_request(
     content: Vec<UserContent>,
 ) -> Result<String, ToolError> {
     let completion_gate = runtime
-        .agents
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .agents()
         .get(child)
         .ok_or_else(|| ToolError::Failed("child agent stopped".into()))?
         .control
         .completion_gate
         .clone();
     *completion_gate.lock().await = true;
-    let (done_tx, mut done_rx) = oneshot::channel();
-    sender
-        .send(AgentCommand::Input {
-            model: None,
-            content,
-            done: Some(done_tx),
-        })
-        .await
-        .map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?;
+    let mut done_rx = send_child_input(sender, content).await?;
     loop {
         tokio::select! {
             result = &mut done_rx => {
@@ -368,20 +371,14 @@ async fn run_child_request(
                         RequestFailure::Interrupted => ToolError::Interrupted,
                         RequestFailure::Failed(message) => ToolError::Failed(message),
                     })?;
-                let mut content = Vec::new();
-                for value in context.drain_input_or_close().await {
-                    content.push(UserContent::ParentInput { text: format!("Owner input: {value}") });
-                }
-                if content.is_empty() { return Ok(text); }
-                // Owner input continues this invocation instead of finishing the job.
-                // The answer above was published as a durable message without a wake
-                // (see `commit_child_message`), so wake the owner here.
+                let inputs = context.drain_input_or_close().await;
+                if inputs.is_empty() { return Ok(text); }
+                // Owner input continues this invocation instead of finishing the job, so
+                // the answer above, published without a wake, needs its wake here.
                 runtime.jobs.notify_owner(context.job()).await;
-                let (done, next) = oneshot::channel();
-                done_rx = next;
                 *completion_gate.lock().await = true;
-                sender.send(AgentCommand::Input { model: None, content, done: Some(done) }).await
-                    .map_err(|_| ToolError::Failed("child agent stopped".into()))?;
+                let content = inputs.iter().map(owner_input).collect();
+                done_rx = send_child_input(sender, content).await?;
             }
             value = context.receive() => {
                 let value = match value {
@@ -397,40 +394,20 @@ async fn run_child_request(
                 {
                     let mut active = completion_gate.lock().await;
                     if !*active {
-                        // The child already resolved this invocation; owner input
-                        // restarts it rather than finishing the job, and it replaces
-                        // `done_rx`, so any answer published without a wake would be
-                        // stranded. Wake the owner for it here.
+                        // The child already resolved this invocation; owner input restarts
+                        // it, so an answer published without a wake needs its wake here.
                         runtime.jobs.notify_owner(context.job()).await;
-                        let (done, next) = oneshot::channel();
-                        done_rx = next;
                         *active = true;
-                        sender.send(AgentCommand::Input {
-                            model: None,
-                            content: vec![UserContent::ParentInput { text: format!("Owner input: {value}") }],
-                            done: Some(done),
-                        }).await.map_err(|_| ToolError::Failed("child agent stopped".into()))?;
+                        done_rx = send_child_input(sender, vec![owner_input(&value)]).await?;
                         continue;
                     }
                     // Owner updates use the same request-boundary mailbox as
                     // queued root prompts, rather than waiting for a new turn.
-                    let token = match QueuedPromptToken::new() {
-                        Ok(token) => token,
-                        Err(error) => {
-                            // Same teardown as a closed owner channel: never
-                            // leave the child running without its owner.
-                            runtime.questions.cancel_child_question(context.job()).await;
-                            runtime.interrupt_tree(child).await;
-                            return Err(tool_error(&error));
-                        }
-                    };
                     let (committed, _receipt) = oneshot::channel();
                     sender.send(AgentCommand::QueuedInputs(vec![QueuedInput {
-                        prepared: PreparedQueuedPrompt {
-                            model: None,
-                            content: vec![UserContent::ParentInput { text: format!("Owner input: {value}") }],
-                            token,
-                        },
+                        model: None,
+                        content: vec![owner_input(&value)],
+                        cancellation: Default::default(),
                         committed,
                     }])).await.map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?;
                 }
@@ -451,7 +428,7 @@ fn tool_error(error: &impl ToString) -> ToolError {
 mod tests {
     use crate::agent::runtime::tests::*;
     use crate::{execution::ExecutionLocation, mcp::McpServerConfig, tool::policy::CapabilitySet};
-    use std::{collections::BTreeMap, path::Path, time::Duration};
+    use std::{collections::BTreeMap, path::Path};
 
     fn builder(root: &Path, requests: Requests) -> HarnessBuilder {
         let provider = scripted_provider(&requests, [answer("done"), answer("done")]);
@@ -525,20 +502,26 @@ for line in sys.stdin:
     async fn mcp_gates_prevent_stdio_launch_and_http_contact() {
         // Required permissions, effective root depth, and the unconditional MCP gate
         // all apply before transport startup, even with an approve-all policy.
-        let mut cases = Vec::new();
-        for missing in Capability::ALL {
+        let mut cases = vec![(CapabilitySet::default(), vec![Capability::Agents], 0)];
+        // The global gate, the depth-dependent capability, and two ordinary ones.
+        for missing in [
+            Capability::Mcp,
+            Capability::Agents,
+            Capability::Exec,
+            Capability::Network,
+        ] {
             let mut capabilities = Capability::ALL.into_iter().collect::<CapabilitySet>();
             capabilities.remove(missing);
             cases.push((capabilities, Capability::ALL.to_vec(), 1));
         }
-        cases.push((CapabilitySet::default(), vec![Capability::Agents], 0));
         let mut without_mcp = CapabilitySet::default();
         without_mcp.remove(Capability::Mcp);
         cases.push((without_mcp, vec![], 1));
         cases.push((CapabilitySet::empty(), vec![], 1));
         for (capabilities, required, depth) in cases {
             let root = tempfile::tempdir().unwrap();
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
             let http = serde_json::from_value(json!({
                 "transport":"streamable_http",
                 "url":format!("http://{}/mcp", listener.local_addr().unwrap()),
@@ -562,8 +545,9 @@ for line in sys.stdin:
             assert!(mcp_names(&session).is_empty());
             shutdown_session(session).await;
             assert!(!root.path().join("launched").exists());
-            let accepted = tokio::time::timeout(Duration::from_millis(30), listener.accept());
-            assert!(accepted.await.is_err());
+            // Startup has finished, so any contact is already in the backlog.
+            let accepted = listener.accept().unwrap_err();
+            assert_eq!(accepted.kind(), std::io::ErrorKind::WouldBlock);
         }
     }
 
@@ -689,6 +673,7 @@ for line in sys.stdin:
             let questions = RecordingQuestions {
                 batches: batches.clone(),
                 answer: json!("host-answer"),
+                ..Default::default()
             };
             let harness = builder(root.path(), requests.clone())
                 .capabilities(capabilities.clone())

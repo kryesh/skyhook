@@ -26,8 +26,6 @@ pub enum HarnessError {
     Execution(#[from] ExecutionError),
     #[error(transparent)]
     Job(#[from] JobError),
-    #[error(transparent)]
-    Queue(#[from] crate::agent::QueueConflict),
     #[error("a default model profile is required")]
     MissingDefaultModelProfile,
     #[error("unknown provider `{0}`")]
@@ -57,8 +55,6 @@ pub enum HarnessError {
     ChildDepth,
     #[error("image limits were exceeded")]
     ImageLimit,
-    #[error("unsupported image format")]
-    UnsupportedImage,
     #[error("model `{0}` does not support image inputs")]
     ImagesUnsupported(String),
     #[error("harness initialization failed: {0}")]

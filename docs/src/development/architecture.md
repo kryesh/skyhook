@@ -4,39 +4,16 @@
   `ProviderContext`, whose `invoke(&mut self, request)` returns an asynchronous response stream.
   Adapters live under `provider::backends` and wire types under `provider::protocol`.
   Custom providers implement both traits. A request's correlation must match its context's identity.
-  The common `ResponseEvent` contract separates output items from independently streamed blocks:
-  `ItemStarted`, `BlockStarted`, typed `BlockDelta`, `BlockEnded`, `ItemEnded`, `UsageUpdated`, and
-  `ResponseEnded`. Item/block IDs identify content; explicit positions determine its order.
-  Start events declare kinds, block ends contain authoritative final content, and item ends attach
-  replay metadata once. Each readable reasoning part is a separate visible block with its own end;
-  encrypted-only reasoning items need not create an empty visible section.
-  `ResponseAssembler` validates lifecycles and supplies ordered snapshots to both the runtime and
-  observation/UI layers. Cumulative usage snapshots replace earlier values, and response termination
-  carries a stop reason rather than a truncation boolean. Legacy unindexed delta events are removed.
-  Completed assistant messages persist nested items/blocks with their IDs and positions. Reasoning
-  replay payloads retain provider/endpoint/protocol/model provenance: incompatible private reasoning
-  is omitted from outgoing requests, not deleted from the stored transcript.
-  Input images are encoded or rejected explicitly, never silently dropped. Protocols without
-  image-bearing tool results adapt images into adjacent user content associated with the tool call.
-  Chat Completions also accepts the common `reasoning_content` / `reasoning` streaming fields used
-  by local Qwen servers, preserving separate visible reasoning blocks and scoped replay envelopes.
-  Chat request-side replay uses the provider's `chat_reasoning_replay` field selector (default
-  `reasoning_content`);
-  other APIs replay their compatible native reasoning state automatically. Null optional extension
-  fields are tolerated; unsupported
-  nonempty semantic fields fail explicitly. Generated image outputs are not supported.
-  Chat streaming compatibility is provider-neutral: absent/null choices and deltas are normalized
-  to empty containers, and metadata-only chunks are harmless before `[DONE]`. After `finish_reason`,
-  usage and no-op deltas (empty/null text, empty tool-call lists, assistant role headers, and null
-  extensions) remain accepted, with or without usage; identical finish reasons are idempotent.
-  Extra envelope, choice, and usage metadata is ignored. Actual post-finish output, conflicting
-  finish reasons, unsupported non-null delta fields, malformed tool calls or usage, and data after
-  `[DONE]` still fail. Metadata never substitutes for a finish reason at EOF or `[DONE]`.
+  Responses stream as `ResponseEvent`s: items and their blocks start, receive typed deltas, and
+  end with authoritative final content; usage snapshots replace earlier values and
+  `ResponseEnded` carries a stop reason. `ResponseAssembler` validates that lifecycle and supplies
+  ordered snapshots to the runtime and to observers. Reasoning replay payloads keep their
+  provider/model provenance, so incompatible private reasoning is omitted from requests rather
+  than deleted from the transcript. Input images are encoded or rejected explicitly, never
+  silently dropped; generated image outputs are not supported.
 - Each agent loop owns an `AgentContext`: projected journal history, model profile and request
-  template, token accounting, and its provider handle. Codex contexts have separate WebSocket
-  connection and continuation state, with shared authentication tokens. Connection setup failures
-  may fall back to HTTP. The provider never internally replays a submitted WebSocket request;
-  the runtime can reset the connection and retry an uncommitted response within its recovery budget.
+  template, token accounting, and its provider handle. Providers never internally replay a submitted
+  request; the runtime retries an uncommitted response within its recovery policy.
   Handles survive turns, retries, questions, and compaction, and are released when the agent exits.
   Model-profile changes prepare a replacement before committing, preserve history, and reset token
   calibration. Equivalent profiles retain their handle. Resuming opens a fresh handle with the

@@ -136,10 +136,8 @@ impl Default for CapabilitySet {
     }
 }
 
-/// Builtin permission resources have structural fields, while extensions retain
-/// their opaque namespace and vector-prefix matching semantics. The wire format
-/// remains `{namespace, segments}`; malformed builtin shapes are rejected rather
-/// than reinterpreted as extension resources. Decoding never normalizes paths.
+/// The wire format is `{namespace, segments}`; unknown namespaces and malformed
+/// shapes are rejected. Decoding never normalizes paths.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(try_from = "ResourceWire", into = "ResourceWire")]
 pub enum ResourceId {
@@ -159,20 +157,17 @@ pub enum ResourceId {
         destination: String,
         hops: Vec<(String, u64)>,
     },
-    /// Extensions, plus the fixed-arity `session` (name) and `mcp` (server, tool)
-    /// builtins. Only the builtin constructors and wire decoding create the latter.
-    Custom(CustomResource),
-}
-
-/// An extension namespace cannot impersonate a builtin resource.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct CustomResource {
-    namespace: String,
-    segments: Vec<String>,
+    Session {
+        name: String,
+    },
+    Mcp {
+        server: String,
+        tool: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("invalid permission resource namespace or shape: {0}")]
+#[error("unknown or malformed permission resource: {0}")]
 pub struct ResourceError(String);
 
 #[derive(Deserialize, Serialize)]
@@ -182,30 +177,6 @@ struct ResourceWire {
 }
 
 impl ResourceId {
-    pub fn custom(
-        namespace: impl Into<String>,
-        segments: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Result<Self, ResourceError> {
-        let namespace = namespace.into();
-        if matches!(
-            namespace.as_str(),
-            "workspace" | "path" | "network" | "session" | "route" | "mcp"
-        ) {
-            return Err(ResourceError(namespace));
-        }
-        Ok(Self::namespaced(
-            namespace,
-            segments.into_iter().map(Into::into).collect(),
-        ))
-    }
-
-    fn namespaced(namespace: impl Into<String>, segments: Vec<String>) -> Self {
-        Self::Custom(CustomResource {
-            namespace: namespace.into(),
-            segments,
-        })
-    }
-
     #[must_use]
     pub fn workspace(target: &str, workspace: &Path) -> Self {
         Self::Workspace {
@@ -244,7 +215,7 @@ impl ResourceId {
 
     #[must_use]
     pub fn session(name: impl Into<String>) -> Self {
-        Self::namespaced("session", vec![name.into()])
+        Self::Session { name: name.into() }
     }
 
     #[must_use]
@@ -257,7 +228,10 @@ impl ResourceId {
 
     #[must_use]
     pub fn mcp(server: impl Into<String>, tool: impl Into<String>) -> Self {
-        Self::namespaced("mcp", vec![server.into(), tool.into()])
+        Self::Mcp {
+            server: server.into(),
+            tool: tool.into(),
+        }
     }
 
     /// Only these three resource kinds are scoped to an execution target.
@@ -286,10 +260,6 @@ impl ResourceId {
                     hops: other_hops,
                 },
             ) => destination == other_destination && other_hops.starts_with(hops),
-            (Self::Custom(resource), Self::Custom(other)) => {
-                resource.namespace == other.namespace
-                    && other.segments.starts_with(&resource.segments)
-            }
             _ => self == other,
         }
     }
@@ -315,7 +285,8 @@ impl TryFrom<ResourceWire> for ResourceId {
                 components: components.to_vec(),
             }),
             ("network", [target, origin]) => Ok(Self::network(target, origin)),
-            ("session", [_]) | ("mcp", [_, _]) => Ok(Self::namespaced(namespace, segments)),
+            ("session", [name]) => Ok(Self::session(name)),
+            ("mcp", [server, tool]) => Ok(Self::mcp(server, tool)),
             ("route", [destination, hops @ ..]) if hops.len() % 2 == 0 => {
                 let hops = hops
                     .as_chunks::<2>()
@@ -330,7 +301,7 @@ impl TryFrom<ResourceWire> for ResourceId {
                     .collect::<Result<_, ResourceError>>()?;
                 Ok(Self::route(destination, hops))
             }
-            _ => Self::custom(namespace, segments),
+            _ => Err(ResourceError(namespace)),
         }
     }
 }
@@ -352,12 +323,8 @@ impl From<ResourceId> for ResourceWire {
                     )
                     .collect(),
             ),
-            ResourceId::Custom(resource) => {
-                return Self {
-                    namespace: resource.namespace,
-                    segments: resource.segments,
-                };
-            }
+            ResourceId::Session { name } => ("session", vec![name]),
+            ResourceId::Mcp { server, tool } => ("mcp", vec![server, tool]),
         };
         Self {
             namespace: namespace.into(),
@@ -541,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_wire_admits_builtins_and_extensions_without_path_normalization() {
+    fn resource_wire_admits_builtin_shapes_without_path_normalization() {
         for (namespace, segments, admitted) in [
             ("workspace", vec!["root", "relative//workspace/../"], true),
             ("path", vec!["root", "/", "", "a/b", "..", "."], true),
@@ -551,8 +518,7 @@ mod tests {
             ("session", vec!["name"], true),
             ("session", vec!["name", "extra"], false),
             ("mcp", vec!["server"], false),
-            ("extension", vec!["root", "opaque", ""], true),
-            // Malformed builtin shapes are rejected rather than becoming custom.
+            ("extension", vec!["root", "opaque"], false),
             ("workspace", vec!["root"], false),
             ("network", vec!["root", "origin", "extra"], false),
             ("route", vec!["destination", "hop"], false),
@@ -564,9 +530,6 @@ mod tests {
             if let Ok(resource) = resource {
                 assert_eq!(serde_json::to_value(resource).unwrap(), wire);
             }
-        }
-        for namespace in ["workspace", "path", "network", "session", "route", "mcp"] {
-            assert!(ResourceId::custom(namespace, [] as [&str; 0]).is_err());
         }
     }
 

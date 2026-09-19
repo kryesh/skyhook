@@ -5,7 +5,7 @@ mod config;
 mod process;
 
 pub(crate) use askpass::AskpassServer;
-pub(crate) use authentication::{Authentication, WorkerAuthentication};
+pub(crate) use authentication::WorkerAuthentication;
 pub(crate) use config::configurable_option;
 pub(crate) use process::open;
 

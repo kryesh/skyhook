@@ -9,7 +9,7 @@ use crate::{
     tool::{
         PathKind, RegistryError, ToolContext, ToolError, ToolOptions, ToolPlacement,
         ToolRegistryBuilder,
-        policy::{ApprovalGrant, Capability, PathAccess, PermissionUse, ResourceId},
+        policy::{Capability, PathAccess, PermissionUse, ResourceId},
     },
 };
 
@@ -39,20 +39,13 @@ pub(crate) fn register_worker(builder: &mut ToolRegistryBuilder) -> Result<(), R
             .placement(ToolPlacement::InheritWorkspace)
             .path_argument("to", PathAccess::Write, PathKind::Writable),
         |_context, args| async move {
-            // Reject the encoded allocation budget before asking the decoder to allocate.
-            if args.data_base64.len() > MAX_COPY_BYTES.div_ceil(3) * 4 {
-                return Err(ToolError::InvalidArguments(
-                    "skill asset is too large".into(),
-                ));
-            }
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(args.data_base64)
-                .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
-            if bytes.len() > MAX_COPY_BYTES {
-                return Err(ToolError::InvalidArguments(
-                    "skill asset is too large".into(),
-                ));
-            }
+            let bytes = crate::media::decode_base64_bounded(&args.data_base64, MAX_COPY_BYTES)
+                .map_err(|error| {
+                    ToolError::invalid(match error {
+                        crate::media::MediaError::TooLarge => "skill asset is too large",
+                        _ => "skill asset has invalid base64",
+                    })
+                })?;
             let to = write(std::path::Path::new(&args.to), &bytes).await?;
             Ok(CopyOutput { to })
         },
@@ -91,13 +84,7 @@ pub(super) async fn copy(
             .path
             .starts_with(&context.execution_location().workspace)
         {
-            let resource = ResourceId::path(&caller.target, &resolved.path);
-            let grant = if resolved.directory {
-                ApprovalGrant::descendants(Capability::Write, resource.clone())
-            } else {
-                ApprovalGrant::exact(Capability::Write, resource.clone())
-            };
-            permissions.push(PermissionUse::new(Capability::Write, resource).with_grant(grant));
+            permissions.push(resolved.permission(Capability::Write, &caller.target));
         }
         router
             .authorize_transfer(
@@ -123,7 +110,7 @@ pub(super) async fn copy(
     let route = router
         .resolve(&caller.target, context.capabilities())
         .await
-        .map_err(|error| ToolError::Failed(error.to_string()))?;
+        .map_err(ToolError::failed)?;
     router
         .authorize_transfer(
             context,
@@ -135,7 +122,7 @@ pub(super) async fn copy(
     let connection = router
         .prepare(route, &caller.workspace, context.invocation_subject()?)
         .await
-        .map_err(|error| ToolError::Failed(error.to_string()))?;
+        .map_err(ToolError::failed)?;
     // The worker resolves `to` and requests path permissions on its own filesystem.
     // Base64 keeps the maximum 8 MiB asset safely below the protocol's 16 MiB frame limit.
     let result = connection
@@ -148,7 +135,7 @@ pub(super) async fn copy(
             context,
         )
         .await
-        .map_err(|error| ToolError::Failed(error.to_string()))?;
+        .map_err(ToolError::failed)?;
     Ok(serde_json::from_value::<CopyOutput>(result.value)?.to)
 }
 
@@ -308,7 +295,7 @@ mod tests {
         let requests = fixture.connections();
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            (requests[0].target.as_str(), &requests[0].workspace),
+            (requests[0].route[0].name.as_str(), &requests[0].workspace),
             ("remote", &caller.workspace)
         );
         let requests = policy.requests.lock().unwrap().clone();

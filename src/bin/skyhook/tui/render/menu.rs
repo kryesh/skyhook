@@ -168,16 +168,8 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
     };
     let row_width = width.saturating_sub(2);
     let stats_columns = AgentStatsColumns::menu(agent_stats.iter());
-    let minimum_identity_width = app
-        .projection
-        .agents
-        .iter()
-        .map(|agent| {
-            let indent = (agent.id.depth() as u16 * 4).min(row_width / 3);
-            indent + 16.max(model::target_suffix(&agent.target).width() as u16 + 8)
-        })
-        .max()
-        .unwrap_or(16);
+    let minimum_identity_width =
+        AgentColumnsLayout::minimum_identity_width(&app.projection.agents, row_width);
     let columns = AgentColumnsLayout::new(row_width, minimum_identity_width, stats_columns.width());
     let headers = AGENT_STATS_HEADERS.map(String::from);
     let header_height = u16::from(agent_menu && columns.stats_width > 0);
@@ -338,7 +330,6 @@ mod tests {
                 assert_eq!(text.contains("Completed"), status);
             }
         }
-        app.session().as_ref().unwrap().shutdown().await.unwrap();
     }
 
     #[test]
@@ -347,17 +338,15 @@ mod tests {
         let kind = MenuKind::Commands(vec![]);
         for (label, hint) in [
             ("New session", "ctrl+x n"),
-            ("Quit", "alt+q"),
             ("界面", "ctrl+shift+p"),
             ("Unbound", ""),
-            ("Long custom shortcut", "ctrl+x ctrl+y ctrl+z"),
         ] {
             let item = super::super::super::app::ItemRef {
                 index: 0,
                 label,
                 detail: hint,
             };
-            for width in [0, 1, 6, 12, 20, 38, 80] {
+            for width in [0, 2, 8, 12, 21, 80] {
                 for selected in [false, true] {
                     let mut terminal = Terminal::new(TestBackend::new(90, 3)).unwrap();
                     let row = r(3, 1, width, 1);

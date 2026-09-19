@@ -12,18 +12,6 @@ pub enum RemoteError {
     Target(#[from] TargetError),
     #[error(transparent)]
     Artifact(#[from] ArtifactError),
-    #[error(
-        "this Skyhook build contains no remote shims; install with default features or provide an EmbeddedShimCatalog"
-    )]
-    MissingShims,
-    #[error(
-        "unsupported remote platform {os}-{protocol}-{arch}: no matching {protocol} shim is embedded"
-    )]
-    UnsupportedPlatform {
-        protocol: String,
-        arch: String,
-        os: String,
-    },
     #[error("could not start transport process: {message}")]
     Start {
         kind: std::io::ErrorKind,
@@ -52,14 +40,8 @@ pub enum RemoteError {
         message: String,
         output: Option<Box<ToolOutput>>,
     },
-    #[error("remote connection is missing {0}")]
-    MissingPipe(&'static str),
     #[error("target route is empty")]
     EmptyRoute,
-    #[error("remote platform probe returned invalid output")]
-    InvalidProbe,
-    #[error("SSH values cannot be empty or contain control characters")]
-    InvalidSshValue,
     #[error("{message}")]
     Io {
         kind: std::io::ErrorKind,

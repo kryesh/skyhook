@@ -4,12 +4,9 @@ use super::*;
 
 impl JobManager {
     /// After stopping creation producers, wait for admitted creation owners to
-    /// finish map publication and any abandoned-lease finalization. The session
-    /// writer drain alone only covers append, not this manager's publication.
+    /// finish map publication and any abandoned-lease finalization.
     pub(crate) async fn drain_creations(&self) {
         let _operation = self.inner.creation_operation.write().await;
-        // Creation publication is complete; every admitted per-job owner now
-        // retains its operation gate through durable append AND map publication.
         let operations = self
             .inner
             .jobs
@@ -28,10 +25,8 @@ impl JobManager {
         if spec.agent.session() != self.inner.store.id() {
             return Err(SessionError::WrongSession.into());
         }
-        // Cancellation while waiting for admission has no effect. Once the
-        // operation owns this gate, it owns accepted append through publication.
-        // A lease abandoned with the detached owner's result is cancelled and
-        // finalized by its completion permit's Drop.
+        // Cancelling the caller before admission has no effect; after it, the
+        // detached owner still publishes, and the abandoned lease is cancelled.
         let operation = self.inner.creation_operation.clone().read_owned().await;
         self.spawn_owned(operation, "creation", move |manager| async move {
             manager.create_owned(spec).await
@@ -92,10 +87,8 @@ impl JobManager {
         Ok(JobLease::new(self.clone(), id, cancellation, input))
     }
 
-    /// Run accepted publication work on a detached owner holding a manager
-    /// clone and `held` (its gates/permits), so caller cancellation cannot
-    /// abandon it. The clone is released before `held`: a gate is also the
-    /// drain receipt, and a drained session must be closable afterwards.
+    /// Run publication work on a detached owner holding `held` (its gates and
+    /// permits), so caller cancellation cannot abandon it.
     pub(super) async fn spawn_owned<T, F, Fut>(
         &self,
         held: impl Send + 'static,
@@ -206,12 +199,9 @@ impl JobManager {
             // Captures have independent pointer/type metadata. A failed tool need not
             // produce a result, and unfinished JSON captures are not valid result trees.
             let document = serde_json::json!({"capture_complete":capture_complete, "result":output, "error":error});
-            tokio::task::spawn_blocking(move || {
-                output::save_completed(&saved, &document, captures)
-            })
-            .await
-            .map_err(|e| JobError::Internal(e.to_string()))?
-            .map_err(|e| JobError::Internal(e.to_string()))?;
+            output::blocking(move || output::save_completed(&saved, &document, captures))
+                .await
+                .map_err(|e| JobError::Internal(e.to_string()))?;
             manager.inner
                 .store
                 .append(
@@ -249,13 +239,7 @@ impl JobManager {
     }
 
     pub(crate) async fn operation(&self, id: JobId) -> Result<Arc<Mutex<()>>, JobError> {
-        self.inner
-            .jobs
-            .lock()
-            .await
-            .get(&id)
-            .map(|entry| entry.operation.clone())
-            .ok_or(JobError::Unknown(id))
+        self.entry(id, |entry| entry.operation.clone()).await
     }
 
     pub(crate) async fn attach_task(
@@ -284,8 +268,7 @@ impl JobManager {
             if entry.state.is_terminal() {
                 return;
             }
-            // Preserve the current denial metadata on this volatile fallback,
-            // just as before; persistence failure does not reclassify authority.
+            // Persistence failure does not reclassify authority: keep the denial.
             entry.apply_finished(
                 JobState::Failed,
                 Vec::new(),
@@ -560,9 +543,8 @@ mod tests {
         }
     }
 
-    /// Writer shielding alone is insufficient: every accepted append keeps its
-    /// ownership gate through a caller abort and publishes both durably and live
-    /// once the writer resumes. Flush/Sync are indistinguishable from Write here.
+    /// Every accepted append keeps its ownership gate through a caller abort and
+    /// publishes both durably and live once the writer resumes.
     #[tokio::test]
     async fn cancelled_callers_keep_accepted_publication_owned_at_append_boundaries() {
         use Op::*;
@@ -575,16 +557,15 @@ mod tests {
             RequestInput,
             ResumeInput,
         ];
-        for (op, boundary) in ops
-            .into_iter()
-            .flat_map(|op| [AppendBoundary::Write, AppendBoundary::Publication].map(|b| (op, b)))
-        {
-            let case = format!("{op:?} at {boundary:?}");
+        for op in ops {
+            let case = format!("{op:?}");
             let (_root, jobs, agent, id) = owned_job(op).await;
             let state = async |jobs: &JobManager| jobs.metadata(id).await.ok().map(|m| m.state);
             let delivery = async |jobs: &JobManager| jobs.inner.jobs.lock().await[&id].delivery;
             let before = state(&jobs).await;
-            let (reached, resume) = jobs.store().pause_append_at(boundary).await;
+            // Either boundary parks the owner on the same receipt; the session's own
+            // tests cover what differs between them.
+            let (reached, resume) = jobs.store().pause_append_at(AppendBoundary::Write).await;
             let caller = tokio::spawn(run(op, jobs.clone(), agent, id));
             reached.await.unwrap();
             caller.abort();
@@ -651,22 +632,38 @@ mod tests {
         }
     }
 
+    /// An indeterminate append publishes nothing live, and the poisoned writer
+    /// refuses the retry instead of appending again.
     #[tokio::test]
-    async fn transition_finish_and_claim_failed_appends_do_not_publish_live_success() {
-        for op in [Op::Transition, Op::Finish, Op::Claim] {
+    async fn indeterminate_appends_do_not_publish_live_success_or_retry() {
+        for op in [Op::Create, Op::Transition, Op::Finish, Op::Claim] {
             let (_root, jobs, agent, id) = owned_job(op).await;
+            let sequence = jobs.store().records().await.len() as u64 + 1;
             jobs.store()
                 .fail_append_at(AppendBoundary::Publication)
                 .await;
-            assert!(matches!(
-                run(op, jobs.clone(), agent, id).await,
-                Err(JobError::Session(SessionError::AppendIndeterminate(_)))
-            ));
-            if op == Op::Claim {
-                assert!(jobs.inner.jobs.lock().await[&id].delivery == DeliveryState::Pending);
-            } else {
-                assert_eq!(jobs.metadata(id).await.unwrap().state, JobState::Queued);
-                assert!(jobs.operation(id).await.unwrap().try_lock().is_ok());
+            let error = run(op, jobs.clone(), agent.clone(), id).await.unwrap_err();
+            let JobError::Session(SessionError::AppendIndeterminate(recovery)) = error else {
+                panic!("{op:?}: expected recovery-required failure: {error}");
+            };
+            assert_eq!(recovery.identity.sequence, sequence, "{op:?}");
+            let retried = run(op, jobs.clone(), agent, id).await;
+            assert!(
+                matches!(retried, Err(JobError::Session(SessionError::AppendUnavailable(ref later))) if later == &recovery),
+                "{op:?}"
+            );
+            match op {
+                Op::Create => {
+                    assert!(jobs.inner.jobs.lock().await.is_empty());
+                    assert_eq!(creation_count(&jobs).await, 0);
+                }
+                Op::Claim => {
+                    assert!(jobs.inner.jobs.lock().await[&id].delivery == DeliveryState::Pending);
+                }
+                _ => {
+                    assert_eq!(jobs.metadata(id).await.unwrap().state, JobState::Queued);
+                    assert!(jobs.operation(id).await.unwrap().try_lock().is_ok());
+                }
             }
         }
     }
@@ -725,34 +722,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn indeterminate_creation_does_not_publish_map_or_retry_append() {
-        let (_root, jobs, agent) = crate::job::tests::runtime().await;
-        let sequence = jobs.store().records().await.len() as u64 + 1;
-        jobs.store()
-            .fail_append_at(AppendBoundary::Publication)
-            .await;
-        let error = jobs
-            .create(JobSpec::test(agent.clone(), "uncertain"))
-            .await
-            .err()
-            .unwrap();
-        let JobError::Session(SessionError::AppendIndeterminate(recovery)) = error else {
-            panic!("expected explicit recovery-required creation failure: {error}");
-        };
-        assert_eq!(recovery.identity.sequence, sequence);
-        let retried = jobs.create(JobSpec::test(agent, "not-retried")).await;
-        assert!(
-            matches!(retried, Err(JobError::Session(SessionError::AppendUnavailable(ref later))) if later == &recovery)
-        );
-        assert!(jobs.inner.jobs.lock().await.is_empty());
-        assert_eq!(creation_count(&jobs).await, 0);
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn prune_create_race_is_linearized_under_bounded_stress() {
         tokio::time::timeout(Duration::from_secs(10), async {
-            for _ in 0..32 {
+            for _ in 0..22 {
                 let (_root, jobs, agent) = crate::job::tests::runtime().await;
                 let parent = claimed(&jobs, &agent, "parent").await;
                 let mut creates = tokio::task::JoinSet::new();

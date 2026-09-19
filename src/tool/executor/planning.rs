@@ -63,7 +63,7 @@ impl ToolExecutor {
         let route = router
             .resolve(selected, &self.capabilities)
             .await
-            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+            .map_err(ToolError::invalid)?;
         let definition = route.destination();
         Ok(SelectedLocation {
             location: ExecutionLocation::select(
@@ -295,14 +295,7 @@ async fn preflight_path_arguments(
         if matches!(spec.binding, crate::tool::registry::PathBinding::Pointer(_))
             || !resolved.path.starts_with(authorization_root)
         {
-            let capability = spec.access.capability();
-            let resource = ResourceId::path(target, &resolved.path);
-            let grant = if resolved.directory {
-                ApprovalGrant::descendants(capability, resource.clone())
-            } else {
-                ApprovalGrant::exact(capability, resource.clone())
-            };
-            permissions.push(PermissionUse::new(capability, resource).with_grant(grant));
+            permissions.push(resolved.permission(spec.access.capability(), target));
         }
     }
     Ok((permissions, read_error))
@@ -440,17 +433,6 @@ pub(super) mod tests {
                                 PathKind::Existing,
                             ));
                         }
-                        if let Some(parts) = arguments["body"]["parts"].as_array() {
-                            for (index, part) in parts.iter().enumerate() {
-                                if part.get("path").is_some() {
-                                    paths.push(PathArgument::pointer(
-                                        format!("/body/parts/{index}/path"),
-                                        PathAccess::Read,
-                                        PathKind::Existing,
-                                    ));
-                                }
-                            }
-                        }
                         if arguments.get("save_to").is_some() {
                             paths.push(PathArgument::pointer(
                                 "/save_to",
@@ -495,31 +477,6 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn network_only_invocations_have_exact_origin_permissions_each_time() {
-        let runtime = crate::tests::TestRuntime::new().await;
-        let policy = RecordingPolicy::allowing();
-        let mut capabilities = CapabilitySet::default();
-        capabilities.remove(Capability::Read);
-        capabilities.remove(Capability::Write);
-        let executor = runtime
-            .executor_with_policy(network_builder(), policy.clone())
-            .with_capabilities(capabilities);
-        for _ in 0..2 {
-            let arguments = serde_json::json!({"url":"https://initial.test"});
-            executor
-                .run_host(&runtime.agent, "network_test", arguments)
-                .await
-                .unwrap();
-        }
-        let requests = policy.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        for request in requests.iter() {
-            assert_eq!(request.permissions, [network_use("https://initial.test")]);
-            assert!(request.permissions[0].proposed_grant.is_none());
-        }
-    }
-
-    #[tokio::test]
     async fn network_paths_and_invalid_arguments_fail_before_approval() {
         let runtime = crate::tests::TestRuntime::new().await;
         let outside = tempfile::tempdir().unwrap();
@@ -531,10 +488,6 @@ pub(super) mod tests {
                 (
                     Capability::Read,
                     serde_json::json!({"body":{"kind":"file","path":upload}}),
-                ),
-                (
-                    Capability::Read,
-                    serde_json::json!({"body":{"kind":"multipart","parts":[{"name":"upload","path":upload}]}}),
                 ),
                 (
                     Capability::Write,
@@ -586,7 +539,7 @@ pub(super) mod tests {
         let policy = RecordingPolicy::allowing();
         let executor = runtime.executor_with_policy(network_builder(), policy.clone());
         let arguments = serde_json::json!({
-            "url":"https://initial.test", "body":{"kind":"multipart","parts":[{"name":"upload","path":"upload"},{"name":"message","text":"not a file"}]}, "save_to":"download"
+            "url":"https://initial.test", "body":{"kind":"file","path":"upload"}, "save_to":"download"
         });
         let plan = plan(&executor, &runtime.agent, "network_test", arguments.clone()).await;
         let (upload, download) = (
@@ -611,7 +564,7 @@ pub(super) mod tests {
             .output
             .value;
         assert_eq!(
-            echoed.pointer("/body/parts/0/path"),
+            echoed.pointer("/body/path"),
             Some(&serde_json::json!(upload))
         );
         assert_eq!(echoed["save_to"], serde_json::json!(download));
@@ -674,7 +627,20 @@ pub(super) mod tests {
                 PolicyDecision::allow()
             }
         });
-        let executor = runtime.executor_with_policy(network_builder(), policy.clone());
+        // Network-only calls plan without Read or Write, and no approval is cached.
+        let mut capabilities = CapabilitySet::default();
+        capabilities.remove(Capability::Read);
+        capabilities.remove(Capability::Write);
+        let executor = runtime
+            .executor_with_policy(network_builder(), policy.clone())
+            .with_capabilities(capabilities);
+        for _ in 0..2 {
+            let arguments = serde_json::json!({"url":"https://initial.test"});
+            executor
+                .run_host(&runtime.agent, "network_test", arguments)
+                .await
+                .unwrap();
+        }
         let arguments =
             serde_json::json!({"url":"https://initial.test", "redirect":true,"insecure":true});
         let error = executor
@@ -682,8 +648,13 @@ pub(super) mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ExecutionError::Denied(_)), "{error:?}");
-        let requests = policy.requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
+        let all = policy.requests.lock().unwrap();
+        assert_eq!(all.len(), 4);
+        for request in &all[..3] {
+            assert_eq!(request.permissions, [network_use("https://initial.test")]);
+            assert!(request.permissions[0].proposed_grant.is_none());
+        }
+        let requests = &all[2..];
         assert_eq!(
             (&requests[0].job, &requests[0].agent),
             (&requests[1].job, &requests[1].agent)

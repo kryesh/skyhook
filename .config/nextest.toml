@@ -1,0 +1,3 @@
+[profile.default]
+# A hung test fails instead of wedging the run.
+slow-timeout = { period = "20s", terminate-after = 3 }

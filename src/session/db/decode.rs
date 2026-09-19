@@ -9,7 +9,7 @@ use super::{Db, DbResult, corrupt};
 use crate::{
     agent::TodoItem,
     execution::ExecutionLocation,
-    identity::{AgentId, EventId, JobId, QueueAttemptId, SessionId},
+    identity::{AgentId, EventId, JobId, SessionId},
     media::{AttachmentRef, BlobDigest, BlobRef, ImageRef, TextRef},
     provider::{
         profile::ModelProfile,
@@ -20,7 +20,7 @@ use crate::{
     },
     session::{
         CompactionCheckpoint, EventRecord, ModelCallOrigin, ModelContext, ProfileSnapshot,
-        QueueIntent, QueueSettlement, SessionEvent,
+        SessionEvent,
     },
     target::{SshOptions, TargetAuth, TargetDefinition, TargetType},
     tool::{Denial, policy::Capability},
@@ -387,10 +387,6 @@ fn event_id(value: Vec<u8>) -> DbResult<EventId> {
     Ok(EventId::from_bytes(bytes(value)?))
 }
 
-fn attempt_id(value: Vec<u8>) -> DbResult<QueueAttemptId> {
-    Ok(QueueAttemptId::from_bytes(bytes(value)?))
-}
-
 /// Decode every committed record in sequence order.
 pub(in crate::session) fn decode_records(
     db: &Db,
@@ -453,21 +449,6 @@ pub(in crate::session) fn decode_records(
         "SELECT agent, capability FROM agent_capability",
         |row| capability(row.get(1)?),
     )?;
-    // Queue attempts bound to each entry that carries one.
-    let queue_attempts = keyed(
-        db,
-        "SELECT q.entry, q.public_id FROM queue_attempt q \
-         UNION ALL SELECT s.entry, q.public_id FROM queue_settlement s \
-           JOIN queue_attempt q ON q.entry = s.attempt \
-         UNION ALL SELECT k.entry, q.public_id FROM queue_ack k \
-           JOIN queue_settlement s ON s.entry = k.settlement \
-           JOIN queue_attempt q ON q.entry = s.attempt \
-         UNION ALL SELECT m.entry, q.public_id FROM message_commit m \
-           JOIN queue_attempt q ON q.entry = m.queue_attempt \
-         UNION ALL SELECT m.entry, q.public_id FROM model_selection m \
-           JOIN queue_attempt q ON q.entry = m.queue_attempt",
-        |row| attempt_id(row.get(1)?),
-    )?;
     let prompts = grouped(
         db,
         "SELECT prompt, text, cache FROM system_segment ORDER BY prompt, position",
@@ -524,44 +505,6 @@ pub(in crate::session) fn decode_records(
             events.extend(keyed(db, $sql, |$row| Ok($event))?)
         };
     }
-    load!(
-        "SELECT entry, public_id, message, model FROM queue_attempt",
-        |row| {
-            let Message::User(content) = messages.message(row.get(2)?)? else {
-                return Err(corrupt("queue draft is not a user message"));
-            };
-            SessionEvent::QueueIntent {
-                intent: QueueIntent {
-                    attempt: attempt_id(row.get(1)?)?,
-                    content,
-                    model: row.get(3)?,
-                },
-            }
-        }
-    );
-    load!(
-        "SELECT s.entry, q.public_id, c.public_id FROM queue_settlement s \
-         JOIN queue_attempt q ON q.entry = s.attempt \
-         LEFT JOIN message_commit m ON m.queue_attempt = q.entry \
-         LEFT JOIN entry c ON c.seq = m.entry",
-        |row| SessionEvent::QueueSettlement {
-            attempt: attempt_id(row.get(1)?)?,
-            settlement: match row.get::<Option<Vec<u8>>>(2)? {
-                Some(event) => QueueSettlement::Committed {
-                    event: event_id(event)?,
-                },
-                None => QueueSettlement::NotCommitted,
-            },
-        }
-    );
-    load!(
-        "SELECT k.entry, q.public_id FROM queue_ack k \
-         JOIN queue_settlement s ON s.entry = k.settlement \
-         JOIN queue_attempt q ON q.entry = s.attempt",
-        |row| SessionEvent::QueueAcknowledged {
-            attempt: attempt_id(row.get(1)?)?,
-        }
-    );
     load!("SELECT entry, kind, text FROM entry_text", |row| {
         let text = row.get(2)?;
         match row.get::<String>(1)?.as_str() {
@@ -926,7 +869,6 @@ pub(in crate::session) fn decode_records(
         }
         records.push(EventRecord {
             id: event_id(public_id)?,
-            queue_attempt: queue_attempts.get(&seq).copied(),
             sequence: u64_of(seq),
             timestamp_millis: created,
             agent: agent_of(agent)?,

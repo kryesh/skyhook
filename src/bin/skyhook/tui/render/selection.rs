@@ -60,7 +60,7 @@ impl Row {
                 column = self
                     .layout
                     .code()
-                    .map_or(prefix_end, |code| code.indent() + code.padding());
+                    .map_or(prefix_end, |code| code.body_start());
             }
             let clipped_prefix = byte < prefix_bytes && column + grapheme.width() > prefix_end;
             if !clipped_prefix && target < column + grapheme.width() {

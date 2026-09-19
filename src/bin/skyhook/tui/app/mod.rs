@@ -59,8 +59,7 @@ pub enum Focus {
 }
 /// A root submission blocks queue dispatch until a later root user record is
 /// observed, either live or through a replacement snapshot after lag. The gate
-/// is `Some((root, last sequence))` while waiting. This is only an initial-input
-/// ordering gate, NOT durable queued-attempt identity.
+/// is `Some((root, last sequence))` while waiting.
 fn observe_initial_input(gate: &mut Option<(AgentId, u64)>, record: &EventRecord) -> bool {
     let Some((root, after)) = gate else {
         return false;
@@ -125,8 +124,6 @@ pub struct App {
     next_queued_id: QueuedInputId,
     queue_sender: Option<mpsc::UnboundedSender<Vec<QueueDelivery>>>,
     queue_activity_revision: u64,
-    /// One journal scan may be outstanding; its result restores queue rows.
-    queue_scan: queue::QueueScan,
     /// `Some((root, sequence))` while a root submission blocks queue dispatch.
     initial_input: Option<(AgentId, u64)>,
     /// `Some(paused before the switch)` while a session switch is in flight.
@@ -248,7 +245,6 @@ impl App {
             next_queued_id: QueuedInputId::default(),
             queue_sender: None,
             queue_activity_revision: 0,
-            queue_scan: queue::QueueScan::Synced,
             initial_input: None,
             switching: None,
             start: StartState::Idle,
@@ -301,7 +297,6 @@ impl App {
             app.model.clone_from(&root.model);
         }
         app.show_warnings();
-        app.paused = !app.queue.is_empty() || app.queue_scan == queue::QueueScan::Failed;
         app
     }
 }
@@ -326,7 +321,7 @@ pub(super) mod tests {
                 .unwrap(),
             workspace: root.path().to_path_buf(),
             sessions: root.path().join(".skyhook/sessions"),
-            catalog: EmbeddedShimCatalog::from_assets(&[]).unwrap(),
+            catalog: EmbeddedShimCatalog::default(),
             interaction: Some(Arc::new(interaction)),
             approve_all: false,
         };
@@ -417,17 +412,25 @@ pub(super) mod tests {
         prompt: String,
         options: Vec<QuestionOption>,
     ) -> oneshot::Receiver<Result<Value, String>> {
+        questions(app, false, vec![("answer", &prompt, options)])
+    }
+    pub(super) fn questions(
+        app: &mut App,
+        background: bool,
+        questions: Vec<(&str, &str, Vec<QuestionOption>)>,
+    ) -> oneshot::Receiver<Result<Value, String>> {
         let (reply, receiver) = oneshot::channel();
+        let questions = questions.into_iter().map(|(id, prompt, options)| Question {
+            id: id.into(),
+            prompt: prompt.into(),
+            options,
+        });
         app.prompt(Prompt {
             id: 1,
             kind: PromptKind::Questions {
                 agent: app.session().unwrap().root_agent().clone(),
-                background: false,
-                questions: vec![Question {
-                    id: "answer".into(),
-                    prompt,
-                    options,
-                }],
+                background,
+                questions: questions.collect(),
                 reply,
             },
         });

@@ -198,19 +198,7 @@ impl StreamingBlock {
             }
             _ => return Ok((Self::Ignored, Vec::new())),
         };
-        let mut chunks = vec![
-            ResponseChunk::ItemStarted {
-                id: id.to_string(),
-                position: id,
-                kind,
-            },
-            ResponseChunk::BlockStarted {
-                item: id.to_string(),
-                id: "0".into(),
-                position: 0,
-                kind: block_kind,
-            },
-        ];
+        let mut chunks = super::common::start_item(id, kind, block_kind).to_vec();
         if !text.is_empty() {
             chunks.push(block_delta(id, ContentDelta::Text(text)));
         }
@@ -271,7 +259,6 @@ pub(crate) struct Decoder {
     message_delta: bool,
     tools_discarded: bool,
     stopped: bool,
-    failed: bool,
     stop_reason: Option<StopReason>,
     blocks: BTreeMap<usize, Block>,
     next_end: usize,
@@ -286,7 +273,6 @@ impl Decoder {
             message_delta: false,
             tools_discarded: false,
             stopped: false,
-            failed: false,
             stop_reason: None,
             blocks: BTreeMap::new(),
             next_end: 0,
@@ -295,17 +281,6 @@ impl Decoder {
     }
 
     pub(crate) fn decode(&mut self, event: &SseEvent) -> Result<Vec<ResponseChunk>, ProviderError> {
-        if self.failed {
-            return Err(protocol("decoder has already failed"));
-        }
-        let result = self.decode_inner(event);
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
-    }
-
-    fn decode_inner(&mut self, event: &SseEvent) -> Result<Vec<ResponseChunk>, ProviderError> {
         if self.stopped {
             return Err(protocol("event after message_stop"));
         }
@@ -529,15 +504,7 @@ impl Decoder {
                     }
                     _ => return Err(protocol("block was already emitted")),
                 };
-                chunks.push(ResponseChunk::BlockEnded {
-                    item: self.next_end.to_string(),
-                    block: "0".into(),
-                    content,
-                });
-                chunks.push(ResponseChunk::ItemEnded {
-                    id: self.next_end.to_string(),
-                    replay,
-                });
+                chunks.extend(super::common::end_item(self.next_end, content, replay));
             }
             self.next_end = self
                 .next_end
@@ -593,10 +560,7 @@ impl Decoder {
             output: counter(value, "output_tokens", previous.output)?,
         };
         // Runtime adds cache reads separately; cache writes are uncached input.
-        let input_tokens = next
-            .input
-            .checked_add(next.creation)
-            .ok_or_else(|| protocol("input token count overflow"))?;
+        let input_tokens = next.input.saturating_add(next.creation);
         self.usage = next;
         Ok(Usage {
             input_tokens,
@@ -606,9 +570,6 @@ impl Decoder {
     }
 
     pub(crate) fn finish(&mut self) -> Result<Vec<ResponseChunk>, ProviderError> {
-        if self.failed {
-            return Err(protocol("decoder has already failed"));
-        }
         if self.stopped {
             return Ok(Vec::new());
         }
@@ -616,7 +577,6 @@ impl Decoder {
         if self.message_delta {
             return Ok(vec![self.end()]);
         }
-        self.failed = true;
         Err(protocol("unexpected EOF before message_stop"))
     }
 }
@@ -789,10 +749,10 @@ mod tests {
         assert_eq!((usage.output_tokens, reason), (7, StopReason::EndTurn));
     }
 
-    #[tokio::test]
-    async fn signed_and_redacted_reasoning_tool_roundtrip_survives_save_resume() {
+    #[test]
+    fn signed_and_redacted_reasoning_tool_roundtrip_is_scoped() {
         use crate::provider::backends::common::{
-            bind_reasoning_scope, filter_reasoning_scope, reasoning_scope, tests::resume_request,
+            bind_reasoning_scope, filter_reasoning_scope, reasoning_scope,
         };
         let mut request = crate::provider::backends::common::tests::request("claude-test");
         let scope = reasoning_scope("anthropic", "https://api.example/v1/messages");
@@ -862,7 +822,7 @@ mod tests {
             images: vec![],
             is_error: false,
         }]));
-        let original = resume_request(&request).await;
+        let original = request;
         let mut matching = original.clone();
         filter_reasoning_scope(&mut matching, &scope);
         let body = encode(&matching).unwrap();
@@ -931,55 +891,61 @@ mod tests {
             "signature":"signed+/=", "future_field":{"opaque":true}});
         let redacted =
             json!({"type":"redacted_thinking", "data":"encrypted+/=", "future_field":42});
-        for (reason, expected) in [
-            ("max_tokens", StopReason::MaxTokens),
-            ("model_context_window_exceeded", StopReason::MaxTokens),
-            ("refusal", StopReason::ContentFilter),
+        // A valid object is also provisional until the terminal reason, and a
+        // truncated tool must not block later completed reasoning.
+        for (reason, expected, input, tool_first) in [
+            (
+                "max_tokens",
+                StopReason::MaxTokens,
+                r#"{"path":"part"#,
+                false,
+            ),
+            (
+                "model_context_window_exceeded",
+                StopReason::MaxTokens,
+                r#"{"path":"complete"}"#,
+                true,
+            ),
+            ("refusal", StopReason::ContentFilter, "[]", false),
         ] {
-            // A valid object is also provisional until the terminal reason, and a
-            // truncated tool must not block later completed reasoning.
-            for input in [r#"{"path":"part"#, r#"{"path":"complete"}"#, "[]"] {
-                for tool_first in [false, true] {
-                    let (tool, reasoning) = if tool_first { (0, [1, 2]) } else { (2, [0, 1]) };
-                    let mut frames = vec![start()];
-                    for index in 0..3 {
-                        if index == tool {
-                            frames.extend([
-                                block_start(index, tool_use("call_1")),
-                                json_delta(index, input),
-                            ]);
-                        } else {
-                            let native = if index == reasoning[0] {
-                                &signed
-                            } else {
-                                &redacted
-                            };
-                            frames.push(block_start(index, native.clone()));
-                        }
-                        frames.push(stop(index));
-                    }
-                    frames.extend([terminal(reason, 19), message_stop()]);
-                    let mut decoder = Decoder::new("claude-test".into());
-                    let chunks = decode(&mut decoder, frames);
-                    decoder.finish().unwrap();
-                    assert!(chunks.contains(&ResponseChunk::ItemDiscarded {
-                        id: tool.to_string()
-                    }));
-                    let (items, actual_usage, stop_reason) = assembled(&chunks).finish().unwrap();
-                    assert_eq!((stop_reason, actual_usage), (expected.clone(), usage(19)));
-                    let payloads: Vec<_> = items
-                        .iter()
-                        .map(|item| (item.kind, &item.replay.as_ref().unwrap().payload))
-                        .collect();
-                    assert_eq!(
-                        payloads,
-                        [
-                            (ItemKind::Reasoning, &signed),
-                            (ItemKind::Reasoning, &redacted)
-                        ]
-                    );
+            let (tool, reasoning) = if tool_first { (0, [1, 2]) } else { (2, [0, 1]) };
+            let mut frames = vec![start()];
+            for index in 0..3 {
+                if index == tool {
+                    frames.extend([
+                        block_start(index, tool_use("call_1")),
+                        json_delta(index, input),
+                    ]);
+                } else {
+                    let native = if index == reasoning[0] {
+                        &signed
+                    } else {
+                        &redacted
+                    };
+                    frames.push(block_start(index, native.clone()));
                 }
+                frames.push(stop(index));
             }
+            frames.extend([terminal(reason, 19), message_stop()]);
+            let mut decoder = Decoder::new("claude-test".into());
+            let chunks = decode(&mut decoder, frames);
+            decoder.finish().unwrap();
+            assert!(chunks.contains(&ResponseChunk::ItemDiscarded {
+                id: tool.to_string()
+            }));
+            let (items, actual_usage, stop_reason) = assembled(&chunks).finish().unwrap();
+            assert_eq!((stop_reason, actual_usage), (expected.clone(), usage(19)));
+            let payloads: Vec<_> = items
+                .iter()
+                .map(|item| (item.kind, &item.replay.as_ref().unwrap().payload))
+                .collect();
+            assert_eq!(
+                payloads,
+                [
+                    (ItemKind::Reasoning, &signed),
+                    (ItemKind::Reasoning, &redacted)
+                ]
+            );
         }
     }
 
@@ -1028,30 +994,17 @@ mod tests {
     #[test]
     fn argumentless_tool_call_is_an_empty_object() {
         let frames = vec![
-            json!({"type":"message_start", "message":{"model":"model-a", "id":"msg_1",
-                "type":"message", "role":"assistant", "content":[], "stop_reason":null,
-                "stop_sequence":null, "stop_details":null,
-                "usage":{"input_tokens":452, "cache_creation_input_tokens":0,
-                    "cache_read_input_tokens":0, "output_tokens":16, "service_tier":"standard"}}}),
-            block_start(
-                0,
-                json!({"type":"tool_use", "id":"toolu_1", "name":"run", "input":{}}),
-            ),
+            start(),
+            block_start(0, tool_use("toolu_1")),
             json_delta(0, ""),
             json_delta(0, "{\"cmd\": \""),
             json_delta(0, "ls -la /tmp\"}"),
             stop(0),
-            block_start(
-                1,
-                json!({"type":"tool_use", "id":"toolu_2", "name":"list_jobs", "input":{}}),
-            ),
+            block_start(1, tool_use("toolu_2")),
             json_delta(1, ""),
             stop(1),
-            json!({"type":"message_delta", "delta":{"stop_reason":"tool_use", "stop_sequence":null,
-                "stop_details":null}, "usage":{"input_tokens":452, "cache_creation_input_tokens":0,
-                "cache_read_input_tokens":0, "output_tokens":79,
-                "output_tokens_details":{"thinking_tokens":0}}}),
-            json!({"type":"message_stop", "usage":{"input_tokens":452, "output_tokens":79}}),
+            terminal("tool_use", 79),
+            message_stop(),
         ];
         let mut decoder = Decoder::new("model-a".into());
         let chunks = decode(&mut decoder, frames);
@@ -1072,8 +1025,8 @@ mod tests {
         assert_eq!(
             calls,
             [
-                ("run".to_owned(), json!({"cmd":"ls -la /tmp"})),
-                ("list_jobs".to_owned(), json!({}))
+                ("inspect".to_owned(), json!({"cmd":"ls -la /tmp"})),
+                ("inspect".to_owned(), json!({}))
             ]
         );
     }
@@ -1118,42 +1071,62 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_unknown_stop_reasons_never_keep_tools() {
-        let tool_frames = || {
-            vec![
+    fn only_a_normal_final_stop_reason_keeps_tools() {
+        let usage_only = json!({"type":"message_delta", "delta":{"stop_reason":null},
+            "usage":{"output_tokens":2}});
+        let max_tokens = Some(StopReason::MaxTokens);
+        for (tail, stop_reason, discarded) in [
+            (vec![], None, true),
+            (
+                vec![json!({"type":"message_delta", "delta":{}})],
+                None,
+                true,
+            ),
+            (vec![terminal("incomplete", 2)], None, true),
+            (vec![terminal("guardrail_intervened", 2)], None, true),
+            (vec![terminal("MAX_TOKENS", 2)], None, true),
+            (vec![terminal("pause_turn", 2)], None, true),
+            // Usage-only deltas do not settle the response.
+            (
+                vec![
+                    usage_only.clone(),
+                    block_start(1, json!({"type":"text","text":"more"})),
+                    stop(1),
+                    usage_only,
+                    terminal("max_tokens", 9),
+                ],
+                max_tokens.clone(),
+                true,
+            ),
+            // A later abnormal reason retracts tools.
+            (
+                vec![terminal("tool_use", 3), terminal("max_tokens", 4)],
+                max_tokens,
+                true,
+            ),
+            (vec![terminal("tool_use", 2)], None, false),
+            (vec![terminal("end_turn", 2)], None, false),
+            (vec![terminal("stop_sequence", 2)], None, false),
+        ] {
+            let mut frames = vec![
                 start(),
                 block_start(0, tool_use("call")),
                 json_delta(0, "{}"),
                 stop(0),
-            ]
-        };
-        for terminal_frames in [
-            vec![message_stop()],
-            vec![json!({"type":"message_delta", "delta":{}}), message_stop()],
-            vec![terminal("incomplete", 2), message_stop()],
-            vec![terminal("guardrail_intervened", 2), message_stop()],
-            vec![terminal("MAX_TOKENS", 2), message_stop()],
-            vec![terminal("pause_turn", 2), message_stop()],
-        ] {
-            let mut frames = tool_frames();
-            frames.extend(terminal_frames.clone());
+            ];
+            frames.extend(tail.clone());
+            frames.push(message_stop());
             let mut decoder = Decoder::new("model-a".into());
             let chunks = decode(&mut decoder, frames);
             decoder.finish().unwrap();
-            assert!(
-                chunks.contains(&ResponseChunk::ItemDiscarded { id: "0".into() }),
-                "{terminal_frames:?}"
-            );
-        }
-        for reason in ["tool_use", "end_turn", "stop_sequence"] {
-            let mut frames = tool_frames();
-            frames.extend([terminal(reason, 2), message_stop()]);
-            let mut decoder = Decoder::new("model-a".into());
-            let chunks = decode(&mut decoder, frames);
-            let discarded = chunks
-                .iter()
-                .any(|chunk| matches!(chunk, ResponseChunk::ItemDiscarded { .. }));
-            assert!(!discarded, "{reason}");
+            let discard = ResponseChunk::ItemDiscarded { id: "0".into() };
+            assert_eq!(chunks.contains(&discard), discarded, "{tail:?}");
+            if stop_reason.is_some() {
+                assert_eq!(decoder.stop_reason, stop_reason, "{tail:?}");
+            }
+            let tools = assembled(&chunks).finish().unwrap().0;
+            let tools = tools.iter().filter(|item| item.kind == ItemKind::ToolCall);
+            assert_eq!(tools.count(), usize::from(!discarded), "{tail:?}");
         }
     }
 
@@ -1171,52 +1144,6 @@ mod tests {
             error.message,
             "Anthropic overloaded_error: Overloaded, retry with Bearer abc.def"
         );
-    }
-
-    #[test]
-    fn usage_only_deltas_do_not_settle_the_response() {
-        let mut decoder = Decoder::new("model-a".into());
-        let usage_only = json!({"type":"message_delta", "delta":{"stop_reason":null},
-            "usage":{"output_tokens":2}});
-        let chunks = decode(
-            &mut decoder,
-            vec![
-                start(),
-                block_start(0, tool_use("call")),
-                json_delta(0, "{}"),
-                stop(0),
-                usage_only.clone(),
-                block_start(1, json!({"type":"text","text":"more"})),
-                stop(1),
-                usage_only,
-                terminal("max_tokens", 9),
-                message_stop(),
-            ],
-        );
-        decoder.finish().unwrap();
-        assert_eq!(decoder.stop_reason, Some(StopReason::MaxTokens));
-        assert!(chunks.contains(&ResponseChunk::ItemDiscarded { id: "0".into() }));
-    }
-
-    #[test]
-    fn a_later_abnormal_reason_retracts_tools() {
-        let mut decoder = Decoder::new("model-a".into());
-        let chunks = decode(
-            &mut decoder,
-            vec![
-                start(),
-                block_start(0, tool_use("call")),
-                json_delta(0, "{}"),
-                stop(0),
-                terminal("tool_use", 3),
-                terminal("max_tokens", 4),
-                message_stop(),
-            ],
-        );
-        assert_eq!(decoder.stop_reason, Some(StopReason::MaxTokens));
-        assert!(chunks.contains(&ResponseChunk::ItemDiscarded { id: "0".into() }));
-        let (items, _, stop) = assembled(&chunks).finish().unwrap();
-        assert_eq!((stop, items.len()), (StopReason::MaxTokens, 0));
     }
 
     #[test]

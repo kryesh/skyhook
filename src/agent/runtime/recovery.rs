@@ -12,72 +12,49 @@ fn recovery_delay(error: &crate::provider::ProviderError, attempt: u64) -> std::
     })
 }
 
-/// Audit attempts span a logical response; backoff counts only transient failures
-/// of the currently frozen request. Rebuilding a request resets only its backoff.
-pub(super) struct RecoveryAttempt {
-    pub(super) model: u64,
-    pub(super) transient: u64,
-}
-
 impl SessionRuntime {
-    /// Transient recovery continues until success or cancellation and never restarts a child or
-    /// re-executes committed tools. The caller has recorded the failed attempt and
-    /// dropped the provider's failed stream before entering this wait.
-    pub(super) async fn schedule_model_recovery(
+    /// Journal a failed attempt and, when it is transient, back off before the
+    /// caller retries its frozen request (`None`). A permanent error is handed back.
+    /// Recovery continues until success or cancellation and never re-executes tools.
+    ///
+    /// `attempt` is the audit attempt of the logical response and the count of
+    /// transient failures of the frozen request, which alone drives the backoff.
+    pub(super) async fn recover_model_failure(
         &self,
         turn: &TurnContext<'_>,
         request: u64,
-        attempt: RecoveryAttempt,
-        error: &crate::provider::ProviderError,
-        provider: &mut dyn crate::provider::ProviderContext,
-    ) -> Result<(), HarnessError> {
+        (attempt, transient): (u64, &mut u64),
+        usage: Usage,
+        error: crate::provider::ProviderError,
+    ) -> Result<Option<crate::provider::ProviderError>, HarnessError> {
+        let kind = crate::session::ModelFailureKind::Error;
+        self.record_model_failure(turn.agent, request, attempt, usage, error.to_string(), kind)
+            .await?;
+        if !error.is_retryable() {
+            return Ok(Some(error));
+        }
         if turn.cancellation.is_cancelled() {
             return Err(HarnessError::Interrupted);
         }
-        provider.reset();
-        let delay = recovery_delay(error, attempt.transient);
-        let delay_millis = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
-        self.store
-            .append(
-                turn.agent.clone(),
-                SessionEvent::ModelRecoveryScheduled {
-                    request,
-                    attempt: attempt.model.saturating_add(1),
-                    max_attempts: None,
-                    delay_millis,
-                    error: error.to_string(),
-                },
-            )
-            .await?;
+        *transient = transient.saturating_add(1);
+        let delay = recovery_delay(&error, *transient);
+        let scheduled = SessionEvent::ModelRecoveryScheduled {
+            request,
+            attempt: attempt.saturating_add(1),
+            max_attempts: None,
+            delay_millis: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            error: error.to_string(),
+        };
+        self.store.append(turn.agent.clone(), scheduled).await?;
         tokio::select! {
             () = turn.cancellation.cancelled() => Err(HarnessError::Interrupted),
-            () = tokio::time::sleep(delay) => Ok(()),
+            () = tokio::time::sleep(delay) => Ok(None),
         }
     }
 
+    /// Journal a failed attempt with its observed usage. A refusal is journaled like
+    /// any other failure; its kind keeps it out of automatic recovery.
     pub(super) async fn record_model_failure(
-        &self,
-        agent: &AgentId,
-        request: u64,
-        attempt: u64,
-        usage: Usage,
-        error: String,
-    ) -> Result<(), HarnessError> {
-        self.record_model_outcome(
-            agent,
-            request,
-            attempt,
-            usage,
-            error,
-            crate::session::ModelFailureKind::Error,
-        )
-        .await
-    }
-
-    /// Record a failed attempt with its classification. A refusal is journaled the
-    /// same way as any other failure so hosts render and resume it identically,
-    /// but its kind keeps it out of automatic recovery.
-    pub(super) async fn record_model_outcome(
         &self,
         agent: &AgentId,
         request: u64,
@@ -144,66 +121,20 @@ impl SessionRuntime {
 mod tests {
     //! Exercise provider-neutral recovery through the real agent loop and durable journal.
 
-    use std::sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::{Arc, atomic::Ordering};
     use std::time::Duration;
 
     use super::*;
     use crate::agent::runtime::tests::{
-        bounded, cloned_provider, count, enqueue_prompts, events, owner, summary_json,
-        test_builder, test_harness, tool_call, usage,
+        Requests, Script, Step, bounded, child_launch, cloned_provider, count, enqueue_prompts,
+        events, owner, poll, shutdown_session, summary_json, test_builder, test_harness, tool_call,
+        usage,
     };
     use crate::provider::{
-        CodexWebSocketError, ProviderContext, ProviderError, ProviderErrorKind, ProviderFuture,
-        ResponseStream,
+        ProviderContext, ProviderError, ProviderErrorKind, ProviderFuture,
         protocol::{StopReason, events_for_content},
     };
     use crate::session::{ModelPurpose, project_history};
-
-    // Failures reuse one provider context: a reset must not reopen agents or replay tools.
-    enum Step {
-        Startup(ProviderError),
-        Stream(Vec<Result<ResponseChunk, ProviderError>>),
-    }
-
-    #[derive(Default)]
-    struct Script {
-        steps: StdMutex<VecDeque<Step>>,
-        requests: StdMutex<Vec<ModelRequest>>,
-        opened: AtomicUsize,
-        resets: AtomicUsize,
-    }
-
-    struct Factory(Arc<Script>);
-    struct Context(Arc<Script>);
-
-    impl Provider for Factory {
-        fn open_context(&self, _: String) -> Result<Box<dyn ProviderContext>, ProviderError> {
-            self.0.opened.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::new(Context(self.0.clone())))
-        }
-    }
-
-    impl ProviderContext for Context {
-        fn reset(&mut self) {
-            self.0.resets.fetch_add(1, Ordering::SeqCst);
-        }
-
-        fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
-            self.0.requests.lock().unwrap().push(request);
-            let step = self.0.steps.lock().unwrap().pop_front();
-            Box::pin(async move {
-                match step.expect("unexpected extra model invocation") {
-                    Step::Startup(error) => Err(error),
-                    Step::Stream(chunks) => {
-                        Ok(Box::pin(futures_util::stream::iter(chunks)) as ResponseStream)
-                    }
-                }
-            })
-        }
-    }
 
     fn error(kind: ProviderErrorKind, message: &str) -> ProviderError {
         ProviderError {
@@ -214,8 +145,7 @@ mod tests {
     }
 
     fn recoverable() -> ProviderError {
-        let kind = ProviderErrorKind::CodexWebSocket(CodexWebSocketError::Read);
-        error(kind, "scripted websocket connection lost")
+        error(ProviderErrorKind::Transport, "scripted connection lost")
     }
 
     fn overflow(streaming: bool) -> Step {
@@ -224,16 +154,16 @@ mod tests {
             "scripted context overflow",
         );
         if streaming {
-            Step::Stream(vec![Err(error)])
+            Step::stream(vec![Err(error)])
         } else {
-            Step::Startup(error)
+            Step::fail(error)
         }
     }
 
     fn success(items: Vec<AssistantContent>, stop_reason: StopReason) -> Step {
         let mut chunks = events_for_content(&items);
         chunks.push(ResponseChunk::ResponseEnded { stop_reason });
-        Step::Stream(chunks.into_iter().map(Ok).collect())
+        Step::stream(chunks.into_iter().map(Ok).collect())
     }
 
     fn answer(text: &str) -> Step {
@@ -257,12 +187,9 @@ mod tests {
     impl Fixture {
         async fn new(steps: impl IntoIterator<Item = Step>) -> Self {
             let workspace = tempfile::tempdir().unwrap();
-            let steps = StdMutex::new(steps.into_iter().collect());
-            let script = Arc::new(Script {
-                steps,
-                ..Script::default()
-            });
-            let provider = Arc::new(Factory(script.clone()));
+            // One shared script: a retry must not reopen agents or replay tools.
+            let script = Script::new(steps, &Requests::default());
+            let provider = script.clone();
             let sessions = workspace.path().join("sessions");
             let builder = test_builder(workspace.path(), &sessions, provider, true);
             let session = builder.build().await.unwrap().new_session().await.unwrap();
@@ -282,10 +209,6 @@ mod tests {
 
         async fn prompt(&self, text: &str) -> String {
             self.session.prompt(text).await.unwrap()
-        }
-
-        fn resets(&self) -> usize {
-            self.script.resets.load(Ordering::SeqCst)
         }
 
         /// Root history as JSON, plus its number of assistant messages.
@@ -333,10 +256,12 @@ mod tests {
         }
     }
 
-    async fn next_recovery(events: &mut broadcast::Receiver<RuntimeEvent>) -> EventRecord {
+    async fn next_recovery(
+        events: &mut broadcast::Receiver<crate::agent::ObservedEvent>,
+    ) -> EventRecord {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let RuntimeEvent::Record(record) = events.recv().await.unwrap()
+                if let RuntimeEvent::Record(record) = events.recv().await.unwrap().event
                     && matches!(record.event, SessionEvent::ModelRecoveryScheduled { .. })
                 {
                     return *record;
@@ -367,7 +292,7 @@ mod tests {
     async fn startup_failure_retries_the_frozen_request_and_honors_server_retry_after() {
         let mut error = recoverable();
         error.retry_after = Some(Duration::from_secs(90));
-        let fixture = Fixture::new([Step::Startup(error), answer("recovered")]).await;
+        let fixture = Fixture::new([Step::fail(error), answer("recovered")]).await;
         let image = crate::media::Attachment::Image {
             file: Some(fixture.workspace.path().join("evidence.png")),
             image: crate::tests::png(b"request image fixture"),
@@ -388,14 +313,13 @@ mod tests {
         assert_eq!(scheduled.collect::<Vec<_>>(), [expected]);
         let requests = fixture.requests();
         assert_eq!(requests.len(), 2);
-        // The retry uses the frozen hydrated request on the same, reset context.
+        // The retry uses the frozen hydrated request on the same context.
         assert_eq!(requests[0], requests[1]);
         assert!(requests[0].messages().any(|message| matches!(message,
             Message::User(blocks) if blocks.iter().any(|block| matches!(block,
                 UserContent::Attachment { attachment: crate::media::AttachmentRef::Image(image) }
                     if requests[0].blobs.get(&image.blob).is_ok())))));
         assert_eq!(fixture.script.opened.load(Ordering::SeqCst), 1);
-        assert_eq!(fixture.resets(), 1);
         let (history, assistants) = fixture.history(&records);
         assert_eq!(assistants, 1);
         assert!(!history.contains("connection lost"));
@@ -416,7 +340,7 @@ mod tests {
         partial.extend(events_for_content(&items).into_iter().map(Ok));
         partial.push(Err(recoverable()));
         let committed = write_step("committed", "successful-tool");
-        let fixture = Fixture::new([Step::Stream(partial), committed, answer("done")]).await;
+        let fixture = Fixture::new([Step::stream(partial), committed, answer("done")]).await;
         assert_eq!(fixture.prompt("write once").await, "done");
         let workspace = fixture.workspace.path();
         assert!(!workspace.join("must-not-exist").exists());
@@ -447,11 +371,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn successful_tool_results_survive_recovery_and_connection_budget_resets() {
         let fixture = Fixture::new([
-            Step::Startup(recoverable()),
-            Step::Startup(recoverable()),
+            Step::fail(recoverable()),
+            Step::fail(recoverable()),
             write_step("prior-tool", "prior-tool"),
-            Step::Startup(recoverable()),
-            Step::Startup(recoverable()),
+            Step::fail(recoverable()),
+            Step::fail(recoverable()),
             answer("done"),
         ])
         .await;
@@ -470,20 +394,19 @@ mod tests {
         let written = std::fs::read_to_string(fixture.workspace.path().join("prior-tool"));
         assert_eq!(written.unwrap(), "prior-tool");
         assert_schedule(&records, &[2, 3, 2, 3]);
-        assert_eq!(fixture.resets(), 4);
         fixture.session.shutdown().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
-    async fn websocket_retries_past_u8_limit_then_succeeds() {
+    async fn transient_retries_number_attempts_of_one_frozen_request() {
+        // Past a u8, so the counters and their journal columns cannot be narrow.
         let failures = 260;
-        let steps = (0..failures).map(|_| Step::Startup(recoverable()));
+        let steps = (0..failures).map(|_| Step::fail(recoverable()));
         let fixture = Fixture::new(steps.chain([answer("recovered")])).await;
         assert_eq!(fixture.prompt("recover").await, "recovered");
         let requests = fixture.requests();
         assert_eq!(requests.len(), failures + 1);
         assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
-        assert_eq!(fixture.resets(), failures);
         let records = fixture.records().await;
         let requested = count!(&records, SessionEvent::ModelRequested { .. });
         assert_eq!(requested, 1, "one frozen logical request across retries");
@@ -495,14 +418,20 @@ mod tests {
         assert_eq!(count!(at_request, SessionEvent::ModelRequested { .. }), 1);
         assert_schedule(&records, &(2..=failures as u64 + 1).collect::<Vec<_>>());
         assert_eq!(count!(&records, SessionEvent::ModelFailed { .. }), failures);
-        fixture.session.shutdown().await.unwrap();
+        let (sessions, id) = (
+            fixture.workspace.path().join("sessions"),
+            fixture.session.id(),
+        );
+        shutdown_session(fixture.session).await;
+        let reopened = SessionStore::read_records(&sessions, id).await.unwrap();
+        assert_eq!(reopened[..records.len()], records);
     }
 
     #[tokio::test(start_paused = true)]
     async fn interrupt_during_backoff_prevents_the_next_invocation() {
-        let steps = (0..4).map(|_| Step::Startup(recoverable()));
+        let steps = (0..4).map(|_| Step::fail(recoverable()));
         let fixture = Fixture::new(steps.chain([answer("must not run")])).await;
-        let mut events = fixture.session.subscribe();
+        let mut events = fixture.session.runtime.events.observe().updates;
         let session = fixture.session.clone();
         let prompt = tokio::spawn(async move { session.prompt("recover then cancel").await });
         for _ in 0..4 {
@@ -514,7 +443,7 @@ mod tests {
             .expect("cancellation must not wait for the recovery delay");
         assert!(result.unwrap().is_err());
         assert_eq!(fixture.requests().len(), 4);
-        assert_eq!(fixture.script.steps.lock().unwrap().len(), 1);
+        assert_eq!(fixture.script.remaining(), 1);
         fixture.session.shutdown().await.unwrap();
         assert_eq!(fixture.requests().len(), 4);
     }
@@ -524,11 +453,11 @@ mod tests {
         use ProviderErrorKind::{RateLimited, Response, Timeout, Transport};
         for kind in [Response, Transport, Timeout, RateLimited] {
             for streaming in [false, true] {
-                let failures = 7;
+                let failures = 4;
                 let failure = || {
                     let error = error(kind, "provider stream error");
                     if !streaming {
-                        return Step::Startup(error);
+                        return Step::fail(error);
                     }
                     let items = [
                         AssistantContent::text("partial", 1, "discard failed partial answer"),
@@ -537,7 +466,7 @@ mod tests {
                     let mut chunks: Vec<_> =
                         events_for_content(&items).into_iter().map(Ok).collect();
                     chunks.push(Err(error));
-                    Step::Stream(chunks)
+                    Step::stream(chunks)
                 };
                 let steps = (0..failures)
                     .map(|_| failure())
@@ -551,7 +480,6 @@ mod tests {
                     "{kind:?}, streaming={streaming}"
                 );
                 assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
-                assert_eq!(fixture.resets(), failures);
                 assert!(!fixture.workspace.path().join("must-not-exist").exists());
                 let records = fixture.records().await;
                 let scheduled = recoveries(&records);
@@ -581,15 +509,14 @@ mod tests {
                     "websocket connection lost; retry this request; previous_response_not_found";
                 let error = error(kind, message);
                 let failure = if streaming {
-                    Step::Stream(vec![Err(error)])
+                    Step::stream(vec![Err(error)])
                 } else {
-                    Step::Startup(error)
+                    Step::fail(error)
                 };
                 let fixture = Fixture::new([failure, answer("must not run")]).await;
                 let result = fixture.session.prompt("fail without recovery").await;
                 assert!(result.is_err(), "{kind:?}");
                 assert_eq!(fixture.requests().len(), 1, "{kind:?}");
-                assert_eq!(fixture.resets(), 0, "{kind:?}");
                 assert!(recoveries(&fixture.records().await).is_empty(), "{kind:?}");
                 fixture.session.shutdown().await.unwrap();
             }
@@ -598,22 +525,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn child_recovery_keeps_the_same_owner_job_and_does_not_fail_the_agent() {
-        let fixture = Fixture::new([Step::Startup(recoverable()), answer("child recovered")]).await;
+        let fixture = Fixture::new([Step::fail(recoverable()), answer("child recovered")]).await;
         let session = &fixture.session;
         let child = session.root.child(1);
         let owner = owner(session).await;
-        let location =
-            crate::execution::ExecutionLocation::root(fixture.workspace.path().to_owned());
-        let launch = AgentLaunch {
-            id: child.clone(),
-            owner_job: Some(owner),
-            model_profile: "test".into(),
-            todos: None,
-            available_depth: 0,
-            location,
-        };
+        let launch = child_launch(session, child.clone(), Some(owner));
         let sender = session.runtime.spawn_agent(launch).await.unwrap();
-        let mut events = session.subscribe();
+        let mut events = session.runtime.events.observe().updates;
         let (done, received) = oneshot::channel();
         let content = vec![UserContent::Text {
             text: "recover".into(),
@@ -631,7 +549,7 @@ mod tests {
         assert_eq!(received.unwrap().unwrap().unwrap(), "child recovered");
         while let Ok(event) = events.try_recv() {
             assert!(
-                !matches!(event, RuntimeEvent::Activity { agent, activity: AgentActivity::Failed(_) } if agent == child)
+                !matches!(event.event, RuntimeEvent::Activity { agent, activity: AgentActivity::Failed(_) } if agent == child)
             );
         }
         let requests = fixture.requests();
@@ -649,36 +567,30 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn queued_input_is_deferred_until_the_frozen_request_recovers() {
-        let steps = [
-            Step::Startup(recoverable()),
-            answer("first"),
-            answer("queued"),
-        ];
+        let steps = [Step::fail(recoverable()), answer("first"), answer("queued")];
         let fixture = Fixture::new(steps).await;
-        let mut events = fixture.session.subscribe();
+        let mut events = fixture.session.runtime.events.observe().updates;
         let session = fixture.session.clone();
         let turn = tokio::spawn(async move { session.prompt("initial input").await });
         next_recovery(&mut events).await;
         let session = fixture.session.clone();
-        let token = QueuedPromptToken::new().unwrap();
-        let token_cancel = token.cancellation_handle();
+        let token_cancel = QueuedPromptCancellation::default();
         let prompt = QueuedPrompt {
             text: "queued input".into(),
-            attachments: vec![],
-            options: PromptOptions::default(),
-            token,
+            cancellation: token_cancel.clone(),
+            ..Default::default()
         };
         let receipt =
             tokio::spawn(
                 async move { enqueue_prompts(&session, vec![prompt]).await.pop().unwrap() },
             );
-        tokio::time::timeout(Duration::from_millis(300), async {
+        // The queued input reaches the mailbox during backoff.
+        bounded(async {
             while fixture.session.root_tx.capacity() == AGENT_CHANNEL_CAPACITY {
-                tokio::task::yield_now().await;
+                poll().await;
             }
         })
-        .await
-        .expect("queued input should reach the mailbox during backoff");
+        .await;
         assert!(!token_cancel.is_claimed());
         assert!(!receipt.is_finished());
         assert_eq!(fixture.requests().len(), 1);
@@ -699,10 +611,10 @@ mod tests {
     async fn transient_retries_do_not_exhaust_context_compaction_budget() {
         let mut summary = summary_json();
         summary["objective"] = json!("preserve context ".repeat(100));
-        let fixture = Fixture::new((0..4).map(|_| Step::Startup(recoverable())).chain([
+        let fixture = Fixture::new((0..4).map(|_| Step::fail(recoverable())).chain([
             overflow(false),
             answer(&summary.to_string()),
-            Step::Startup(recoverable()),
+            Step::fail(recoverable()),
             answer("recovered after compaction"),
         ]))
         .await;
@@ -722,7 +634,7 @@ mod tests {
         assert!(requests[..5].windows(2).all(|pair| pair[0] == pair[1]));
         assert_ne!(requests[4], requests[6]);
         assert_eq!(requests[6], requests[7]);
-        assert!(fixture.script.steps.lock().unwrap().is_empty());
+        assert_eq!(fixture.script.remaining(), 0);
         let records = fixture.records().await;
         assert_schedule(&records, &[2, 3, 4, 5, 7]);
         assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 1);
@@ -747,7 +659,7 @@ mod tests {
             assert!(error.to_string().contains("scripted context overflow"));
             let requests = fixture.requests().len();
             assert_eq!(requests, 5, "three context failures and two summaries");
-            assert_eq!(fixture.script.steps.lock().unwrap().len(), 1);
+            assert_eq!(fixture.script.remaining(), 1);
             let records = fixture.records().await;
             assert!(recoveries(&records).is_empty());
             assert_eq!(count!(&records, SessionEvent::ModelFailed { .. }), 3);

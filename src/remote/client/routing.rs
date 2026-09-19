@@ -5,12 +5,26 @@ use crate::tool::authorization::AuthorizationError;
 use tokio::io::AsyncRead;
 
 pub(super) async fn route_responses<R>(
-    mut output: R,
+    output: R,
     state: &Mutex<ConnectionState>,
     host: (&Arc<Mutex<RequestWriter>>, &AuthorizationCoordinator),
     target: String,
     prompts: Arc<dyn SensitivePromptHandler>,
 ) where
+    R: AsyncRead + Unpin,
+{
+    let Err(error) = route(output, state, host, target, prompts).await;
+    fail_connection(state, error).await;
+}
+
+async fn route<R>(
+    mut output: R,
+    state: &Mutex<ConnectionState>,
+    host: (&Arc<Mutex<RequestWriter>>, &AuthorizationCoordinator),
+    target: String,
+    prompts: Arc<dyn SensitivePromptHandler>,
+) -> Result<std::convert::Infallible, RemoteError>
+where
     R: AsyncRead + Unpin,
 {
     let mut callbacks = tokio::task::JoinSet::<Result<Option<PromptId>, RemoteError>>::new();
@@ -30,79 +44,28 @@ pub(super) async fn route_responses<R>(
                             Some(Ok(Ok(Some(id)))) => { prompt_tasks.remove(&id); }
                             Some(Ok(Ok(None))) => {}
                             Some(Err(error)) if error.is_cancelled() => {}
-                            Some(Ok(Err(error))) => {
-                                fail_connection(state, error).await;
-                                return;
-                            }
-                            Some(Err(error)) => {
-                                fail_connection(state, RemoteError::ConnectionTask(error.to_string())).await;
-                                return;
-                            }
+                            Some(Ok(Err(error))) => return Err(error),
+                            Some(Err(error)) => return Err(RemoteError::ConnectionTask(error.to_string())),
                             None => unreachable!("nonempty callback set"),
                         }
                     }
                 }
             }
         };
-        let response = match response {
-            Ok(Some(response)) => response,
-            Ok(None) => {
-                fail_connection(
-                    state,
-                    RemoteError::Protocol("shim closed before replying".to_owned()),
-                )
-                .await;
-                return;
-            }
-            Err(error) => {
-                fail_connection(state, RemoteError::io(error)).await;
-                return;
-            }
-        };
+        let response = response
+            .map_err(RemoteError::io)?
+            .ok_or_else(|| RemoteError::Protocol("shim closed before replying".to_owned()))?;
         match response {
-            Response::ToolArtifact {
-                request_id,
-                field,
-                kind,
-                offset,
-                data,
-                finished,
-            } => {
-                if let Err(error) = results
-                    .artifact(
-                        state,
-                        super::results::ArtifactFrame {
-                            request_id,
-                            field,
-                            kind,
-                            offset,
-                            data,
-                            finished,
-                        },
-                    )
-                    .await
-                {
-                    fail_connection(state, error).await;
-                    return;
-                }
-            }
+            frame @ Response::ToolArtifact { .. } => results.artifact(state, frame).await?,
             Response::ToolChunk {
                 request_id,
                 offset,
                 data,
                 finished,
             } => {
-                let result = match results.chunk(request_id, offset, data, finished) {
-                    Ok(Some(result)) => result,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        fail_connection(state, RemoteError::io(error)).await;
-                        return;
-                    }
-                };
-                if let Err(error) = results.finish(state, request_id, result).await {
-                    fail_connection(state, error).await;
-                    return;
+                let chunk = results.chunk(request_id, offset, data, finished);
+                if let Some(result) = chunk.map_err(RemoteError::io)? {
+                    results.finish(state, request_id, result).await?;
                 }
             }
             Response::SensitiveCancelled { prompt_id } => {
@@ -119,14 +82,9 @@ pub(super) async fn route_responses<R>(
                     })
                 };
                 if invalid || overflow {
-                    fail_connection(
-                        state,
-                        RemoteError::Protocol(
-                            "invalid stream output or flow-control overflow".into(),
-                        ),
-                    )
-                    .await;
-                    return;
+                    return Err(RemoteError::Protocol(
+                        "invalid stream output or flow-control overflow".into(),
+                    ));
                 }
             }
             Response::StreamClosed { channel, error } => {
@@ -149,9 +107,7 @@ pub(super) async fn route_responses<R>(
                     })
                 };
                 if invalid {
-                    fail_connection(state, RemoteError::Protocol("invalid stream credit".into()))
-                        .await;
-                    return;
+                    return Err(RemoteError::Protocol("invalid stream credit".into()));
                 }
             }
             Response::SensitivePrompt {
@@ -159,8 +115,7 @@ pub(super) async fn route_responses<R>(
                 mut prompt,
             } => {
                 if prompt_tasks.contains_key(&prompt_id) {
-                    fail_connection(state, RemoteError::Protocol("duplicate prompt".into())).await;
-                    return;
+                    return Err(RemoteError::Protocol("duplicate prompt".into()));
                 }
                 prompt.message = format!("[origin={target}] {}", prompt.message);
                 let writer = host.0.clone();
@@ -189,10 +144,7 @@ pub(super) async fn route_responses<R>(
                 prompt_tasks.insert(prompt_id, cancellation);
             }
             Response::Tool { request_id, result } => {
-                if let Err(error) = results.finish(state, request_id, result).await {
-                    fail_connection(state, error).await;
-                    return;
-                }
+                results.finish(state, request_id, result).await?;
             }
             Response::Authorization {
                 request_id,
@@ -201,10 +153,7 @@ pub(super) async fn route_responses<R>(
                 mut permissions,
                 arguments,
             } => {
-                if let Err(error) = rebase_remote_permissions(&target, &mut permissions) {
-                    fail_connection(state, error).await;
-                    return;
-                }
+                rebase_remote_permissions(&target, &mut permissions)?;
                 let context = state
                     .lock()
                     .await
@@ -256,12 +205,9 @@ pub(super) async fn route_responses<R>(
                 });
             }
             Response::Ready { .. } => {
-                fail_connection(
-                    state,
-                    RemoteError::Protocol("received a second remote ready response".to_owned()),
-                )
-                .await;
-                return;
+                return Err(RemoteError::Protocol(
+                    "received a second remote ready response".to_owned(),
+                ));
             }
         }
     }

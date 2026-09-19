@@ -872,19 +872,15 @@ impl ToolRegistryBuilder {
         if self.tools.contains_key(&definition.name) {
             return Err(RegistryError::Duplicate(definition.name));
         }
-        // Input transformations only add properties/defaults; their object root is
-        // validated at registration. Static outputs likewise have invariant root
-        // types. Only arbitrary output generators require every capability variant.
-        let generated_output = matches!(definition.output_schema, Some(OutputSchema::Generated(_)));
-        for capabilities in capability_subsets() {
-            if let Some(spec) = definition.generate_scoped(&capabilities, &execution, false) {
-                validate_object_schema(&spec.input_schema)?;
-                if let Some(schema) = &spec.output_schema {
-                    validate_output_schema(schema)?;
-                }
-                if !generated_output {
-                    break;
-                }
+        // Schema roots do not vary with capabilities; validate the full surface once.
+        let mut capabilities = CapabilitySet::empty();
+        Capability::ALL
+            .iter()
+            .for_each(|capability| capabilities.insert(*capability));
+        if let Some(spec) = definition.generate_scoped(&capabilities, &execution, false) {
+            validate_object_schema(&spec.input_schema)?;
+            if let Some(schema) = &spec.output_schema {
+                validate_output_schema(schema)?;
             }
         }
         self.tools.insert(
@@ -1002,8 +998,7 @@ impl ToolRegistryBuilder {
             .map_err(|error| RegistryError::Schema(error.to_string()))?;
         let handler = Arc::new(handler);
         self.register_admission(name, description, input_schema, options, move |arguments| {
-            let input = serde_json::from_value::<I>(arguments)
-                .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+            let input = serde_json::from_value::<I>(arguments).map_err(ToolError::invalid)?;
             let handler = handler.clone();
             Ok(AdmittedInvocation(Box::new(move |context| {
                 Box::pin(handler(context, input))
@@ -1016,23 +1011,6 @@ impl ToolRegistryBuilder {
             tools: Arc::new(self.tools),
         }
     }
-}
-
-fn capability_subsets() -> impl Iterator<Item = CapabilitySet> {
-    (0_usize..(1 << Capability::ALL.len())).map(|mask| {
-        let mut capabilities = CapabilitySet::default();
-        Capability::ALL
-            .iter()
-            .enumerate()
-            .for_each(|(index, capability)| {
-                if mask & (1 << index) == 0 {
-                    capabilities.remove(*capability);
-                } else {
-                    capabilities.insert(*capability);
-                }
-            });
-        capabilities
-    })
 }
 
 fn validate_name(name: &str) -> Result<(), RegistryError> {

@@ -1,9 +1,9 @@
 //! Assemble visible text, reasoning envelopes, and sequential tool fragments.
 use super::super::wire;
-use super::{Block, Decoder, hex};
+use super::{Block, Decoder};
 use crate::provider::{
     ProviderError,
-    backends::common::{parse_tool_arguments, reasoning_envelope},
+    backends::common::{self, parse_tool_arguments, reasoning_envelope},
     protocol::{BlockContent, BlockKind, ContentDelta, ItemKind, ResponseChunk, ToolCall},
 };
 use serde_json::{Value, json};
@@ -348,29 +348,18 @@ impl Decoder {
                 }
             }
         }
-        hex(&hasher.finalize()[..8])
+        let digest = crate::media::BlobDigest::from_bytes(hasher.finalize().into());
+        digest.to_string()[..16].to_owned()
     }
 }
 
 fn start_item(chunks: &mut Vec<ResponseChunk>, id: usize, kind: ItemKind, block_kind: BlockKind) {
-    chunks.push(ResponseChunk::ItemStarted {
-        id: id.to_string(),
-        position: id,
-        kind,
-    });
-    chunks.push(ResponseChunk::BlockStarted {
-        item: id.to_string(),
-        id: "0".into(),
-        position: 0,
-        kind: block_kind,
-    });
+    chunks.extend(common::start_item(id, kind, block_kind));
 }
 
 impl Decoder {
     fn end_item(&self, chunks: &mut Vec<ResponseChunk>, id: usize, content: BlockContent) {
-        // The transport wrapper binds the provider+endpoint scope. llama-swap
-        // injected reasoning is indistinguishable on this wire and receives
-        // the same origin scope, never a fabricated separate provenance.
+        // The transport wrapper binds the provider+endpoint scope.
         let replay = match &content {
             BlockContent::Reasoning { text } => Some(reasoning_envelope(
                 "chat_completions",
@@ -379,15 +368,7 @@ impl Decoder {
             )),
             _ => None,
         };
-        chunks.push(ResponseChunk::BlockEnded {
-            item: id.to_string(),
-            block: "0".into(),
-            content,
-        });
-        chunks.push(ResponseChunk::ItemEnded {
-            id: id.to_string(),
-            replay,
-        });
+        chunks.extend(common::end_item(id, content, replay));
     }
 }
 
@@ -447,6 +428,17 @@ mod tests {
     }
 
     /// Asserts frames before `failing` decode, and that frame and finish are rejected.
+    fn assert_calls(mut frames: Vec<SseEvent>, expected: Vec<(&str, &str, Value)>) {
+        frames.push(end("tool_calls"));
+        let (items, _, stop) = decode(frames);
+        assert_eq!(stop, StopReason::ToolUse);
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|(id, name, arguments)| (id.to_owned(), name.to_owned(), arguments))
+            .collect();
+        assert_eq!(calls_of(&items), expected);
+    }
+
     fn assert_fails_at(frames: Vec<SseEvent>, failing: usize) {
         let mut decoder = Decoder::new("test-model".into());
         for frame in &frames[..failing] {
@@ -724,13 +716,7 @@ mod tests {
                 vec![("c", "server.tool", json!({}))],
             ),
         ] {
-            let (items, _, stop) = decode(vec![tool_delta(calls), end("tool_calls")]);
-            assert_eq!(stop, StopReason::ToolUse);
-            let expected: Vec<_> = expected
-                .into_iter()
-                .map(|(id, name, arguments)| (id.to_owned(), name.to_owned(), arguments))
-                .collect();
-            assert_eq!(calls_of(&items), expected);
+            assert_calls(vec![tool_delta(calls)], expected);
         }
     }
 
@@ -868,15 +854,7 @@ mod tests {
                 vec![("a", "one", json!({})), ("b", "two", json!({}))],
             ),
         ] {
-            let mut frames = frames;
-            frames.push(end("tool_calls"));
-            let (items, _, stop) = decode(frames);
-            assert_eq!(stop, StopReason::ToolUse);
-            let expected: Vec<_> = expected
-                .into_iter()
-                .map(|(id, name, arguments)| (id.to_owned(), name.to_owned(), arguments))
-                .collect();
-            assert_eq!(calls_of(&items), expected);
+            assert_calls(frames, expected);
         }
     }
 

@@ -41,13 +41,9 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 pub fn remember(workspace: &Path, model: &str) -> std::io::Result<()> {
-    update(workspace, |state| state.model = Some(model.into()))
-}
-fn update(workspace: &Path, edit: impl FnOnce(&mut SavedState)) -> std::io::Result<()> {
-    static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = WRITER.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut state, _) = load(workspace);
-    edit(&mut state);
+    let state = SavedState {
+        model: Some(model.into()),
+    };
     atomic_write(&state_path(workspace), &serde_json::to_vec(&state)?)
 }
 

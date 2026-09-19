@@ -16,10 +16,8 @@ use tokio::{
 use super::{CancellationToken, JobError, JobId, JobManager, JobOutcome};
 use crate::tool::{ToolError, ToolOutput};
 
-/// A fresh job's non-cloneable start-or-fail obligation.
-///
-/// Dropping startup cancels the job and hands finalization to the manager's
-/// drained completion owner. Drop itself never performs persistence.
+/// A fresh job's start-or-fail obligation. Dropping it cancels the job and
+/// leaves finalization to the manager.
 #[must_use = "a job lease must be started or failed"]
 pub struct JobLease {
     input: Option<mpsc::Receiver<serde_json::Value>>,
@@ -77,8 +75,7 @@ impl JobLease {
     }
 }
 
-/// The only movable authority to supervise/finalize this invocation. Cancellation
-/// remains a competing manager operation, so AlreadyTerminal is still checked.
+/// The only authority to supervise and finalize this invocation.
 pub(super) struct CompletionPermit {
     jobs: Option<JobManager>,
     id: JobId,
@@ -116,15 +113,12 @@ impl CompletionPermit {
             .jobs
             .as_ref()
             .expect("completion permit is consumed once");
-        // Until this await completes both the worker's abort guard and the
-        // invocation's completion obligation remain owned by this future.
         jobs.attach_task(self.id, worker.abort_handle()).await?;
         let jobs = self
             .jobs
             .take()
             .expect("completion permit is consumed once");
-        // No suspension point between relinquishing the permit and registering
-        // its manager-owned supervisor. Both initial and retained starts use it.
+        // No suspension point between relinquishing the permit and supervising.
         spawn_completion(jobs, self.id, async move {
             match worker.join().await {
                 Ok(Ok(output)) => JobOutcome::Completed(output),
@@ -141,8 +135,7 @@ impl Drop for CompletionPermit {
     fn drop(&mut self) {
         let Some(jobs) = self.jobs.take() else { return };
         self.cancellation.cancel();
-        // Leases originate in the Tokio runtime. Outside a running runtime only
-        // cancellation is possible; runtime shutdown/replay owns recovery.
+        // Outside a running runtime only cancellation is possible; replay recovers.
         if tokio::runtime::Handle::try_current().is_ok() {
             spawn_completion(jobs, self.id, async { JobOutcome::Cancelled });
         }
@@ -164,8 +157,7 @@ fn spawn_completion(
     })
 }
 
-/// Counts owned completion tasks, including cleanup admitted synchronously by
-/// Drop. Unlike a spawned barrier, this cannot miss a task not yet first-polled.
+/// Counts owned completion tasks, including cleanup admitted synchronously by Drop.
 #[derive(Default)]
 pub(super) struct Supervision {
     active: AtomicUsize,
@@ -210,8 +202,6 @@ impl JobManager {
 }
 
 /// Aborts a spawned worker if startup fails or is cancelled before supervision.
-/// This guard owns no persistence: the supervisor or shutdown/replay remains
-/// responsible for terminal state. It is deliberately not a full job lease.
 struct WorkerGuard<T>(JoinHandle<T>);
 
 impl<T> WorkerGuard<T> {

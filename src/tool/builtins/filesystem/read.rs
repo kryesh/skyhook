@@ -82,7 +82,7 @@ pub(super) fn register(
                 let reference = store
                     .store_image(Some(output_path.clone()), &image)
                     .await
-                    .map_err(|error| ToolError::Failed(error.to_string()))?;
+                    .map_err(ToolError::failed)?;
                 Ok(ToolOutput::new(serde_json::to_value(ReadOutput::Image {
                     path: output_path,
                     image: reference.clone(),
@@ -120,7 +120,7 @@ async fn read_text(
         }
     })
     .await
-    .map_err(|error| ToolError::Failed(error.to_string()))??;
+    .map_err(ToolError::failed)??;
     if let Some(completed) = completed {
         Ok(TextReadOutcome::Captured(completed))
     } else {

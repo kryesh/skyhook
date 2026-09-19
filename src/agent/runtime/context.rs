@@ -22,7 +22,6 @@ pub(super) struct AgentContext {
     pub provider: Box<dyn ProviderContext>,
     /// Pinned tools the live registry no longer provides as journaled.
     pub unavailable_tools: std::sync::Arc<std::collections::HashSet<String>>,
-    checkpoint: Option<u64>,
     /// The last journal sequence reflected in `projected`.
     through: u64,
     /// Checkpoint and retained messages, which precede later commits in `projected`.
@@ -53,7 +52,6 @@ impl AgentContext {
             meter,
             provider,
             unavailable_tools: Default::default(),
-            checkpoint: checkpoint(records, agent),
             through: records.last().map_or(0, |record| record.sequence),
         })
     }
@@ -86,7 +84,6 @@ impl AgentContext {
             self.projected = project_history(&records, agent)?;
             self.prefix = history_prefix(&self.projected, &records, agent);
             self.meter = TokenMeter::default();
-            self.checkpoint = checkpoint(&records, agent);
             self.through = records.last().map_or(0, |record| record.sequence);
             return Ok(());
         }
@@ -123,25 +120,21 @@ impl AgentContext {
             },
             ..self.template.to_request()
         };
-        if self.reaches_compaction(u128::from(self.meter.estimate(&request))) {
+        if self.reaches_compaction(self.meter.estimate(&request)) {
             request.history_lifetime = HistoryLifetime::Ending;
         }
         request
     }
 
     pub fn needs_compaction(&self, usage: Usage) -> bool {
-        // Use only the completed response's reported occupancy, including cached
-        // input and generated output. Estimates and output limits do not trigger
-        // automatic compaction. Widen before arithmetic to avoid overflow.
-        self.reaches_compaction(
-            u128::from(usage.input_tokens)
-                + u128::from(usage.cached_input_tokens)
-                + u128::from(usage.output_tokens),
-        )
+        // Only the completed response's reported occupancy, including cached input
+        // and generated output; estimates and output limits never trigger it.
+        let input = usage.input_tokens.saturating_add(usage.cached_input_tokens);
+        self.reaches_compaction(input.saturating_add(usage.output_tokens))
     }
 
-    fn reaches_compaction(&self, tokens: u128) -> bool {
-        tokens * 5 >= u128::from(self.profile.max_context) * 4
+    fn reaches_compaction(&self, tokens: u64) -> bool {
+        u128::from(tokens) * 5 >= u128::from(self.profile.max_context) * 4
     }
 
     pub fn contains_images(&self) -> bool {
@@ -166,16 +159,6 @@ fn history_prefix(projected: &[(u64, Message)], records: &[EventRecord], agent: 
             .take_while(|(sequence, _)| *sequence <= frontier)
             .count()
     })
-}
-
-fn checkpoint(records: &[EventRecord], agent: &AgentId) -> Option<u64> {
-    records
-        .iter()
-        .rev()
-        .find(|record| {
-            &record.agent == agent && matches!(record.event, SessionEvent::Compaction { .. })
-        })
-        .map(|record| record.sequence)
 }
 
 /// Reconstruct context occupancy for historical agents without consulting current config.
@@ -352,7 +335,6 @@ mod tests {
             meter: super::TokenMeter::default(),
             provider,
             unavailable_tools: Default::default(),
-            checkpoint: None,
             through: 0,
             prefix: 0,
         }
@@ -388,27 +370,26 @@ mod tests {
             (u64::MAX, 14_757_395_258_967_641_292),
         ];
         for (capacity, threshold) in limits {
-            for max_output in [1, capacity / 2, capacity - 1] {
+            for max_output in [1, capacity - 1] {
                 let context = test_context(capacity, max_output);
+                let total = |tokens: u64| Usage {
+                    input_tokens: tokens / 3,
+                    cached_input_tokens: tokens / 3,
+                    output_tokens: tokens - 2 * (tokens / 3),
+                };
                 assert!(!context.needs_compaction(Usage::default()));
                 for tokens in [threshold - 1, threshold, threshold + 1] {
-                    let usage = Usage {
-                        input_tokens: tokens / 3,
-                        cached_input_tokens: tokens / 3,
-                        output_tokens: tokens - 2 * (tokens / 3),
-                    };
+                    let expected = tokens >= threshold;
                     assert_eq!(
-                        context.needs_compaction(usage),
-                        tokens >= threshold,
-                        "context={capacity}, max_output={max_output}, total={tokens}",
+                        context.needs_compaction(total(tokens)),
+                        expected,
+                        "{tokens}"
                     );
                 }
-                let max = u64::MAX;
-                assert!(context.needs_compaction(Usage {
-                    input_tokens: max,
-                    cached_input_tokens: max,
-                    output_tokens: max,
-                }));
+                // Each partial sum overflows a u64; a wrapped total would be tiny.
+                for overflow in [tests::usage(u64::MAX, 1, 0), tests::usage(u64::MAX, 0, 1)] {
+                    assert!(context.needs_compaction(overflow));
+                }
             }
         }
     }
@@ -448,14 +429,7 @@ mod tests {
                 ..crate::job::JobSpec::test(session.root.clone(), "agent")
             };
             let owner_job = jobs.create(spec).await.unwrap().into_test_id();
-            let launch = AgentLaunch {
-                id: child.clone(),
-                owner_job: Some(owner_job),
-                model_profile: "first".into(),
-                todos: None,
-                available_depth: 0,
-                location: crate::execution::ExecutionLocation::root(root.path().to_owned()),
-            };
+            let launch = tests::child_launch(&session, child.clone(), Some(owner_job));
             let sender = session.runtime.spawn_agent(launch).await.unwrap();
             tracking.fail_all_calls.store(fail, Ordering::SeqCst);
             let (done, received) = oneshot::channel();

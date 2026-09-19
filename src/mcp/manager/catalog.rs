@@ -87,6 +87,7 @@ pub(super) async fn discover(client: &Client) -> Result<Vec<Tool>, McpError> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::McpManager;
     #[cfg(unix)]
     use super::super::tests::assert_process_reaped;
     use super::super::tests::{Fixture, connect, shutdown};
@@ -95,19 +96,26 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_limits_skip_and_reap_unusable_servers() {
-        for mode in ["oversized_schema", "many_tools", "repeated_cursor"] {
-            let Some(fixture) = Fixture::new() else {
-                return;
-            };
-            let mut config = fixture.config();
-            config.env.insert("MCP_TEST_DISCOVERY".into(), mode.into());
-            let manager = connect(config).await;
-            assert!(manager.catalog().is_empty(), "{mode}");
-            assert_eq!(manager.warnings().len(), 1, "{mode}");
-            #[cfg(unix)]
+        let modes = ["oversized_schema", "many_tools", "repeated_cursor"];
+        let Some(fixtures) = modes.map(|_| Fixture::new()).into_iter().collect() else {
+            return;
+        };
+        let fixtures: Vec<Fixture> = fixtures;
+        let configs = std::iter::zip(modes, &fixtures)
+            .map(|(mode, fixture)| {
+                let mut config = fixture.config();
+                config.env.insert("MCP_TEST_DISCOVERY".into(), mode.into());
+                (mode.to_owned(), config.try_into().unwrap())
+            })
+            .collect();
+        let manager = McpManager::connect(&configs, &Default::default(), Default::default()).await;
+        assert!(manager.catalog().is_empty());
+        assert_eq!(manager.warnings().len(), 3, "{:?}", manager.warnings());
+        #[cfg(unix)]
+        for fixture in &fixtures {
             assert_process_reaped(fixture.pid()).await;
-            shutdown(&manager).await;
         }
+        shutdown(&manager).await;
     }
 
     #[test]

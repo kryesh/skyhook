@@ -32,7 +32,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
                 search_blocking(&workspace, &root, &args, capture, &context.cancellation_token())
             })
             .await
-            .map_err(|error| ToolError::Failed(error.to_string()))?
+            .map_err(ToolError::failed)?
             .and_then(|capture| {
                 let output = SearchOutput { matches: SearchMatches::Grouped(BTreeMap::new()) };
                 Ok(crate::tool::ToolOutput::new(serde_json::to_value(output)?).with_captures(vec![capture]))
@@ -61,7 +61,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
                 )
             })
             .await
-            .map_err(|error| ToolError::Failed(error.to_string()))?
+            .map_err(ToolError::failed)?
             .map(|capture| {
                 crate::tool::ToolOutput::new(serde_json::json!({})).with_captures(vec![capture])
             })
@@ -103,13 +103,9 @@ fn walk_builder(
 fn overrides(root: &Path, patterns: &[String]) -> Result<ignore::overrides::Override, ToolError> {
     let mut builder = OverrideBuilder::new(root);
     for pattern in patterns {
-        builder
-            .add(pattern)
-            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        builder.add(pattern).map_err(ToolError::invalid)?;
     }
-    builder
-        .build()
-        .map_err(|error| ToolError::InvalidArguments(error.to_string()))
+    builder.build().map_err(ToolError::invalid)
 }
 
 fn search_blocking(
@@ -134,7 +130,7 @@ fn search_blocking(
     }
     let matcher = matcher_builder
         .build(&args.pattern)
-        .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        .map_err(ToolError::invalid)?;
 
     let files: Box<dyn Iterator<Item = Result<PathBuf, ToolError>>> = if root.is_file() {
         Box::new(std::iter::once(Ok(root.to_owned())))
@@ -202,7 +198,7 @@ fn glob_blocking(
         if cancellation.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
-        let entry = entry.map_err(|error| ToolError::Failed(error.to_string()))?;
+        let entry = entry.map_err(ToolError::failed)?;
         if entry.depth() != 0 && entry.file_type().is_some_and(|kind| kind.is_file()) {
             paths.push(relative_path(workspace, entry.path()))?;
         }
@@ -376,7 +372,7 @@ struct SearchArgs {
     #[serde(default)]
     details: bool,
     /// File or directory to search.
-    #[serde(default = "default_dot")]
+    #[serde(default = "super::default_dot")]
     path: String,
     /// Ripgrep-style include/exclude globs. Prefix exclusions with `!`; later globs override earlier ones.
     #[serde(default)]
@@ -430,7 +426,7 @@ struct GlobArgs {
     /// Ripgrep-style file glob, such as `src/**/*.rs`.
     pattern: String,
     /// Directory to enumerate.
-    #[serde(default = "default_dot")]
+    #[serde(default = "super::default_dot")]
     path: String,
     /// Include hidden files and directories.
     #[serde(default)]
@@ -446,9 +442,6 @@ struct GlobOutput {
     paths: Vec<String>,
 }
 
-fn default_dot() -> String {
-    ".".to_owned()
-}
 fn common_matcher() -> RegexMatcherBuilder {
     let mut builder = RegexMatcherBuilder::new();
     builder
@@ -460,9 +453,7 @@ fn common_matcher() -> RegexMatcherBuilder {
 }
 
 pub(crate) fn output_matcher(pattern: &str) -> Result<grep_regex::RegexMatcher, ToolError> {
-    common_matcher()
-        .build(pattern)
-        .map_err(|error| ToolError::InvalidArguments(error.to_string()))
+    common_matcher().build(pattern).map_err(ToolError::invalid)
 }
 
 #[cfg(test)]

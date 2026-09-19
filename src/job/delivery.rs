@@ -2,30 +2,16 @@
 
 use super::*;
 
-/// Aggregate child-reply bytes one notification may carry.
-///
-/// This is a batching bound, not a size guarantee: a single oversized reply is
-/// always admitted, so no cap here can bound a notification. What it does decide
-/// is how many *separate* owner turns a burst of pending work costs, because every
-/// deferred item waits for another model request. Concentrating replies costs the
-/// owner only ordering, so the bound is several output pages rather than one:
-/// receiving four page-sized replies must not cost four requests.
+/// Aggregate child-reply bytes one notification batches; a single oversized
+/// reply is still admitted.
 pub(super) const MESSAGE_BATCH_BYTES: usize = 4 * output::PAGE_BYTES;
 
-/// Aggregate lifecycle-envelope bytes one notification may carry, budgeted
-/// separately from replies.
-///
-/// Envelopes and replies are not substitutes. A completed child agent's envelope is
-/// metadata referencing a reply the owner is already reading, and a question envelope
-/// is small, but a tool or script completion presents its result, which can be large.
-/// Sharing one budget let reply content starve that metadata for a whole turn (and,
-/// for a reply larger than the batch, indefinitely), so each side has its own
-/// allowance and envelopes are costed by the bytes they really present.
+/// Aggregate lifecycle-envelope bytes one notification batches, budgeted
+/// separately so reply content cannot starve completion metadata.
 pub(super) const LIFECYCLE_BATCH_BYTES: usize = 4 * output::PAGE_BYTES;
 
-/// A non-destructive snapshot serialized against publication, claims and resumption.
-/// Dropping a receipt before committing leaves its messages and jobs pending.
-/// Presentation must not claim jobs while this receipt holds the delivery gate.
+/// A pending batch holding the delivery gate. Dropping it uncommitted leaves its
+/// messages and jobs pending; presentation must not claim jobs while it is held.
 pub(crate) struct PendingDelivery {
     manager: JobManager,
     pub(super) owner: AgentId,
@@ -45,11 +31,7 @@ impl PendingDelivery {
 
     /// Commit the parent notification with an acknowledgement row for each delivered
     /// job outcome and child reply, in one transaction, then acknowledge them live.
-    ///
-    /// This consuming receipt shields the commit and all selected acknowledgements.
-    /// Cancelling the caller after admission cannot release the delivery gate, which
-    /// is released only after durable and live acknowledgement; no reusable receipt
-    /// survives a successful or failed commit.
+    /// Shielded from caller cancellation once admitted.
     pub(crate) async fn commit(self, message: Message) -> Result<u64, JobError> {
         let Self {
             manager,
@@ -121,9 +103,7 @@ impl PendingDelivery {
                             entry.reserve_delivery(DeliveryState::Injected);
                         }
                     }
-                    // A bounded snapshot may leave more work. Wake after durable
-                    // acknowledgement so the next parent turn cannot sleep with a
-                    // pending suffix.
+                    // A bounded snapshot may leave more work: wake the owner for it.
                     for (&job, entry) in jobs.iter() {
                         if entry.agent == owner && entry.has_pending() {
                             let _ = manager.inner.completions.send(JobCompletion {
@@ -158,9 +138,7 @@ impl JobManager {
         self.wait_inner(id, None, WaitMode::Foreground).await
     }
 
-    /// Block until `id` is terminal and no longer retained for resumption, i.e. no
-    /// longer live. Non-claiming and without hydrating output: a readiness edge
-    /// for a `wait` deferring to foreground work, not a result collection.
+    /// Block until `id` is no longer live, without claiming or hydrating output.
     pub(crate) async fn wait_settled(&self, id: JobId) -> Result<(), JobError> {
         self.wait_inner(id, None, WaitMode::Terminal)
             .await
@@ -215,8 +193,7 @@ impl JobManager {
                 (snapshot, notified, ready, claimed_agent)
             };
             if ready {
-                self.persist_delivery(id, claimed_agent, DeliveryState::Claimed, delivery)
-                    .await?;
+                self.persist_claim(id, claimed_agent, delivery).await?;
                 return Ok(snapshot);
             }
             drop(delivery);
@@ -230,33 +207,24 @@ impl JobManager {
         }
     }
 
-    pub(super) async fn persist_delivery(
+    /// Append the claim, then install it live; a no-op without `agent`.
+    async fn persist_claim(
         &self,
         id: JobId,
         agent: Option<AgentId>,
-        delivery: DeliveryState,
         gate: OwnedMutexGuard<()>,
     ) -> Result<(), JobError> {
         let Some(agent) = agent else {
             return Ok(());
         };
         self.spawn_owned(gate, "delivery publication", move |manager| async move {
-            manager.publish_delivery(id, agent, delivery).await
+            let claimed = SessionEvent::JobClaimed { job: id };
+            manager.inner.store.append(agent, claimed).await?;
+            let mut jobs = manager.inner.jobs.lock().await;
+            jobs.get_mut(&id).ok_or(JobError::Unknown(id))?.delivery = DeliveryState::Claimed;
+            Ok(())
         })
         .await
-    }
-
-    /// Append the delivery event, then install the same state live.
-    async fn publish_delivery(
-        &self,
-        id: JobId,
-        agent: AgentId,
-        delivery: DeliveryState,
-    ) -> Result<(), JobError> {
-        self.inner.store.append(agent, delivery.event(id)).await?;
-        let mut jobs = self.inner.jobs.lock().await;
-        jobs.get_mut(&id).ok_or(JobError::Unknown(id))?.delivery = delivery;
-        Ok(())
     }
 
     pub async fn claim(&self, id: JobId) -> Result<(), JobError> {
@@ -269,15 +237,13 @@ impl JobManager {
             }
             (entry.delivery == DeliveryState::Pending).then(|| entry.agent.clone())
         };
-        self.persist_delivery(id, agent, DeliveryState::Claimed, delivery)
-            .await
+        self.persist_claim(id, agent, delivery).await
     }
 
     pub(crate) async fn prune_claimed(&self) -> Result<usize, JobError> {
         let creation = self.inner.creation_operation.clone().write_owned().await;
         self.spawn_owned(creation, "prune", move |manager| async move {
-            // Pin candidates against accepted finalization/reset publication before
-            // taking the delivery gate, preserving operation -> delivery lock order.
+            // Pin candidates before the delivery gate: operation -> delivery lock order.
             let candidates = manager
                 .inner
                 .jobs
@@ -315,8 +281,6 @@ impl JobManager {
                 }
                 removed
             };
-            // The owner retains creation and candidate gates through cleanup even
-            // if its caller disappears after membership publication.
             for id in &removed {
                 manager.inner.store.remove_job_artifacts(*id).await?;
             }
@@ -349,9 +313,7 @@ impl JobManager {
     }
 
     /// Lifecycle envelopes to present alongside `messages`, within their own
-    /// budget. Replies never consume it, so a completion is deferred only behind
-    /// other completions; `messages` still decides ordering (a completion must not
-    /// overtake the replies of its own job) and pinning (below).
+    /// budget. A completion never overtakes the replies of its own job.
     pub(super) fn pending_ids(
         &self,
         jobs: &HashMap<JobId, JobEntry>,
@@ -379,14 +341,10 @@ impl JobManager {
             let entry = &jobs[&id];
             let metadata = serde_json::to_vec(&entry.metadata(id))
                 .map_or(output::PAGE_BYTES, |bytes| bytes.len());
-            // A completed child agent presents its result by reference to the visible
-            // reply, so its envelope costs metadata whatever the child wrote.
+            // A completed child agent presents its result by reference to its reply.
             let referenced = entry.role == JobRole::Agent
                 && entry.state == JobState::Completed
                 && entry.last_agent_message.is_some();
-            // Cost the bytes this envelope will actually present, unsaturated: an
-            // untruncatable result is presented whole, so a budget that capped its
-            // cost would admit several of them and bound nothing.
             let cost = if referenced {
                 metadata.saturating_add(128)
             } else {
@@ -394,51 +352,16 @@ impl JobManager {
                     .saturating_add(metadata)
                     .saturating_add(128)
             };
-            // A reply in this batch pins the completion that only references it, even
-            // when earlier completions have exhausted the budget: deferring it would
-            // spend a whole owner turn on metadata about content the owner has just
-            // read. The pre-filter above admits this job only when the batch carries
-            // every reply it has pending, so the pinned message is the referenced one.
+            // A reply in this batch pins the completion that references it.
             let pinned = referenced && messages.iter().any(|message| message.id == id);
             if !pinned && cost > remaining && !pending.is_empty() {
-                // A smaller later completion may fit the remaining budget. A single
-                // envelope larger than the whole budget is still admitted when it is
-                // first, so an untruncatable result cannot stall delivery — that is
-                // the one case where a notification exceeds this bound.
+                // A later completion may still fit; an oversized first one is admitted.
                 continue;
             }
             pending.push(id);
             remaining = remaining.saturating_sub(cost);
         }
         pending
-    }
-
-    /// Legacy eager delivery for callers that do not commit parent history.
-    /// Each accepted event is installed live before releasing the shared gate.
-    pub async fn take_pending(&self, owner: &AgentId) -> Result<Vec<JobEnvelope>, JobError> {
-        let gate = self.inner.delivery_operation.clone().lock_owned().await;
-        let owner = owner.clone();
-        self.spawn_owned(gate, "pending delivery", move |manager| async move {
-            let pending = {
-                let jobs = manager.inner.jobs.lock().await;
-                manager
-                    .pending_ids(&jobs, &owner, &[])
-                    .into_iter()
-                    .map(|id| (id, jobs[&id].agent.clone(), jobs[&id].envelope(id)))
-                    .collect::<Vec<_>>()
-            };
-            for (id, agent, _) in &pending {
-                let injected = DeliveryState::Injected;
-                manager
-                    .publish_delivery(*id, agent.clone(), injected)
-                    .await?;
-            }
-            Ok(pending
-                .into_iter()
-                .map(|(_, _, envelope)| envelope)
-                .collect())
-        })
-        .await
     }
 }
 
@@ -471,15 +394,8 @@ mod tests {
         (root, manager, owner, job)
     }
 
-    fn notification_text(job: JobId, state: JobState) -> String {
-        let events = serde_json::json!([{"id":job,"state":state}]);
-        format!("<skyhook_job_events>\n{events}\n</skyhook_job_events>")
-    }
-
     fn notification(job: JobId, state: JobState) -> Message {
-        Message::User(vec![UserContent::Runtime {
-            text: notification_text(job, state),
-        }])
+        crate::job::tests::job_events(serde_json::json!([{"id":job,"state":state}]))
     }
 
     async fn commit_pending(manager: &JobManager, owner: &AgentId, message: Message) -> u64 {
@@ -719,7 +635,7 @@ mod tests {
         let question_view = manager.wait(lease.id(), None, true).await.unwrap();
         assert_eq!(question_view.state, JobState::WaitingInput);
         assert_eq!(question_view.output.unwrap()["question_id"], "q-2");
-        assert!(manager.take_pending(&agent).await.unwrap().is_empty());
+        assert!(!manager.has_pending(&agent).await);
         let repeated = manager
             .wait(lease.id(), Some(Duration::from_millis(1)), true)
             .await
@@ -733,9 +649,12 @@ mod tests {
             .request_input(lease.id(), question("q-3"))
             .await
             .unwrap();
-        let injected = manager.take_pending(&agent).await.unwrap();
-        assert_eq!(injected.len(), 1);
-        assert_eq!(injected[0].output.as_ref().unwrap()["question_id"], "q-3");
-        assert!(manager.take_pending(&agent).await.unwrap().is_empty());
+        let receipt = manager.pending_delivery(&agent).await.unwrap();
+        assert_eq!(receipt.envelopes().len(), 1);
+        let output = receipt.envelopes()[0].output.as_ref().unwrap();
+        assert_eq!(output["question_id"], "q-3");
+        let message = notification(lease.id(), JobState::WaitingInput);
+        receipt.commit(message).await.unwrap();
+        assert!(!manager.has_pending(&agent).await);
     }
 }

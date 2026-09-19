@@ -1,7 +1,6 @@
 //! Prepare replayable uploads and dispatch authorized HTTP requests.
 use std::path::Path;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use reqwest::{
     Method, Url,
@@ -81,14 +80,12 @@ fn check_upload_size(size: usize) -> Result<(), ToolError> {
     }
 }
 fn decode_base64(value: &str) -> Result<Vec<u8>, ToolError> {
-    if value.len() as u64 > MAX_UPLOAD_BYTES.div_ceil(3) * 4 {
-        return Err(invalid("upload exceeds 100 MiB limit"));
-    }
-    let bytes = STANDARD
-        .decode(value)
-        .map_err(|_| invalid("invalid base64 body"))?;
-    check_upload_size(bytes.len())?;
-    Ok(bytes)
+    crate::media::decode_base64_bounded(value, MAX_UPLOAD_BYTES as usize).map_err(|error| {
+        invalid(match error {
+            crate::media::MediaError::TooLarge => "upload exceeds 100 MiB limit",
+            _ => "invalid base64 body",
+        })
+    })
 }
 async fn prepare_body(body: Option<&RequestBody>) -> Result<Option<Upload>, ToolError> {
     let Some(body) = body else { return Ok(None) };

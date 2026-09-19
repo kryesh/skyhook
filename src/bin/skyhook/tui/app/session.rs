@@ -35,7 +35,6 @@ impl App {
         self.queue_activity_revision = 0;
         self.initial_input = None;
         self.attached_draft = None;
-        self.queue.clear();
         self.install_observation(observation);
         self.selected = self
             .session()
@@ -53,7 +52,7 @@ impl App {
         self.switching = None;
         self.start = StartState::Idle;
         self.deferred_switch = None;
-        self.paused = !self.queue.is_empty() || self.queue_scan == queue::QueueScan::Failed;
+        self.paused = !self.queue.is_empty();
         self.operation = false;
         self.menu = None;
         self.unsaved_status.clear();
@@ -105,21 +104,12 @@ impl App {
         let was_paused = self.paused;
         self.paused = true;
         self.cancel_queue_delivery();
-        // Every saved row stays in this session's journal. The old runtime's
-        // shutdown drains a claimed dispatch before it returns, so its commit is
-        // durable, and reopening the session resolves unresolved rows.
-        let unsettled = self.queue.iter().any(|input| input.state.unsettled());
         self.switching = Some(was_paused);
         self.notice(if id.is_some() {
             "Opening session…"
         } else {
             "New session"
         });
-        if unsettled {
-            self.notice(
-                "Queued input awaiting acknowledgement or recovery stays saved in the previous session; reopen it to resolve",
-            );
-        }
         let old = self.session().cloned();
         let launch = self.launch.clone();
         let tx = self.tx.clone();

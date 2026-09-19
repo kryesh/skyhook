@@ -92,9 +92,9 @@ pub(super) mod tests {
     }
 
     /// Snapshotting must not consume the only durable copy of a child's progress.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn child_progress_snapshot_survives_abandoned_parent_commits() {
-        let tracking = Tracking::new(vec![("root", answer()), ("root", answer())]);
+        let tracking = tracking(vec![("root", answer()), ("root", answer())]);
         let (root, session) = start(&tracking).await;
         let runtime = &session.runtime;
         let turn = prompt(&session);
@@ -135,7 +135,7 @@ pub(super) mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancelling_a_started_commit_finishes_acknowledgments_and_serializes_the_next_snapshot()
     {
         for with_completion in [true, false] {
@@ -144,7 +144,7 @@ pub(super) mod tests {
     }
 
     async fn cancelled_notification_commit(with_completion: bool) {
-        let tracking = Tracking::new(vec![("root", answer()), ("root", answer())]);
+        let tracking = tracking(vec![("root", answer()), ("root", answer())]);
         let (root, session) = start(&tracking).await;
         let runtime = &session.runtime;
         let turn = prompt(&session);
@@ -183,7 +183,7 @@ pub(super) mod tests {
                 }
             }
             while runtime.jobs.has_pending(session.root_agent()).await {
-                tokio::task::yield_now().await;
+                poll().await;
             }
         })
         .await;

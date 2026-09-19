@@ -291,26 +291,13 @@ pub(crate) async fn write_tool_result<W: AsyncWrite + Unpin>(
         )
         .await;
     }
-    let mut file = tokio::fs::File::from_std(file.into_file()?);
-    let mut offset = 0;
-    let mut buffer = vec![0; 64 * 1024];
-    loop {
-        let length = file.read(&mut buffer).await?;
-        write_frame(
-            &mut *writer.lock().await,
-            &Response::ToolChunk {
-                request_id,
-                offset,
-                data: buffer[..length].to_vec(),
-                finished: length == 0,
-            },
-        )
-        .await?;
-        if length == 0 {
-            return Ok(());
-        }
-        offset += length as u64;
-    }
+    let frame = move |offset, data, finished| Response::ToolChunk {
+        request_id,
+        offset,
+        data,
+        finished,
+    };
+    write_chunks(writer, file.into_file()?, frame).await
 }
 
 pub(crate) async fn write_artifact<W: AsyncWrite + Unpin>(
@@ -318,7 +305,24 @@ pub(crate) async fn write_artifact<W: AsyncWrite + Unpin>(
     request_id: RequestId,
     field: String,
     kind: crate::job::output::CaptureKind,
-    mut input: crate::job::output::Source,
+    input: crate::job::output::Source,
+) -> std::io::Result<()> {
+    let frame = move |offset, data, finished| Response::ToolArtifact {
+        request_id,
+        field: field.clone(),
+        kind,
+        offset,
+        data,
+        finished,
+    };
+    write_chunks(writer, input, frame).await
+}
+
+/// Sends `input` as 64 KiB frames followed by an empty `finished` frame.
+async fn write_chunks<W: AsyncWrite + Unpin, R: std::io::Read + Send + 'static>(
+    writer: &tokio::sync::Mutex<W>,
+    mut input: R,
+    frame: impl Fn(u64, Vec<u8>, bool) -> Response,
 ) -> std::io::Result<()> {
     let mut buffer = vec![0; 64 * 1024];
     let mut offset = 0;
@@ -326,24 +330,14 @@ pub(crate) async fn write_artifact<W: AsyncWrite + Unpin>(
         // Capture reads query the session database; keep them off the runtime.
         let length;
         (input, buffer, length) = tokio::task::spawn_blocking(move || {
-            let length = std::io::Read::read(&mut input, &mut buffer);
+            let length = input.read(&mut buffer);
             (input, buffer, length)
         })
         .await
         .map_err(std::io::Error::other)?;
         let length = length?;
-        write_frame(
-            &mut *writer.lock().await,
-            &Response::ToolArtifact {
-                request_id,
-                field: field.clone(),
-                kind,
-                offset,
-                data: buffer[..length].to_vec(),
-                finished: length == 0,
-            },
-        )
-        .await?;
+        let response = frame(offset, buffer[..length].to_vec(), length == 0);
+        write_frame(&mut *writer.lock().await, &response).await?;
         if length == 0 {
             return Ok(());
         }

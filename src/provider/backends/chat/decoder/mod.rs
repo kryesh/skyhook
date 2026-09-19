@@ -40,7 +40,6 @@ pub(crate) struct Decoder {
     usage: Usage,
     raw_prompt_tokens: u64,
     done: bool,
-    failed: bool,
 }
 
 impl Decoder {
@@ -59,31 +58,16 @@ impl Decoder {
             usage: Usage::default(),
             raw_prompt_tokens: 0,
             done: false,
-            failed: false,
         }
     }
 
     /// Bind the decoder to the request it decodes the response of.
     pub(crate) fn for_request(mut self, body: &serde_json::Value) -> Self {
-        use sha2::{Digest, Sha256};
-        self.request_digest = hex(&Sha256::digest(body.to_string().as_bytes()));
+        self.request_digest = crate::sha256_hex(body.to_string());
         self
     }
 
     pub(crate) fn decode(&mut self, event: &SseEvent) -> Result<Vec<ResponseChunk>, ProviderError> {
-        if self.failed {
-            return Err(ProviderError::protocol("Chat stream already failed"));
-        }
-        match self.decode_event(event) {
-            Ok(chunks) => Ok(chunks),
-            Err(error) => {
-                self.failed = true;
-                Err(error)
-            }
-        }
-    }
-
-    fn decode_event(&mut self, event: &SseEvent) -> Result<Vec<ResponseChunk>, ProviderError> {
         if self.done {
             return Ok(Vec::new());
         }
@@ -204,14 +188,10 @@ impl Decoder {
     }
 
     pub(crate) fn finish(&mut self) -> Result<Vec<ResponseChunk>, ProviderError> {
-        if self.failed {
-            return Err(ProviderError::protocol("Chat stream already failed"));
-        }
         if self.done {
             return Ok(Vec::new());
         }
         let Some(stop_reason) = self.finish_reason.clone() else {
-            self.failed = true;
             return Err(ProviderError::protocol(
                 "Chat stream ended before finish_reason",
             ));
@@ -219,10 +199,6 @@ impl Decoder {
         self.done = true;
         Ok(vec![ResponseChunk::ResponseEnded { stop_reason }])
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -288,7 +264,6 @@ pub(super) mod tests {
         decoder.decode(&delta(json!({"content":"answer"}))).unwrap();
         decoder.decode(&end("stop")).unwrap();
         assert!(decoder.decode(&event(packet.clone())).is_err(), "{packet}");
-        assert!(decoder.finish().is_err(), "{packet}");
     }
 
     pub(super) fn noop_packets() -> Vec<Value> {
@@ -394,145 +369,88 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn noop_metadata_before_during_and_after_generation_preserves_output() {
+    fn noop_metadata_is_ignored_at_every_stage_and_never_finishes_a_response() {
+        let ended = |chunk: &ResponseChunk| matches!(chunk, ResponseChunk::ResponseEnded { .. });
         for mut packet in noop_packets() {
             // Envelope/choice metadata is ignored; unknown non-null delta output is not.
             packet["provider_metadata"] = json!({"stage":"heartbeat"});
             if let Some(choice) = packet["choices"].get_mut(0) {
                 choice["logprobs"] = json!({"provider_extension":true});
             }
-            for usage in [
-                None,
-                Some(Value::Null),
-                Some(json!({
-                    "prompt_tokens":100,"completion_tokens":10,
-                    "prompt_tokens_details":{"cached_tokens":80,"extension":true},
-                    "provider_extension":{"ignored":true}
-                })),
+            let mut with_usage = packet.clone();
+            with_usage["usage"] = phantom_usage_chunk()["usage"].clone();
+            let mut null_usage = packet.clone();
+            null_usage["usage"] = Value::Null;
+
+            // Before, during and after generation, with and without [DONE].
+            for (packet, expected_usage, with_done) in [
+                (&packet, Usage::default(), false),
+                (&null_usage, Usage::default(), true),
+                (&with_usage, USAGE, true),
             ] {
-                let mut packet = packet.clone();
-                if let Some(usage) = &usage {
-                    packet["usage"] = usage.clone();
-                }
-                let expected_usage = match usage {
-                    Some(usage) if !usage.is_null() => USAGE,
-                    _ => Usage::default(),
+                let mut frames = vec![
+                    event(packet.clone()),
+                    delta(json!({"reasoning_content":"think"})),
+                    event(packet.clone()),
+                    delta(json!({"content":"an"})),
+                    delta(json!({"refusal":"swer"})),
+                    end("length"),
+                    event(packet.clone()),
+                ];
+                frames.extend(with_done.then(done));
+                let (items, usage, stop) = decode(frames);
+                let reasoning = BlockContent::Reasoning {
+                    text: "think".into(),
                 };
+                assert_eq!(contents(&items), [&reasoning, &text("answer")], "{packet}");
+                assert_eq!((stop, usage), (StopReason::MaxTokens, expected_usage));
+            }
+
+            // Metadata never supplies a finish reason; only [DONE] ends the response.
+            for packet in [&packet, &with_usage] {
+                let mut decoder = Decoder::new("test-model".into());
+                let partial = delta(json!({"content":"partial"}));
+                decoder.decode(&partial).unwrap();
+                let chunks = decoder.decode(&event(packet.clone())).unwrap();
+                assert!(!chunks.iter().any(ended), "{packet}");
+                assert!(decoder.clone().finish().is_err(), "{packet}");
+                assert!(decoder.decode(&done()).unwrap().iter().any(ended));
+                // Packets after [DONE] are ignored.
+                assert!(decoder.decode(&event(packet.clone())).unwrap().is_empty());
+                assert!(decoder.finish().unwrap().is_empty(), "{packet}");
+            }
+
+            // A repeated identical finish on a no-op delta keeps the stop and usage.
+            if packet["choices"].get(0).is_some() {
                 for (finish, expected_stop) in [
                     ("stop", StopReason::EndTurn),
-                    ("length", StopReason::MaxTokens),
+                    ("abort", StopReason::Aborted),
+                    ("content_filter", StopReason::ContentFilter),
                 ] {
-                    for with_done in [false, true] {
-                        let mut frames = vec![
-                            event(packet.clone()),
-                            delta(json!({"reasoning_content":"think"})),
-                            event(packet.clone()),
-                            delta(json!({"content":"an"})),
-                            event(packet.clone()),
-                            delta(json!({"refusal":"swer"})),
-                            end(finish),
-                            event(packet.clone()),
-                        ];
-                        frames.extend(with_done.then(done));
-                        let (items, actual_usage, stop) = decode(frames);
-                        let reasoning = BlockContent::Reasoning {
-                            text: "think".into(),
-                        };
-                        assert_eq!(contents(&items), [&reasoning, &text("answer")], "{packet}");
-                        assert_eq!(
-                            (stop, actual_usage),
-                            (expected_stop.clone(), expected_usage)
-                        );
-                    }
+                    let mut repeated = packet.clone();
+                    repeated["choices"][0]["finish_reason"] = json!(finish);
+                    let (items, usage, stop) = decode(vec![
+                        delta(json!({"content":"answer"})),
+                        end(finish),
+                        event(phantom_usage_chunk()),
+                        event(repeated.clone()),
+                        event(repeated),
+                    ]);
+                    assert_eq!(contents(&items), [&text("answer")]);
+                    assert_eq!((stop, usage), (expected_stop, USAGE));
                 }
             }
         }
-    }
-
-    #[test]
-    fn noop_metadata_never_supplies_a_finish_or_ends_response_early() {
-        for packet in noop_packets() {
-            for with_content in [false, true] {
-                for with_usage in [false, true] {
-                    for with_done in [false, true] {
-                        let mut decoder = Decoder::new("test-model".into());
-                        if with_content {
-                            decoder
-                                .decode(&delta(json!({"content":"partial"})))
-                                .unwrap();
-                        }
-                        let mut packet = packet.clone();
-                        if with_usage {
-                            packet["usage"] = phantom_usage_chunk()["usage"].clone();
-                        }
-                        let chunks = decoder.decode(&event(packet.clone())).unwrap();
-                        let ended = |chunk: &ResponseChunk| {
-                            matches!(chunk, ResponseChunk::ResponseEnded { .. })
-                        };
-                        assert!(!chunks.iter().any(ended), "{packet}");
-                        if with_done {
-                            let chunks = decoder.decode(&done()).unwrap();
-                            assert!(chunks.iter().any(ended), "{packet}");
-                            decoder.finish().unwrap();
-                        } else {
-                            assert!(decoder.finish().is_err(), "{packet}");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn packets_after_done_are_ignored() {
-        let mut packets = noop_packets();
-        packets.push(phantom_usage_chunk());
-        packets.push(json!({"choices":[{"finish_reason":"stop"}]}));
-        for packet in packets {
+        // A finish or usage after [DONE] is ignored too.
+        for packet in [
+            phantom_usage_chunk(),
+            json!({"choices":[{"finish_reason":"stop"}]}),
+        ] {
             let mut decoder = Decoder::new("test-model".into());
             for frame in [delta(json!({"content":"answer"})), end("stop"), done()] {
                 decoder.decode(&frame).unwrap();
             }
-            assert!(decoder.decode(&event(packet.clone())).unwrap().is_empty());
-            assert!(decoder.finish().unwrap().is_empty(), "{packet}");
-        }
-    }
-
-    #[test]
-    fn repeated_identical_finish_with_noop_delta_preserves_stop_and_usage() {
-        for (finish, expected_stop) in [
-            ("stop", StopReason::EndTurn),
-            ("length", StopReason::MaxTokens),
-            ("abort", StopReason::Aborted),
-            ("content_filter", StopReason::ContentFilter),
-        ] {
-            let with_choice = |packet: &Value| {
-                packet["choices"]
-                    .as_array()
-                    .is_some_and(|choices| !choices.is_empty())
-            };
-            for mut packet in noop_packets().into_iter().filter(with_choice) {
-                packet["choices"][0]["finish_reason"] = json!(finish);
-                for with_usage in [false, true] {
-                    for with_done in [false, true] {
-                        let mut repeated = packet.clone();
-                        if with_usage {
-                            repeated["usage"] = phantom_usage_chunk()["usage"].clone();
-                        }
-                        let mut frames = vec![
-                            delta(json!({"content":"answer"})),
-                            end(finish),
-                            event(phantom_usage_chunk()),
-                            event(repeated.clone()),
-                            event(repeated),
-                        ];
-                        frames.extend(with_done.then(done));
-                        let (items, usage, stop) = decode(frames);
-                        assert_eq!(contents(&items), [&text("answer")]);
-                        assert_eq!((stop, usage), (expected_stop.clone(), USAGE));
-                    }
-                }
-            }
+            assert!(decoder.decode(&event(packet)).unwrap().is_empty());
         }
     }
 

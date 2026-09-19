@@ -15,12 +15,6 @@ pub enum MenuLoaded {
     Output(MenuId, JobId, Result<Vec<Item<OutputAction>>, String>),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ConfirmationChoice {
-    KeepWorking,
-    Proceed,
-}
-
 /// A draft item in the attachments menu: pasted text by id, or an attachment by index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DraftItem {
@@ -68,7 +62,8 @@ pub enum MenuKind {
     Files(Vec<Item<PathBuf>>, Option<usize>),
     Attachments(Vec<Item<DraftItem>>),
     Queue(Vec<Item<QueuedInputId>>),
-    Confirm(ConfirmAction, Vec<Item<ConfirmationChoice>>),
+    /// Row 0 keeps working; row 1 proceeds.
+    Confirm(ConfirmAction),
     Output(JobId, Vec<Item<OutputAction>>),
     OutputSearch(JobId),
     Info(Vec<Item<()>>),
@@ -100,7 +95,15 @@ impl MenuKind {
             Self::Files(items, _) => rows(items),
             Self::Attachments(items) => rows(items),
             Self::Queue(items) => rows(items),
-            Self::Confirm(_, items) => rows(items),
+            Self::Confirm(_) => ["Keep working", "Stop work and continue"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, label)| ItemRef {
+                    index,
+                    label,
+                    detail: "",
+                })
+                .collect(),
             Self::Output(_, items) => rows(items),
             Self::Info(items) => rows(items),
             Self::OutputSearch(_) => vec![],
@@ -343,16 +346,7 @@ impl App {
         );
     }
     pub(super) fn confirm(&mut self, action: ConfirmAction) {
-        self.open(
-            "Confirm action",
-            MenuKind::Confirm(
-                action,
-                vec![
-                    Item::new(ConfirmationChoice::KeepWorking, "Keep working", ""),
-                    Item::new(ConfirmationChoice::Proceed, "Stop work and continue", ""),
-                ],
-            ),
-        );
+        self.open("Confirm action", MenuKind::Confirm(action));
     }
     pub fn command(&mut self, command: Command) {
         match command {
@@ -394,21 +388,6 @@ impl App {
             Command::Copy => self.copy(),
             Command::Attention => self.activate_prompt(),
             Command::Resume => {
-                if self.queue_requires_recovery() || self.queue_scan == queue::QueueScan::Failed {
-                    // Delivery stays blocked until the journal resolves each row.
-                    self.paused = false;
-                    match self.session().cloned() {
-                        Some(session) => {
-                            self.request_queue_recovery(&session);
-                            self.notice("Reconciling queued input with the session journal…");
-                        }
-                        None => {
-                            self.paused = true;
-                            self.notice("Queued input requires recovery; it has not been retried");
-                        }
-                    }
-                    return;
-                }
                 self.paused = false;
                 // Not busy means no creation is in flight, so only a parked retry can be taken.
                 if !self.busy()
@@ -529,10 +508,11 @@ impl App {
             }
             Command::Files => self.open_files(None),
             Command::Export => {
-                let entries = model::entries(
-                    &self.snapshot, &self.projection, &self.selected,
-                    &View::default(), &self.outputs, self.thinking, true,
-                );
+                let view = model::EntryView {
+                    agent: &self.selected, view: &View::default(),
+                    thinking: self.thinking, all_details: true,
+                };
+                let entries = model::entries(&self.snapshot, &self.projection, view, &self.outputs, true);
                 let text = entries.iter().map(|entry| entry.text()).collect::<Vec<_>>().join("\n\n");
                 let Some(session) = self.session() else {
                     self.notice("No session to export yet");
@@ -589,40 +569,24 @@ impl App {
                 key.code = KeyCode::Down;
             }
         }
+        if let Some(menu) = &mut self.menu {
+            let last = menu.filtered().len().saturating_sub(1);
+            let selected = match key.code {
+                KeyCode::Home => Some(0),
+                KeyCode::End => Some(last),
+                KeyCode::Up => Some(menu.selected.saturating_sub(1)),
+                KeyCode::Down => Some((menu.selected + 1).min(last)),
+                KeyCode::PageUp => Some(menu.selected.saturating_sub(10)),
+                KeyCode::PageDown => Some((menu.selected + 10).min(last)),
+                _ => None,
+            };
+            if let Some(selected) = selected {
+                menu.selected = selected;
+                return;
+            }
+        }
         match key.code {
-            KeyCode::Home => {
-                if let Some(menu) = &mut self.menu {
-                    menu.selected = 0;
-                }
-            }
-            KeyCode::End => {
-                if let Some(menu) = &mut self.menu {
-                    menu.selected = menu.filtered().len().saturating_sub(1);
-                }
-            }
             KeyCode::Esc => self.menu = None,
-            KeyCode::Up => {
-                if let Some(menu) = &mut self.menu {
-                    menu.selected = menu.selected.saturating_sub(1);
-                }
-            }
-            KeyCode::Down => {
-                if let Some(menu) = &mut self.menu {
-                    menu.selected =
-                        (menu.selected + 1).min(menu.filtered().len().saturating_sub(1));
-                }
-            }
-            KeyCode::PageUp => {
-                if let Some(menu) = &mut self.menu {
-                    menu.selected = menu.selected.saturating_sub(10);
-                }
-            }
-            KeyCode::PageDown => {
-                if let Some(menu) = &mut self.menu {
-                    menu.selected =
-                        (menu.selected + 10).min(menu.filtered().len().saturating_sub(1));
-                }
-            }
             KeyCode::Enter | KeyCode::Tab => self.choose(),
             KeyCode::Delete => {
                 if let Some(menu) = &self.menu {
@@ -748,8 +712,8 @@ impl App {
                     self.replace_draft(queued.submission);
                 }
             }
-            MenuKind::Confirm(action, items) => {
-                if selected.is_some_and(|index| items[index].value == ConfirmationChoice::Proceed) {
+            MenuKind::Confirm(action) => {
+                if selected == Some(1) {
                     match action {
                         ConfirmAction::Exit => self.shutdown(),
                         ConfirmAction::NewSession => self.switch(None),
@@ -1304,6 +1268,5 @@ mod tests {
         mouse(&mut app, visible_second, MouseEventKind::Moved);
         key(&mut app, KeyCode::Enter, M::NONE);
         assert_eq!(app.model, "second");
-        app.session().unwrap().shutdown().await.unwrap();
     }
 }

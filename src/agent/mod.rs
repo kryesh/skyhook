@@ -14,10 +14,8 @@ pub use observation::{
     AgentActivity, ContextUsage, LiveResponse, Observation, ObservationSnapshot, ObservedEvent,
 };
 pub use runtime::{
-    ContinueOptions, ContinueOutcome, Harness, HarnessBuilder, PreparedQueuedPrompt, PromptOptions,
-    QueueConflict, QueuedPrompt, QueuedPromptCancellation, QueuedPromptCommit, QueuedPromptError,
-    QueuedPromptIdentity, QueuedPromptRecovery, QueuedPromptToken, RecoveredQueuedPrompt,
-    RecoveredQueuedPromptState, SessionHandle,
+    ContinueOptions, ContinueOutcome, Harness, HarnessBuilder, PromptOptions, QueuedPrompt,
+    QueuedPromptCancellation, QueuedPromptReceipt, SessionHandle,
 };
 pub use todo::{TodoItem, TodoSnapshot, TodoStatus};
 

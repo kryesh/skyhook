@@ -227,7 +227,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
                 result = tokio::time::timeout(timeout, execute(&context, plan, &mut progress)) => result,
             };
             match outcome {
-                Ok(Ok(result)) => Ok(ToolOutput::new(serde_json::to_value(result).map_err(failed)?)),
+                Ok(Ok(result)) => Ok(ToolOutput::new(serde_json::to_value(result).map_err(ToolError::failed)?)),
                 Ok(Err(error)) => Err(progress.failure(error)),
                 Err(_) => Err(progress.timeout(timeout.as_secs())),
             }
@@ -237,10 +237,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
 }
 
 fn invalid(error: impl std::fmt::Display) -> ToolError {
-    ToolError::InvalidArguments(error.to_string())
-}
-fn failed(error: impl std::fmt::Display) -> ToolError {
-    ToolError::Failed(error.to_string())
+    ToolError::invalid(error)
 }
 
 #[cfg(test)]
@@ -248,7 +245,6 @@ mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde_json::json;
-    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::{net::TcpListener, task::JoinHandle};
 
@@ -325,20 +321,17 @@ mod tests {
         responses: Vec<impl AsRef<[u8]> + Send + 'static>,
     ) -> (String, JoinHandle<Vec<String>>) {
         let (listener, url) = listen().await;
+        // No deadline of its own: the client's timeout and the runner's bound it.
         let task = tokio::spawn(async move {
-            let serve = async move {
-                let mut requests = Vec::new();
-                for response in responses {
-                    let (mut socket, _) = listener.accept().await.unwrap();
-                    requests.push(read_request(&mut socket).await);
-                    socket.write_all(response.as_ref()).await.unwrap();
-                    socket.shutdown().await.unwrap();
-                }
-                requests
-            };
-            tokio::time::timeout(Duration::from_secs(10), serve)
-                .await
-                .expect("fixture server timed out")
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.push(read_request(&mut socket).await);
+                socket.write_all(response.as_ref()).await.unwrap();
+                // A client that has already closed makes this fail harmlessly.
+                let _ = socket.shutdown().await;
+            }
+            requests
         });
         (url, task)
     }

@@ -2,15 +2,6 @@
 use super::*;
 use crate::job::output::{AsyncCapture, CaptureKind, CompletedCapture};
 
-pub(super) struct ArtifactFrame {
-    pub request_id: RequestId,
-    pub field: String,
-    pub kind: crate::job::output::CaptureKind,
-    pub offset: u64,
-    pub data: Vec<u8>,
-    pub finished: bool,
-}
-
 /// Local evidence travels alongside the unchanged wire result, never inside it.
 #[derive(Debug)]
 pub(super) struct ReceivedResult {
@@ -93,19 +84,23 @@ pub(super) struct Results {
     transfers: HashMap<RequestId, (std::fs::File, u64)>,
 }
 impl Results {
+    /// Receives one `Response::ToolArtifact` frame.
     pub(super) async fn artifact(
         &mut self,
         state: &Mutex<ConnectionState>,
-        frame: ArtifactFrame,
+        frame: Response,
     ) -> Result<(), RemoteError> {
-        let ArtifactFrame {
+        let Response::ToolArtifact {
             request_id,
             field,
             kind,
             offset,
             data,
             finished,
-        } = frame;
+        } = frame
+        else {
+            unreachable!("only artifact frames are routed here");
+        };
         let context = state
             .lock()
             .await
@@ -244,7 +239,6 @@ mod tests {
     use super::super::tests::route_fixture;
     use super::*;
     use crate::job::output::transfer_fields;
-    use crate::tool::ToolError;
     use base64::Engine as _;
 
     fn read(source: &mut crate::job::output::Source) -> Vec<u8> {
@@ -259,9 +253,9 @@ mod tests {
         offset: u64,
         data: &[u8],
         finished: bool,
-    ) -> ArtifactFrame {
+    ) -> Response {
         let (request_id, field, data) = (RequestId::FIRST, field.into(), data.into());
-        ArtifactFrame {
+        Response::ToolArtifact {
             request_id,
             field,
             kind,
@@ -417,127 +411,88 @@ mod tests {
 
     #[tokio::test]
     async fn artifact_transfer_hydrates_native_results_and_preserves_interrupted_prefixes() {
+        // Just over two 64 KiB transfer frames.
+        const LINES: usize = 2 * 64 * 1024 / 5 + 1;
         for complete in [true, false] {
             let runtime = crate::tests::TestRuntime::new().await;
-            let payload = "line\n".repeat(250_000);
-            let source = payload.clone().into_bytes();
-            // The worker's own session: no result exists for its small, unfinished JSON capture.
-            let remote = crate::tests::TestRuntime::new().await;
-            let spec = crate::job::JobSpec::test(remote.agent.clone(), "remote");
-            let captures = remote.jobs.output(remote.jobs.test_create(spec).await);
-            captures.test_capture(
-                "/result/custom~1partial",
-                crate::job::output::CaptureKind::Json,
-                b"{\"key\":",
-            );
+            let schema = schemars::schema_for!(crate::tool::builtins::ProcessOutput);
+            let options = crate::tool::ToolOptions::default()
+                .output_schema(serde_json::to_value(schema).unwrap());
+            let input =
+                serde_json::json!({"type":"object","properties":{},"additionalProperties":false});
             let mut builder = crate::tool::ToolRegistryBuilder::default();
-            builder.register_dynamic("remote_fixture", "remote fixture", serde_json::json!({"type":"object","properties":{},"additionalProperties":false}), crate::tool::ToolOptions::default().output_schema(serde_json::to_value(schemars::schema_for!(crate::tool::builtins::ProcessOutput)).unwrap()), move |context, _| {
-                let source = source.clone();
-                let captures = captures.clone();
+            let tool = move |context: ToolContext, _| async move {
                 let store = context.store().clone();
-                async move {
-                    let (peer, stream) = tokio::io::duplex(64 * 1024);
-                    let (sender, receiver) = oneshot::channel();
-                    let state = Arc::new(Mutex::new(ConnectionState { pending:HashMap::from([(RequestId::FIRST, PendingCall {sender,context})]), failure:None,streams:HashMap::new() }));
-                    let reader_state = state.clone();
-                    let reader = tokio::spawn(async move { route_fixture(stream, &reader_state, "fixture").await; });
-                    let writer = tokio::spawn(async move {
-                        let peer = Mutex::new(peer);
-                        if complete {
-                            let fields = crate::job::output::transfer_fields(&captures).unwrap();
-                            assert_eq!(fields.len(), 1);
-                            for (field, kind, source) in fields {
-                                crate::remote::protocol::write_artifact(&peer, RequestId::FIRST, field, kind, source).await.unwrap();
-                            }
-                            let payload = crate::job::output::Source::Memory(std::io::Cursor::new(source));
-                            crate::remote::protocol::write_artifact(&peer,RequestId::FIRST,"/result/stdout".into(),crate::job::output::CaptureKind::Text,payload).await.unwrap();
-                            write_frame(&mut *peer.lock().await,&Response::Tool {request_id:RequestId::FIRST,result:Ok(RemoteToolOutput { streams: Default::default(),value:serde_json::json!({"stdout":"","exit_code":0}),images:Vec::new()})}).await.unwrap();
-                        } else {
-                            write_frame(&mut *peer.lock().await,&Response::ToolArtifact {request_id:RequestId::FIRST,field:"/result/stdout".into(),kind:crate::job::output::CaptureKind::Text,offset:0,data:b"retained prefix\n".to_vec(),finished:false}).await.unwrap();
-                        }
-                    });
-                    let result = receiver.await.map_err(|e| ToolError::Failed(e.to_string()))?;
-                    writer.await.map_err(|e| ToolError::Failed(e.to_string()))?;
-                    reader.await.map_err(|e| ToolError::Failed(e.to_string()))?;
-                    result.map_err(RemoteError::into_tool_error)?.into_output(&store).await.map_err(RemoteError::into_tool_error)
-                }
-            }).unwrap();
-            let script_slot = Arc::new(std::sync::OnceLock::new());
-            crate::tool::builtins::install_script_tool(&mut builder, Arc::downgrade(&script_slot))
+                let (peer, stream) = tokio::io::duplex(64 * 1024);
+                let (sender, receiver) = oneshot::channel();
+                let pending = HashMap::from([(RequestId::FIRST, PendingCall { sender, context })]);
+                let state = Mutex::new(ConnectionState {
+                    pending,
+                    ..Default::default()
+                });
+                let peer = Mutex::new(peer);
+                let write = async {
+                    let (field, kind) = ("/result/stdout".to_owned(), CaptureKind::Text);
+                    if complete {
+                        let source = std::io::Cursor::new(b"line\n".repeat(LINES));
+                        let source = crate::job::output::Source::Memory(source);
+                        crate::remote::protocol::write_artifact(
+                            &peer,
+                            RequestId::FIRST,
+                            field,
+                            kind,
+                            source,
+                        )
+                        .await
+                        .unwrap();
+                        let result = Ok(RemoteToolOutput {
+                            streams: Default::default(),
+                            value: serde_json::json!({"stdout":"","exit_code":0}),
+                            images: Vec::new(),
+                        });
+                        let request_id = RequestId::FIRST;
+                        let frame = Response::Tool { request_id, result };
+                        write_frame(&mut *peer.lock().await, &frame).await.unwrap();
+                    } else {
+                        let frame = artifact(&field, kind, 0, b"retained prefix\n", false);
+                        write_frame(&mut *peer.lock().await, &frame).await.unwrap();
+                    }
+                    drop(peer);
+                };
+                let ((), ()) = tokio::join!(write, route_fixture(stream, &state, "fixture"));
+                let result = receiver.await.unwrap();
+                let result = result.map_err(RemoteError::into_tool_error)?;
+                let output = result.into_output(&store).await;
+                output.map_err(RemoteError::into_tool_error)
+            };
+            builder
+                .register_dynamic("remote_fixture", "remote fixture", input, options, tool)
                 .unwrap();
             let executor = runtime.executor(builder);
-            script_slot.set(executor.clone()).ok().unwrap();
+            let arguments = serde_json::json!({});
             let result = executor
-                .execute(
-                    runtime.agent.clone(),
-                    "remote_fixture",
-                    serde_json::json!({}),
-                    None,
-                )
+                .execute(runtime.agent.clone(), "remote_fixture", arguments, None)
                 .await;
             if complete {
-                let result = result.unwrap();
-                assert_eq!(result.output.value["stdout"], payload);
-                let view = runtime
-                    .jobs
-                    .present_output(
-                        crate::job::output::OutputArgs::new(result.job),
-                        &Default::default(),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(view["result"]["stdout"], "line\n".repeat(100));
-                assert_eq!(view["result"]["exit_code"], 0);
-                assert!(view["result"].get("custom/partial").is_none());
-                assert!(view["captures"].as_array().unwrap().iter().any(
-                    |capture| capture["field"] == "/result/custom~1partial"
-                        && capture["kind"] == "json"
-                        && capture["complete"] == false
-                ));
-                let mut partial = crate::job::output::OutputArgs::new(result.job);
-                partial.field = Some("/result/custom~1partial".into());
-                let partial = runtime
-                    .jobs
-                    .present_output(partial, &Default::default())
-                    .await
-                    .unwrap();
-                assert_eq!(partial["preview"]["lines"][0], "{\"key\":");
-                assert_eq!(view["truncated"][0]["field"], "/result/stdout");
-                let script = executor.execute_model(runtime.agent.clone(), "script", serde_json::json!({
-                    "source":"const remote = await tool.remote_fixture({}); if (remote.stdout.length !== 1250000) throw new Error('truncated inside script'); return {remote};"
-                }), None).await.unwrap();
-                let child = &script.output.value["result"]["value"]["remote"];
-                assert_eq!(child["tool"], "remote_fixture");
-                assert_eq!(child["result"]["stdout"], "line\n".repeat(100));
-                let mut query = crate::job::output::OutputArgs::new(
-                    serde_json::from_value(child["id"].clone()).unwrap(),
+                assert_eq!(
+                    result.unwrap().output.value["stdout"],
+                    "line\n".repeat(LINES)
                 );
-                query.field = Some(child["truncated"][0]["field"].as_str().unwrap().into());
-                query.start = Some(child["truncated"][0]["next_start"].as_u64().unwrap() as usize);
-                query.offset =
-                    Some(child["truncated"][0]["next_offset"].as_u64().unwrap_or(0) as usize);
-                let page = runtime
-                    .jobs
-                    .present_output(query, &Default::default())
-                    .await
-                    .unwrap();
-                assert_eq!(child["truncated"][0]["next_start"], 101);
-                assert_eq!(page["preview"]["lines"][0], "line");
-            } else {
-                assert!(result.is_err());
-                let job = runtime.jobs.list(&runtime.agent).await[0].id;
-                let mut args = crate::job::output::OutputArgs::new(job);
-                args.field = Some("/result/stdout".into());
-                let view = runtime
-                    .jobs
-                    .present_output(args, &Default::default())
-                    .await
-                    .unwrap();
-                assert_eq!(view["state"], "failed");
-                assert_eq!(view["preview"]["lines"][0], "retained prefix");
-                assert_eq!(view["notice"], "Output incomplete.");
-                assert!(view["preview"].get("capture_complete").is_none());
+                continue;
             }
+            assert!(result.is_err());
+            let job = runtime.jobs.list(&runtime.agent).await[0].id;
+            let mut args = crate::job::output::OutputArgs::new(job);
+            args.field = Some("/result/stdout".into());
+            let view = runtime
+                .jobs
+                .present_output(args, &Default::default())
+                .await
+                .unwrap();
+            assert_eq!(view["state"], "failed");
+            assert_eq!(view["preview"]["lines"][0], "retained prefix");
+            assert_eq!(view["notice"], "Output incomplete.");
+            assert!(view["preview"].get("capture_complete").is_none());
         }
     }
 }

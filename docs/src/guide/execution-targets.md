@@ -134,9 +134,8 @@ prompt again. Changing a target or any hop in its route invalidates the affected
 
 JavaScript remains host-owned while nested targeted tools inherit their caller's location. The
 `agent` tool also accepts a named target or `root`.
-Remote agent state machines, providers, approvals, message history, and canonical session logging
-remain host-owned. The shim retains only live remote tool/process execution state and unclaimed
-background-job results; its worker store is ephemeral.
+Agents, providers, approvals, and the session log stay on the host; a shim only runs tools and
+processes.
 
 For shim selection and catalog injection, see
 [remote transport and shims](../development/remote-transport-and-shims.md).

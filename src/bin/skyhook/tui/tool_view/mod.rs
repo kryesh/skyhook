@@ -8,8 +8,6 @@ pub use output::OutputView;
 
 use super::{format::push_clean, model, theme::ContentTheme};
 use highlighting::CodeKey;
-#[allow(unused_imports)] // Keep the existing direct-highlighting API available.
-pub use highlighting::highlight_code;
 pub use highlighting::{CodeSource, HighlightCache};
 use ratatui::{
     style::{Modifier, Style},
@@ -209,7 +207,7 @@ impl Document {
 mod tests {
     use super::*;
 
-    fn text(lines: &[Line<'_>]) -> String {
+    pub(super) fn text(lines: &[Line<'_>]) -> String {
         lines
             .iter()
             .map(ToString::to_string)

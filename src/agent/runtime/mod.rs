@@ -40,7 +40,7 @@ pub use super::error::HarnessError;
 use super::interaction::{QuestionHandler, RuntimeEvent};
 use super::observation::RuntimeEvents;
 use super::{AgentActivity, Observation};
-use super::{TodoItem, TodoSnapshot, todo::TodoStore};
+use super::{TodoItem, todo::TodoStore};
 
 mod compact;
 mod compaction;
@@ -50,11 +50,7 @@ pub(super) use context::recorded_context;
 mod prompt;
 mod questions;
 mod queue;
-pub use queue::{
-    PreparedQueuedPrompt, QueueConflict, QueuedPrompt, QueuedPromptCancellation,
-    QueuedPromptCommit, QueuedPromptError, QueuedPromptIdentity, QueuedPromptRecovery,
-    QueuedPromptToken, RecoveredQueuedPrompt, RecoveredQueuedPromptState,
-};
+pub use queue::{QueuedPrompt, QueuedPromptCancellation, QueuedPromptReceipt};
 mod tools;
 mod wait;
 use wait::AgentSender;
@@ -150,7 +146,6 @@ struct SessionRuntime {
     _executor_slot: Arc<OnceLock<ToolExecutor>>,
     router: crate::target::TargetRouter,
     agents: StdRwLock<HashMap<AgentId, LiveAgent>>,
-    queue_state: queue::QueueRuntimeState,
     child_counters: RwLock<HashMap<AgentId, u32>>,
     questions: Arc<questions::QuestionCoordinator>,
     usage: Mutex<Usage>,
@@ -254,15 +249,27 @@ struct TurnContext<'a> {
     capabilities: &'a CapabilitySet,
 }
 
+type LiveAgents = HashMap<AgentId, LiveAgent>;
+
 impl SessionRuntime {
+    /// The live agents; a poisoned lock still holds a consistent map.
+    fn agents(&self) -> std::sync::RwLockReadGuard<'_, LiveAgents> {
+        let agents = self.agents.read();
+        agents.unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn agents_mut(&self) -> std::sync::RwLockWriteGuard<'_, LiveAgents> {
+        let agents = self.agents.write();
+        agents.unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub(super) fn activity(&self, agent: &AgentId, activity: AgentActivity) {
         self.events.send(RuntimeEvent::Activity {
             agent: agent.clone(),
             activity,
         });
     }
-}
-impl SessionRuntime {
+
     pub(super) async fn catch_up_store_events(&self) {
         // Serialize catchups so the cursor advances only after the entire prefix is
         // published. Live forwarding may race ahead; RuntimeEvents deduplicates it.
@@ -317,9 +324,7 @@ impl SessionRuntime {
                             break;
                         };
                         let agents = runtime
-                            .agents
-                            .read()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .agents()
                             .iter()
                             .map(|(id, agent)| (id.clone(), agent.sender.clone()))
                             .collect::<Vec<_>>();
@@ -341,8 +346,7 @@ impl SessionRuntime {
             }
         });
     }
-}
-impl SessionRuntime {
+
     pub(super) async fn commit(
         &self,
         agent: &AgentId,
@@ -366,14 +370,11 @@ fn contains_images(messages: &[Message]) -> bool {
 #[cfg(test)]
 mod tests {
     pub(super) use std::{
-        collections::VecDeque,
         future::Future,
-        pin::Pin,
         sync::{
             Mutex as StdMutex,
             atomic::{AtomicUsize, Ordering},
         },
-        task::Poll,
         time::Duration,
     };
 
@@ -422,20 +423,179 @@ mod tests {
     }
     pub(crate) use {cloned_provider, count, events};
 
-    #[derive(Clone)]
-    pub(super) struct ScriptedProvider {
-        pub(super) responses: Arc<StdMutex<VecDeque<Vec<ResponseChunk>>>>,
+    type Chunks = Vec<Result<ResponseChunk, ProviderError>>;
+
+    /// One scripted response, served to the first unserved request it matches.
+    pub(super) struct Step {
+        model: Option<&'static str>,
+        response: StdMutex<Option<Result<Chunks, ProviderError>>>,
+        gate: tokio::sync::Semaphore,
+        midstream: bool,
+    }
+
+    impl Step {
+        pub(super) fn stream(chunks: Chunks) -> Self {
+            Self {
+                model: None,
+                response: StdMutex::new(Some(Ok(chunks))),
+                gate: tokio::sync::Semaphore::new(1),
+                midstream: false,
+            }
+        }
+
+        pub(super) fn new(chunks: Vec<ResponseChunk>) -> Self {
+            Self::stream(chunks.into_iter().map(Ok).collect())
+        }
+
+        /// The invocation itself fails, before any stream exists.
+        pub(super) fn fail(error: ProviderError) -> Self {
+            let step = Self::stream(Vec::new());
+            *step.response.lock().unwrap() = Some(Err(error));
+            step
+        }
+
+        /// Serve only requests for this model.
+        pub(super) fn model(mut self, model: &'static str) -> Self {
+            self.model = Some(model);
+            self
+        }
+
+        /// Hold the response until `Script::release`.
+        pub(super) fn gated(mut self) -> Self {
+            self.gate = tokio::sync::Semaphore::new(0);
+            self
+        }
+
+        /// Stream the first chunk, then hold the rest until `Script::release`.
+        pub(super) fn midstream(mut self) -> Self {
+            self.midstream = true;
+            self.gated()
+        }
+    }
+
+    /// A provider answering from `steps`, shared by every context it opens.
+    pub(super) struct Script {
+        steps: Vec<Step>,
+        served: StdMutex<Vec<(usize, ModelRequest)>>,
+        changed: tokio::sync::Notify,
         pub(super) requests: Requests,
+        pub(super) opened: AtomicUsize,
+        this: Weak<Script>,
+    }
+
+    impl Script {
+        pub(super) fn new(steps: impl IntoIterator<Item = Step>, requests: &Requests) -> Arc<Self> {
+            Arc::new_cyclic(|this| Self {
+                steps: steps.into_iter().collect(),
+                served: StdMutex::default(),
+                changed: tokio::sync::Notify::new(),
+                requests: requests.clone(),
+                opened: AtomicUsize::new(0),
+                this: this.clone(),
+            })
+        }
+
+        /// The request that `step` served, once it arrives.
+        pub(super) async fn request(&self, step: usize) -> ModelRequest {
+            bounded(async {
+                loop {
+                    let notified = self.changed.notified();
+                    // Clone only the match, in a scope that ends the guard before awaiting.
+                    let found = {
+                        let served = self.served.lock().unwrap();
+                        served.iter().find(|(id, _)| *id == step).cloned()
+                    };
+                    if let Some((_, request)) = found {
+                        return request;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+        }
+
+        pub(super) fn release(&self, step: usize) {
+            self.steps[step].gate.add_permits(1);
+        }
+
+        /// Waits for a step's request, then lets its response through.
+        pub(super) async fn pass(&self, step: usize) -> ModelRequest {
+            let request = self.request(step).await;
+            self.release(step);
+            request
+        }
+
+        /// Whether any step at or after `step` has been requested.
+        pub(super) fn requested_from(&self, step: usize) -> bool {
+            let served = self.served.lock().unwrap();
+            served.iter().any(|(seen, _)| *seen >= step)
+        }
+
+        pub(super) fn remaining(&self) -> usize {
+            self.steps.len() - self.served.lock().unwrap().len()
+        }
+    }
+
+    impl Provider for Script {
+        fn open_context(&self, _: String) -> Result<Box<dyn ProviderContext>, ProviderError> {
+            self.opened.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(ScriptContext(self.this.upgrade().unwrap())))
+        }
+    }
+
+    struct ScriptContext(Arc<Script>);
+
+    impl ProviderContext for ScriptContext {
+        fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
+            let script = self.0.clone();
+            let step = {
+                let mut served = script.served.lock().unwrap();
+                let free = |(index, step): &(usize, &Step)| {
+                    step.model.is_none_or(|model| model == request.model)
+                        && !served.iter().any(|(seen, _)| seen == index)
+                };
+                let (step, _) = script
+                    .steps
+                    .iter()
+                    .enumerate()
+                    .find(free)
+                    .expect("scripted response");
+                script.requests.lock().unwrap().push(request.clone());
+                served.push((step, request));
+                step
+            };
+            script.changed.notify_waiters();
+            Box::pin(async move {
+                let gate = async move |script: Arc<Script>| {
+                    script.steps[step].gate.acquire().await.unwrap().forget();
+                };
+                let midstream = script.steps[step].midstream;
+                if !midstream {
+                    gate(script.clone()).await;
+                }
+                let mut chunks = script.steps[step]
+                    .response
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()?;
+                let rest = chunks.split_off(usize::from(midstream).min(chunks.len()));
+                let held = stream::once(async move {
+                    if midstream {
+                        gate(script).await;
+                    }
+                    stream::iter(rest)
+                });
+                Ok(Box::pin(stream::iter(chunks).chain(held.flatten())) as ResponseStream)
+            })
+        }
     }
 
     pub(super) fn scripted_provider(
         requests: &Requests,
         responses: impl IntoIterator<Item = Vec<ResponseChunk>>,
-    ) -> Arc<ScriptedProvider> {
-        Arc::new(ScriptedProvider {
-            requests: requests.clone(),
-            responses: Arc::new(StdMutex::new(responses.into_iter().collect())),
-        })
+    ) -> Arc<Script> {
+        Script::new(responses.into_iter().map(Step::new), requests)
     }
 
     /// A session over `root` (sessions in `root/sessions`) answering from a script.
@@ -446,52 +606,30 @@ mod tests {
         let requests = Requests::default();
         let provider = scripted_provider(&requests, responses);
         let harness = test_harness(root.path(), &root.path().join("sessions"), provider).await;
-        let session = harness.new_session().await.unwrap();
-        (root, requests, session)
+        (root, requests, ephemeral_session(&harness).await)
+    }
+
+    /// A session whose journal is never reopened, so it skips durability.
+    pub(super) async fn ephemeral_session(harness: &Harness) -> SessionHandle {
+        let store = SessionStore::create_ephemeral(&harness.inner.session_root);
+        let store = store.await.unwrap();
+        let runtime = SessionRuntime::build(harness.inner.clone(), store, Vec::new());
+        runtime.await.unwrap().start_root(None).await.unwrap()
     }
 
     #[derive(Clone)]
     pub(super) struct HangingProvider;
 
-    #[derive(Clone)]
-    pub(super) struct BlockingFirstProvider {
-        pub(super) calls: Arc<AtomicUsize>,
-        pub(super) requests: Requests,
-        pub(super) release: Arc<tokio::sync::Semaphore>,
-    }
-
+    #[derive(Default)]
     pub(super) struct RecordingQuestions {
         pub(super) batches: Arc<StdMutex<Vec<Vec<Question>>>>,
+        pub(super) backgrounds: Arc<StdMutex<Vec<bool>>>,
         pub(super) answer: serde_json::Value,
+        /// Fail every batch, as a host dismissing it would.
+        pub(super) cancel: bool,
     }
 
-    pub(super) struct GatedResponse {
-        pub(super) release: Pin<Box<dyn Future<Output = ()> + Send>>,
-        pub(super) released: bool,
-        pub(super) events: VecDeque<ResponseChunk>,
-    }
-
-    impl futures_util::Stream for GatedResponse {
-        type Item = Result<ResponseChunk, crate::provider::ProviderError>;
-
-        fn poll_next(
-            mut self: Pin<&mut Self>,
-            context: &mut std::task::Context<'_>,
-        ) -> Poll<Option<Result<ResponseChunk, crate::provider::ProviderError>>> {
-            if self.events.is_empty() {
-                return Poll::Ready(None);
-            }
-            if !self.released {
-                if self.release.as_mut().poll(context).is_pending() {
-                    return Poll::Pending;
-                }
-                self.released = true;
-            }
-            Poll::Ready(self.events.pop_front().map(Ok))
-        }
-    }
-
-    cloned_provider!(HangingProvider, ScriptedProvider, BlockingFirstProvider);
+    cloned_provider!(HangingProvider);
 
     impl ProviderContext for HangingProvider {
         fn invoke(&mut self, _request: ModelRequest) -> ProviderFuture {
@@ -499,45 +637,55 @@ mod tests {
         }
     }
 
-    impl ProviderContext for ScriptedProvider {
-        fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
-            self.requests.lock().unwrap().push(request);
-            let chunks = self.responses.lock().unwrap().pop_front();
-            let chunks = chunks.expect("scripted provider response");
-            Box::pin(async move {
-                Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))) as ResponseStream)
-            })
-        }
-    }
-
-    impl ProviderContext for BlockingFirstProvider {
-        fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
-            self.requests.lock().unwrap().push(request);
-            let call = self.calls.fetch_add(1, Ordering::SeqCst);
-            let release = self.release.clone();
-            Box::pin(async move {
-                let response: ResponseStream = if call == 0 {
-                    Box::pin(GatedResponse {
-                        release: Box::pin(async move {
-                            release.acquire_owned().await.unwrap().forget();
-                        }),
-                        released: false,
-                        events: answer("initial").into(),
-                    })
-                } else {
-                    Box::pin(stream::iter(answer("jobs handled").into_iter().map(Ok)))
-                };
-                Ok(response)
-            })
-        }
-    }
-
     impl QuestionHandler for RecordingQuestions {
-        fn ask(&self, _agent: AgentId, questions: Vec<Question>) -> crate::agent::QuestionFuture {
-            self.batches.lock().unwrap().push(questions);
-            let answer = self.answer.clone();
-            Box::pin(async move { Ok(answer) })
+        fn ask(
+            &self,
+            _agent: AgentId,
+            questions: Vec<Question>,
+            background: bool,
+        ) -> crate::agent::QuestionFuture {
+            self.backgrounds.lock().unwrap().push(background);
+            let answer = if self.cancel {
+                Err(crate::agent::QuestionError::Failed(
+                    "question cancelled".into(),
+                ))
+            } else {
+                self.batches.lock().unwrap().push(questions);
+                Ok(self.answer.clone())
+            };
+            Box::pin(async move { answer })
         }
+    }
+
+    /// Every message of a request, as the JSON text assertions search.
+    pub(super) fn rendered(request: &ModelRequest) -> String {
+        serde_json::to_string(&request.messages().collect::<Vec<_>>()).unwrap()
+    }
+
+    /// A leaf child of the root on the default test profile, in the session workspace.
+    pub(super) fn child_launch(
+        session: &SessionHandle,
+        id: AgentId,
+        owner_job: Option<JobId>,
+    ) -> AgentLaunch {
+        let workspace = session.runtime.harness.workspace.clone();
+        AgentLaunch {
+            id,
+            owner_job,
+            model_profile: session.runtime.harness.default_model_profile.clone(),
+            todos: None,
+            available_depth: 0,
+            location: crate::execution::ExecutionLocation::root(workspace),
+        }
+    }
+
+    pub(super) fn assistant_commits(records: &[EventRecord]) -> usize {
+        count!(
+            records,
+            SessionEvent::MessageCommitted {
+                message: Message::Assistant(_)
+            }
+        )
     }
 
     pub(super) fn request_runtime_state(request: &ModelRequest) -> &str {
@@ -550,10 +698,6 @@ mod tests {
             _ => None,
         });
         state.expect("request has a compact runtime state block")
-    }
-
-    pub(super) fn request_history(request: &ModelRequest) -> &[Message] {
-        &request.history
     }
 
     pub(super) fn test_builder(
@@ -580,6 +724,12 @@ mod tests {
         }
     }
 
+    /// One step of a polling loop. A timer rather than a yield, because paused
+    /// time only advances while every task is idle.
+    pub(super) async fn poll() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
     pub(super) async fn until(
         session: &SessionHandle,
         job: JobId,
@@ -591,7 +741,7 @@ mod tests {
                 if predicate(&snapshot) {
                     return snapshot;
                 }
-                tokio::task::yield_now().await;
+                poll().await;
             }
         })
         .await
@@ -665,13 +815,13 @@ mod tests {
         let runtime = Arc::downgrade(&session.runtime);
         session.shutdown().await.unwrap();
         drop(session);
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // The journal lock is released with the runtime; a resume needs it.
+        bounded(async {
             while runtime.strong_count() != 0 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                poll().await;
             }
         })
-        .await
-        .expect("session runtime released after shutdown");
+        .await;
     }
 
     pub(super) fn usage(input_tokens: u64, cached_input_tokens: u64, output_tokens: u64) -> Usage {
@@ -715,28 +865,16 @@ mod tests {
         }
     }
 
-    /// Prepare each prompt, then enqueue every prepared one as one batch;
-    /// results keep input order.
+    /// Enqueue one batch and await every receipt; results keep input order.
     pub(super) async fn enqueue_prompts(
         session: &SessionHandle,
         prompts: Vec<QueuedPrompt>,
-    ) -> Vec<Result<QueuedPromptCommit, QueuedPromptError>> {
-        let (mut prepared, mut results) = (Vec::new(), Vec::new());
-        for prompt in prompts {
-            results.push(match session.prepare_queued_prompt(prompt).await {
-                Ok(permit) => {
-                    prepared.push(permit);
-                    None
-                }
-                Err(error) => Some(Err(error)),
-            });
+    ) -> Vec<Result<(), HarnessError>> {
+        let mut results = Vec::new();
+        for receipt in session.enqueue_prompts(prompts).await {
+            results.push(receipt.await.unwrap_or(Err(HarnessError::AgentStopped)));
         }
-        let mut receipts = session
-            .enqueue_prepared_queued_prompts(prepared)
-            .await
-            .into_iter();
-        let next = |result: Option<_>| result.unwrap_or_else(|| receipts.next().unwrap());
-        results.into_iter().map(next).collect()
+        results
     }
 
     pub(super) fn model(profile: &str) -> PromptOptions {
@@ -758,13 +896,7 @@ mod tests {
 
     async fn observation_session(root: &Path) -> SessionHandle {
         let harness = test_harness(root, &root.join("sessions"), Arc::new(HangingProvider)).await;
-        let store = SessionStore::create_ephemeral(&root.join("sessions"))
-            .await
-            .unwrap();
-        let runtime = SessionRuntime::build(harness.inner.clone(), store, Vec::new())
-            .await
-            .unwrap();
-        runtime.start_root(None).await.unwrap()
+        ephemeral_session(&harness).await
     }
 
     #[tokio::test]

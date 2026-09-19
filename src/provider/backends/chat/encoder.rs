@@ -1,15 +1,15 @@
 //! Encode canonical history and provider-bound reasoning replay into Chat requests.
 use super::{schema::validate_schema, valid_name, wire};
-use crate::media::AttachmentRef;
 use crate::provider::{
     ProviderError,
     backends::{
         ChatReasoningReplay,
         common::{
-            attach_runtime_tail, attachment_text, image_url, invalid, opaque_payload, tool_text,
+            attach_runtime_tail, image_url, invalid, opaque_payload, system_text, tool_text,
+            user_parts, validate_openai_effort,
         },
     },
-    protocol::{BlockContent, Message, ModelRequest, UserContent},
+    protocol::{BlockContent, Message, ModelRequest},
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -18,9 +18,6 @@ pub(crate) fn encode(
     request: &ModelRequest,
     replay: ChatReasoningReplay,
 ) -> Result<Value, ProviderError> {
-    if request.model.is_empty() {
-        return Err(invalid("Chat Completions requires a model"));
-    }
     // Cache hints need no wire field: OpenAI automatically caches matching
     // prefixes, and history precedes the per-request tail so the tail never
     // breaks the cached history prefix. Runtime state joins the final history turn,
@@ -28,13 +25,7 @@ pub(crate) fn encode(
     let mut messages = Vec::new();
     // One leading system message: many open-model chat templates reject
     // repeated or non-leading system turns.
-    if !request.system.is_empty() {
-        let text = request
-            .system
-            .iter()
-            .map(|segment| segment.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
+    if let Some(text) = system_text(request) {
         messages.push(json!({"role": "system", "content": text}));
     }
     for (index, message) in request.messages().enumerate() {
@@ -47,23 +38,11 @@ pub(crate) fn encode(
         }
         match message {
             Message::User(parts) => {
-                let mut content = Vec::new();
-                for part in parts {
-                    content.push(match part {
-                        UserContent::Text { text }
-                        | UserContent::Runtime { text }
-                        | UserContent::ParentInput { text }
-                        | UserContent::Compaction { text } => json!({"type": "text", "text": text}),
-                        UserContent::Attachment { attachment } => match attachment {
-                            AttachmentRef::Image(image) => {
-                                json!({"type": "image_url", "image_url": {"url": image_url(request, image)?}})
-                            }
-                            AttachmentRef::Text(text) => {
-                                json!({"type": "text", "text": attachment_text(request, text)?})
-                            }
-                        },
-                    });
-                }
+                let content = user_parts(request, parts, "text", |image| {
+                    Ok(
+                        json!({"type": "image_url", "image_url": {"url": image_url(request, image)?}}),
+                    )
+                })?;
                 messages.push(json!({"role": "user", "content": content}));
             }
             Message::Assistant(parts) => {
@@ -145,14 +124,7 @@ pub(crate) fn encode(
     .map_err(|_| invalid("Unable to serialize Chat request"))?;
     flatten_text_content(&mut body["messages"]);
     if let Some(effort) = &request.reasoning {
-        if !matches!(
-            effort.as_str(),
-            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-        ) {
-            return Err(invalid(format!(
-                "Unsupported standard Chat reasoning_effort: {effort}"
-            )));
-        }
+        validate_openai_effort(effort)?;
         body["reasoning_effort"] = json!(effort);
     }
     if let Some(limit) = request.max_output_tokens {
@@ -258,7 +230,7 @@ mod tests {
         media::{AttachmentRef, BlobRef, ImageFormat, ImageRef, TextRef},
         provider::protocol::{
             AssistantItem, ItemKind, ReplayEnvelope, ResponseAssembler, SystemSegment, ToolCall,
-            ToolDefinition, ToolResult,
+            ToolDefinition, ToolResult, UserContent,
         },
     };
 

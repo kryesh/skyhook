@@ -308,21 +308,29 @@ impl HighlightCache {
         }
     }
     #[cfg(test)]
-    pub fn is_highlighted(&self, document: &Document) -> bool {
-        document.keys().any(|key| self.ready(&key).is_some())
+    fn is_highlighted(&self, document: &Document) -> bool {
+        document.keys().next().is_some() && document.keys().all(|key| self.ready(&key).is_some())
     }
+    /// Block until the real worker has completed every section.
     #[cfg(test)]
-    pub fn is_fully_highlighted(&self, document: &Document) -> bool {
-        document.keys().peekable().peek().is_some()
-            && document.keys().all(|key| self.ready(&key).is_some())
+    pub fn wait(&mut self, document: &Document) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while {
+            self.prepare(std::iter::once(document));
+            !self.is_highlighted(document)
+        } {
+            assert!(std::time::Instant::now() < deadline, "highlight worker");
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::Role;
+    use super::super::tests::text;
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     type Queue = (
         HighlightCache,
@@ -372,14 +380,6 @@ mod tests {
             .count()
     }
 
-    fn text(lines: &[Line<'_>]) -> String {
-        lines
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
     fn source_bytes(cache: &HighlightCache) -> usize {
         cache.entries.keys().map(|key| key.source.len()).sum()
     }
@@ -427,7 +427,7 @@ mod tests {
                 tokens(document.lines(Some(cache))),
                 tokens(document.lines(None))
             );
-            assert!(cache.is_fully_highlighted(document));
+            assert!(cache.is_highlighted(document));
         };
         let (mut cache, queued, completed) = queued_cache(16);
         let original = "unchanged  \n\n";
@@ -493,17 +493,7 @@ mod tests {
             assert_eq!(text(&document.lines(Some(&cache))), original);
         }
         let document = code("unchanged  \n\n", "unknown-extension", Role::Plain);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while {
-            cache.prepare(std::iter::once(&document));
-            !document.keys().all(|key| cache.ready(&key).is_some())
-        } {
-            assert!(
-                Instant::now() < deadline,
-                "highlight worker did not complete"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
+        cache.wait(&document);
         assert_eq!(text(&document.lines(Some(&cache))), "unchanged  \n\n");
         // Admission and exact source identity share one boundary.
         let mut document = Document::default();
@@ -566,7 +556,7 @@ mod tests {
         let key = CodeKey::admit(&CodeSource::from(source.as_str()), "js").unwrap();
         cache.schedule(std::iter::repeat_n(key.clone(), CACHE_SECTIONS + 1));
         assert_eq!(cache.entries.len(), 1);
-        let keys = (0..CACHE_SECTIONS).map(|index| {
+        let keys = (0..CACHE_BYTES / source.len() + 8).map(|index| {
             let text = format!("{index}\n{}", &source[..source.len() - 8]);
             CodeKey::admit(&CodeSource::from(text.as_str()), "js").unwrap()
         });

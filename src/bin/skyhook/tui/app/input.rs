@@ -599,6 +599,5 @@ mod tests {
         chord(&mut app, KeyCode::Char('i'));
         assert!(matches!(app.focus, Focus::Content));
         assert_eq!(app.view().tab, Tab::Conversation);
-        app.session().unwrap().shutdown().await.unwrap();
     }
 }

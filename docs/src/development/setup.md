@@ -5,7 +5,6 @@
 - Rust 1.88 or newer via rustup, and [just](https://just.systems/) on `PATH`.
 - [Zig](https://ziglang.org/download/) on `PATH` (or `CARGO_ZIGBUILD_ZIG_PATH`) **only for
   building the SSH shims**.
-- Python 3.11+ only for the documentation link checker.
 
 ```sh
 git clone https://github.com/kryesh/skyhook.git
@@ -31,12 +30,10 @@ Run these commands from the repository root:
 | `just test` | Full nextest suite plus doctests. |
 | `just lint` | Clippy over all targets and features with warnings denied. |
 | `just fmt` | Format Rust code. |
-| `just fmt-check` | Check formatting without edits. |
 | `just docs` | Build the mdBook into `docs/book`. |
-| `just docs-check` | Build and check rendered local links/anchors and root README links. |
 | `just docs-serve` | Serve and watch the book locally. |
 | `just pages-build` | Build the Pages artifact and add `.nojekyll`. |
-| `just pages-publish [remote] [branch]` | Publish a clean, committed checkout via a temporary worktree; defaults to `origin` and `pages`. |
+| `just pages-publish [remote] [branch]` | Publish the built book via a temporary worktree, never force-pushing; defaults to `origin` and `pages`. |
 
 There is no build script and no default feature: a plain `cargo build` compiles only the
 library. Each binary requires its own feature, `tui` for `skyhook` and `shim-bin` for
@@ -46,5 +43,5 @@ explicit missing-shim error if asked to use SSH.
 
 The `skyhook-agent` package is one library crate named `skyhook` plus those two binaries. See
 [architecture](architecture.md) and [embedding](embedding.md) for the library boundaries.
-[Documentation and publishing](documentation.md) covers local preview, link validation, and the
-manual GitHub Pages workflow.
+[Documentation and publishing](documentation.md) covers local preview and manual GitHub Pages
+publishing.

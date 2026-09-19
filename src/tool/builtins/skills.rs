@@ -75,10 +75,6 @@ impl TryFrom<SkillArgs> for SkillRequest {
     }
 }
 
-#[path = "skills_inventory.rs"]
-mod inventory;
-pub use inventory::{SkillAsset, SkillAssetKind, SkillInventory, SkillInventoryEntry};
-
 const MAX_INLINE_BYTES: u64 = 1024 * 1024;
 const MAX_DESCRIPTION_CHARS: usize = 512;
 
@@ -134,10 +130,51 @@ impl HostSkills {
         }
     }
 
-    /// Inspect winning skills and their assets without reading asset contents or
-    /// creating a runtime, session, or provider. Discovery diagnostics are retained.
-    pub async fn inventory(&self) -> SkillInventory {
-        inventory::collect(self).await
+    /// Render every winning skill's source, description, frontmatter and asset
+    /// tree without reading asset contents. Returns the text and all errors.
+    pub async fn describe(&self) -> (String, Vec<String>) {
+        let (mut text, mut errors) = (String::new(), self.warnings.to_vec());
+        let mut unreadable = Vec::new();
+        for entry in self.entries.values() {
+            let yaml = serde_yaml::to_string(&entry.frontmatter)
+                .unwrap_or_else(|error| format!("[cannot render YAML: {error}]"));
+            // The canonical root may have been replaced since discovery; links are not followed.
+            let listed = match fs::symlink_metadata(&entry.root).await {
+                Ok(metadata) if !metadata.is_dir() => Err(ToolError::Failed(
+                    "skill root is no longer a directory".to_owned(),
+                )),
+                _ => asset_tree(&entry.root, true, Some(&mut unreadable)).await,
+            };
+            errors.extend(
+                unreadable.drain(..).map(|error| {
+                    format!("Cannot list assets for skill `{}` at {error}", entry.name)
+                }),
+            );
+            let assets = listed.unwrap_or_else(|error| {
+                errors.push(format!(
+                    "Cannot list assets for skill `{}` at {}: {error}",
+                    entry.name,
+                    entry.root.display()
+                ));
+                String::new()
+            });
+            text.push_str(&format!(
+                "{}\n  source: {}\n  description: {}\n",
+                escaped(&entry.name),
+                escaped(&entry.root.to_string_lossy()),
+                escaped(&entry.description)
+            ));
+            for (title, body) in [("frontmatter", yaml), ("assets", assets)] {
+                text.push_str(&format!("  {title}:\n"));
+                for line in body.lines() {
+                    text.push_str(&format!("    {}\n", escaped(line)));
+                }
+            }
+        }
+        if text.is_empty() {
+            text.push_str("skills (empty)\n");
+        }
+        (text, errors)
     }
 
     pub fn warnings(&self) -> &[String] {
@@ -328,7 +365,7 @@ pub(super) fn register(
         // Copy permissions are scoped to the caller by skill_transfer, not this host tool.
         ToolOptions::new(vec![Capability::Read]).argument_validator(|arguments| {
             let args: SkillArgs = serde_json::from_value(arguments.clone())
-                .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+                .map_err(ToolError::invalid)?;
             SkillRequest::try_from(args).map(drop)
         }),
         move |context, args| {
@@ -343,7 +380,7 @@ pub(super) fn register(
                         name: entry.name.clone(),
                         description: entry.description.clone(),
                         content: entry.instructions.clone(),
-                        assets: asset_tree(&entry.root, true).await?,
+                        assets: asset_tree(&entry.root, true, None).await?,
                     }),
                     SkillOperation::Inspect { asset } => inspect_asset(entry, asset, &store).await,
                     SkillOperation::Copy { asset, destination } => {
@@ -397,7 +434,7 @@ async fn inspect_asset(
         return skill_output(SkillOutput::Directory {
             name: entry.name.clone(),
             path: asset,
-            assets: asset_tree(&source, false).await?,
+            assets: asset_tree(&source, false, None).await?,
         });
     }
     let bytes = read_asset(
@@ -407,12 +444,11 @@ async fn inspect_asset(
     )
     .await?;
     if crate::media::ImageFormat::sniff(&bytes).is_some() {
-        let image = crate::media::Image::new(bytes)
-            .map_err(|error| ToolError::Failed(error.to_string()))?;
+        let image = crate::media::Image::new(bytes).map_err(ToolError::failed)?;
         let image = store
             .store_image(Some(asset.clone()), &image)
             .await
-            .map_err(|error| ToolError::Failed(error.to_string()))?;
+            .map_err(ToolError::failed)?;
         return Ok(skill_output(SkillOutput::Image {
             name: entry.name.clone(),
             path: asset,
@@ -452,7 +488,13 @@ fn text_content(bytes: &[u8]) -> Option<&str> {
 
 // Render the complete tree; the output schema, not discovery, controls model-view
 // truncation. Keep an explicit stack so deeply nested assets do not recurse.
-async fn asset_tree(root: &Path, exclude_instructions: bool) -> Result<String, ToolError> {
+// With an error sink, an unreadable directory is marked and reported instead of
+// failing the listing.
+async fn asset_tree(
+    root: &Path,
+    exclude_instructions: bool,
+    mut unreadable: Option<&mut Vec<String>>,
+) -> Result<String, ToolError> {
     let mut tree = String::new();
     let mut pending = vec![(root.to_path_buf(), String::new(), true, true)];
     while let Some((path, prefix, last, is_root)) = pending.pop() {
@@ -463,13 +505,7 @@ async fn asset_tree(root: &Path, exclude_instructions: bool) -> Result<String, T
             tree.push_str(&prefix);
             tree.push_str(if last { "└── " } else { "├── " });
             // Control characters in filenames must not create fake tree lines.
-            for character in path.file_name().unwrap().to_string_lossy().chars() {
-                if character.is_control() {
-                    tree.extend(character.escape_default());
-                } else {
-                    tree.push(character);
-                }
-            }
+            tree.push_str(&escaped(&path.file_name().unwrap().to_string_lossy()));
             if is_symlink {
                 tree.push_str(" [symlink]");
             } else if is_directory {
@@ -483,7 +519,17 @@ async fn asset_tree(root: &Path, exclude_instructions: bool) -> Result<String, T
         if !is_directory {
             continue;
         }
-        let mut directory = fs::read_dir(&path).await?;
+        let mut directory = match (fs::read_dir(&path).await, unreadable.as_deref_mut()) {
+            (Ok(directory), _) => directory,
+            (Err(error), Some(unreadable)) => {
+                if !is_root {
+                    tree.insert_str(tree.len() - 1, " [unreadable]");
+                }
+                unreadable.push(format!("{}: {error}", path.display()));
+                continue;
+            }
+            (Err(error), None) => return Err(error.into()),
+        };
         let mut children = Vec::new();
         while let Some(child) = directory.next_entry().await? {
             if is_root && exclude_instructions && child.file_name() == "SKILL.md" {
@@ -507,6 +553,18 @@ async fn asset_tree(root: &Path, exclude_instructions: bool) -> Result<String, T
     // No trailing newline keeps empty trees an ordinary empty string.
     tree.pop();
     Ok(tree)
+}
+
+fn escaped(text: &str) -> String {
+    let mut output = String::new();
+    for character in text.chars() {
+        if character.is_control() {
+            output.extend(character.escape_default());
+        } else {
+            output.push(character);
+        }
+    }
+    output
 }
 
 /// A nonblank relative source with no parent/root/prefix components. This does
@@ -603,10 +661,111 @@ mod tests {
     };
 
     #[test]
+    fn summary_comes_from_a_string_description_else_the_first_prose() {
+        for (yaml, expected) in [
+            ("description: a summary", Some("a summary")),
+            ("description: null", Some("Fallback prose")),
+            ("description: ''", Some("Fallback prose")),
+            ("other: value", Some("Fallback prose")),
+            ("description: true", Some("true")),
+            ("description: [invalid]", None),
+            ("scalar", None),
+        ] {
+            let parsed = parse_instructions(&format!("---\n{yaml}\n---\nFallback prose"));
+            assert_eq!(
+                parsed.ok().map(|parsed| parsed.0).as_deref(),
+                expected,
+                "{yaml}"
+            );
+        }
+        let summary = |text: &str| parse_instructions(text).map(|parsed| parsed.0);
+        assert_eq!(
+            parse_instructions("# Heading\r\n\r\nProse here").unwrap(),
+            ("Prose here".to_owned(), serde_yaml::Value::Null)
+        );
+        assert_eq!(
+            summary("---\r\ndescription: summary\r\n---\r\nBody").unwrap(),
+            "summary"
+        );
+        assert!(summary("---\ndescription: unterminated").is_err());
+        assert!(summary("# Heading only").is_err());
+        assert_eq!(summary(&"é".repeat(600)).unwrap().chars().count(), 512);
+    }
+
+    #[tokio::test]
+    async fn describe_renders_frontmatter_and_assets_and_reports_every_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let skills = HostSkills::discover_from(temp.path(), None).await;
+        assert_eq!(
+            skills.describe().await,
+            ("skills (empty)\n".to_owned(), Vec::new())
+        );
+
+        let root = temp.path().join(".agents/skills");
+        for (name, text) in [
+            (
+                "good",
+                "---\ndescription: Useful\nextra: [1, {two: null}]\n---\nBody",
+            ),
+            ("bad", "---\ndescription: [invalid]\n---\nBody"),
+        ] {
+            std::fs::create_dir_all(root.join(name).join("refs")).unwrap();
+            std::fs::write(root.join(name).join("SKILL.md"), text).unwrap();
+        }
+        std::fs::write(root.join("good/refs/a\u{1b}.md"), "private").unwrap();
+        std::os::unix::fs::symlink("/", root.join("good/link")).unwrap();
+        // Unreadable directories are marked and reported; the rest is still listed.
+        use std::os::unix::fs::PermissionsExt as _;
+        let locked = ["locked", "sealed"].map(|name| root.join("good").join(name));
+        for path in &locked {
+            std::fs::create_dir(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let is_root = std::fs::read_dir(&locked[0]).is_ok();
+        let (text, errors) = HostSkills::discover_from(temp.path(), None)
+            .await
+            .describe()
+            .await;
+        for path in &locked {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mark = if is_root { "" } else { " [unreadable]" };
+        for expected in [
+            "good\n  source: ".to_owned(),
+            "  description: Useful\n  frontmatter:\n    description: Useful\n    extra:\n"
+                .to_owned(),
+            format!(
+                "  assets:\n    ├── locked/{mark}\n    ├── refs/\n    │   └── a\\u{{1b}}.md\n    \
+                 ├── sealed/{mark}\n    └── link [symlink]\n"
+            ),
+        ] {
+            assert!(text.contains(&expected), "missing {expected:?}: {text}");
+        }
+        assert!(!text.contains("private") && !text.contains("bad\n"));
+        assert!(errors[0].contains("bad") && errors[0].contains("invalid YAML frontmatter"));
+        if !is_root {
+            assert_eq!(errors.len(), 3, "{errors:?}");
+            assert!(errors[1].contains("good/locked") && errors[2].contains("good/sealed"));
+        }
+
+        // A root replaced after discovery is an error, never an empty listing.
+        let skills = HostSkills::discover_from(temp.path(), None).await;
+        std::fs::remove_dir_all(root.join("good")).unwrap();
+        std::fs::write(root.join("good"), "not a directory").unwrap();
+        let (_, errors) = skills.describe().await;
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("no longer a directory")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
     fn skill_requests_admit_operations_and_reject_blank_or_malformed_fields() {
         let request = |value| {
             serde_json::from_value::<SkillArgs>(value)
-                .map_err(|error| ToolError::InvalidArguments(error.to_string()))
+                .map_err(ToolError::invalid)
                 .and_then(SkillRequest::try_from)
         };
         let operation = |value| request(value).unwrap().operation;

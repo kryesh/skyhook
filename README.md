@@ -71,14 +71,13 @@ just build               # Debug CLI using whatever is in target/shims
 just build-release       # Release CLI embedding whatever is in target/shims
 just test                # nextest suite plus doctests
 just lint                # Clippy with warnings denied
-just fmt-check           # Check Rust formatting
+just fmt                 # Format Rust code
 ```
 
 The documentation uses the installed [mdBook](https://rust-lang.github.io/mdBook/):
 
 ```sh
 just docs         # Build docs/book
-just docs-check   # Check local links and anchors (also requires Python 3.11+)
 just docs-serve   # Preview the book locally
 just pages-build  # Build the static site for the pages branch
 ```

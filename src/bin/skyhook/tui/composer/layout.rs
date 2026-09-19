@@ -221,24 +221,6 @@ mod tests {
 
     fn rows(editor: &Composer, width: usize) -> Vec<String> {
         let layout = editor.layout(width);
-        if !editor.has_pastes() {
-            let mut plain = crate::tui::editor::Editor::default();
-            plain.set(editor.text.clone());
-            plain.set_selection(plain.anchor(), editor.cursor);
-            plain.set_selection(editor.anchor, plain.cursor());
-            let plain = plain.layout(width);
-            assert_eq!(
-                (plain.cursor, &plain.positions),
-                (layout.cursor, &layout.positions)
-            );
-            let style = Style::default();
-            let shape = |rows: &[ComposerRow]| {
-                let rows = rows.iter();
-                rows.map(|r: &ComposerRow| (r.width, r.line(style, style, style)))
-                    .collect::<Vec<_>>()
-            };
-            assert_eq!(shape(&plain.rows), shape(&layout.rows));
-        }
         let rows = layout.rows.iter();
         rows.map(|r| r.spans.iter().map(|s| s.text.as_str()).collect())
             .collect()

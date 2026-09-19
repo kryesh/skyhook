@@ -367,7 +367,7 @@ mod tests {
         let job = jobs.create(spec).await.unwrap();
         let mut subject = subject(CancellationToken::new());
         (subject.agent, subject.job) = (session.agent.clone(), job.id());
-        let resource = ResourceId::custom("plugin", ["server", "operation"]).unwrap();
+        let resource = ResourceId::mcp("server", "operation");
         let policy = Arc::new(CountingPolicy::default());
         let journaled = async || {
             AuthorizationCoordinator::new(policy.clone())
@@ -393,7 +393,7 @@ mod tests {
         let policy = Arc::new(CountingPolicy::default());
         let coordinator = AuthorizationCoordinator::new(policy.clone());
         let subject = subject(CancellationToken::new());
-        let resource = ResourceId::custom("plugin", ["server", "operation"]).unwrap();
+        let resource = ResourceId::mcp("server", "operation");
         for _ in 0..2 {
             authorize(&coordinator, &subject, &resource).await.unwrap();
         }
@@ -409,7 +409,7 @@ mod tests {
         });
         let coordinator = AuthorizationCoordinator::new(policy.clone());
         let first_cancellation = CancellationToken::new();
-        let resource = ResourceId::custom("anything", ["shared"]).unwrap();
+        let resource = ResourceId::session("shared");
         let spawn = |subject: AuthorizationSubject| {
             let (coordinator, resource) = (coordinator.clone(), resource.clone());
             tokio::spawn(async move { authorize(&coordinator, &subject, &resource).await })
@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn exact_proposals_cannot_be_widened() {
-        let resource = ResourceId::custom("opaque", ["one"]).unwrap();
+        let resource = ResourceId::session("one");
         let proposed = ApprovalGrant::exact(Capability::Write, resource.clone());
         let widened = ApprovalGrant {
             capability: Capability::Write,

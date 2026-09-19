@@ -23,13 +23,8 @@ pub(super) fn working_entry(
     }
     // Attempt-aware requests carry status in their original journal position,
     // including the short transition between failure and scheduled recovery.
-    if projection.active_request.get(agent).is_some_and(|request| {
-        projection.requests.get(request).is_some_and(|info| {
-            info.retry
-                .as_ref()
-                .is_some_and(super::retry::RetryState::has_error)
-        })
-    }) {
+    let active = projection.active_request.get(agent);
+    if active.is_some_and(|request| projection.retry_failed(*request)) {
         return None;
     }
     let state = match snapshot.activity.get(agent) {
@@ -127,12 +122,7 @@ pub(super) fn live_tail_response<'a>(
         .responses
         .get(&(agent.clone(), request))
         .filter(|response| {
-            projection.live_response(request, response)
-                && !projection.requests.get(&request).is_some_and(|info| {
-                    info.retry
-                        .as_ref()
-                        .is_some_and(super::retry::RetryState::has_error)
-                })
+            projection.live_response(request, response) && !projection.retry_failed(request)
         })
 }
 

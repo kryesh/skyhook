@@ -152,10 +152,7 @@ impl PreparedAgentLaunch {
             .register(agent_loop.id.clone(), agent_loop.owner_job, todos)
             .await?;
         {
-            let mut agents = runtime
-                .agents
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut agents = runtime.agents_mut();
             // Serialize this check with shutdown's agent snapshot. A child whose
             // provider initialization raced shutdown must not leave an idle loop.
             if runtime.shutting_down.load(Ordering::Acquire) {
@@ -456,19 +453,13 @@ impl SessionRuntime {
     }
 
     pub(super) fn available_depth(&self, agent: &AgentId) -> usize {
-        self.agents
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.agents()
             .get(agent)
             .map_or(0, |agent| agent.available_depth)
     }
 
     pub(super) fn agent_sender(&self, id: &AgentId) -> Option<AgentSender> {
-        self.agents
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(id)
-            .map(|agent| agent.sender.clone())
+        self.agents().get(id).map(|agent| agent.sender.clone())
     }
 
     /// Register this agent's turn cancellation, or decline once stopping. Checked
@@ -476,10 +467,7 @@ impl SessionRuntime {
     /// snapshot is cancelled by it, and none can be minted after.
     pub(super) fn begin_turn(&self, id: &AgentId) -> Option<CancellationToken> {
         let cancellation = CancellationToken::new();
-        let mut agents = self
-            .agents
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut agents = self.agents_mut();
         if self.shutting_down.load(Ordering::Acquire) {
             return None;
         }
@@ -499,7 +487,7 @@ mod tests {
     use crate::agent::runtime::tests::*;
 
     fn last_tool_results(request: &ModelRequest) -> &[ToolResult] {
-        let Some(Message::Tool(results)) = request_history(request).last() else {
+        let Some(Message::Tool(results)) = request.history.last() else {
             panic!("expected tool results at the end of the history");
         };
         results
@@ -609,14 +597,10 @@ mod tests {
                 let (_root, _, session) = scripted_session([]).await;
                 let runtime = &session.runtime;
                 let todos = Some(vec![todo("seed", crate::agent::TodoStatus::Pending)]);
-                let workspace = runtime.harness.workspace.clone();
+                let id = runtime.next_child(&session.root).await;
                 let launch = AgentLaunch {
-                    id: runtime.next_child(&session.root).await,
-                    owner_job: None,
-                    model_profile: "test".to_owned(),
                     todos,
-                    available_depth: 0,
-                    location: crate::execution::ExecutionLocation::root(workspace),
+                    ..child_launch(&session, id, None)
                 };
                 let launch = PreparedAgentLaunch::prepare(runtime.clone(), launch)
                     .await
@@ -644,9 +628,8 @@ mod tests {
                 assert!(bounded(worker).await.unwrap().is_err());
                 bounded(sender.closed()).await;
                 assert!(!runtime.agents.read().unwrap().contains_key(&agent));
-                let snapshots = runtime.todos.snapshots().await;
-                let mut seeded = snapshots.iter().filter(|s| !s.items.is_empty());
-                assert!(seeded.all(|s| s.agent != agent));
+                let seeded = runtime.todos.inspect(&agent, None).await.unwrap();
+                assert!(seeded.items.is_empty());
                 // A failed append may leave a replayable prefix, never a live agent.
                 let visible = runtime.store.records().await;
                 let prefix = visible.iter().filter(|r| r.agent == agent).count();

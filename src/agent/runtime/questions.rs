@@ -324,7 +324,7 @@ impl QuestionCoordinator {
         let answer = async {
             match &self.handler {
                 Some(handler) => handler
-                    .ask_with_background(agent, questions, background)
+                    .ask(agent, questions, background)
                     .await
                     .map_err(|error| error.to_string()),
                 None => std::future::pending().await,
@@ -616,32 +616,6 @@ mod tests {
         harness.new_session().await.unwrap()
     }
 
-    struct QuestionsWithMode {
-        inner: RecordingQuestions,
-        backgrounds: Backgrounds,
-        cancel: bool,
-    }
-
-    impl QuestionHandler for QuestionsWithMode {
-        fn ask(&self, agent: AgentId, questions: Vec<Question>) -> crate::agent::QuestionFuture {
-            self.inner.ask(agent, questions)
-        }
-
-        fn ask_with_background(
-            &self,
-            agent: AgentId,
-            questions: Vec<Question>,
-            background: bool,
-        ) -> crate::agent::QuestionFuture {
-            self.backgrounds.lock().unwrap().push(background);
-            if !self.cancel {
-                return self.ask(agent, questions);
-            }
-            let error = crate::agent::QuestionError::Failed("question cancelled".into());
-            Box::pin(async { Err(error) })
-        }
-    }
-
     async fn mode_session(
         root: &Path,
         provider: Arc<dyn Provider>,
@@ -649,14 +623,10 @@ mod tests {
         cancel: bool,
     ) -> (SessionHandle, Batches, Backgrounds) {
         let (batches, backgrounds) = (Batches::default(), Backgrounds::default());
-        let inner = RecordingQuestions {
+        let handler = RecordingQuestions {
             batches: batches.clone(),
+            backgrounds: backgrounds.clone(),
             answer,
-        };
-        let backgrounds_seen = backgrounds.clone();
-        let handler = QuestionsWithMode {
-            inner,
-            backgrounds: backgrounds_seen,
             cancel,
         };
         let harness = test_builder(root, &root.join("sessions"), provider, false)
@@ -680,10 +650,12 @@ mod tests {
         {
             let batches = batches.lock().unwrap();
             assert_eq!(batches.len(), 1);
-            let ids = batches[0].iter().map(|q| q.id.as_str()).collect::<Vec<_>>();
+            // Concurrent asks join the batch in arrival order.
+            let mut ids = batches[0].iter().map(|q| q.id.as_str()).collect::<Vec<_>>();
+            ids.sort_unstable();
             assert_eq!(ids, ["first", "second"]);
             let requests = requests.lock().unwrap();
-            let Message::Tool(results) = request_history(&requests[1]).last().unwrap() else {
+            let Message::Tool(results) = requests[1].history.last().unwrap() else {
                 panic!("missing tool results")
             };
             assert_eq!(results[0].result["result"], "yes");
@@ -816,8 +788,9 @@ mod tests {
         assert_eq!(state, JobState::WaitingInput);
         let answered = coordinator.answer_child_question(owner, json!({"first":"yes", "second":2}));
         assert!(answered.await.unwrap());
+        // More than a job's input mailbox (32) holds.
         bounded(async {
-            for _ in 0..100 {
+            for _ in 0..40 {
                 let duplicate = json!({"first":"duplicate", "second":"duplicate"});
                 let duplicate = coordinator.answer_child_question(owner, duplicate);
                 assert!(duplicate.await.unwrap());
@@ -834,7 +807,7 @@ mod tests {
         let pending = pending_questions(&[("cancel", asks[0].id())]);
         coordinator.open_child_questions(pending).await.unwrap();
         bounded(async {
-            for _ in 0..100 {
+            for _ in 0..40 {
                 let answer = coordinator.answer_child_question(owner, json!("cancel me"));
                 answer.await.unwrap();
             }
@@ -951,6 +924,7 @@ mod tests {
             let handler = RecordingQuestions {
                 batches: batches.clone(),
                 answer: json!("host-answer"),
+                ..Default::default()
             };
             let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
                 .max_child_depth(1)
@@ -960,6 +934,9 @@ mod tests {
                 .await
                 .unwrap();
             let session = harness.new_session().await.unwrap();
+            // The idle root is told about its background child's question and would
+            // spend a scripted response on it; this test answers through scripts.
+            let root_inbox = quiet_root(&session);
             let launch = "return await tool.agent({prompt:'ask parent', depth:0, bg:true});";
             let launched = bounded(session.run_script(launch)).await.unwrap();
             let owner = serde_json::from_value(launched.value["value"]["id"].clone()).unwrap();
@@ -972,12 +949,12 @@ mod tests {
                 let requests = requests.lock().unwrap();
                 let offers_ask = |r: &ModelRequest| r.tools.iter().any(|tool| tool.name == "ask");
                 assert!(requests.iter().all(offers_ask));
-                let messages =
-                    serde_json::to_string(&requests[1].messages().collect::<Vec<_>>()).unwrap();
+                let messages = rendered(&requests[1]);
                 assert!(messages.contains("parent-answer"));
             }
             // Child asks must not reach the host handler.
             assert!(batches.lock().unwrap().is_empty());
+            drop(root_inbox);
             shutdown_session(session).await;
         }
     }
@@ -993,10 +970,12 @@ mod tests {
             let mut builder =
                 test_builder(root.path(), &sessions, provider, false).capabilities(capabilities);
             if with_handler {
-                let answer = json!("unused");
                 let batches = batches.clone();
-                builder =
-                    builder.question_handler(Arc::new(RecordingQuestions { batches, answer }));
+                let handler = RecordingQuestions {
+                    batches,
+                    ..Default::default()
+                };
+                builder = builder.question_handler(Arc::new(handler));
             }
             let session = builder.build().await.unwrap().new_session().await.unwrap();
             let (jobs, questions) = (&session.runtime.jobs, &session.runtime.questions);

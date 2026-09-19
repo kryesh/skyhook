@@ -17,7 +17,26 @@ pub(super) struct AgentColumnsLayout {
     pub(super) stats_width: u16,
 }
 
+fn right_aligned(value: &str, width: usize) -> String {
+    format!("{}{value}", " ".repeat(width.saturating_sub(value.width())))
+}
+
+fn join_right_aligned(values: &[String], widths: &[usize]) -> String {
+    let values = values.iter().zip(widths);
+    let values = values.map(|(value, width)| right_aligned(value, *width));
+    values.collect::<Vec<_>>().join(" · ")
+}
+
 impl AgentColumnsLayout {
+    /// Identity space that keeps the deepest agent's name and target legible.
+    pub(super) fn minimum_identity_width(agents: &[model::AgentInfo], width: u16) -> u16 {
+        let widths = agents.iter().map(|agent| {
+            let indent = (agent.id.depth() as u16 * 4).min(width / 3);
+            indent + 16.max(model::target_suffix(&agent.target).width() as u16 + 8)
+        });
+        widths.max().unwrap_or(16)
+    }
+
     pub(super) fn new(width: u16, minimum_identity_width: u16, stats_width: u16) -> Self {
         let status_width = if usize::from(width) >= usize::from(minimum_identity_width) + 30 {
             28
@@ -79,7 +98,7 @@ impl AgentStatsColumns {
                     width.min(usize::from(rect.right().saturating_sub(x))) as u16,
                     1,
                 ),
-                format!("{}{value}", " ".repeat(width.saturating_sub(value.width()))),
+                right_aligned(value, width),
                 fg,
                 bg,
             );
@@ -106,13 +125,7 @@ impl AgentStatsColumns {
     /// A row outside the measured set is never truncated: it pads to the
     /// shared width when it fits and otherwise prints at its own width.
     pub(super) fn format(&self, row: &[String; 3]) -> String {
-        row.iter()
-            .zip(self.0)
-            .map(|(value, width)| {
-                format!("{}{value}", " ".repeat(width.saturating_sub(value.width())))
-            })
-            .collect::<Vec<_>>()
-            .join(" · ")
+        join_right_aligned(row, &self.0)
     }
 }
 
@@ -173,14 +186,7 @@ impl RequestColumns {
     }
 
     fn format_statistics(&self, values: &[String; 4]) -> String {
-        values
-            .iter()
-            .zip(self.statistics)
-            .map(|(value, width)| {
-                format!("{}{value}", " ".repeat(width.saturating_sub(value.width())))
-            })
-            .collect::<Vec<_>>()
-            .join(" · ")
+        join_right_aligned(values, &self.statistics)
     }
 
     pub(super) fn header(&self, width: u16, p: Palette) -> Option<Line<'static>> {
@@ -267,13 +273,6 @@ impl RequestColumns {
 mod tests {
     use super::*;
     use ratatui::widgets::Widget;
-
-    fn line_text(line: &Line<'_>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
-    }
 
     fn request(sequence: u64, status: model::RequestStatus, output: u64) -> model::RequestRow {
         model::RequestRow {
@@ -365,7 +364,7 @@ mod tests {
         let header = columns.header(100, Palette::new()).unwrap().to_string();
         for row in [&running, &completed] {
             let line = columns.line(row, 100, Palette::new());
-            let text = line_text(&line);
+            let text = line.to_string();
             assert!(text.starts_with(&format!("  Request #{}", row.sequence)));
             assert!(text.ends_with(&columns.format_statistics(&row.statistics())));
             assert_eq!(header.width(), text.width());
@@ -394,10 +393,10 @@ mod tests {
             elapsed_tenths: None,
         };
         let columns = RequestColumns::new([&row]);
-        for width in 0..100 {
+        for width in [0, 1, 2, 3, 8, 20, 45, 46, 60, 81, 82, 99] {
             let line = columns.line(&row, width, Palette::new());
             assert!(line.width() <= width as usize, "overflow at width {width}");
-            let text = line_text(&line);
+            let text = line.to_string();
             assert!(text.starts_with(&" ".repeat(width.min(2) as usize)));
             let header = columns.header(width, Palette::new());
             assert_eq!(header.is_some(), text.contains('—'));

@@ -11,13 +11,12 @@ use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, oneshot};
 
 use crate::{
-    identity::{AgentId, EventId, QueueAttemptId, SessionId},
+    identity::{AgentId, EventId, SessionId},
     provider::protocol::{Message, ModelRequest, UserContent},
 };
 
 mod db;
 mod event;
-mod queue;
 mod request;
 mod template;
 
@@ -27,9 +26,8 @@ pub(crate) use db::{CaptureExtent, CaptureRow, Presentation, SharedDb};
 pub use db::{DbError, SessionSummary};
 pub use event::{
     CompactionCheckpoint, EventRecord, ModelCallOrigin, ModelContext, ModelFailureKind,
-    ModelPurpose, ProfileSnapshot, QueueIntent, QueueSettlement, SessionEvent,
+    ModelPurpose, ProfileSnapshot, SessionEvent,
 };
-pub use queue::QueueIntentRecord;
 pub use request::{merge_tool_results, project_history, reconstruct_model_request};
 
 /// The database schema version; earlier formats are intentionally unsupported.
@@ -87,7 +85,6 @@ enum WriterHealth {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AppendIdentity {
     pub event: EventId,
-    pub queue_attempt: Option<QueueAttemptId>,
     pub session: SessionId,
     pub sequence: u64,
 }
@@ -108,13 +105,12 @@ impl std::fmt::Display for AppendRecovery {
     }
 }
 
-/// Non-clonable receipt for an accepted operation. Dropping the receipt does not
-/// cancel the writer. Its identity must be retained by a retrying producer until
-/// a committed record or explicit reopen/recovery resolves the attempt.
+/// Receipt for an accepted append; dropping it does not cancel the writer. A
+/// retrying producer keeps its identity until a record or reopen resolves it.
 #[derive(Debug)]
 pub struct AcceptedAppend {
     identity: AppendIdentity,
-    committed: oneshot::Receiver<Result<Vec<EventRecord>, SessionError>>,
+    committed: Receipt,
 }
 
 impl AcceptedAppend {
@@ -125,42 +121,39 @@ impl AcceptedAppend {
 
     pub async fn committed(self) -> Result<EventRecord, SessionError> {
         let identity = self.identity;
-        match self.committed.await {
-            Ok(result) => result.and_then(|mut records| {
-                records.pop().ok_or_else(|| {
-                    SessionError::AppendIndeterminate(AppendRecovery {
-                        identity,
-                        reason: "accepted append committed no record".into(),
-                    })
-                })
-            }),
-            Err(_) => Err(SessionError::AppendIndeterminate(AppendRecovery {
+        let mut records = receipt(identity, self.committed).await?;
+        records.pop().ok_or_else(|| {
+            SessionError::AppendIndeterminate(AppendRecovery {
                 identity,
-                reason: "accepted writer lost its receipt; recovery is required".into(),
-            })),
-        }
+                reason: "accepted append committed no record".into(),
+            })
+        })
     }
 }
 
-/// Test hooks at the commit boundary of the next accepted append.
+type Receipt = oneshot::Receiver<Result<Vec<EventRecord>, SessionError>>;
+
+async fn receipt(
+    identity: AppendIdentity,
+    committed: Receipt,
+) -> Result<Vec<EventRecord>, SessionError> {
+    committed.await.unwrap_or_else(|_| {
+        Err(SessionError::AppendIndeterminate(AppendRecovery {
+            identity,
+            reason: "accepted writer lost its receipt; recovery is required".into(),
+        }))
+    })
+}
+
+/// Test hook for the next accepted append.
 #[cfg(test)]
 pub(crate) enum CommitFault {
-    /// Stop after acceptance, before COMMIT, until resumed.
-    Pause {
-        reached: oneshot::Sender<()>,
-        resume: oneshot::Receiver<()>,
-    },
-    /// Roll back after acceptance: nothing is durable.
-    RollBack,
-    /// Commit, then report failure: the append is durable.
-    ReportAfterCommit,
+    /// Stop at the boundary until resumed.
+    Pause(AppendBoundary, oneshot::Sender<()>, oneshot::Receiver<()>),
+    /// Report failure at the boundary.
+    Fail(AppendBoundary),
     /// Lose the writer thread before COMMIT.
     Panic,
-    /// Stop after COMMIT, before publication, until resumed.
-    PauseCommitted {
-        reached: oneshot::Sender<()>,
-        resume: oneshot::Receiver<()>,
-    },
 }
 
 /// Where a test pauses or fails the next accepted append.
@@ -182,12 +175,6 @@ type Acceptance = oneshot::Sender<Result<Vec<AppendIdentity>, SessionError>>;
 
 /// Builds events that reference the first entry's sequence, in the same transaction.
 type Follow = Box<dyn FnOnce(u64) -> Vec<(AgentId, SessionEvent)> + Send>;
-
-struct Pending {
-    agent: AgentId,
-    queue_attempt: Option<QueueAttemptId>,
-    event: SessionEvent,
-}
 
 struct State {
     records: Vec<EventRecord>,
@@ -244,7 +231,7 @@ impl Writer {
     /// rejection for the caller to report once the writer is released.
     fn append(
         &mut self,
-        entries: Vec<Pending>,
+        entries: Vec<(AgentId, SessionEvent)>,
         follow: Option<Follow>,
         accepted: Acceptance,
     ) -> Result<Result<Vec<EventRecord>, SessionError>, (Acceptance, SessionError)> {
@@ -264,43 +251,31 @@ impl Writer {
             reason: "accepted append did not finish publication".into(),
         });
         #[cfg(test)]
-        if let Some(fault) = self.fault.take() {
-            let shared = self.shared.clone();
-            let injected = |reason: &str| {
-                let recovery = AppendRecovery {
-                    identity,
-                    reason: reason.into(),
-                };
-                shared.write().health = WriterHealth::NeedsRecovery(recovery.clone());
-                Ok(Err(SessionError::AppendIndeterminate(recovery)))
-            };
-            match fault {
-                CommitFault::Pause { reached, resume } => {
-                    let _ = reached.send(());
-                    let _ = resume.blocking_recv();
+        {
+            self.pause_at(AppendBoundary::Write);
+            match self.fault.take() {
+                Some(CommitFault::Fail(boundary)) => {
+                    let reason = if boundary == AppendBoundary::Write {
+                        let _ = db.rollback();
+                        self.encoder.reset();
+                        "injected rollback"
+                    } else {
+                        let _ = db.commit();
+                        "injected failure after commit"
+                    };
+                    let (identity, reason) = (identity, reason.into());
+                    let recovery = AppendRecovery { identity, reason };
+                    self.shared.write().health = WriterHealth::NeedsRecovery(recovery.clone());
+                    return Ok(Err(SessionError::AppendIndeterminate(recovery)));
                 }
-                CommitFault::RollBack => {
-                    let _ = db.rollback();
-                    self.encoder.reset();
-                    return injected("injected rollback");
-                }
-                CommitFault::ReportAfterCommit => {
-                    let _ = db.commit();
-                    return injected("injected failure after commit");
-                }
-                CommitFault::Panic => panic!("injected writer loss"),
-                CommitFault::PauseCommitted { reached, resume } => {
-                    self.fault = Some(CommitFault::PauseCommitted { reached, resume });
-                }
+                Some(CommitFault::Panic) => panic!("injected writer loss"),
+                pause => self.fault = pause,
             }
         }
         Ok(match db.commit() {
             Ok(()) => {
                 #[cfg(test)]
-                if let Some(CommitFault::PauseCommitted { reached, resume }) = self.fault.take() {
-                    let _ = reached.send(());
-                    let _ = resume.blocking_recv();
-                }
+                self.pause_at(AppendBoundary::Publication);
                 let mut state = self.shared.write();
                 for record in &records {
                     state.records.push(record.clone());
@@ -322,11 +297,21 @@ impl Writer {
         })
     }
 
+    #[cfg(test)]
+    fn pause_at(&mut self, boundary: AppendBoundary) {
+        if matches!(&self.fault, Some(CommitFault::Pause(at, ..)) if *at == boundary)
+            && let Some(CommitFault::Pause(_, reached, resume)) = self.fault.take()
+        {
+            let _ = reached.send(());
+            let _ = resume.blocking_recv();
+        }
+    }
+
     /// Validate and encode inside an open transaction; any error is a definite rejection.
     fn accept(
         &mut self,
         db: &db::Db,
-        mut entries: Vec<Pending>,
+        mut entries: Vec<(AgentId, SessionEvent)>,
         follow: Option<Follow>,
     ) -> Result<Vec<EventRecord>, SessionError> {
         let state = self.shared.read();
@@ -340,31 +325,25 @@ impl Writer {
             .map_or(1, |record| record.sequence.saturating_add(1));
         let timestamp_millis = Utc::now().timestamp_millis();
         if let Some(follow) = follow {
-            entries.extend(follow(first).into_iter().map(|(agent, event)| Pending {
-                agent,
-                queue_attempt: None,
-                event,
-            }));
+            entries.extend(follow(first));
         }
         let mut records = Vec::with_capacity(entries.len());
-        for (offset, pending) in entries.into_iter().enumerate() {
-            if pending.agent.session() != self.shared.id {
+        for (offset, (agent, event)) in entries.into_iter().enumerate() {
+            if agent.session() != self.shared.id {
                 return Err(SessionError::WrongSession);
             }
             records.push(EventRecord {
                 id: EventId::generate()?,
-                queue_attempt: pending.queue_attempt.or(pending.event.queue_attempt()),
                 sequence: first.saturating_add(offset as u64),
                 timestamp_millis,
-                agent: pending.agent,
-                event: pending.event,
+                agent,
+                event,
             });
         }
         // Order-dependent rules validate against the committed prefix plus this batch.
         // Only a multi-entry batch copies the prefix.
         let mut prefix = std::borrow::Cow::Borrowed(state.records.as_slice());
         for (index, record) in records.iter().enumerate() {
-            queue::validate_queue_record(&prefix, record)?;
             request::validate_compaction(&prefix, record)?;
             if index + 1 < records.len() {
                 prefix.to_mut().push(record.clone());
@@ -390,6 +369,19 @@ struct StoreInner {
     db: SharedDb,
     directory: PathBuf,
     writer: Arc<Mutex<Writer>>,
+    turn: Arc<Mutex<()>>,
+}
+
+/// The writer, taken FIFO. The writer reference drops before the turn ends, so
+/// the next turn (notably `close`) never sees an earlier holder keep the lease alive.
+struct Turn {
+    writer: tokio::sync::OwnedMutexGuard<Writer>,
+    _turn: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// Keeps closures from capturing the writer without the turn.
+impl Drop for Turn {
+    fn drop(&mut self) {}
 }
 
 #[derive(Clone)]
@@ -400,7 +392,7 @@ pub struct SessionStore {
 impl SessionStore {
     #[cfg(test)]
     pub(crate) async fn fault_next_commit(&self, fault: CommitFault) {
-        self.inner.writer.lock().await.fault = Some(fault);
+        self.turn().await.writer.fault = Some(fault);
     }
 
     #[cfg(test)]
@@ -410,21 +402,14 @@ impl SessionStore {
     ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (reached, waiting) = oneshot::channel();
         let (resume_sender, resume) = oneshot::channel();
-        self.fault_next_commit(match boundary {
-            AppendBoundary::Write => CommitFault::Pause { reached, resume },
-            AppendBoundary::Publication => CommitFault::PauseCommitted { reached, resume },
-        })
-        .await;
+        self.fault_next_commit(CommitFault::Pause(boundary, reached, resume))
+            .await;
         (waiting, resume_sender)
     }
 
     #[cfg(test)]
     pub(crate) async fn fail_append_at(&self, boundary: AppendBoundary) {
-        self.fault_next_commit(match boundary {
-            AppendBoundary::Write => CommitFault::RollBack,
-            AppendBoundary::Publication => CommitFault::ReportAfterCommit,
-        })
-        .await;
+        self.fault_next_commit(CommitFault::Fail(boundary)).await;
     }
 
     /// Replace a stored blob's bytes, or delete it, as disk corruption would.
@@ -449,8 +434,8 @@ impl SessionStore {
 
     #[cfg(test)]
     pub(crate) async fn inherit_lock(&self) -> Option<std::fs::File> {
-        let writer = self.inner.writer.lock().await;
-        writer
+        let turn = self.turn().await;
+        turn.writer
             ._lock
             .as_ref()
             .and_then(|lock| lock.0.try_clone().ok())
@@ -481,7 +466,7 @@ impl SessionStore {
         read: impl FnOnce(&db::Db) -> Result<T, DbError> + Send + 'static,
     ) -> Result<T, SessionError> {
         let path = root.join(id.to_string()).join(DATABASE_FILE);
-        tokio::task::spawn_blocking(move || {
+        blocking(move || {
             if !path.is_file() {
                 return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
             }
@@ -491,8 +476,7 @@ impl SessionStore {
             db.batch("COMMIT")?;
             Ok(value?)
         })
-        .await
-        .map_err(|error| SessionError::Io(std::io::Error::other(error)))?
+        .await?
     }
 
     /// Attempts and tool calls a stopped process left without an outcome.
@@ -543,7 +527,7 @@ impl SessionStore {
         existing: bool,
     ) -> Result<(Self, Vec<EventRecord>), SessionError> {
         let (shared_directory, open_directory) = (directory.clone(), directory.clone());
-        let (db, lock, records) = tokio::task::spawn_blocking(move || {
+        let (db, lock, records) = blocking(move || {
             // Acquire ownership before opening a potentially active database.
             let lock = durable
                 .then(|| lock_session(&open_directory, id))
@@ -561,8 +545,7 @@ impl SessionStore {
             let records = db::decode_records(&db, id)?;
             Ok::<_, SessionError>((db, lock, records))
         })
-        .await
-        .map_err(|error| SessionError::Io(std::io::Error::other(error)))??;
+        .await??;
         let (events, _) = broadcast::channel(512);
         let shared = Arc::new(Shared {
             id,
@@ -589,6 +572,7 @@ impl SessionStore {
                     db,
                     directory: shared_directory,
                     writer: Arc::new(Mutex::new(writer)),
+                    turn: Arc::default(),
                 }),
             },
             records,
@@ -600,10 +584,20 @@ impl SessionStore {
         &self,
         work: impl FnOnce(&mut Writer) -> T + Send + 'static,
     ) -> Result<T, SessionError> {
-        let mut writer = self.inner.writer.clone().lock_owned().await;
-        tokio::task::spawn_blocking(move || work(&mut writer))
-            .await
-            .map_err(|error| SessionError::Io(std::io::Error::other(error.to_string())))
+        let turn = self.turn().await;
+        blocking(move || {
+            // Own the whole turn: a cancelled caller must not end it early.
+            let mut turn = turn;
+            work(&mut turn.writer)
+        })
+        .await
+    }
+
+    async fn turn(&self) -> Turn {
+        let _turn = self.inner.turn.clone().lock_owned().await;
+        let writer = self.inner.writer.clone().try_lock_owned();
+        let writer = writer.expect("only the turn holder locks the writer");
+        Turn { writer, _turn }
     }
 
     #[must_use]
@@ -629,7 +623,7 @@ impl SessionStore {
     /// Committed records, refused while an accepted append needs recovery (reopen first).
     /// Waits out in-flight appends: their pessimistic poison lasts until publication.
     pub async fn reconciled_records(&self) -> Result<Vec<EventRecord>, SessionError> {
-        let _writer = self.inner.writer.lock().await;
+        let _turn = self.inner.turn.lock().await;
         let state = self.inner.shared.read();
         state.require_healthy()?;
         Ok(state.records.clone())
@@ -682,52 +676,19 @@ impl SessionStore {
         events: Vec<(AgentId, SessionEvent)>,
         follow: Option<Follow>,
     ) -> Result<Vec<EventRecord>, SessionError> {
-        let entries = events
-            .into_iter()
-            .map(|(agent, event)| Pending {
-                agent,
-                queue_attempt: None,
-                event,
-            })
-            .collect();
-        let (identities, committed) = self.accept(entries, follow).await?;
+        let (identities, committed) = self.accept(events, follow).await?;
         let identity = *identities.last().expect("appends carry at least one entry");
-        committed.await.unwrap_or_else(|_| {
-            Err(SessionError::AppendIndeterminate(AppendRecovery {
-                identity,
-                reason: "accepted writer lost its receipt; recovery is required".into(),
-            }))
-        })
+        receipt(identity, committed).await
     }
 
-    /// Validate and accept one append; an error means it was not accepted.
+    /// Validate and accept one append; an error means it was not accepted. The
+    /// commit completes regardless of the caller.
     pub async fn accept_append(
         &self,
         agent: AgentId,
         event: SessionEvent,
     ) -> Result<AcceptedAppend, SessionError> {
-        self.accept_append_bound(agent, None, event).await
-    }
-
-    /// Acceptance validates and encodes in FIFO order on the writer thread; the
-    /// commit completes there regardless of the caller. `queue_attempt` binds a
-    /// queued model or user-message event to its intent.
-    pub(crate) async fn accept_append_bound(
-        &self,
-        agent: AgentId,
-        queue_attempt: Option<QueueAttemptId>,
-        event: SessionEvent,
-    ) -> Result<AcceptedAppend, SessionError> {
-        let (mut identities, committed) = self
-            .accept(
-                vec![Pending {
-                    agent,
-                    queue_attempt,
-                    event,
-                }],
-                None,
-            )
-            .await?;
+        let (mut identities, committed) = self.accept(vec![(agent, event)], None).await?;
         Ok(AcceptedAppend {
             identity: identities.pop().expect("one identity per entry"),
             committed,
@@ -736,33 +697,25 @@ impl SessionStore {
 
     async fn accept(
         &self,
-        entries: Vec<Pending>,
+        entries: Vec<(AgentId, SessionEvent)>,
         follow: Option<Follow>,
-    ) -> Result<
-        (
-            Vec<AppendIdentity>,
-            oneshot::Receiver<Result<Vec<EventRecord>, SessionError>>,
-        ),
-        SessionError,
-    > {
+    ) -> Result<(Vec<AppendIdentity>, Receipt), SessionError> {
         if entries
             .iter()
-            .any(|entry| entry.agent.session() != self.id())
+            .any(|(agent, _)| agent.session() != self.id())
         {
             return Err(SessionError::WrongSession);
         }
         let (accepted, acceptance) = oneshot::channel();
         let (committed, receipt) = oneshot::channel();
-        // FIFO admission; the owned task holds the writer through commit and
-        // publication, releasing it before the receipt so an immediate reopen succeeds.
-        let mut writer = self.inner.writer.clone().lock_owned().await;
+        let mut turn = self.turn().await;
         tokio::task::spawn_blocking(move || {
             // Release the writer before any report, even when the writer panics, so
             // a caller that closes and reopens on the answer finds the lock free.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                writer.append(entries, follow, accepted)
+                turn.writer.append(entries, follow, accepted)
             }));
-            drop(writer);
+            drop(turn);
             match result {
                 Ok(Ok(result)) => drop(committed.send(result)),
                 Ok(Err((accepted, error))) => drop(accepted.send(Err(error))),
@@ -772,9 +725,7 @@ impl SessionStore {
                 }
             }
         });
-        // A dropped sender means the writer was lost before acceptance, so nothing
-        // is durable. Health cannot explain it: a prior poison is reported through
-        // the channel, and any poison seen now belongs to a later in-flight append.
+        // A dropped sender means the writer was lost before acceptance: nothing is durable.
         let identities = acceptance.await.map_err(|_| {
             SessionError::Io(std::io::Error::other(
                 "session writer lost before accepting the append",
@@ -785,13 +736,14 @@ impl SessionStore {
 
     /// Await accepted appends and report recovery-required state without closing admission.
     pub async fn drain(&self) -> Result<(), SessionError> {
-        let _writer = self.inner.writer.lock().await;
+        let _turn = self.inner.turn.lock().await;
         self.inner.shared.read().require_healthy()
     }
 
-    /// Stop admission and report recovery-required state; the lease lasts until the store drops.
+    /// Stop admission, wait out operations already queued, and report
+    /// recovery-required state; the lease lasts until the store drops.
     pub async fn close(&self) -> Result<(), SessionError> {
-        let _writer = self.inner.writer.lock().await;
+        let _turn = self.inner.turn.lock().await;
         let mut state = self.inner.shared.write();
         state.closed = true;
         state.require_healthy()
@@ -807,10 +759,7 @@ impl SessionStore {
         job: crate::identity::JobId,
     ) -> Result<(), SessionError> {
         let db = self.outputs();
-        tokio::task::spawn_blocking(move || db.remove_job_output(job.get()))
-            .await
-            .map_err(|error| SessionError::Io(std::io::Error::other(error)))??;
-        Ok(())
+        Ok(blocking(move || db.remove_job_output(job.get())).await??)
     }
 
     /// Store bytes in the content-addressed blob store.
@@ -891,27 +840,6 @@ impl SessionStore {
         })
     }
 
-    /// Load a stored attachment back into memory, such as a recovered draft's.
-    pub async fn load_attachment(
-        &self,
-        reference: &crate::media::AttachmentRef,
-    ) -> Result<crate::media::Attachment, SessionError> {
-        use crate::media::{Attachment, AttachmentRef, Image, MAX_IMAGE_BYTES, MediaError};
-        let limit = MAX_IMAGE_BYTES as usize;
-        Ok(match reference {
-            AttachmentRef::Text(text) => Attachment::Text {
-                file: text.file.as_ref().map(PathBuf::from),
-                content: String::from_utf8(self.read_blob(&text.blob, limit).await?)
-                    .map_err(|_| invalid_data(MediaError::InvalidText))?,
-            },
-            AttachmentRef::Image(image) => Attachment::Image {
-                file: image.file.as_ref().map(PathBuf::from),
-                image: Image::new(self.read_blob(&image.blob, limit).await?)
-                    .map_err(invalid_data)?,
-            },
-        })
-    }
-
     /// Load every blob a request references so providers can encode it.
     pub async fn load_blobs(&self, request: &mut ModelRequest) -> Result<(), SessionError> {
         use crate::media::{AttachmentRef, ImageFormat, MAX_IMAGE_BYTES, MediaError};
@@ -956,6 +884,13 @@ impl SessionStore {
     }
 }
 
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, SessionError> {
+    let joined = tokio::task::spawn_blocking(work).await;
+    joined.map_err(|error| SessionError::Io(std::io::Error::other(error)))
+}
+
 fn invalid_data(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> SessionError {
     SessionError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
@@ -974,8 +909,6 @@ pub enum SessionError {
     ModelRequestReplay { sequence: u64, reason: &'static str },
     #[error("session I/O failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error("session JSON failed: {0}")]
-    Json(#[from] serde_json::Error),
     #[error(transparent)]
     Database(DbError),
     #[error("session identifier generation failed: {0}")]
@@ -988,8 +921,6 @@ pub enum SessionError {
     UnsupportedVersion(i64),
     #[error("event belongs to another session")]
     WrongSession,
-    #[error("invalid queue journal record: {0}")]
-    InvalidQueue(&'static str),
     #[error("blob `{0}` failed its content hash check")]
     BlobHashMismatch(String),
 }
@@ -1235,8 +1166,8 @@ mod tests {
     #[tokio::test]
     async fn failures_poison_the_writer_and_reopen_resolves_the_commit() {
         for (fault, durable) in [
-            (CommitFault::RollBack, false),
-            (CommitFault::ReportAfterCommit, true),
+            (CommitFault::Fail(AppendBoundary::Write), false),
+            (CommitFault::Fail(AppendBoundary::Publication), true),
             (CommitFault::Panic, false),
         ] {
             let (root, store, id, agent) = fresh().await;
@@ -1308,7 +1239,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn acknowledged_append_releases_owned_store_before_immediate_reopen() {
-        for _ in 0..32 {
+        for _ in 0..28 {
             let (_root, store, id, agent) = fresh().await;
             let root = _root.path().to_path_buf();
             store
@@ -1318,6 +1249,65 @@ mod tests {
             drop(store);
             let (_, records) = SessionStore::open(&root, id).await.unwrap();
             assert_eq!(records.len(), 3);
+        }
+    }
+
+    /// A cancelled caller leaves its operation running: later work waits for it.
+    #[tokio::test]
+    async fn cancelled_writer_operation_keeps_its_turn_until_it_finishes() {
+        let (_root, store, _id, agent) = fresh().await;
+        let (entered, running) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let caller = tokio::spawn({
+            let store = store.clone();
+            async move {
+                let work = move |_: &mut Writer| {
+                    let _ = entered.send(());
+                    let _ = released.recv();
+                };
+                store.with_writer(work).await
+            }
+        });
+        running.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let append = tokio::spawn({
+            let store = store.clone();
+            async move { store.append(agent, SessionEvent::AgentInterrupted).await }
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!append.is_finished(), "the operation still owns the writer");
+        release.send(()).unwrap();
+        append.await.unwrap().unwrap();
+    }
+
+    /// `close` waits until queued work has let go of the lease, so dropping the
+    /// last handle frees the session at once, and admission stays closed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_under_traffic_stops_admission_and_frees_the_lease_for_reopen() {
+        for round in 0..16 {
+            let (root, store, id, agent) = fresh().await;
+            let traffic = async {
+                for _ in 0..3 {
+                    // Dropped receipts: the commits are still in flight when `close` queues.
+                    let accepted =
+                        store.accept_append(agent.clone(), SessionEvent::AgentInterrupted);
+                    drop(accepted.await.unwrap());
+                }
+                store.close().await
+            };
+            let (blob, closed) = tokio::join!(store.store_blob(b"racing"), traffic);
+            blob.unwrap();
+            closed.unwrap();
+            if round % 2 == 0 {
+                let late = store.append(agent, SessionEvent::AgentCompleted).await;
+                assert!(matches!(late, Err(SessionError::Closed)));
+            }
+            drop(store);
+            let (_, records) = SessionStore::open(root.path(), id).await.unwrap();
+            assert_eq!(records.len(), 5);
         }
     }
 

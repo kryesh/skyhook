@@ -148,9 +148,6 @@ impl Decoder {
         }
         // A migration alias is only valid while the snapshots present one
         // namespace. Once both are explicit, each needs its own display block.
-        // Retain the original block at its original position: close_part still
-        // rejects any attempt to rewrite text actually received there. The
-        // formerly aliased namespace may now supply its own distinct text.
         self.items
             .get_mut(&id)
             .expect("checked item")

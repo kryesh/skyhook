@@ -2,42 +2,20 @@
 
 use super::super::format::brief;
 use super::super::tool_view::{Document, Role, Run};
-#[cfg(test)]
-use super::jobs::header_text;
 use super::jobs::state_role;
 use super::{Entry, EntryKey, Projection, Surface, View, clean};
 use serde_json::Value;
 use skyhook::identity::JobId;
 use skyhook::job::JobState;
 
-/// Keep recognizing the original envelopes when projecting saved sessions.
-#[derive(Clone, Copy)]
-pub(super) enum JobNotificationKind {
-    State,
-    AgentMessage,
-}
+const TAGS: (&str, &str) = ("<skyhook_job_events>", "</skyhook_job_events>");
 
-impl JobNotificationKind {
-    fn tags(self) -> (&'static str, &'static str) {
-        match self {
-            Self::State => ("<skyhook_job_events>", "</skyhook_job_events>"),
-            Self::AgentMessage => ("<skyhook_agent_messages>", "</skyhook_agent_messages>"),
-        }
-    }
-}
-
-pub(super) fn job_notification_kind(text: &str) -> Option<JobNotificationKind> {
-    [
-        JobNotificationKind::State,
-        JobNotificationKind::AgentMessage,
-    ]
-    .into_iter()
-    .find(|kind| text.trim_start().starts_with(kind.tags().0))
+pub(super) fn is_job_notification(text: &str) -> bool {
+    text.trim_start().starts_with(TAGS.0)
 }
 
 /// Show the event where the model received it, using its historical payload
 /// rather than the job's latest output (the same job may have since resumed).
-/// Both runtime envelopes describe historical job notifications, not user text.
 pub(super) fn job_event_entries(
     record: u64,
     block: usize,
@@ -46,15 +24,11 @@ pub(super) fn job_event_entries(
     view: &View,
     all: bool,
 ) -> Vec<Entry> {
-    let kind = job_notification_kind(text);
-    let legacy_agent_messages = matches!(kind, Some(JobNotificationKind::AgentMessage));
-    let events = kind.and_then(|kind| {
-        let (start, end) = kind.tags();
-        text.trim()
-            .strip_prefix(start)
-            .and_then(|text| text.strip_suffix(end))
-            .and_then(|json| serde_json::from_str::<Vec<Value>>(json).ok())
-    });
+    let events = text
+        .trim()
+        .strip_prefix(TAGS.0)
+        .and_then(|text| text.strip_suffix(TAGS.1))
+        .and_then(|json| serde_json::from_str::<Vec<Value>>(json).ok());
     let Some(events) = events.filter(|events| !events.is_empty()) else {
         return vec![Entry::new(
             EntryKey::Notification {
@@ -70,10 +44,8 @@ pub(super) fn job_event_entries(
         .iter()
         .enumerate()
         .map(|(index, event)| {
-            // Unified envelopes mix lifecycle and message items. The old envelope
-            // remains message-only for historical sessions without a kind field.
-            let agent_message = legacy_agent_messages
-                || event.get("kind").and_then(Value::as_str) == Some("message");
+            // Envelopes mix lifecycle and message items.
+            let agent_message = event.get("kind").and_then(Value::as_str) == Some("message");
             let key = EntryKey::Notification {
                 record,
                 block,
@@ -160,13 +132,10 @@ pub(super) fn job_event_entries(
         .collect()
 }
 
-/// A call without an admitted job uses the original response expansion key and
-/// never acquires job navigation. The result is presentation-only session data.
-#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 mod tests {
     use super::super::JobInfo;
-    use super::super::tests::{job_info, root};
+    use super::super::tests::{header_text, job_info, root};
     use super::*;
 
     fn events(text: &str, projection: &Projection, view: &View, all: bool) -> Vec<Entry> {
@@ -205,9 +174,9 @@ mod tests {
     fn intermediate_agent_messages_are_historical_expandable_job_events() {
         let message = "Both reviewer gaps are fixed.\nChecking \"native\" replay — next.";
         let text = format!(
-            " <skyhook_agent_messages>\n{}\n</skyhook_agent_messages> ",
+            " <skyhook_job_events>\n{}\n</skyhook_job_events> ",
             serde_json::json!([{
-                "id":253, "name":"implement-native-replay", "message":6577, "text":message,
+                "kind":"message", "id":253, "name":"implement-native-replay", "message":6577, "text":message,
             }]),
         );
         let mut projection = Projection::default();
@@ -227,7 +196,7 @@ mod tests {
         assert_eq!(card.key(), &key);
         let header = "Job event · agent #253 · implement-native-replay · message #6577";
         assert!(card.text().contains(header));
-        assert!(!card.text().contains("skyhook_agent_messages") && !card.text().contains(message));
+        assert!(!card.text().contains("skyhook_job_events") && !card.text().contains(message));
         view.set_expanded(key.clone(), true);
         let expanded = events(&text, &projection, &view, false);
         assert!(expanded[0].document().is_some());
@@ -260,33 +229,13 @@ mod tests {
     }
 
     #[test]
-    fn unified_agent_message_preserves_legacy_expansion_and_attribution() {
-        let payload = serde_json::json!([
-            {"id":253,"name":"reviewer","message":6577,"text":"Historical reply.\nNext line."},
-        ]);
-        let legacy = format!("<skyhook_agent_messages>\n{payload}\n</skyhook_agent_messages>");
-        let mut unified = payload;
-        unified[0]["kind"] = serde_json::json!("message");
-        let unified = format!("<skyhook_job_events>\n{unified}\n</skyhook_job_events>");
-        let (projection, view) = (Projection::default(), View::default());
-        for expanded in [false, true] {
-            let legacy = events(&legacy, &projection, &view, expanded);
-            let unified = events(&unified, &projection, &view, expanded);
-            assert!(
-                unified == legacy,
-                "envelope migration changed message presentation"
-            );
-        }
-    }
-
-    #[test]
     fn malformed_agent_notifications_use_job_event_fallback_without_panicking() {
         for text in [
-            "<skyhook_agent_messages>bad json</skyhook_agent_messages>",
-            "<skyhook_agent_messages>[]</skyhook_agent_messages>",
-            "<skyhook_agent_messages>[{}]",
+            "<skyhook_job_events>bad json</skyhook_job_events>",
+            "<skyhook_job_events>[]</skyhook_job_events>",
+            "<skyhook_job_events>[{}]",
         ] {
-            assert!(job_notification_kind(text).is_some());
+            assert!(is_job_notification(text));
             let entries = events(text, &Projection::default(), &View::default(), true);
             assert_eq!((entries.len(), entries[0].surface), (1, Surface::Tool));
             let text = entries[0].text();

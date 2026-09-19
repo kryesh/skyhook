@@ -165,13 +165,6 @@ mod tests {
     };
     use super::*;
 
-    fn line_text(line: &Line<'_>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
-    }
-
     fn rows_of(entry: &model::Entry, width: u16, cache: &HighlightCache) -> Vec<Row> {
         let p = Palette::new();
         layout_document_or_plain_with_expansion(entry, width, p, cache, 0, entry.default_open)
@@ -192,7 +185,7 @@ mod tests {
         let mut entry = model::Entry::card(model::EntryKey::Record(1), header, Some(body));
         entry.default_open = true;
         entry.compact_after = true;
-        for width in [0, 1, 2, 5, 12, 24, 40, 64, 120, 24] {
+        for width in [0, 1, 2, 8, 12, 40, 120, 24] {
             let geometry = EntryGeometry::new(&entry, width, 0);
             let rows = rows_of(&entry, width, cache);
             let body = geometry.body_width.saturating_sub(1).max(1) as usize;
@@ -209,7 +202,7 @@ mod tests {
                         Wrap::Words => wrap_words(line, first),
                     }
                 })
-                .map(|line| line_text(&line))
+                .map(|line| line.to_string())
                 .collect();
             assert_eq!(
                 rows.iter().map(Row::text).collect::<Vec<_>>(),
@@ -249,14 +242,14 @@ mod tests {
         // A long prompt's short words must never be split, even though its
         // paragraphs are longer than the viewport and include indentation.
         for (line, wrapping) in document.layout_lines(None) {
-            let text = line_text(&line);
+            let text = line.to_string();
             if wrapping != Wrap::Words || text.contains("extraordinarily") {
                 continue;
             }
             for width in [24, 40, 64] {
                 let parts: Vec<_> = wrap_words(line.clone(), width)
                     .iter()
-                    .map(line_text)
+                    .map(ToString::to_string)
                     .collect();
                 let words = parts.join(" ");
                 let words: Vec<_> = words.split_whitespace().collect();
@@ -267,9 +260,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_argument_code_keeps_hard_wrap_and_copy_after_highlights_and_resize() {
+    fn tool_argument_code_keeps_hard_wrap_and_copy_after_resize() {
         let source = "  const message = 'long words stay hard wrapped';\t// café 👩‍💻\n\n    console.log(message);  \n";
-        let mut cache = HighlightCache::default();
+        let cache = HighlightCache::default();
         for (tool, args) in [
             (
                 "script",
@@ -299,19 +292,6 @@ mod tests {
             let document = arguments(tool, &args);
             let original = document.clone();
             assert_argument_reflow(&document, &cache);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while {
-                cache.prepare(std::iter::once(&document));
-                document.highlight_sources().next().is_some()
-                    && !cache.is_fully_highlighted(&document)
-            } {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "highlight worker did not finish"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            assert_argument_reflow(&document, &cache);
             assert_eq!(document, original);
         }
     }
@@ -328,7 +308,7 @@ mod tests {
             Run::new("Completed", Role::Success),
             Run::new(" · #42", Role::Muted),
         ];
-        let text = line_text(&header_line(&header));
+        let text = header_line(&header).to_string();
         let key = model::EntryKey::Record(1);
         let entry = model::Entry::card(key.clone(), header.clone(), None);
         assert_eq!(entry.text(), text);

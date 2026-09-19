@@ -29,11 +29,6 @@ impl SessionHandle {
         &self.root
     }
 
-    #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
-        self.runtime.events.subscribe()
-    }
-
     /// Observe without a gap between the initial snapshot and subsequent updates.
     pub async fn observe(&self) -> Observation {
         self.runtime.catch_up_store_events().await;
@@ -123,12 +118,6 @@ impl SessionHandle {
         *self.runtime.usage.lock().await
     }
 
-    /// Current todo lists for all session agents, including historical children.
-    /// Subscribe before reading this snapshot to observe subsequent replacements.
-    pub async fn todos(&self) -> Vec<TodoSnapshot> {
-        self.runtime.todos.snapshots().await
-    }
-
     #[must_use]
     pub fn tools(&self) -> &ToolRegistry {
         self.runtime.executor.registry()
@@ -139,19 +128,16 @@ impl SessionHandle {
             .await
     }
 
-    /// Continue retained history after a failed/interrupted turn, without duplicating its input.
-    ///
-    /// A soft session interruption first restarts every retained interrupted child.
-    /// This deliberately does not enqueue a root request while a parent is still
-    /// waiting on those children; ordinary completion delivery wakes it later.
+    /// `continue_turn_with` default options, returning the answer (empty if none).
     pub async fn continue_turn(&self) -> Result<String, HarnessError> {
         let outcome = self.continue_turn_with(ContinueOptions::default()).await?;
         Ok(outcome.answer.unwrap_or_default())
     }
 
-    /// Continue a failed or interrupted turn, optionally on another model profile.
-    /// A refusal is deterministic for a given request, so continuing one usually
-    /// requires a different model to make progress.
+    /// Continue a failed or interrupted turn without duplicating its input,
+    /// optionally on another model profile (a refusal is deterministic for a given
+    /// request). Retained interrupted children restart first; a root still waiting
+    /// on them is left alone and woken by their ordinary completion.
     pub async fn continue_turn_with(
         &self,
         options: ContinueOptions,
@@ -161,20 +147,12 @@ impl SessionHandle {
         {
             return Err(HarnessError::UnknownModelProfile(model.clone()));
         }
-        self.continue_turn_inner(options.model).await
-    }
-
-    async fn continue_turn_inner(
-        &self,
-        model: Option<String>,
-    ) -> Result<ContinueOutcome, HarnessError> {
+        let model = options.model;
         // Interrupt requests cancel model futures before their owning job has
         // finished journaling. An immediate resume must not miss those children.
         let interrupted = self
             .runtime
-            .agents
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .agents()
             .iter()
             .filter(|(_, agent)| agent.control.retryable_interrupt.load(Ordering::Acquire))
             .map(|(id, _)| id.clone())
@@ -317,20 +295,11 @@ impl SessionHandle {
         self.runtime
             .shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
-        // Wake provider-held mailbox consumers before waiting for intake: a
-        // bounded mailbox send may currently hold the admission gate.
         self.runtime.interrupt_tree(&self.root).await;
-        // Passing through the gate once is the admission barrier: an operation
-        // already holding it finishes its send or write, and every later one
-        // observes `shutting_down`. Holding it any longer would stall abandon,
-        // acknowledgement and reclaim for the whole drain.
-        drop(self.runtime.queue_state.gate.lock().await);
         // Completed children retain idle loops for resumption, and must also stop.
         let senders = self
             .runtime
-            .agents
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .agents()
             .values()
             .map(|agent| agent.sender.clone())
             .collect::<Vec<_>>();
@@ -366,14 +335,16 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_drains_before_final_host_status_without_closing_journal() {
-        let (root, _, session) = scripted_session([]).await;
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, Arc::new(HangingProvider)).await;
+        let session = harness.new_session().await.unwrap();
         let result = session.run_script("console.log('completed'); return 42;");
         assert_eq!(result.await.unwrap().value["value"], 42);
         session.shutdown().await.unwrap();
         // Hosts record final status after shutdown so drain errors are not hidden.
         let status = session.record_status(session.root.clone(), "Completed".into());
         status.await.unwrap();
-        let sessions = root.path().join("sessions");
         let durable = SessionStore::read_records(&sessions, session.id()).await;
         let durable = durable.unwrap();
         assert!(matches!(&durable.last().unwrap().event,
@@ -491,7 +462,7 @@ mod tests {
         let captured = requests.lock().unwrap().clone();
         assert_eq!(captured[1].tools, original.tools);
         assert_eq!(captured[1].system, original.system);
-        let Some(Message::Tool(results)) = request_history(&captured[2]).last() else {
+        let Some(Message::Tool(results)) = captured[2].history.last() else {
             panic!("expected the write result");
         };
         assert!(results[0].is_error);
@@ -543,7 +514,7 @@ mod tests {
             .rev()
             .find(|request| request.correlation.as_deref() != Some(&resumed.root.to_string()))
             .expect("the child made a request after the restart");
-        let history = serde_json::to_string(request_history(child)).unwrap();
+        let history = serde_json::to_string(&child.history).unwrap();
         assert!(history.contains("work") && history.contains("child done"));
         assert!(history.contains("Owner input"));
         shutdown_session(resumed).await;
@@ -705,25 +676,42 @@ mod tests {
     async fn continuing_interrupted_turn_retains_input_once_and_shutdown_is_idempotent() {
         let root = tempfile::tempdir().unwrap();
         let requests = Requests::default();
-        let provider = Arc::new(BlockingFirstProvider {
-            calls: Arc::new(AtomicUsize::new(0)),
-            requests: requests.clone(),
-            release: Arc::new(tokio::sync::Semaphore::new(0)),
-        });
-        let harness = test_harness(root.path(), &root.path().join("sessions"), provider).await;
+        // The first response reports usage, then hangs mid-stream.
+        let mut initial = answer("initial");
+        let spent = usage(7, 0, 1);
+        initial.insert(0, ResponseChunk::UsageUpdated { usage: spent });
+        let steps = [
+            Step::new(initial).midstream(),
+            Step::new(answer("jobs handled")),
+        ];
+        let provider = Script::new(steps, &requests);
+        let harness =
+            test_harness(root.path(), &root.path().join("sessions"), provider.clone()).await;
         let session = harness.new_session().await.unwrap();
         let task = tokio::spawn({
             let session = session.clone();
             async move { session.prompt("retained input").await }
         });
+        let mut events = session.runtime.events.observe().updates;
+        provider.request(0).await;
         bounded(async {
-            while requests.lock().unwrap().is_empty() {
-                tokio::task::yield_now().await;
-            }
+            while !matches!(
+                events.recv().await.unwrap().event,
+                RuntimeEvent::ResponseEvent { .. }
+            ) {}
         })
         .await;
         session.interrupt().await;
         assert!(task.await.unwrap().is_err());
+        // The interrupted stream journals its usage and attempt, and commits nothing.
+        let records = session.runtime.store.records().await;
+        let recorded = events!(&records, SessionEvent::Usage { usage, .. } => *usage);
+        assert_eq!(recorded, [spent]);
+        let interrupted = count!(
+            &records,
+            SessionEvent::ModelAttemptInterrupted { attempt: 1, .. }
+        );
+        assert_eq!((interrupted, assistant_commits(&records)), (1, 0));
         let status = session.record_status(session.root.clone(), "Interrupted".into());
         status.await.unwrap();
         assert_eq!(session.continue_turn().await.unwrap(), "jobs handled");

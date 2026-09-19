@@ -89,12 +89,6 @@ pub fn project_history(
             && record.sequence > frontier
             && let SessionEvent::MessageCommitted { message } = &record.event
         {
-            // Journals written before the commit guard existed may contain a
-            // content-free assistant message. It is unencodable, so replaying a
-            // session that holds one would fail every later request.
-            if message.is_content_free() {
-                return None;
-            }
             return Some((record.sequence, message.clone()));
         }
         None
@@ -113,7 +107,7 @@ pub(super) fn validate_compaction(
     let SessionEvent::Compaction { checkpoint } = &record.event else {
         return Ok(());
     };
-    if !matches!(checkpoint.schema_version, 1 | 2) {
+    if checkpoint.schema_version != 2 {
         return Err(invalid("unsupported compaction schema version"));
     }
     if checkpoint
@@ -451,45 +445,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projection_drops_content_free_assistant_messages_from_older_journals() {
-        let (_directory, store, agent) = crate::session::fixture::on_disk().await;
-        // A journal written before the commit guard existed: an assistant message
-        // with no content at all, which no provider can encode.
-        for event in [
-            committed(text_message("feedback")),
-            committed(Message::Assistant(Vec::new())),
-            committed(text_message("continue")),
-        ] {
-            store.append(agent.clone(), event).await.unwrap();
-        }
-        let records = store.records().await;
-        let history = project_history(&records, &agent).unwrap();
-        let messages: Vec<_> = history.into_iter().map(|(_, message)| message).collect();
-        assert_eq!(
-            messages,
-            vec![text_message("feedback"), text_message("continue")],
-        );
-        // Reasoning that still carries replay state is content-bearing and kept.
-        let replay = ReplayEnvelope {
-            version: 1,
-            protocol: "anthropic".into(),
-            model: "model".into(),
-            scope: "scope".into(),
-            payload: json!({"type":"thinking","thinking":"p","signature":"s"}),
-            conversation_bound: false,
-        };
-        let signed = AssistantItem::reasoning("thought", 0, "", Some(replay));
-        let message = Message::Assistant(vec![signed]);
-        store
-            .append(agent.clone(), committed(message.clone()))
-            .await
-            .unwrap();
-        let records = store.records().await;
-        let history = project_history(&records, &agent).unwrap();
-        assert_eq!(history.last().map(|(_, message)| message), Some(&message));
-    }
-
-    #[tokio::test]
     async fn replay_preserves_context_boundaries_and_image_payloads() {
         let (directory, store, agent) = crate::session::fixture::on_disk().await;
         let child = agent.child(1);
@@ -522,7 +477,8 @@ mod tests {
             protocol: "test".into(),
             model: "original-model".into(),
             scope: "reasoning".into(),
-            payload: json!({"signature":"preserve"}),
+            // Opaque to the journal: nesting, key order, numbers and escapes must survive.
+            payload: json!({"signature":"pre\"serve\u{e9}","a":[1.5,{"z":null,"b":-0.0}],"n":1e300}),
             conversation_bound: false,
         };
         let reasoning = AssistantItem::reasoning("reasoning-item", 0, "reasoning", Some(envelope));
@@ -577,6 +533,9 @@ mod tests {
             (vec![user, assistant, tool], history_lifetime);
         expected.tail = vec![text_message("exact call-time state")];
         assert_eq!(restored, expected);
+        // Value equality ignores key order and the sign of zero; the wire bytes must not.
+        let wire = |request: &ModelRequest| serde_json::to_string(&request.history[1]).unwrap();
+        assert_eq!(wire(&restored), wire(&expected));
         store.load_blobs(&mut restored).await.unwrap();
         store.load_blobs(&mut expected).await.unwrap();
         assert_eq!(restored, expected);
@@ -615,7 +574,7 @@ mod tests {
     fn projection_fixture() -> (AgentId, Vec<EventRecord>) {
         let agent = AgentId::root(crate::identity::SessionId::generate().unwrap());
         let checkpoint = super::super::CompactionCheckpoint {
-            schema_version: 1,
+            schema_version: 2,
             todos: Vec::new(),
             previous: None,
             frontier: 2,
@@ -663,7 +622,6 @@ mod tests {
             .enumerate()
             .map(|(index, event)| EventRecord {
                 id: crate::identity::EventId::generate().unwrap(),
-                queue_attempt: None,
                 sequence: index as u64 + 1,
                 timestamp_millis: 0,
                 agent: agent.clone(),

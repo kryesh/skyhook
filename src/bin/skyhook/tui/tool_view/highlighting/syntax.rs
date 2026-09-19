@@ -7,7 +7,10 @@ use ratatui::{
 };
 use std::sync::OnceLock;
 use syntect::{
-    easy::HighlightLines, highlighting::Theme, parsing::SyntaxSet, util::LinesWithEndings,
+    easy::HighlightLines,
+    highlighting::{FontStyle, Theme},
+    parsing::SyntaxSet,
+    util::LinesWithEndings,
 };
 
 pub(super) struct SyntaxResources {
@@ -34,17 +37,7 @@ pub fn highlight_code(source: &str, language: &str) -> Option<Vec<Line<'static>>
     {
         return None;
     }
-    highlight_source(source, language, syntax_resources())
-}
-
-fn highlight_source(
-    source: &str,
-    language: &str,
-    resources: &SyntaxResources,
-) -> Option<Vec<Line<'static>>> {
-    if language.is_empty() {
-        return None;
-    }
+    let resources = syntax_resources();
     let syntaxes = &resources.syntaxes;
     let syntax = syntaxes
         .find_syntax_by_extension(language)
@@ -63,23 +56,14 @@ fn highlight_source(
                 style.foreground.g,
                 style.foreground.b,
             ));
-            if style
-                .font_style
-                .contains(syntect::highlighting::FontStyle::BOLD)
-            {
-                rendered = rendered.add_modifier(Modifier::BOLD);
-            }
-            if style
-                .font_style
-                .contains(syntect::highlighting::FontStyle::ITALIC)
-            {
-                rendered = rendered.add_modifier(Modifier::ITALIC);
-            }
-            if style
-                .font_style
-                .contains(syntect::highlighting::FontStyle::UNDERLINE)
-            {
-                rendered = rendered.add_modifier(Modifier::UNDERLINED);
+            for (font, modifier) in [
+                (FontStyle::BOLD, Modifier::BOLD),
+                (FontStyle::ITALIC, Modifier::ITALIC),
+                (FontStyle::UNDERLINE, Modifier::UNDERLINED),
+            ] {
+                if style.font_style.contains(font) {
+                    rendered = rendered.add_modifier(modifier);
+                }
             }
             spans.push(Span::styled(
                 model::clean(text.strip_suffix('\n').unwrap_or(text)),
@@ -96,15 +80,8 @@ fn highlight_source(
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::tests::text;
     use super::*;
-
-    fn text(lines: &[Line<'_>]) -> String {
-        lines
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
 
     fn has_span(line: &Line<'_>, test: impl Fn(&str, Option<Color>) -> bool) -> bool {
         line.spans

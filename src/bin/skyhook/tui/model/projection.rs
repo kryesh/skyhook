@@ -186,6 +186,20 @@ pub struct Projection {
     pub(super) tool_origins: HashSet<(AgentId, u64, String)>,
 }
 impl Projection {
+    pub(super) fn agent_name(&self, agent: &AgentId) -> &str {
+        let info = self.agents.iter().find(|info| &info.id == agent);
+        info.map_or("Agent", |info| info.name.as_str())
+    }
+
+    /// The request's latest attempt failed, so its retry card owns the content.
+    pub(super) fn retry_failed(&self, request: u64) -> bool {
+        let retry = self
+            .requests
+            .get(&request)
+            .and_then(|info| info.retry.as_ref());
+        retry.is_some_and(RetryState::has_error)
+    }
+
     pub fn complete_agent(&mut self, agent: &AgentId) {
         // A fresh explicit completion after retirement starts another grace;
         // owner-state reconciliation in rebuild must not do so on every rebuild.
@@ -200,13 +214,6 @@ impl Projection {
             info.lifecycle = AgentLifecycle::Terminal {
                 grace_started: Some(Instant::now()),
             };
-        }
-    }
-
-    #[cfg(test)]
-    pub fn reopen_agent(&mut self, agent: &AgentId) {
-        if let Some(info) = self.agents.iter_mut().find(|info| &info.id == agent) {
-            info.lifecycle = AgentLifecycle::Active;
         }
     }
 
@@ -271,8 +278,16 @@ impl Projection {
                     arguments,
                     parent,
                     location,
+                    origin,
                     ..
                 } => {
+                    if let Some(origin) = origin {
+                        self.tool_origins.insert((
+                            record.agent.clone(),
+                            origin.message,
+                            origin.call_id.clone(),
+                        ));
+                    }
                     self.jobs.insert(
                         *job,
                         JobInfo {
@@ -314,24 +329,32 @@ impl Projection {
                         info.error = error.clone();
                     }
                 }
-                SessionEvent::AgentCompleted | SessionEvent::AgentInterrupted => {
+                SessionEvent::AgentCompleted => self.complete_agent(&record.agent),
+                SessionEvent::AgentInterrupted => {
                     self.complete_agent(&record.agent);
+                    if let Some(request) = self.active_request.get(&record.agent)
+                        && let Some(info) = self.requests.get_mut(request)
+                    {
+                        info.finished_millis.get_or_insert(record.timestamp_millis);
+                    }
                 }
                 SessionEvent::ModelChanged { profile } => {
                     if let Some(agent) = self.agents.iter_mut().find(|a| a.id == record.agent) {
                         agent.model.clone_from(&profile.name);
                     }
                 }
-                SessionEvent::Usage { usage, .. } => {
+                SessionEvent::Usage { request, usage } => {
                     add_usage(&mut self.usage, *usage);
                     add_usage(
                         self.agent_usage.entry(record.agent.clone()).or_default(),
                         *usage,
                     );
+                    if let Some(request) = request {
+                        let info = self.requests.entry(*request).or_default();
+                        add_usage(info.usage.get_or_insert_with(Usage::default), *usage);
+                        info.finished_millis.get_or_insert(record.timestamp_millis);
+                    }
                 }
-                _ => {}
-            }
-            match &record.event {
                 SessionEvent::ModelRequested {
                     context, purpose, ..
                 } => {
@@ -354,13 +377,6 @@ impl Projection {
                     self.active_request
                         .insert(record.agent.clone(), record.sequence);
                 }
-                SessionEvent::AgentInterrupted => {
-                    if let Some(request) = self.active_request.get(&record.agent)
-                        && let Some(info) = self.requests.get_mut(request)
-                    {
-                        info.finished_millis.get_or_insert(record.timestamp_millis);
-                    }
-                }
                 SessionEvent::ModelFailed {
                     request,
                     attempt,
@@ -369,9 +385,10 @@ impl Projection {
                 } => {
                     let info = self.requests.entry(*request).or_default();
                     info.failed = true;
+                    let (attempt, error) = (*attempt, error.clone());
                     info.retry = Some(match kind {
-                        ModelFailureKind::Refusal => RetryState::refused(*attempt, error),
-                        ModelFailureKind::Error => RetryState::failed(*attempt, error),
+                        ModelFailureKind::Refusal => RetryState::Refused { attempt, error },
+                        ModelFailureKind::Error => RetryState::Failed { attempt, error },
                     });
                     info.finished_millis.get_or_insert(record.timestamp_millis);
                 }
@@ -379,7 +396,7 @@ impl Projection {
                     let info = self.requests.entry(*request).or_default();
                     info.failed = false;
                     info.finished_millis = None;
-                    info.retry = Some(RetryState::started(*attempt));
+                    info.retry = Some(RetryState::Started { attempt: *attempt });
                 }
                 SessionEvent::ModelRecoveryScheduled {
                     request,
@@ -388,20 +405,13 @@ impl Projection {
                     delay_millis,
                     error,
                 } => {
-                    self.requests.entry(*request).or_default().retry = Some(RetryState::scheduled(
-                        *attempt,
-                        *max_attempts,
-                        *delay_millis,
-                        error,
-                    ));
-                }
-                SessionEvent::Usage {
-                    request: Some(request),
-                    usage,
-                } => {
-                    let info = self.requests.entry(*request).or_default();
-                    add_usage(info.usage.get_or_insert_with(Usage::default), *usage);
-                    info.finished_millis.get_or_insert(record.timestamp_millis);
+                    self.requests.entry(*request).or_default().retry =
+                        Some(RetryState::Scheduled {
+                            attempt: *attempt,
+                            max_attempts: *max_attempts,
+                            delay_millis: *delay_millis,
+                            error: error.clone(),
+                        });
                 }
                 SessionEvent::MessageCommitted {
                     message: Message::Assistant(_),
@@ -416,16 +426,6 @@ impl Projection {
                                 .get_or_insert(record.timestamp_millis);
                         }
                     }
-                }
-                SessionEvent::JobCreated {
-                    origin: Some(origin),
-                    ..
-                } => {
-                    self.tool_origins.insert((
-                        record.agent.clone(),
-                        origin.message,
-                        origin.call_id.clone(),
-                    ));
                 }
                 _ => {}
             }
@@ -737,8 +737,6 @@ mod tests {
         // Explicit repeated completion, unlike owner reconciliation, renews grace.
         projection.complete_agent(&child);
         assert_eq!(projection.visible(&root).len(), 1);
-        projection.reopen_agent(&child);
-        assert!(!projection.agents[0].terminal());
     }
 
     fn expired_grace() -> AgentLifecycle {

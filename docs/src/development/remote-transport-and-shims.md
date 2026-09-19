@@ -1,28 +1,14 @@
 # Remote transport and shims
 
-## Remote transport architecture
+## Remote transport
 
-Remote connection protocols use the production `ConnectionFactory` interface in
-`src/remote/backend.rs`. Factories receive the route hops after the destination's origin and return an owned
-`Transport` byte stream; the manager performs the common shim handshake and client setup for both
-real backends and test doubles. Protocol selection goes through the backend dispatch layer, rather
-than constructing SSH launchers in the manager or target router.
-
-- `remote/manager.rs` owns splitting routes at SSH origins, workspace connection pooling,
-  cancellation, and invalidation.
-- `remote/client/` owns shared shim RPC and relayed stream state; `remote/transport.rs` defines
-  the owned asynchronous byte-stream contract.
-- `remote/backends/ssh/` contains OpenSSH configuration/bootstrap, process supervision, askpass,
-  and session-owned authentication. The public `remote::ssh` path remains a compatibility export.
-- `remote/protocol.rs` is the **shim wire protocol**, not the SSH/WinRM transport interface.
+The crate-private `ConnectionFactory` (`remote/backend.rs`) opens an owned `Transport` byte stream
+to a route; the manager performs the shim handshake over it, pools one connection per workspace,
+and test doubles implement the same trait. `remote/protocol.rs` is the shim wire protocol carried over that stream.
 
 SSH configuration is generated only from target definitions. An SSH process runs on root or on
-the shim of the destination's `origin`, whose connection the child stream retains; `via` hops are
-native `ProxyJump` hops of that process and share its origin. Each origin runs its own lazy private
-agent. A backend must release its resources during session shutdown. Cancelling one waiter must not terminate a connection startup shared with
-other callers. Adding another protocol still requires its own target configuration,
-authentication, and bootstrap; the abstraction does not make SSH shell commands or ProxyJump
-semantics universal.
+the shim of the destination's `origin`; `via` hops are native `ProxyJump` hops of that process.
+Cancelling one waiter never terminates a connection startup shared with other callers.
 
 ## Embedded shim builds
 
@@ -40,11 +26,6 @@ no CLI rebuild. Release builds (`just build-release`) include the bytes at compi
 self-contained; the recipe touches the embedding module first because `rust-embed` cannot detect
 newly added files. A missing or empty directory yields an empty catalog, and SSH use then
 reports an explicit missing-shim error.
-
-The runtime catalog is not tied to the build targets: it discovers embedded filenames and selects
-by protocol, platform, and architecture after probing the remote machine. It also understands
-executable extensions, such as `windows-winrm-x86_64.exe`, but no Windows build target or WinRM
-transport is implemented yet.
 
 ## Shim targets and artifacts
 

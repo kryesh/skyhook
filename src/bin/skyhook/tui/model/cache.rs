@@ -1,4 +1,4 @@
-use super::entries::entries_inner;
+use super::entries::entries as history_entries;
 use super::jobs::job_entry;
 use super::live::{response_entries, working_entry};
 use super::requests::{refresh_request_entry, request_running};
@@ -71,22 +71,29 @@ impl ContentCache {
         }
         self.invalid_jobs.clear();
         // Preserve warm layout for journal/output changes that leave ordering
-        // intact, including response snapshot replacements. Reuse equal
-        // allocations and retain layout for unchanged entries.
+        // intact, including response snapshot replacements.
         changes.reset =
             old.is_empty() || old.iter().zip(entries.iter()).any(|(a, b)| a.key != b.key);
         changes.dirty.clear();
         if !changes.reset {
-            let old_len = old.len();
-            for (index, previous) in old.into_iter().enumerate().take(entries.len()) {
-                if previous == entries[index] {
-                    entries[index] = previous;
-                } else {
-                    changes.dirty.push(index);
-                }
-            }
-            changes.dirty.extend(old_len..entries.len());
+            changes.dirty = changed_indices(&old, entries, 0);
         }
+    }
+
+    fn push_live(
+        &mut self,
+        entries: &mut Vec<Entry>,
+        request: u64,
+        content: impl IntoIterator<Item = Entry>,
+    ) {
+        let start = entries.len();
+        entries.extend(content);
+        let count = entries.len() - start;
+        self.live.push(LiveContent {
+            request,
+            start,
+            count,
+        });
     }
 
     pub fn entries(&self) -> &[Entry] {
@@ -163,14 +170,10 @@ impl ContentCache {
         } else {
             None
         };
-        let agent_name = projection
-            .agents
-            .iter()
-            .find(|a| &a.id == agent)
-            .map_or("Agent", |a| a.name.as_str());
+        let agent_name = projection.agent_name(agent);
         if reset {
             self.identity = Some(identity);
-            *entries = entries_inner(snapshot, projection, presentation, outputs, false);
+            *entries = history_entries(snapshot, projection, presentation, outputs, false);
             self.history_len = entries.len();
             self.history_running = entries.iter().any(|entry| entry.running);
             self.live.clear();
@@ -229,15 +232,8 @@ impl ContentCache {
         if reset {
             let responses = super::live::live_tail_responses(snapshot, projection, agent);
             for (request, response) in responses {
-                let start = entries.len();
-                entries.extend(response_entries(
-                    request, response, view, thinking, agent_name,
-                ));
-                self.live.push(LiveContent {
-                    request,
-                    start,
-                    count: entries.len() - start,
-                });
+                let content = response_entries(request, response, view, thinking, agent_name);
+                self.push_live(entries, request, content);
             }
         }
         if !reset && !dirty_responses.is_empty() {
@@ -257,38 +253,17 @@ impl ContentCache {
                 if let Some(response) =
                     super::live::live_tail_response(snapshot, projection, agent, request)
                 {
-                    let start = entries.len();
-                    entries.extend(response_entries(
-                        request, response, view, thinking, agent_name,
-                    ));
-                    self.live.push(LiveContent {
-                        request,
-                        start,
-                        count: entries.len() - start,
-                    });
+                    let content = response_entries(request, response, view, thinking, agent_name);
+                    self.push_live(entries, request, content);
                 }
             }
-            // Keep unchanged live allocations, too. The old working indicator
-            // is regenerated below; entry removal is conveyed by vector length.
-            let reordered = previous
-                .iter()
-                .zip(&entries[self.history_len..])
-                .any(|(old, new)| old.key() != new.key());
-            changes.reset |= reordered;
-            let previous_len = previous.len();
-            for (offset, old) in previous.into_iter().enumerate() {
-                let index = self.history_len + offset;
-                if let Some(entry) = entries.get_mut(index) {
-                    if *entry == old {
-                        *entry = old;
-                    } else {
-                        changes.dirty.push(index);
-                    }
-                }
-            }
-            changes
-                .dirty
-                .extend(self.history_len + previous_len..entries.len());
+            // The old working indicator is regenerated below; entry removal is
+            // conveyed by vector length.
+            let live = &entries[self.history_len..];
+            let mut tail = previous.iter().zip(live);
+            changes.reset |= tail.any(|(old, new)| old.key() != new.key());
+            let dirty = changed_indices(&previous, live, self.history_len);
+            changes.dirty.extend(dirty);
         }
         // The working indicator is a synthetic tail, never part of history.
         let end = self
@@ -320,6 +295,13 @@ impl ContentCache {
         changes.dirty.dedup();
         changes
     }
+}
+
+/// Indices (from `offset`) of entries which differ from, or extend past, `old`.
+fn changed_indices(old: &[Entry], new: &[Entry], offset: usize) -> Vec<usize> {
+    let changed = |index: &usize| old.get(*index) != new.get(*index);
+    let indices = (0..new.len()).filter(changed);
+    indices.map(|index| offset + index).collect()
 }
 
 #[cfg(test)]
@@ -363,7 +345,7 @@ mod tests {
             Vec::new(),
         );
         assert!(
-            cache.entries() == entries_inner(snapshot, projection, presentation, outputs, true)
+            cache.entries() == history_entries(snapshot, projection, presentation, outputs, true)
         );
         changes
     }
@@ -599,7 +581,7 @@ mod tests {
             }
             let mut projection = Projection::default();
             projection.rebuild(&replay);
-            entries_inner(&replay, &projection, presentation, &outputs, true)
+            history_entries(&replay, &projection, presentation, &outputs, true)
         };
         for attempt in 1..=3 {
             let started = SessionEvent::ModelAttemptStarted { request, attempt };

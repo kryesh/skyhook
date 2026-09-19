@@ -58,7 +58,7 @@ impl ToolContext {
 
     /// Attach the invocation authority prepared by the executor.
     #[must_use]
-    pub(super) fn with_invocation_authority(
+    pub(crate) fn with_invocation_authority(
         mut self,
         coordinator: super::authorization::AuthorizationCoordinator,
         tool: String,
@@ -95,18 +95,6 @@ impl ToolContext {
     #[must_use]
     pub fn caller_location(&self) -> &ExecutionLocation {
         &self.caller_location
-    }
-
-    /// Test fixture only: enter the same invocation-construction path as the
-    /// executor without making resume contexts authoritative in production.
-    #[cfg(test)]
-    pub(crate) fn with_test_invocation_authority(
-        self,
-        coordinator: super::authorization::AuthorizationCoordinator,
-        tool: String,
-        arguments: Value,
-    ) -> Self {
-        self.with_invocation_authority(coordinator, tool, arguments)
     }
 
     /// Identity/provenance for legitimate resumed job contexts. This is not
@@ -372,6 +360,14 @@ pub enum ToolError {
 }
 
 impl ToolError {
+    pub(crate) fn invalid(error: impl std::fmt::Display) -> Self {
+        Self::InvalidArguments(error.to_string())
+    }
+
+    pub(crate) fn failed(error: impl std::fmt::Display) -> Self {
+        Self::Failed(error.to_string())
+    }
+
     pub(crate) fn concise_message(&self) -> String {
         match self {
             Self::Failed(message) | Self::FailedWithOutput { message, .. } => message.clone(),

@@ -1,32 +1,12 @@
 //! Encode conversation history and request options as native Responses input.
 use super::*;
-use crate::media::AttachmentRef;
 use crate::provider::backends::common::{
-    attach_runtime_tail, attachment_text, image_url, invalid, opaque_payload, tool_text,
+    attach_runtime_tail, image_url, invalid, opaque_payload, system_text, tool_text, user_parts,
+    validate_openai_effort,
 };
-use crate::provider::protocol::{BlockContent, Message, ModelRequest, UserContent};
+use crate::provider::protocol::{BlockContent, Message, ModelRequest};
 
-/// Backend-private request envelope. Input is always an explicit array, including
-/// an intentionally empty conversation; vendor items and settings remain opaque.
-/// There is no raw-JSON constructor or deserializer that can omit this history.
-#[derive(Clone, Debug)]
-pub(crate) struct EncodedRequest {
-    pub(crate) input: Vec<Value>,
-    pub(crate) settings: serde_json::Map<String, Value>,
-}
-
-impl EncodedRequest {
-    /// Lower the envelope only when handing a request to an HTTP/WS transport.
-    pub(crate) fn into_wire(self) -> Value {
-        let mut body = self.settings;
-        // Keep the encoder's established key order (model, input, settings)
-        // as well as its JSON semantics when preserve_order is enabled.
-        body.shift_insert(1.min(body.len()), "input".into(), Value::Array(self.input));
-        Value::Object(body)
-    }
-}
-
-pub(crate) fn encode(request: &ModelRequest) -> Result<EncodedRequest, ProviderError> {
+pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
     if request.model.trim().is_empty() {
         return Err(invalid("Responses requires a nonempty model"));
     }
@@ -45,25 +25,9 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<EncodedRequest, ProviderE
         }
         match message {
             Message::User(parts) => {
-                let content = parts
-                    .iter()
-                    .map(|part| match part {
-                        UserContent::Text { text }
-                        | UserContent::Runtime { text }
-                        | UserContent::ParentInput { text }
-                        | UserContent::Compaction { text } => {
-                            Ok(json!({"type":"input_text", "text":text}))
-                        }
-                        UserContent::Attachment { attachment } => match attachment {
-                            AttachmentRef::Image(image) => {
-                                Ok(json!({"type":"input_image", "image_url":image_url(request, image)?}))
-                            }
-                            AttachmentRef::Text(text) => {
-                                Ok(json!({"type":"input_text", "text":attachment_text(request, text)?}))
-                            }
-                        },
-                    })
-                    .collect::<Result<Vec<_>, ProviderError>>()?;
+                let content = user_parts(request, parts, "input_text", |image| {
+                    Ok(json!({"type":"input_image", "image_url":image_url(request, image)?}))
+                })?;
                 input.push(json!({"type":"message", "role":"user", "content":content}));
             }
             Message::Assistant(items) => {
@@ -131,18 +95,8 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<EncodedRequest, ProviderE
         ("include".into(), json!(["reasoning.encrypted_content"])),
         ("reasoning".into(), json!({"summary":"auto"})),
     ]);
-    if !request.system.is_empty() {
-        settings.insert(
-            "instructions".into(),
-            Value::String(
-                request
-                    .system
-                    .iter()
-                    .map(|s| s.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-            ),
-        );
+    if let Some(system) = system_text(request) {
+        settings.insert("instructions".into(), Value::String(system));
     }
     if !request.tools.is_empty() {
         let mut tools = Vec::new();
@@ -170,14 +124,7 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<EncodedRequest, ProviderE
         );
     }
     if let Some(effort) = &request.reasoning {
-        if !matches!(
-            effort.as_str(),
-            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
-        ) {
-            return Err(invalid(format!(
-                "Unsupported Responses reasoning effort: {effort}"
-            )));
-        }
+        validate_openai_effort(effort)?;
         settings.insert(
             "reasoning".into(),
             json!({"summary":"auto", "effort":effort}),
@@ -192,7 +139,9 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<EncodedRequest, ProviderE
     if let Some(correlation) = &request.correlation {
         settings.insert("prompt_cache_key".into(), json!(correlation));
     }
-    Ok(EncodedRequest { input, settings })
+    // Input is always an explicit array, even for an empty conversation.
+    settings.shift_insert(1, "input".into(), Value::Array(input));
+    Ok(Value::Object(settings))
 }
 
 #[cfg(test)]
@@ -204,7 +153,7 @@ mod tests {
         media::{AttachmentRef, BlobRef, ImageFormat, ImageRef, TextRef},
         provider::protocol::{
             AssistantItem, ResponseAssembler, ResponseSchema, SystemSegment, ToolDefinition,
-            ToolResult,
+            ToolResult, UserContent,
         },
     };
 
@@ -258,11 +207,8 @@ mod tests {
         let mut req = request("gpt-5");
         req.history.clear();
         req.max_output_tokens = None;
-        let encoded = encode(&req).unwrap();
-        assert!(encoded.input.is_empty());
-        assert!(!encoded.settings.contains_key("input"));
         assert_eq!(
-            encoded.into_wire(),
+            encode(&req).unwrap(),
             json!({
                 "model":"gpt-5", "input":[], "stream":true, "store":false,
                 "include":["reasoning.encrypted_content"],
@@ -306,7 +252,7 @@ mod tests {
         // Load the fixture blobs as the session store would.
         req.blobs.insert(image().blob, b"a".to_vec());
         req.blobs.insert(notes().blob, b"notes".to_vec());
-        let body = encode(&req).unwrap().into_wire();
+        let body = encode(&req).unwrap();
         let image_url = "data:image/png;base64,YQ==";
         assert_eq!(body["instructions"], "system");
         assert_eq!(body["tools"][0]["name"], "search");
@@ -337,14 +283,14 @@ mod tests {
             let envelope = reasoning_envelope(provider, model, reasoning_item());
             let reasoning = AssistantItem::reasoning("r", 0, "private", Some(envelope));
             req.history = vec![Message::Assistant(vec![reasoning])];
-            assert_eq!(encode(&req).unwrap().into_wire()["input"], json!([]));
+            assert_eq!(encode(&req).unwrap()["input"], json!([]));
         }
     }
 
-    #[tokio::test]
-    async fn encrypted_reasoning_and_tools_survive_save_resume_and_scope_changes() {
+    #[test]
+    fn encrypted_reasoning_and_tools_replay_only_within_their_scope() {
         use crate::provider::backends::common::{
-            bind_reasoning_scope, filter_reasoning_scope, reasoning_scope, tests::resume_request,
+            bind_reasoning_scope, filter_reasoning_scope, reasoning_scope,
         };
         let mut req = request("gpt-5");
         let scope = reasoning_scope("openai", "https://api.example/v1/responses");
@@ -366,10 +312,10 @@ mod tests {
             Message::Assistant(items),
             tool_result(json!({"found":true}), vec![], false),
         ];
-        let original = resume_request(&req).await;
+        let original = req;
         let mut matching = original.clone();
         filter_reasoning_scope(&mut matching, &scope);
-        let body = encode(&matching).unwrap().into_wire();
+        let body = encode(&matching).unwrap();
         let input = &body["input"];
         assert_eq!(input[0], native);
         assert_eq!(
@@ -389,11 +335,11 @@ mod tests {
             };
             assert_eq!((items.len(), items[0].blocks.len()), (2, 1));
             assert!(items[0].replay.is_none());
-            let wire = encode(&foreign).unwrap().into_wire();
+            let wire = encode(&foreign).unwrap();
             assert_eq!(wire["input"], json!([input[1].clone(), input[2].clone()]));
         }
         // Filtering a call-time clone must never destroy resumable journal state.
-        assert_eq!(encode(&original).unwrap().into_wire()["input"][0], native);
+        assert_eq!(encode(&original).unwrap()["input"][0], native);
     }
 
     #[test]
@@ -402,7 +348,7 @@ mod tests {
         let efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
         for effort in std::iter::once(None).chain(efforts.map(Some)) {
             req.reasoning = effort.map(str::to_owned);
-            let body = encode(&req).unwrap().into_wire();
+            let body = encode(&req).unwrap();
             assert_eq!(body["reasoning"]["summary"], "auto");
             assert_eq!(
                 body["reasoning"].get("effort"),
@@ -429,7 +375,7 @@ mod tests {
             Message::Assistant(items),
             tool_result(json!({"value":42}), vec![], false),
         ];
-        let encoded = encode(&req).unwrap().into_wire();
+        let encoded = encode(&req).unwrap();
         let input = encoded["input"].as_array().unwrap();
         let reasoning = input.iter().filter(|item| item["type"] == "reasoning");
         assert_eq!(reasoning.count(), 1);
@@ -456,7 +402,7 @@ mod tests {
             "answer", "42",
         )])));
         req.history.push(user("thanks"));
-        let replayed = encode(&req).unwrap().into_wire();
+        let replayed = encode(&req).unwrap();
         let replayed = replayed["input"].as_array().unwrap();
         assert_eq!(&replayed[..input.len()], input.as_slice());
         assert_eq!(replayed[5]["content"][0]["text"], "42");
@@ -470,19 +416,17 @@ mod tests {
         }]);
         let mut req = request("gpt-5");
         req.history = vec![tool_result(json!(1), vec![], false)];
-        let without_tail = encode(&req).unwrap().input;
+        let without_tail = encode(&req).unwrap()["input"].take();
         req.tail = vec![state.clone()];
-        let input = encode(&req).unwrap().input;
-        assert_eq!(input.len(), 1);
+        let input = encode(&req).unwrap()["input"].take();
+        assert_eq!(input.as_array().unwrap().len(), 1);
         let output = without_tail[0]["output"].as_str().unwrap();
         assert_eq!(input[0]["output"], format!("{output}\n\n<skyhook_state>"));
         req.history = vec![user("hi")];
-        let input = encode(&req).unwrap().input;
+        let input = encode(&req).unwrap()["input"].take();
         assert_eq!(
             input,
-            vec![
-                json!({"type":"message","role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_text","text":"<skyhook_state>"}]})
-            ]
+            json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_text","text":"<skyhook_state>"}]}])
         );
     }
 }

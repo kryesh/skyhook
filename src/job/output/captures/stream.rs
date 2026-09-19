@@ -286,10 +286,9 @@ impl Seek for CaptureWriter {
     }
 }
 
-/// Async producers' view of a capture. Writes run in order on the blocking pool,
-/// so they never stall a runtime thread behind a ledger commit. An operation whose
-/// caller is dropped still completes before the next one starts, so accepted bytes
-/// are neither lost nor duplicated. Dropping the owner discards uncommitted text captures.
+/// Async producers' view of a capture. Writes run in order on the blocking pool;
+/// one whose caller is dropped still completes before the next starts, so accepted
+/// bytes are neither lost nor duplicated.
 pub(crate) struct AsyncCapture {
     writer: Arc<Mutex<CaptureWriter>>,
     pending: Option<tokio::task::JoinHandle<()>>,
@@ -348,14 +347,12 @@ impl JobManager {
         remove_on_abandon: bool,
     ) -> Result<PendingCapture, ToolError> {
         let output = self.output(job);
-        tokio::task::spawn_blocking(move || {
+        crate::job::output::blocking(move || {
             let mut pending = PendingCapture::create(&output, &field, kind)?;
             pending.writer.remove_on_abandon = remove_on_abandon;
             Ok(pending)
         })
         .await
-        .map_err(|error| ToolError::Failed(error.to_string()))?
-        .map_err(io::Error::into)
     }
 }
 

@@ -153,7 +153,7 @@ impl SseParser {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{ObservedServer, ResponsePlan, short_timeouts};
+    use super::super::tests::{Plan, Server, timeouts};
     use super::super::{client, post_sse_with_timeouts};
     use super::*;
     use crate::provider::ProviderErrorKind;
@@ -198,16 +198,16 @@ mod tests {
             let wire = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 999\r\n\r\n{body}"
             );
-            let mut plan = ResponsePlan::reply(wire);
+            let mut plan = Plan::reply(wire);
             plan.stall_body = stall_body;
-            let mut server = ObservedServer::start(vec![plan]).await;
+            let mut server = Server::start(vec![plan]).await;
             let client = client().unwrap();
             let post = post_sse_with_timeouts(
                 &client,
                 &server.url,
                 HeaderMap::new(),
                 &Value::Null,
-                short_timeouts(),
+                timeouts(100, 100),
             );
             let mut stream = post.await.unwrap();
             if partial_output {
@@ -219,7 +219,7 @@ mod tests {
             }
             assert!(stream.next().await.is_none());
             server.request().await;
-            server.no_more_requests().await;
+            assert!(server.finish().await.is_empty(), "unexpected replay");
         }
     }
 }

@@ -1,4 +1,4 @@
-//! Native OpenAI Responses wire codec, shared by HTTP/SSE and Codex WebSocket.
+//! Native OpenAI Responses wire codec, shared with Codex.
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
@@ -22,7 +22,7 @@ mod reasoning;
 mod terminal;
 
 use decoder::api_error;
-pub(crate) use encoder::{EncodedRequest, encode};
+pub(crate) use encoder::encode;
 use native::{arguments, array, final_parts, index, kind, protocol, string};
 use reasoning::{readable_reasoning, reasoning_parts, reasoning_position, reasoning_text};
 

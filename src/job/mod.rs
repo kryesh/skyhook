@@ -52,9 +52,8 @@ pub use supervisor::JobLease;
 
 const JOB_INPUT_CAPACITY: usize = 32;
 
-/// Orders what becomes pending for delivery. Taken under the jobs lock at each
-/// transition, so a wait floor snapshotted under that lock covers exactly what was
-/// visible to the wait, whatever order the wake forwarding later catches up in.
+/// Orders what becomes pending for delivery. Taken under the jobs lock, so a wait
+/// floor snapshotted under that lock covers exactly what the wait could see.
 static PENDING_STAMP: AtomicU64 = AtomicU64::new(0);
 
 fn next_pending_stamp() -> u64 {
@@ -204,8 +203,7 @@ struct JobEntry {
     messages: Vec<AgentMessage>,
     last_agent_message: Option<u64>,
     /// Pending stamp and input revision a `wait` hosted by this script last
-    /// reported. A script never reaches the request boundary that consumes a model
-    /// caller's events, so this is what keeps it from being told twice.
+    /// reported, so the script is not told twice.
     wait_floor: Option<(u64, u64)>,
     /// When the current delivery last became pending.
     delivery_stamp: u64,
@@ -261,8 +259,7 @@ impl JobEntry {
         )
     }
 
-    /// Clear the previous invocation's in-memory projection. Its saved output stays in
-    /// the database under the earlier generation; replay never rewrites it.
+    /// Clear the previous invocation's in-memory projection; saved output is untouched.
     fn clear_invocation_output(&mut self) {
         self.output = None;
         self.images.clear();
@@ -270,10 +267,8 @@ impl JobEntry {
         self.denial = None;
     }
 
-    /// Install all reported-outcome metadata together. Live callers establish
-    /// transition validity before publication; replay preserves permissive
-    /// historical state/error/denial combinations rather than tightening them.
-    /// Saved result values and captures stay in the database, not in JobEntry.
+    /// Install all reported-outcome metadata together; callers establish
+    /// transition validity. Saved results and captures stay in the database.
     fn apply_finished(
         &mut self,
         state: JobState,
@@ -286,8 +281,7 @@ impl JobEntry {
         self.images = images;
         self.error = error;
         self.denial = denial;
-        // A reported outcome is a new delivery even after an earlier question
-        // was claimed/injected. Only explicit cancellation retires resumption.
+        // A new delivery even after an earlier question was acknowledged.
         self.pend_delivery();
         if state == JobState::Cancelled {
             self.resume = None;
@@ -362,19 +356,6 @@ enum WaitMode {
         claim: bool,
     },
     Terminal,
-}
-
-impl DeliveryState {
-    fn event(self, job: JobId) -> SessionEvent {
-        match self {
-            Self::Claimed => SessionEvent::JobClaimed { job },
-            Self::Injected => SessionEvent::JobInjected {
-                job,
-                notification: None,
-            },
-            Self::Pending => unreachable!("pending delivery has no event"),
-        }
-    }
 }
 
 struct JobManagerInner {
@@ -514,6 +495,15 @@ mod tests {
         (runtime.root, runtime.jobs, runtime.agent)
     }
 
+    /// A parent notification presenting `items`.
+    pub(super) fn job_events(items: impl Serialize) -> Message {
+        let items = serde_json::to_string(&items).unwrap();
+        let text = format!("<skyhook_job_events>\n{items}\n</skyhook_job_events>");
+        Message::User(vec![crate::provider::protocol::UserContent::Runtime {
+            text,
+        }])
+    }
+
     /// Poll until a published job settles into a terminal state.
     pub(super) async fn terminal(jobs: &JobManager, id: JobId) -> JobEnvelope {
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -529,8 +519,7 @@ mod tests {
         .expect("creation owner must settle its published job")
     }
 
-    // Small fixture operations keep tests focused on the delivery/state boundary
-    // under test. Error-path calls deliberately bypass these success-only helpers.
+    // Success-only fixture operations.
     impl JobManager {
         pub(super) async fn test_lease(&self, spec: JobSpec) -> JobLease {
             self.create(spec).await.unwrap().into_test_fixture()

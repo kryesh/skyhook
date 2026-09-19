@@ -102,8 +102,7 @@ protocol errors remain terminal. Upstream error details are sanitized before jou
 
 A valid server `Retry-After` hint—delay-seconds or an HTTP-date—sets the delay,
 even when it exceeds 30 seconds. Past dates mean no delay; malformed or ambiguous
-headers fall back to the runtime policy. HTTP throttling during a WebSocket handshake
-also honors this delay instead of immediately switching to HTTP.
+headers fall back to the runtime policy.
 Without a valid hint, delays grow exponentially: **1s, 2s, 4s, 8s, 16s, 30s**, then
 remain at 30s. This backoff counts only transient failures of the frozen request;
 rebuilding a request after compaction or validation starts the fallback at 1s again.
@@ -126,10 +125,8 @@ succeed or are cancelled. Invalid summary/checkpoint retries rebuild against cur
 runtime state and remain bounded independently.
 
 HTTP transports perform one attempt per runtime invocation, with fresh startup and
-read-idle deadlines. There is no additional provider-specific HTTP retry loop. Codex
-WebSocket handshake fallback remains transport negotiation, not another retry budget.
-Recovery clears failed connection and continuation state so the next attempt sends
-full history rather than continuing the interrupted response.
+read-idle deadlines. There is no additional provider-specific HTTP retry loop. Every
+attempt sends full history.
 
 This prevents duplicate **Skyhook tool execution**, not duplicate provider inference: the
 provider may have processed the interrupted request, and additional usage may be incurred.
@@ -211,8 +208,7 @@ The server may continue work if it does not honor disconnects.
 
 After successful HTTP headers are accepted, transport/read-idle failures remain transient and
 may retry the frozen request, discarding failed partial output. Malformed SSE/protocol responses
-are permanent; context overflow follows the separate bounded compaction path. Codex uses the
-same attempt count and eligibility, while preserving its WebSocket handshake fallback.
+are permanent; context overflow follows the separate bounded compaction path.
 Aborted or truncated tool generation never makes incomplete arguments executable.
 
 ## Migrating older configurations

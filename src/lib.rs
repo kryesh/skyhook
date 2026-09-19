@@ -82,10 +82,23 @@ mod tests {
 
     impl TestRuntime {
         pub async fn new() -> Self {
+            Self::with_durability(false).await
+        }
+
+        /// Journals under `root/sessions`, for tests that reopen the session.
+        pub async fn on_disk() -> Self {
+            Self::with_durability(true).await
+        }
+
+        async fn with_durability(durable: bool) -> Self {
             let root = tempfile::tempdir().unwrap();
-            let store = SessionStore::create(&root.path().join("sessions"))
-                .await
-                .unwrap();
+            let sessions = root.path().join("sessions");
+            let store = if durable {
+                SessionStore::create(&sessions).await
+            } else {
+                SessionStore::create_ephemeral(&sessions).await
+            }
+            .unwrap();
             Self {
                 agent: crate::session::fixture::started(&store, root.path()).await,
                 jobs: JobManager::new(store.clone()),

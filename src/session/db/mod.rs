@@ -22,7 +22,7 @@ pub use state::SessionSummary;
 pub(super) use state::{interrupted_work, summary};
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 4;
+pub(super) const USER_VERSION: i64 = 5;
 const SCHEMA: &str = include_str!("../schema.sql");
 /// Payload tables outside the append-only ledger: blob writes, output upserts and pruning.
 const MUTABLE_TABLES: [&str; 6] = [
@@ -316,12 +316,12 @@ mod tests {
     use super::{Db, Encoder, OpenMode, decode_records};
     use crate::{
         execution::ExecutionLocation,
-        identity::{AgentId, EventId, JobId, QueueAttemptId, SessionId},
+        identity::{AgentId, EventId, JobId, SessionId},
         job::{JobRole, JobState},
         media::{AttachmentRef, BlobRef, ImageFormat, ImageRef},
         provider::protocol::{AssistantItem, Message, ToolCall, ToolResult, UserContent},
         session::{
-            EventRecord, ModelCallOrigin, QueueIntent, QueueSettlement, SessionEvent,
+            EventRecord, ModelCallOrigin, SessionEvent,
             fixture::{child_started, start_events},
         },
     };
@@ -361,15 +361,14 @@ mod tests {
         /// Commit events as one transaction; returns their sequences.
         pub(super) fn commit(
             &mut self,
-            events: Vec<(AgentId, Option<QueueAttemptId>, SessionEvent)>,
+            events: Vec<(AgentId, SessionEvent)>,
         ) -> Result<Vec<u64>, super::DbError> {
             let first = self.records.len() as u64 + 1;
             let records: Vec<_> = events
                 .into_iter()
                 .enumerate()
-                .map(|(offset, (agent, attempt, event))| EventRecord {
+                .map(|(offset, (agent, event))| EventRecord {
                     id: EventId::generate().unwrap(),
-                    queue_attempt: attempt.or(event.queue_attempt()),
                     sequence: first + offset as u64,
                     timestamp_millis: 1_700_000_000_000 + offset as i64,
                     agent,
@@ -397,21 +396,18 @@ mod tests {
         pub(super) fn start(&mut self, workspace: &str) -> AgentId {
             let root = self.root();
             let events = start_events(&root, std::path::Path::new(workspace));
-            let events = events
-                .into_iter()
-                .map(|(agent, event)| (agent, None, event));
-            self.commit(events.collect()).unwrap();
+            self.commit(events).unwrap();
             root
         }
 
         pub(super) fn one(&mut self, agent: AgentId, event: SessionEvent) -> u64 {
-            self.commit(vec![(agent, None, event)]).unwrap()[0]
+            self.commit(vec![(agent, event)]).unwrap()[0]
         }
 
         fn reject(&mut self, agent: AgentId, event: SessionEvent) {
             let before = self.records.len();
             assert!(
-                self.commit(vec![(agent, None, event.clone())]).is_err(),
+                self.commit(vec![(agent, event.clone())]).is_err(),
                 "accepted {event:?}"
             );
             assert_eq!(self.records.len(), before);
@@ -534,49 +530,15 @@ mod tests {
                 }]),
             },
         );
-        // Queue settlement must match the bound commit.
-        let attempt = QueueAttemptId::from_bytes([1; 16]);
-        one!(SessionEvent::QueueIntent {
-            intent: QueueIntent {
-                attempt,
-                content: vec![UserContent::Text {
-                    text: "draft".into(),
-                }],
-                model: None,
-            },
-        });
-        fixture.reject(
-            root.clone(),
-            SessionEvent::QueueSettlement {
-                attempt,
-                settlement: QueueSettlement::Committed {
-                    event: EventId::from_bytes([2; 16]),
-                },
-            },
-        );
-        fixture.reject(root.clone(), SessionEvent::QueueAcknowledged { attempt });
-        one!(SessionEvent::QueueSettlement {
-            attempt,
-            settlement: QueueSettlement::NotCommitted,
-        });
-        let late = fixture.commit(vec![(
-            root.clone(),
-            Some(attempt),
-            SessionEvent::MessageCommitted {
-                message: user("draft"),
-            },
-        )]);
-        assert!(late.is_err());
         // A failed batch leaves nothing behind, including rows of its valid events.
         let batch = fixture.commit(vec![
             (
                 root.clone(),
-                None,
                 SessionEvent::Status {
                     message: "kept?".into(),
                 },
             ),
-            (root.clone(), None, finished(JobState::Completed)),
+            (root.clone(), finished(JobState::Completed)),
         ]);
         assert!(batch.is_err());
         fixture.assert_round_trip();

@@ -35,33 +35,22 @@ impl SessionRuntime {
                 .summarize_attempt(turn, provider, request.clone(), request_sequence)
                 .await
             {
+                // The summary request stays frozen too, and transient failures do not
+                // consume the separate validation budget in `compact_history`.
                 Err(HarnessError::Provider(error)) => {
-                    self.record_model_failure(
-                        turn.agent,
-                        request_sequence,
-                        *model_attempt,
-                        Usage::default(),
-                        error.to_string(),
-                    )
-                    .await?;
-                    if error.recovery().is_none() {
+                    let attempt = (*model_attempt, &mut transient_attempt);
+                    let recovered = self
+                        .recover_model_failure(
+                            turn,
+                            request_sequence,
+                            attempt,
+                            Usage::default(),
+                            error,
+                        )
+                        .await?;
+                    if let Some(error) = recovered {
                         return Err(error.into());
                     }
-                    // Keep the summary request frozen too. Failed partial summaries
-                    // never become a checkpoint. Transient failures do not consume
-                    // the separate validation budget in compact_history.
-                    transient_attempt = transient_attempt.saturating_add(1);
-                    self.schedule_model_recovery(
-                        turn,
-                        request_sequence,
-                        super::super::recovery::RecoveryAttempt {
-                            model: *model_attempt,
-                            transient: transient_attempt,
-                        },
-                        &error,
-                        provider,
-                    )
-                    .await?;
                 }
                 result => return result,
             }
@@ -144,31 +133,30 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test(start_paused = true)]
-    async fn summarizer_retries_frozen_requests_past_u8_limit_until_success() {
+    async fn summarizer_retries_frozen_requests_until_success() {
         for streaming in [false, true] {
-            for failures in [4, 260] {
-                let fixture = Fixture::new().await;
-                fixture.add_history(20_000).await;
-                let before = fixture.provider.requests.lock().unwrap().len();
-                let counter = if streaming {
-                    &fixture.provider.summary_stream_failures
-                } else {
-                    &fixture.provider.summary_immediate_failures
-                };
-                counter.store(failures, Ordering::SeqCst);
-                fixture.compact(&CancellationToken::new()).await.unwrap();
-                let requests = fixture.provider.requests.lock().unwrap().clone();
-                let summaries = &requests[before..];
-                assert_eq!(summaries.len(), failures + 1);
-                assert!(summaries.windows(2).all(|pair| pair[0] == pair[1]));
-                assert_eq!(counter.load(Ordering::SeqCst), 0);
-                let records = fixture.records().await;
-                assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 1);
-                let retries = count!(&records, SessionEvent::ModelRecoveryScheduled { .. });
-                assert_eq!(retries, failures);
-                fixture.assert_no_tool_execution().await;
-                fixture.session.shutdown().await.unwrap();
-            }
+            let failures = 4;
+            let fixture = Fixture::new().await;
+            fixture.add_history(20_000).await;
+            let before = fixture.provider.requests.lock().unwrap().len();
+            let counter = if streaming {
+                &fixture.provider.summary_stream_failures
+            } else {
+                &fixture.provider.summary_immediate_failures
+            };
+            counter.store(failures, Ordering::SeqCst);
+            fixture.compact(&CancellationToken::new()).await.unwrap();
+            let requests = fixture.provider.requests.lock().unwrap().clone();
+            let summaries = &requests[before..];
+            assert_eq!(summaries.len(), failures + 1);
+            assert!(summaries.windows(2).all(|pair| pair[0] == pair[1]));
+            assert_eq!(counter.load(Ordering::SeqCst), 0);
+            let records = fixture.records().await;
+            assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 1);
+            let retries = count!(&records, SessionEvent::ModelRecoveryScheduled { .. });
+            assert_eq!(retries, failures);
+            fixture.assert_no_tool_execution().await;
+            fixture.session.shutdown().await.unwrap();
         }
     }
 
@@ -223,11 +211,11 @@ mod tests {
         let root = &fixture.session.root;
         let before = crate::session::project_history(&fixture.records().await, root).unwrap();
         let cancellation = CancellationToken::new();
-        let mut events = fixture.session.subscribe();
+        let mut events = fixture.session.runtime.events.observe().updates;
         let (result, ()) = tokio::time::timeout(Duration::from_secs(60), async {
             tokio::join!(fixture.compact(&cancellation), async {
                 for _ in 0..4 {
-                    while !matches!(events.recv().await.unwrap(),
+                    while !matches!(events.recv().await.unwrap().event,
                         crate::agent::runtime::RuntimeEvent::Record(record)
                             if matches!(record.event, SessionEvent::ModelRecoveryScheduled { .. }))
                     {

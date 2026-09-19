@@ -196,16 +196,4 @@ impl TodoStore {
                 .map_or_else(Vec::new, |state| state.items.clone()),
         })
     }
-
-    pub async fn snapshots(&self) -> Vec<TodoSnapshot> {
-        self.agents
-            .lock()
-            .await
-            .iter()
-            .map(|(agent, state)| TodoSnapshot {
-                agent: agent.clone(),
-                items: state.items.clone(),
-            })
-            .collect()
-    }
 }

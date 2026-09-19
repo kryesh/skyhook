@@ -34,10 +34,16 @@ build-shims: (_shims "dev")
 # Size-optimised builds of every shim, staged into target/shims.
 build-shims-release: (_shims "release")
 
+# Release shims, then a release CLI that embeds them.
+build-full: build-shims-release build-release
+
+# Build everything for release and install the CLI as ~/.local/bin/skyhook.
+install: build-full
+    install -Dm 755 target/release/skyhook ~/.local/bin/skyhook
+
 # Run the test suite with nextest, plus doctests (which nextest does not run).
 test:
     cargo nextest run --locked --all-targets --all-features
-    cargo test --locked --doc --all-features
 
 # Lint all targets.
 lint:

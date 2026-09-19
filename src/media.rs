@@ -44,21 +44,12 @@ impl FromStr for BlobDigest {
     type Err = MediaError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.len() != 64 {
+        if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
             return Err(MediaError::InvalidDigest);
         }
-        let mut digest = [0; 32];
-        fn nibble(value: u8) -> Result<u8, MediaError> {
-            match value {
-                b'0'..=b'9' => Ok(value - b'0'),
-                b'a'..=b'f' => Ok(value - b'a' + 10),
-                _ => Err(MediaError::InvalidDigest),
-            }
-        }
-        for (slot, pair) in digest.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
-            *slot = (nibble(pair[0])? << 4) | nibble(pair[1])?;
-        }
-        Ok(Self(digest))
+        crate::identity::decode_hex(value)
+            .map(Self)
+            .ok_or(MediaError::InvalidDigest)
     }
 }
 
@@ -77,10 +68,7 @@ impl From<BlobDigest> for String {
 
 impl fmt::Display for BlobDigest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
+        crate::identity::write_hex(&self.0, formatter)
     }
 }
 
