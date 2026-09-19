@@ -89,7 +89,7 @@ pub async fn run(
         None => None,
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut app = App::new(observation, launch, saved.model, tx.clone());
+    let mut app = App::new(observation, launch, saved, tx.clone());
     if let Some(warning) = warning {
         app.notice(warning);
     }

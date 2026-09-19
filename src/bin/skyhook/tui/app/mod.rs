@@ -110,6 +110,7 @@ pub struct App {
     /// UI-only choice, captured by each submitted user message.
     pub model: String,
     remembered_model: Option<String>,
+    pub sidebar: bool,
     pub snapshot: ObservationSnapshot,
     pub projection: Projection,
     pub selected: AgentId,
@@ -219,7 +220,7 @@ impl App {
     pub fn new(
         observation: Option<PreparedObservation>,
         launch: Launch,
-        remembered_model: Option<String>,
+        saved: state::SavedState,
         tx: mpsc::UnboundedSender<Work>,
     ) -> Self {
         let selected = observation
@@ -228,7 +229,8 @@ impl App {
             .unwrap_or_else(draft_root);
         let mut app = Self {
             model: launch.model.name().to_owned(),
-            remembered_model,
+            remembered_model: saved.model,
+            sidebar: saved.sidebar,
             observation: None,
             launch,
             snapshot: ObservationSnapshot::default(),
@@ -326,7 +328,7 @@ pub(super) mod tests {
             approve_all: false,
         };
         let (tx, _) = mpsc::unbounded_channel();
-        let mut app = App::new(None, launch, None, tx);
+        let mut app = App::new(None, launch, Default::default(), tx);
         // Unit fixtures must not change the user's global model preference.
         app.remembered_model = Some("first".into());
         (root, app)
@@ -568,7 +570,12 @@ pub(super) mod tests {
         let id = session.id();
         let (tx, _) = mpsc::unbounded_channel();
         let observation = PreparedObservation::subscribe(session.clone()).await;
-        let mut initial = App::new(Some(observation), draft.launch.clone(), None, tx);
+        let mut initial = App::new(
+            Some(observation),
+            draft.launch.clone(),
+            Default::default(),
+            tx,
+        );
         assert_startup_warnings_ui_only(&mut initial).await;
         draft.session_started(PreparedObservation::subscribe(session.clone()).await);
         assert_startup_warnings_ui_only(&mut draft).await;

@@ -50,6 +50,17 @@ pub struct DiscoveredTool {
     pub(crate) capabilities: Vec<Capability>,
 }
 
+/// Startup outcome of one configured server, frozen with the catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpServerStatus {
+    Connected {
+        tools: usize,
+    },
+    Failed(String),
+    /// Never started: excluded by capability policy, or startup was cancelled.
+    Skipped,
+}
+
 // rmcp request handles do not cancel on drop. Keep ownership until a response
 // arrives, so aborting the caller's future also sends bounded best-effort cancel.
 struct CancelOnDrop(Option<RequestHandle<RoleClient>>);
@@ -73,6 +84,7 @@ pub struct McpManager {
     catalog: Vec<DiscoveredTool>,
     warnings: Vec<String>,
     servers: BTreeMap<String, Server>,
+    statuses: BTreeMap<String, McpServerStatus>,
     closed: CancellationToken,
 }
 
@@ -89,6 +101,10 @@ impl McpManager {
             catalog: Vec::new(),
             warnings: Vec::new(),
             servers: BTreeMap::new(),
+            statuses: configs
+                .keys()
+                .map(|name| (name.clone(), McpServerStatus::Skipped))
+                .collect(),
             closed: CancellationToken::new(),
         };
         // Own entries before creating futures: no borrowed iterator/closure
@@ -121,6 +137,8 @@ impl McpManager {
             };
             match result {
                 Ok((tools, server)) => {
+                    let status = McpServerStatus::Connected { tools: tools.len() };
+                    manager.statuses.insert(name.clone(), status);
                     manager
                         .catalog
                         .extend(tools.into_iter().map(|tool| DiscoveredTool {
@@ -130,9 +148,14 @@ impl McpManager {
                         }));
                     manager.servers.insert(name, server);
                 }
-                Err(error) => manager
-                    .warnings
-                    .push(format!("MCP server {name:?} unavailable: {error}")),
+                Err(error) => {
+                    manager
+                        .warnings
+                        .push(format!("MCP server {name:?} unavailable: {error}"));
+                    manager
+                        .statuses
+                        .insert(name, McpServerStatus::Failed(error.to_string()));
+                }
             }
         }
         manager
@@ -149,6 +172,10 @@ impl McpManager {
     }
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+    /// Every configured server, including those that failed or were skipped.
+    pub fn servers(&self) -> &BTreeMap<String, McpServerStatus> {
+        &self.statuses
     }
 
     /// Send exactly one request. Cancellation and timeout report an uncertain
@@ -502,6 +529,12 @@ for line in sys.stdin:
             assert!(manager.catalog().is_empty());
             // Missing header resolution or command startup would produce a warning.
             assert!(manager.warnings().is_empty(), "{:?}", manager.warnings());
+            assert!(
+                manager
+                    .servers()
+                    .values()
+                    .eq([&McpServerStatus::Skipped; 2])
+            );
             assert!(!fixture.directory.path().join("pid").exists());
             let accepted = listener.accept().unwrap_err();
             assert_eq!(accepted.kind(), std::io::ErrorKind::WouldBlock);
@@ -681,6 +714,9 @@ for line in sys.stdin:
             warnings.iter().any(|warning| warning.contains("broken")),
             "{warnings:?}"
         );
+        let servers = manager.servers();
+        assert!(matches!(servers["broken"], McpServerStatus::Failed(_)));
+        assert_eq!(servers["fixture"], McpServerStatus::Connected { tools: 4 });
         shutdown(&manager).await;
     }
 

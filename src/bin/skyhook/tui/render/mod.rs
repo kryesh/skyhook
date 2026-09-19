@@ -10,6 +10,7 @@ mod painting;
 mod panels;
 mod rows;
 mod selection;
+mod sidebar;
 mod stream;
 mod wrapping;
 
@@ -27,6 +28,7 @@ use menu::*;
 use painting::*;
 use panels::*;
 use selection::*;
+use sidebar::*;
 use wrapping::*;
 
 use super::{

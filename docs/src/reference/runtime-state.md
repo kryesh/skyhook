@@ -44,8 +44,8 @@ return tool.todo({items: [
 ```
 
 Lists persist with the session, including completed and interrupted child lists. Resume preserves
-recorded statuses. Host interfaces can read all current lists through `SessionHandle::todos()`
-and observe `SessionEvent::TodosReplaced` through the existing runtime event subscription.
+recorded statuses. Host interfaces observe `SessionEvent::TodosReplaced` through the existing
+runtime event subscription.
 The public `TodoItem`, `TodoStatus`, and `TodoSnapshot` types live in `skyhook::agent`.
 
 ## Per-request state snapshot

@@ -64,7 +64,8 @@ commands and endpoints remain trusted host configuration.
 Skyhook imports **tools only**, not MCP prompts or resources. At startup it initializes each server
 and discovers its tools, then freezes that catalog for the session lifetime; later catalog-change
 notifications do not add or replace tools. A server that fails startup/discovery is warned about and
-skipped rather than preventing the rest of the harness from starting.
+skipped rather than preventing the rest of the harness from starting. The terminal
+interface's sidebar shows each server's startup status.
 
 Imported tools are exposed both as ordinary model tools and through lazy `tool` builders inside
 `script`, using the registered tool name shown in the catalog. Native MCP argument schemas are

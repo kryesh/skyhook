@@ -4,10 +4,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(default)]
 pub struct SavedState {
     pub model: Option<String>,
+    pub sidebar: bool,
+}
+impl Default for SavedState {
+    fn default() -> Self {
+        Self {
+            model: None,
+            sidebar: true,
+        }
+    }
 }
 /// UI state lives with the workspace's sessions.
 pub fn state_path(workspace: &Path) -> PathBuf {
@@ -40,10 +49,15 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     temp.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
-pub fn remember(workspace: &Path, model: &str) -> std::io::Result<()> {
-    let state = SavedState {
-        model: Some(model.into()),
-    };
+/// Change saved settings without disturbing the others.
+pub fn update(workspace: &Path, change: impl FnOnce(&mut SavedState)) -> std::io::Result<()> {
+    // Concurrent savers must not overwrite each other's setting.
+    static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _saving = SAVING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (mut state, _) = load(workspace);
+    change(&mut state);
     atomic_write(&state_path(workspace), &serde_json::to_vec(&state)?)
 }
 
@@ -58,5 +72,20 @@ mod tests {
         std::fs::write(&blocker, b"preserved").unwrap();
         assert!(atomic_write(&blocker.join("state.json"), b"replacement").is_err());
         assert_eq!(std::fs::read(blocker).unwrap(), b"preserved");
+    }
+
+    #[test]
+    fn updates_keep_other_settings_and_the_sidebar_defaults_on() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(load(root.path()).0.sidebar);
+        update(root.path(), |state| state.model = Some("m".into())).unwrap();
+        update(root.path(), |state| state.sidebar = false).unwrap();
+        let (state, warning) = load(root.path());
+        assert_eq!(
+            (state.model.as_deref(), state.sidebar, warning),
+            (Some("m"), false, None)
+        );
+        std::fs::write(state_path(root.path()), br#"{"model":"m"}"#).unwrap();
+        assert!(load(root.path()).0.sidebar);
     }
 }

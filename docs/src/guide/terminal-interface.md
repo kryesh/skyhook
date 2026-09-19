@@ -93,9 +93,15 @@ shows the choice for the next message; reply footers identify the model that act
 Resumed sessions retain their last applied model. `/models` remains an alias for `/model`.
 Restore a missing recorded model profile before resuming rather than substituting another model.
 
-The interface stores the last submitted model in the workspace's `.skyhook/state.json`, beside its
-sessions. Writes are atomic and do not rewrite the model configuration.
+The interface stores the last submitted model and the sidebar setting in the workspace's
+`.skyhook/state.json`, beside its sessions. Writes are atomic and do not rewrite the model
+configuration.
 Session titles are recorded in each session's database alongside its history.
+
+A sidebar beside the conversation lists each configured MCP server with its startup status and the
+viewed agent's todos. It is shown by default; `Ctrl+X B` or `/sidebar` toggles it. Terminals
+narrower than 100 columns, or having no servers and no todos to list, hide it without changing the
+saved setting.
 
 The bottom bar uses this format:
 
@@ -121,6 +127,7 @@ The command palette and `/help` also list these shortcuts. `Ctrl+X` is a leader:
 | `Ctrl+X I`, `/queue` | Edit queued follow-ups |
 | `Ctrl+X T`, `/details` | Toggle tool details |
 | `Ctrl+X F`, `@` | Attach a workspace file |
+| `Ctrl+X B`, `/sidebar` | Toggle the sidebar |
 | `Ctrl+X R`, `/attention` | Reopen pending questions and permissions |
 | `/requests`, `/jobs` | Requests, jobs |
 | `Ctrl+X ↑`, `Ctrl+X ↓` | Parent, first child |

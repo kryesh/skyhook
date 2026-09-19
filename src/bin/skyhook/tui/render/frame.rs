@@ -123,7 +123,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let tree_y = composer_y.saturating_sub(tree_height);
     app.composer_rect = r(0, composer_y, width, composer_height);
     app.tree_rect = r(0, tree_y, width, tree_height);
-    app.content_rect = r(0, 2, width, tree_y.saturating_sub(2 + notice_height));
+    let content_width = width - sidebar_width(app, width);
+    app.content_rect = r(
+        0,
+        2,
+        content_width,
+        tree_y.saturating_sub(2 + notice_height),
+    );
+    if content_width < width {
+        let rect = r(
+            content_width,
+            2,
+            width - content_width,
+            app.content_rect.height,
+        );
+        draw_sidebar(frame, app, rect, p);
+    }
     fill(frame, r(0, 0, width, 2), p.panel);
     let workspace = app.launch.workspace.display().to_string();
     let workspace = clipped_header(&workspace, width.saturating_sub(4));
@@ -163,12 +178,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.hits.push((rect, Hit::Tab(value)));
         x += n + 1;
     }
-    prepare_rows(app, width, p);
+    prepare_rows(app, content_width, p);
     if tab == Tab::Requests
         && app.content_rect.height > 1
         && let Some(entry) = app.entries().iter().find(|entry| entry.request().is_some())
     {
-        let geometry = EntryGeometry::new(entry, width, 0);
+        let geometry = EntryGeometry::new(entry, content_width, 0);
         if let Some(header) = app.render.request_columns.header(geometry.body_width, p) {
             text(
                 frame,
@@ -198,7 +213,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.entries().is_empty() {
         text(
             frame,
-            r(3, 4, width.saturating_sub(6), 1),
+            r(3, 4, content_width.saturating_sub(6), 1),
             "Start a conversation, or /sessions to resume one.",
             p.muted,
             p.base,
@@ -278,8 +293,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 };
                 let start = row.paragraph_x() as usize + column;
                 let end = start + grapheme.width();
-                let source_end = row.layout.code().map_or(width as usize, |code| {
-                    (row.paragraph_x() as usize + code.body_end()).min(width as usize)
+                let source_end = row.layout.code().map_or(content_width as usize, |code| {
+                    (row.paragraph_x() as usize + code.body_end()).min(content_width as usize)
                 });
                 if start >= source_end {
                     break;
@@ -339,14 +354,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let thumb = app.content_rect.y
             + ((scroll as u64 * app.content_rect.height.saturating_sub(1) as u64)
                 / max.max(1) as u64) as u16;
-        text(frame, r(width - 1, thumb, 1, 1), "▐", p.muted, p.base);
+        text(
+            frame,
+            r(content_width - 1, thumb, 1, 1),
+            "▐",
+            p.muted,
+            p.base,
+        );
         if app
             .views
             .get(&app.selected)
             .is_some_and(|v| v.scroll.is_some())
         {
             let rect = r(
-                width.saturating_sub(18),
+                content_width.saturating_sub(18),
                 app.content_rect.bottom().saturating_sub(1),
                 17,
                 1,
@@ -364,7 +385,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(search) = &app.search_editor {
         text(
             frame,
-            r(2, app.content_rect.y, width.saturating_sub(4), 1),
+            r(2, app.content_rect.y, content_width.saturating_sub(4), 1),
             format!("Find: {}▏", search.text()),
             p.fg,
             p.input,
@@ -577,6 +598,78 @@ mod tests {
         let message = Message::Assistant(vec![AssistantItem::text("frame-test", 0, text)]);
         push_record(app, SessionEvent::MessageCommitted { message });
         app.refresh();
+    }
+
+    #[tokio::test]
+    async fn sidebar_narrows_only_the_transcript_and_persists_its_toggle() {
+        use skyhook::agent::{TodoItem, TodoStatus};
+        let (root, mut app) = fixture().await;
+        let text = "right-aligned user text ".repeat(12);
+        let message = Message::User(vec![skyhook::provider::protocol::UserContent::Text {
+            text,
+        }]);
+        push_record(&mut app, SessionEvent::MessageCommitted { message });
+        let items = [
+            ("parse", TodoStatus::Completed),
+            (
+                "render the wrapped todo text wholeword",
+                TodoStatus::InProgress,
+            ),
+        ];
+        let items = items.map(|(text, status)| TodoItem {
+            text: text.into(),
+            status,
+        });
+        push_record(
+            &mut app,
+            SessionEvent::TodosReplaced {
+                items: items.into(),
+            },
+        );
+        let screen = |app: &mut App, width| {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows = (0..24).map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect());
+            rows.collect::<Vec<String>>().join("\n")
+        };
+        // Nothing to show yet: no configured servers and no todos.
+        assert!(!screen(&mut app, 120).contains("MCP servers"));
+        assert_eq!(app.content_rect.width, 120);
+        app.refresh();
+        let wide = screen(&mut app, 120);
+        for expected in [
+            "MCP servers",
+            "No servers configured",
+            "Todos 1/2",
+            "✓ parse",
+            "● render the wrapped todo   ",
+            "    text wholeword",
+        ] {
+            assert!(wide.contains(expected), "{expected}\n{wide}");
+        }
+        assert_eq!(app.content_rect.width, 88);
+        assert!(
+            app.hits
+                .iter()
+                .all(|(rect, hit)| !matches!(hit, Hit::Entry(..)) || rect.right() <= 88)
+        );
+        screen(&mut app, 160);
+        assert_eq!(app.content_rect.width, 120);
+        // A cramped terminal hides the column without changing the setting.
+        assert!(!screen(&mut app, 99).contains("Todos"));
+        assert_eq!((app.content_rect.width, app.sidebar), (99, true));
+        app.command(Command::Sidebar);
+        assert!(!screen(&mut app, 120).contains("Todos"));
+        assert_eq!(app.content_rect.width, 120);
+        let saved = || crate::tui::state::load(root.path()).0.sidebar;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while saved() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("toggle is saved");
     }
 
     #[tokio::test]

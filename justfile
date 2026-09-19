@@ -15,8 +15,9 @@ setup:
     cargo install --locked cargo-zigbuild cargo-nextest mdbook
 
 # Debug CLI; reads whatever is in target/shims live from disk.
-run:
-    cargo run --locked --features tui
+[positional-arguments]
+run *args:
+    cargo run --locked --features tui -- "$@"
 
 # Debug CLI; reads whatever is in target/shims live from disk.
 build:

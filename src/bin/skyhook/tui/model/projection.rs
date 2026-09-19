@@ -4,7 +4,7 @@ use super::super::format::agent_label;
 use super::retry::RetryState;
 use super::state_name;
 use serde_json::Value;
-use skyhook::agent::{AgentActivity, LiveResponse, ObservationSnapshot};
+use skyhook::agent::{AgentActivity, LiveResponse, ObservationSnapshot, TodoItem};
 use skyhook::execution::ExecutionLocation;
 use skyhook::identity::{AgentId, JobId};
 use skyhook::job::{JobRole, JobState};
@@ -178,6 +178,7 @@ pub struct Projection {
     pub jobs: BTreeMap<JobId, JobInfo>,
     pub usage: Usage,
     pub agent_usage: HashMap<AgentId, Usage>,
+    pub todos: HashMap<AgentId, Vec<TodoItem>>,
     pub(super) through: u64,
     pub(super) records_by_agent: HashMap<AgentId, Vec<u64>>,
     pub(super) requests: HashMap<u64, RequestInfo>,
@@ -426,6 +427,13 @@ impl Projection {
                                 .get_or_insert(record.timestamp_millis);
                         }
                     }
+                }
+                SessionEvent::TodosReplaced { items } => {
+                    self.todos.insert(record.agent.clone(), items.clone());
+                }
+                SessionEvent::Compaction { checkpoint } => {
+                    self.todos
+                        .insert(record.agent.clone(), checkpoint.todos.clone());
                 }
                 _ => {}
             }

@@ -46,8 +46,9 @@ pub async fn run(
             }
             if request.resume.is_none()
                 && saved.model.as_deref() != Some(launch.model.name())
-                && let Err(error) =
-                    super::tui::state::remember(&launch.workspace, launch.model.name())
+                && let Err(error) = super::tui::state::update(&launch.workspace, |state| {
+                    state.model = Some(launch.model.name().to_owned());
+                })
             {
                 session
                     .record_status(

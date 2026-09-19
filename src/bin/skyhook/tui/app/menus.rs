@@ -507,6 +507,16 @@ impl App {
                 });
             }
             Command::Files => self.open_files(None),
+            Command::Sidebar => {
+                self.sidebar = !self.sidebar;
+                let (sidebar, notices) = (self.sidebar, self.root_notifier());
+                let workspace = self.launch.workspace.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(error) = state::update(&workspace, |state| state.sidebar = sidebar) {
+                        notices.send(format!("Could not save sidebar setting: {error}"));
+                    }
+                });
+            }
             Command::Export => {
                 let view = model::EntryView {
                     agent: &self.selected, view: &View::default(),

@@ -40,6 +40,11 @@ impl SessionHandle {
         &self.runtime.startup_warnings
     }
 
+    /// Startup outcome of every configured MCP server.
+    pub fn mcp_servers(&self) -> &std::collections::BTreeMap<String, crate::mcp::McpServerStatus> {
+        self.runtime.mcp.servers()
+    }
+
     /// Host skill diagnostics that must not write directly to a terminal.
     pub fn warnings(&self) -> &[String] {
         self.runtime.harness.skills.warnings()

@@ -60,6 +60,7 @@ commands! {
     Attention => ("attention", "Reopen questions and permissions", "ctrl+x r", &[], true),
     Help => ("help", "Help and shortcuts", "", &[], true),
     Files => ("files", "Attach workspace file", "ctrl+x f", &[], true),
+    Sidebar => ("sidebar", "Toggle sidebar", "ctrl+x b", &[], true),
 }
 
 impl fmt::Display for Command {

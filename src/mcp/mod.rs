@@ -10,3 +10,4 @@ pub(crate) mod manager;
 mod transport;
 
 pub use config::{McpServerConfig, McpTransport, RawMcpServerConfig};
+pub use manager::McpServerStatus;
