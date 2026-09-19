@@ -90,6 +90,8 @@ pub struct Composer {
     redo: VecDeque<Snapshot>,
     width: usize,
     preferred_column: Option<usize>,
+    /// Last layout, keyed by a hash of everything it was built from.
+    layout_cache: std::cell::RefCell<Option<(u64, std::sync::Arc<ComposerLayout>)>>,
 }
 impl Default for Composer {
     fn default() -> Self {
@@ -104,6 +106,7 @@ impl Default for Composer {
             redo: VecDeque::new(),
             width: 80,
             preferred_column: None,
+            layout_cache: Default::default(),
         }
     }
 }
@@ -284,6 +287,7 @@ impl Composer {
         self.anchor = None;
         self.preferred_column = None;
         self.next_id = 1;
+        self.layout_cache.take();
     }
     /// Replace the whole document as plain text (history/menu recall).
     pub fn set(&mut self, text: String) -> EditOutcome {

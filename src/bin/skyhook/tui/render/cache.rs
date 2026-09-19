@@ -260,27 +260,26 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
     dirty.dedup();
     let truncated = app.render.rows.entry_count() > app.content_cache.entries().len();
     let changed = reset || !dirty.is_empty() || truncated;
-    // Selection validation visits just selected rows, never concatenates history.
+    // Selection validation visits just the selected rows that can change:
+    // those from the first dirty or removed entry onward.
+    let rows = &app.render.rows;
+    let first_changed = if reset {
+        Some(0)
+    } else {
+        let dirty = dirty.first().and_then(|&i| rows.entry_start(i));
+        let removed = rows.entry_start(app.content_cache.entries().len());
+        dirty.into_iter().chain(removed).min()
+    };
     let selection_before = app
         .selection
-        .filter(|selection| {
-            changed
-                && (reset
-                    || truncated
-                    || dirty
-                        .first()
-                        .and_then(|&i| app.render.rows.entry_start(i))
-                        .is_some_and(|first| first <= selection.0.row.max(selection.1.row)))
-        })
-        .map(|selection| {
-            let start = selection.0.row.min(selection.1.row);
-            let end = selection.0.row.max(selection.1.row);
-            (
-                start,
-                (start..=end)
-                    .filter_map(|i| app.render.rows.get(i).cloned())
-                    .collect::<Vec<_>>(),
-            )
+        .zip(first_changed)
+        .and_then(|((a, b), first)| {
+            let first = first.max(a.row.min(b.row));
+            let end = a.row.max(b.row);
+            (first <= end).then(|| {
+                let before = rows.iter_from(first).take(end - first + 1).cloned();
+                (first, before.collect::<Vec<_>>())
+            })
         });
     if reset {
         app.render.rows.clear();
@@ -313,8 +312,9 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
     app.render
         .rows
         .truncate_entries(app.content_cache.entries().len());
-    if let (Some(selection), Some((start, before))) = (app.selection, selection_before) {
-        let unchanged = selection_unchanged(&before, app.render.rows.iter().skip(start), selection);
+    if let (Some(selection), Some((first, before))) = (app.selection, selection_before) {
+        let unchanged =
+            selection_unchanged(first, &before, app.render.rows.iter_from(first), selection);
         if !unchanged {
             app.selection = None;
         }

@@ -222,8 +222,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     for (offset, row) in app
         .render
         .rows
-        .iter()
-        .skip(scroll)
+        .iter_from(scroll)
         .take(app.content_rect.height as usize)
         .enumerate()
     {
@@ -281,18 +280,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
         if let Some(range) = selected {
             let view = row_text.as_ref().expect("selected range has row text");
-            let value = view.text();
             // Source-to-column geometry skips hanging prefixes and code padding.
-            for (byte, grapheme) in value.grapheme_indices(true) {
+            // A malformed layout yields no cells; never paint it elsewhere.
+            for (byte, column, width) in view.source_cells() {
                 if !range.contains(&byte) {
                     continue;
                 }
-                // A malformed layout has no column for this byte; never paint it elsewhere.
-                let Some(column) = view.source_column(byte) else {
-                    continue;
-                };
                 let start = row.paragraph_x() as usize + column;
-                let end = start + grapheme.width();
+                let end = start + width;
                 let source_end = row.layout.code().map_or(content_width as usize, |code| {
                     (row.paragraph_x() as usize + code.body_end()).min(content_width as usize)
                 });

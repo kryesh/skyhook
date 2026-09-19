@@ -88,6 +88,7 @@ impl RowText<'_> {
         let byte = byte.min(self.text.len());
         self.text.is_char_boundary(byte).then_some(byte)
     }
+    #[cfg(test)]
     pub fn source_column(&self, byte: usize) -> Option<usize> {
         let byte = self.endpoint(byte)?;
         let layout = &self.row.layout;
@@ -110,6 +111,38 @@ impl RowText<'_> {
                     .map(|g| g.width())
                     .sum::<usize>()
         })
+    }
+    /// Every grapheme as (byte, `source_column`, width), in one pass over the row.
+    pub fn source_cells(&self) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+        fn cells(
+            text: &str,
+            offset: usize,
+            start: usize,
+            limit: usize,
+        ) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+            text.grapheme_indices(true)
+                .scan(0usize, move |used, (byte, g)| {
+                    let column = start + (*used).min(limit);
+                    *used += g.width();
+                    Some((offset + byte, column, g.width()))
+                })
+        }
+        let layout = &self.row.layout;
+        let (prefix_bytes, prefix_width) = layout.source_prefix();
+        let leading = layout.prefix.width();
+        let body = layout
+            .code()
+            .map_or(leading + prefix_width, |code| code.body_start());
+        self.endpoint(prefix_bytes)
+            .into_iter()
+            .flat_map(move |prefix| {
+                cells(&self.text[..prefix], 0, leading, prefix_width).chain(cells(
+                    &self.text[prefix..],
+                    prefix,
+                    body,
+                    usize::MAX,
+                ))
+            })
     }
     pub fn selection_range(
         &self,
@@ -160,19 +193,16 @@ pub fn selected_text(rows: &RowBlocks, selection: (TextPosition, TextPosition)) 
     text
 }
 
-/// Compare only selected rows, sharing the same fast path as retained rendering.
+/// Compare the selected rows from `first` onward.
 pub(super) fn selection_unchanged<'a>(
+    first: usize,
     previous: &[Row],
     current: impl IntoIterator<Item = &'a Row>,
     selection: (TextPosition, TextPosition),
 ) -> bool {
     let (start, end) = (selection.0.min(selection.1), selection.0.max(selection.1));
     let mut current = current.into_iter();
-    let Some(selected_rows) = end
-        .row
-        .checked_sub(start.row)
-        .and_then(|n| n.checked_add(1))
-    else {
+    let Some(selected_rows) = end.row.checked_sub(first).and_then(|n| n.checked_add(1)) else {
         return false;
     };
     previous.len() == selected_rows
@@ -188,7 +218,7 @@ pub(super) fn selection_unchanged<'a>(
                 return false;
             }
             for endpoint in [start, end] {
-                if endpoint.row == start.row + offset
+                if endpoint.row == first + offset
                     && (before.text_view().endpoint(endpoint.byte).is_none()
                         || after.text_view().endpoint(endpoint.byte).is_none())
                 {
@@ -200,7 +230,7 @@ pub(super) fn selection_unchanged<'a>(
             }
             let before = before.text();
             let after = after.text();
-            if start.row + offset == end.row {
+            if first + offset == end.row {
                 before
                     .get(..end.byte)
                     .is_some_and(|prefix| after.get(..end.byte) == Some(prefix))
@@ -288,6 +318,20 @@ mod tests {
         let expected = source.strip_prefix("  ").unwrap();
         assert_eq!(selected_text(&blocks, selection), expected);
         assert_eq!(selected_text(&blocks, (selection.1, selection.0)), expected);
+        // The single-pass painter geometry agrees with per-byte lookup.
+        let list = model::Entry::new(
+            model::EntryKey::Record(3),
+            "- 界 wide item that wraps onto more rows\n  > quoted 👩‍💻 text".to_owned(),
+            Surface::Agent,
+        );
+        for row in rows.iter().chain(&layout(&list, 16)) {
+            let view = row.text_view();
+            let cells: Vec<_> = view.source_cells().collect();
+            assert_eq!(cells.len(), row.text().graphemes(true).count());
+            for (byte, column, _) in cells {
+                assert_eq!(view.source_column(byte), Some(column), "{:?}", row.text());
+            }
+        }
         for (text, unchanged) in [
             (format!("{}\nLater streaming text", entry.text()), true),
             (entry.text().replace("first", "other"), false),
@@ -296,8 +340,12 @@ mod tests {
                 &model::Entry::new(entry.key().clone(), text, entry.surface),
                 30,
             );
-            let same =
-                selection_unchanged(&rows[start..=end], updated.iter().skip(start), selection);
+            let same = selection_unchanged(
+                start,
+                &rows[start..=end],
+                updated.iter().skip(start),
+                selection,
+            );
             assert_eq!(same, unchanged);
         }
     }
@@ -309,8 +357,9 @@ mod tests {
             TextPosition { row: 0, byte: 0 },
             TextPosition { row: 0, byte: 4 },
         );
-        let unchanged =
-            |old: &Row, new: &Row| selection_unchanged(std::slice::from_ref(old), [new], selection);
+        let unchanged = |old: &Row, new: &Row| {
+            selection_unchanged(0, std::slice::from_ref(old), [new], selection)
+        };
         let mut spacer = row.clone();
         spacer.layout = markdown::RowLayout::spacer();
         assert!(!unchanged(&row, &spacer) && !unchanged(&spacer, &row));

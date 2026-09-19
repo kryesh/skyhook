@@ -69,14 +69,29 @@ impl Composer {
     /// at grapheme boundaries, and clips a paste label rather than splitting it.
     /// A full last row gets an empty caret row; callers must not wrap these rows
     /// again. Tabs occupy four cells and other terminal controls are made visible.
-    pub fn layout(&self, width: usize) -> ComposerLayout {
-        ComposerLayout::from_tokens(
+    pub fn layout(&self, width: usize) -> std::sync::Arc<ComposerLayout> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        (&self.text, self.cursor, self.anchor, width).hash(&mut hasher);
+        for (offset, paste) in &self.pastes {
+            (offset, paste.id, paste.lines).hash(&mut hasher);
+        }
+        let key = hasher.finish();
+        let mut cache = self.layout_cache.borrow_mut();
+        if let Some((cached, layout)) = &*cache
+            && *cached == key
+        {
+            return layout.clone();
+        }
+        let layout = std::sync::Arc::new(ComposerLayout::from_tokens(
             self.tokens(),
             self.text.len(),
             self.cursor,
             self.anchor,
             width,
-        )
+        ));
+        *cache = Some((key, layout.clone()));
+        layout
     }
 }
 

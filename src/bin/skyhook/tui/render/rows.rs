@@ -33,8 +33,17 @@ impl RowBlocks {
         let (entry, offset) = self.locate(row)?;
         self.blocks[entry].get(offset)
     }
+    #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = &Row> {
         self.blocks.iter().flatten()
+    }
+    /// Rows from `row` onward, without visiting earlier entries.
+    pub fn iter_from(&self, row: usize) -> impl Iterator<Item = &Row> {
+        let (entry, offset) = self.locate(row).unwrap_or((self.blocks.len(), 0));
+        let (first, rest) = self.blocks[entry..]
+            .split_first()
+            .map_or((&[][..], &[][..]), |(first, rest)| (&first[offset..], rest));
+        first.iter().chain(rest.iter().flatten())
     }
     pub fn clear(&mut self) {
         self.blocks.clear();
@@ -162,6 +171,10 @@ mod tests {
                 );
             }
             assert!(actual.get(flat.len()).is_none());
+            for start in 0..=flat.len() + 1 {
+                let expected = flat.iter().skip(start).map(|row| row.text());
+                assert!(actual.iter_from(start).map(Row::text).eq(expected));
+            }
             let mut reverse: HashMap<u64, HashSet<usize>> = HashMap::new();
             for (index, sources) in self.sources.iter().enumerate() {
                 for source in sources {
