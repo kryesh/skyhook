@@ -244,7 +244,14 @@ impl SessionRuntime {
                 tokio::select! {
                     biased;
                     () = context.cancelled() => return Err(ToolError::Cancelled),
-                    _ = self.jobs.wait_settled(holding) => continue,
+                    // Completed foreground work is something the agent acts on: its
+                    // result returns with this wait's. A script's wait cannot.
+                    _ = self.jobs.wait_settled(holding) => {
+                        if !state.hosted && self.jobs.settled(holding).await {
+                            return Ok(WaitOutput { reason: WakeReason::Event });
+                        }
+                        continue;
+                    }
                     () = parked => continue,
                     changed = revision.changed() => {
                         if changed.is_err() { return Err(ToolError::Cancelled); }

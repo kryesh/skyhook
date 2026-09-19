@@ -168,7 +168,7 @@ impl AuthorizationCoordinator {
                 proposals.clone(),
             );
             let coordinator = self.clone();
-            let (agent, job) = (subject.agent.clone(), subject.job);
+            let agent = subject.agent.clone();
             // Finalization belongs to the decision, not to any individual waiter.
             let task = tokio::spawn(async move {
                 let result = tokio::spawn(decision).await.unwrap_or_else(|error| {
@@ -176,7 +176,7 @@ impl AuthorizationCoordinator {
                         "authorization policy failed: {error}"
                     )))
                 });
-                coordinator.finish_pending(id, agent, job, &result).await;
+                coordinator.finish_pending(id, agent, &result).await;
                 result
             });
             let future = async move {
@@ -206,7 +206,6 @@ impl AuthorizationCoordinator {
         &self,
         id: u64,
         agent: AgentId,
-        job: JobId,
         result: &Result<Vec<ApprovalGrant>, AuthorizationError>,
     ) {
         let mut state = self.state.lock().await;
@@ -229,7 +228,7 @@ impl AuthorizationCoordinator {
                     .iter()
                     .map(|grant| {
                         let grant = grant.clone();
-                        let event = crate::session::SessionEvent::ApprovalGranted { job, grant };
+                        let event = crate::session::SessionEvent::ApprovalGranted { grant };
                         (agent.clone(), event)
                     })
                     .collect();

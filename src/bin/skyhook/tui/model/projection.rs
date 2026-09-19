@@ -29,10 +29,7 @@ pub enum WaitReason {
 pub enum AgentDisplayState {
     Ready,
     Working,
-    Reconnecting {
-        attempt: u64,
-        max_attempts: Option<u64>,
-    },
+    Reconnecting { attempt: u64 },
     Compacting,
     RunningTools,
     Waiting(WaitReason),
@@ -51,13 +48,7 @@ impl AgentDisplayState {
         match self {
             Self::Ready => "Ready".into(),
             Self::Working => "Working".into(),
-            Self::Reconnecting {
-                attempt,
-                max_attempts,
-            } => match max_attempts {
-                Some(max) => format!("Reconnecting · attempt {attempt} of {max}"),
-                None => format!("Retrying · attempt {attempt}"),
-            },
+            Self::Reconnecting { attempt } => format!("Retrying · attempt {attempt}"),
             Self::Compacting => "Compacting".into(),
             Self::RunningTools => "Running tools".into(),
             Self::Waiting(reason) => match reason {
@@ -402,14 +393,12 @@ impl Projection {
                 SessionEvent::ModelRecoveryScheduled {
                     request,
                     attempt,
-                    max_attempts,
                     delay_millis,
                     error,
                 } => {
                     self.requests.entry(*request).or_default().retry =
                         Some(RetryState::Scheduled {
                             attempt: *attempt,
-                            max_attempts: *max_attempts,
                             delay_millis: *delay_millis,
                             error: error.clone(),
                         });
@@ -509,13 +498,9 @@ impl Projection {
         }
         match snapshot.activity.get(&agent.id) {
             Some(AgentActivity::Working) => State::Working,
-            Some(AgentActivity::Reconnecting {
-                attempt,
-                max_attempts,
-            }) => State::Reconnecting {
-                attempt: *attempt,
-                max_attempts: *max_attempts,
-            },
+            Some(AgentActivity::Reconnecting { attempt }) => {
+                State::Reconnecting { attempt: *attempt }
+            }
             Some(AgentActivity::Compacting) => State::Compacting,
             Some(AgentActivity::Interrupted) => State::Job(JobState::Interrupted),
             Some(AgentActivity::Failed(_)) => State::Job(JobState::Failed),
@@ -607,18 +592,12 @@ mod tests {
         let mut agent = agent();
         let mut projection = Projection::default();
         let mut snapshot = ObservationSnapshot::default();
-        let reconnecting = AgentActivity::Reconnecting {
-            attempt: 2,
-            max_attempts: Some(3),
-        };
+        let reconnecting = AgentActivity::Reconnecting { attempt: 2 };
         snapshot.activity.insert(agent.id.clone(), reconnecting);
         // Recovery is active without any job.
         assert_eq!(
             projection.status(&agent, &snapshot),
-            State::Reconnecting {
-                attempt: 2,
-                max_attempts: Some(3)
-            }
+            State::Reconnecting { attempt: 2 }
         );
         let owner = job(&agent, 1, JobRole::Agent, JobState::WaitingInput);
         agent.owner = Some(owner.id);

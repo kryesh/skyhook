@@ -84,7 +84,15 @@ impl TargetDefinition {
         if let Some((key, _)) = (self.ssh.options.iter())
             .find(|(key, value)| !crate::remote::ssh::configurable_option(key, value))
         {
-            return Err(TargetError::InvalidSshOption(key.clone()));
+            let field = match key.to_ascii_lowercase().as_str() {
+                "user" => "ssh.user",
+                "hostname" => "host",
+                "port" => "ssh.port",
+                "identityfile" => "ssh.auth",
+                "proxyjump" => "via",
+                _ => return Err(TargetError::InvalidSshOption(key.clone())),
+            };
+            return Err(TargetError::DedicatedSshOption(key.clone(), field));
         }
         let proxy_command =
             (self.ssh.options.keys()).any(|key| key.eq_ignore_ascii_case("proxycommand"));
@@ -417,6 +425,8 @@ pub enum TargetError {
     InvalidHost(String),
     #[error("SSH option `{0}` is invalid or reserved by Skyhook")]
     InvalidSshOption(String),
+    #[error("SSH option `{0}` is set through the `{1}` field, not ssh.options")]
+    DedicatedSshOption(String, &'static str),
     #[error("target `{0}` sets ProxyCommand, which cannot be combined with via")]
     ProxyCommandWithVia(String),
     #[error("target `{0}` sets via to its origin; omit via to connect directly from the origin")]

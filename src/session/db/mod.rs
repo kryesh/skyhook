@@ -22,7 +22,7 @@ pub use state::SessionSummary;
 pub(super) use state::{interrupted_work, summary};
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 5;
+pub(super) const USER_VERSION: i64 = 6;
 const SCHEMA: &str = include_str!("../schema.sql");
 /// Payload tables outside the append-only ledger: blob writes, output upserts and pruning.
 const MUTABLE_TABLES: [&str; 6] = [
@@ -376,10 +376,7 @@ mod tests {
                 })
                 .collect();
             let (db, encoder) = (&self.db, &mut self.encoder);
-            let result = db.transaction(|| {
-                let tx = encoder.begin_tx(db, 0)?;
-                encoder.records(db, tx, &records)
-            });
+            let result = db.transaction(|| encoder.records(db, &records));
             match result {
                 Ok(()) => db.commit().unwrap(),
                 Err(error) => {
@@ -404,7 +401,7 @@ mod tests {
             self.commit(vec![(agent, event)]).unwrap()[0]
         }
 
-        fn reject(&mut self, agent: AgentId, event: SessionEvent) {
+        pub(super) fn reject(&mut self, agent: AgentId, event: SessionEvent) {
             let before = self.records.len();
             assert!(
                 self.commit(vec![(agent, event.clone())]).is_err(),

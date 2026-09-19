@@ -19,8 +19,10 @@ unfinished jobs become interrupted and job identifiers continue monotonically; t
 service survival across harness restarts. `SessionHandle::interrupt` stops active provider streams
 and cancels the foreground tool, script and question jobs that hold each interrupted turn; the
 cancelled calls are recorded as error results. Delegated child agents are left interrupted but
-retained, and `/retry` restarts them; an agent whose only live work is delegated children or background
-jobs is left waiting. Background jobs keep running, except any launched by a cancelled script, which are
+retained, and `/retry` restarts them; an agent waiting on delegated children or background jobs
+keeps its wait and, while a child it delegated in the foreground is retained, shows as interrupted.
+New input to that agent releases the retained child to the background and proceeds; a resumed
+session does the same for a call it settled. Background jobs keep running, except any launched by a cancelled script, which are
 cancelled with it. `job_cancel` and shutdown remain the final,
 non-resumable paths. Once shutdown is requested no agent begins another model request; a child
 reply still pending at that moment stays in the journal and is presented after resume.

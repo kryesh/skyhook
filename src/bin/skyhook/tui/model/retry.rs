@@ -21,7 +21,6 @@ pub(super) enum RetryState {
     },
     Scheduled {
         attempt: u64,
-        max_attempts: Option<u64>,
         delay_millis: u64,
         error: String,
     },
@@ -69,20 +68,18 @@ pub(super) fn retry_entry(
 ) -> Option<Entry> {
     let info = projection.requests.get(&request)?;
     let state = info.retry.as_ref()?;
-    // Started attempts have no diagnostic; scheduled retries always have one,
-    // even when their retry budget is unlimited.
+    // Started attempts have no diagnostic; scheduled retries always have one.
     let refused = matches!(state, RetryState::Refused { .. });
-    let (attempt, max_attempts, delay_millis, error) = match state {
+    let (attempt, delay_millis, error) = match state {
         RetryState::Started { .. } => return None,
         RetryState::Failed { attempt, error } | RetryState::Refused { attempt, error } => {
-            (*attempt, None, None, error)
+            (*attempt, None, error)
         }
         RetryState::Scheduled {
             attempt,
-            max_attempts,
             delay_millis,
             error,
-        } => (*attempt, *max_attempts, Some(*delay_millis), error),
+        } => (*attempt, Some(*delay_millis), error),
     };
     let interrupted = projection.active_request.get(agent) == Some(&request)
         && matches!(
@@ -101,10 +98,9 @@ pub(super) fn retry_entry(
     } else {
         "Request failed"
     };
-    let mut text = format!("{label} · attempt {attempt}");
-    if let Some(max) = max_attempts {
-        text.push_str(&format!(" of {max}"));
-    }
+    // A running header leaves its first cell to the spinner.
+    let gutter = if running { "  " } else { "" };
+    let mut text = format!("{gutter}{label} · attempt {attempt}");
     if let Some(delay) = delay_millis.filter(|_| !interrupted) {
         text.push_str(&format!(" · retry delay {delay} ms"));
     }
@@ -167,9 +163,8 @@ mod tests {
         let mut projection = Projection::default();
         let mut snapshot = ObservationSnapshot::default();
         projection.active_request.insert(agent.clone(), 4);
-        let scheduled = |attempt, max_attempts, delay_millis| RetryState::Scheduled {
+        let scheduled = |attempt, delay_millis| RetryState::Scheduled {
             attempt,
-            max_attempts,
             delay_millis,
             error: "failure".into(),
         };
@@ -184,13 +179,13 @@ mod tests {
                 false,
             ),
             (
-                scheduled(2, None, 0),
-                Some("Retrying · attempt 2 · retry delay 0 ms\nfailure"),
+                scheduled(2, 0),
+                Some("  Retrying · attempt 2 · retry delay 0 ms\nfailure"),
                 true,
             ),
             (
-                scheduled(3, Some(4), 100),
-                Some("Retrying · attempt 3 of 4 · retry delay 100 ms\nfailure"),
+                scheduled(3, 100),
+                Some("  Retrying · attempt 3 · retry delay 100 ms\nfailure"),
                 true,
             ),
         ] {
@@ -204,14 +199,14 @@ mod tests {
             .activity
             .insert(agent.clone(), AgentActivity::Interrupted);
         let entry = retry_entry(&snapshot, &projection, &agent, 4, false).unwrap();
-        assert_eq!(entry.text(), "Interrupted · attempt 3 of 4\nfailure");
+        assert_eq!(entry.text(), "Interrupted · attempt 3\nfailure");
         assert!(!entry.running);
         // Historical schedules retain their diagnostic but do not animate.
         projection.active_request.insert(agent.clone(), 5);
         let entry = retry_entry(&snapshot, &projection, &agent, 4, false).unwrap();
         assert_eq!(
             entry.text(),
-            "Retrying · attempt 3 of 4 · retry delay 100 ms\nfailure"
+            "Retrying · attempt 3 · retry delay 100 ms\nfailure"
         );
         assert!(!entry.running);
     }

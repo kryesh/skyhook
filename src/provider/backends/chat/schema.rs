@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 /// Deliberately conservative subset of strict Structured Outputs. Do not silently
 /// rewrite optional properties, open objects, or unsupported schema constraints.
-pub(super) fn validate_schema(
+pub(crate) fn validate_schema(
     schema: &Value,
     root: &Value,
     depth: usize,

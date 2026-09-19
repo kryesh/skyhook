@@ -62,6 +62,8 @@ pub(crate) fn response_schema() -> serde_json::Value {
     let todo_properties = &mut schema["properties"]["todos"]["items"]["properties"];
     todo_properties["text"]["description"] = "The task or step. Preserve existing wording unless the conversation establishes a change. Must not be blank.".into();
     todo_properties["status"]["description"] = "Current execution status supported by the conversation. Intent to perform work is not evidence that it started or finished.".into();
+    // Strict structured outputs accept no numeric format or range; parsing still checks ids.
+    schema["properties"]["jobs"]["items"] = serde_json::json!({"type": "integer"});
     schema
 }
 
@@ -214,6 +216,12 @@ pub(crate) fn estimate_request(request: &ModelRequest) -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn response_schema_is_a_strict_chat_schema() {
+        let schema = response_schema();
+        crate::provider::backends::validate_chat_schema(&schema, &schema, 0).unwrap();
+    }
 
     fn text(message: &Message) -> &str {
         let Message::User(blocks) = message else {

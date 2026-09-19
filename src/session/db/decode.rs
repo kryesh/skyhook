@@ -446,7 +446,7 @@ pub(in crate::session) fn decode_records(
     };
     let agent_capabilities = grouped(
         db,
-        "SELECT agent, capability FROM agent_capability",
+        "SELECT entry, capability FROM agent_capability",
         |row| capability(row.get(1)?),
     )?;
     let prompts = grouped(
@@ -471,9 +471,15 @@ pub(in crate::session) fn decode_records(
             })
         },
     )?;
-    let histories = grouped(
+    let commits = grouped(
         db,
-        "SELECT request, source FROM model_request_history ORDER BY request, position",
+        "SELECT e.agent, m.entry FROM message_commit m JOIN entry e ON e.seq = m.entry \
+         ORDER BY m.entry",
+        |row| Ok(row.get::<u64>(1)?),
+    )?;
+    let omitted = grouped(
+        db,
+        "SELECT request, source FROM model_request_omitted",
         |row| Ok(row.get::<u64>(1)?),
     )?;
     let tails = grouped(
@@ -485,11 +491,6 @@ pub(in crate::session) fn decode_records(
         db,
         "SELECT compaction, source FROM compaction_retained ORDER BY compaction, source",
         |row| Ok(row.get::<u64>(1)?),
-    )?;
-    let grant_segments = grouped(
-        db,
-        "SELECT grant_entry, value FROM approval_grant_segment ORDER BY grant_entry, position",
-        |row| Ok(row.get::<String>(1)?),
     )?;
     let finish_images = grouped(
         db,
@@ -515,9 +516,9 @@ pub(in crate::session) fn decode_records(
     });
     load!(
         "SELECT s.entry, a.id, a.parent, a.owner_job, a.available_depth, t.name, \
-         a.location_workspace, s.profile FROM agent_start s \
+         s.location_workspace, s.profile FROM agent_start s \
          JOIN entry e ON e.seq = s.entry JOIN agent a ON a.id = e.agent \
-         JOIN target t ON t.id = a.location_target",
+         JOIN target t ON t.id = s.location_target",
         |row| SessionEvent::AgentStarted {
             parent: row.get::<Option<i64>>(2)?.map(agent_of).transpose()?,
             owner_job: row.get::<Option<i64>>(3)?.map(job).transpose()?,
@@ -525,7 +526,7 @@ pub(in crate::session) fn decode_records(
             available_depth: row.get(4)?,
             capabilities: sorted(
                 agent_capabilities
-                    .get(&row.get::<i64>(1)?)
+                    .get(&row.get::<i64>(0)?)
                     .cloned()
                     .unwrap_or_default(),
             ),
@@ -569,15 +570,28 @@ pub(in crate::session) fn decode_records(
         }
     );
     load!(
-        "SELECT entry, context, purpose, checkpoint, history_lifetime FROM model_request",
+        "SELECT r.entry, r.context, r.purpose, r.checkpoint, r.history_lifetime, \
+         r.history_through, e.agent, coalesce(c.frontier, 0) FROM model_request r \
+         JOIN entry e ON e.seq = r.entry LEFT JOIN compaction c ON c.entry = r.checkpoint",
         |row| {
             let seq = row.get::<i64>(0)?;
+            let checkpoint = row.get::<Option<i64>>(3)?;
+            let (through, frontier) = (row.get::<Option<u64>>(5)?, row.get::<u64>(7)?);
+            let kept = checkpoint.and_then(|checkpoint| retained.get(&checkpoint));
+            let later = commits
+                .get(&row.get::<i64>(6)?)
+                .map_or(&[][..], Vec::as_slice);
+            let later = later
+                .iter()
+                .filter(|&&source| source > frontier && Some(source) <= through);
+            let omitted = omitted.get(&seq).map_or(&[][..], Vec::as_slice);
             SessionEvent::ModelRequested {
                 context: row.get(1)?,
-                history: row
-                    .get::<Option<u64>>(3)?
+                history: checkpoint
+                    .map(u64_of)
                     .into_iter()
-                    .chain(histories.get(&seq).into_iter().flatten().copied())
+                    .chain(kept.into_iter().flatten().chain(later).copied())
+                    .filter(|source| !omitted.contains(source))
                     .collect(),
                 tail: tails.get(&seq).cloned().unwrap_or_default(),
                 history_lifetime: parse_variant(row.get(4)?)?,
@@ -586,9 +600,9 @@ pub(in crate::session) fn decode_records(
         }
     );
     load!(
-        "SELECT c.entry, c.schema_version, c.request, a.attempt, c.frontier, c.message, \
-         c.max_context, c.before_tokens, c.after_tokens FROM compaction c \
-         JOIN model_attempt a ON a.entry = c.attempt",
+        "SELECT c.entry, c.schema_version, a.request, a.attempt, c.frontier, c.message, \
+         c.before_tokens, c.after_tokens FROM compaction c \
+         JOIN attempt_outcome o ON o.entry = c.entry JOIN model_attempt a ON a.entry = o.attempt",
         |row| {
             let seq = row.get::<i64>(0)?;
             SessionEvent::Compaction {
@@ -603,9 +617,8 @@ pub(in crate::session) fn decode_records(
                     retained: retained.get(&seq).cloned().unwrap_or_default(),
                     request: row.get(2)?,
                     attempt: row.get(3)?,
-                    max_context: row.get(6)?,
-                    before_tokens: row.get(7)?,
-                    after_tokens: row.get(8)?,
+                    before_tokens: row.get(6)?,
+                    after_tokens: row.get(7)?,
                 },
             }
         }
@@ -618,7 +631,7 @@ pub(in crate::session) fn decode_records(
     });
     load!(
         "SELECT f.entry, a.request, a.attempt, f.error, f.failure FROM model_failure f \
-         JOIN model_attempt a ON a.entry = f.attempt",
+         JOIN attempt_outcome o ON o.entry = f.entry JOIN model_attempt a ON a.entry = o.attempt",
         |row| SessionEvent::ModelFailed {
             request: row.get(1)?,
             attempt: row.get(2)?,
@@ -627,8 +640,8 @@ pub(in crate::session) fn decode_records(
         }
     );
     load!(
-        "SELECT i.entry, a.request, a.attempt FROM model_interruption i \
-         JOIN model_attempt a ON a.entry = i.attempt",
+        "SELECT o.entry, a.request, a.attempt FROM attempt_outcome o \
+         JOIN model_attempt a ON a.entry = o.attempt WHERE o.kind = 'model_attempt_interrupted'",
         |row| SessionEvent::ModelAttemptInterrupted {
             request: row.get(1)?,
             attempt: row.get(2)?,
@@ -636,7 +649,8 @@ pub(in crate::session) fn decode_records(
     );
     load!(
         "SELECT r.entry, a.request, a.attempt, m.entry, r.stop_reason, r.stop_other \
-         FROM model_response r JOIN model_attempt a ON a.entry = r.attempt \
+         FROM model_response r JOIN attempt_outcome o ON o.entry = r.entry \
+         JOIN model_attempt a ON a.entry = o.attempt \
          LEFT JOIN message_commit m ON m.message = r.message",
         |row| SessionEvent::ResponseCompleted {
             request: row.get(1)?,
@@ -649,15 +663,14 @@ pub(in crate::session) fn decode_records(
         }
     );
     load!(
-        "SELECT v.entry, a.request, a.attempt, v.max_attempts, v.delay_millis, f.error \
+        "SELECT v.entry, a.request, a.attempt, v.delay_millis, f.error \
          FROM model_recovery v JOIN model_failure f ON f.entry = v.failure \
-         JOIN model_attempt a ON a.entry = f.attempt",
+         JOIN attempt_outcome o ON o.entry = f.entry JOIN model_attempt a ON a.entry = o.attempt",
         |row| SessionEvent::ModelRecoveryScheduled {
             request: row.get(1)?,
             attempt: row.get::<u64>(2)?.saturating_add(1),
-            max_attempts: row.get(3)?,
-            delay_millis: row.get(4)?,
-            error: row.get(5)?,
+            delay_millis: row.get(3)?,
+            error: row.get(4)?,
         }
     );
     load!(
@@ -732,21 +745,13 @@ pub(in crate::session) fn decode_records(
         }
     );
     load!(
-        "SELECT entry, job, capability, namespace, coverage FROM approval_grant",
-        |row| {
-            let resource = serde_json::json!({
-                "namespace": row.get::<String>(3)?,
-                "segments": grant_segments.get(&row.get::<i64>(0)?).cloned().unwrap_or_default(),
-            });
-            SessionEvent::ApprovalGranted {
-                job: job(row.get(1)?)?,
-                grant: crate::tool::policy::ApprovalGrant {
-                    capability: capability(row.get(2)?)?,
-                    resource: serde_json::from_value(resource)
-                        .map_err(|error| corrupt(error.to_string()))?,
-                    coverage: parse_variant(row.get(4)?)?,
-                },
-            }
+        "SELECT entry, capability, resource, coverage FROM approval_grant",
+        |row| SessionEvent::ApprovalGranted {
+            grant: crate::tool::policy::ApprovalGrant {
+                capability: capability(row.get(1)?)?,
+                resource: parse_json(&row.get::<String>(2)?)?,
+                coverage: parse_variant(row.get(3)?)?,
+            },
         }
     );
     load!(
@@ -786,7 +791,7 @@ pub(in crate::session) fn decode_records(
             let missing = || corrupt("message delivery has no notification or source");
             match row.get::<String>(1)?.as_str() {
                 "job_claimed" => SessionEvent::JobClaimed { job },
-                "job_injected" => SessionEvent::JobInjected { job, notification },
+                "job_injected" => SessionEvent::JobInjected { job },
                 _ => SessionEvent::JobMessageDelivered {
                     job,
                     source: row.get::<Option<u64>>(4)?.ok_or_else(missing)?,
@@ -795,35 +800,12 @@ pub(in crate::session) fn decode_records(
             }
         }
     );
-    load!(
-        "SELECT entry, job, question_id, questions FROM question",
-        |row| SessionEvent::QuestionOpened {
-            job: job(row.get(1)?)?,
-            question_id: row.get(2)?,
-            questions: parse_json(&row.get::<String>(3)?)?,
-        }
-    );
-    load!(
-        "SELECT a.entry, q.job, q.question_id, a.answers FROM question_answer a \
-         JOIN question q ON q.entry = a.question",
-        |row| SessionEvent::QuestionResolved {
-            job: job(row.get(1)?)?,
-            question_id: row.get(2)?,
-            answers: parse_json(&row.get::<String>(3)?)?,
-        }
-    );
-
-    let session_row = db.query_row(
-        "SELECT max_child_depth, public_id FROM session",
-        Vec::new(),
-        |row| Ok((row.get::<u32>(0)?, row.get::<Vec<u8>>(1)?)),
-    )?;
-    if let Some((_, id)) = &session_row
-        && id.as_slice() != session.to_bytes()
-    {
+    let public_id = db.query_row("SELECT public_id FROM session", Vec::new(), |row| {
+        Ok(row.get::<Vec<u8>>(0)?)
+    })?;
+    if public_id.is_some_and(|id| id.as_slice() != session.to_bytes()) {
         return Err(corrupt("database belongs to another session"));
     }
-    let session_row = session_row.map(|(depth, _)| depth);
     let session_capabilities = sorted(db.query(
         "SELECT capability FROM session_capability",
         Vec::new(),
@@ -849,7 +831,6 @@ pub(in crate::session) fn decode_records(
             "session_started" => SessionEvent::SessionStarted {
                 targets: targets.get(&seq).cloned().unwrap_or_default(),
                 capabilities: session_capabilities.clone(),
-                max_child_depth: session_row.ok_or_else(|| corrupt("session row is missing"))?,
             },
             "targets_upserted" => SessionEvent::TargetsUpserted {
                 targets: targets.get(&seq).cloned().unwrap_or_default(),
@@ -857,7 +838,6 @@ pub(in crate::session) fn decode_records(
             "todos_replaced" => SessionEvent::TodosReplaced {
                 items: todos.get(&seq).cloned().unwrap_or_default(),
             },
-            "session_resumed" => SessionEvent::SessionResumed,
             "agent_completed" => SessionEvent::AgentCompleted,
             "agent_interrupted" => SessionEvent::AgentInterrupted,
             _ => events

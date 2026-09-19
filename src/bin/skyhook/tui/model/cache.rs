@@ -534,10 +534,7 @@ mod tests {
         let agent = root(1);
         let mut snapshot = ObservationSnapshot::default();
         let (projection, view, outputs, mut cache) = Default::default();
-        let reconnecting = |attempt| AgentActivity::Reconnecting {
-            attempt,
-            max_attempts: Some(3),
-        };
+        let reconnecting = |attempt| AgentActivity::Reconnecting { attempt };
         for activity in [
             AgentActivity::Working,
             reconnecting(2),
@@ -631,7 +628,6 @@ mod tests {
             let scheduled = SessionEvent::ModelRecoveryScheduled {
                 request,
                 attempt: attempt + 1,
-                max_attempts: None,
                 delay_millis: 1000,
                 error,
             };

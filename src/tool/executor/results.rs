@@ -308,16 +308,25 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(result.output.value["state"], "completed");
-            assert_eq!(result.output.value["last_message"], sequence);
-            for field in ["result", "preview", "truncated"] {
-                assert!(result.output.value.get(field).is_none(), "{field}");
-            }
-            // Claiming the model result must not claim the independently
-            // deliverable reply, nor destroy the explicit saved final answer.
             let pending = runtime.jobs.pending_delivery(&runtime.agent).await.unwrap();
-            assert_eq!(pending.messages().len(), 1);
-            assert_eq!(pending.messages()[0].text, text);
+            if background {
+                // The reply is an independently delivered event; the result
+                // references it, and claiming the result leaves it pending.
+                assert_eq!(result.output.value["last_message"], sequence);
+                for field in ["result", "preview", "truncated"] {
+                    assert!(result.output.value.get(field).is_none(), "{field}");
+                }
+                assert_eq!(pending.messages().len(), 1);
+                assert_eq!(pending.messages()[0].text, text);
+            } else {
+                // A foreground call returns its answer; nothing is delivered later.
+                assert!(result.output.value.get("last_message").is_none());
+                let presented = serde_json::to_string(&result.output.value).unwrap();
+                assert!(presented.contains("child answer line 0"), "{presented}");
+                assert!(pending.messages().is_empty());
+            }
             drop(pending);
+            // The saved final answer survives either way.
             let saved = runtime.jobs.snapshot(job).await.unwrap();
             assert_eq!(saved.output, Some(serde_json::json!(text)));
         }

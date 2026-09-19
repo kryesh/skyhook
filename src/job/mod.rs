@@ -40,7 +40,7 @@ mod delivery;
 mod input;
 mod lifecycle;
 mod messages;
-mod views;
+pub(super) mod views;
 
 pub(crate) use delivery::PendingDelivery;
 pub use views::JobEnvelope;

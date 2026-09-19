@@ -1,6 +1,7 @@
 use crate::session::{EventRecord, SessionEvent, SessionStore};
 
-use super::{DeliveryState, JobEntry, JobError, JobManager, JobOutcome, JobSpec};
+use super::{DeliveryState, JobEntry, JobError, JobManager, JobOutcome, JobSpec, JobState};
+use crate::provider::protocol::Message;
 
 pub(super) async fn restore(
     store: SessionStore,
@@ -9,7 +10,17 @@ pub(super) async fn restore(
     let mut jobs = std::collections::HashMap::new();
     let mut maximum = 0_u64;
     let mut children = std::collections::HashMap::new();
+    // Calls already answered: a live job launched by one has no waiter left.
+    let mut answered = std::collections::HashSet::new();
     for record in records {
+        if let SessionEvent::MessageCommitted {
+            message: Message::Tool(results),
+        } = &record.event
+        {
+            for result in results {
+                answered.insert((record.agent.clone(), result.call_id.clone()));
+            }
+        }
         match &record.event {
             SessionEvent::JobCreated {
                 origin,
@@ -94,11 +105,13 @@ pub(super) async fn restore(
                 }
             }
             SessionEvent::MessageCommitted { message } => {
-                if let Some(job) = children.get(&record.agent)
-                    && let Some(entry) = jobs.get_mut(job)
+                if let Some(job) = children.get(&record.agent).copied()
                     && let Some(text) = super::messages::visible_text(message)
                 {
-                    entry.publish_message(*job, record.sequence, text);
+                    let deliver = super::views::effectively_background(&jobs, job);
+                    if let Some(entry) = jobs.get_mut(&job) {
+                        entry.publish_message(job, record.sequence, text, deliver);
+                    }
                 }
             }
             SessionEvent::JobFinished {
@@ -128,6 +141,16 @@ pub(super) async fn restore(
                 }
             }
             _ => {}
+        }
+    }
+    // A retained child whose call was answered goes on in the background.
+    for entry in jobs.values_mut() {
+        let released = !entry.state.is_terminal() || entry.state == JobState::Interrupted;
+        if released
+            && let Some(origin) = &entry.origin
+            && answered.contains(&(entry.agent.clone(), origin.call_id.clone()))
+        {
+            entry.background = true;
         }
     }
     let active = jobs

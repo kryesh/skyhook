@@ -84,6 +84,28 @@ pub(super) fn target_property_schema() -> Value {
     })
 }
 
+/// Put an object's tag properties (a `const` or single-value `enum`) before the
+/// rest. A decoder constrained to the schema in property order could otherwise
+/// never reach a variant whose tag is not written first.
+pub(super) fn tags_first(schema: &mut Value) {
+    for_each_subschema(schema, &mut |schema| {
+        let Some(Value::Object(properties)) = schema.get_mut("properties") else {
+            return;
+        };
+        let is_tag = |property: &Value| {
+            property.get("const").is_some()
+                || property
+                    .get("enum")
+                    .and_then(Value::as_array)
+                    .is_some_and(|values| values.len() == 1)
+        };
+        let (tags, rest): (Vec<_>, Vec<_>) = std::mem::take(properties)
+            .into_iter()
+            .partition(|(_, property)| is_tag(property));
+        properties.extend(tags.into_iter().chain(rest));
+    });
+}
+
 pub(super) fn add_schema_property(schema: &mut Value, name: &str, property: Value) {
     schema
         .as_object_mut()
@@ -271,6 +293,29 @@ mod tests {
     use super::*;
     use crate::tool::{ToolOptions, ToolOutput, ToolRegistryBuilder};
     use serde_json::json;
+
+    /// An internally tagged variant lists its tag last; a grammar built from that
+    /// order can never reach the variant once the tag is written first.
+    #[test]
+    fn tags_lead_their_objects_at_every_depth() {
+        let mut schema = json!({"type": "object", "properties": {"auth": {"oneOf": [
+            {"type": "object", "properties": {"kind": {"const": "agent"}}},
+            {"type": "object", "properties": {
+                "path": {"type": "string"}, "kind": {"type": "string", "const": "key"}}},
+            {"type": "object", "properties": {"path": {"type": "string"}, "mode": {"enum": ["x"]}}},
+        ]}}});
+        tags_first(&mut schema);
+        let keys = |variant: usize| -> Vec<&str> {
+            schema["properties"]["auth"]["oneOf"][variant]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect()
+        };
+        assert_eq!(keys(1), ["kind", "path"]);
+        assert_eq!(keys(2), ["mode", "path"]);
+    }
 
     #[test]
     fn sanitization_preserves_property_names_and_literal_payloads() {

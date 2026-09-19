@@ -176,15 +176,13 @@ mod tests {
         assert!(bounded(turn).await.unwrap().is_err());
     }
 
-    /// The reported session: a script's foreground `tool.agent(...)`, then waits.
-    /// The pending reply resolves the first wait at once instead of sleeping out its
-    /// timeout, the script is not told twice (the root is busy in its drain, so
-    /// nothing consumes the reply meanwhile), and the model still gets it once.
+    /// A script's foreground `tool.agent(...)` returns the child's answer to the
+    /// script alone: no reply is left pending for its waits or for the model.
     #[tokio::test(start_paused = true)]
-    async fn script_wait_reports_a_pending_child_reply_once() {
+    async fn script_foreground_child_leaves_no_pending_reply() {
         const FINAL: &str = "readme-first-lines";
         let source = "const answer = await tool.agent({prompt:'read', model:'child', name:'read-readme'}); \
-            const first = await tool.wait({timeout:60}); \
+            const first = await tool.wait({timeout:1}); \
             const second = await tool.wait({timeout:1}); \
             return [first, second];";
         let tracking = tracking_all(vec![
@@ -208,21 +206,21 @@ mod tests {
             .await
             .unwrap()
             .output;
-        let expected = json!([{"reason":"event"}, {"reason":"timeout"}]);
+        let expected = json!([{"reason":"timeout"}, {"reason":"timeout"}]);
         assert_eq!(
             output.as_ref().map(|output| &output["value"]),
             Some(&expected),
             "{output:?}"
         );
         let history = rendered(&request);
-        assert_eq!(history.matches(FINAL).count(), 1, "{history}");
+        assert!(!history.contains(FINAL), "{history}");
         tracking.release(2);
         bounded(turn).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
     }
 
     /// A `wait` beside a foreground child keeps waiting through the child's progress;
-    /// the next request carries progress and answer together.
+    /// the next request carries the answer in the child's result, not its progress.
     #[tokio::test(start_paused = true)]
     async fn outstanding_foreground_work_defers_wait_resolution() {
         const PROGRESS: &str = "foreground-progress";
@@ -266,7 +264,7 @@ mod tests {
         assert_reason(&request, "waiting", "event");
         let history = rendered(&request);
         assert!(
-            history.contains(PROGRESS) && history.contains(FINAL),
+            !history.contains(PROGRESS) && history.contains(FINAL),
             "{history}"
         );
         tracking.release(3);

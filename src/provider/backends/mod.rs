@@ -9,6 +9,9 @@ mod errors;
 pub(crate) mod responses;
 pub(crate) mod transport;
 
+#[cfg(test)]
+pub(crate) use chat::validate_schema as validate_chat_schema;
+
 use crate::provider::{
     Provider, ProviderContext, ProviderError, ProviderFuture, ProviderTimeouts, ResponseStream,
     protocol::{ModelRequest, ResponseChunk},

@@ -121,19 +121,24 @@ impl SessionRuntime {
 
     /// Close what a stopped process left open, in one transaction, before any agent
     /// resumes: attempts without an outcome, and committed calls without a result.
-    pub(super) async fn settle_interrupted_work(&self) -> Result<(), HarnessError> {
+    /// Their agents' turns end interrupted; returns those agents. A settled call to
+    /// a retained child releases it: nothing waits on it any more.
+    pub(super) async fn settle_interrupted_work(&self) -> Result<Vec<AgentId>, HarnessError> {
         let work = self.store.interrupted_work().await?;
         if work.attempts.is_empty() && work.calls.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
-        let root = AgentId::root(self.store.id());
-        let mut events = vec![(root, SessionEvent::SessionResumed)];
-        events.extend(work.attempts.into_iter().map(|(agent, request, attempt)| {
+        let attempts = work.attempts.into_iter().map(|(agent, request, attempt)| {
             (
                 agent,
                 SessionEvent::ModelAttemptInterrupted { request, attempt },
             )
-        }));
+        });
+        let mut events: Vec<_> = attempts.collect();
+        let mut agents: Vec<_> = events.iter().map(|(agent, _)| agent.clone()).collect();
+        agents.extend(work.calls.iter().map(|(agent, ..)| agent.clone()));
+        agents.sort();
+        agents.dedup();
         events.extend(work.calls.into_iter().map(|(agent, call_id, name)| {
             let result = ToolResult {
                 call_id,
@@ -145,8 +150,13 @@ impl SessionRuntime {
             let message = Message::Tool(vec![result]);
             (agent, SessionEvent::MessageCommitted { message })
         }));
+        let interrupted = agents.iter().cloned();
+        events.extend(interrupted.map(|agent| (agent, SessionEvent::AgentInterrupted)));
         self.store.append_all(events).await?;
-        Ok(())
+        for agent in &agents {
+            self.jobs.release_held(agent).await;
+        }
+        Ok(agents)
     }
 
     pub(super) async fn start_root(
@@ -177,12 +187,14 @@ impl SessionRuntime {
     /// retryable session-interrupt path; explicit job/tree cancellation remains in
     /// `interrupt_tree` below.
     ///
-    /// Retained child agents are spared and restarted by `continue`. Foreground
-    /// non-agent jobs have no resume point and are cancelled: the tool drain never
-    /// observes the agent token, and job tokens descend from parent jobs, so the
-    /// turn cannot unwind otherwise. Cancelling a script cancels what it launched.
+    /// Retained child agents are spared and restarted by `continue`; a parent
+    /// holding one keeps waiting for it, shown interrupted, until input redirects
+    /// it (`redirect`). Foreground non-agent jobs have no resume point and are
+    /// cancelled: the tool drain never observes the agent token, and job tokens
+    /// descend from parent jobs, so the turn cannot unwind otherwise. Cancelling a
+    /// script cancels what it launched.
     pub(super) async fn interrupt_turns(&self, root: &AgentId) -> usize {
-        let targets = self
+        let mut targets = self
             .agents()
             .keys()
             .filter(|agent| {
@@ -190,8 +202,9 @@ impl SessionRuntime {
             })
             .cloned()
             .collect::<Vec<_>>();
+        targets.sort_by_key(AgentId::depth);
         let activity = self.events.observe().snapshot.activity;
-        let mut interrupted = 0;
+        let (mut holders, mut cancelled) = (Vec::new(), Vec::new());
         for agent in &targets {
             let work = self.jobs.live_work(agent).await;
             match activity.get(agent) {
@@ -200,6 +213,9 @@ impl SessionRuntime {
                 Some(AgentActivity::Tools | AgentActivity::WaitingChildren)
                     if work.any && work.blocking.is_empty() =>
                 {
+                    if work.holding.is_some() {
+                        holders.push(agent.clone());
+                    }
                     continue;
                 }
                 None
@@ -229,9 +245,51 @@ impl SessionRuntime {
                 let _ = self.jobs.cancel(job).await;
             }
             self.activity(agent, AgentActivity::Interrupted);
-            interrupted += 1;
+            cancelled.push(agent.clone());
+        }
+        // A held child is retained too; its holder shows interrupted meanwhile.
+        let mut interrupted = cancelled.len();
+        for holder in holders {
+            let descendant_cancelled = cancelled
+                .iter()
+                .any(|agent| agent != &holder && agent.path().starts_with(holder.path()));
+            if descendant_cancelled {
+                self.activity(&holder, AgentActivity::Interrupted);
+                interrupted += 1;
+            }
         }
         interrupted
+    }
+
+    /// Wait for interrupted agents' jobs to settle: an interrupt cancels model
+    /// futures before their owning job has finished journaling.
+    pub(super) async fn settle_interrupts(&self) {
+        let interrupted = self
+            .agents()
+            .iter()
+            .filter(|(_, agent)| agent.control.retryable_interrupt.load(Ordering::Acquire))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        self.jobs.settle_interrupted_agents(&interrupted).await;
+    }
+
+    /// New input for an agent holding a retained job breaks the link: the job goes
+    /// on in the background and the held wait returns. Queued input then joins the
+    /// turn's next request; a direct prompt ends the turn (`cancel`) to start the next.
+    pub(super) async fn redirect(&self, agent: &AgentId, cancel: bool) {
+        self.settle_interrupts().await;
+        // Cancel before releasing: the released wait must not reach an uncancelled
+        // request boundary.
+        if cancel
+            && self.jobs.has_suspended(agent).await
+            && let Some(live) = self.agents().get(agent)
+        {
+            live.control
+                .retryable_interrupt
+                .store(true, Ordering::Release);
+            live.cancellation.cancel();
+        }
+        self.jobs.release_held(agent).await;
     }
 
     pub(super) async fn interrupt_tree(&self, root: &AgentId) -> usize {

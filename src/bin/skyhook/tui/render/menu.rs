@@ -7,19 +7,12 @@ pub(super) fn agent_status_color(state: model::AgentDisplayState, p: Palette) ->
     use model::AgentDisplayState as State;
     match state {
         State::Job(JobState::Failed) => p.content.error,
-        // Only a bounded retry warns; an unlimited one reads as ordinary work.
-        State::Waiting(_)
-        | State::Reconnecting {
-            max_attempts: Some(_),
-            ..
+        State::Waiting(_) | State::Job(JobState::AwaitingApproval | JobState::WaitingInput) => {
+            p.content.warning
         }
-        | State::Job(JobState::AwaitingApproval | JobState::WaitingInput) => p.content.warning,
-        State::Working
-        | State::Reconnecting {
-            max_attempts: None, ..
+        State::Working | State::Reconnecting { .. } | State::Compacting | State::RunningTools => {
+            p.content.primary
         }
-        | State::Compacting
-        | State::RunningTools => p.content.primary,
         State::Job(JobState::Completed) => p.content.success,
         State::Ready | State::Job(_) => p.muted,
     }

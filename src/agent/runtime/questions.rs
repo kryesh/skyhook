@@ -661,9 +661,6 @@ mod tests {
             assert_eq!(results[0].result["result"], "yes");
             assert_eq!(results[1].result["result"], json!({"value":2}));
         }
-        let records = session.runtime.store.records().await;
-        assert_eq!(count!(&records, SessionEvent::QuestionOpened { .. }), 2);
-        assert_eq!(count!(&records, SessionEvent::QuestionResolved { .. }), 2);
         assert_eq!(*backgrounds.lock().unwrap(), [false]);
         shutdown_session(session).await;
 

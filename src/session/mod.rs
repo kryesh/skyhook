@@ -352,10 +352,7 @@ impl Writer {
         drop(prefix);
         drop(state);
         let encoder = &mut self.encoder;
-        let result = db.transaction(|| {
-            let tx = encoder.begin_tx(db, timestamp_millis)?;
-            encoder.records(db, tx, &records)
-        });
+        let result = db.transaction(|| encoder.records(db, &records));
         if result.is_err() {
             self.encoder.reset();
         }
@@ -622,7 +619,8 @@ impl SessionStore {
 
     /// Committed records, refused while an accepted append needs recovery (reopen first).
     /// Waits out in-flight appends: their pessimistic poison lasts until publication.
-    pub async fn reconciled_records(&self) -> Result<Vec<EventRecord>, SessionError> {
+    #[cfg(test)]
+    async fn reconciled_records(&self) -> Result<Vec<EventRecord>, SessionError> {
         let _turn = self.inner.turn.lock().await;
         let state = self.inner.shared.read();
         state.require_healthy()?;
@@ -1021,7 +1019,6 @@ pub(crate) mod fixture {
                 SessionEvent::SessionStarted {
                     targets: Vec::new(),
                     capabilities: Capability::ALL.to_vec(),
-                    max_child_depth: 4,
                 },
             ),
             (agent.clone(), agent_started(None, workspace)),

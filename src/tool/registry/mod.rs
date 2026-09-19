@@ -5,8 +5,8 @@ mod schema;
 
 pub(crate) use docs::{ScriptManifest, job_view_type};
 use schema::{
-    add_nested_schema_property, add_schema_property, ensure_no_target, target_property_schema,
-    validate_object_schema, validate_output_schema, validate_schema,
+    add_nested_schema_property, add_schema_property, ensure_no_target, tags_first,
+    target_property_schema, validate_object_schema, validate_output_schema, validate_schema,
 };
 
 use std::{
@@ -799,10 +799,11 @@ impl ToolRegistryBuilder {
         &mut self,
         name: impl Into<String>,
         description: impl Into<String>,
-        input_schema: Value,
+        mut input_schema: Value,
         mut options: ToolOptions,
         admit: impl Fn(Value) -> Result<AdmittedInvocation, ToolError> + Send + Sync + 'static,
     ) -> Result<&mut Self, RegistryError> {
+        tags_first(&mut input_schema);
         if options.execution.placement == ToolPlacement::TargetedWorkspace {
             ensure_no_target(&input_schema)?;
             options =
@@ -1162,6 +1163,49 @@ mod admission_tests {
         assert!(!extra(&capabilities));
         capabilities.insert(Capability::Targets);
         assert!(extra(&capabilities));
+    }
+
+    /// schemars lists an internally tagged variant's fields before its tag; the
+    /// registered schema leads with the tag so a schema-constrained decoder can
+    /// still choose that variant after writing the tag.
+    #[tokio::test]
+    async fn registered_schemas_lead_tagged_variants_with_their_tag() {
+        #[derive(serde::Deserialize, JsonSchema)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Auth {
+            Agent,
+            Key {
+                #[serde(rename = "path")]
+                _path: String,
+            },
+        }
+        #[derive(serde::Deserialize, JsonSchema)]
+        struct Input {
+            #[serde(rename = "auth")]
+            _auth: Auth,
+        }
+        let runtime = crate::tests::TestRuntime::new().await;
+        let mut builder = ToolRegistryBuilder::default();
+        let handler = |_, _: Input| async { Ok(String::new()) };
+        let options = ToolOptions::default();
+        builder
+            .register::<Input, String, _, _>("tagged", "Tagged", options, handler)
+            .unwrap();
+        let registry = builder.build();
+        let spec = registry
+            .get("tagged")
+            .unwrap()
+            .spec(&CapabilitySet::default(), &runtime.agent)
+            .unwrap();
+        let variants = spec.input_schema["$defs"]["Auth"]["oneOf"]
+            .as_array()
+            .unwrap();
+        let key = variants
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["const"] == "key")
+            .unwrap();
+        let keys: Vec<_> = key["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["kind", "path"]);
     }
 
     #[tokio::test]

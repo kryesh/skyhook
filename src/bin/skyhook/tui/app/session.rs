@@ -152,13 +152,9 @@ mod tests {
     async fn reconnecting_keeps_input_delivery_busy_until_interrupted() {
         let (_root, mut app) = draft_fixture().await;
         let agent = app.root_agent().clone();
-        app.snapshot.activity.insert(
-            agent.clone(),
-            AgentActivity::Reconnecting {
-                attempt: 2,
-                max_attempts: Some(3),
-            },
-        );
+        app.snapshot
+            .activity
+            .insert(agent.clone(), AgentActivity::Reconnecting { attempt: 2 });
         assert!(app.busy());
         app.snapshot
             .activity

@@ -94,8 +94,10 @@ impl Fixture {
     }
     /// The committed records of the session whose id `output` printed.
     fn records(&self, output: &Output) -> Vec<skyhook::session::EventRecord> {
-        assert!(
+        // Only a failure writes to stderr.
+        assert_eq!(
             output.stderr.is_empty(),
+            output.status.success(),
             "stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
@@ -141,10 +143,11 @@ fn eventually(what: &str, condition: impl Fn() -> bool) {
     }
 }
 
-fn assert_silent_failure(output: &Output) {
+/// A failure prints no session ID and explains itself on stderr.
+fn assert_reported_failure(output: &Output) {
     assert!(!output.status.success());
     assert!(
-        output.stdout.is_empty() && output.stderr.is_empty(),
+        output.stdout.is_empty() && !output.stderr.is_empty(),
         "{output:?}"
     );
 }
@@ -207,14 +210,14 @@ fn parse_early_runtime_and_redirected_terminal_failures_are_reported_correctly()
         &["--non-interactive=true", "-p", "x"],
         &["--non-interactive", "-p", "x", "-m", "missing"],
     ] {
-        assert_silent_failure(&run(args));
+        assert_reported_failure(&run(args));
     }
     // Terminal mode still rejects redirected IO.
     let out = run(&["-p", "hello"]);
     assert!(!out.status.success() && out.stdout.is_empty());
     assert!(String::from_utf8_lossy(&out.stderr).contains("interactive terminal"));
     f.write("config/skyhook/config.toml", "invalid [");
-    assert_silent_failure(&run(&["--non-interactive", "-p", "x"]));
+    assert_reported_failure(&run(&["--non-interactive", "-p", "x"]));
 }
 
 mod dotenv {
@@ -296,14 +299,15 @@ mod dotenv {
             let stderr = String::from_utf8(out.stderr).unwrap();
             assert_eq!(stderr, "skyhook: invalid invocation directory .env file\n");
             let headless = ["--non-interactive", "-p", "unused"];
-            assert_silent_failure(&output(f.command().args(headless)));
+            assert_reported_failure(&output(f.command().args(headless)));
             for flag in ["--help", "--version"] {
                 let out = output(f.bare_command().args(["--non-interactive", flag]));
                 assert!(out.status.success(), "{out:?}");
                 assert!(!out.stdout.is_empty() && out.stderr.is_empty());
             }
             // Without an inherited socket the helper exits before reading anything.
-            assert_silent_failure(&output(f.bare_command().args(["--askpass", "Password:"])));
+            let out = output(f.bare_command().args(["--askpass", "Password:"]));
+            assert!(!out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
         }
     }
 
@@ -588,7 +592,7 @@ mod headless {
     }
 
     #[test]
-    fn script_and_input_failures_are_silent_persisted_and_drain_jobs() {
+    fn script_and_input_failures_are_reported_persisted_and_drain_jobs() {
         let f = Fixture::new();
         let source = format!(
             "{BACKGROUND} console.log('before-throw'); throw new Error('deliberate-failure');"
@@ -722,7 +726,7 @@ mod headless {
         let f = Fixture::new();
         let missing_id = "00000000000000000000000000000001";
         let args = ["--non-interactive", "-p", "hello", "--resume", missing_id];
-        assert_silent_failure(&output(f.command().args(args)));
+        assert_reported_failure(&output(f.command().args(args)));
         f.write("config/skyhook/config.toml", "[providers.test]\nkind='codex'\n[models.first]\nprovider='test'\nmodel='fixture'\nmax_context=128000\nmax_output=4096\n");
         let out = output(
             f.command()

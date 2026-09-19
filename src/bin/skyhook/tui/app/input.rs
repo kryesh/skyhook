@@ -215,7 +215,7 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(M::CONTROL) => {
                 if self.focus == Focus::Composer && !self.editor.is_empty() {
                     self.editor.clear();
-                } else if self.busy() {
+                } else if self.busy() && !self.root_interrupted() {
                     self.interrupt();
                 } else {
                     self.command(Command::Exit);

@@ -71,10 +71,9 @@ impl PendingDelivery {
                             owner.clone(),
                             SessionEvent::MessageCommitted { message },
                             move |notification| {
-                                let injected = acknowledged.into_iter().map(|job| {
-                                    let notification = Some(notification);
-                                    SessionEvent::JobInjected { job, notification }
-                                });
+                                let injected = acknowledged
+                                    .into_iter()
+                                    .map(|job| SessionEvent::JobInjected { job });
                                 let replies = replies.into_iter().map(|reply| {
                                     SessionEvent::JobMessageDelivered {
                                         job: reply.id,
@@ -232,6 +231,11 @@ impl JobManager {
         let agent = {
             let mut jobs = self.inner.jobs.lock().await;
             let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
+            // A suspended job's delivery waits for its restart; reading its state
+            // acknowledges nothing.
+            if entry.suspended() {
+                return Ok(());
+            }
             if !entry.deliverable() {
                 return Err(JobError::NotTerminal(id));
             }
@@ -460,12 +464,12 @@ mod tests {
             let acks: Vec<_> = records
                 .iter()
                 .filter_map(|record| match record.event {
-                    SessionEvent::JobClaimed { .. } => Some(None),
-                    SessionEvent::JobInjected { notification, .. } => Some(notification),
+                    SessionEvent::JobClaimed { .. } => Some(false),
+                    SessionEvent::JobInjected { .. } => Some(true),
                     _ => None,
                 })
                 .collect();
-            assert_eq!(acks, [sequence]);
+            assert_eq!(acks, [sequence.is_some()]);
             // Claiming affects delivery, not later explicit output access.
             let output = manager
                 .test_replay()

@@ -13,7 +13,6 @@ use tokio::sync::oneshot;
 use crate::{
     agent::{Question, TodoItem, todo::TodoStore},
     provider::protocol::UserContent,
-    session::SessionEvent,
     tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::Capability},
 };
 
@@ -146,34 +145,7 @@ fn register_ask(
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
             async move {
                 let runtime = runtime.ok_or_else(runtime_unavailable)?;
-                let question_id = format!("q-{}", context.job());
-                let questions = vec![input.clone()];
-                runtime
-                    .store
-                    .append(
-                        context.agent().clone(),
-                        SessionEvent::QuestionOpened {
-                            job: context.job(),
-                            question_id: question_id.clone(),
-                            questions: serde_json::to_value(&questions)?,
-                        },
-                    )
-                    .await
-                    .map_err(|error| tool_error(&error))?;
-                let answers = runtime.questions.coordinate_question(context.clone(), input).await?;
-                runtime
-                    .store
-                    .append(
-                        context.agent().clone(),
-                        SessionEvent::QuestionResolved {
-                            job: context.job(),
-                            question_id,
-                            answers: answers.clone(),
-                        },
-                    )
-                    .await
-                    .map_err(|error| tool_error(&error))?;
-                Ok(answers)
+                runtime.questions.coordinate_question(context, input).await
             }
         },
     )?;

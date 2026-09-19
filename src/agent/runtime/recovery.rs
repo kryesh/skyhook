@@ -41,7 +41,6 @@ impl SessionRuntime {
         let scheduled = SessionEvent::ModelRecoveryScheduled {
             request,
             attempt: attempt.saturating_add(1),
-            max_attempts: None,
             delay_millis: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
             error: error.to_string(),
         };
@@ -222,9 +221,9 @@ mod tests {
         }
     }
 
-    fn recoveries(records: &[EventRecord]) -> Vec<(u64, u64, Option<u64>, u64, String)> {
-        events!(records, SessionEvent::ModelRecoveryScheduled { request, attempt, max_attempts, delay_millis, error }
-            => (*request, *attempt, *max_attempts, *delay_millis, error.clone()))
+    fn recoveries(records: &[EventRecord]) -> Vec<(u64, u64, u64, String)> {
+        events!(records, SessionEvent::ModelRecoveryScheduled { request, attempt, delay_millis, error }
+            => (*request, *attempt, *delay_millis, error.clone()))
     }
 
     fn assert_schedule(records: &[EventRecord], expected_attempts: &[u64]) {
@@ -232,11 +231,11 @@ mod tests {
         let attempts = scheduled.iter().map(|entry| entry.1).collect::<Vec<_>>();
         assert_eq!(attempts, expected_attempts);
         let mut transient_attempts = std::collections::HashMap::<u64, u64>::new();
-        for (request, _attempt, maximum, delay, error) in scheduled {
+        for (request, _attempt, delay, error) in scheduled {
             let transient = transient_attempts.entry(request).or_default();
             *transient += 1;
             let expected = recovery_delay(&recoverable(), *transient).as_millis() as u64;
-            assert_eq!((maximum, delay), (None, expected));
+            assert_eq!(delay, expected);
             assert_eq!(error, recoverable().to_string());
             let requested = records.iter().filter(|record| record.sequence == request);
             assert_eq!(
@@ -307,9 +306,8 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_secs(90));
         let records = fixture.records().await;
         let scheduled = recoveries(&records).into_iter();
-        let scheduled =
-            scheduled.map(|(_, attempt, max, delay, error)| (attempt, max, delay, error));
-        let expected = (2, None, 90_000, recoverable().to_string());
+        let scheduled = scheduled.map(|(_, attempt, delay, error)| (attempt, delay, error));
+        let expected = (2, 90_000, recoverable().to_string());
         assert_eq!(scheduled.collect::<Vec<_>>(), [expected]);
         let requests = fixture.requests();
         assert_eq!(requests.len(), 2);
@@ -484,7 +482,6 @@ mod tests {
                 let records = fixture.records().await;
                 let scheduled = recoveries(&records);
                 assert_eq!(scheduled.len(), failures);
-                assert!(scheduled.iter().all(|recovery| recovery.2.is_none()));
                 assert_eq!(count!(&records, SessionEvent::ModelFailed { .. }), failures);
                 let (history, assistants) = fixture.history(&records);
                 for discarded in [

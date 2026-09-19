@@ -58,46 +58,12 @@ fn main() {
         }
         return;
     }
-    // Clap normally prints parse errors. Machine-mode failures are silent even
-    // before a session exists; explicit help/version retain their normal output.
-    let cli: Vec<_> = std::env::args_os().collect();
-    let dumping = cli
-        .iter()
-        .skip(1)
-        .take_while(|arg| arg.as_os_str() != "--")
-        .any(|arg| arg == "--dump" || arg.to_str().is_some_and(|arg| arg.starts_with("--dump=")));
-    let silent = !dumping
-        && cli
-            .iter()
-            .skip(1)
-            .take_while(|arg| arg.as_os_str() != "--")
-            .any(|arg| {
-                arg == "--non-interactive"
-                    || arg
-                        .to_str()
-                        .is_some_and(|arg| arg.starts_with("--non-interactive="))
-            });
-    let invocation = match cli::parse_from(cli) {
-        Ok(invocation) => invocation,
-        Err(error) => {
-            if !silent
-                || matches!(
-                    error.kind(),
-                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
-                )
-            {
-                error.exit();
-            }
-            std::process::exit(2);
-        }
-    };
+    let invocation = cli::parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
     // SAFETY: startup is still single-threaded: no Tokio runtime, terminal,
     // tracing subscriber, provider, or background worker has been started.
     // Parse Clap first so help/version do not depend on a valid .env file.
     if let Err(error) = unsafe { dotenv::load_invocation_env() } {
-        if !silent {
-            eprintln!("skyhook: {error}");
-        }
+        eprintln!("skyhook: {error}");
         std::process::exit(1);
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -106,9 +72,7 @@ fn main() {
     {
         Ok(runtime) => runtime,
         Err(_) => {
-            if !silent {
-                eprintln!("skyhook: could not start async runtime");
-            }
+            eprintln!("skyhook: could not start async runtime");
             std::process::exit(1);
         }
     };
@@ -131,7 +95,8 @@ async fn run(invocation: Invocation) {
         }
         Invocation::Headless(request, input) => {
             // Do not install any terminal, renderer, or tracing subscriber here.
-            if headless::run(request, input).await.is_err() {
+            if let Err(error) = headless::run(request, input).await {
+                eprintln!("skyhook: {error}");
                 std::process::exit(1);
             }
         }

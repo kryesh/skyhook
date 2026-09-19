@@ -1,4 +1,4 @@
-//! A single root operation with journal-only diagnostics and deterministic cleanup.
+//! A single root operation with journaled diagnostics and deterministic cleanup.
 use super::{
     cli::{ExecutionRequest, InitialInput},
     launch::{self, Launch},

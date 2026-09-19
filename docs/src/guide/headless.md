@@ -17,8 +17,9 @@ Headless mode uses only the selected workspace's history, just like the terminal
 
 Assistant output, script console output/results, startup warnings, and execution diagnostics remain
 in the session logs; they are not printed to stdout or stderr. The process exits successfully when
-the submitted operation and shutdown succeed, and nonzero on failure or interruption. A failure
-before a session can be opened produces no session-ID line. Explicit `--help` and `--version`
+the submitted operation and shutdown succeed. On failure or interruption it exits nonzero and
+prints the error to stderr; stdout still carries only the session ID. A failure before a session
+can be opened produces no session-ID line. Explicit `--help` and `--version`
 retain their normal output. Headless mode is not a line-oriented conversation over stdin.
 
 The submitted root turn or workflow defines completion. A workflow must explicitly await background

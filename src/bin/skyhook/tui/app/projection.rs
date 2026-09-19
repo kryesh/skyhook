@@ -98,6 +98,14 @@ impl App {
             self.content_dirty = false;
         }
     }
+    /// The root's turn ended, or is held, interrupted: nothing more to interrupt.
+    pub(super) fn root_interrupted(&self) -> bool {
+        matches!(
+            self.snapshot.activity.get(self.root_agent()),
+            Some(AgentActivity::Interrupted | AgentActivity::Failed(_))
+        )
+    }
+
     pub fn busy(&self) -> bool {
         self.switching.is_some()
             || self.start.is_creating()

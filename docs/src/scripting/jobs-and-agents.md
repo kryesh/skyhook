@@ -12,16 +12,18 @@ resumable. After a session interruption, retry resumes every retained failed/int
 parent that is waiting on work untouched and does not add a root model request. Retrying without
 an instruction continues the same history without adding a synthetic user or parent-input
 message.
-Children do not need `receive()` to read these updates. Every visible child text reply,
-including text-only and final replies, is delivered independently through the background-job
-event path, without waiting for the child job to finish. `wait` resolves when the agent can act:
+Children do not need `receive()` to read these updates. A background child's visible text
+replies, including text-only and final replies, are delivered independently through the
+background-job event path, without waiting for the child job to finish. A foreground child is a
+call: its result carries its final reply, its progress replies are not delivered, and nothing
+about it arrives as a later event. `wait` resolves when the agent can act:
 while the agent has other foreground work outstanding it keeps waiting, and the next model request
 then carries every accumulated event together; otherwise any pending event resolves it. Each
 notification resolves a given caller's `wait` once, and `wait` never consumes content. Message events carry
 `kind: "message"`, the child job `id`, source `message` sequence, optional `name`, and `text`.
 Completion is determined separately by the agent's remaining work and queued inputs, not by
-message delivery. A completed child notification references its `last_message` instead of
-repeating that reply, as do automatic model tool responses for completed children. Explicit
+message delivery. A completed background child's notification references its `last_message`
+instead of repeating the reply that already arrived as an event. Explicit
 `job_output` reads and native script/host calls still expose the saved final result.
 Progress text is not concatenated into that final result. A foreground call still needs to
 return before its parent can make another model request.
@@ -30,7 +32,7 @@ acknowledgment boundary. Failed or abandoned preparation leaves notifications pe
 caller cancellation cannot split a started append/acknowledgment operation. Pending messages
 are recovered from committed child history after restart; committed parent notifications
 acknowledge each message independently and prevent duplicate delivery. Reading or claiming a
-job result does not consume its message events. Legacy message notifications and exact final
+background job's result does not consume its message events. Legacy message notifications and exact final
 replies in completed runtime notifications are recognized on replay. An old output-claim marker
 alone is not evidence of message delivery, so such a reply may be delivered again rather than
 discarded. Delivery means inclusion in parent history at a request boundary, not interruption

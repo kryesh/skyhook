@@ -36,13 +36,9 @@ pub(super) fn working_entry(
         {
             AgentDisplayState::Working
         }
-        Some(AgentActivity::Reconnecting {
-            attempt,
-            max_attempts,
-        }) => AgentDisplayState::Reconnecting {
-            attempt: *attempt,
-            max_attempts: *max_attempts,
-        },
+        Some(AgentActivity::Reconnecting { attempt }) => {
+            AgentDisplayState::Reconnecting { attempt: *attempt }
+        }
         Some(AgentActivity::Compacting) => AgentDisplayState::Compacting,
         _ => return None,
     };

@@ -425,6 +425,7 @@ impl App {
                 let model = (active.as_ref() != Some(&self.model)).then(|| self.model.clone());
                 let tx = self.tx.clone();
                 let notices = self.root_notifier();
+                notices.send("Continue requested");
                 let requested_model = model.clone();
                 tokio::spawn(async move {
                     let outcome = session

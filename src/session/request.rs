@@ -582,7 +582,6 @@ mod tests {
             retained: vec![1],
             request: 4,
             attempt: 1,
-            max_context: 128_000,
             before_tokens: 100_000,
             after_tokens: 10_000,
         };

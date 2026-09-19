@@ -12,7 +12,7 @@ pub(crate) use captures::{
 };
 pub(crate) use reader::Source;
 mod truncation;
-use super::{JobError, JobManager, JobRole, JobState, OutputPresentation};
+use super::{JobError, JobManager, JobRole, JobState, OutputPresentation, views};
 use crate::{
     identity::JobId,
     session::{CaptureRow, SharedDb},
@@ -646,11 +646,14 @@ impl JobManager {
             (
                 entry.envelope(args.job),
                 entry.output_schema.clone().unwrap_or(Value::Bool(true)),
+                // A background child's reply arrived as an event; a foreground
+                // child's is its result.
                 entry.last_agent_message.filter(|_| {
                     !explicit
                         && presentation == OutputPresentation::Automatic
                         && entry.role == JobRole::Agent
                         && entry.state == JobState::Completed
+                        && views::effectively_background(&jobs, args.job)
                 }),
                 if output_selection == OutputSelection::WholeWithImages {
                     entry.images.clone()

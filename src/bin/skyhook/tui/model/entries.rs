@@ -854,7 +854,6 @@ mod tests {
         let scheduled = SessionEvent::ModelRecoveryScheduled {
             request,
             attempt: 2,
-            max_attempts: Some(3),
             delay_millis: 1000,
             error: error.clone(),
         };
@@ -862,7 +861,7 @@ mod tests {
         let cards = render(&snapshot, &agent, false);
         let text = cards[0].text();
         assert_eq!((cards.len(), text.lines().count()), (1, 2));
-        assert!(text.contains("attempt 2 of 3") && text.contains("HTTP 503 overloaded"));
+        assert!(text.contains("attempt 2") && text.contains("HTTP 503 overloaded"));
         assert!(!text.contains('\u{1b}') && text.chars().count() < 320 && text.ends_with('…'));
         assert!(snapshot.records.values().any(|r| matches!(&r.event,
             SessionEvent::ModelFailed { error: stored, .. } if stored == &error)));

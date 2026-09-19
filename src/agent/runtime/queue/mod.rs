@@ -99,6 +99,7 @@ impl SessionHandle {
             }
         }
         if !batch.is_empty() {
+            self.runtime.redirect(&self.root, false).await;
             let _ = self.root_tx.send(AgentCommand::QueuedInputs(batch)).await;
         }
         receipts

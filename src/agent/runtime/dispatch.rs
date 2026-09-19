@@ -132,7 +132,6 @@ impl PreparedAgentLaunch {
             let session = first.then(|| SessionEvent::SessionStarted {
                 targets: harness.target_definitions.clone(),
                 capabilities: harness.capabilities.iter().collect(),
-                max_child_depth: u32::try_from(harness.max_child_depth).unwrap_or(u32::MAX),
             });
             let events = session.into_iter().chain([started]);
             let id = &agent_loop.id;

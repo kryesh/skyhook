@@ -10,8 +10,9 @@ pub(crate) struct LiveWork {
     /// Foreground non-agent jobs. They hold the turn and have no resume point, so an
     /// interrupt cancels them; retained children and background work survive it.
     pub(crate) blocking: Vec<JobId>,
-    /// A foreground job, child agents included, that is not itself parked in a
-    /// `wait`. While one exists the agent cannot act, so a `wait` defers to it.
+    /// A foreground job, child agents included, that is working: neither parked in
+    /// a `wait` nor suspended. While one exists the agent cannot act, so a `wait`
+    /// defers to it.
     pub(crate) holding: Option<JobId>,
 }
 
@@ -22,6 +23,8 @@ pub(crate) struct WaitState {
     pub(crate) unseen: bool,
     /// The input revision this caller was last shown, if it is a script.
     pub(crate) seen_input: Option<u64>,
+    /// The caller is a script's wait, not one the model called.
+    pub(crate) hosted: bool,
     /// What to record as the caller's floor if it reports now.
     pub(crate) stamp: u64,
 }
@@ -55,7 +58,7 @@ fn classify(jobs: &HashMap<JobId, JobEntry>, owner: &AgentId) -> LiveWork {
         if entry.role != JobRole::Agent {
             work.blocking.push(*id);
         }
-        if !parked.contains(id) {
+        if !parked.contains(id) && !entry.suspended() {
             work.holding.get_or_insert(*id);
         }
     }
@@ -65,7 +68,7 @@ fn classify(jobs: &HashMap<JobId, JobEntry>, owner: &AgentId) -> LiveWork {
 /// Whether `id` or any ancestor launched by the same agent is background: a
 /// foreground call inside a background script does not hold the agent either.
 /// Stops at the agent boundary, whose launch mode belongs to the parent agent.
-fn effectively_background(jobs: &HashMap<JobId, JobEntry>, id: JobId) -> bool {
+pub(super) fn effectively_background(jobs: &HashMap<JobId, JobEntry>, id: JobId) -> bool {
     let mut next = jobs.get(&id);
     while let Some(entry) = next {
         if entry.background {
@@ -125,8 +128,8 @@ struct PresentedJob<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "question_or_output_schema")]
     output: Option<&'a Value>,
-    /// Source sequence of the last visible child reply. Automatic completed-agent
-    /// notifications reference that message instead of repeating the saved result.
+    /// Source sequence of the last visible child reply. A completed background
+    /// child's notification references it instead of repeating the saved result.
     #[serde(skip_serializing_if = "Option::is_none")]
     last_message: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -368,6 +371,40 @@ impl JobManager {
         classify(&*self.inner.jobs.lock().await, owner)
     }
 
+    /// Release `owner`'s suspended foreground jobs: they go on in the background,
+    /// so waits on them return and their restarts report through delivery.
+    pub(crate) async fn release_held(&self, owner: &AgentId) -> Vec<JobId> {
+        let mut jobs = self.inner.jobs.lock().await;
+        let held: Vec<_> = jobs
+            .iter()
+            .filter(|(id, entry)| {
+                &entry.agent == owner && entry.suspended() && !effectively_background(&jobs, **id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &held {
+            let entry = jobs.get_mut(id).expect("selected above");
+            entry.background = true;
+            entry.notify.notify_waiters();
+        }
+        held
+    }
+
+    /// Whether `owner` has a suspended foreground job to release.
+    pub(crate) async fn has_suspended(&self, owner: &AgentId) -> bool {
+        let jobs = self.inner.jobs.lock().await;
+        jobs.iter().any(|(id, entry)| {
+            &entry.agent == owner && entry.suspended() && !effectively_background(&jobs, *id)
+        })
+    }
+
+    /// Whether the job ended, other than by a retained interruption.
+    pub(crate) async fn settled(&self, id: JobId) -> bool {
+        self.entry(id, |entry| entry.state.is_terminal() && !entry.suspended())
+            .await
+            .unwrap_or(true)
+    }
+
     /// Mark `caller` parked and resolve its decision under one lock, so concurrent
     /// waits classify each other consistently.
     pub(crate) async fn wait_state(&self, owner: &AgentId, caller: JobId) -> WaitState {
@@ -377,9 +414,11 @@ impl JobManager {
         {
             self.parked_signal(owner).notify_waiters();
         }
-        let floor = script_host(&jobs, caller).and_then(|host| jobs.get(&host)?.wait_floor);
+        let host = script_host(&jobs, caller);
+        let floor = host.and_then(|host| jobs.get(&host)?.wait_floor);
         let since = floor.map_or(0, |(stamp, _)| stamp);
         WaitState {
+            hosted: host.is_some(),
             holding: classify(&jobs, owner).holding,
             unseen: jobs
                 .values()

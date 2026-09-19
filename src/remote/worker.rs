@@ -76,7 +76,6 @@ where
                 crate::session::SessionEvent::SessionStarted {
                     targets: Vec::new(),
                     capabilities: crate::tool::policy::Capability::ALL.to_vec(),
-                    max_child_depth: 0,
                 },
             ),
             (

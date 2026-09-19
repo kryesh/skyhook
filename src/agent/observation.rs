@@ -15,10 +15,7 @@ use tokio::sync::broadcast;
 pub enum AgentActivity {
     Idle,
     Working,
-    Reconnecting {
-        attempt: u64,
-        max_attempts: Option<u64>,
-    },
+    Reconnecting { attempt: u64 },
     Tools,
     WaitingChildren,
     Compacting,
@@ -75,20 +72,13 @@ impl ObservationSnapshot {
                     return;
                 }
                 match &record.event {
-                    SessionEvent::ModelRecoveryScheduled {
-                        attempt,
-                        max_attempts,
-                        ..
-                    } => {
+                    SessionEvent::ModelRecoveryScheduled { attempt, .. } => {
                         // ModelFailed settles only its response. Recovery keeps the
                         // agent active without turning a transport failure into a
                         // terminal agent/job failure.
                         self.activity.insert(
                             record.agent.clone(),
-                            AgentActivity::Reconnecting {
-                                attempt: *attempt,
-                                max_attempts: *max_attempts,
-                            },
+                            AgentActivity::Reconnecting { attempt: *attempt },
                         );
                     }
                     SessionEvent::ModelAttemptStarted { request, .. } => {
@@ -257,6 +247,15 @@ impl RuntimeEvents {
         }
     }
 
+    /// Whether the agent's last turn failed or was interrupted and can be continued.
+    pub(crate) fn retryable(&self, agent: &AgentId) -> bool {
+        let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(
+            state.activity.get(agent),
+            Some(AgentActivity::Failed(_) | AgentActivity::Interrupted)
+        )
+    }
+
     pub fn send(&self, event: RuntimeEvent) {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let RuntimeEvent::Record(record) = &event
@@ -348,10 +347,7 @@ mod tests {
         hub.send(attempt(1));
         let observed = hub.observe().snapshot;
         assert_eq!(observed.activity.get(&agent), Some(&AgentActivity::Tools));
-        let recovering = AgentActivity::Reconnecting {
-            attempt: 1,
-            max_attempts: None,
-        };
+        let recovering = AgentActivity::Reconnecting { attempt: 1 };
         hub.send(activity(recovering));
         hub.send(attempt(2));
         let observed = hub.observe().snapshot;
@@ -407,7 +403,6 @@ mod tests {
         SessionEvent::ModelRecoveryScheduled {
             request: 7,
             attempt,
-            max_attempts: Some(3),
             delay_millis: 1000,
             error: "connection lost".into(),
         }
@@ -476,10 +471,7 @@ mod tests {
         assert_eq!(*found, AgentActivity::Working);
         record(&hub, &agent, 9, scheduled(2));
         let snapshot = hub.observe().snapshot;
-        let reconnecting = AgentActivity::Reconnecting {
-            attempt: 2,
-            max_attempts: Some(3),
-        };
+        let reconnecting = AgentActivity::Reconnecting { attempt: 2 };
         assert_eq!(snapshot.activity[&agent], reconnecting);
         let response = &snapshot.responses[&key];
         assert!(response.settled);

@@ -14,8 +14,15 @@ impl Harness {
         let root = AgentId::root(id);
         let selection = crate::session::agent_selection(&records, &root);
         let runtime = SessionRuntime::build(self.inner.clone(), store, records).await?;
-        runtime.settle_interrupted_work().await?;
-        runtime.start_root(selection).await
+        let interrupted = runtime.settle_interrupted_work().await?;
+        let session = runtime.start_root(selection).await?;
+        // Starting an agent marks it idle; a turn settled here can be continued.
+        for agent in &interrupted {
+            session
+                .runtime
+                .activity(agent, crate::agent::AgentActivity::Interrupted);
+        }
+        Ok(session)
     }
 }
 impl SessionHandle {
@@ -153,30 +160,17 @@ impl SessionHandle {
             return Err(HarnessError::UnknownModelProfile(model.clone()));
         }
         let model = options.model;
-        // Interrupt requests cancel model futures before their owning job has
-        // finished journaling. An immediate resume must not miss those children.
-        let interrupted = self
-            .runtime
-            .agents()
-            .iter()
-            .filter(|(_, agent)| agent.control.retryable_interrupt.load(Ordering::Acquire))
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        self.runtime
-            .jobs
-            .settle_interrupted_agents(&interrupted)
-            .await;
-        let root_retryable = matches!(
-            self.runtime
-                .events
-                .observe()
-                .snapshot
-                .activity
-                .get(&self.root),
-            Some(crate::agent::AgentActivity::Failed(_) | crate::agent::AgentActivity::Interrupted)
-        );
+        // An immediate resume must not miss children still journaling.
+        self.runtime.settle_interrupts().await;
         let children_resumed = self.runtime.jobs.continue_resumable_children().await?;
-        if root_retryable {
+        let root_retryable = self.runtime.events.retryable(&self.root);
+        let holding = self.runtime.jobs.live_work(&self.root).await.holding;
+        if root_retryable && holding.is_some() {
+            // The root's wait resumes with its restarted children.
+            self.runtime
+                .activity(&self.root, crate::agent::AgentActivity::WaitingChildren);
+        }
+        if root_retryable && holding.is_none() {
             // An independently failed root has no live wait to preserve; continue
             // it after scheduling descendant recovery.
             let model_applied = model.is_some();
@@ -234,6 +228,7 @@ impl SessionHandle {
         let content = self
             .prepare_prompt(text.into(), attachments, &options)
             .await?;
+        self.runtime.redirect(&self.root, true).await;
         self.submit(content, options.model).await
     }
 
@@ -407,11 +402,6 @@ mod tests {
         for resume in 0..2 {
             let resumed = harness.resume_session(id).await.unwrap();
             let records = resumed.runtime.store.records().await;
-            assert_eq!(
-                count!(&records, SessionEvent::SessionResumed),
-                1,
-                "resume {resume}"
-            );
             let interrupted = events!(&records,
                 SessionEvent::ModelAttemptInterrupted { request, attempt } => (*request, *attempt));
             assert_eq!(interrupted, [(request.sequence, 1)]);
@@ -422,6 +412,8 @@ mod tests {
                 (results[0][0].call_id.as_str(), results[0][0].is_error),
                 ("orphan", true)
             );
+            // The resume that settles the turn can continue it.
+            assert_eq!(resumed.runtime.events.retryable(&resumed.root), resume == 0);
             shutdown_session(resumed).await;
         }
     }
@@ -522,6 +514,138 @@ mod tests {
         let history = serde_json::to_string(&child.history).unwrap();
         assert!(history.contains("work") && history.contains("child done"));
         assert!(history.contains("Owner input"));
+        shutdown_session(resumed).await;
+    }
+
+    /// A process killed while a foreground child works leaves the root's call
+    /// open. Resume settles it with an error result, so nothing waits on the child
+    /// any more; retry restarts the child and its answer reaches the root as an event.
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_a_crash_delivers_a_retained_foreground_childs_answer() {
+        for answered in [false, true] {
+            crash_then_retry(answered).await;
+        }
+    }
+
+    async fn crash_then_retry(answered: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let requests = Requests::default();
+        let provider = scripted_provider(&requests, [answer("first")]);
+        let harness = test_harness(root.path(), &sessions, provider).await;
+        let session = harness.new_session().await.unwrap();
+        assert_eq!(session.prompt("hello").await.unwrap(), "first");
+        // What a process killed while its foreground child worked leaves behind.
+        let store = &session.runtime.store;
+        let root_agent = session.root.clone();
+        let call = ToolCall::new("delegate", "agent", json!({"prompt": "work"})).unwrap();
+        let assistant = Message::Assistant(vec![AssistantContent::tool_call("delegate", 0, call)]);
+        let launch = store
+            .append(
+                root_agent.clone(),
+                SessionEvent::MessageCommitted { message: assistant },
+            )
+            .await
+            .unwrap();
+        let job = crate::identity::JobId::new(1).unwrap();
+        let location = crate::execution::ExecutionLocation::root(root.path().to_owned());
+        let events = vec![
+            (
+                root_agent.clone(),
+                SessionEvent::JobCreated {
+                    job,
+                    parent: None,
+                    origin: Some(crate::session::ModelCallOrigin {
+                        message: launch.sequence,
+                        call_id: "delegate".into(),
+                    }),
+                    tool: "agent".into(),
+                    role: crate::job::JobRole::Agent,
+                    name: None,
+                    arguments: json!({"prompt": "work"}),
+                    output_schema: None,
+                    accepts_input: true,
+                    background: false,
+                    authorization_scope: None,
+                    location: location.clone(),
+                },
+            ),
+            (
+                root_agent.clone(),
+                SessionEvent::JobStateChanged {
+                    job,
+                    state: crate::job::JobState::Running,
+                },
+            ),
+        ];
+        store.append_all(events).await.unwrap();
+        let started =
+            crate::session::fixture::child_started(Some(root_agent.clone()), Some(job), location);
+        store.append(root_agent.child(1), started).await.unwrap();
+        if answered {
+            // A second crash: the first resume answered the call and retry restarted
+            // the child, which was working again when the process died.
+            let result = crate::provider::protocol::ToolResult {
+                call_id: "delegate".into(),
+                name: "agent".into(),
+                result: json!({"error": "interrupted while the session was not running"}),
+                images: Vec::new(),
+                is_error: true,
+            };
+            let events = vec![
+                (
+                    root_agent.clone(),
+                    SessionEvent::JobFinished {
+                        job,
+                        state: crate::job::JobState::Interrupted,
+                        error: Some("interrupted while the session was not running".into()),
+                        images: Vec::new(),
+                        denial: None,
+                    },
+                ),
+                (
+                    root_agent.clone(),
+                    SessionEvent::MessageCommitted {
+                        message: Message::Tool(vec![result]),
+                    },
+                ),
+                (
+                    root_agent.clone(),
+                    SessionEvent::JobStateChanged {
+                        job,
+                        state: crate::job::JobState::Running,
+                    },
+                ),
+            ];
+            store.append_all(events).await.unwrap();
+        }
+        let id = session.id();
+        shutdown_session(session).await;
+
+        // Steps serve requests in arrival order; the root's continuation and the
+        // restarted child race, so every answer reads the same.
+        let steps = [(); 3].map(|()| Step::new(answer("recovered")));
+        let provider = Script::new(steps, &requests);
+        let harness = test_harness(root.path(), &sessions, provider).await;
+        let resumed = harness.resume_session(id).await.unwrap();
+        assert!(resumed.runtime.jobs.is_background(job).await.unwrap());
+        bounded(resumed.continue_turn()).await.unwrap();
+        // The child's answer reaches the root as a job event.
+        bounded(async {
+            loop {
+                let delivered = requests.lock().unwrap().iter().any(|request| {
+                    let history = rendered(request);
+                    history.contains("skyhook_job_events") && history.contains("recovered")
+                });
+                if delivered {
+                    break;
+                }
+                poll().await;
+            }
+        })
+        .await;
+        let records = resumed.runtime.store.records().await;
+        assert_eq!(count!(&records, SessionEvent::AgentStarted { .. }), 2);
         shutdown_session(resumed).await;
     }
 

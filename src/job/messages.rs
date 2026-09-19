@@ -27,13 +27,23 @@ impl JobEntry {
                 && self.delivery_stamp > floor)
     }
 
-    /// Queue a child reply for delivery, reporting whether it was published: a
-    /// blank turn is not a reply and must not wake the owner.
-    pub(super) fn publish_message(&mut self, id: JobId, sequence: u64, text: String) -> bool {
+    /// Record a child reply and, for a background child, queue it for delivery;
+    /// reports whether it was queued. A blank turn is not a reply, and a foreground
+    /// child's replies are read through its result, so neither wakes the owner.
+    pub(super) fn publish_message(
+        &mut self,
+        id: JobId,
+        sequence: u64,
+        text: String,
+        deliver: bool,
+    ) -> bool {
         if text.is_empty() {
             return false;
         }
         self.last_agent_message = Some(sequence);
+        if !deliver {
+            return false;
+        }
         self.message_stamp = super::next_pending_stamp();
         self.messages.push(AgentMessage {
             id,
@@ -114,11 +124,11 @@ impl JobManager {
                 .await?
                 .swap_remove(0);
             let mut jobs = manager.inner.jobs.lock().await;
+            let deliver = views::effectively_background(&jobs, job);
             let entry = jobs.get_mut(&job).ok_or(JobError::Unknown(job))?;
             entry.child = Some(child);
-            let published = entry.publish_message(job, record.sequence, text);
+            let published = entry.publish_message(job, record.sequence, text, deliver);
             if published && wake_owner {
-                // Foreground child replies are just as deliverable as background ones.
                 let _ = manager
                     .inner
                     .completions
@@ -311,41 +321,29 @@ mod tests {
         manager.pending_delivery(owner).await.unwrap().messages()[0].clone()
     }
 
+    /// A foreground child is a call: its replies are never delivered as events, and
+    /// claiming its result consumes them, live and across replay.
     #[tokio::test]
-    async fn messages_are_independent_of_claims_and_foreground_lifecycle() {
+    async fn foreground_replies_are_consumed_by_the_result() {
         let (_root, manager, owner, child, job) = child_job(false).await;
-        let mut wakes = manager.subscribe_completions();
-        let first = commit(&manager, &child, job, "first").await;
-        assert_eq!(wakes.recv().await.unwrap().agent, owner);
-        let receipt = manager.pending_delivery(&owner).await.unwrap();
-        assert_eq!(sequences(&receipt), vec![first]);
-        ack(receipt).await;
+        commit(&manager, &child, job, "first").await;
         let second = commit(&manager, &child, job, "second").await;
-        assert_eq!(wakes.recv().await.unwrap().job, job);
+        let receipt = manager.pending_delivery(&owner).await.unwrap();
+        assert!(receipt.messages().is_empty() && receipt.envelopes().is_empty());
+        drop(receipt);
         finish(&manager, job).await;
         manager.claim(job).await.unwrap();
-        assert!(manager.has_pending(&owner).await);
-        let receipt = manager.pending_delivery(&owner).await.unwrap();
-        assert!(receipt.envelopes().is_empty());
-        assert_eq!(sequences(&receipt), vec![second]);
-        drop(receipt);
-        let restored = manager.test_replay().await;
-        let receipt = restored.pending_delivery(&owner).await.unwrap();
-        assert_eq!(sequences(&receipt), [second]);
-        ack(receipt).await;
-        assert!(!restored.has_pending(&owner).await);
-        assert_eq!(
-            restored.last_agent_message(job).await.unwrap(),
-            Some(second)
-        );
-        let output = restored.snapshot(job).await.unwrap().output;
-        assert_eq!(output, Some(serde_json::json!("saved result")));
-        assert!(!restored.test_replay().await.has_pending(&owner).await);
+        for state in [manager.clone(), manager.test_replay().await] {
+            assert!(!state.has_pending(&owner).await);
+            assert_eq!(state.last_agent_message(job).await.unwrap(), Some(second));
+            let output = state.snapshot(job).await.unwrap().output;
+            assert_eq!(output, Some(serde_json::json!("saved result")));
+        }
     }
 
     #[tokio::test]
     async fn replay_derives_publication_and_ack_from_source_history_only() {
-        let (_root, manager, owner, child, job) = child_job(false).await;
+        let (_root, manager, owner, child, job) = child_job(true).await;
         let mut item = AssistantContent::text("visible", 0, "visible");
         item.blocks.push(crate::provider::protocol::AssistantBlock {
             id: "secret".into(),
@@ -682,7 +680,7 @@ mod tests {
 
     #[tokio::test]
     async fn child_commit_is_shielded_from_cancellation_and_serialized_with_receipts() {
-        let (_root, manager, owner, child, job) = child_job(false).await;
+        let (_root, manager, owner, child, job) = child_job(true).await;
         let receipt = manager.pending_delivery(&owner).await.unwrap();
         let mut wakes = manager.subscribe_completions();
         let message = assistant("survives");
@@ -832,19 +830,17 @@ mod tests {
 
     #[tokio::test]
     async fn claims_without_parent_delivery_evidence_never_acknowledge_last_reply() {
-        for background in [false, true] {
-            let (_root, manager, owner, child, job) = child_job(background).await;
-            let last = commit(&manager, &child, job, "final reply").await;
-            manager
-                .test_finish(job, serde_json::json!("final reply"))
-                .await;
-            manager.claim(job).await.unwrap();
-            assert_eq!(
-                first_pending(&manager.test_replay().await, &owner)
-                    .await
-                    .message,
-                last
-            );
-        }
+        let (_root, manager, owner, child, job) = child_job(true).await;
+        let last = commit(&manager, &child, job, "final reply").await;
+        manager
+            .test_finish(job, serde_json::json!("final reply"))
+            .await;
+        manager.claim(job).await.unwrap();
+        assert_eq!(
+            first_pending(&manager.test_replay().await, &owner)
+                .await
+                .message,
+            last
+        );
     }
 }

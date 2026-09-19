@@ -7,6 +7,8 @@ mod wire;
 
 pub(crate) use decoder::Decoder;
 pub(crate) use encoder::encode;
+#[cfg(test)]
+pub(crate) use schema::validate_schema;
 
 pub(super) fn valid_name(name: &str) -> bool {
     !name.is_empty()

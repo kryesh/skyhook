@@ -49,7 +49,7 @@ ANTHROPIC_API_KEY="your-key"
 
 Keep `.env` out of version control and restrict its file permissions. The CLI supports normal dotenv
 quoting, comments, `export` declarations, and variable interpolation. A malformed or unreadable file
-fails startup without printing its contents; non-interactive startup errors remain silent.
+fails startup without printing its contents.
 
 ## Codex subscription login
 

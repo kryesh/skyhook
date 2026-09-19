@@ -297,7 +297,6 @@ impl SessionRuntime {
                     attempt: *model_attempt,
                     before_tokens,
                     after_tokens,
-                    max_context,
                 },
             )
             .await?

@@ -47,7 +47,6 @@ pub struct CompactionCheckpoint {
     pub request: u64,
     /// The summary attempt of `request` that produced this checkpoint.
     pub attempt: u64,
-    pub max_context: u64,
     pub before_tokens: u64,
     pub after_tokens: u64,
 }
@@ -98,10 +97,7 @@ pub enum SessionEvent {
     SessionStarted {
         targets: Vec<TargetDefinition>,
         capabilities: Vec<Capability>,
-        max_child_depth: u32,
     },
-    /// A process reopened the session and settled work that was in flight.
-    SessionResumed,
     TitleSet {
         title: String,
     },
@@ -138,7 +134,8 @@ pub enum SessionEvent {
     /// A provider call with exact ordered messages, independent of future state/configuration.
     ModelRequested {
         context: u64,
-        /// Journal sequences of the committed messages or compaction checkpoints sent as history.
+        /// Journal sequences sent as history: the agent's checkpoint, its retained
+        /// messages, then every later committed message up to the last one named.
         history: Vec<u64>,
         /// Request-specific messages sent after history.
         tail: Vec<Message>,
@@ -183,9 +180,6 @@ pub enum SessionEvent {
         request: u64,
         /// The next logical invocation; the failed attempt is `attempt - 1`.
         attempt: u64,
-        /// Historical bounded limits remain readable; None means retry indefinitely.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        max_attempts: Option<u64>,
         /// Backoff scheduled before the next invocation.
         delay_millis: u64,
         /// The failure that triggered this recovery.
@@ -222,9 +216,8 @@ pub enum SessionEvent {
         authorization_scope: Option<u64>,
         location: ExecutionLocation,
     },
-    /// A policy approved this grant for the rest of the session while authorizing `job`.
+    /// A policy approved this grant for the rest of the session.
     ApprovalGranted {
-        job: JobId,
         grant: ApprovalGrant,
     },
     /// The grant journaled at sequence `grant` no longer applies.
@@ -246,28 +239,15 @@ pub enum SessionEvent {
     JobClaimed {
         job: JobId,
     },
-    /// The job's outcome was delivered to its owner, by the `notification`
-    /// message committed in the same transaction when there is one.
+    /// The job's outcome was delivered to its owner.
     JobInjected {
         job: JobId,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        notification: Option<u64>,
     },
     /// The child reply committed at `source` reached the owner in `notification`.
     JobMessageDelivered {
         job: JobId,
         source: u64,
         notification: u64,
-    },
-    QuestionOpened {
-        job: JobId,
-        question_id: String,
-        questions: Value,
-    },
-    QuestionResolved {
-        job: JobId,
-        question_id: String,
-        answers: Value,
     },
     AgentCompleted,
     AgentInterrupted,

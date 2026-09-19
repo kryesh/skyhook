@@ -285,6 +285,10 @@ mod tests {
         for (key, value) in [("proxyjump", "a"), ("Server Alive", "1"), ("LogLevel", "")] {
             assert!(!configurable_option(key, value), "{key}");
         }
+        // Managed options with a field of their own name it.
+        let user = json!({"type": "ssh", "host": "x", "ssh": {"options": {"User": "debian"}}});
+        let error = target("x", user).unwrap_err().to_string();
+        assert!(error.contains("`ssh.user"), "{error}");
     }
 
     #[tokio::test]

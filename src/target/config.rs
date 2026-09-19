@@ -97,7 +97,7 @@ pub struct SshOptions {
     #[schemars(skip)]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub external_agent: bool,
-    /// Extra ssh_config options written verbatim, e.g. {"ProxyCommand": "sudo -n -u deploy ssh -W %h:%p gateway.internal"}.
+    /// Extra ssh_config options written verbatim, e.g. {"ProxyCommand": "sudo -n -u deploy ssh -W %h:%p gateway.internal"}. User, Port and IdentityFile belong in user, port and auth; ProxyJump in the target's via.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub options: BTreeMap<String, String>,
 }

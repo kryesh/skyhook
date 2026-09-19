@@ -473,8 +473,6 @@ mod tests {
             answer("premature child answer"),
             answer(&final_answer),
             answer("root done"),
-            // The large final message is its own batch, consumed at a no-tool boundary.
-            answer("root done"),
         ])
         .await;
         let mut events = session.runtime.events.observe().updates;
@@ -520,14 +518,15 @@ mod tests {
         });
         let result = results.find(|result| result.name == "agent").unwrap();
         assert_eq!(result.result["state"], "completed");
-        // The automatic tool result must not repeat the final text.
-        assert!(result.result.get("result").is_none());
-        assert!(result.result.get("truncated").is_none());
-        assert!(result.result["last_message"].is_u64());
+        // A foreground call returns its answer in the result and nothing else is
+        // delivered: no progress replies, and the answer only once.
+        assert!(result.result.get("last_message").is_none());
         let serialized = rendered(last);
-        assert_eq!(serialized.matches("premature child answer").count(), 1);
-        // The large final message is delivered once, independently of the tool result.
-        assert_eq!(serialized.matches("child work completed").count(), 500);
+        assert_eq!(serialized.matches("premature child answer").count(), 0);
+        let in_result = serde_json::to_string(&result.result).unwrap();
+        let answered = in_result.matches("child work completed").count();
+        assert!(answered > 0, "{in_result}");
+        assert_eq!(serialized.matches("child work completed").count(), answered);
         for request in requests.iter() {
             let system = &request.system[0].text;
             assert!(!system.contains("compaction"));
@@ -577,15 +576,23 @@ mod tests {
         .await;
         let original_jobs = session.runtime.jobs.list(&session.root).await;
         assert_eq!(original_jobs.len(), 2);
-        // Interrupt the children, not the waiting parent.
-        assert_eq!(session.interrupt().await, 2);
+        // The children are interrupted; the parent holding them shows interrupted
+        // but keeps its wait.
+        assert_eq!(session.interrupt().await, 3);
         assert!(!parent.is_finished());
         assert!(!provider.requested_from(3));
         // Resume immediately, even before the child worker journals Interrupted.
+        assert!(session.runtime.events.retryable(&session.root));
         assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
         provider.request(4).await;
-        // Resume must leave the original parent wait pending.
+        // Resume must leave the original parent wait pending, and shows it waiting
+        // again rather than interrupted.
         assert!(!parent.is_finished());
+        assert!(!session.runtime.events.retryable(&session.root));
+        assert_eq!(
+            session.observe().await.snapshot.activity.get(&session.root),
+            Some(&crate::agent::AgentActivity::WaitingChildren)
+        );
         let records = session.runtime.store.records().await;
         let interrupted = count!(&records, SessionEvent::JobFinished { state, .. } if *state == JobState::Interrupted);
         assert_eq!(interrupted, 2);
@@ -615,6 +622,123 @@ mod tests {
         provider.release(3);
         provider.release(4);
         assert_eq!(bounded(parent).await.unwrap().unwrap(), "parent done");
+        session.shutdown().await.unwrap();
+    }
+
+    /// A prompt to a parent holding interrupted children breaks the link: its held
+    /// turn ends, the prompt starts the next one, and the children stay retained.
+    #[tokio::test(start_paused = true)]
+    async fn prompt_redirects_a_parent_holding_interrupted_children() {
+        let child = json!({"prompt":"child task", "depth":0});
+        let steps = [
+            Step::new(response(vec![tool_call(0, "agent-0", "agent", child)])),
+            Step::new(Vec::new()).midstream(),
+            Step::new(answer("redirected")),
+            Step::new(answer("child recovered")).gated(),
+            Step::new(answer("parent done")),
+        ];
+        let requests = Requests::default();
+        let provider = Script::new(steps, &requests);
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        let parent_session = session.clone();
+        let parent = tokio::spawn(async move { parent_session.prompt("delegate").await });
+        provider.request(1).await;
+        bounded(async {
+            while !matches!(
+                session.observe().await.snapshot.activity.get(&session.root),
+                Some(
+                    crate::agent::AgentActivity::Tools
+                        | crate::agent::AgentActivity::WaitingChildren
+                )
+            ) {
+                poll().await;
+            }
+        })
+        .await;
+        assert_eq!(session.interrupt().await, 2);
+        assert!(!parent.is_finished());
+        assert_eq!(
+            bounded(session.prompt("new direction")).await.unwrap(),
+            "redirected"
+        );
+        assert!(bounded(parent).await.unwrap().is_err());
+        let jobs = session.runtime.jobs.list(&session.root).await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, JobState::Interrupted);
+        // The redirected request carries the interrupted result and the prompt.
+        let history = serde_json::to_string(&requests.lock().unwrap()[2].history).unwrap();
+        assert!(
+            history.contains("interrupted") && history.contains("new direction"),
+            "{history}"
+        );
+        // The retained child still continues, and its answer reaches the root as
+        // an event rather than through the ended wait.
+        assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
+        provider.request(3).await;
+        provider.release(3);
+        let woken = provider.request(4).await;
+        assert!(rendered(&woken).contains("child recovered"));
+        assert_eq!(
+            count!(
+                &session.runtime.store.records().await,
+                SessionEvent::AgentStarted { .. }
+            ),
+            2
+        );
+        session.shutdown().await.unwrap();
+    }
+
+    /// Queued input joins the held turn instead of ending it: the parent's next
+    /// request carries the child's interrupted result and the instruction together.
+    #[tokio::test(start_paused = true)]
+    async fn queued_input_redirects_a_parent_holding_an_interrupted_child() {
+        let child = json!({"prompt":"child task", "depth":0});
+        let steps = [
+            Step::new(response(vec![tool_call(0, "agent-0", "agent", child)])),
+            Step::new(Vec::new()).midstream(),
+            Step::new(answer("redirected")),
+        ];
+        let requests = Requests::default();
+        let provider = Script::new(steps, &requests);
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        let parent_session = session.clone();
+        let parent = tokio::spawn(async move { parent_session.prompt("delegate").await });
+        provider.request(1).await;
+        bounded(async {
+            while !matches!(
+                session.observe().await.snapshot.activity.get(&session.root),
+                Some(
+                    crate::agent::AgentActivity::Tools
+                        | crate::agent::AgentActivity::WaitingChildren
+                )
+            ) {
+                poll().await;
+            }
+        })
+        .await;
+        assert_eq!(session.interrupt().await, 2);
+        let prompt = QueuedPrompt {
+            text: "use the right user".into(),
+            ..Default::default()
+        };
+        let receipts = bounded(enqueue_prompts(&session, vec![prompt])).await;
+        assert!(receipts[0].is_ok());
+        assert_eq!(bounded(parent).await.unwrap().unwrap(), "redirected");
+        let history = serde_json::to_string(&requests.lock().unwrap()[2].history).unwrap();
+        assert!(
+            history.contains("interrupted") && history.contains("use the right user"),
+            "{history}"
+        );
+        assert_eq!(
+            session.runtime.jobs.list(&session.root).await[0].state,
+            JobState::Interrupted
+        );
         session.shutdown().await.unwrap();
     }
 
