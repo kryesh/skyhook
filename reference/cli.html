@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-b114b291.js";
+            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -182,11 +182,14 @@
                     <main>
                         <h1 id="command-line-reference"><a class="header" href="#command-line-reference">Command-line reference</a></h1>
 <pre><code class="language-text">skyhook [OPTIONS]
+skyhook batch [OPTIONS] &lt;--prompt TEXT|--script PATH&gt;
 skyhook auth &lt;login|status|logout&gt; [codex]
+skyhook dump [config|skills] [OPTIONS]
+skyhook stats &lt;SESSION_ID|--list&gt; [OPTIONS]
 </code></pre>
-<p>Run <code>skyhook --help</code>, <code>skyhook --version</code>, or <code>skyhook auth --help</code> for the installed
-binary’s command help. Session execution requires an interactive terminal unless
-<code>--non-interactive</code> is supplied. Dump modes do not need a terminal.</p>
+<p>Run <code>skyhook --help</code>, <code>skyhook --version</code>, or <code>skyhook &lt;subcommand&gt; --help</code> for the installed
+binary’s command help. <code>skyhook</code> itself requires an interactive terminal; <code>batch</code>, <code>dump</code> and
+<code>stats</code> do not.</p>
 <h2 id="session-options"><a class="header" href="#session-options">Session options</a></h2>
 <div class="table-wrapper">
 <table>
@@ -194,48 +197,73 @@ binary’s command help. Session execution requires an interactive terminal unle
 <tr><th>Option</th><th>Meaning</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--config PATH</code></td><td>Use only this TOML file; disable user/workspace config searching and merging.</td></tr>
-<tr><td><code>--workspace PATH</code></td><td>Set the workspace base directory (default <code>.</code>).</td></tr>
+<tr><td><code>-c, --config PATH</code></td><td>Use only this TOML file; disable user/workspace config searching and merging.</td></tr>
+<tr><td><code>-w, --workspace PATH</code></td><td>Set the workspace base directory (default <code>.</code>).</td></tr>
 <tr><td><code>--resume SESSION_ID</code></td><td>Reopen a saved session.</td></tr>
 <tr><td><code>-m, --model PROFILE</code></td><td>Choose a configured model profile for a new session. Resumed sessions retain their recorded model.</td></tr>
 <tr><td><code>-p, --prompt TEXT</code></td><td>Submit an initial user message.</td></tr>
 <tr><td><code>-s, --script PATH</code></td><td>Run a JavaScript workflow. Mutually exclusive with <code>--prompt</code>.</td></tr>
 <tr><td><code>--image PATH</code></td><td>Attach an image to the initial prompt; repeat for multiple images. Requires <code>--prompt</code>, conflicts with <code>--script</code>.</td></tr>
-<tr><td><code>--non-interactive</code></td><td>Run headlessly with exactly one prompt or script, then exit.</td></tr>
-<tr><td><code>--approve-all</code></td><td>Bypass tool approval prompts, not capability gates or authentication prompts.</td></tr>
-<tr><td><code>--capabilities LIST</code></td><td>Replace the configured policy allowlist with a comma-separated list. <code>--capabilities=</code> grants no policy capabilities.</td></tr>
+<tr><td><code>--mode NAME</code></td><td>Start the new-session prompt in this configured <a href="../guide/permissions.html#modes">mode</a> instead of the default. With <code>--resume</code>, the next message switches the session to it.</td></tr>
+<tr><td><code>-a, --approve-all</code></td><td>Bypass tool approval prompts, not capability gates or authentication prompts.</td></tr>
 <tr><td><code>-h, --help</code></td><td>Print command help.</td></tr>
 <tr><td><code>-V, --version</code></td><td>Print the version.</td></tr>
 </tbody>
 </table>
 </div>
-<p>Without <code>--non-interactive</code>, an initial prompt or script runs in the terminal interface,
-which remains open afterward. Startup without initial input opens an empty draft; no session
-is created until a message or script is submitted.</p>
-<p>Headless stdout contains only the session ID and newline, flushed before execution; results
-remain in session logs. See the <a href="../guide/headless.html">headless guide</a> for completion, errors,
-shutdown, signals, and interaction restrictions. <code>--non-interactive</code> is not an authentication
-subcommand option and cannot be combined with <code>auth</code>.</p>
-<p>Policy capability names are <code>read</code>, <code>write</code>, <code>exec</code>, <code>network</code>, <code>targets</code>, <code>agents</code>, and <code>mcp</code>.
-The runtime supplies <code>interactive</code>; it is invalid in the CLI allowlist. See
+<p>An initial prompt or script runs in the terminal interface, which remains open afterward.
+Startup without initial input opens an empty draft; no session is created until a message or
+script is submitted. These options belong to session execution only: a subcommand accepts
+just its own options, after its name.</p>
+<h2 id="batch"><a class="header" href="#batch">Batch</a></h2>
+<p><code>skyhook batch</code> runs exactly one prompt or script without a terminal, then exits. It takes the
+session options above except that <code>--prompt</code> or <code>--script</code> is required, plus:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Option</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--mode NAME</code></td><td>Run in this configured mode instead of the default. With <code>--resume</code>, the prompt switches the session to it; a script has no prompt, so that combination is an error.</td></tr>
+<tr><td><code>--capabilities LIST</code></td><td>Run with exactly this comma-separated policy allowlist instead of a mode. <code>--capabilities=</code> grants none. Conflicts with <code>--mode</code>.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Stdout contains only the session ID and newline, flushed before execution; results remain in
+session logs. See the <a href="../guide/headless.html">headless guide</a> for completion, errors, shutdown,
+signals, and interaction restrictions.</p>
+<p>Policy capability names are <code>read</code>, <code>write</code>, <code>exec</code>, <code>network</code>, <code>targets</code>, <code>ssh_agent</code>,
+<code>agents</code>, and <code>mcp</code>. The terminal supplies <code>interactive</code>; a batch job never has it. See
 <a href="../guide/permissions.html">permissions</a> for resolution and limitations.</p>
-<h2 id="dump-modes"><a class="header" href="#dump-modes">Dump modes</a></h2>
-<p><code>--dump</code> defaults to <code>--dump config</code>. The only selectors are <strong><code>config</code></strong> and <strong><code>skills</code></strong>;
-unknown selectors (including <code>agents</code>) are errors. <code>--workspace PATH</code> applies to both modes.</p>
-<pre><code class="language-sh">skyhook --dump                        # Resolved effective TOML
-skyhook --dump config &gt; effective.toml
-skyhook --workspace /path/to/project --dump config
-skyhook --config ./standalone.toml --dump config --capabilities=read --approve-all
-skyhook --workspace /path/to/project --dump skills
+<h2 id="dump"><a class="header" href="#dump">Dump</a></h2>
+<p><code>skyhook dump</code> defaults to <code>skyhook dump config</code>. The only selectors are <strong><code>config</code></strong> and
+<strong><code>skills</code></strong>; unknown selectors are errors.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Option</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-w, --workspace PATH</code></td><td>Workspace whose configuration or skills to inspect (default <code>.</code>).</td></tr>
+<tr><td><code>-c, --config PATH</code></td><td><code>config</code> only: use only this TOML file, with no user/workspace merging.</td></tr>
+<tr><td><code>-a, --approve-all</code></td><td><code>config</code> only: apply the approval override.</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-sh">skyhook dump                          # Resolved effective TOML
+skyhook dump config &gt; effective.toml
+skyhook dump config --workspace /path/to/project
+skyhook dump config --config ./standalone.toml --approve-all
+skyhook dump skills --workspace /path/to/project
 </code></pre>
-<p>Both modes are inspection-only: no terminal UI, harness, session creation, provider credential
-commands, MCP startup, or network access. API credentials are not required. They do not execute
-skill assets.</p>
+<p>Both modes are inspection-only: they do not start a session, run provider credential commands,
+connect to MCP servers, access the network, or execute skill assets. API credentials are not
+required. <code>dump skills</code> rejects <code>--config</code> and <code>--approve-all</code> as irrelevant.</p>
 <h3 id="configuration-dump"><a class="header" href="#configuration-dump">Configuration dump</a></h3>
 <p>The config dump writes the resolved effective configuration as TOML to <strong>stdout</strong>. It follows
 normal <a href="../configuration/overview.html#file-selection-and-layering">file selection and layering</a>,
-including explicit-file-only behavior for <code>--config</code>, and includes defaults plus any
-<code>--capabilities</code> and <code>--approve-all</code> overrides. Source paths and diagnostics go to <strong>stderr</strong>,
+including explicit-file-only behavior for <code>--config</code>, and includes defaults (such as the
+built-in <code>general</code> mode) plus any <code>--approve-all</code> override. Source paths and diagnostics go to <strong>stderr</strong>,
 so redirected stdout remains TOML. It exits with status <strong>0</strong> when a valid config can be produced,
 and <strong>nonzero</strong> otherwise; it does not require provider credentials to validate configuration.</p>
 <p>The dump includes literal values stored in configuration, such as MCP environment entries;
@@ -243,8 +271,8 @@ treat its output as potentially sensitive. Environment-backed API keys are not e
 credential commands are not executed. Diagnostic control characters are escaped for safe
 terminal display.</p>
 <h3 id="skills-dump"><a class="header" href="#skills-dump">Skills dump</a></h3>
-<p>The skills dump uses the same <strong>HostSkills discovery</strong> as the harness, independently of the main
-model configuration. It works without a model config or API credentials. The output is a tree of
+<p>The skills dump uses the same skill discovery as a session, independently of model configuration.
+It works without a model config or API credentials. The output is a tree of
 winning skills (after name precedence), including each source path, effective summary, complete
 YAML frontmatter, and nested assets in sorted order. Symlinks are marked and not followed;
 asset contents are not executed.</p>
@@ -253,11 +281,51 @@ asset contents are not executed.</p>
 errors were reported, even if stdout contains some valid skills. This does not change skill
 search locations: <code>~/.agents/skills</code> plus <code>.agents/skills</code> along workspace ancestry. See
 <a href="../guide/instructions-and-skills.html">instructions and skills</a>.</p>
-<h3 id="incompatible-options"><a class="header" href="#incompatible-options">Incompatible options</a></h3>
-<p>Both dump modes reject <code>--prompt</code>, <code>--script</code>, <code>--resume</code>, <code>--image</code>, <code>--non-interactive</code>,
-<code>--model</code>, and the <code>auth</code> subcommand. <code>--dump skills</code> additionally rejects <code>--config</code>,
-<code>--capabilities</code>, and <code>--approve-all</code> as irrelevant. Invalid selectors and conflicting options
-exit nonzero rather than starting a session.</p>
+<h2 id="stats"><a class="header" href="#stats">Stats</a></h2>
+<p><code>skyhook stats SESSION_ID</code> reads a saved session and reports where its tokens went,
+how its model requests ended, what each agent delegated, and which tools it called. Like
+<code>--resume</code>, it finds the session in the selected workspace’s history
+(<code>&lt;workspace&gt;/.skyhook/sessions</code>). It needs no configuration, credentials, or terminal, and it
+can read a session another process still has open.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Option</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-l, --list</code></td><td>List the workspace’s sessions, newest first, instead of reporting one; takes no <code>--format</code>.</td></tr>
+<tr><td><code>-w, --workspace PATH</code></td><td>Workspace whose session history holds the session (default <code>.</code>).</td></tr>
+<tr><td><code>-f, --format markdown|tree|json</code></td><td>Machine-readable output; omitted, the tables are rendered for reading.</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-sh">skyhook stats 94e934f0ee9c1e314c27d91977919462
+skyhook stats 94e934f0ee9c1e314c27d91977919462 --format tree
+skyhook stats 94e934f0ee9c1e314c27d91977919462 --format json | jq '.agents[].tools'
+skyhook stats --list
+</code></pre>
+<p>Without <code>--format</code>, the report is a session header (initial prompt, start time, duration, request and
+token totals) followed by aligned tables: one row per agent (path, model, completed/requested
+model calls, tool calls, input, cached, and output tokens, duration) with a total row, then
+totals per model profile and per tool.</p>
+<ul>
+<li><strong><code>markdown</code></strong> prints that document as Markdown headings and tables.</li>
+<li><strong><code>tree</code></strong> lists the agents as <code>tree</code> would, each line carrying that agent’s figures, followed
+by a one-line total.</li>
+<li><strong><code>json</code></strong> writes one JSON document with every figure: per agent, its outcome, start and
+final finish times (a resumed child counts only its last completion),
+usage, request counts (requested, completed, failed, interrupted, attempts), compactions, jobs
+created by role, and calls, errors, and unanswered calls per tool; plus per-model and
+per-tool totals and the session totals.</li>
+</ul>
+<p><code>--list</code> prints one row per session: id, start time, the initial prompt’s first 60 characters,
+and the same totals as a report’s total row. Sessions written by an earlier session format
+are left out.</p>
+<p>Agent paths are built from names like directories: the root agent is <code>/</code>, and an agent named
+<code>bar</code> spawned by <code>/foo</code> is <code>/foo/bar</code>; a later sibling with the same name is <code>/foo/bar#2</code>.
+Names come from the job that spawned the agent. Model call counts
+cover agent turns only, while token figures include compaction requests. Sessions written by an
+earlier session format are refused with a nonzero exit.</p>
 <h2 id="authentication-commands"><a class="header" href="#authentication-commands">Authentication commands</a></h2>
 <pre><code class="language-sh">skyhook auth login
 skyhook auth login --headless
@@ -266,7 +334,7 @@ skyhook auth logout
 </code></pre>
 <p>The optional provider argument currently accepts only <code>codex</code>, which is the default.
 <code>auth login --headless</code> selects device authorization rather than a browser; it is separate
-from session <code>--non-interactive</code>. Login does not require model configuration.
+from <code>skyhook batch</code>. Login does not require model configuration.
 See <a href="../configuration/authentication.html">authentication</a> for credential ownership and storage.</p>
 <h2 id="related-settings"><a class="header" href="#related-settings">Related settings</a></h2>
 <p>The <a href="../configuration/overview.html">configuration overview</a> describes configuration paths

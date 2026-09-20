@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-b114b291.js";
+            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -199,9 +199,10 @@ configurations are loaded. An unreadable or invalid workspace file is an error.<
 A broken user file is not silently treated as missing if no fallback succeeds. The effective
 configuration must be valid; defaults are applied <strong>after merging</strong>.</p>
 <p>Tables merge recursively; arrays and scalar values replace the earlier value. The exception is
-<strong>named entries under <code>targets</code></strong>: a workspace <code>[targets.build]</code> replaces the <em>whole</em> user
-<code>[targets.build]</code> entry, including its SSH, authentication, workspace, and routing settings.
-It does not inherit omitted fields. Other named targets remain available.</p>
+<strong>named entries under <code>targets</code> and <code>modes</code></strong>: a workspace entry replaces the <em>whole</em> user
+entry of the same name, without inheriting omitted fields. For example, <code>[targets.build]</code>
+replaces that target’s SSH, authentication, workspace, and routing settings; <code>[modes.general]</code>
+replaces that mode’s capabilities, instructions, and hint. Other named entries remain available.</p>
 <h3 id="example-user-models-workspace-targets"><a class="header" href="#example-user-models-workspace-targets">Example: user models, workspace targets</a></h3>
 <p>Keep provider/model definitions in the selected user <code>config.toml</code>:</p>
 <pre><code class="language-toml">[providers.openai]
@@ -230,7 +231,8 @@ kind = "key"
 path = "~/.ssh/old-build"
 </code></pre>
 <p>Then use this <code>&lt;workspace&gt;/.skyhook/config.toml</code>:</p>
-<pre><code class="language-toml">capabilities = ["read", "write", "exec", "targets"]
+<pre><code class="language-toml">[modes.general]
+capabilities = ["read", "write", "exec", "targets"]
 
 [targets.build]
 type = "ssh"
@@ -238,13 +240,13 @@ host = "new-build.example.com"
 workspace = "/srv/project"
 </code></pre>
 <p>The effective configuration retains <code>providers.openai</code>, <code>models.default</code>, and <code>targets.bastion</code>.
-The capabilities array is replaced, not extended. <code>targets.build</code> uses the new host and workspace,
+A named mode or target is replaced whole, not merged: <code>modes.general</code> grants exactly the listed
+capabilities, and <code>targets.build</code> uses the new host and workspace,
 with default authentication/routing behavior: neither the old key nor <code>via = "bastion"</code> survives.
 If a route or key is needed, repeat it explicitly in the workspace entry.</p>
 <p><strong>Trust boundary:</strong> workspace configuration is full configuration, not a restricted project hint.
-It can change approvals, capabilities, provider credential commands, and MCP server startup.
-Review it before starting Skyhook in an untrusted checkout. This repository currently ignores
-<code>.skyhook/</code>, so creating <code>.skyhook/config.toml</code> does <strong>not</strong> automatically make it versioned.</p>
+It can change approvals, modes, provider credential commands, and MCP server startup.
+Review it before starting Skyhook in an untrusted checkout.</p>
 <h2 id="paths-and-environment"><a class="header" href="#paths-and-environment">Paths and environment</a></h2>
 <p>Relative MCP <code>cwd</code> values resolve against the directory of the <strong>source file defining that
 value</strong>. A user-defined <code>cwd</code> keeps its user-file base when other MCP fields are overlaid;
@@ -252,21 +254,20 @@ a workspace-defined <code>cwd</code> uses the workspace config’s directory (<c
 not the workspace root.</p>
 <p>The CLI always stores and discovers sessions in <code>&lt;workspace&gt;/.skyhook/sessions</code>, including
 headless execution and resume. It does not search other workspaces or honor <code>session_root</code> overrides.
-For library users, <code>session_root</code> can still override storage; relative values use the process working
-directory, not the config file’s directory. Remote target paths retain their existing remote
-semantics. The workspace is a base directory, not filesystem isolation.</p>
-<p>The CLI still loads <strong><code>.env</code> from the invocation directory</strong>, with existing process environment
+Remote paths resolve on the selected <a href="../guide/execution-targets.html">execution target</a>.
+The workspace is a base directory, not filesystem isolation.</p>
+<p>The CLI loads <strong><code>.env</code> from the invocation directory</strong>, with existing process environment
 variables taking precedence. Neither <code>--workspace</code> nor <code>--config</code> changes that location.
 See <a href="authentication.html#api-keys-and-environment-files">authentication</a>.</p>
 <h2 id="inspect-without-starting-a-session"><a class="header" href="#inspect-without-starting-a-session">Inspect without starting a session</a></h2>
-<pre><code class="language-sh">skyhook --workspace /path/to/project --dump       # Same as --dump config
-skyhook --workspace /path/to/project --dump config --capabilities=read --approve-all
-skyhook --config ./standalone.toml --dump config  # Explicit file only
+<pre><code class="language-sh">skyhook dump --workspace /path/to/project         # Same as dump config
+skyhook dump config --workspace /path/to/project --approve-all
+skyhook dump config --config ./standalone.toml    # Explicit file only
 </code></pre>
 <p>These commands write resolved effective TOML to stdout and source paths/diagnostics to stderr.
 They apply defaults and applicable CLI policy overrides without requiring API credentials,
 starting MCP servers, or making network requests. Exit status is zero for a valid dump and
-nonzero if valid configuration cannot be produced. See <a href="../reference/cli.html#dump-modes">dump modes</a>
+nonzero if valid configuration cannot be produced. See <a href="../reference/cli.html#dump">dump</a>
 for selectors and incompatible options.</p>
 <h2 id="configuration-areas"><a class="header" href="#configuration-areas">Configuration areas</a></h2>
 <ul>
@@ -274,10 +275,10 @@ for selectors and incompatible options.</p>
 context/output limits, reasoning replay, and connection recovery.</li>
 <li><a href="authentication.html">Authentication</a>: environment variables, secret-manager commands,
 <code>.env</code>, and Skyhook-owned Codex login.</li>
-<li><a href="../guide/permissions.html">Permissions and capabilities</a>: <code>approve_all</code> and the exact
-<code>capabilities</code> allowlist.</li>
+<li><a href="../guide/permissions.html">Permissions and capabilities</a>: <code>approve_all</code>, modes, and their exact
+capability allowlists.</li>
 <li><a href="../guide/execution-targets.html">Execution targets</a>: SSH destinations, origins, routing,
-and optional SSH-config import.</li>
+and authentication.</li>
 <li><a href="mcp.html">MCP servers</a>: trusted local server startup and imported tools.</li>
 </ul>
 <h2 id="complete-example"><a class="header" href="#complete-example">Complete example</a></h2>
@@ -289,11 +290,23 @@ running a session. For a minimal configuration, follow <a href="../getting-start
 # With no saved selection, the first declared model below is used.
 # Set to true to skip interactive approval for every tool call.
 approve_all = false
-# Exact policy-capability allowlist. Omitted uses this default; [] grants no policy capabilities.
-# Add "targets" for remote-target tools, arguments, JavaScript APIs, and guidance.
-# CLI --capabilities replaces this list. Interaction is runtime-controlled, not configurable here.
-# Use --non-interactive to disable human interaction.
-capabilities = ["read", "write", "exec", "network", "agents", "mcp"]
+# The mode a new session starts in: the built-in general, or one declared below.
+# default_mode = "general"
+
+# Modes are named permission presets. A mode's capabilities are an exact allowlist ([] grants
+# none); add "targets" for remote-target tools, arguments, JavaScript APIs, and guidance.
+# Interaction is supplied by the terminal and absent from batch jobs, never listed here.
+# Optional instructions are added to the system prompt of an agent running in the mode.
+# A hint, on a mode or a model, offers it to agents starting a child; others cannot be chosen.
+# The terminal switches modes with Tab/Shift+Tab in the composer; --mode picks the starting one.
+# This built-in mode always exists; declare it to change what it grants:
+# [modes.general]
+# capabilities = ["read", "write", "exec", "network", "agents", "mcp"]
+#
+# [modes.readonly]
+# capabilities = ["read", "network"]
+# instructions = "Investigate and report. Do not change anything."
+# hint = "Look things up without changing anything"
 
 # The CLI loads .env from its invocation directory (not --workspace or the config directory).
 # Existing process environment variables take precedence; no parent-directory search.
@@ -376,6 +389,8 @@ max_context = 262144
 max_output = 131072
 # The text-only server above has no multimodal projector configured.
 supports_images = false
+# Adding a hint makes the model available to be used for delegation by other agents
+hint = "Local model, good at exploration and logic but not writing"
 
 # Targets are defined only here or by target_add; SSH configuration files are never read.
 

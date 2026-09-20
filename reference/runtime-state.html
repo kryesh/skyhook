@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-b114b291.js";
+            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -183,13 +183,13 @@
                         <h1 id="todos-and-runtime-state"><a class="header" href="#todos-and-runtime-state">Todos and runtime state</a></h1>
 <h2 id="todo-lists"><a class="header" href="#todo-lists">Todo lists</a></h2>
 <p>Every agent has an ordered advisory todo list. <code>todo()</code> reads the caller’s list;
-<code>todo({items:[...]})</code> replaces the whole list and returns <code>{updated:true}</code>; an empty array clears it. Each item has
-<code>text</code> and a <code>status</code> of <code>pending</code>, <code>in_progress</code>, or <code>completed</code>. Multiple items may be in
-progress. Unfinished items do not prevent an agent from finishing.</p>
+<code>todo({items:[...]})</code> replaces the whole list and returns <code>{updated:true}</code>; an empty array clears it.
+Each item has <code>text</code> and a <code>status</code> of <code>pending</code>, <code>in_progress</code>, or <code>completed</code>. Multiple items may
+be in progress. Unfinished items do not prevent an agent from finishing.</p>
 <p>Any agent allowed to delegate can seed a child with <code>agent.todos</code>. The task <code>prompt</code> remains
 required; seed items use the same <code>{text, status}</code> format as <code>todo.items</code> and appear in the
 child’s runtime state before its first model request:</p>
-<pre><code class="language-js">const child = await tool.agent({
+<pre><code class="language-js">return tool.agent({
   prompt: "Implement the requested change and report the validation results.",
   name: "implement-change",
   todos: [
@@ -199,17 +199,12 @@ child’s runtime state before its first model request:</p>
   ],
   bg: true
 });
-// Yield for an event, then inspect the child; an event need not mean completion.
-await tool.wait({timeout:300});
-const childStatus = await tool.job(child.id).output();
-if (childStatus.state === "queued") return childStatus;
-return tool.todo({job: child.id});
 </code></pre>
-<p>The child owns subsequent edits. Ancestors can inspect a descendant using its agent job ID,
+<p>The child owns subsequent edits. Ancestors can inspect a descendant with <code>todo({job: childJobId})</code>,
 including after it finishes; <code>items</code> and <code>job</code> cannot be combined. Inspection is available once
-the child has initialized; a queued launch may not have a list yet. Reads return <code>{items}</code>;
-replacements return <code>{updated:true}</code>. An agent without todos has an empty list. Inside the child, progress can be
-updated with the same tool:</p>
+the child has initialized; a queued launch may not have a list yet. Reads return <code>{items}</code>.
+An agent without todos has an empty list. Inside the child, progress can be updated with the
+same tool:</p>
 <pre><code class="language-js">return tool.todo({items: [
   {text: "Inspect the implementation", status: "completed"},
   {text: "Make the change", status: "in_progress"},
@@ -217,40 +212,34 @@ updated with the same tool:</p>
 ]});
 </code></pre>
 <p>Lists persist with the session, including completed and interrupted child lists. Resume preserves
-recorded statuses. Host interfaces observe <code>SessionEvent::TodosReplaced</code> through the existing
-runtime event subscription.
-The public <code>TodoItem</code>, <code>TodoStatus</code>, and <code>TodoSnapshot</code> types live in <code>skyhook::agent</code>.</p>
+recorded statuses. For Rust host observation, see
+<a href="../development/embedding.html#host-observation-api">embedding</a>.</p>
 <h2 id="per-request-state-snapshot"><a class="header" href="#per-request-state-snapshot">Per-request state snapshot</a></h2>
-<p>Unless the model profile’s <a href="../configuration/providers-and-models.html"><code>state_mode</code></a> is <code>none</code>,
-each model request carries a fresh, compact-text <code>&lt;skyhook_state&gt;</code> snapshot: after the history
-(<code>dynamic</code>, the default) or committed to the conversation after earlier snapshots (<code>persist</code>). Its first
-line is <code>date:YYYY-MM-DD</code>, using the host’s current local date, refreshed per request rather
-than fixed in the system prompt at agent startup. The optional <code>jobs:</code> and <code>todos:</code> sections
-follow in that order; empty sections are omitted. The format is self-describing; the system
-prompt does not explain it. This presentation does not change the JSON returned by job or todo tools.</p>
-<p>The jobs section starts with <code>jobs: job parent tool name state age_s turns tool_calls</code>.
-Each following row contains those fields separated by single spaces. <code>parent</code> is <code>-</code> for
-jobs directly visible to the caller; nested active child-agent rows identify their immediate
-parent job explicitly. Ordinary tool jobs are not included as nested children. Tool and name
-values are unquoted only when they consist of ASCII letters, digits, <code>_</code>, <code>-</code>, <code>.</code>, or <code>/</code>;
-other values, including a literal <code>-</code>, are JSON-quoted. Missing names or counters use <code>-</code>.</p>
-<p><code>age_s</code> counts elapsed whole seconds since job creation, including time queued or waiting for
-input, clamped to zero if the clock moves before the creation timestamp. Child-agent jobs report
-the child’s selected target and workspace once initialized. Optional <code>target="..."</code> and
-<code>workspace="..."</code> fields use JSON-quoted values and appear only when they differ from the
-snapshot’s current execution location. Every row is compared with that location, never with
-its parent row; omitted fields do not inherit a parent’s overrides. Target fields are omitted
-when target capabilities are disabled.</p>
-<p>Active agent jobs include exclusive <code>turns</code> and <code>tool_calls</code> counters. A turn is a complete,
-committed assistant response (including responses containing tool calls); failed attempts,
-incomplete responses, retries, and compaction requests do not add turns. Tool calls count jobs
-launched by that child, including calls inside its scripts, but not work owned by its descendants.
-Counters remain cumulative across retained-child follow-ups and session resume. Counters are
-per-agent, not subtree totals.</p>
-<p>The todos section retains every item, including completed items, in its original order. Each
-consecutive run of the same status starts with <code>pending:</code>, <code>in_progress:</code>, or <code>completed:</code>;
-each item’s text follows on its own line, indented by two spaces and JSON-quoted. A status
-heading repeats if that status occurs again after another status; items are not globally regrouped.</p>
+<p>The model profile’s <a href="../configuration/providers-and-models.html#context-and-output-budgets"><code>state_mode</code></a>
+controls whether and how the model receives a fresh <code>&lt;skyhook_state&gt;</code> snapshot with each request.</p>
+<p>The snapshot shows the host’s current local date, active jobs, and the caller’s todo list.
+Empty job and todo sections are omitted. This is a compact model-facing view, not the JSON
+returned by job or todo tools; scripts should use those tools to inspect state.
+Dynamic snapshots are still recorded with model requests; this mode is not a data-retention or
+provider-cache control.</p>
+<h3 id="reading-job-progress"><a class="header" href="#reading-job-progress">Reading job progress</a></h3>
+<p>Job rows identify the job, parent, tool, optional name, state, age, and child-agent progress.
+Directly visible jobs have <code>-</code> as their parent; nested active child agents identify their
+immediate parent job. Ordinary tool jobs are not shown as nested children.</p>
+<p><code>age_s</code> is elapsed whole seconds since creation, including time queued or waiting for input.
+Child-agent jobs report the child’s selected target and workspace once initialized. Location
+overrides are shown only when they differ from the snapshot’s current execution location.
+Omitted locations refer to that current location, not to the parent row’s overrides. Targets
+are omitted when target capabilities are unavailable.</p>
+<p>Child-agent <code>turns</code> and <code>tool_calls</code> counters describe that agent alone, not its subtree:</p>
+<ul>
+<li>A turn is a complete, recorded assistant response, including responses containing tool calls. Failed or
+incomplete attempts, retries, and compaction requests do not add turns.</li>
+<li>Tool calls count jobs launched by that child, including calls inside its scripts, but not work
+owned by its descendants.</li>
+<li>Counters remain cumulative across retained-child follow-ups and session resume.</li>
+</ul>
+<p>Todos retain their original order, including completed items. For example:</p>
 <pre><code class="language-text">&lt;skyhook_state&gt;
 date:2026-09-05
 jobs: job parent tool name state age_s turns tool_calls
@@ -266,12 +255,8 @@ pending:
   "Run relevant checks"
 &lt;/skyhook_state&gt;
 </code></pre>
-<p>In this example, job 9 uses the snapshot’s current location, not job 8’s workspace override.
-With no active jobs or todos, only the date line remains inside the state block.</p>
-<p>These snapshots are assembled at request time
-and never appended to durable conversation history. Actual job notifications, tool exchanges,
-and todo replacement events remain durable. Provider caching behavior is
-unchanged; transient history does not guarantee exclusion from provider KV caches.</p>
+<p>Here, job 9 uses the snapshot’s current location, not job 8’s workspace override. With no
+active jobs or todos, only the date remains.</p>
 
                     </main>
 

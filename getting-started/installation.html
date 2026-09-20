@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-b114b291.js";
+            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -189,15 +189,14 @@ set <code>CARGO_ZIGBUILD_ZIG_PATH</code>). <code>just setup</code> installs the 
 <pre><code class="language-sh">git clone https://github.com/kryesh/skyhook.git
 cd skyhook
 just setup
-just build-shims-release   # stage static SSH shims into target/shims
-just build-release         # target/release/skyhook, with the staged shims embedded
+just install   # release shims, release CLI embedding them, installed as ~/.local/bin/skyhook
 </code></pre>
-<p>The executable is <code>skyhook</code>. Release builds embed whatever is in <code>target/shims</code> at compile time;
-debug builds (<code>just build</code>) read that directory live. Skip the shim step for a local-only build:
-SSH use from such a build returns an explicit missing-shim error. The <code>tui</code> feature enables the
-<code>skyhook</code> binary and its UI dependencies; the same binary also supports headless execution.</p>
+<p>The executable supports both the terminal interface and headless execution; make sure
+<code>~/.local/bin</code> is on <code>PATH</code>. For a local-only build without Zig, run <code>just build-release</code> instead
+and use <code>target/release/skyhook</code>. SSH use without an included shim
+returns an explicit missing-shim error.</p>
 <p>See <a href="../development/setup.html">development setup</a> for contributor commands and
-<a href="../development/remote-transport-and-shims.html#embedded-shim-builds">embedded shim builds</a>
+<a href="../development/remote-transport-and-shims.html#building-and-packaging-artifacts">shim builds</a>
 for the build matrix, artifact layout, and native shim-only builds.</p>
 <p>Continue with <a href="first-session.html">your first session</a>.</p>
 

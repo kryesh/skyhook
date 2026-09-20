@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-b114b291.js";
+            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -181,25 +181,45 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="documentation-and-publishing"><a class="header" href="#documentation-and-publishing">Documentation and publishing</a></h1>
-<p>The book uses the installed <code>mdbook</code> with its default theme. Sources live in <code>docs/src</code>,
-navigation in <code>docs/src/SUMMARY.md</code>, configuration in <code>docs/book.toml</code>; generated output is
-<code>docs/book</code> (ignored, never committed to the source branch).</p>
+<p>The book sources live in <code>docs/src</code>, navigation in <code>docs/src/SUMMARY.md</code>, and configuration in
+<code>docs/book.toml</code>. Generated output goes to <code>docs/book</code>; it is ignored and must not be committed
+to the source branch. Builds use the installed mdBook and its default theme.</p>
+<h2 id="writing-and-reviewing"><a class="header" href="#writing-and-reviewing">Writing and reviewing</a></h2>
+<p>Follow <a href="https://github.com/kryesh/skyhook/blob/main/AGENTS.md">AGENTS.md</a>: document behavior,
+usage, and non-obvious rationale, and keep each chapter focused on its audience.</p>
+<ul>
+<li><strong>Getting started, guides, and configuration</strong> explain what users can do, how to configure it,
+and which limits or security boundaries matter. Keep internal types, storage schemas,
+transport machinery, and rendering algorithms out of these chapters.</li>
+<li><strong>Scripting and reference</strong> describe callable interfaces, result shapes, lifecycle behavior,
+and examples. Distinguish supported contracts from implementation details.</li>
+<li><strong>Development</strong> covers library APIs and implementation responsibilities. Keep the
+<a href="architecture.html">architecture</a> accurate when those responsibilities or boundaries change.</li>
+</ul>
+<p>Describe the current behavior rather than accumulating historical implementation notes.
+Give shared behavior one main explanation and link to it from other chapters. Check behavioral
+claims and examples against the implementation, including defaults, limits, and failure cases.</p>
+<p>Use relative chapter links such as <code>../guide/headless.md</code> inside the book, and
+<code>https://github.com/kryesh/skyhook/blob/main/...</code> for repository files. The configuration
+overview includes the root <code>config.example.toml</code> at build time instead of maintaining a second copy.</p>
+<p>Keep secrets out of <code>docs/src</code>: mdBook copies every non-Markdown file there into the output,
+ignored or not.</p>
+<h2 id="build-and-preview"><a class="header" href="#build-and-preview">Build and preview</a></h2>
 <pre><code class="language-sh">just docs          # mdbook build docs
 just docs-serve    # mdbook serve docs, normally http://localhost:3000
 just pages-build   # build, then add .nojekyll for GitHub Pages
 </code></pre>
-<p>Keep secrets out of <code>docs/src</code>: mdBook copies every non-Markdown file there into the output,
-ignored or not. Use relative chapter links such as <code>../guide/headless.md</code> inside the book, and
-<code>https://github.com/kryesh/skyhook/blob/main/...</code> for repository files. The configuration
-overview includes the root <code>config.example.toml</code> at build time.</p>
+<p>After editing, build the book and inspect the affected pages, examples, and links. A successful
+build alone does not establish that examples are correct or linked pages exist.</p>
 <h2 id="publishing"><a class="header" href="#publishing">Publishing</a></h2>
 <pre><code class="language-sh">just pages-publish [remote] [branch]   # defaults: origin, pages
 </code></pre>
-<p>The recipe requires a clean checkout, builds the committed sources in a temporary worktree,
-refuses to publish over a branch that contains sources, and pushes without force; your checkout
-and branches are untouched. In the
-GitHub repository’s <strong>Settings → Pages</strong>, choose <strong>Deploy from a branch</strong>, <strong><code>pages</code></strong>, <strong><code>/ (root)</code></strong>.
-The planned canonical URL is <a href="https://kryesh.github.io/skyhook/">https://kryesh.github.io/skyhook/</a>.</p>
+<p>Publishing is explicit, not part of a normal build. Choose a remote that points to the intended
+GitHub repository. The recipe requires a clean checkout, builds the committed sources in a
+temporary worktree, refuses to publish over a branch that contains sources, and pushes without
+force. Your source checkout and local branches are untouched.</p>
+<p>In the GitHub repository’s <strong>Settings → Pages</strong>, choose <strong>Deploy from a branch</strong>, <strong><code>pages</code></strong>,
+<strong><code>/ (root)</code></strong>. The documentation URL is <a href="https://kryesh.github.io/skyhook/">https://kryesh.github.io/skyhook/</a>.</p>
 
                     </main>
 

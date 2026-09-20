@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-b114b291.js";
+            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -207,21 +207,14 @@ $HOME/.config/skyhook/AGENTS.md     # Not loaded when the XDG selection is reada
 /project/app/AGENTS.md             # Selected workspace file, even if empty.
 /project/app/agents.md             # Ignored when AGENTS.md exists, even if unreadable.
 </code></pre>
-<p>The model context uses these labels, regardless of the selected filename’s casing, in this order:</p>
-<pre><code class="language-text">user AGENTS.md:
-&lt;user file contents&gt;
-
-workspace AGENTS.md:
-&lt;workspace file contents&gt;
-</code></pre>
-<p>Instructions configured through the library are appended afterward. Root and child agents use
-the built-in system prompts; there are no named agent profiles or <code>.agents/agents</code> role discovery.</p>
+<p>User instructions are supplied before workspace instructions, with their source identified.
+If both locations select the same file, it is loaded only once. Root and child agents share
+these instructions.</p>
 <h2 id="host-owned-skills"><a class="header" href="#host-owned-skills">Host-owned skills</a></h2>
-<p>Host-owned skills are exposed through <code>skills</code> and <code>skill</code>. Their discovery rules are <strong>unchanged</strong>
-by the instruction-file rules above. Discovery reads <code>~/.agents/skills</code>
-and <code>.agents/skills</code> directories along the workspace ancestry, with the nearest workspace
-definition winning when names collide. Discovery happens when the harness starts; restart it
-to discover newly added skills. A skill directory contains <code>SKILL.md</code> and optional supporting
+<p>Host-owned skills are exposed through <code>skills</code> and <code>skill</code>. Unlike instructions, skill discovery
+reads <code>~/.agents/skills</code> and <code>.agents/skills</code> directories along the workspace ancestry, with the
+nearest workspace definition winning when names collide. Discovery happens at startup;
+restart Skyhook to discover newly added skills. A skill directory contains <code>SKILL.md</code> and optional supporting
 files, conventionally grouped in <code>scripts/</code>, <code>references/</code>, and <code>assets/</code>:</p>
 <pre><code class="language-text">.agents/skills/release/
 ├── SKILL.md

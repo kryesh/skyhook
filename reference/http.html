@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-b114b291.js";
+            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -181,46 +181,46 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="http-requests-with-fetch"><a class="header" href="#http-requests-with-fetch">HTTP requests with <code>fetch</code></a></h1>
-<p><code>fetch</code> is a reqwest-backed HTTP tool, available directly and as <code>tool.fetch(...)</code> in scripts.
+<p><code>fetch</code> is an HTTP request tool, available directly and as <code>tool.fetch(...)</code> in scripts.
 It runs on the selected execution target: DNS, TLS, proxy discovery, uploads, and downloads all
 happen there. Relative paths use that target’s workspace; no files are implicitly copied between
 machines. Like <code>exec</code>, it supports <code>name</code>, <code>bg</code>, cancellation, and saved job output.</p>
 <pre><code class="language-js">// Read an article without sending HTML boilerplate to the model.
-const page = await tool.fetch({url: "https://example.com/article", text: true});
+const page = (await tool.fetch({url: "https://example.com/article", text: true})).unwrap();
 
 // Send JSON to an API. HTTP 4xx/5xx are responses, not tool failures.
-const response = await tool.fetch({
+const response = (await tool.fetch({
   url: "https://api.example.com/items",
   method: "POST",
   body: {kind: "json", value: {name: "example"}}
-});
+})).unwrap();
 
 // Duplicate query parameters and request headers are supported.
-const search = await tool.fetch({
+const search = (await tool.fetch({
   url: "https://api.example.com/search",
   query: [["tag", "rust"], ["tag", "http"]],
   headers: {Accept: "application/json"}
-});
+})).unwrap();
 
 // Send a file as the raw request body, without base64-encoding it in model context.
-const upload = await tool.fetch({
+const upload = (await tool.fetch({
   url: "https://api.example.com/upload",
   method: "PUT",
   headers: {"Content-Type": "application/gzip"},
   body: {kind: "file", path: "dist/archive.tar.gz"}
-});
+})).unwrap();
 
 // Save a download on the execution target. Existing files are preserved unless overwrite:true.
-const download = await tool.fetch({
+const download = (await tool.fetch({
   url: "https://example.com/archive.tar.gz",
   save_to: "archive.tar.gz",
   max_bytes: 104857600,
   timeout: 300
-});
+})).unwrap();
 
 // Explicitly opt out of certificate validation for a development HTTPS server.
 // This permits untrusted certificates and enables interception; never use casually.
-const development = await tool.fetch({url: "https://localhost:8443/health", insecure: true});
+const development = (await tool.fetch({url: "https://localhost:8443/health", insecure: true})).unwrap();
 </code></pre>
 <h2 id="request-options"><a class="header" href="#request-options">Request options</a></h2>
 <p>Only <code>url</code> is required. <code>method</code> defaults to <code>GET</code> and accepts standard methods and valid custom
@@ -241,26 +241,27 @@ Do not combine <code>auth</code> with an <code>Authorization</code> header or em
 <code>Content-Type</code> request header; they are not interchangeable with multipart uploads.</p>
 <h2 id="responses-and-extraction"><a class="header" href="#responses-and-extraction">Responses and extraction</a></h2>
 <p>Responses include final URL/method, status, <code>ok</code> (2xx), redirect history, received byte count,
-elapsed time, and a tagged <code>body</code>: <code>text</code>, <code>base64</code>, <code>file</code>, or <code>empty</code>. Response headers are omitted
-by default; set the optional <code>include_headers: true</code> to return them as a map of repeated values.
-<code>include_headers</code> defaults to <code>false</code> and does not affect the <code>headers</code> request-header map.
+elapsed time, and a tagged <code>body</code>: <code>text</code>, <code>base64</code>, <code>file</code>, or <code>empty</code>. Response <code>headers</code> is
+<code>null</code> by default; set <code>include_headers: true</code> to return a map of repeated header values.
+This option does not affect the <code>headers</code> request-header map.
 JSON responses remain decoded text; scripts can use <code>JSON.parse(response.body.text)</code>.
 <code>response_format</code> defaults to <code>auto</code> (text for textual content, base64 otherwise); <code>text</code> forces
 character decoding and <code>base64</code> preserves response entity bytes. HTTP decompression is automatic;
-these are not raw wire bytes. <code>save_to</code> streams to a temporary file and commits on success instead
-of embedding the payload. Errors or cancellation do not replace an existing destination.
+these are not raw wire bytes. <code>save_to</code> saves the response to a file on success instead of
+embedding the payload. Errors or cancellation do not replace an existing destination.
 Automatic job presentation may shorten <code>body.text</code> and <code>body.data</code>, with continuation markers;
 retrieve the complete saved payload using <code>job_output</code> fields <code>/result/body/text</code> or
 <code>/result/body/data</code>. Status, opted-in headers, body kind, and other metadata remain intact. JavaScript
 calls still receive the complete payload for processing.</p>
 <p><code>text:true</code> is separate from <code>response_format:"text"</code>: it extracts readable article content from
-HTML with <strong>dom_smoothie</strong>, returning plain text and available title/byline/site/language metadata.
+HTML, returning plain text and metadata identifying the extraction engine and title, plus byline,
+excerpt, site name, and language when available.
 It does not execute JavaScript or fetch linked assets. Plain text, JSON, and other textual types
 pass through decoded; binary content is not converted. Extraction failures are explicit, never
 silently replaced with raw HTML. Fetch with <code>text:false</code> to inspect the original response. Empty
 responses remain empty. <code>text:true</code> cannot be combined with <code>save_to</code> or <code>response_format:"base64"</code>.
-Extraction accepts at most 10 MiB of decoded HTML and 50,000 DOM elements, with bounded parser
-concurrency. Character decoding honors BOMs, HTTP charsets, and HTML meta charsets where applicable.</p>
+Extraction accepts at most 10 MiB of decoded HTML and 50,000 DOM elements. Character decoding
+honors BOMs, HTTP charsets, and HTML meta charsets where applicable.</p>
 <h2 id="limits-and-failure-diagnostics"><a class="header" href="#limits-and-failure-diagnostics">Limits and failure diagnostics</a></h2>
 <p>The default total <code>timeout</code> is 30 seconds, <code>connect_timeout</code> is 10 seconds, and <code>max_bytes</code> is
 10 MiB. The response limit can be raised to 100 MiB; total uploads are also capped at 100 MiB.
@@ -269,54 +270,53 @@ Limits apply while streaming, including to decompressed data; exceeding a limit 
 rather than reporting an incomplete body as successful. Model-visible preview truncation is
 independent: retrieve saved results with <code>job_output</code>. Cancellation and timeouts cannot undo
 server-side effects, and requests are not automatically retried.</p>
-<p>Transport and processing failures remain failed jobs (and rejected script calls), but include a
-structured failure result. It contains <code>method</code>, a safe <code>origin</code>, <code>elapsed_ms</code>, <code>received_bytes</code>,
-redirect history, and <code>diagnostic</code>: <code>phase</code>, <code>error_kind</code>, and a concise <code>message</code>. To keep tool
-definitions compact, diagnostic category fields use string schemas rather than exhaustive lists
-of labels; the typed runtime classifications and returned values are unchanged. When available,
-<code>diagnostic.os_error</code> supplies the executing platform, a numeric OS <code>code</code>, and a portable <code>kind</code>.
+<p>Transport and processing failures remain failed jobs and failed JobViews (not rejected
+operational script calls), but include a structured failure result. It contains <code>method</code>, a safe
+<code>origin</code>, <code>elapsed_ms</code>, <code>received_bytes</code>, redirect history, and <code>diagnostic</code>: <code>phase</code>, <code>error_kind</code>,
+and a concise <code>message</code>. When available, <code>diagnostic.os_error</code> supplies the executing platform,
+a numeric OS <code>code</code>, and a portable <code>kind</code>.
 Timeouts include <code>diagnostic.timeout.kind</code> (<code>total</code>, <code>connect</code>, or <code>unknown</code>) and a <code>limit_ms</code> only
 when the expiring limit is known. Timing starts inside fetch on the execution target; it does not
 include SSH startup or initial tool approval.</p>
-<p>Connection refusal, host/network unreachability, DNS failures, TLS failures, typed HTTP proxy
+<p>Connection refusal, host/network unreachability, DNS failures, TLS failures, HTTP proxy
 CONNECT failures, and response-processing failures are distinguished when the underlying errors
 provide evidence. Otherwise fetch reports a generic transport category; it never infers that a
 firewall caused an error. Diagnostic messages do not copy arbitrary error strings, query strings,
 credentials, headers, or bodies. Failure URL/redirect context is reduced to origins. Received HTTP
 headers are included only with <code>include_headers: true</code>; they retain their normal response semantics
 and may still contain sensitive response data.
-<code>proxy_origin</code>, when present, describes an explicit proxy; omission does not rule out an environment
-proxy. Use the job’s target for source attribution, and interpret OS codes using the reported platform.</p>
-<p>If headers arrived before a failure (including an outer timeout), the failure also retains the
-HTTP status, <code>ok</code>, and byte count, plus headers when <code>include_headers: true</code>. Before any response,
-those HTTP fields are omitted,
-not fabricated. HTTP 4xx/5xx responses still complete normally: a 405 establishes HTTP connectivity,
-not successful ingestion. Permission denial and cancellation retain their separate semantics.</p>
-<p>In scripts, catch failures inside each worker and inspect <code>error.output.diagnostic</code>; merely
-logging an Error or allowing <code>WorkPool</code> to skip a failed worker loses the structured row:</p>
-<pre><code class="language-js">try {
-  const response = await tool.fetch({url, target});
-  return {target, http_reached: true, status: response.status};
-} catch (error) {
-  const failure = error.output ?? {};
+<code>proxy_origin</code>, when non-null, describes an explicit proxy; <code>null</code> does not rule out an
+environment proxy. Use the job’s target for source attribution, and interpret OS codes using the reported platform.</p>
+<p>If headers arrived before a failure (including an outer timeout), the failure retains the
+HTTP status, <code>ok</code>, and byte count, plus headers when <code>include_headers: true</code>; known fields retain
+null/default values when unavailable. HTTP 4xx/5xx responses still complete normally: a 405
+establishes HTTP connectivity, not successful ingestion. Permission denial and cancellation
+retain their separate semantics.</p>
+<p>In scripts, operational fetch failures are failed JobViews rather than rejected promises. Inspect
+the failed view’s <code>.result</code> directly (or use <code>response.unwrap()</code> for fail-fast extraction):</p>
+<pre><code class="language-js">const response = await tool.fetch({url, target});
+if (response.state === "failed") {
+  const failure = response.result ?? {};
   return {
     target,
     http_reached: Number.isInteger(failure.status),
     status: failure.status ?? null,
     elapsed_ms: failure.elapsed_ms ?? null,
     diagnostic: failure.diagnostic ?? null,
-    error: error.message,
+    error: response.error,
   };
 }
+return {target, http_reached: true, status: response.result.status};
 </code></pre>
-<p>The same diagnostic is retrievable from a failed fetch job at <code>/result/diagnostic</code>. An uncaught
-script failure preserves it under <code>/result/failure/output/diagnostic</code> in the script job.</p>
+<p>The same diagnostic is retrievable from a failed fetch JobView at <code>/result/diagnostic</code>. If a
+script returns that response, the preserved response remains in the script payload’s <code>/result/value</code>;
+operational fetch failure does not become an uncaught script exception.</p>
 <h2 id="redirects-proxies-and-security"><a class="header" href="#redirects-proxies-and-security">Redirects, proxies, and security</a></h2>
 <p><code>redirects</code> is <code>safe</code> by default (follow GET/HEAD), <code>follow</code> to follow other methods too, or <code>manual</code>
 to return the redirect response. <code>max_redirects</code> defaults to 5. Changed origins require authorization;
 cross-origin requests do not inherit sensitive request headers, and HTTPS-to-HTTP redirects are
 rejected. Redirect method rewriting follows HTTP conventions; 307/308 preserve method and body.
-<code>proxy</code> selects an explicit HTTP proxy; otherwise reqwest uses the target’s proxy environment.
+<code>proxy</code> selects an explicit HTTP proxy; otherwise fetch uses the target’s proxy environment.
 <code>insecure</code> defaults to <strong>false</strong>. Setting it to <strong>true</strong> disables HTTPS certificate validation for
 that invocation only; it does not disable authorization or permit HTTPS downgrade redirects.</p>
 <p>All requests require the <code>network</code> capability and approval, not just filesystem <code>read</code> permission.

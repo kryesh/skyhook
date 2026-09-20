@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-b114b291.js";
+            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -182,48 +182,37 @@
                     <main>
                         <h1 id="jobs-and-agents"><a class="header" href="#jobs-and-agents">Jobs and agents</a></h1>
 <h2 id="delegation-and-child-input"><a class="header" href="#delegation-and-child-input">Delegation and child input</a></h2>
-<p>Child agents retain their conversation for follow-up work. <code>tool.job(id).send({value: instructions})</code> delivers unsolicited input automatically at a running child’s next model-request
-boundary, without interrupting the current request or tools. A retained child whose job is
-<code>completed</code>, <code>failed</code>, or <code>interrupted</code> is restarted under the same job and agent identity; the
-new instruction is appended to its retained conversation. Explicitly <code>cancelled</code> jobs are not
-resumable. After a session interruption, retry resumes every retained failed/interrupted child
-(deepest descendants first), without selecting them individually. A child-only retry leaves a
-parent that is waiting on work untouched and does not add a root model request. Retrying without
-an instruction continues the same history without adding a synthetic user or parent-input
-message.
-Children do not need <code>receive()</code> to read these updates. Every visible child text reply,
-including text-only and final replies, is delivered independently through the background-job
-event path, without waiting for the child job to finish. <code>wait</code> resolves when the agent can act:
-while the agent has other foreground work outstanding it keeps waiting, and the next model request
-then carries every accumulated event together; otherwise any pending event resolves it. Each
-notification resolves a given caller’s <code>wait</code> once, and <code>wait</code> never consumes content. Message events carry
-<code>kind: "message"</code>, the child job <code>id</code>, source <code>message</code> sequence, optional <code>name</code>, and <code>text</code>.
-Completion is determined separately by the agent’s remaining work and queued inputs, not by
-message delivery. A completed child notification references its <code>last_message</code> instead of
-repeating that reply, as do automatic model tool responses for completed children. Explicit
-<code>job_output</code> reads and native script/host calls still expose the saved final result.
-Progress text is not concatenated into that final result. A foreground call still needs to
-return before its parent can make another model request.
-Messages and terminal/question notifications share a snapshot → parent-history commit →
-acknowledgment boundary. Failed or abandoned preparation leaves notifications pending, and
-caller cancellation cannot split a started append/acknowledgment operation. Pending messages
-are recovered from committed child history after restart; committed parent notifications
-acknowledge each message independently and prevent duplicate delivery. Reading or claiming a
-job result does not consume its message events. Legacy message notifications and exact final
-replies in completed runtime notifications are recognized on replay. An old output-claim marker
-alone is not evidence of message delivery, so such a reply may be delivered again rather than
-discarded. Delivery means inclusion in parent history at a request boundary, not interruption
-of an in-flight model request.
-Sending to a completed child appends
-the instructions after its existing
-conversation and starts a new request under the same agent and job ID; it does not start
-over with fresh history. <code>job_output(id)</code> then exposes the latest run’s saved result, not an archive
-of earlier results; already-committed parent notifications and the child conversation remain intact.
-This resumption applies to successfully completed agent jobs retained
-in the live runtime, not arbitrary completed tools or jobs restored after a process restart.
-Failed, cancelled, and interrupted agents are not resumed by <code>send</code>.
-Each model-facing <code>ask</code> contains one
-<code>{id, prompt, options}</code> question; independent concurrent calls are merged by the runtime. A child
+<p>Child agents retain their conversation for follow-up work. Send instructions with
+<code>tool.job(id).send({value: instructions})</code>; the returned JobView’s payload includes
+<code>.result.accepted</code>. A running child receives the input at its next model-request boundary,
+without interrupting its current request or tools. Children do not need <code>receive()</code> for these
+updates.</p>
+<p>A retained child whose job is <code>completed</code>, <code>failed</code>, or <code>interrupted</code> resumes under the same
+job and agent identity, including after a session restart. New instructions are appended to its
+existing conversation. Explicitly <code>cancelled</code> children and non-agent jobs cannot be resumed.
+<code>job_output</code> then exposes the latest run’s saved result, not an archive of earlier results;
+the child conversation and messages already delivered to the parent remain intact.</p>
+<p>After a session interruption, retry resumes every retained failed/interrupted child without
+selecting them individually. A child-only retry leaves a parent waiting on work untouched and
+does not add a root model request. Retrying without an instruction continues the same history
+without adding a synthetic message.</p>
+<p>A background child’s visible text replies, including progress and final replies, arrive as
+message events without waiting for the child job to finish. Events carry <code>kind: "message"</code>,
+the child job <code>id</code>, source <code>message</code> sequence, optional <code>name</code>, and <code>text</code>. They reach the
+parent at a model-request boundary, not by interrupting an in-flight request. Pending messages
+survive session restart. Reading a background job’s output does not consume its message events.</p>
+<p>Message delivery does not mean the child has finished: completion also requires its owned work
+and queued inputs to be resolved. A completed background child’s notification references its
+<code>meta.last_message</code> instead of repeating the reply already delivered. Explicit <code>job_output</code>
+reads and script calls still expose the saved final result; progress text is not concatenated
+into it. A foreground child returns its final reply in the call’s <code>.result</code>, with no progress
+or later message events. The parent cannot make another model request until its foreground
+calls return.</p>
+<p>Child names are scoped to their caller: <code>A</code> and <code>B</code> may each create a child named <code>worker</code>, but
+all scripts owned by <code>A</code> share <code>A</code>’s child-name scope. A child retains its name even after
+termination; send follow-ups to its existing job instead of launching a duplicate. A failed
+launch that never created a child does not permanently reserve the name.</p>
+<p>Each model-facing <code>ask</code> contains one <code>{id, prompt, options?}</code> question; independent concurrent calls are merged by the runtime. A child
 question batch changes its stable agent job to <code>waiting_input</code>; answer that job with
 <code>tool.job(id).send({value: answer})</code> in a script. For a merged batch, use
 <code>tool.job(id).send({value: {question_id: answer, another_id: answer}})</code>; the keys are the IDs
@@ -231,7 +220,7 @@ included in the waiting job’s <code>questions</code> output. Each answer can b
 label or free-form text), or <code>{"answer": "selected label", "comment": "user text"}</code> for a
 suggestion with a non-whitespace comment. A single question returns that value directly;
 a merged batch keeps each value under its question ID.
-Root-agent questions still go directly to the host question handler.
+Root-agent questions go to the host interface instead of a parent agent.
 <code>ask</code> also accepts optional <code>bg</code> (boolean, default <code>false</code>). With <code>bg: true</code>, the call returns
 job metadata immediately so the agent can continue independent work. Use <code>job_output</code> or
 <code>tool.job(id).output()</code> to inspect the pending question and eventual answer; the ask job also
@@ -241,37 +230,44 @@ job; parents may answer a subset keyed by question ID, and unanswered questions 
 IDs must be unique across that child’s outstanding questions. Background questions are still
 owned jobs: children must await or cancel them before finishing.</p>
 <p><code>agent</code> accepts an optional <code>depth</code> delegation budget. It defaults to zero, making the launched
-child a leaf. A caller may grant less than its own available depth; once no depth remains, <code>agent</code>
-is omitted from both model tools and script bindings. Its optional <code>workspace</code> accepts relative or
+child a leaf. The value must be less than the caller’s own available depth; once no depth remains,
+<code>agent</code> is omitted from both model tools and script bindings. Its optional <code>workspace</code> accepts relative or
 absolute directories for both local and remote children. Relative overrides resolve against the
-workspace selected by the target rules. Children receive a fresh conversation, shared harness
+workspace selected by the target rules. Children receive a fresh conversation, shared session
 instructions and host-owned skills, and their parent’s active model, including model switches and
-restored session selections. An explicit child <code>model</code> overrides the inherited model.
+restored session selections. An explicit child <code>model</code> overrides the inherited model, and <code>mode</code>
+runs the child in a mode in place of the caller’s capabilities. Both take only entries configured
+with a <code>hint</code>, and <code>mode</code> only
+those granting nothing the caller lacks; an input with nothing to offer is absent.
 This applies equally to local children, remote children, and deeper descendants. Agents on
 the same target share files; a workspace override creates no filesystem isolation. Children must
 finish or cancel all owned jobs and descendants before their agent job completes. Only root agents
 may leave background services running after answering.</p>
 <h2 id="job-lifecycle-and-cancellation"><a class="header" href="#job-lifecycle-and-cancellation">Job lifecycle and cancellation</a></h2>
-<p>Background-capable tools accept an optional <code>bg</code> argument. Model-facing calls return a job view
-with <code>id</code>, <code>state</code>, the actual <code>target</code> when enabled, and <code>result</code>. Workspace is included when it differs from the caller. Listings and notifications also include tool identity and applicable name/parent metadata. Only annotated fields are shortened; <code>truncated</code> lists their total line counts and next read positions.
-JavaScript foreground calls return the handler’s full native result; background launches return
-a job reference. A child question has <code>state: "waiting_input"</code>; <code>job_output</code> returns its stable
-question IDs and text in <code>question</code>, regardless of its size.</p>
+<p>Background-capable tools accept an optional <code>bg</code> argument. Calls use the <a href="../reference/javascript.html#jobview-response-contract">common JobView
+contract</a>; background launches have
+<code>result: null</code> and <code>has_result: false</code>, while loaded literal <code>null</code> results have <code>has_result: true</code>.
+Cancellation returns target-job metadata in <code>.result</code>. A child
+question has <code>state: "waiting_input"</code>; <code>job_output</code> returns its stable question IDs and text in
+<code>presentation.question</code>, regardless of its size.</p>
 <p>Jobs normally follow <code>queued → running → completed</code>, optionally cycling through
 <code>waiting_input → running</code>; <code>failed</code>, <code>cancelled</code>, and <code>interrupted</code> are terminal alternatives.
 <code>job_output</code> acknowledges a pending question or terminal result and suppresses duplicate automatic
-notification. Explicit reads remain repeatable. Use <code>wait</code> to yield for an event or timeout, then inspect output; <code>job_output</code> itself never waits.
+notification. Explicit reads remain repeatable, and <code>job_output</code> itself never waits; see
+<a href="#waiting-for-background-work">waiting for background work</a>.
 Unanswered questions do not expire. Send answers to the stable child-agent job ID.</p>
 <p>Cancellation cascades through descendant jobs and agents and terminates managed command process
 groups locally and remotely. It is a request: use job_output to confirm termination. Deliberately
 detached processes and unreachable remote hosts limit cleanup. Command timeouts are optional;
 omission or null means no deadline. Explicit timeouts of 1–3600 seconds terminate execution,
-retaining captured output. A nonzero command exit is a normal result with <code>exit_code</code>.</p>
+retaining captured output. A nonzero command exit is a normal result; see
+<a href="../reference/job-output.html#tool-result-shapes">tool result shapes</a> for process payloads.</p>
 <h2 id="job-names"><a class="header" href="#job-names">Job names</a></h2>
 <p><code>agent</code>, <code>exec</code>, <code>shell</code>, and <code>fetch</code> accept an optional <code>name</code> describing the work. Names must use
 lowercase kebab-case: start with a letter, then use lowercase ASCII letters, digits, and single
 hyphens between nonempty words. Examples include <code>inspect-config</code>, <code>run-tests</code>, and <code>build-v2</code>.
-Names are descriptive labels, do not need to be unique, and do not replace job IDs.</p>
+Names are descriptive labels and do not replace job IDs. Tool job names need not be unique;
+child-agent names must be unique within their caller’s scope, as described above.</p>
 <pre><code class="language-js">return tool.exec({argv: ["cargo", "test"], name: "run-tests", bg: true});
 </code></pre>
 <p>Names appear in active-job state, job envelopes (including notifications and inspection), and
@@ -279,8 +275,12 @@ durable job records. They survive session resume. Omitted or null names leave jo
 invalid names are rejected before execution. JavaScript builders also support <code>.name("run-tests")</code>.</p>
 <h2 id="waiting-for-background-work"><a class="header" href="#waiting-for-background-work">Waiting for background work</a></h2>
 <p>Launch with <code>bg: true</code>, do independent work, then yield for events and inspect status.
-A wait timeout ends the wait, not the job. A child must finish or cancel all owned work before
-it can finish; root background services remain managed by the live session. In headless mode,
+<code>wait</code> resolves when the agent can act: if other foreground work is still running, it keeps
+waiting; otherwise any pending event resolves it. Each notification resolves a given caller’s
+<code>wait</code> once, without consuming the notification content. The next model request receives the
+accumulated events together. A wait timeout ends the wait, not the job. A child must finish or
+cancel all owned work before it can finish; root background services remain managed by the live
+session. In headless mode,
 shutdown cancels and drains outstanding work, so workflows must await work they need completed.</p>
 <pre><code class="language-js">const job = await tool.exec({argv: ["cargo", "test"], name: "run-tests", bg: true});
 let status = await tool.job(job.id).output();

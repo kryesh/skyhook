@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-b114b291.js";
+            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -181,26 +181,26 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="scripting-introduction"><a class="header" href="#scripting-introduction">Scripting introduction</a></h1>
-<p>Every <code>script</code> call gets a fresh QuickJS runtime. Run the example below from a Skyhook source checkout (or adapt the paths to your project).
-Tool calls are lazy. Each builder
-instance memoizes its own execution, so reusing one builder executes it once while constructing an
-equivalent new builder creates a new call:</p>
-<pre><code class="language-js">const packageFile = tool.read({ path: "Cargo.toml" });
-const matches = tool.search({ pattern: "TODO", path: "src" });
+<p>Every <code>script</code> call gets a fresh JavaScript environment. Run the example below from a Skyhook
+source checkout (or adapt the paths to your project). Tool calls are lazy: reusing one builder
+executes it once, while constructing an equivalent new builder creates a new call:</p>
+<pre><code class="language-js">// Every direct JavaScript call is a JobView; use unwrap for the native payload.
+const packageFile = (await tool.read({ path: "Cargo.toml" })).unwrap();
+const matches = (await tool.search({ pattern: "TODO", path: "src" })).unwrap();
 
-// The same schema also generates an immutable fluent builder.
-const readme = tool.read().path("README.md");
+// Fluent setters accept the same arguments; each setter returns a new builder.
+const readme = (await tool.read().path("README.md")).unwrap();
 
-// Builders nested in the returned value are resolved concurrently.
+// Builders can be awaited independently (and can still be batched with Promise.all).
 return { packageFile, matches, readme };
 </code></pre>
 <p>A workflow file runs in the same runtime:</p>
 <pre><code class="language-sh">skyhook --script workflow.js
 # Run headlessly and exit when the workflow and shutdown finish:
-skyhook --non-interactive --script workflow.js
+skyhook batch --script workflow.js
 </code></pre>
 <p>There is no Node.js environment or recursive <code>script</code> call. Calls use the same tool schemas,
-capabilities, approvals, and persistence as model-originated calls. Read the
+capabilities, approvals, and saved-output behavior as direct tool calls. Read the
 <a href="../reference/javascript.html">JavaScript reference</a> for supported globals, serialization,
 concurrency, result wrappers, and failure handling.</p>
 <p>For delegation and background work, continue with <a href="jobs-and-agents.html">jobs and agents</a>.

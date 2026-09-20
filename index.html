@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-b114b291.js";
+            window.path_to_searchindex_js = "searchindex-0a4ca1d0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-8b14bb79.js"></script>
@@ -181,21 +181,29 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="skyhook"><a class="header" href="#skyhook">Skyhook</a></h1>
-<p>Skyhook is a provider-neutral coding-agent harness with a programmable JavaScript orchestration
-runtime. A tool is registered once and is then available through the model tool protocol and as a
-lazy builder inside <code>script</code>.</p>
-<p>The <code>skyhook-agent</code> package contains the <code>skyhook</code> library crate and the <code>skyhook</code> CLI binary.
-The library does not depend on a
-provider-specific response type; native backends implement OpenAI Chat Completions and Responses,
-Anthropic Messages, and Codex/ChatGPT subscription behind a common provider API.</p>
-<p>This book covers installation, everyday use, configuration, scripting, the tool contracts,
-and development of Skyhook. Start with <a href="getting-started/installation.html">installation</a> and
-<a href="getting-started/first-session.html">your first session</a>, or explore the
-<a href="scripting/introduction.html">JavaScript workflow runtime</a>.</p>
-<p>The source repository is <a href="https://github.com/kryesh/skyhook">github.com/kryesh/skyhook</a>.
-The planned canonical documentation URL is <a href="https://kryesh.github.io/skyhook/">https://kryesh.github.io/skyhook/</a>;
-publication is a separate step from building this book locally.</p>
-<p>Skyhook is licensed under <a href="https://github.com/kryesh/skyhook/blob/main/LICENSE">AGPL-3.0-only</a>.</p>
+<p>Skyhook is a provider-neutral coding agent with a terminal interface and a programmable
+JavaScript workflow runtime. Use it interactively, automate work in headless sessions,
+or embed its Rust library in your own application.</p>
+<p>Skyhook supports OpenAI Chat Completions and Responses, Anthropic Messages, Codex/ChatGPT
+subscriptions, and compatible local model endpoints. Tools work in local workspaces and
+on SSH targets. The agent can call tools directly or use scripts to coordinate jobs and
+child agents through the same permissions and saved-output system.</p>
+<h2 id="find-your-starting-point"><a class="header" href="#find-your-starting-point">Find your starting point</a></h2>
+<ul>
+<li><strong>New users:</strong> <a href="getting-started/installation.html">install Skyhook</a> and
+<a href="getting-started/first-session.html">start your first session</a>.</li>
+<li><strong>Everyday use:</strong> learn the <a href="guide/terminal-interface.html">terminal interface</a>,
+<a href="guide/sessions-and-context.html">session management</a>, and
+<a href="guide/permissions.html">permissions</a>.</li>
+<li><strong>Configuration:</strong> choose <a href="configuration/providers-and-models.html">providers and models</a>
+and set up <a href="configuration/authentication.html">authentication</a>.</li>
+<li><strong>Automation:</strong> run <a href="guide/headless.html">headless workflows</a> or use
+<a href="scripting/introduction.html">JavaScript scripts</a>.</li>
+<li><strong>Development:</strong> see <a href="development/setup.html">setup</a>,
+<a href="development/architecture.html">architecture</a>, and <a href="development/embedding.html">embedding</a>.</li>
+</ul>
+<p>Source: <a href="https://github.com/kryesh/skyhook">github.com/kryesh/skyhook</a>.
+Skyhook is licensed under <a href="https://github.com/kryesh/skyhook/blob/main/LICENSE">AGPL-3.0-only</a>.</p>
 
                     </main>
 

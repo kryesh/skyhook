@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-b114b291.js";
+            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -213,22 +213,21 @@ Loaded variables are also inherited by API-key commands and other <strong>local<
 inherited host environment variables nor <code>.env</code> values are automatically forwarded into remote target
 processes; remote commands use the remote machine’s environment. Managed SSH routes disable <code>SendEnv</code>,
 <code>SetEnv</code>, and X11 forwarding. Local SSH authentication/proxy helpers still use the host environment;
-Skyhook’s deliberate SSH-agent forwarding remains supported separately. Library embedders manage
-their own process environment; loading a core <code>Config</code> does not load <code>.env</code>.</p>
+Skyhook’s <a href="../guide/execution-targets.html#agents">SSH-agent forwarding</a> is
+configured separately.</p>
 <p>For example, in the directory from which you run <code>skyhook</code>:</p>
 <pre><code class="language-dotenv">ANTHROPIC_API_KEY="your-key"
 </code></pre>
 <p>Keep <code>.env</code> out of version control and restrict its file permissions. The CLI supports normal dotenv
 quoting, comments, <code>export</code> declarations, and variable interpolation. A malformed or unreadable file
-fails startup without printing its contents; non-interactive startup errors remain silent.</p>
+fails startup without printing its contents.</p>
 <h2 id="codex-subscription-login"><a class="header" href="#codex-subscription-login">Codex subscription login</a></h2>
 <p>The <code>codex</code> provider uses <strong>Skyhook-owned</strong> OAuth credentials. Run <code>skyhook auth login</code> for browser
 authorization or <code>skyhook auth login --headless</code> for device authorization. <code>skyhook auth status</code>
 reports local login status and <code>skyhook auth logout</code> removes Skyhook’s credentials. Login does not
 require a model configuration. Skyhook never imports, reads, or modifies the official Codex client’s
 credential files. Secure Codex credential storage currently requires Unix; other platforms fail
-explicitly rather than writing tokens without private ACL guarantees. Claude subscription support
-has been removed.</p>
+explicitly rather than writing tokens without private file permissions.</p>
 
                     </main>
 

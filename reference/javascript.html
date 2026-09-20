@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-b114b291.js";
+            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -213,39 +213,80 @@ return results;
 </code></pre>
 <h2 id="saved-output-and-serialization"><a class="header" href="#saved-output-and-serialization">Saved output and serialization</a></h2>
 <p>Read or search saved command output with <code>tool.job(commandJobId).output({field:"/result/stdout"})</code>.
-Field-selected output is a job view, not a raw string: available text is in <code>preview.lines</code>,
-with pagination metadata alongside it. Field, pagination, and search selections omit image
-attachments; whole-output reads can attach saved images.</p>
+<code>job.output()</code> returns the existing JobView for that job; it does not add another wrapper.
+Field-selected output is a job view, not a raw string: available text is in
+<code>presentation.preview.lines</code>, with pagination metadata alongside it. Field, pagination, and
+search selections omit image attachments; whole-output reads can attach saved images.</p>
+<h2 id="jobview-response-contract"><a class="header" href="#jobview-response-contract">JobView response contract</a></h2>
+<p>Direct model calls and JavaScript tool calls return the same seven-key <code>JobView</code> envelope. Its
+required keys and types are:</p>
+<pre><code class="language-text">id: number|null
+state: string
+has_result: boolean
+result: JSON
+error: string|null
+meta: null|JobMetadata
+presentation: null|Presentation
+</code></pre>
+<p><code>result</code> is the native tool payload (and may be a loaded literal <code>null</code>); <code>has_result</code> tells
+whether that payload is available. <code>meta</code> is <code>null</code> on an ordinary successful foreground call
+when no full metadata is needed. Background, status, inspection, and failure responses carry
+<code>meta</code> when available. It has nullable <code>parent</code>, <code>tool</code>, <code>name</code>, <code>target</code>, <code>workspace</code>,
+<code>last_message</code>, <code>code</code>, and <code>executed</code> fields. <code>target</code> is <code>null</code> when target capabilities are
+unavailable. A pre-admission failure can have <code>id: null</code>.</p>
+<p><code>presentation</code> is <code>null</code> when a successful foreground response has no truncation, page, capture,
+question, or notice. When present, it groups <code>preview</code>, <code>truncated</code>, <code>captures</code>, <code>question</code>, and
+<code>notice</code>; empty or absent members use their nullable/empty defaults. Read a page as
+<code>r.presentation.preview.lines</code> and a question as <code>r.presentation.question</code>.
+Truncation entries keep their source paths rooted at <code>/result/...</code>.</p>
+<p>JavaScript receives complete data; model views may shorten fields as described in
+<a href="job-output.html#automatic-previews">saved job output</a>.
+Tool descriptions’ <code>Result</code> refers to the envelope’s <code>.result</code>, not a separate wrapper. A successful
+<code>job_output</code> call on a failed target is still a successful tool invocation returning that failed
+<code>JobView</code>; <code>response.unwrap()</code> checks the observed job state and can therefore throw for that view.</p>
+<h2 id="responseunwrap-and-native-results"><a class="header" href="#responseunwrap-and-native-results"><code>response.unwrap()</code> and native results</a></h2>
+<p>Use <code>response.unwrap()</code> synchronously when a completed native payload is needed:</p>
+<pre><code class="language-js">const data = (await tool.read({path: "README.md"})).unwrap();
+</code></pre>
+<p>It returns <code>response.result</code> only when <code>state: "completed"</code> and <code>has_result: true</code>, including a
+completed literal <code>null</code>. It throws for failed, pending, or result-unavailable responses; the
+thrown error has <code>error.response</code> containing the envelope and <code>error.output</code> equal to its
+<code>.result</code>. The method is non-enumerable and runtime-only: <code>Object.keys</code>, JSON serialization,
+logging, returning, and saving the envelope retain plain JSON. Nested payloads, JSON copies, and
+<code>receive()</code> values are not decorated, and there is no built-in <code>tool.unwrap</code> helper.</p>
+<p><code>job.output()</code> and output selections already return views, so inspect their <code>presentation.preview</code>,
+<code>presentation.captures</code>, or pagination rather than unwrapping them. Operational tool failures are
+failed views rather than JavaScript throws; programmer, serialization, <code>receive</code>, and sleep errors
+still throw.</p>
 <p>Before returning results, convert <code>BigInt</code> values to strings, dates with <code>.toISOString()</code>, and
 typed arrays with <code>Array.from(bytes)</code>, <code>.toBase64()</code>, or <code>.toHex()</code>. The runtime does not provide
 Node.js APIs, <code>fetch</code>, <code>URL</code>, <code>TextEncoder</code>/<code>TextDecoder</code>, or <code>setTimeout</code>/<code>setInterval</code>.</p>
 <h2 id="script-results-and-failures"><a class="header" href="#script-results-and-failures">Script results and failures</a></h2>
-<p>Every script result is <code>{value: &lt;JavaScript return&gt;, console: &lt;captured text&gt;}</code>, including
-silent scripts (<code>console: ""</code>) and scripts without a return (<code>value: null</code>). This wrapper applies
-to both public job views and native/programmatic script results; only script results need this
-extra <code>.value</code> unwrapping. Ordinary tool results inside JavaScript remain unchanged. In a script
-job view, the return is at <code>/result/value</code> and logs are at <code>/result/console</code>.</p>
-<p><code>console.log(...values)</code> captures space-separated text, formatting objects as JSON. Console
-capture is disk-backed and each log write is flushed, so a running script’s captured text can
-be inspected at <code>/result/console</code> with <code>job_output</code> or
+<p>Every script result payload is always <code>{value: &lt;JavaScript return&gt;, console: &lt;captured text&gt;, failure: null|JSON}</code>,
+including silent scripts (<code>console: ""</code>) and scripts without a return (<code>value: null</code>). <code>failure</code>
+is <code>null</code> on success. In a script JobView, the payload is at <code>/result</code> and its return is at
+<code>/result/value</code>; logs are at <code>/result/console</code>.</p>
+<p><code>console.log(...values)</code> captures space-separated text, formatting objects as JSON. A running
+script’s captured text can be inspected at <code>/result/console</code> with <code>job_output</code> or
 <code>tool.job(scriptJobId).output({field: "/result/console"})</code>. These inspections read the currently
 available output; they do not subscribe to future writes or wait for script completion.</p>
 <p>There is no fixed console-capture size cap. Disk capacity and I/O failures still apply.
 Automatic previews can truncate displayed text without discarding captured output; use
 <a href="job-output.html">paging or search</a> to inspect more. The <strong>16 MiB limit applies to JavaScript
 source</strong>, not console capture.</p>
-<p>On failure, the result is <code>{value: null, console: &lt;captured text&gt;, failure: &lt;details&gt;}</code> alongside
-the job error. Console text belongs to the script result, not generic job metadata or a separate
-tool-result text block.</p>
+<p>On a script execution failure, the saved script payload is <code>{value: null, console: &lt;captured text&gt;, failure: &lt;details&gt;}</code>;
+the enclosing JobView is <code>failed</code> and also carries its <code>error</code>. Console text belongs to the script
+result, not job metadata. A top-level <code>undefined</code> becomes JSON
+<code>null</code>; nested <code>undefined</code> is not coerced or removed and causes serialization failure.</p>
 <h2 id="builder-execution-and-policy"><a class="header" href="#builder-execution-and-policy">Builder execution and policy</a></h2>
-<p>Builder setters and object arguments come from the same strict JSON schema; omitted values receive
-the handler’s normal defaults. Awaiting a builder executes it immediately. Returning builders recursively executes independent
-branches concurrently. All executions still pass through the same registry, policy hook, job
-supervisor, persistence, and path authorization checks as model-originated calls. Top-level
-<code>undefined</code> returns JSON <code>null</code>; nested <code>undefined</code> values are rejected with their result path.
-The <code>script</code> tool is deliberately omitted from the runtime, preventing recursive script invocation.</p>
-<p>Failed tools retain any partial output (including captured process output on timeout). Model tool
-errors include it in an <code>output</code> field; JavaScript callers can catch the error and read <code>error.output</code>.</p>
+<p>Builder setters and object arguments accept the same inputs; omitted values receive the tool’s
+normal defaults. Awaiting a builder executes it immediately. Returning builders recursively executes
+independent branches concurrently. Calls use the same capabilities, approvals, path access checks,
+and saved-output behavior as direct tool calls. Scripts cannot invoke the <code>script</code> tool recursively.</p>
+<p>Failed tools retain any partial output (including captured process output on timeout) in the failed
+JobView’s <code>.result</code>; JavaScript operational failures do not reject the builder promise. Use
+<code>response.unwrap()</code> when failures should throw rather than be handled as data. Programmer and
+serialization errors are not operational tool failures and still reject/throw.</p>
 <p>See <a href="../scripting/introduction.html">scripting introduction</a> for lazy-builder examples and
 <a href="../scripting/jobs-and-agents.html">jobs and agents</a> for background work and child input.</p>
 

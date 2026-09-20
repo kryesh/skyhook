@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-b114b291.js";
+            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -185,8 +185,9 @@
 <p><code>--approve-all</code> or
 <code>approve_all = true</code> bypasses approval prompts. Subject to the granted capabilities, the default
 CLI auto-allows reads and agent operations, as well as writes inside the root workspace.
-Execution, remote access, target changes, and writes outside the root workspace require confirmation. When the <code>interactive</code> capability is granted, questions
-and SSH authentication appear in the interface. Otherwise operations needing human input fail
+Execution, HTTP requests, SSH access, target changes, and writes outside the root workspace
+require approval. When the <code>interactive</code> capability is granted, questions and SSH authentication
+appear in the interface. Otherwise operations needing human input fail
 immediately; <code>approve_all</code> bypasses tool approvals but never restores questions or authentication.</p>
 <p>Filesystem tools and command <code>cwd</code> accept absolute paths or relative paths including <code>..</code>.
 The workspace is a base directory, not a security boundary. Filesystem path authorization and
@@ -194,25 +195,25 @@ human approval are distinct: the default CLI read policy auto-allows reads even 
 canonical paths are outside the workspace. Do not rely on a confirmation prompt to protect
 outside-workspace reads. Outside-workspace writes require confirmation, and remote access has
 its own approval requirements.</p>
-<p>Path grants are cached in memory by session, target, access mode, and path; directory grants
-cover descendants, and read and write grants remain separate. Process execution remains subject
-to confirmation on each invocation. Applications embedding the core can supply a different
-approval policy, including one that prompts for or denies reads.</p>
+<p>Choose <strong>Allow once</strong> to approve only the current operation. When offered, <strong>Allow proposed
+scope</strong> saves the displayed grant for later operations in the same session, including after
+resume; inspect <strong>Details</strong> before granting it. Path grants apply only to the approved target
+and access mode. Directory grants cover descendants; read and write grants remain separate.
+Process execution remains subject to confirmation on each invocation. These defaults apply to
+the CLI; <a href="../development/embedding.html">library hosts</a> can supply a different approval policy.</p>
 <p>Approval controls and pending/granted approval details remain user-facing. Agents see an ordinary
-queued job while authorization is pending. Denials preserve the reason and add
-<code>code: "permission_denied", executed: false</code> to the rejected operation’s error or job envelope;
-script exceptions carry the same fields. A containing script may already have executed other work,
-so uncaught script failures retain the rejected operation as nested failure details. Agents must not
-circumvent a denial through another tool or route.</p>
+queued job while authorization is pending. A denial preserves its reason and marks the rejected
+operation with <code>code: "permission_denied", executed: false</code>; it does not undo work that a
+containing script already performed.
+Agents must not circumvent a denial through another tool or route. For programmatic failure
+handling, see the <a href="../reference/javascript.html#responseunwrap-and-native-results">JavaScript response contract</a>.</p>
 <h2 id="capabilities"><a class="header" href="#capabilities">Capabilities</a></h2>
-<p>The top-level configuration has one exact policy-capability allowlist:</p>
-<pre><code class="language-toml"># These are the defaults when capabilities is omitted. Add "targets" to enable targets.
-capabilities = ["read", "write", "exec", "network", "agents", "mcp"]
-</code></pre>
+<p>Capabilities are granted by the active <a href="#modes">mode</a>, or by a batch job’s
+<code>--capabilities</code> list.</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Capability</th><th>Controls</th><th>Default</th></tr>
+<tr><th>Capability</th><th>Controls</th><th><code>general</code> mode</th></tr>
 </thead>
 <tbody>
 <tr><td><code>read</code></td><td>File reads, searches, and skill reads</td><td>Enabled</td></tr>
@@ -222,20 +223,53 @@ capabilities = ["read", "write", "exec", "network", "agents", "mcp"]
 <tr><td><code>targets</code></td><td>Target-management tools and target-selection inputs</td><td>Disabled</td></tr>
 <tr><td><code>ssh_agent</code></td><td>Targets using <code>ssh.external_agent</code>, which forward an SSH agent Skyhook does not own; without it they are hidden</td><td>Disabled</td></tr>
 <tr><td><code>agents</code></td><td>Child-agent creation, also limited by available delegation depth</td><td>Enabled</td></tr>
-<tr><td><code>interactive</code> (runtime only)</td><td>Human-facing root questions, approval prompts, and sensitive authentication</td><td>Enabled by the terminal host; disabled in headless mode</td></tr>
+<tr><td><code>interactive</code> (runtime only)</td><td>Human-facing root questions, approval prompts, and sensitive authentication</td><td>Enabled by the terminal host; never in a batch job</td></tr>
 <tr><td><code>mcp</code></td><td>MCP server startup and MCP tool availability</td><td>Enabled</td></tr>
 </tbody>
 </table>
 </div>
-<p>An explicit array replaces the defaults; <code>capabilities = []</code> grants no policy capabilities.
-Unknown names and <code>interactive</code> are errors in this list and in <code>--capabilities</code>.
-<code>--capabilities read,write</code> replaces the config allowlist for that invocation; <code>--capabilities=</code>
-selects an empty policy set. Resolution is <strong>CLI allowlist &gt; config allowlist &gt; defaults</strong>.
-The host then supplies <code>interactive</code> according to the runtime mode, independently of the allowlist,
-and per-agent depth restrictions narrow the result. Use <code>--non-interactive</code> to disable human
-interaction; an empty allowlist does not disable the terminal interface or root questions.
-Overrides also apply when resuming or creating another session in the interface. Enable target
-support by including <code>"targets"</code> in the allowlist.</p>
+<p>A capability list is exact; <code>[]</code> grants no policy capabilities. Unknown names and <code>interactive</code>
+are errors in a mode and in <code>--capabilities</code>. The host supplies <code>interactive</code> independently of the
+list: the terminal always has it and <code>skyhook batch</code> never does, so an empty list does not disable
+the terminal interface or root questions. Per-agent depth restrictions narrow the result. Enable
+target support by including <code>"targets"</code> in a mode.</p>
+<h2 id="modes"><a class="header" href="#modes">Modes</a></h2>
+<p>A mode is a named permission preset. The root agent runs in one mode at a time:</p>
+<pre><code class="language-toml"># The mode a new session starts in; "general" when omitted.
+default_mode = "readonly"
+
+[modes.readonly]
+capabilities = ["read", "network"]
+instructions = "Investigate and report. Do not change anything."
+hint = "Look things up without changing anything"
+
+# Built in, and listed first. Declare it only to change what it grants.
+[modes.general]
+capabilities = ["read", "write", "exec", "network", "agents", "mcp"]
+</code></pre>
+<p><code>capabilities</code> is required, and <code>default_mode</code> must name <code>general</code> or a declared mode. Optional <code>instructions</code> are added to the system prompt of an agent
+running in the mode; they guide the model, whereas capabilities are enforced. An optional <code>hint</code>
+offers the mode to agents starting a child: the <code>agent</code> tool lists each hinted mode whose
+capabilities the caller holds itself, with those capabilities and the hint. A mode without a hint
+cannot be given to a child. A workspace
+config that declares a mode replaces the whole definition of a user-config mode with that name;
+modes it does not name are kept, in declaration order.</p>
+<p><code>--mode NAME</code> selects the starting mode; without it the terminal starts in the mode last used in
+that workspace, and a batch job in <code>default_mode</code>. In the terminal, <code>Tab</code>/<code>Shift+Tab</code> in the composer (or
+<code>/mode</code>) choose the mode the next message is sent in; the footer shows it. A change takes effect
+with that message and forfeits the provider’s prompt cache for the next request. Child agents keep what they start with: the capabilities and instructions of the mode their
+parent chose for them, or otherwise the capabilities their parent holds and no mode instructions.
+Background jobs and scripts already running keep their capabilities too. A session can only hold capabilities
+that some configured mode grants, and MCP servers start under that union, so switching modes
+never starts or stops a server. Approvals granted earlier stay recorded but cannot be used while
+the mode lacks their capability. A resumed session continues in the mode it was last in. A
+session records each mode’s definition the first time it is used and keeps it: editing or
+removing that mode in the configuration does not change the session, while modes added later
+can still be selected. A resumed session is also never granted more than it started with, so a
+batch session reopened in the terminal stays without <code>interactive</code>. Because <code>general</code> is always
+present, redeclare it with a narrower list if the terminal should never be able to switch to its
+default capabilities.
+Continuing a failed or interrupted root turn also applies a newly chosen mode.</p>
 <p>Capabilities gate both tool discovery and invocation, including JavaScript. Approval policies and
 cached grants cannot restore a missing capability. Ungated orchestration tools remain available even
 with an empty set. These gates are <strong>not an OS sandbox</strong>: allowing <code>exec</code> lets a command access files

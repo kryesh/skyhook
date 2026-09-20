@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-b114b291.js";
+            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -181,28 +181,73 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="remote-transport-and-shims"><a class="header" href="#remote-transport-and-shims">Remote transport and shims</a></h1>
-<h2 id="remote-transport"><a class="header" href="#remote-transport">Remote transport</a></h2>
-<p>The crate-private <code>ConnectionFactory</code> (<code>remote/backend.rs</code>) opens an owned <code>Transport</code> byte stream
-to a route; the manager performs the shim handshake over it, pools one connection per workspace,
-and test doubles implement the same trait. <code>remote/protocol.rs</code> is the shim wire protocol carried over that stream.</p>
-<p>SSH configuration is generated only from target definitions. An SSH process runs on root or on
-the shim of the destination’s <code>origin</code>; <code>via</code> hops are native <code>ProxyJump</code> hops of that process.
-Cancelling one waiter never terminates a connection startup shared with other callers.</p>
-<h2 id="embedded-shim-builds"><a class="header" href="#embedded-shim-builds">Embedded shim builds</a></h2>
+<p>Remote execution changes where an operation runs, not who owns the agent or job. Provider calls,
+agent loops, policy decisions, job state, saved output, and session blobs remain owned by the
+Skyhook host. A shim runs individual operations and streams their output back; it does not create
+a session database or run a second agent harness.</p>
+<h2 id="responsibility-boundaries"><a class="header" href="#responsibility-boundaries">Responsibility boundaries</a></h2>
+<ul>
+<li>Target resolution selects a validated route and execution workspace. SSH configuration comes
+from target definitions, not the user’s or system’s SSH configuration.</li>
+<li><code>RemoteManager</code> owns the session’s connection pool, keyed by resolved route identity <strong>and</strong>
+workspace. It coordinates shared startup, invalidation, and shutdown.</li>
+<li><code>ConnectionFactory</code> supplies the byte stream and lifetime owner. The SSH backend handles
+authentication, OpenSSH processes, platform probing, and shim deployment; it does not implement
+job supervision or saved-output storage.</li>
+<li>The common client performs the shim handshake and routes multiplexed requests, output,
+authorization checks, and private control messages. The host persists streamed output and
+images using the same job-output machinery as local execution.</li>
+<li>The worker reuses the local built-in invocation layer for argument admission and operation
+execution. Permission requests return to the host’s authorization coordinator. Private services
+support relayed SSH streams and sensitive prompts without turning them into tool results.</li>
+</ul>
+<p>This division keeps transport-specific code below the tool/job boundary and lets local and remote
+operations share validation and execution behavior.</p>
+<h2 id="connection-and-request-lifecycle"><a class="header" href="#connection-and-request-lifecycle">Connection and request lifecycle</a></h2>
+<p>Connection startup is shared by callers using the same pool key. Cancelling one waiter stops its
+wait, not the shared startup. Startup failure removes the failed slot; I/O or protocol failure
+during execution discards the affected pooled connection so later work can establish a new one.
+It does not transparently replay the failed tool operation.</p>
+<p>Once connected, request IDs associate output and cancellation with individual operations.
+Credit-based flow control bounds queued payload and relayed-stream data. A transport’s lifetime
+owner retains its underlying process resources; dropping it tears those resources down. A relayed
+connection also retains its origin connection for the lifetime of the child stream. Session
+shutdown cancels startup, clears the pool, and releases session-owned authentication resources.</p>
+<h3 id="origin-versus-jump-hosts"><a class="header" href="#origin-versus-jump-hosts">Origin versus jump hosts</a></h3>
+<p><a href="../guide/execution-targets.html#routing-origin-and-via">Routing</a> decides where SSH runs: on root
+or on the shim of the destination’s <code>origin</code>. Targets listed through <code>via</code> are native <code>ProxyJump</code>
+hops of that SSH process, not additional shim workers. A remote origin’s shim can start SSH and relay its
+byte stream over the existing host connection, while the host still runs the destination’s
+protocol client and supervises its jobs.</p>
+<h3 id="shim-deployment"><a class="header" href="#shim-deployment">Shim deployment</a></h3>
+<p>The backend probes the remote platform, selects a matching embedded artifact, and installs it in
+a digest-named directory under the remote user’s cache. An existing executable is reused only
+after it matches the expected digest, and an upload is verified before it is installed. The shim starts in the
+requested workspace. The target’s configured workspace
+is separately resolved as the authorization root, so a per-call working directory does not
+silently redefine the target’s permission boundary.</p>
+<h2 id="authentication-and-prompt-isolation"><a class="header" href="#authentication-and-prompt-isolation">Authentication and prompt isolation</a></h2>
+<p>Each credential origin can lazily own a private <code>ssh-agent</code>. Root’s agent is session-owned; remote
+origins manage theirs inside the shim. <a href="../guide/execution-targets.html#agents"><code>external_agent</code></a>
+targets use the origin’s inherited agent socket instead. Ordinary processes
+started by a remote worker receive OpenSSH’s forwarded <code>SSH_AUTH_SOCK</code>; no second forwarding
+listener is needed.</p>
+<p>SSH authentication prompts use <code>SensitivePromptHandler</code>, separate from model questions and tool
+output. Remote prompts and answers travel as private control messages, not session events or
+saved results. OpenSSH is given an explicit askpass helper so the host can handle passwords,
+passphrases, and confirmations without exposing them to the agent transcript.</p>
+<p>Each askpass server keeps its helper and socket in a private temporary directory and accepts
+only peers running as its own user. This prevents other local users from injecting
+prompts or obtaining answers through the socket; it is not an isolation boundary against other
+processes running as the same user. Dropping the server cancels its task and removes its temporary
+files.</p>
+<h2 id="building-and-packaging-artifacts"><a class="header" href="#building-and-packaging-artifacts">Building and packaging artifacts</a></h2>
 <p>Shims are built explicitly, never as a side effect of building the CLI. <code>just build-shims</code> builds
 every shim type with Cargo’s <code>dev</code> profile; <code>just build-shims-release</code> uses the size-optimised,
 stripped <code>shim-release</code> profile. The <code>linux-ssh</code> shim is cross-compiled with <code>cargo zigbuild</code> for
-every target in the justfile’s <code>linux_ssh_targets</code> and copied to <code>target/shims/linux-ssh-&lt;arch&gt;</code>,
-replacing the previous variant. New shim types are added to the justfile’s <code>_shims</code> recipe. Debug
-artifacts are substantially larger. Zig 0.16.0 was used to validate both targets; <code>just setup</code>
-installs <code>cargo-zigbuild</code> and the musl targets, but Zig itself must be installed separately.</p>
-<p>The CLI embeds whatever <code>target/shims/</code> contains, via <code>rust-embed</code>, without checking how it got
-there. Debug builds (<code>just build</code>) read the directory live at runtime, so rebuilding shims needs
-no CLI rebuild. Release builds (<code>just build-release</code>) include the bytes at compile time and are
-self-contained; the recipe touches the embedding module first because <code>rust-embed</code> cannot detect
-newly added files. A missing or empty directory yields an empty catalog, and SSH use then
-reports an explicit missing-shim error.</p>
-<h2 id="shim-targets-and-artifacts"><a class="header" href="#shim-targets-and-artifacts">Shim targets and artifacts</a></h2>
+every target in the justfile’s <code>linux_ssh_targets</code> and staged into <code>target/shims/</code>, replacing the
+previous variant. New shim types belong in the justfile’s <code>_shims</code> recipe. <code>just setup</code> installs
+<code>cargo-zigbuild</code> and the musl targets; Zig itself must be installed separately.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -214,14 +259,24 @@ reports an explicit missing-shim error.</p>
 </tbody>
 </table>
 </div>
-<p>Git contains source only, not prebuilt shim binaries. To build just a native Linux SSH shim
-without Zig or UI dependencies:</p>
+<p>The CLI discovers staged artifacts through <code>rust-embed</code>, without checking which build profile
+produced them. Debug builds (<code>just build</code>) read the directory live, so rebuilding shims needs no
+CLI rebuild. Release builds (<code>just build-release</code>) include bytes at compile time and are
+self-contained. That recipe touches the embedding module first because <code>rust-embed</code> cannot detect
+newly added files. Debug shim artifacts are substantially larger than release artifacts.</p>
+<p>A missing or empty staging directory yields an empty catalog; SSH then reports an explicit
+missing-shim error. Library hosts inject their own <a href="embedding.html#embedded-shim-catalog">embedded catalog</a>
+rather than inheriting the CLI catalog.</p>
+<p>Git contains source only, not prebuilt shim binaries. To build a native Linux SSH shim without
+Zig or UI dependencies:</p>
 <pre><code class="language-sh">cargo build --bin linux-ssh --features shim-bin
 </code></pre>
-<p>See <a href="setup.html">development setup</a> for the full recipe list. Library hosts inject their own
-<a href="embedding.html#embedded-shim-catalog">embedded catalog</a>.</p>
-<p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/src/remote">remote module</a>
-and <a href="https://github.com/kryesh/skyhook/tree/main/src/bin/linux-ssh">shim binary</a>.</p>
+<p>This Cargo command builds the binary but does not stage it into <code>target/shims/</code>. See
+<a href="setup.html">development setup</a> for the recipe list, including the combined shim and CLI build.</p>
+<p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/src/remote">remote module</a>,
+<a href="https://github.com/kryesh/skyhook/tree/main/src/bin/linux-ssh">shim binary</a>,
+<a href="https://github.com/kryesh/skyhook/blob/main/src/bin/skyhook/embedded_shims.rs">CLI catalog</a>, and
+<a href="https://github.com/kryesh/skyhook/blob/main/justfile">build recipes</a>.</p>
 
                     </main>
 

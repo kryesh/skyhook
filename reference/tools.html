@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-b114b291.js";
+            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -182,23 +182,29 @@
                     <main>
                         <h1 id="built-in-tools"><a class="header" href="#built-in-tools">Built-in tools</a></h1>
 <p><code>read</code>, <code>search</code>, <code>glob</code>, <code>exec</code>, <code>shell</code>, <code>fetch</code>, <code>write</code>, <code>replace</code>, <code>patch</code>, <code>remove</code>, <code>script</code>, <code>targets</code>,
-<code>target_add</code>, <code>skills</code>, <code>skill</code>, <code>jobs</code>, <code>job_output</code>, <code>wait</code>, <code>ask</code>, <code>todo</code>, and <code>agent</code>. <code>jobs()</code> lists the current agent’s
-active jobs, excluding the listing call and its containing script. <code>jobs({all:true})</code> includes
-completed history; listings contain status and references, never saved results.</p>
+<code>target_add</code>, <code>skills</code>, <code>skill</code>, <code>jobs</code>, <code>job_output</code>, <code>wait</code>, <code>ask</code>, <code>todo</code>, and <code>agent</code>. Calls use the
+<a href="javascript.html#jobview-response-contract">common JobView envelope</a>; native payloads are in <code>.result</code>.
+<code>jobs()</code> lists the current agent’s active jobs, excluding the listing call and its containing script.
+<code>jobs({all:true})</code> includes completed history, and the listing payload is in the envelope’s <code>.result</code>.</p>
 <p><code>job_output</code> reads saved output and status immediately; it never waits for new output or completion.
-Scripts use <code>tool.job(id).output(...)</code>, <code>.send({value})</code>, and <code>.cancel()</code>.</p>
+<code>tool.job(id).output(...)</code> returns the existing queried view, not another wrapper. Scripts use
+<code>tool.job(id).output(...)</code>, <code>.send({value})</code>, and <code>.cancel()</code>.</p>
 <p>Use <code>wait({timeout?: seconds})</code> (or <code>await tool.wait(...)</code> in scripts) to yield until an agent
-event or a timeout, then inspect the relevant jobs. Omitted or null <code>timeout</code> waits indefinitely;
-a supplied timeout must be a positive integer number of seconds.
-The result is <code>{reason:"event"}</code> or <code>{reason:"timeout"}</code>. An event does not guarantee a particular
-job has completed; inspect its current status. Waiting does not stop background work.
-Do independent work first rather than polling output in a tight loop. Output reads reject the old
-<code>wait</code> argument.</p>
+event or a timeout, then inspect the relevant jobs. The returned view’s <code>.result</code> is
+<code>{reason:"event"}</code> or <code>{reason:"timeout"}</code>. Omitted or null <code>timeout</code> waits indefinitely;
+a supplied timeout must be a positive integer number of seconds. An event does not guarantee a
+particular job has completed; inspect its current status. See
+<a href="../scripting/jobs-and-agents.html#waiting-for-background-work">waiting for background work</a> for
+when a wait resolves.</p>
+<p>See the <a href="javascript.html#responseunwrap-and-native-results">JavaScript response contract</a> for
+<code>response.unwrap()</code>, serialization, and operational-failure behavior. In this reference,
+<code>tool.job(id).output(...)</code> and other inspection calls return views for reading their
+<code>presentation</code> fields; use the task-specific contracts below for their payloads.</p>
 <h2 id="creating-files-with-write"><a class="header" href="#creating-files-with-write">Creating files with <code>write</code></a></h2>
 <p><code>write({path, content})</code> atomically creates or replaces a UTF-8 file. Set the optional
 <code>create_parents: true</code> to create missing parent directories recursively before writing, for example
 <code>write({path: "reports/run/summary.md", content: "...", create_parents: true})</code>.
-It defaults to <code>false</code>, so existing calls still fail when a parent directory is missing.</p>
+It defaults to <code>false</code>, so a missing parent directory causes the call to fail.</p>
 <h2 id="further-contracts"><a class="header" href="#further-contracts">Further contracts</a></h2>
 <ul>
 <li><a href="javascript.html">JavaScript runtime</a>: fluent builders and native/script result shapes.</li>
@@ -208,7 +214,7 @@ It defaults to <code>false</code>, so existing calls still fail when a parent di
 <li><a href="runtime-state.html">Runtime state</a>: todos and per-request job snapshots.</li>
 <li><a href="../guide/execution-targets.html">Execution targets</a>: target selection and workspace inheritance.</li>
 <li><a href="../guide/instructions-and-skills.html">Instructions and skills</a>: discovery, assets, and copying.</li>
-<li><a href="../configuration/mcp.html">MCP</a>: importing external tools into the same registry.</li>
+<li><a href="../configuration/mcp.html">MCP</a>: making external tools available to agents and scripts.</li>
 </ul>
 <p>All tools remain subject to <a href="../guide/permissions.html">permissions and capabilities</a>, including
 calls made inside scripts. A workspace does not sandbox commands or file paths.</p>

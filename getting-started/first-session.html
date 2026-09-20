@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-b114b291.js";
+            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -199,10 +199,10 @@ model = "gpt-5.6"
 max_context = 1050000
 max_output = 128000
 </code></pre>
-<p>Use a model identifier supported by your account. These are the published GPT-5.6 Sol limits
-(the <code>gpt-5.6</code> alias routes to Sol), not automatic model detection. You can choose smaller
-budgets. For other providers, a keyless local server,
-or Codex OAuth, see <a href="../configuration/providers-and-models.html">providers and models</a> and
+<p>Use a model identifier supported by your account and set its token limits explicitly; Skyhook
+does not detect them automatically. You can choose smaller budgets. For model limits, other
+providers, a keyless local server, or Codex OAuth, see
+<a href="../configuration/providers-and-models.html">providers and models</a> and
 <a href="../configuration/authentication.html">authentication</a>.</p>
 <p>From a source checkout, you can instead copy the comprehensive example and edit it before running:</p>
 <pre><code class="language-sh">cp config.example.toml "$config_dir/config.toml"
@@ -216,7 +216,7 @@ skyhook --prompt "inspect this repository"
 <p>Skyhook opens a full-screen terminal interface. <code>--prompt</code> submits an initial message;
 <code>--script workflow.js</code> starts a JavaScript workflow in the same interface. Both remain open
 for inspection and follow-up input after the work finishes. These interface modes require an
-interactive terminal. Add <code>--non-interactive</code> to <code>-p/--prompt</code> or <code>-s/--script</code> for headless execution
+interactive terminal. Use <code>skyhook batch</code> with <code>-p/--prompt</code> or <code>-s/--script</code> for headless execution
 with redirected input/output support and automatic exit; see <a href="../guide/headless.html">Headless execution</a>.</p>
 <p>An unused startup draft creates no saved session. The first sent message or explicitly run
 script creates the session. Use <code>--workspace PATH</code> to select another workspace. Normally,
@@ -225,14 +225,16 @@ script creates the session. Use <code>--workspace PATH</code> to select another 
 See <a href="../configuration/overview.html#file-selection-and-layering">configuration layering</a>, including
 its workspace trust boundary.</p>
 <p>To inspect configuration or available skills without a session or API credentials:</p>
-<pre><code class="language-sh">skyhook --dump config  # Effective TOML on stdout; diagnostics/source paths on stderr.
-skyhook --dump skills  # Winning skills, frontmatter, and asset tree.
+<pre><code class="language-sh">skyhook dump config  # Effective TOML on stdout; diagnostics/source paths on stderr.
+skyhook dump skills  # Winning skills, frontmatter, and asset tree.
 </code></pre>
 <p>Both return nonzero on errors; skills can still list valid entries when other entries fail.
-See <a href="../reference/cli.html#dump-modes">dump modes</a> for compatible options.</p>
-<p>By default, execution, remote access, target changes, and writes outside the workspace
-require confirmation. See <a href="../guide/permissions.html">permissions and capabilities</a> before
-using <code>--approve-all</code>; it bypasses tool approvals, not authentication prompts.</p>
+See <a href="../reference/cli.html#dump">dump</a> for compatible options. After a session,
+<code>skyhook stats SESSION_ID</code> reports its token usage, model requests, delegation, and tool calls
+(see <a href="../reference/cli.html#stats">stats</a>).</p>
+<p>Actions with effects outside the workspace require approval. See
+<a href="../guide/permissions.html">permissions and capabilities</a> before using <code>--approve-all</code>; it bypasses
+tool approvals, not authentication prompts.</p>
 <p>Next, learn the <a href="../guide/terminal-interface.html">terminal interface</a>,
 <a href="../guide/sessions-and-context.html">session and context behavior</a>, or
 <a href="../guide/headless.html">headless execution</a>. All command-line options are summarized in the

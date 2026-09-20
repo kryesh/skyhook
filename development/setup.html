@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-b114b291.js";
+            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -207,7 +207,10 @@ just setup
 <tr><td><code>just build-shims-release</code></td><td>Cross-compile size-optimised SSH shims into <code>target/shims</code>; requires Zig.</td></tr>
 <tr><td><code>just build</code></td><td>Debug CLI; reads <code>target/shims</code> live at runtime.</td></tr>
 <tr><td><code>just build-release</code></td><td>Release CLI embedding the current contents of <code>target/shims</code>.</td></tr>
-<tr><td><code>just test</code></td><td>Full nextest suite plus doctests.</td></tr>
+<tr><td><code>just build-full</code></td><td>Release shims, then a release CLI that embeds them.</td></tr>
+<tr><td><code>just install</code></td><td><code>build-full</code>, then install the CLI as <code>~/.local/bin/skyhook</code>.</td></tr>
+<tr><td><code>just run [args]</code></td><td>Run the debug CLI.</td></tr>
+<tr><td><code>just test</code></td><td>Nextest suite over all targets and features.</td></tr>
 <tr><td><code>just lint</code></td><td>Clippy over all targets and features with warnings denied.</td></tr>
 <tr><td><code>just fmt</code></td><td>Format Rust code.</td></tr>
 <tr><td><code>just docs</code></td><td>Build the mdBook into <code>docs/book</code>.</td></tr>
@@ -222,6 +225,22 @@ library. Each binary requires its own feature, <code>tui</code> for <code>skyhoo
 <code>linux-ssh</code>, so pass <code>--features tui</code> (or <code>--all-features</code>) to direct Cargo commands.
 Shims are only ever built by the <code>build-shims*</code> recipes; a CLI built without them reports an
 explicit missing-shim error if asked to use SSH.</p>
+<h2 id="verification"><a class="header" href="#verification">Verification</a></h2>
+<p>Follow the repository policy in <a href="https://github.com/kryesh/skyhook/blob/main/AGENTS.md">AGENTS.md</a>.
+The standard checks are:</p>
+<pre><code class="language-sh">just fmt
+just lint
+just test
+</code></pre>
+<p>When running Cargo directly, include the CLI/TUI and shim features:</p>
+<pre><code class="language-sh">cargo fmt --all --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo nextest run --locked --all-targets --all-features
+</code></pre>
+<p>Nextest does not run doctests; run <code>cargo test --locked --doc --all-features</code> separately
+when changing Rust documentation examples. For book changes, run <code>just docs</code> and check the
+rendered pages and links. <code>AGENTS.md</code> also covers test policy, including stress runs for tests
+that coordinate gated provider steps.</p>
 <p>The <code>skyhook-agent</code> package is one library crate named <code>skyhook</code> plus those two binaries. See
 <a href="architecture.html">architecture</a> and <a href="embedding.html">embedding</a> for the library boundaries.
 <a href="documentation.html">Documentation and publishing</a> covers local preview and manual GitHub Pages
