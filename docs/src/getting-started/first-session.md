@@ -24,10 +24,10 @@ max_context = 1050000
 max_output = 128000
 ```
 
-Use a model identifier supported by your account. These are the published GPT-5.6 Sol limits
-(the `gpt-5.6` alias routes to Sol), not automatic model detection. You can choose smaller
-budgets. For other providers, a keyless local server,
-or Codex OAuth, see [providers and models](../configuration/providers-and-models.md) and
+Use a model identifier supported by your account and set its token limits explicitly; Skyhook
+does not detect them automatically. You can choose smaller budgets. For model limits, other
+providers, a keyless local server, or Codex OAuth, see
+[providers and models](../configuration/providers-and-models.md) and
 [authentication](../configuration/authentication.md).
 
 From a source checkout, you can instead copy the comprehensive example and edit it before running:
@@ -71,9 +71,9 @@ See [dump](../reference/cli.md#dump) for compatible options. After a session,
 `skyhook stats SESSION_ID` reports its token usage, model requests, delegation, and tool calls
 (see [stats](../reference/cli.md#stats)).
 
-By default, execution, remote access, target changes, and writes outside the workspace
-require confirmation. See [permissions and capabilities](../guide/permissions.md) before
-using `--approve-all`; it bypasses tool approvals, not authentication prompts.
+Actions with effects outside the workspace require approval. See
+[permissions and capabilities](../guide/permissions.md) before using `--approve-all`; it bypasses
+tool approvals, not authentication prompts.
 
 Next, learn the [terminal interface](../guide/terminal-interface.md),
 [session and context behavior](../guide/sessions-and-context.md), or

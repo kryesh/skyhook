@@ -24,6 +24,8 @@ headers_env = { Authorization = "MY_MCP_AUTHORIZATION" }
 # start_command = ["my-http-mcp-server", "--port", "8080"]
 ```
 
+## Connections and credentials
+
 `start_command` is an argument vector, not shell text; its first element must name a nonempty
 executable. Stdio requires it and rejects `url` and `headers_env`. Streamable HTTP requires an
 absolute HTTP(S) `url`. It connects first, and only starts the optional command if the endpoint is
@@ -31,9 +33,8 @@ unreachable—not on authentication, protocol, or other server errors. `cwd` and
 `start_command`; HTTP connections without a startup command must omit them. Relative `cwd` is
 resolved against the directory of the source configuration file that defines the value, not the
 agent workspace. When user and workspace config are layered, an inherited user `cwd` retains its
-user-file base; an overlaid workspace `cwd` uses `<workspace>/.skyhook`. Unknown fields, transports,
-capabilities, invalid transport combinations, and zero, negative, fractional, or overflowing
-timeouts are rejected.
+user-file base; an overlaid workspace `cwd` uses `<workspace>/.skyhook`. Timeouts must be positive
+whole seconds. Unknown settings and invalid transport combinations are rejected.
 
 HTTP `headers_env` maps header names to environment-variable names. The variable's complete value
 is sent as the header (for example, `MY_MCP_AUTHORIZATION` can contain `Bearer ...`); secrets do not
@@ -41,11 +42,13 @@ belong in TOML. Missing or non-Unicode variables, invalid header names, and valu
 encoded as HTTP headers prevent that server's connection from starting. Empty header values are
 passed through to the server. Do not put secrets in `start_command` arguments or literal `env` values.
 
+## Trust and permissions
+
 **Trust boundary:** configured startup commands are trusted configuration, including commands
 from a workspace `.skyhook/config.toml` overlay. Review workspace config before use. They run during
-harness startup without a model tool-approval prompt, only on the local root/session host—not on
-selected SSH targets. Only configure commands and endpoints you trust. MCP clients and launched
-processes are owned by the root session rather than independently restarted for each child agent.
+session startup without a model tool-approval prompt, only on the local root/session host—not on
+selected SSH targets. Only configure commands and endpoints you trust. Child agents share the
+session's MCP connections rather than starting their own servers.
 
 The session must hold the global **`mcp` capability** before any MCP server is launched or contacted,
 and before any MCP tool can be exposed or invoked. Each server's `capabilities` array defaults to
@@ -61,27 +64,26 @@ capabilities. **An omitted or empty per-server list requires only global `mcp` a
 permission prompt.** MCP transports do not implicitly require `exec` or `network`; startup
 commands and endpoints remain trusted host configuration.
 
+## Using imported tools
+
 Skyhook imports **tools only**, not MCP prompts or resources. At startup it initializes each server
 and discovers its tools, then freezes that catalog for the session lifetime; later catalog-change
 notifications do not add or replace tools. A server that fails startup/discovery is warned about and
-skipped rather than preventing the rest of the harness from starting. The terminal
+skipped rather than preventing the session from starting. The terminal
 interface's sidebar shows each server's startup status.
 
-Imported tools are exposed both as ordinary model tools and through lazy `tool` builders inside
-`script`, using the registered tool name shown in the catalog. Native MCP argument schemas are
-preserved when they can safely coexist with Skyhook's common tool arguments. If a schema is open
-or conflicts with the common `bg` argument, its MCP input is nested under an `arguments` object
-instead. Schemas with a root `$ref` or `patternProperties` are also conservatively wrapped. Input
-schema roots must declare `type = "object"`; tools with invalid or unsupported schemas are warned
-about and skipped individually. Use the advertised schema for either surface; the wrapper is
-removed before sending input to the MCP server. Tools normally use readable names such as
-`mcp_filesystem_write_file`. A short, deterministic hash suffix is added only when a name needs
-sanitizing or shortening to the 64-character limit, or conflicts with another tool. Ambiguous
-names are resolved across the startup catalog independently of discovery order. Use the exact
-advertised name with `tool[name](...)` or its fluent builder. Direct model and foreground script
-calls return the [common JobView envelope](../reference/javascript.md#jobview-response-contract); the
-MCP payload (`content`, plus optional `structuredContent` and `isError`) is in `.result`. Images use
-the usual saved-output image handling, and server-reported errors retain their output in failed jobs.
+Imported tools are available to the model and through `tool` builders inside `script`. Use the
+exact advertised name and schema rather than deriving them from the server's tool name. Names
+usually look like `mcp_filesystem_write_file`, but may have a suffix to avoid conflicts. Arguments
+may appear at the top level or under an `arguments` object so they do not conflict with common
+Skyhook arguments such as `bg`. Tools with invalid or unsupported input schemas are warned about
+and skipped individually.
+
+Call a tool with `tool[name](...)` or its fluent builder. Calls return the
+[common JobView envelope](../reference/javascript.md#jobview-response-contract); the MCP payload
+(`content`, plus optional `structuredContent` and `isError`) is in `.result`. Images use the usual
+[saved-output image handling](../reference/javascript.md#saved-output-and-serialization), and server-reported errors retain their
+output in failed jobs.
 
 Calls pass through the same cancellation and background-job machinery as builtins. Skyhook
 bounds discovery and response sizes, and does not replay a call with an uncertain outcome after

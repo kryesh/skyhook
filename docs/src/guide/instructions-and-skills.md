@@ -33,26 +33,16 @@ $HOME/.config/skyhook/AGENTS.md     # Not loaded when the XDG selection is reada
 /project/app/agents.md             # Ignored when AGENTS.md exists, even if unreadable.
 ```
 
-The model context uses these labels, regardless of the selected filename's casing, in this order:
-
-```text
-user AGENTS.md:
-<user file contents>
-
-workspace AGENTS.md:
-<workspace file contents>
-```
-
-Instructions configured through the library are appended afterward. Root and child agents use
-the built-in system prompts; there are no named agent profiles or `.agents/agents` role discovery.
+User instructions are supplied before workspace instructions, with their source identified.
+If both locations select the same file, it is loaded only once. Root and child agents share
+these instructions.
 
 ## Host-owned skills
 
-Host-owned skills are exposed through `skills` and `skill`. Their discovery rules are **unchanged**
-by the instruction-file rules above. Discovery reads `~/.agents/skills`
-and `.agents/skills` directories along the workspace ancestry, with the nearest workspace
-definition winning when names collide. Discovery happens when the harness starts; restart it
-to discover newly added skills. A skill directory contains `SKILL.md` and optional supporting
+Host-owned skills are exposed through `skills` and `skill`. Unlike instructions, skill discovery
+reads `~/.agents/skills` and `.agents/skills` directories along the workspace ancestry, with the
+nearest workspace definition winning when names collide. Discovery happens at startup;
+restart Skyhook to discover newly added skills. A skill directory contains `SKILL.md` and optional supporting
 files, conventionally grouped in `scripts/`, `references/`, and `assets/`:
 
 ```text

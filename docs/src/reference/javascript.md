@@ -70,7 +70,8 @@ question, or notice. When present, it groups `preview`, `truncated`, `captures`,
 `r.presentation.preview.lines` and a question as `r.presentation.question`.
 Truncation entries keep their source paths rooted at `/result/...`.
 
-JavaScript receives complete data; model views may truncate only fields annotated as truncatable.
+JavaScript receives complete data; model views may shorten fields as described in
+[saved job output](job-output.md#automatic-previews).
 Tool descriptions' `Result` refers to the envelope's `.result`, not a separate wrapper. A successful
 `job_output` call on a failed target is still a successful tool invocation returning that failed
 `JobView`; `response.unwrap()` checks the observed job state and can therefore throw for that view.
@@ -106,9 +107,8 @@ including silent scripts (`console: ""`) and scripts without a return (`value: n
 is `null` on success. In a script JobView, the payload is at `/result` and its return is at
 `/result/value`; logs are at `/result/console`.
 
-`console.log(...values)` captures space-separated text, formatting objects as JSON. Console
-capture is disk-backed and each log write is flushed, so a running script's captured text can be
-inspected at `/result/console` with `job_output` or
+`console.log(...values)` captures space-separated text, formatting objects as JSON. A running
+script's captured text can be inspected at `/result/console` with `job_output` or
 `tool.job(scriptJobId).output({field: "/result/console"})`. These inspections read the currently
 available output; they do not subscribe to future writes or wait for script completion.
 
@@ -117,18 +117,17 @@ Automatic previews can truncate displayed text without discarding captured outpu
 [paging or search](job-output.md) to inspect more. The **16 MiB limit applies to JavaScript
 source**, not console capture.
 
-On a script execution failure, the completed script payload is `{value: null, console: <captured text>, failure: <details>}`;
+On a script execution failure, the saved script payload is `{value: null, console: <captured text>, failure: <details>}`;
 the enclosing JobView is `failed` and also carries its `error`. Console text belongs to the script
-result, not generic job metadata or a separate tool-result text block. A top-level `undefined` becomes JSON
+result, not job metadata. A top-level `undefined` becomes JSON
 `null`; nested `undefined` is not coerced or removed and causes serialization failure.
 
 ## Builder execution and policy
 
-Builder setters and object arguments come from the same strict JSON schema; omitted values receive
-the handler's normal defaults. Awaiting a builder executes it immediately. Returning builders recursively executes independent
-branches concurrently. All executions pass through the same registry, policy hook, job supervisor,
-persistence, and path authorization checks as model-originated calls. The `script` tool is omitted
-from the runtime, preventing recursive script invocation.
+Builder setters and object arguments accept the same inputs; omitted values receive the tool's
+normal defaults. Awaiting a builder executes it immediately. Returning builders recursively executes
+independent branches concurrently. Calls use the same capabilities, approvals, path access checks,
+and saved-output behavior as direct tool calls. Scripts cannot invoke the `script` tool recursively.
 
 Failed tools retain any partial output (including captured process output on timeout) in the failed
 JobView's `.result`; JavaScript operational failures do not reject the builder promise. Use

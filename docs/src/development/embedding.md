@@ -1,79 +1,152 @@
 # Embedding
 
-The `skyhook-agent` package exposes the `skyhook` Rust library crate. Embedding hosts supply
-configuration, a workspace, model selection, and interaction handlers rather than depending
-on terminal UI state. See [library architecture](architecture.md) for the provider, registry,
-and session ownership boundaries.
+The `skyhook-agent` package exposes the `skyhook` Rust library crate. Hosts supply configuration,
+a workspace, model selection, and interaction handlers rather than depending on terminal UI
+state. See [library architecture](architecture.md) for responsibility boundaries and the internal
+request lifecycle.
+
+## Constructing a harness and session
+
+The configuration-backed entry point is:
+
+```rust,ignore
+let harness = config
+    .into_runtime()?
+    .select_model(name)?
+    .harness_builder(workspace)?
+    .build()
+    .await?;
+let session = harness.new_session().await?;
+```
+
+`into_runtime()` admits an immutable configuration generation; `select_model(name)` binds the
+host's explicit choice to that generation. Admission and selection precede provider construction,
+credential lookup, and workspace access. `harness_builder(workspace)` returns a `HarnessBuilder`
+that can be customized before `build().await`; hosts supplying their own providers and model
+profiles can instead start with `HarnessBuilder::new(workspace)`.
+
+The configuration-backed builder carries the configured modes and selects the configured default.
+`mode(name)` selects another, and `capabilities(set)` limits what modes can grant. A builder without
+modes gives the root agent that capability set directly. `PromptOptions::model` and
+`PromptOptions::mode` carry selections with a submitted message; omitted selections retain the
+active model and mode. A mode change applies to the root agent from the boundary that consumes
+it, not retroactively to children it already started. A session pins each mode's definition on
+first use and cannot outgrow its original capability ceiling.
+
+Before building, hosts can supply policy, question and sensitive-prompt handlers, additional tools,
+and an embedded shim catalog. Core `Config` loading does not load `.env`; environment setup belongs
+to the host (the CLI performs its own startup loading).
+
+The builder defaults to `<workspace>/.skyhook/sessions`. `HarnessBuilder::session_root`, including
+an override supplied by `Config::session_root`, is passed through unchanged: a relative path is
+relative to the process working directory, not the workspace or configuration file. The CLI selects
+its own workspace-local session root.
 
 ## Host observation API
 
-`config.into_runtime()?.select_model(name)?.harness_builder(workspace)?` admits the configuration,
-selects the host's explicit model choice, and returns a `HarnessBuilder` for that workspace.
-The builder carries the configured modes, starts in the default one (`mode(name)` selects another),
-and limits every mode to `capabilities(set)`; `PromptOptions::mode` switches the root agent's mode
-with a submitted message. A builder without modes gives the root agent `capabilities` itself.
-`SessionHandle::observe()` returns an atomic snapshot/receiver pair with revisioned updates,
-request-scoped live responses, current activity, and context estimates. On receiver lag, replace
-both with a fresh observation. Durable records are identified by their original sequence.
-`inspect_jobs` and `inspect_output` inspect metadata and saved output without claiming jobs or
-consuming notifications; `cancel_job` explicitly requests cancellation. `SessionStore::read_records`
-reads an archive without acquiring a writer lock or repairing a partial final line.
+`SessionHandle::observe().await` returns a snapshot and receiver sharing an atomic revision
+boundary. Apply updates to the snapshot in revision order with `ObservationSnapshot::apply`.
+It contains:
 
-Library embedders manage their own process environment: loading a core `Config` does not
-load `.env`. That startup behavior belongs to the CLI.
+- Durable records keyed by their original journal sequence.
+- Request-scoped live responses keyed by agent and logical request, with assembler snapshots.
+- Current agent activity and context-usage estimates.
+
+Live response deltas are provisional, not additional committed messages. A new attempt of the
+same logical request resets its live response without removing durable attempt records. On
+receiver lag, obtain a fresh observation and replace **both** the snapshot and receiver; continuing
+with only one can leave a gap or apply stale live state.
+
+`inspect_jobs`, `inspect_output`, `inspect_output_with_captures`, and `inspect_output_fields` are
+host inspection APIs. They do not claim jobs or consume agent notifications. `cancel_job` is the
+separate operation that requests cancellation. `startup_warnings`, `warnings`, and `mcp_servers`
+expose startup diagnostics and MCP discovery outcomes without inserting diagnostics into model
+context or writing directly to a terminal. `record_status` likewise records host-facing status,
+not a user message.
+
+`TodoItem`, `TodoStatus`, and `TodoSnapshot` are exported by `skyhook::agent`. Hosts projecting
+checklists from observed records apply `SessionEvent::TodosReplaced` and the reconciled todos in
+`SessionEvent::Compaction` checkpoints in sequence. Both replace the owning agent's entire list;
+child-agent lists remain independent.
+
+## Interruption, continuation, and shutdown
+
+`prompt` and `prompt_with_options` submit input and wait for its turn. `interrupt` stops active
+turns while retaining child jobs for continuation; explicit job cancellation is non-resumable.
+`continue_turn_with` continues failed or interrupted work without duplicating its input and can
+select a model or mode for the continued root turn. Its `ContinueOutcome` distinguishes a root
+answer from resumed children and reports whether the selection applied: restarting children does
+not imply that a waiting or live root also ran. `continue_turn` uses default options and returns
+the root answer, or an empty string when there is none.
+
+Use `Harness::resume_session` to reopen durable state. The runtime reconciles interrupted work
+before starting agents and opens fresh provider contexts; it does not reuse old network resources.
+Journaled agent settings remain the baseline, subject to restrictions imposed by current host
+configuration.
+
+Await `SessionHandle::shutdown()` before releasing the host's session owner. Shutdown stops runtime
+producers, drains accepted job and journal work, and closes MCP and remote resources. The journal
+remains available so the host can append a final status after observing shutdown errors; await
+that append before dropping the session/store owner.
 
 ## Embedded shim catalog
 
-The CLI injects its embedded shim catalog into the core harness. Shims are selected by protocol,
-platform, and architecture; artifact names follow `platform-protocol-arch` (for example,
-`linux-ssh-aarch64`). Library embedders receive an empty catalog by default
-and can provide their own `EmbeddedShimCatalog` through `HarnessBuilder`; selecting a combination
-without a supplied shim returns an unsupported-platform error.
+The library's shim catalog is empty by default. Supply `remote::EmbeddedShimCatalog` through
+`HarnessBuilder::shim_catalog` to enable remote execution. The CLI supplies its own catalog, but
+library hosts do not inherit the CLI's artifacts.
+
+`EmbeddedShimCatalog::from_embedded_assets` accepts names of the form `platform-protocol-arch`
+(for example, `linux-ssh-aarch64`) and artifact bytes. Selection uses the destination's protocol,
+platform, and architecture. A missing matching artifact produces an explicit deployment error.
+See [remote transport and shims](remote-transport-and-shims.md) for build, packaging, and deployment
+behavior.
+
+## Reading a session archive
+
+`SessionStore::read_records(root, id).await` returns sequence-ordered records from a read-only
+database snapshot without acquiring the session's writer lock. A live owner may continue writing;
+archive inspection neither takes ownership nor resumes unfinished work.
+
+The SQLite layout is versioned by `session::SESSION_FORMAT_VERSION`. Opening a database validates
+its identity and version; there is no migration or compatibility layer for earlier layouts.
 
 ## Reconstructing model calls
 
-Session format 3 records the inputs needed to reconstruct each call at the shared `Provider`
-boundary. It stores no backend-specific request bodies or authentication headers:
+The journal records inputs at the shared `Provider` boundary, not backend-specific request bodies
+or authentication headers:
 
-- `model_context` records the configured provider name and a shared `ModelRequest` template:
-  actual model ID, assembled system prompt (including harness instructions and location),
-  tool descriptions and schemas, optional response schema, reasoning setting, output limit, and correlation. Its `history`
-  and `tail` arrays are empty; conversation history remains in `message_committed` and `compaction` events.
-- `model_requested` is persisted before each provider invocation. It references the context event's
-  sequence and records `history` as ordered source-event sequences (committed messages or compaction
-  checkpoints), `tail` as exact inline messages (transient runtime state and compaction directives),
-  and the request's `history_lifetime`. Its purpose distinguishes ordinary
-  agent calls from summarization. Ordinary calls within a turn share one context record;
-  summarization records a separate template containing its response schema.
-- `compaction` is an ordinary log event containing the exact replacement message, retained original
-  message references, covered frontier, previous compaction reference, and the
-  summarization request reference and token estimates. It also contains schema version 1 and the
-  reconciled owner todo list. History and todos become active together after persistence.
-- Reconstruction resolves recorded references and inline values rather than using current
-  configuration, prompt code, or live job state. It neither reruns summarization nor rerenders old
-  compaction messages. Failed/interrupted calls retain their input records; usage records identify
-  their originating request, including summarization calls.
+- `model_context` stores a `ModelContext`: the purpose, named model-profile snapshot, assembled
+  system segments (including harness instructions and location), tool descriptions and schemas,
+  and optional response schema. Its `template(agent)` derives the history-free `ModelRequest`,
+  including the model ID, reasoning setting, output limit, and agent correlation identity. Context
+  records describe request settings, not the lifetime of a `ProviderContext` resource.
+- `model_requested` identifies one frozen logical request before its first invocation. It references
+  the context record and stores `history` as ordered source-event sequences, `tail` as exact inline
+  messages, `history_lifetime`, and purpose. Retries refer back to this request using
+  `model_attempt_started`, with separate failure/interruption or completion outcomes. Ordinary
+  requests reuse a context record while their settings remain applicable; summarization has a
+  separate context with its structured response schema.
+- `compaction` stores the exact replacement message, retained original message references, covered
+  frontier, previous checkpoint, summary request and attempt, token estimates, schema version,
+  and reconciled owner todos. History and todos become active together after persistence.
+- Reconstruction resolves those references and inline values. It does not consult current
+  configuration, prompt code, live jobs, or the current compaction renderer. Failed and interrupted
+  requests keep their recorded inputs; usage identifies the originating request, including summary
+  requests and failed attempts.
 
-`session::reconstruct_model_request(&records, sequence)` returns the provider name and reconstructed
-`ModelRequest` for a `model_requested` sequence, using sequence-ordered records from `SessionStore`.
-Attachments and tool images reference content-addressed session blobs by sha256;
-`store.load_blobs(&mut request).await` loads their contents for provider encoding. This reconstructs
-Skyhook's provider-neutral input, not an API-specific wire encoding.
+`session::reconstruct_model_request(&records, sequence)` returns the configured provider name and
+reconstructed `ModelRequest` for a `model_requested` sequence, using sequence-ordered records from
+`SessionStore`. Attachments and tool images reference content-addressed blobs by SHA-256;
+`load_blobs(&mut request).await` on an owning `SessionStore` loads their contents for provider
+encoding; unlike `read_records`, opening a store acquires the session's writer lock. Reconstruction
+reproduces Skyhook's provider-neutral input, not an API-specific wire encoding or a replay of the
+external call.
 
-A `ModelRequest` sends `history` (committed conversation, an unchanged prefix of later requests in the
-same context until compaction replaces it) followed by `tail` (rebuilt for each request and never
-cacheable); `request.messages()` iterates both in order. A model profile's `state_mode` decides where
-runtime state goes: in the tail (`dynamic`), committed to history (`persist`), or nowhere (`none`).
-`history_lifetime` is `continuing` (the default) when later requests in the context extend this
-history, `ending` when compaction replaces it after this agent request (its own estimate already
-reaches the compaction threshold), or `detached` for compaction summaries, which share no request
-settings with any other request. Providers decide prompt-cache placement from `history`, `tail`, and
-the lifetime: Anthropic places a cache breakpoint on the last history block unless it is detached
-(ending history is still marked, since cache reads land only at breakpoints), and OpenAI protocols rely on
-automatic prefix caching with the tail sent last. Chat Completions and Responses append a runtime-only
-tail message to the final tool output or user message rather than sending a separate user message,
-which models read as the user speaking again after every tool call.
-Session databases use format version 8; there is no compatibility or migration layer for earlier layouts.
+The `ModelRequest` contract preserves the history/tail split and `history_lifetime` cache hints.
+See [history, transient state, and caching](architecture.md#history-transient-state-and-caching)
+for their semantics and backend rationale.
 
-Source: [session module](https://github.com/kryesh/skyhook/tree/main/src/session)
-and [agent module](https://github.com/kryesh/skyhook/tree/main/src/agent).
+Source: [configuration admission](https://github.com/kryesh/skyhook/blob/main/src/config/runtime.rs),
+[session handle](https://github.com/kryesh/skyhook/blob/main/src/agent/runtime/session.rs),
+[observation](https://github.com/kryesh/skyhook/blob/main/src/agent/observation.rs), and
+[request reconstruction](https://github.com/kryesh/skyhook/blob/main/src/session/request.rs).

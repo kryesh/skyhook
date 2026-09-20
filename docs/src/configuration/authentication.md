@@ -38,8 +38,8 @@ Loaded variables are also inherited by API-key commands and other **local** chil
 inherited host environment variables nor `.env` values are automatically forwarded into remote target
 processes; remote commands use the remote machine's environment. Managed SSH routes disable `SendEnv`,
 `SetEnv`, and X11 forwarding. Local SSH authentication/proxy helpers still use the host environment;
-Skyhook's deliberate SSH-agent forwarding remains supported separately. Library embedders manage
-their own process environment; loading a core `Config` does not load `.env`.
+Skyhook's [SSH-agent forwarding](../guide/execution-targets.md#agents) is
+configured separately.
 
 For example, in the directory from which you run `skyhook`:
 
@@ -58,5 +58,4 @@ authorization or `skyhook auth login --headless` for device authorization. `skyh
 reports local login status and `skyhook auth logout` removes Skyhook's credentials. Login does not
 require a model configuration. Skyhook never imports, reads, or modifies the official Codex client's
 credential files. Secure Codex credential storage currently requires Unix; other platforms fail
-explicitly rather than writing tokens without private ACL guarantees. Claude subscription support
-has been removed.
+explicitly rather than writing tokens without private file permissions.

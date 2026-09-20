@@ -27,7 +27,10 @@ Run these commands from the repository root:
 | `just build-shims-release` | Cross-compile size-optimised SSH shims into `target/shims`; requires Zig. |
 | `just build` | Debug CLI; reads `target/shims` live at runtime. |
 | `just build-release` | Release CLI embedding the current contents of `target/shims`. |
-| `just test` | Full nextest suite plus doctests. |
+| `just build-full` | Release shims, then a release CLI that embeds them. |
+| `just install` | `build-full`, then install the CLI as `~/.local/bin/skyhook`. |
+| `just run [args]` | Run the debug CLI. |
+| `just test` | Nextest suite over all targets and features. |
 | `just lint` | Clippy over all targets and features with warnings denied. |
 | `just fmt` | Format Rust code. |
 | `just docs` | Build the mdBook into `docs/book`. |
@@ -40,6 +43,30 @@ library. Each binary requires its own feature, `tui` for `skyhook` and `shim-bin
 `linux-ssh`, so pass `--features tui` (or `--all-features`) to direct Cargo commands.
 Shims are only ever built by the `build-shims*` recipes; a CLI built without them reports an
 explicit missing-shim error if asked to use SSH.
+
+## Verification
+
+Follow the repository policy in [AGENTS.md](https://github.com/kryesh/skyhook/blob/main/AGENTS.md).
+The standard checks are:
+
+```sh
+just fmt
+just lint
+just test
+```
+
+When running Cargo directly, include the CLI/TUI and shim features:
+
+```sh
+cargo fmt --all --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo nextest run --locked --all-targets --all-features
+```
+
+Nextest does not run doctests; run `cargo test --locked --doc --all-features` separately
+when changing Rust documentation examples. For book changes, run `just docs` and check the
+rendered pages and links. `AGENTS.md` also covers test policy, including stress runs for tests
+that coordinate gated provider steps.
 
 The `skyhook-agent` package is one library crate named `skyhook` plus those two binaries. See
 [architecture](architecture.md) and [embedding](embedding.md) for the library boundaries.

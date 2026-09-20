@@ -14,8 +14,8 @@ with the exact `--capabilities` list. Headless mode does not require a terminal 
 It creates or opens the session, prints **only its session ID followed by a newline to stdout**, and
 flushes that line before executing the prompt or workflow. It then exits automatically. The ID lets
 external programs locate and follow the normal session logs under `<workspace>/.skyhook/sessions`.
-Headless mode uses only the selected workspace's history, just like the terminal UI; the CLI ignores
-`session_root` overrides. Resumed runs print the existing session ID.
+Headless mode uses only the selected workspace's history, just like the terminal UI.
+Resumed runs print the existing session ID.
 
 Assistant output, script console output/results, startup warnings, and execution diagnostics remain
 in the session logs; they are not printed to stdout or stderr. The process exits successfully when
@@ -34,20 +34,14 @@ ordinary automatically allowed operations still work. `--approve-all` (or config
 bypasses tool approvals but does not enable questions, SSH passwords/passphrases, or host/agent
 confirmation prompts. SSH credentials that work without a prompt can still authenticate.
 
-Without `interactive`, `exec` and `shell` run in a new process session with no controlling terminal,
-so ordinary `/dev/tty` prompts cannot stop the job waiting for terminal input. Each command forces a
-Skyhook-owned rejecting askpass helper over inherited `SSH_ASKPASS` settings, even when `targets` is
-disabled. Existing `SSH_AUTH_SOCK` credentials are preserved unless the configured target-authentication
-setup replaces them. Remote tool requests carry the caller's exact capabilities, so remote commands
-apply the same restrictions; incompatible shim protocol versions are rejected rather than falling
-back to default capabilities. This is still not an OS sandbox against deliberately programmed
+`exec` and `shell` never have stdin connected; without `interactive` they also have no
+controlling terminal, so
+ordinary `/dev/tty` prompts cannot stop the job waiting for terminal input. SSH authentication
+prompts are rejected even when inherited `SSH_ASKPASS` settings request another prompt helper
+or the `targets` capability is disabled. Existing `SSH_AUTH_SOCK` credentials are preserved unless
+the configured target-authentication setup replaces them. Remote commands apply the same
+capability restrictions. This is still not an OS sandbox against deliberately programmed
 subprocesses that establish their own external interaction mechanisms.
-
-Askpass sockets and helpers live in uniquely created `skyhook-askpass-<pid>-<random>` temporary
-directories. No fixed socket pathname is shared across Skyhook instances, or even across concurrent
-askpass servers in one instance. Directories and helpers have explicit `0700` permissions and sockets
-have `0600` permissions independent of umask; the listener accepts only peers with the same effective
-UID. Each owner removes only its own socket/helper/directory during cleanup.
 
 See the [CLI reference](../reference/cli.md) for argument combinations and
 [permissions](permissions.md) for the capability/approval distinction.

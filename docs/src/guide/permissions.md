@@ -5,8 +5,9 @@
 `--approve-all` or
 `approve_all = true` bypasses approval prompts. Subject to the granted capabilities, the default
 CLI auto-allows reads and agent operations, as well as writes inside the root workspace.
-Execution, remote access, target changes, and writes outside the root workspace require confirmation. When the `interactive` capability is granted, questions
-and SSH authentication appear in the interface. Otherwise operations needing human input fail
+Execution, HTTP requests, SSH access, target changes, and writes outside the root workspace
+require approval. When the `interactive` capability is granted, questions and SSH authentication
+appear in the interface. Otherwise operations needing human input fail
 immediately; `approve_all` bypasses tool approvals but never restores questions or authentication.
 
 Filesystem tools and command `cwd` accept absolute paths or relative paths including `..`.
@@ -16,17 +17,19 @@ canonical paths are outside the workspace. Do not rely on a confirmation prompt 
 outside-workspace reads. Outside-workspace writes require confirmation, and remote access has
 its own approval requirements.
 
-Path grants are cached in memory by session, target, access mode, and path; directory grants
-cover descendants, and read and write grants remain separate. Process execution remains subject
-to confirmation on each invocation. Applications embedding the core can supply a different
-approval policy, including one that prompts for or denies reads.
+Choose **Allow once** to approve only the current operation. When offered, **Allow proposed
+scope** saves the displayed grant for later operations in the same session, including after
+resume; inspect **Details** before granting it. Path grants apply only to the approved target
+and access mode. Directory grants cover descendants; read and write grants remain separate.
+Process execution remains subject to confirmation on each invocation. These defaults apply to
+the CLI; [library hosts](../development/embedding.md) can supply a different approval policy.
 
 Approval controls and pending/granted approval details remain user-facing. Agents see an ordinary
-queued job while authorization is pending. Denials preserve the reason and add
-`code: "permission_denied", executed: false` to the rejected operation's error or job envelope;
-script exceptions carry the same fields. A containing script may already have executed other work,
-so uncaught script failures retain the rejected operation as nested failure details. Agents must not
-circumvent a denial through another tool or route.
+queued job while authorization is pending. A denial preserves its reason and marks the rejected
+operation with `code: "permission_denied", executed: false`; it does not undo work that a
+containing script already performed.
+Agents must not circumvent a denial through another tool or route. For programmatic failure
+handling, see the [JavaScript response contract](../reference/javascript.md#responseunwrap-and-native-results).
 
 ## Capabilities
 
@@ -80,8 +83,7 @@ modes it does not name are kept, in declaration order.
 `--mode NAME` selects the starting mode; without it the terminal starts in the mode last used in
 that workspace, and a batch job in `default_mode`. In the terminal, `Tab`/`Shift+Tab` in the composer (or
 `/mode`) choose the mode the next message is sent in; the footer shows it. A change takes effect
-with that message: the root agent's tools and system prompt are rebuilt, which forfeits the
-provider's prompt cache. Child agents keep what they start with: the capabilities and instructions of the mode their
+with that message and forfeits the provider's prompt cache for the next request. Child agents keep what they start with: the capabilities and instructions of the mode their
 parent chose for them, or otherwise the capabilities their parent holds and no mode instructions.
 Background jobs and scripts already running keep their capabilities too. A session can only hold capabilities
 that some configured mode grants, and MCP servers start under that union, so switching modes

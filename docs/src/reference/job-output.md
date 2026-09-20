@@ -1,6 +1,6 @@
 # Saved job output
 
-Tools execute once and capture their complete results to disk. File reads capture snapshots;
+Tools execute once and save their complete results. File reads capture snapshots;
 subsequent retrieval does not reread changed files. Search and glob capture their complete result
 sets. There is no configured capture-size cap or automatic eviction; storage failures are reported
 as failures, with retained partial output marked incomplete.
@@ -10,7 +10,7 @@ as failures, with retained partial output marked incomplete.
 See the [JavaScript JobView response contract](javascript.md#jobview-response-contract) for the
 seven-key envelope, metadata, presentation group, `has_result`, and `unwrap()` behavior. This page
 focuses on saved output and the task-specific payloads below. A failed or pending view remains an
-ordinary response, and background launches have `result: null` and `has_result: false`.
+ordinary response.
 
 Search and glob patterns filter eligible files without overriding hidden-file or ignore settings.
 Nulls in tool payloads and metadata are preserved; known empty/default output fields do not disappear.
@@ -27,7 +27,7 @@ Missing paths and operating-system access denials from `read` are successful too
 error without catching an exception. Tool-policy permission denials remain tool errors.
 Search returns `{matches:{"src/main.rs":["12: matching text"]}}`, preserving source whitespace.
 `search({pattern:"...",details:true})` returns structured `{path,line,column,text}` matches instead.
-Empty directory/search maps remain `{}` and known default fields remain in their payloads. Grouped maps share a single normal preview budget.
+An empty search result has `matches: {}`. Grouped maps share a single preview budget.
 `targets({details:true})` returns full target metadata. Defaults and `target_add` retain their documented
 fields and populate known name/type/host/workspace/via/origin metadata; fields are null only when genuinely unavailable.
 All defaulted input fields, including `details: false`, are optional in tool schemas.
@@ -38,30 +38,27 @@ rooted in subdirectories inherit ancestor ignore rules; explicitly requested pat
 
 ## Automatic previews
 
-Model-facing direct responses and JavaScript tool calls use the same fully populated JobView
-(core fields, including `has_result`, are never omitted); JavaScript receives hydrated result data
-while model previews may shorten annotated fields. Only output fields annotated with `x-skyhook-truncatable: true` may be shortened. Each annotated
-field independently retains at most 100 lines or 32 KiB (32768 bytes), whichever is reached first.
-Strings count UTF-8 content bytes before JSON escaping; arrays and grouped maps count their saved JSON text and
-retain only complete items. Grouped maps share one budget across all groups. All other fields remain intact regardless of size, so there is no
-aggregate response-size limit or whole-result fallback.
+JavaScript receives complete result data. Model-facing previews may shorten designated output
+fields: file `content`, directory `entries`, process `stdout` and `stderr`, search `matches`, glob
+`paths`, skill asset `content` and `assets` trees, HTTP `body.text` and `body.data`, and script
+`console` text. Skill instructions, errors, questions, and other fields remain complete; there
+is no aggregate response-size limit or whole-result fallback.
 
-Annotations cover file `content`, directory `entries`, process `stdout` and `stderr`, search
-`matches`, glob `paths`, skill asset `content` and `assets` trees, and script result `console` text. Skill instructions
-remain complete. Script results retain `console: ""` even for silent scripts; ordinary tools have
-no console field. Shortened fields keep their original types;
-`truncated: [{field, total_lines, next_start, next_offset}]` identifies each one, reports its
-total
-source lines, and supplies the exact first unread position; `next_offset` is always numeric, including `0`. Finished jobs with an incomplete capture include an `Output incomplete.` notice. Errors
-and questions are returned in full. Schemas are persisted with jobs so these rules also apply
-after session resume and to completed remote jobs.
+Each shortened field independently retains at most 100 lines or 32 KiB (32768 bytes), whichever
+is reached first. Strings count UTF-8 content bytes before JSON escaping; arrays and grouped maps
+count their saved JSON text and retain only complete items. Grouped maps share one budget across
+all groups. Shortened fields keep their original types.
+
+`presentation.truncated` contains `{field, total_lines, next_start, next_offset}` for each shortened
+field, reporting its total source lines and exact first unread position. `next_offset` is always
+numeric, including `0`. Finished jobs with incomplete captures include an `Output incomplete.`
+notice. These rules also apply after session resume and to completed remote jobs.
 
 ## Script result presentation
 
-JavaScript tool calls return hydrated JobViews, while model-facing previews may shorten only
-annotated fields. The enclosing script's `.result` is the script payload
-`{value, console, failure}`. Existing JobViews such as `tool.job(id).output()` are not wrapped
-again.
+The enclosing script's `.result` is `{value, console, failure}`; silent scripts retain
+`console: ""`. Ordinary tools have no console field. Existing JobViews such as
+`tool.job(id).output()` are not wrapped again.
 
 Presentation never changes the full saved return value. Default script output retrieval returns
 the composed script payload; explicit field selections read saved script data. Logging and
@@ -69,9 +66,8 @@ returning the same data explicitly produces both outputs.
 
 ## Paging and searching
 
-Script console text uses the shared per-field limit. Explicit `job_output` selections return a view whose `presentation.preview` defaults to
-100 lines with up to 32 KiB of JSON-encoded line content, so typical 100-line pages fit without
-byte truncation. Unannotated job metadata is always returned in full.
+Explicit `job_output` selections return a view whose `presentation.preview` defaults to
+100 lines with up to 32 KiB of JSON-encoded line content. Job metadata is always returned in full.
 
 ```js
 // Read a selected part of a saved result.
@@ -94,7 +90,7 @@ for larger lines; ordinary paging can still read those lines.
 `start` is one-based (default 1); `offset` is a zero-based UTF-8 byte offset within that
 starting line (default 0). `limit` is 1–1000 returned source lines (default 100), including
 match context. `context` is 0–20 surrounding lines (default 0); positive context requires `pattern`.
-Every argument with a default is optional in the tool schema. Output inspection has no wait argument.
+Output inspection returns immediately; it does not wait for new output.
 
 Explicit read pages contain `field` and `lines`, plus `total_lines` (which is `null` when
 unavailable) and a next position. `next_start` is `null` when no continuation remains, while
@@ -117,15 +113,13 @@ windows until more output arrives or capture closes. A wait timeout never stops 
 
 ## Persistence and live output
 
-Reads are repeatable and survive session resume, without opaque tokens or saved query state.
-The old `cursor` argument is no longer accepted. Finished jobs with retained partial output have
+Reads are repeatable and survive session resume. Finished jobs with retained partial output have
 an `Output incomplete.` notice, including when viewing the final captured page.
 
-Output views advertise actual available captures, independently of tool names or whether a
-structured result was returned:
+The view's `presentation.captures` lists available captures, even without a structured result:
 
 ```json
-{"captures":[{"field":"/result/console","kind":"text","complete":false}]}
+[{"field":"/result/console","kind":"text","complete":false,"output":null}]
 ```
 
 `kind` is `text`, `json`, or `unknown`. `complete: false` means the capture is still live or
@@ -134,17 +128,15 @@ Select a descriptor's `field` to page or search its retained bytes. Capture desc
 failures, cancellation, and session resume even when there is no structured result containing
 those fields. Empty or absent result fields are not fabricated to represent partial captures.
 
-Local captures, including script console output, can be read while running. Remote shims capture
-first and transfer results in bounded frames; already-transferred captures can be queried locally,
-including during transfer, without reconnecting to the remote machine.
+Local captures, including script console output, can be read while running. Remote captures
+become available as they are transferred; inspecting already-transferred output does not require
+reconnecting to the remote machine.
 
 The TUI's automatic output view shows the structured result and previews any available captures
 not represented there. This exposes both process streams while live and preserves stderr and exit
 status on completion. Explicit field, page, and search selections remain selected; choose
-**automatic output** in the Saved output menu to return to automatic viewing. Menu fields are
-generated from the result object and available capture descriptors.
+**automatic output** in the Saved output menu to return to automatic viewing. The menu includes
+both result fields and available captures.
 
-The journal stores the exact model-visible previews, pages, and notifications. Full artifacts
-are separate; provider-neutral request reconstruction reuses committed content rather than
-regenerating it from current files or settings. Session format 3 has no migration layer;
-earlier journals are rejected.
+Recorded model requests keep the previews, pages, and notifications the model actually saw;
+they are not regenerated from saved output.

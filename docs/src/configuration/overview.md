@@ -22,9 +22,10 @@ A broken user file is not silently treated as missing if no fallback succeeds. T
 configuration must be valid; defaults are applied **after merging**.
 
 Tables merge recursively; arrays and scalar values replace the earlier value. The exception is
-**named entries under `targets`**: a workspace `[targets.build]` replaces the *whole* user
-`[targets.build]` entry, including its SSH, authentication, workspace, and routing settings.
-It does not inherit omitted fields. Other named targets remain available.
+**named entries under `targets` and `modes`**: a workspace entry replaces the *whole* user
+entry of the same name, without inheriting omitted fields. For example, `[targets.build]`
+replaces that target's SSH, authentication, workspace, and routing settings; `[modes.general]`
+replaces that mode's capabilities, instructions, and hint. Other named entries remain available.
 
 ### Example: user models, workspace targets
 
@@ -77,8 +78,7 @@ If a route or key is needed, repeat it explicitly in the workspace entry.
 
 **Trust boundary:** workspace configuration is full configuration, not a restricted project hint.
 It can change approvals, modes, provider credential commands, and MCP server startup.
-Review it before starting Skyhook in an untrusted checkout. This repository currently ignores
-`.skyhook/`, so creating `.skyhook/config.toml` does **not** automatically make it versioned.
+Review it before starting Skyhook in an untrusted checkout.
 
 ## Paths and environment
 
@@ -89,11 +89,10 @@ not the workspace root.
 
 The CLI always stores and discovers sessions in `<workspace>/.skyhook/sessions`, including
 headless execution and resume. It does not search other workspaces or honor `session_root` overrides.
-For library users, `session_root` can still override storage; relative values use the process working
-directory, not the config file's directory. Remote target paths retain their existing remote
-semantics. The workspace is a base directory, not filesystem isolation.
+Remote paths resolve on the selected [execution target](../guide/execution-targets.md).
+The workspace is a base directory, not filesystem isolation.
 
-The CLI still loads **`.env` from the invocation directory**, with existing process environment
+The CLI loads **`.env` from the invocation directory**, with existing process environment
 variables taking precedence. Neither `--workspace` nor `--config` changes that location.
 See [authentication](authentication.md#api-keys-and-environment-files).
 
@@ -120,7 +119,7 @@ for selectors and incompatible options.
 - [Permissions and capabilities](../guide/permissions.md): `approve_all`, modes, and their exact
   capability allowlists.
 - [Execution targets](../guide/execution-targets.md): SSH destinations, origins, routing,
-  and optional SSH-config import.
+  and authentication.
 - [MCP servers](mcp.md): trusted local server startup and imported tools.
 
 ## Complete example

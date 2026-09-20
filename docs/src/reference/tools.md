@@ -13,10 +13,10 @@
 Use `wait({timeout?: seconds})` (or `await tool.wait(...)` in scripts) to yield until an agent
 event or a timeout, then inspect the relevant jobs. The returned view's `.result` is
 `{reason:"event"}` or `{reason:"timeout"}`. Omitted or null `timeout` waits indefinitely;
-a supplied timeout must be a positive integer number of seconds. An event does not guarantee a particular
-job has completed; inspect its current status. Waiting does not stop background work.
-Do independent work first rather than polling output in a tight loop. Output reads reject the old
-`wait` argument.
+a supplied timeout must be a positive integer number of seconds. An event does not guarantee a
+particular job has completed; inspect its current status. See
+[waiting for background work](../scripting/jobs-and-agents.md#waiting-for-background-work) for
+when a wait resolves.
 
 See the [JavaScript response contract](javascript.md#responseunwrap-and-native-results) for
 `response.unwrap()`, serialization, and operational-failure behavior. In this reference,
@@ -28,7 +28,7 @@ See the [JavaScript response contract](javascript.md#responseunwrap-and-native-r
 `write({path, content})` atomically creates or replaces a UTF-8 file. Set the optional
 `create_parents: true` to create missing parent directories recursively before writing, for example
 `write({path: "reports/run/summary.md", content: "...", create_parents: true})`.
-It defaults to `false`, so existing calls still fail when a parent directory is missing.
+It defaults to `false`, so a missing parent directory causes the call to fail.
 
 ## Further contracts
 
@@ -39,7 +39,7 @@ It defaults to `false`, so existing calls still fail when a parent directory is 
 - [Runtime state](runtime-state.md): todos and per-request job snapshots.
 - [Execution targets](../guide/execution-targets.md): target selection and workspace inheritance.
 - [Instructions and skills](../guide/instructions-and-skills.md): discovery, assets, and copying.
-- [MCP](../configuration/mcp.md): importing external tools into the same registry.
+- [MCP](../configuration/mcp.md): making external tools available to agents and scripts.
 
 All tools remain subject to [permissions and capabilities](../guide/permissions.md), including
 calls made inside scripts. A workspace does not sandbox commands or file paths.

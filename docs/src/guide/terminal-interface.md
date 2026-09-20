@@ -3,35 +3,20 @@
 ## Conversation and inspector
 
 User messages appear on the right and assistant messages on the left. Tool previews show their
-remote execution target after the tool name, such as `exec @lab-monitoring`; local calls omit `@root`. Tool calls expand inline
-with named argument fields, nested lists, and syntax-highlighted scripts, commands, file content,
-and diffs. Prose arguments, such as agent prompts, wrap at word boundaries; commands and source
-retain whitespace-preserving wrapping. JSON results and result pages are pretty-printed; source
-and plain-text log whitespace is preserved. The dark theme uses a consistent text and syntax palette throughout the UI:
-blue headings and emphasis, cyan links and targets, and semantic colours for code, tool output,
-and agent status. Command palette shortcut hints are muted and right-aligned.
-Tool-call headers keep neutral text with blue expand arrows, cyan remote targets, and status-coloured
-icons and labels. Failed calls keep their error details inside the expanded Output section,
-including failures that occur before a job is created, rather than adding separate JSON messages.
-Language-labelled Markdown code fences share the tool-output syntax palette and have a distinct,
-darker background sized to their content, with one cell of padding. Wrapped Markdown text retains
-list and quote indentation; visual padding is excluded from copied code. Unknown languages and
-oversized code retain readable fallback text. The interface keeps its neutral surfaces;
-dark mode uses a pure black background. All formatting is local to the UI and leaves session
-records unchanged. Expanded sections keep persistent highlights on their first and last content
-lines; tool calls also have a connecting gutter beneath the expand arrow. Their bodies retain the
-normal background, including on hover. Click an expanded body to
-collapse it, or drag to select text. The agent tree appears above the composer while children
-are active or a child agent is being viewed, with blank padding matching the input. Click an agent to inspect its conversation
-without mixing its output with other agents. Each agent retains its reading position and expanded rows.
-Agent tree rows show `@target` for non-root agents. Agent call previews show the child's target,
-including while queued or running; an omitted target inherits the calling agent's target.
-Agent rows show their own token totals and context usage in the same compact format as the
-bottom-right session summary: output · input (uncached) · context.
-Status messages, including interruptions and errors, appear as distinct rows in the conversation
-log and are saved with the session. An interruption row is recorded only when something was
-actually interrupted. They are excluded from the model’s context.
-Completed final replies show their recorded model ID in a muted footer below the answer.
+remote execution target after the tool name, such as `exec @lab-monitoring`; local calls omit
+`@root`. Expand a tool call to inspect its arguments, output, or failure details. Scripts,
+commands, file content, and diffs have syntax highlighting. Click an expanded body to collapse
+it, or drag to select text. Copying code preserves its contents without visual padding or
+newlines added by wrapping.
+
+The agent tree appears above the composer while children are active or a child agent is being
+viewed. Click an agent to inspect its conversation without mixing its output with other agents.
+Each agent retains its reading position and expanded rows. Tree rows show `@target` for remote
+agents and their own token totals and context usage: output · input (uncached) · context.
+Agent call previews show the child's target even while queued or running; an omitted target
+inherits the caller's target. Completed final replies identify the model that answered in a
+footer below the reply.
+
 The composer always sends to the root agent. While root is busy, Enter queues a follow-up
 for its next model request, without interrupting the current request or tools. It does not wait
 for the entire turn to finish. `/queue` edits/removes input that has not yet been consumed.
@@ -39,45 +24,38 @@ Selecting a queued message to edit pauses automatic queue delivery and moves it 
 composer; merely opening the queue or deleting an item does not pause it. Interruption,
 submission or delivery errors, and session-start failures also pause queue delivery. `/resume`
 clears that pause, as does normal composer Enter (even with an empty draft); slash commands
-do not automatically resume the queue. There is no standalone `/pause` command.
+do not automatically resume the queue.
 Queued input lives only in the running interface: it is not saved with the session. Each open
 session keeps its own queue, which keeps delivering while you look at another session and is
 discarded when its session is closed.
+
 `/retry` continues failed or interrupted turns without duplicating their original prompts.
 After a session interruption it resumes all interrupted children automatically, regardless of
-which agent is selected. Parents with pending waits stay in those waits rather than starting
-another model request merely because recovery was requested.
+which agent is selected. Parents with pending waits stay in those waits.
+Automatic model retries display the attempt number, next delay, and latest diagnostic in one
+error block. Partial output from the failed attempt clears when the next attempt starts;
+successful replies have no retry labels. Retries continue until success or cancellation for
+[transient model failures](../configuration/providers-and-models.md#model-failure-recovery).
 
-Normal conversation messages, reasoning, tool cards, and successful replies keep their existing
-presentation; they do not display attempt counters. Automatic model retries update one error block
-for the failed request instead of appending failure rows. Only that block displays the attempt
-number, next delay, and a compact diagnostic, including safe HTTP status and error codes
-when available. Only the latest failed attempt's partial output is shown in that block. It clears
-when the next attempt starts; streaming output and successful answers use the unchanged normal
-conversation rendering, without retry labels.
-Retries have no fixed attempt limit; older session logs with a recorded limit still display it.
-Every attempt start, failure, and scheduled delay remains in the session journal for auditing.
-These recovery events are visible to the UI and logs, not added to the model's conversation.
+The inspector provides Conversation, Requests, and Jobs tabs. Requests include compaction
+requests and token summaries; transient retries appear under the same request. Full request
+bodies are available in the session log, not rendered in the UI. Status messages, including
+skill warnings, interruptions, and errors, appear in the conversation and are saved with the
+session, but are not sent to the model. Connection and MCP startup warnings describe this
+installation rather than the session, so they are shown but not saved.
 
-The inspector provides Conversation, Requests, and Jobs tabs. Requests show one metadata row per
-logical model request, including compaction requests, with token summaries alongside the row.
-Transient retries reuse that request; older logs can contain separate request rows for each attempt.
-Full request bodies remain in the session journal for reconstruction but are not rendered in the UI.
-Startup warnings appear directly in the conversation log rather than a separate diagnostics page.
-Job output is paged and searchable without acknowledging the agent's pending notifications. Select a job
-and press `o` for output fields, regex search, and the next page; `c` requests cancellation
-(useful for background jobs, since interrupting already cancels the foreground tool).
+Job output is paged and searchable without acknowledging the agent's pending notifications.
+Select a job and press `o` for output fields, regex search, and the next page; `c` requests
+cancellation (useful for background jobs, since interrupting already cancels the foreground tool).
 Intermediate child-agent messages and terminal job notifications appear as expandable **Job event**
-cards in the conversation. Agent-message cards show the job identity/name, source message sequence,
-and readable progress text when expanded, rather than raw runtime envelopes. They retain their
-historical payload when the job later completes or is resumed; ordinary user text is not reclassified.
-This presentation also applies when reopening older saved sessions.
-Remote output is available after transfer completes. Provider-supplied reasoning streams in a separate
-expanded block with an animated spinner and collapses as soon as answer text starts (or the response
-finishes). Single-line reasoning stays inline without an expand/collapse control and is not
-selectable, even when it wraps in a narrow terminal. Reasoning uses the same Markdown rendering as replies. A separate working
-spinner appears while a request is active without a reasoning spinner. Click a multi-line block or press Enter when selected to
-reopen it, including after resuming a session.
+cards. Earlier progress messages remain readable after the job completes or resumes. Remote
+output becomes available as it is transferred to the host.
+
+Provider-supplied reasoning streams in a separate expanded block and collapses when answer text
+starts or the response finishes. Click a multi-line block or press Enter when selected to reopen
+it, including after resuming a session. Single-line reasoning stays inline without an
+expand/collapse control and is not selectable, even when it wraps in a narrow terminal.
+Spinners indicate that a request is still active.
 
 ## Model selection and UI state
 
@@ -98,9 +76,8 @@ Resumed sessions retain their last applied model. `/models` remains an alias for
 Restore a missing recorded model profile before resuming rather than substituting another model.
 
 The interface stores the last submitted model and mode and the sidebar setting in the workspace's
-`.skyhook/state.json`, beside its sessions. Writes are atomic and do not rewrite the model
-configuration.
-Session titles are recorded in each session's database alongside its history.
+`.skyhook/state.json`, beside its sessions, without changing the model configuration.
+Session titles are saved with their history.
 
 A sidebar beside the conversation lists each configured MCP server with its startup status and the
 viewed agent's todos, with the viewed agent's capabilities pinned to its bottom. For the root agent
@@ -130,6 +107,7 @@ The command palette and `/help` also list these shortcuts. `Ctrl+X` is a leader:
 | `Ctrl+X M`, `/model` | Model for subsequent user messages |
 | `Ctrl+X A` | Agent picker |
 | `Ctrl+X I`, `/queue` | Edit queued follow-ups |
+| `Ctrl+X C`, `/retry` | Continue failed or interrupted turns |
 | `Ctrl+X T`, `/details` | Toggle tool details |
 | `Ctrl+X F`, `@` | Attach a workspace file |
 | `Ctrl+X B`, `/sidebar` | Toggle the sidebar |
@@ -163,7 +141,7 @@ Type `/` in an empty composer to open the command palette. Search by command nam
 The command palette omits navigation-only actions; the `Ctrl+X` arrows step through
 agents and inspector tabs. Click the conversation, or pick an agent with `Ctrl+X A`, to focus it.
 Menus use arrows, mouse hover, the mouse wheel, or `Ctrl+P/N`; Enter or Tab activates
-the selected item. Open palettes isolate hover from the conversation underneath. The Agents
+the selected item. The Agents
 palette labels its Output, Input (uncached), and Context statistics. The composer
 wraps at word boundaries and supports word movement, selection, `Ctrl+A/E`, `Ctrl+W`,
 `Ctrl+U/K`, and undo/redo with `Ctrl+-` / `Ctrl+.`. Up/Down moves through displayed input
@@ -188,7 +166,6 @@ Submitting a new prompt rejects any pending question batches; those batches can 
 For background questions and SSH authentication/askpass prompts, `Esc` cancels the request;
 cancelled requests cannot be reopened. SSH authentication prompts take priority over questions,
 permissions, menus, and search; interrupted question drafts resume afterward.
-Startup warnings, such as skipped skills, appear in the conversation as status messages.
 
 Within questions and permissions, `↑`/`↓` selects an answer, `PageUp`/`PageDown` scrolls
 the prompt text, and `Ctrl+PageUp`/`Ctrl+PageDown` scrolls long answer descriptions.
@@ -199,9 +176,8 @@ confirms an answer and advances to an unanswered question; switching alone never
 The mouse wheel scrolls the text or choices beneath the pointer. Drafts remain intact while
 answering questions or inspecting details.
 Question choices are suggestions: you can select one, optionally add a comment, or provide
-a free-form answer. A suggestion without a non-whitespace comment returns its label as a string;
-with a comment it returns `{"answer": "selected label", "comment": "user text"}`. Free-form
-answers remain strings.
+a free-form answer. For answering agent questions from a script, see
+[jobs and agents](../scripting/jobs-and-agents.md#delegation-and-child-input).
 
 See [sessions and context](sessions-and-context.md) for compaction and persistence,
 and the [CLI reference](../reference/cli.md) for startup options.

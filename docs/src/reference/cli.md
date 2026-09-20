@@ -54,7 +54,7 @@ Policy capability names are `read`, `write`, `exec`, `network`, `targets`, `ssh_
 ## Dump
 
 `skyhook dump` defaults to `skyhook dump config`. The only selectors are **`config`** and
-**`skills`**; unknown selectors (including `agents`) are errors.
+**`skills`**; unknown selectors are errors.
 
 | Option | Meaning |
 | --- | --- |
@@ -70,9 +70,9 @@ skyhook dump config --config ./standalone.toml --approve-all
 skyhook dump skills --workspace /path/to/project
 ```
 
-Both modes are inspection-only: no terminal UI, harness, session creation, provider credential
-commands, MCP startup, or network access. API credentials are not required. They do not execute
-skill assets. `dump skills` rejects `--config` and `--approve-all` as irrelevant.
+Both modes are inspection-only: they do not start a session, run provider credential commands,
+connect to MCP servers, access the network, or execute skill assets. API credentials are not
+required. `dump skills` rejects `--config` and `--approve-all` as irrelevant.
 
 ### Configuration dump
 
@@ -90,8 +90,8 @@ terminal display.
 
 ### Skills dump
 
-The skills dump uses the same **HostSkills discovery** as the harness, independently of the main
-model configuration. It works without a model config or API credentials. The output is a tree of
+The skills dump uses the same skill discovery as a session, independently of model configuration.
+It works without a model config or API credentials. The output is a tree of
 winning skills (after name precedence), including each source path, effective summary, complete
 YAML frontmatter, and nested assets in sorted order. Symlinks are marked and not followed;
 asset contents are not executed.
@@ -104,7 +104,7 @@ search locations: `~/.agents/skills` plus `.agents/skills` along workspace ances
 
 ## Stats
 
-`skyhook stats SESSION_ID` reads a saved session's journal and reports where its tokens went,
+`skyhook stats SESSION_ID` reads a saved session and reports where its tokens went,
 how its model requests ended, what each agent delegated, and which tools it called. Like
 `--resume`, it finds the session in the selected workspace's history
 (`<workspace>/.skyhook/sessions`). It needs no configuration, credentials, or terminal, and it
@@ -138,14 +138,14 @@ totals per model profile and per tool.
   per-tool totals and the session totals.
 
 `--list` prints one row per session: id, start time, the initial prompt's first 60 characters,
-and the same totals as a report's total row. Sessions written by an earlier journal format
+and the same totals as a report's total row. Sessions written by an earlier session format
 are left out.
 
 Agent paths are built from names like directories: the root agent is `/`, and an agent named
 `bar` spawned by `/foo` is `/foo/bar`; a later sibling with the same name is `/foo/bar#2`.
 Names come from the job that spawned the agent. Model call counts
 cover agent turns only, while token figures include compaction requests. Sessions written by an
-earlier journal format are refused with a nonzero exit.
+earlier session format are refused with a nonzero exit.
 
 ## Authentication commands
 

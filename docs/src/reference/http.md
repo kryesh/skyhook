@@ -1,6 +1,6 @@
 # HTTP requests with `fetch`
 
-`fetch` is a reqwest-backed HTTP tool, available directly and as `tool.fetch(...)` in scripts.
+`fetch` is an HTTP request tool, available directly and as `tool.fetch(...)` in scripts.
 It runs on the selected execution target: DNS, TLS, proxy discovery, uploads, and downloads all
 happen there. Relative paths use that target's workspace; no files are implicitly copied between
 machines. Like `exec`, it supports `name`, `bg`, cancellation, and saved job output.
@@ -67,27 +67,28 @@ Multipart form-data encoding is not supported. File bodies can set their media t
 ## Responses and extraction
 
 Responses include final URL/method, status, `ok` (2xx), redirect history, received byte count,
-elapsed time, and a tagged `body`: `text`, `base64`, `file`, or `empty`. Response headers are omitted
-by default; set the optional `include_headers: true` to return them as a map of repeated values.
-`include_headers` defaults to `false` and does not affect the `headers` request-header map.
+elapsed time, and a tagged `body`: `text`, `base64`, `file`, or `empty`. Response `headers` is
+`null` by default; set `include_headers: true` to return a map of repeated header values.
+This option does not affect the `headers` request-header map.
 JSON responses remain decoded text; scripts can use `JSON.parse(response.body.text)`.
 `response_format` defaults to `auto` (text for textual content, base64 otherwise); `text` forces
 character decoding and `base64` preserves response entity bytes. HTTP decompression is automatic;
-these are not raw wire bytes. `save_to` streams to a temporary file and commits on success instead
-of embedding the payload. Errors or cancellation do not replace an existing destination.
+these are not raw wire bytes. `save_to` saves the response to a file on success instead of
+embedding the payload. Errors or cancellation do not replace an existing destination.
 Automatic job presentation may shorten `body.text` and `body.data`, with continuation markers;
 retrieve the complete saved payload using `job_output` fields `/result/body/text` or
 `/result/body/data`. Status, opted-in headers, body kind, and other metadata remain intact. JavaScript
 calls still receive the complete payload for processing.
 
 `text:true` is separate from `response_format:"text"`: it extracts readable article content from
-HTML with **dom_smoothie**, returning plain text and available title/byline/site/language metadata.
+HTML, returning plain text and metadata identifying the extraction engine and title, plus byline,
+excerpt, site name, and language when available.
 It does not execute JavaScript or fetch linked assets. Plain text, JSON, and other textual types
 pass through decoded; binary content is not converted. Extraction failures are explicit, never
 silently replaced with raw HTML. Fetch with `text:false` to inspect the original response. Empty
 responses remain empty. `text:true` cannot be combined with `save_to` or `response_format:"base64"`.
-Extraction accepts at most 10 MiB of decoded HTML and 50,000 DOM elements, with bounded parser
-concurrency. Character decoding honors BOMs, HTTP charsets, and HTML meta charsets where applicable.
+Extraction accepts at most 10 MiB of decoded HTML and 50,000 DOM elements. Character decoding
+honors BOMs, HTTP charsets, and HTML meta charsets where applicable.
 
 ## Limits and failure diagnostics
 
@@ -102,23 +103,21 @@ server-side effects, and requests are not automatically retried.
 Transport and processing failures remain failed jobs and failed JobViews (not rejected
 operational script calls), but include a structured failure result. It contains `method`, a safe
 `origin`, `elapsed_ms`, `received_bytes`, redirect history, and `diagnostic`: `phase`, `error_kind`,
-and a concise `message`. To keep tool
-definitions compact, diagnostic category fields use string schemas rather than exhaustive lists
-of labels; the typed runtime classifications and returned values are unchanged. When available,
-`diagnostic.os_error` supplies the executing platform, a numeric OS `code`, and a portable `kind`.
+and a concise `message`. When available, `diagnostic.os_error` supplies the executing platform,
+a numeric OS `code`, and a portable `kind`.
 Timeouts include `diagnostic.timeout.kind` (`total`, `connect`, or `unknown`) and a `limit_ms` only
 when the expiring limit is known. Timing starts inside fetch on the execution target; it does not
 include SSH startup or initial tool approval.
 
-Connection refusal, host/network unreachability, DNS failures, TLS failures, typed HTTP proxy
+Connection refusal, host/network unreachability, DNS failures, TLS failures, HTTP proxy
 CONNECT failures, and response-processing failures are distinguished when the underlying errors
 provide evidence. Otherwise fetch reports a generic transport category; it never infers that a
 firewall caused an error. Diagnostic messages do not copy arbitrary error strings, query strings,
 credentials, headers, or bodies. Failure URL/redirect context is reduced to origins. Received HTTP
 headers are included only with `include_headers: true`; they retain their normal response semantics
 and may still contain sensitive response data.
-`proxy_origin`, when present, describes an explicit proxy; omission does not rule out an environment
-proxy. Use the job's target for source attribution, and interpret OS codes using the reported platform.
+`proxy_origin`, when non-null, describes an explicit proxy; `null` does not rule out an
+environment proxy. Use the job's target for source attribution, and interpret OS codes using the reported platform.
 
 If headers arrived before a failure (including an outer timeout), the failure retains the
 HTTP status, `ok`, and byte count, plus headers when `include_headers: true`; known fields retain
@@ -155,7 +154,7 @@ operational fetch failure does not become an uncaught script exception.
 to return the redirect response. `max_redirects` defaults to 5. Changed origins require authorization;
 cross-origin requests do not inherit sensitive request headers, and HTTPS-to-HTTP redirects are
 rejected. Redirect method rewriting follows HTTP conventions; 307/308 preserve method and body.
-`proxy` selects an explicit HTTP proxy; otherwise reqwest uses the target's proxy environment.
+`proxy` selects an explicit HTTP proxy; otherwise fetch uses the target's proxy environment.
 `insecure` defaults to **false**. Setting it to **true** disables HTTPS certificate validation for
 that invocation only; it does not disable authorization or permit HTTPS downgrade redirects.
 

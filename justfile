@@ -42,7 +42,7 @@ build-full: build-shims-release build-release
 install: build-full
     install -Dm 755 target/release/skyhook ~/.local/bin/skyhook
 
-# Run the test suite with nextest, plus doctests (which nextest does not run).
+# Run the test suite with nextest.
 test:
     cargo nextest run --locked --all-targets --all-features
 
