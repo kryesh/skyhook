@@ -1,4 +1,4 @@
--- Skyhook session database (application_id 0x534B5948, user_version 8). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 9). Tables are STRICT;
 -- subtype rows key (entry, kind) -> entry(seq, kind). db/mod.rs adds append-only triggers
 -- to tables outside MUTABLE_TABLES. u64 values saturate to i64::MAX.
 
@@ -546,15 +546,13 @@ CREATE TABLE job_output_field (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX job_output_field_capture ON job_output_field(capture);
 
--- Script result provenance: a pointer shows a child job's output, or (child NULL) is an
--- annotated truncatable field of the script's own result.
+-- Annotated truncatable fields of a script's independently saved result.
 CREATE TABLE job_presentation (
   id INTEGER PRIMARY KEY,
   job INTEGER NOT NULL,
   generation INTEGER NOT NULL,
   pointer TEXT NOT NULL,
-  child INTEGER REFERENCES job(id),
-  UNIQUE (job, generation, pointer, child),
+  UNIQUE (job, generation, pointer),
   FOREIGN KEY (job, generation) REFERENCES job_run(job, generation)
 ) STRICT;
 

@@ -110,36 +110,84 @@ pub struct JobEnvelope {
     pub denial: Option<crate::tool::Denial>,
 }
 
-#[derive(Serialize, JsonSchema)]
-struct PresentedJob<'a> {
-    id: JobId,
-    state: JobState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    parent: Option<JobId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    target: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    workspace: Option<&'a std::path::Path>,
-    /// A waiting child agent returns a question batch; other jobs may return any output.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "question_or_output_schema")]
-    output: Option<&'a Value>,
-    /// Source sequence of the last visible child reply. A completed background
-    /// child's notification references it instead of repeating the saved result.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_message: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<&'a str>,
-    #[serde(flatten)]
-    denial: Option<crate::tool::Denial>,
+/// The single public wire contract for both model and JavaScript job responses.
+/// Payload JSON is opaque; only these owned presentation groups are constructed.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub(crate) struct JobView {
+    pub(crate) id: Option<JobId>,
+    pub(crate) state: JobState,
+    pub(crate) has_result: bool,
+    pub(crate) result: Value,
+    pub(crate) error: Option<String>,
+    pub(crate) meta: Option<JobMetadata>,
+    pub(crate) presentation: Option<Presentation>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
+pub(crate) struct JobMetadata {
+    pub(crate) parent: Option<JobId>,
+    pub(crate) tool: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) target: Option<String>,
+    /// Display metadata; execution keeps its native PathBuf in JobEnvelope.
+    pub(crate) workspace: Option<String>,
+    /// Source sequence of the last visible child reply.
+    pub(crate) last_message: Option<u64>,
+    pub(crate) code: Option<crate::tool::DenialCode>,
+    pub(crate) executed: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
+pub(crate) struct Presentation {
+    pub(crate) preview: Option<output::OutputPreview>,
+    pub(crate) truncated: Vec<output::OutputTruncation>,
+    pub(crate) captures: Vec<output::CaptureDescriptor>,
+    /// A waiting child agent returns a question batch rather than a result.
+    #[schemars(schema_with = "question_schema")]
+    pub(crate) question: Option<Value>,
+    pub(crate) notice: Option<String>,
+}
+
+impl Presentation {
+    pub(crate) fn into_option(self) -> Option<Self> {
+        (self.preview.is_some()
+            || !self.truncated.is_empty()
+            || !self.captures.is_empty()
+            || self.question.is_some()
+            || self.notice.is_some())
+        .then_some(self)
+    }
+}
+
+impl JobView {
+    pub(crate) fn failure(
+        message: String,
+        output: Option<Value>,
+        denial: Option<crate::tool::Denial>,
+        mut metadata: JobMetadata,
+    ) -> Self {
+        if let Some(denial) = denial {
+            metadata.code = Some(denial.code);
+            metadata.executed = Some(denial.executed);
+        }
+        Self {
+            id: None,
+            state: JobState::Failed,
+            has_result: output.is_some(),
+            result: output.unwrap_or(Value::Null),
+            error: Some(message),
+            meta: Some(metadata),
+            presentation: None,
+        }
+    }
+
+    pub(crate) fn into_value(self) -> Value {
+        serde_json::to_value(self).expect("job view serializes")
+    }
 }
 
 // Keep question fields discoverable without classifying extensible tool names.
-fn question_or_output_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+fn question_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "anyOf": [generator.subschema_for::<crate::agent::QuestionOutput>(), true]
     })
@@ -169,72 +217,62 @@ pub(crate) struct ActiveJobLocation {
 }
 
 impl JobEnvelope {
-    #[cfg(test)]
-    pub(crate) fn presented(
-        &self,
-        capabilities: &CapabilitySet,
-    ) -> Result<Value, serde_json::Error> {
-        self.presented_for(capabilities, None, true)
+    /// Ordinary foreground responses omit redundant launch metadata on success.
+    pub(crate) fn response_view(&self, capabilities: &CapabilitySet) -> JobView {
+        let failed = self.error.is_some()
+            || self.denial.is_some()
+            || (self.state.is_terminal() && self.state != JobState::Completed);
+        self.view(capabilities, failed)
     }
 
-    pub(crate) fn presented_for(
-        &self,
-        capabilities: &CapabilitySet,
-        viewer: Option<&ExecutionLocation>,
-        detailed: bool,
-    ) -> Result<Value, serde_json::Error> {
-        self.presented_with_reference(capabilities, viewer, detailed, None)
+    /// Explicit inspection and background handles always retain launch metadata.
+    pub(crate) fn metadata_view(&self, capabilities: &CapabilitySet) -> JobView {
+        self.view(capabilities, true)
     }
 
-    pub(super) fn presented_with_reference(
-        &self,
-        capabilities: &CapabilitySet,
-        viewer: Option<&ExecutionLocation>,
-        detailed: bool,
-        last_message: Option<u64>,
-    ) -> Result<Value, serde_json::Error> {
-        serde_json::to_value(PresentedJob {
-            id: self.id,
+    fn view(&self, capabilities: &CapabilitySet, metadata: bool) -> JobView {
+        let waiting = self.state == JobState::WaitingInput;
+        JobView {
+            id: Some(self.id),
             state: self.state.presented(),
-            last_message,
-            parent: self.parent.filter(|_| detailed),
-            tool: detailed.then_some(self.tool.as_str()),
-            name: self
-                .name
-                .as_deref()
-                .filter(|name| detailed && !name.is_empty()),
-            target: capabilities
-                .contains(Capability::Targets)
-                .then_some(self.location.target.as_str()),
-            workspace: viewer
-                .is_none_or(|location| location.workspace != self.location.workspace)
-                .then_some(self.location.workspace.as_path()),
-            output: self.output.as_ref(),
-            error: self.error.as_deref(),
-            denial: self.denial.clone(),
-        })
+            has_result: !waiting && self.output.is_some(),
+            result: if waiting {
+                Value::Null
+            } else {
+                self.output.clone().unwrap_or(Value::Null)
+            },
+            error: self.error.clone(),
+            meta: metadata.then(|| JobMetadata {
+                parent: self.parent,
+                tool: Some(self.tool.clone()),
+                name: self.name.clone().filter(|name| !name.is_empty()),
+                target: capabilities
+                    .contains(Capability::Targets)
+                    .then(|| self.location.target.clone()),
+                workspace: Some(self.location.workspace.to_string_lossy().into_owned()),
+                last_message: None,
+                code: self.denial.as_ref().map(|denial| denial.code.clone()),
+                executed: self.denial.as_ref().map(|denial| denial.executed),
+            }),
+            presentation: Presentation {
+                question: waiting.then(|| self.output.clone()).flatten(),
+                ..Presentation::default()
+            }
+            .into_option(),
+        }
     }
 }
 
-pub(crate) fn presented_job_schema(capabilities: &CapabilitySet, many: bool) -> Value {
-    let mut envelope = serde_json::to_value(schemars::schema_for!(PresentedJob<'_>))
-        .expect("job schema serializes");
-    if !capabilities.contains(Capability::Targets) {
-        envelope["properties"]
-            .as_object_mut()
-            .unwrap()
-            .remove("target");
-    }
-    if many {
-        let definitions = envelope
-            .as_object_mut()
-            .unwrap()
-            .remove("$defs")
-            .unwrap_or_else(|| serde_json::json!({}));
-        serde_json::json!({"type":"array", "items":envelope, "$defs":definitions})
+pub(crate) fn presented_job_schema(many: bool) -> Value {
+    let generator = schemars::generate::SchemaSettings::default()
+        .for_serialize()
+        .into_generator();
+    let schema = if many {
+        generator.into_root_schema_for::<Vec<JobView>>()
     } else {
-        envelope
-    }
+        generator.into_root_schema_for::<JobView>()
+    };
+    serde_json::to_value(schema).expect("job schema serializes")
 }
 
 impl JobManager {
@@ -472,17 +510,139 @@ impl JobManager {
 mod tests {
     use super::*;
 
+    fn envelope(output: Option<Value>) -> JobEnvelope {
+        JobEnvelope {
+            id: JobId::new(1).unwrap(),
+            parent: None,
+            tool: "fixture".into(),
+            role: JobRole::Tool,
+            name: None,
+            state: JobState::Completed,
+            output,
+            error: None,
+            location: ExecutionLocation::root(std::path::PathBuf::from("/work")),
+            denial: None,
+        }
+    }
+
+    #[test]
+    fn plain_process_response_keeps_model_text_under_two_hundred_bytes() {
+        let job = envelope(Some(serde_json::json!({
+            "exit_code":0, "stdout":"", "stderr":"", "timed_out":false
+        })));
+        let view = job.response_view(&CapabilitySet::default()).into_value();
+        let wire =
+            serde_json::to_vec(&serde_json::json!({"result":view,"is_error":false})).unwrap();
+        assert!(
+            wire.len() < 200,
+            "plain response grew to {} bytes",
+            wire.len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn display_metadata_with_non_utf8_workspace_is_json_serializable() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let mut job = envelope(None);
+        job.location.workspace = std::ffi::OsString::from_vec(b"/work/\xff".to_vec()).into();
+        let view = job.metadata_view(&CapabilitySet::default()).into_value();
+        assert_eq!(view["meta"]["workspace"], "/work/\u{fffd}");
+    }
+
+    #[test]
+    fn compact_responses_preserve_payload_nulls_and_explicit_inspection_metadata() {
+        let capabilities = CapabilitySet::default();
+        let payload =
+            serde_json::json!({"nested": null, "array": [null], "presentation": {"preview": null}});
+        let job = envelope(Some(payload.clone()));
+        let view = job.response_view(&capabilities).into_value();
+        assert_eq!(
+            view,
+            serde_json::json!({
+                "id":1, "state":"completed", "has_result":true,
+                "result":payload, "error":null, "meta":null, "presentation":null
+            })
+        );
+        let full = job.metadata_view(&capabilities).into_value();
+        assert_eq!(full["result"], view["result"]);
+        assert_eq!(full["meta"]["tool"], "fixture");
+        assert!(full["meta"].get("target").unwrap().is_null());
+        let null = envelope(Some(Value::Null))
+            .response_view(&capabilities)
+            .into_value();
+        assert_eq!(null["has_result"], true);
+        let unavailable = envelope(None).metadata_view(&capabilities).into_value();
+        assert_eq!(unavailable["has_result"], false);
+        assert_eq!(unavailable["result"], Value::Null);
+    }
+
+    #[test]
+    fn serialization_schema_requires_nullable_keys_in_every_group() {
+        let schema = presented_job_schema(false);
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let capabilities = CapabilitySet::default();
+        let mut job = envelope(Some(serde_json::json!({"nested":null})));
+        for (state, full) in [
+            (JobState::Completed, false),
+            (JobState::Completed, true),
+            (JobState::WaitingInput, true),
+        ] {
+            job.state = state;
+            let view = if full {
+                job.metadata_view(&capabilities)
+            } else {
+                job.response_view(&capabilities)
+            }
+            .into_value();
+            assert!(validator.is_valid(&view));
+            for group in ["", "/meta", "/presentation"] {
+                if let Some(fields) = view.pointer(group).and_then(Value::as_object) {
+                    for key in fields.keys() {
+                        let mut missing = view.clone();
+                        missing
+                            .pointer_mut(group)
+                            .unwrap()
+                            .as_object_mut()
+                            .unwrap()
+                            .remove(key);
+                        assert!(!validator.is_valid(&missing), "{group}/{key}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failures_include_metadata_with_or_without_admission() {
+        let mut job = envelope(Some(Value::Null));
+        job.state = JobState::Failed;
+        job.error = Some("failed".into());
+        job.denial = Some(crate::tool::Denial::permission_denied());
+        let view = job.response_view(&CapabilitySet::default()).into_value();
+        assert_eq!(view["meta"]["code"], "permission_denied");
+        assert_eq!(view["meta"]["executed"], false);
+        let failure = JobView::failure(
+            "denied".into(),
+            Some(Value::Null),
+            job.denial,
+            JobMetadata::default(),
+        )
+        .into_value();
+        assert_eq!(failure["id"], Value::Null);
+        assert_eq!(failure["has_result"], true);
+        assert!(jsonschema::is_valid(&presented_job_schema(false), &failure));
+    }
+
     #[test]
     fn question_schema_documents_batches_without_classifying_tool_names() {
         for many in [false, true] {
-            let schema = presented_job_schema(&CapabilitySet::default(), many);
+            let schema = presented_job_schema(many);
             assert!(
                 schema["$defs"]["QuestionOutput"]["properties"]
                     .get("questions")
                     .is_some()
             );
-            let envelope = if many { &schema["items"] } else { &schema };
-            assert!(envelope["properties"].get("role").is_none());
             for (tool, output) in [
                 (
                     "delegate",
@@ -490,7 +650,12 @@ mod tests {
                 ),
                 ("agent", serde_json::json!("custom prompt")),
             ] {
-                let job = serde_json::json!({"id":1, "state":"waiting_input", "tool":tool, "output":output});
+                let mut job = envelope(Some(output.clone()));
+                job.state = JobState::WaitingInput;
+                job.tool = tool.into();
+                let job = job.metadata_view(&CapabilitySet::default()).into_value();
+                assert_eq!(job["presentation"]["question"], output);
+                assert_eq!(job["has_result"], false);
                 let value = if many { serde_json::json!([job]) } else { job };
                 assert!(jsonschema::is_valid(&schema, &value));
             }

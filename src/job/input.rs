@@ -47,6 +47,29 @@ impl JobManager {
             .collect()
     }
 
+    /// Find a caller-owned child (or a launch still in progress) using this name.
+    /// Installed children retain their names after completion because follow-ups
+    /// address their existing job. A failed admission with no child identity must
+    /// not reserve the name permanently. The current invocation excludes itself.
+    pub(crate) async fn child_name_owner(
+        &self,
+        owner: &AgentId,
+        name: &str,
+        current: JobId,
+    ) -> Option<JobId> {
+        self.inner.jobs.lock().await.iter().find_map(|(id, entry)| {
+            (*id != current
+                && &entry.agent == owner
+                && entry.role == crate::job::JobRole::Agent
+                && entry.name.as_deref() == Some(name)
+                // Earlier pending launches reserve the name. Without ordering,
+                // simultaneous invocations could both reject one another before
+                // either has installed a child.
+                && (entry.child.is_some() || (*id < current && !entry.state.is_terminal())))
+            .then_some(*id)
+        })
+    }
+
     /// Record the agent identity as soon as it is launched, including turns that
     /// fail before producing visible assistant text.
     pub(crate) async fn set_child_agent(&self, id: JobId, child: AgentId) -> Result<(), JobError> {
@@ -354,6 +377,76 @@ impl JobManager {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn pending_child_names_reserve_in_order_without_creating_terminal_ghosts() {
+        let runtime = crate::tests::TestRuntime::new().await;
+        let jobs = &runtime.jobs;
+        let launch = async |owner: &AgentId| {
+            jobs.create(JobSpec {
+                role: JobRole::Agent,
+                name: Some("worker".into()),
+                ..JobSpec::test(owner.clone(), "agent")
+            })
+            .await
+            .unwrap()
+            .into_test_id()
+        };
+        let first = launch(&runtime.agent).await;
+        let second = launch(&runtime.agent).await;
+        assert_eq!(
+            jobs.child_name_owner(&runtime.agent, "worker", first).await,
+            None
+        );
+        assert_eq!(
+            jobs.child_name_owner(&runtime.agent, "worker", second)
+                .await,
+            Some(first)
+        );
+
+        jobs.finish(
+            first,
+            JobOutcome::Failed {
+                message: "launch failed before installing a child".into(),
+                output: None,
+                denial: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            jobs.child_name_owner(&runtime.agent, "worker", second)
+                .await,
+            None
+        );
+        jobs.set_child_agent(second, runtime.agent.child(1))
+            .await
+            .unwrap();
+        jobs.finish(
+            second,
+            JobOutcome::Completed(crate::tool::ToolOutput::new(Value::Null)),
+        )
+        .await
+        .unwrap();
+        let third = launch(&runtime.agent).await;
+        assert_eq!(
+            jobs.child_name_owner(&runtime.agent, "worker", third).await,
+            Some(second)
+        );
+        let other = crate::session::fixture::start_child(
+            &runtime.store,
+            &runtime.agent,
+            2,
+            None,
+            runtime.root.path(),
+        )
+        .await;
+        let independent = launch(&other).await;
+        assert_eq!(
+            jobs.child_name_owner(&other, "worker", independent).await,
+            None
+        );
+    }
 
     /// A running input-capable job whose resume handler echoes and counts calls.
     async fn retained(jobs: &JobManager, agent: &AgentId) -> (JobLease, Arc<AtomicUsize>) {

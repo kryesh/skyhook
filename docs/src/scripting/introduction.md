@@ -6,13 +6,14 @@ instance memoizes its own execution, so reusing one builder executes it once whi
 equivalent new builder creates a new call:
 
 ```js
-const packageFile = tool.read({ path: "Cargo.toml" });
-const matches = tool.search({ pattern: "TODO", path: "src" });
+// Every direct JavaScript call is a JobView; use unwrap for the native payload.
+const packageFile = (await tool.read({ path: "Cargo.toml" })).unwrap();
+const matches = (await tool.search({ pattern: "TODO", path: "src" })).unwrap();
 
 // The same schema also generates an immutable fluent builder.
-const readme = tool.read().path("README.md");
+const readme = (await tool.read().path("README.md")).unwrap();
 
-// Builders nested in the returned value are resolved concurrently.
+// Builders can be awaited independently (and can still be batched with Promise.all).
 return { packageFile, matches, readme };
 ```
 

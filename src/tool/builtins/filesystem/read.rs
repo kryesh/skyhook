@@ -281,13 +281,9 @@ enum DirectoryEntries {
 
 #[derive(Default, Serialize, JsonSchema)]
 struct DirectoryGroups {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     files: Vec<DirectoryFile>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     directories: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     symlinks: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     other: Vec<String>,
 }
 
@@ -334,6 +330,23 @@ mod tests {
         let executor = runtime.executor(builder);
         assert!(slot.set(executor.clone()).is_ok());
         (executor, slot)
+    }
+
+    #[test]
+    fn grouped_directory_entries_keep_empty_groups() {
+        let groups = DirectoryGroups::from(vec![DirectoryEntry::File {
+            name: "one.txt".into(),
+            bytes: 3,
+        }]);
+        assert_eq!(
+            serde_json::to_value(groups).unwrap(),
+            json!({
+                "files":[{"name":"one.txt", "bytes":3}],
+                "directories":[],
+                "symlinks":[],
+                "other":[]
+            })
+        );
     }
 
     /// Schema-valid input rejected by typed admission still owns a job, which
@@ -449,7 +462,7 @@ mod tests {
             assert_eq!(model.output.value["result"]["error"]["code"], "not_found");
             let path = serde_json::to_string(path).unwrap();
             let source = format!(
-                "const result = await tool.read({{path:{path}}}); return {{resolved:true, result}};"
+                "const response = await tool.read({{path:{path}}}); return {{resolved:true, result:response.unwrap()}};"
             );
             let script = executor
                 .run_host(agent, "script", json!({"source": source}))
@@ -483,6 +496,6 @@ mod tests {
             .present_output(args, &Default::default())
             .await
             .unwrap();
-        assert_eq!(page["preview"]["lines"][0], "two");
+        assert_eq!(page["presentation"]["preview"]["lines"][0], "two");
     }
 }

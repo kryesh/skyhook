@@ -5,14 +5,19 @@ pub(super) const FIELD_BYTES: usize = 2 * 1024;
 pub(super) const FIELD_LINES: usize = 100;
 const ANNOTATION: &str = "x-skyhook-truncatable";
 
-/// The projected view, with its truncated fields listed under `truncated`.
+/// Typed presentation assembled before the JobView is serialized.
+pub(super) struct Projected {
+    pub(super) result: Value,
+    pub(super) truncated: Vec<OutputTruncation>,
+    pub(super) notice: Option<String>,
+}
+
 pub(super) fn project(
     saved: &Saved,
     schema: &Value,
     cancellation: &super::super::CancellationToken,
     annotated: &BTreeSet<String>,
-    replacements: &BTreeMap<String, Value>,
-) -> Result<serde_json::Map<String, Value>, ToolError> {
+) -> Result<Projected, ToolError> {
     let mut document = saved
         .document
         .clone()
@@ -22,19 +27,14 @@ pub(super) fn project(
         truncated: Vec::new(),
         cancellation,
         annotated,
-        replacements,
     };
     projection.visit(&mut document["result"], "/result", &[schema], schema)?;
-    let mut output = serde_json::Map::new();
-    output.insert("result".into(), document["result"].take());
-    capture_notice(&mut output, document["capture_complete"].as_bool());
-    if !projection.truncated.is_empty() {
-        output.insert(
-            "truncated".into(),
-            serde_json::to_value(&projection.truncated)?,
-        );
-    }
-    Ok(output)
+    Ok(Projected {
+        result: document["result"].take(),
+        truncated: projection.truncated,
+        notice: (document["capture_complete"].as_bool() == Some(false))
+            .then(|| "Output incomplete.".into()),
+    })
 }
 
 struct Projection<'a> {
@@ -42,7 +42,6 @@ struct Projection<'a> {
     truncated: Vec<OutputTruncation>,
     cancellation: &'a super::super::CancellationToken,
     annotated: &'a BTreeSet<String>,
-    replacements: &'a BTreeMap<String, Value>,
 }
 
 impl Projection<'_> {
@@ -55,10 +54,6 @@ impl Projection<'_> {
     ) -> Result<(), ToolError> {
         if self.cancellation.is_cancelled() {
             return Err(ToolError::Cancelled);
-        }
-        if let Some(replacement) = self.replacements.get(field) {
-            *value = replacement.clone();
-            return Ok(());
         }
         let applicable = ApplicableSchemas::new(schemas, root, value);
         if (self.annotated.contains(field) || applicable.is_annotated())
@@ -87,10 +82,8 @@ impl Projection<'_> {
                 self.truncated.push(OutputTruncation {
                     field: field.into(),
                     total_lines: index.total_lines,
-                    next: OutputContinuation {
-                        start: line,
-                        offset,
-                    },
+                    next_start: line,
+                    next_offset: offset,
                 });
             }
             return Ok(());
@@ -478,7 +471,7 @@ mod tests {
     }
 
     fn marker<'a>(view: &'a Value, field: &str) -> &'a Value {
-        view["truncated"]
+        view["presentation"]["truncated"]
             .as_array()
             .unwrap()
             .iter()
@@ -512,8 +505,11 @@ mod tests {
             manager.metadata(id).await.unwrap().error.as_deref(),
             Some(error.as_str())
         );
-        assert!(view.get("console").is_none() && view.get("preview").is_none());
-        assert_eq!(view["truncated"].as_array().unwrap().len(), 3);
+        assert!(view.get("console").is_none() && view["presentation"]["preview"].is_null());
+        assert_eq!(
+            view["presentation"]["truncated"].as_array().unwrap().len(),
+            3
+        );
         assert_eq!(manager.snapshot(id).await.unwrap().output.unwrap(), value);
         let session = manager.store().id();
         drop(manager);
@@ -538,7 +534,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(
-                page["preview"]["lines"][0]
+                page["presentation"]["preview"]["lines"][0]
                     .as_str()
                     .unwrap()
                     .starts_with(expected)
@@ -569,14 +565,14 @@ mod tests {
                     .present_output(query.clone(), &Default::default())
                     .await
                     .unwrap();
-                for row in page["preview"]["lines"].as_array().unwrap() {
+                for row in page["presentation"]["preview"]["lines"].as_array().unwrap() {
                     remaining.push_str(row.as_str().unwrap());
                     remaining.push_str("\r\n");
                 }
-                if page["preview"]["next_start"].is_null() {
+                if page["presentation"]["preview"]["next_start"].is_null() {
                     break;
                 }
-                query = continuation(id, &page["preview"]);
+                query = continuation(id, &page["presentation"]["preview"]);
             }
             assert_eq!(format!("{prefix}{remaining}"), text);
         }

@@ -37,9 +37,63 @@ return results;
 ## Saved output and serialization
 
 Read or search saved command output with `tool.job(commandJobId).output({field:"/result/stdout"})`.
-Field-selected output is a job view, not a raw string: available text is in `preview.lines`,
-with pagination metadata alongside it. Field, pagination, and search selections omit image
-attachments; whole-output reads can attach saved images.
+`job.output()` returns the existing JobView for that job; it does not add another wrapper.
+Field-selected output is a job view, not a raw string: available text is in
+`presentation.preview.lines`, with pagination metadata alongside it. Field, pagination, and
+search selections omit image attachments; whole-output reads can attach saved images.
+
+## JobView response contract
+
+Direct model calls and JavaScript tool calls return the same seven-key `JobView` envelope. Its
+required keys and types are:
+
+```text
+id: number|null
+state: string
+has_result: boolean
+result: JSON
+error: string|null
+meta: null|JobMetadata
+presentation: null|Presentation
+```
+
+`result` is the native tool payload (and may be a loaded literal `null`); `has_result` tells
+whether that payload is available. `meta` is `null` on an ordinary successful foreground call
+when no full metadata is needed. Background, status, inspection, and failure responses carry
+`meta` when available. It has nullable `parent`, `tool`, `name`, `target`, `workspace`,
+`last_message`, `code`, and `executed` fields. `target` is `null` when target capabilities are
+unavailable. A pre-admission failure can have `id: null`.
+
+`presentation` is `null` when a successful foreground response has no truncation, page, capture,
+question, or notice. When present, it groups `preview`, `truncated`, `captures`, `question`, and
+`notice`; empty or absent members use their nullable/empty defaults. Read a page as
+`r.presentation.preview.lines` and a question as `r.presentation.question`.
+Truncation entries keep their source paths rooted at `/result/...`.
+
+JavaScript receives complete data; model views may truncate only fields annotated as truncatable.
+Tool descriptions' `Result` refers to the envelope's `.result`, not a separate wrapper. A successful
+`job_output` call on a failed target is still a successful tool invocation returning that failed
+`JobView`; `response.unwrap()` checks the observed job state and can therefore throw for that view.
+
+## `response.unwrap()` and native results
+
+Use `response.unwrap()` synchronously when a completed native payload is needed:
+
+```js
+const data = (await tool.read({path: "README.md"})).unwrap();
+```
+
+It returns `response.result` only when `state: "completed"` and `has_result: true`, including a
+completed literal `null`. It throws for failed, pending, or result-unavailable responses; the
+thrown error has `error.response` containing the envelope and `error.output` equal to its
+`.result`. The method is non-enumerable and runtime-only: `Object.keys`, JSON serialization,
+logging, returning, and saving the envelope retain plain JSON. Nested payloads, JSON copies, and
+`receive()` values are not decorated, and there is no built-in `tool.unwrap` helper.
+
+`job.output()` and output selections already return views, so inspect their `presentation.preview`,
+`presentation.captures`, or pagination rather than unwrapping them. Operational tool failures are
+failed views rather than JavaScript throws; programmer, serialization, `receive`, and sleep errors
+still throw.
 
 Before returning results, convert `BigInt` values to strings, dates with `.toISOString()`, and
 typed arrays with `Array.from(bytes)`, `.toBase64()`, or `.toHex()`. The runtime does not provide
@@ -47,15 +101,14 @@ Node.js APIs, `fetch`, `URL`, `TextEncoder`/`TextDecoder`, or `setTimeout`/`setI
 
 ## Script results and failures
 
-Every script result is `{value: <JavaScript return>, console: <captured text>}`, including
-silent scripts (`console: ""`) and scripts without a return (`value: null`). This wrapper applies
-to both public job views and native/programmatic script results; only script results need this
-extra `.value` unwrapping. Ordinary tool results inside JavaScript remain unchanged. In a script
-job view, the return is at `/result/value` and logs are at `/result/console`.
+Every script result payload is always `{value: <JavaScript return>, console: <captured text>, failure: null|JSON}`,
+including silent scripts (`console: ""`) and scripts without a return (`value: null`). `failure`
+is `null` on success. In a script JobView, the payload is at `/result` and its return is at
+`/result/value`; logs are at `/result/console`.
 
 `console.log(...values)` captures space-separated text, formatting objects as JSON. Console
-capture is disk-backed and each log write is flushed, so a running script's captured text can
-be inspected at `/result/console` with `job_output` or
+capture is disk-backed and each log write is flushed, so a running script's captured text can be
+inspected at `/result/console` with `job_output` or
 `tool.job(scriptJobId).output({field: "/result/console"})`. These inspections read the currently
 available output; they do not subscribe to future writes or wait for script completion.
 
@@ -64,21 +117,23 @@ Automatic previews can truncate displayed text without discarding captured outpu
 [paging or search](job-output.md) to inspect more. The **16 MiB limit applies to JavaScript
 source**, not console capture.
 
-On failure, the result is `{value: null, console: <captured text>, failure: <details>}` alongside
-the job error. Console text belongs to the script result, not generic job metadata or a separate
-tool-result text block.
+On a script execution failure, the completed script payload is `{value: null, console: <captured text>, failure: <details>}`;
+the enclosing JobView is `failed` and also carries its `error`. Console text belongs to the script
+result, not generic job metadata or a separate tool-result text block. A top-level `undefined` becomes JSON
+`null`; nested `undefined` is not coerced or removed and causes serialization failure.
 
 ## Builder execution and policy
 
 Builder setters and object arguments come from the same strict JSON schema; omitted values receive
 the handler's normal defaults. Awaiting a builder executes it immediately. Returning builders recursively executes independent
-branches concurrently. All executions still pass through the same registry, policy hook, job
-supervisor, persistence, and path authorization checks as model-originated calls. Top-level
-`undefined` returns JSON `null`; nested `undefined` values are rejected with their result path.
-The `script` tool is deliberately omitted from the runtime, preventing recursive script invocation.
+branches concurrently. All executions pass through the same registry, policy hook, job supervisor,
+persistence, and path authorization checks as model-originated calls. The `script` tool is omitted
+from the runtime, preventing recursive script invocation.
 
-Failed tools retain any partial output (including captured process output on timeout). Model tool
-errors include it in an `output` field; JavaScript callers can catch the error and read `error.output`.
+Failed tools retain any partial output (including captured process output on timeout) in the failed
+JobView's `.result`; JavaScript operational failures do not reject the builder promise. Use
+`response.unwrap()` when failures should throw rather than be handled as data. Programmer and
+serialization errors are not operational tool failures and still reject/throw.
 
 See [scripting introduction](../scripting/introduction.md) for lazy-builder examples and
 [jobs and agents](../scripting/jobs-and-agents.md) for background work and child input.

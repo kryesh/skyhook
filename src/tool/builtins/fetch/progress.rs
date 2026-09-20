@@ -20,8 +20,7 @@ pub(super) struct FetchFailureOutput {
     received_bytes: u64,
     redirects: Vec<FailureRedirect>,
     diagnostic: FetchDiagnostic,
-    /// Explicitly configured proxy only; omission does not rule out an environment proxy.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Explicitly configured proxy only; null does not rule out an environment proxy.
     proxy_origin: Option<SanitizedOrigin>,
     #[serde(flatten)]
     response: Option<FailureResponse>,
@@ -42,8 +41,7 @@ struct FailureResponse {
     status: u16,
     ok: bool,
     url: SanitizedOrigin,
-    /// Response headers, present only when include_headers is true.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Response headers, or null when include_headers is false.
     headers: Option<std::collections::BTreeMap<String, Vec<String>>>,
     body: ResponseBody,
 }
@@ -240,7 +238,7 @@ mod tests {
                 if include_headers == Some(true) {
                     assert_eq!(output["headers"]["x-result"], json!(["one", "two"]));
                 } else {
-                    assert!(output.get("headers").is_none(), "{output}");
+                    assert_eq!(output["headers"], Value::Null, "{output}");
                 }
                 task.await.unwrap();
             }
@@ -271,13 +269,11 @@ mod tests {
             let output = error.into_failure().output.unwrap().value;
             assert_eq!(output["status"], 200);
             assert_eq!(output["diagnostic"]["timeout"]["kind"], "total");
-            let headers = (include_headers == Some(true)).then(|| json!({"x-result":["waiting"]}));
-            assert_eq!(
-                output
-                    .get("headers")
-                    .map(|h| json!({"x-result": h["x-result"]})),
-                headers
-            );
+            if include_headers == Some(true) {
+                assert_eq!(output["headers"]["x-result"], json!(["waiting"]));
+            } else {
+                assert_eq!(output["headers"], Value::Null);
+            }
             tokio::time::timeout(Duration::from_secs(10), task)
                 .await
                 .unwrap()
@@ -310,8 +306,12 @@ mod tests {
             (&diagnostic["phase"], &diagnostic["error_kind"]),
             (&json!("extraction"), &json!("extraction_failure"))
         );
-        assert!(diagnostic.get("timeout").is_none());
-        for absent in ["headers", "body", "proxy_origin"] {
+        assert_eq!(diagnostic["timeout"], Value::Null);
+        assert_eq!(diagnostic["os_error"], Value::Null);
+        assert_eq!(output.value["proxy_origin"], Value::Null);
+        // These belong to the absent flattened response variant, rather than
+        // nullable fields of the failure itself.
+        for absent in ["headers", "body"] {
             assert!(output.value.get(absent).is_none(), "{absent}");
         }
         // Cancellation and denial keep their original boundary contracts instead.

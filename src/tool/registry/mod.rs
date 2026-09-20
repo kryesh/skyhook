@@ -16,7 +16,7 @@ use std::{
 };
 
 use futures_util::future::BoxFuture;
-use schemars::{JsonSchema, schema_for};
+use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use thiserror::Error;
@@ -747,7 +747,7 @@ impl ToolRegistry {
             .collect();
         ToolSurface {
             tools,
-            job_envelope: crate::job::presented_job_schema(capabilities, false),
+            job_envelope: crate::job::presented_job_schema(false),
         }
     }
 
@@ -828,6 +828,9 @@ impl ToolRegistryBuilder {
         }
         let name = name.into();
         validate_name(&name)?;
+        if matches!(options.script_binding, ScriptBinding::TopLevel) && name == "job" {
+            return Err(RegistryError::ReservedScriptName(name));
+        }
         validate_schema(&input_schema)?;
         if let Some((pointer, ..)) = (options.conditional_inputs.iter())
             .find(|(pointer, ..)| !input_schema.pointer(pointer).is_some_and(Value::is_object))
@@ -951,8 +954,16 @@ impl ToolRegistryBuilder {
         F: Fn(ToolContext, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
     {
-        let output_schema = serde_json::to_value(schema_for!(O))
-            .map_err(|error| RegistryError::Schema(error.to_string()))?;
+        // Handler results are described by their serialization contract. In
+        // particular, an `Option<T>` that is always emitted is required and
+        // nullable, while `skip_serializing_if` still makes a field optional.
+        let output_schema = serde_json::to_value(
+            SchemaSettings::default()
+                .for_serialize()
+                .into_generator()
+                .into_root_schema_for::<O>(),
+        )
+        .map_err(|error| RegistryError::Schema(error.to_string()))?;
         if options.output_schema.is_none() {
             options = options.output_schema(output_schema);
         }
@@ -990,7 +1001,7 @@ impl ToolRegistryBuilder {
             return Err(RegistryError::PresentedPlacement(name.into()));
         }
         options.execution.result_policy = ToolResultPolicy::JobView;
-        options = options.generated_output_schema(crate::job::output::view_schema);
+        options = options.generated_output_schema(|_| crate::job::presented_job_schema(false));
         self.register_typed::<I, _, _>(name, description, options, move |context, input| {
             let future = handler(context, input);
             async move {
@@ -1012,8 +1023,16 @@ impl ToolRegistryBuilder {
         F: Fn(ToolContext, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
     {
-        let input_schema = serde_json::to_value(schema_for!(I))
-            .map_err(|error| RegistryError::Schema(error.to_string()))?;
+        // Typed arguments keep the deserialization contract: defaults and
+        // `Option` fields remain omissible even when the output type would emit
+        // the same fields.
+        let input_schema = serde_json::to_value(
+            SchemaSettings::default()
+                .for_deserialize()
+                .into_generator()
+                .into_root_schema_for::<I>(),
+        )
+        .map_err(|error| RegistryError::Schema(error.to_string()))?;
         let handler = Arc::new(handler);
         self.register_admission(name, description, input_schema, options, move |arguments| {
             let input = serde_json::from_value::<I>(arguments).map_err(ToolError::invalid)?;
@@ -1060,6 +1079,10 @@ pub enum RegistryError {
     InvalidName(String),
     #[error("duplicate tool `{0}`")]
     Duplicate(String),
+    #[error(
+        "`{0}` is reserved by the JavaScript tool API; use a different name or disable its script binding"
+    )]
+    ReservedScriptName(String),
     #[error("tool schema is invalid: {0}")]
     Schema(String),
     #[error("`bg` is reserved by the harness")]
@@ -1075,6 +1098,115 @@ mod admission_tests {
     use super::*;
     use crate::job::{JobOutcome, JobSpec, output};
     use std::io::Write as _;
+
+    #[test]
+    fn javascript_job_namespace_is_reserved_but_unwrap_is_an_ordinary_tool_name() {
+        #[derive(serde::Deserialize, JsonSchema)]
+        struct Empty {}
+        let mut builder = ToolRegistryBuilder::default();
+        let registered = builder.register::<Empty, Value, _, _>(
+            "job",
+            "reserved namespace",
+            ToolOptions::default(),
+            |_, _| async { Ok(Value::Null) },
+        );
+        assert!(matches!(
+            registered,
+            Err(RegistryError::ReservedScriptName(_))
+        ));
+        for (name, options) in [
+            ("job", ToolOptions::default().script_unavailable()),
+            ("unwrap", ToolOptions::default()),
+        ] {
+            builder
+                .register::<Empty, Value, _, _>(name, "allowed binding", options, |_, _| async {
+                    Ok(Value::Null)
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn typed_schemas_use_their_respective_serde_contracts() {
+        #[derive(serde::Deserialize, JsonSchema)]
+        struct Input {
+            #[serde(default, rename = "defaulted")]
+            _defaulted: bool,
+            #[serde(rename = "optional")]
+            _optional: Option<String>,
+        }
+        #[derive(serde::Serialize, JsonSchema)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Choice {
+            Empty,
+            Value { value: Option<u64> },
+        }
+        #[derive(serde::Serialize, JsonSchema)]
+        struct Output {
+            emitted: Option<String>,
+            #[serde(default)]
+            defaulted: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            skipped: Option<String>,
+            choice: Choice,
+        }
+
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register::<Input, Output, _, _>(
+                "contracts",
+                "serde contracts",
+                ToolOptions::default(),
+                |_, _| async {
+                    Ok(Output {
+                        emitted: None,
+                        defaulted: false,
+                        skipped: None,
+                        choice: Choice::Empty,
+                    })
+                },
+            )
+            .unwrap();
+        let spec = builder
+            .build()
+            .surface(&CapabilitySet::default())
+            .get("contracts")
+            .unwrap()
+            .clone();
+
+        let input = jsonschema::validator_for(&spec.input_schema).unwrap();
+        assert!(input.is_valid(&serde_json::json!({})));
+        assert!(input.is_valid(&serde_json::json!({"optional": null})));
+
+        let schema = spec.output_schema.unwrap();
+        let required = schema["required"].as_array().unwrap();
+        for field in ["emitted", "defaulted", "choice"] {
+            assert!(required.contains(&Value::String(field.into())), "{schema}");
+        }
+        assert!(!required.contains(&Value::String("skipped".into())));
+        let output = jsonschema::validator_for(&schema).unwrap();
+        for value in [
+            serde_json::to_value(Output {
+                emitted: None,
+                defaulted: false,
+                skipped: None,
+                choice: Choice::Empty,
+            })
+            .unwrap(),
+            serde_json::to_value(Output {
+                emitted: Some("present".into()),
+                defaulted: true,
+                skipped: Some("present".into()),
+                choice: Choice::Value { value: None },
+            })
+            .unwrap(),
+        ] {
+            assert!(output.is_valid(&value), "{value} rejected by {schema}");
+        }
+        assert!(!output.is_valid(&serde_json::json!({
+            "defaulted": false, "choice": {"kind": "empty"}
+        })));
+    }
 
     #[tokio::test]
     async fn product_registration_preserves_capture_evidence_without_serialization() {
@@ -1240,10 +1372,7 @@ mod admission_tests {
             .finish(source, JobOutcome::Completed(result))
             .await
             .unwrap();
-        let location = ExecutionLocation::root(runtime.root.path().to_owned());
         let options = output::OutputOptions::Model {
-            viewer: Some(&location),
-            detailed: false,
             presentation: crate::job::OutputPresentation::Automatic,
         };
         let args = output::OutputArgs::new(source);
@@ -1269,7 +1398,8 @@ mod admission_tests {
                 "schema_control",
                 "Schema reference",
                 serde_json::json!({"type":"object"}),
-                ToolOptions::default().generated_output_schema(output::view_schema),
+                ToolOptions::default()
+                    .generated_output_schema(|_| crate::job::presented_job_schema(false)),
                 |_, _| async { Ok(ToolOutput::new(Value::Null)) },
             )
             .unwrap();

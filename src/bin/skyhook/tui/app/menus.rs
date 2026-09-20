@@ -1008,7 +1008,8 @@ mod tests {
         query.field = Some("/result/console".into());
         let session = app.session().unwrap().clone();
         let page = session.inspect_output(query.clone()).await.unwrap();
-        assert!(page.get("result").is_none());
+        assert_eq!(page.get("result"), Some(&serde_json::Value::Null));
+        assert_eq!(page["has_result"], false);
         app.outputs
             .insert_product(job, OutputView::historical(page.clone()));
         app.outputs.set_query(query);
@@ -1031,9 +1032,9 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(fields.contains(&"/result/value/child/content"));
-        assert!(!fields.contains(&"/result/value/child/result/content"));
-        assert!(!fields.contains(&"/result/value/child/id"));
+        assert!(fields.contains(&"/result/value/child/result/content"));
+        assert!(!fields.contains(&"/result/value/child/content"));
+        assert!(fields.contains(&"/result/value/child/id"));
         // Discovery must not replace the displayed page.
         assert_eq!(app.outputs.get(&job).unwrap().value(), &page);
         assert_eq!(
@@ -1052,7 +1053,7 @@ mod tests {
         );
         let query = app.outputs.query(job).unwrap().clone();
         let output = session.inspect_output(query).await.unwrap();
-        assert_eq!(output["preview"]["lines"], json!(["42"]));
+        assert_eq!(output["presentation"]["preview"]["lines"], json!(["42"]));
     }
 
     async fn wait_for_failures(

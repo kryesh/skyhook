@@ -78,9 +78,10 @@ removed before sending input to the MCP server. Tools normally use readable name
 `mcp_filesystem_write_file`. A short, deterministic hash suffix is added only when a name needs
 sanitizing or shortening to the 64-character limit, or conflicts with another tool. Ambiguous
 names are resolved across the startup catalog independently of discovery order. Use the exact
-advertised name with `tool[name](...)` or its fluent builder. Direct calls return normal job views,
-while foreground script calls return the MCP result envelope (`content`, plus optional `structuredContent` and `isError`). Images use the
-usual saved-output image handling, and server-reported errors retain their output in failed jobs.
+advertised name with `tool[name](...)` or its fluent builder. Direct model and foreground script
+calls return the [common JobView envelope](../reference/javascript.md#jobview-response-contract); the
+MCP payload (`content`, plus optional `structuredContent` and `isError`) is in `.result`. Images use
+the usual saved-output image handling, and server-reported errors retain their output in failed jobs.
 
 Calls pass through the same cancellation and background-job machinery as builtins. Skyhook
 bounds discovery and response sizes, and does not replay a call with an uncertain outcome after

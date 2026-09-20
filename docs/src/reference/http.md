@@ -7,41 +7,41 @@ machines. Like `exec`, it supports `name`, `bg`, cancellation, and saved job out
 
 ```js
 // Read an article without sending HTML boilerplate to the model.
-const page = await tool.fetch({url: "https://example.com/article", text: true});
+const page = (await tool.fetch({url: "https://example.com/article", text: true})).unwrap();
 
 // Send JSON to an API. HTTP 4xx/5xx are responses, not tool failures.
-const response = await tool.fetch({
+const response = (await tool.fetch({
   url: "https://api.example.com/items",
   method: "POST",
   body: {kind: "json", value: {name: "example"}}
-});
+})).unwrap();
 
 // Duplicate query parameters and request headers are supported.
-const search = await tool.fetch({
+const search = (await tool.fetch({
   url: "https://api.example.com/search",
   query: [["tag", "rust"], ["tag", "http"]],
   headers: {Accept: "application/json"}
-});
+})).unwrap();
 
 // Send a file as the raw request body, without base64-encoding it in model context.
-const upload = await tool.fetch({
+const upload = (await tool.fetch({
   url: "https://api.example.com/upload",
   method: "PUT",
   headers: {"Content-Type": "application/gzip"},
   body: {kind: "file", path: "dist/archive.tar.gz"}
-});
+})).unwrap();
 
 // Save a download on the execution target. Existing files are preserved unless overwrite:true.
-const download = await tool.fetch({
+const download = (await tool.fetch({
   url: "https://example.com/archive.tar.gz",
   save_to: "archive.tar.gz",
   max_bytes: 104857600,
   timeout: 300
-});
+})).unwrap();
 
 // Explicitly opt out of certificate validation for a development HTTPS server.
 // This permits untrusted certificates and enables interception; never use casually.
-const development = await tool.fetch({url: "https://localhost:8443/health", insecure: true});
+const development = (await tool.fetch({url: "https://localhost:8443/health", insecure: true})).unwrap();
 ```
 
 ## Request options
@@ -99,9 +99,10 @@ rather than reporting an incomplete body as successful. Model-visible preview tr
 independent: retrieve saved results with `job_output`. Cancellation and timeouts cannot undo
 server-side effects, and requests are not automatically retried.
 
-Transport and processing failures remain failed jobs (and rejected script calls), but include a
-structured failure result. It contains `method`, a safe `origin`, `elapsed_ms`, `received_bytes`,
-redirect history, and `diagnostic`: `phase`, `error_kind`, and a concise `message`. To keep tool
+Transport and processing failures remain failed jobs and failed JobViews (not rejected
+operational script calls), but include a structured failure result. It contains `method`, a safe
+`origin`, `elapsed_ms`, `received_bytes`, redirect history, and `diagnostic`: `phase`, `error_kind`,
+and a concise `message`. To keep tool
 definitions compact, diagnostic category fields use string schemas rather than exhaustive lists
 of labels; the typed runtime classifications and returned values are unchanged. When available,
 `diagnostic.os_error` supplies the executing platform, a numeric OS `code`, and a portable `kind`.
@@ -119,34 +120,34 @@ and may still contain sensitive response data.
 `proxy_origin`, when present, describes an explicit proxy; omission does not rule out an environment
 proxy. Use the job's target for source attribution, and interpret OS codes using the reported platform.
 
-If headers arrived before a failure (including an outer timeout), the failure also retains the
-HTTP status, `ok`, and byte count, plus headers when `include_headers: true`. Before any response,
-those HTTP fields are omitted,
-not fabricated. HTTP 4xx/5xx responses still complete normally: a 405 establishes HTTP connectivity,
-not successful ingestion. Permission denial and cancellation retain their separate semantics.
+If headers arrived before a failure (including an outer timeout), the failure retains the
+HTTP status, `ok`, and byte count, plus headers when `include_headers: true`; known fields retain
+null/default values when unavailable. HTTP 4xx/5xx responses still complete normally: a 405
+establishes HTTP connectivity, not successful ingestion. Permission denial and cancellation
+retain their separate semantics.
 
-In scripts, catch failures inside each worker and inspect `error.output.diagnostic`; merely
-logging an Error or allowing `WorkPool` to skip a failed worker loses the structured row:
+In scripts, operational fetch failures are failed JobViews rather than rejected promises. Inspect
+the failed view's `.result` directly (or use `response.unwrap()` for fail-fast extraction):
 
 ```js
-try {
-  const response = await tool.fetch({url, target});
-  return {target, http_reached: true, status: response.status};
-} catch (error) {
-  const failure = error.output ?? {};
+const response = await tool.fetch({url, target});
+if (response.state === "failed") {
+  const failure = response.result ?? {};
   return {
     target,
     http_reached: Number.isInteger(failure.status),
     status: failure.status ?? null,
     elapsed_ms: failure.elapsed_ms ?? null,
     diagnostic: failure.diagnostic ?? null,
-    error: error.message,
+    error: response.error,
   };
 }
+return {target, http_reached: true, status: response.result.status};
 ```
 
-The same diagnostic is retrievable from a failed fetch job at `/result/diagnostic`. An uncaught
-script failure preserves it under `/result/failure/output/diagnostic` in the script job.
+The same diagnostic is retrievable from a failed fetch JobView at `/result/diagnostic`. If a
+script returns that response, the preserved response remains in the script payload's `/result/value`;
+operational fetch failure does not become an uncaught script exception.
 
 ## Redirects, proxies, and security
 

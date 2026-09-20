@@ -684,7 +684,7 @@ mod tests {
                 .prepare_question_batch(&agent, &calls, registry);
             prepared.await;
             let source = format!(
-                "async function ask(id, bg) {{ try {{ const answer = await tool.ask({{id,prompt:'Question?',bg}}); return bg ? {{job:answer.id}} : {{answer}}; }} catch (error) {{ return {{error:String(error)}}; }} }} return await Promise.all([ask('first',false), ask('second',{ask_background})]);"
+                "async function ask(id, bg) {{ try {{ const answer = await tool.ask({{id,prompt:'Question?',bg}}); return bg ? {{job:answer.id}} : {{answer:answer.unwrap()}}; }} catch (error) {{ return {{error:String(error)}}; }} }} return await Promise.all([ask('first',false), ask('second',{ask_background})]);"
             );
             let arguments = json!({"source": source, "bg": script_background});
             let script = runtime
@@ -910,7 +910,8 @@ mod tests {
             let requests = Requests::default();
             let batches = Batches::default();
             let call = if scripted {
-                let source = "return await tool.ask({id:'child', prompt:'parent question'});";
+                let source =
+                    "return (await tool.ask({id:'child', prompt:'parent question'})).result;";
                 tool_call(0, "question", "script", json!({ "source": source }))
             } else {
                 ask("child", 0)

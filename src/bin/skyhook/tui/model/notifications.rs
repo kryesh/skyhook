@@ -57,7 +57,8 @@ pub(super) fn job_event_entries(
                 .and_then(Value::as_u64)
                 .and_then(|id| JobId::new(id).ok());
             let job = id.and_then(|id| projection.jobs.get(&id));
-            let tool = event
+            let metadata = if agent_message { event } else { &event["meta"] };
+            let tool = metadata
                 .get("tool")
                 .and_then(Value::as_str)
                 .or_else(|| job.map(|job| job.tool.as_str()))
@@ -147,8 +148,8 @@ mod tests {
         let text = format!(
             "<skyhook_job_events>{}</skyhook_job_events>",
             serde_json::json!([
-                {"id": 1, "tool": "exec", "state": "failed"},
-                {"id": 2, "tool": "exec", "state": "not failed but updated"},
+                {"id": 1, "meta": {"tool": "exec"}, "state": "failed"},
+                {"id": 2, "meta": {"tool": "exec"}, "state": "not failed but updated"},
                 {"id": 3, "tool": "agent", "kind": "message", "name": "Failed", "message": 4, "state": "failed", "text": "Completed"}
             ])
         );

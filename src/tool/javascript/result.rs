@@ -18,9 +18,7 @@ pub(crate) fn script_output(
 ) -> ToolOutput {
     let mut result = Map::new();
     result.insert("value".into(), value);
-    if let Some(failure) = failure {
-        result.insert("failure".into(), failure);
-    }
+    result.insert("failure".into(), failure.unwrap_or(Value::Null));
     let captures = match console {
         Some(capture) => vec![capture],
         None => {
@@ -48,7 +46,7 @@ impl JsonSchema for ScriptResult {
                 "console": {"type": "string", "x-skyhook-truncatable": true},
                 "failure": {}
             },
-            "required": ["value", "console"],
+            "required": ["value", "console", "failure"],
             "additionalProperties": false
         })
     }
@@ -80,6 +78,12 @@ mod tests {
         assert_eq!(round_trip, expected);
     }
 
+    #[test]
+    fn schema_requires_all_canonical_fields() {
+        let schema = serde_json::to_value(schemars::schema_for!(ScriptResult)).unwrap();
+        assert_eq!(schema["required"], json!(["value", "console", "failure"]));
+    }
+
     #[tokio::test]
     async fn empty_console_success_preserves_arbitrary_values_and_real_empty_finalization() {
         for value in [
@@ -92,7 +96,7 @@ mod tests {
         ] {
             assert_codec(
                 script_output(value.clone(), None, None),
-                json!({"value": value, "console": ""}),
+                json!({"value": value, "console": "", "failure": null}),
             );
         }
         let runtime = TestRuntime::new().await;
@@ -102,7 +106,7 @@ mod tests {
         assert!(proof.is_none());
         assert_codec(
             script_output(Value::Null, None, proof),
-            json!({"value": null, "console": ""}),
+            json!({"value": null, "console": "", "failure": null}),
         );
     }
 
@@ -140,7 +144,7 @@ mod tests {
                 (expected, outcome)
             } else {
                 (
-                    json!({"value": 42, "console": "captured console\n"}),
+                    json!({"value": 42, "console": "captured console\n", "failure": null}),
                     crate::job::JobOutcome::Completed(output),
                 )
             };

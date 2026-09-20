@@ -11,10 +11,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use super::{
-    bridge::{HostResponse, SourceProvenance},
-    console::ConsoleOutput,
-};
+use super::{bridge::HostResponse, console::ConsoleOutput};
 
 use crate::{
     media::ImageRef,
@@ -184,9 +181,15 @@ async fn evaluate_inner(
                         serde_json::from_str(&request).map_err(|error| bridge_error(&error))?;
                     let response = match request {
                         HostRequest::Call { name, arguments } => {
-                            let tool = surface.get(&name);
-                            let schema = tool.and_then(|tool| tool.result_schema.as_ref());
-                            match host_executor
+                            // A JobView-producing tool already owns the schema of its
+                            // returned view. Native schemas describe only envelope.result.
+                            let schema = surface.get(&name).and_then(|tool| {
+                                (tool.result_policy != crate::tool::ToolResultPolicy::JobView)
+                                    .then_some(tool.result_schema.as_ref())
+                                    .flatten()
+                            });
+                            let requested_name = arguments.get("name").and_then(Value::as_str).map(str::to_owned);
+                            let output = match host_executor
                                 .execute_script(
                                     host_context.agent().clone(),
                                     &name,
@@ -195,26 +198,28 @@ async fn evaluate_inner(
                                 )
                                 .await
                             {
-                                Ok(result) => {
-                                    // Job output queries already return views; background
-                                    // calls return handles rather than completed tool data.
-                                    let native = tool.is_none_or(|tool| tool.result_policy != crate::tool::ToolResultPolicy::JobView);
-                                    let provenance = (!result.background && native).then(|| SourceProvenance {
-                                        source_job: result.job,
-                                        annotations: schema.map(|schema| crate::job::output::annotated_fields(&result.output.value, schema)).unwrap_or_default(),
-                                    });
-                                    host_images.lock().await.extend(result.output.images);
-                                    HostResponse::Success { value: result.output.value, provenance }
-                                }
-                                Err(error) => {
-                                    let failure = error.into_failure();
-                                    let output = if let Some(output) = failure.output {
-                                        host_images.lock().await.extend(output.images);
-                                        Some(output.value)
-                                    } else { None };
-                                    HostResponse::Failure { message: failure.message, denial: failure.denial, output }
-                                }
-                            }
+                                Ok(result) => result.output,
+                                // Preadmission failures have no job to collect, but are
+                                // still ordinary tool responses rather than JS exceptions.
+                                Err(error) => error.into_response(
+                                    &name,
+                                    Some(host_context.job()),
+                                    requested_name.as_deref(),
+                                ),
+                            };
+                            let annotations = schema
+                                .and_then(|schema| output.value.get("result").map(|value| (schema, value)))
+                                .map(|(schema, value)| {
+                                    crate::job::output::annotated_fields(value, schema)
+                                        .into_iter()
+                                        .map(|pointer| format!("/result{pointer}"))
+                                        .collect::<std::collections::BTreeSet<_>>()
+                                })
+                                .unwrap_or_default();
+                            let annotations = (!annotations.is_empty())
+                                .then_some(annotations);
+                            host_images.lock().await.extend(output.images);
+                            HostResponse::Success { value: output.value, annotations }
                         }
                         HostRequest::Receive => {
                             let result = match host_executor.jobs().is_background(host_context.job()).await {
@@ -223,8 +228,8 @@ async fn evaluate_inner(
                                 Err(error) => Err(error.to_string()),
                             };
                             match result {
-                                Ok(value) => HostResponse::Success { value, provenance: None },
-                                Err(message) => HostResponse::failure(message),
+                                Ok(value) => HostResponse::Success { value, annotations: None },
+                                Err(message) => HostResponse::Failure(message),
                             }
                         }
                     };
@@ -319,7 +324,7 @@ pub(super) fn wrapper_script(source: &str, builders: &str) -> String {
          const value = await (async () => {{\n\
          {USER_SOURCE_MARKER}{source}\n\
          }})();\n\
-         const presentation = {{jobs:Object.create(null), fields:[]}};\n\
+         const presentation = {{fields:[]}};\n\
          const resolved = await __resolve(value, \"$\", new Set(), \"/result/value\", presentation);\n\
          return __stringify({{ok:true, value:resolved, presentation}});\n\
          }} catch (error) {{ return __stringify({{ok:false, error:__describeError(error)}}); }}\n\
@@ -460,7 +465,18 @@ mod tests {
             .await
             .expect("independent builders did not run concurrently")
             .unwrap();
-        assert_eq!(output.value["value"], json!(["a", "a", "a"]));
+        let responses = output.value["value"].as_array().unwrap();
+        assert_eq!(responses.len(), 3);
+        for response in responses {
+            assert_eq!(response["state"], "completed");
+            assert_eq!(response["has_result"], true);
+            assert_eq!(response["result"], "a");
+            assert!(response["error"].is_null());
+            assert!(response["presentation"].is_null());
+        }
+        // Reusing one builder keeps the exact response, including its job ID.
+        assert_eq!(responses[0], responses[1]);
+        assert_ne!(responses[0]["id"], responses[2]["id"]);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -493,37 +509,56 @@ mod tests {
 const direct = JSON.parse(await __skyhookHostCall(JSON.stringify({
   type: "call",
   name: "script",
-  arguments: {source: "return null;"},
+  arguments: {source: "return null;", name: "nested"},
 })));
+const deniedResponse = await tool.deny({value:"x"});
 let denied;
-try { await tool.deny({value:"x"}); } catch (error) { denied = {code:error.code, executed:error.executed, message:error.message}; }
-return {visible: typeof tool.script, direct, denied};
+try { deniedResponse.unwrap(); } catch (error) {
+  denied = {code:error.code, executed:error.executed, message:error.message,
+            output:error.output, sameResponse:error.response === deniedResponse};
+}
+return {visible: typeof tool.script, direct, deniedResponse, denied};
 "#;
         let output = evaluate(source, executor.clone(), context.clone())
             .await
             .unwrap();
         let value = &output.value["value"];
         assert_eq!(value["visible"], "undefined");
-        assert_eq!(value["direct"]["ok"], false);
+        assert_eq!(value["direct"]["ok"], true);
+        assert_eq!(value["direct"]["value"]["state"], "failed");
+        assert_eq!(value["direct"]["value"].get("id"), Some(&Value::Null));
+        assert_eq!(value["direct"]["value"]["meta"]["tool"], "script");
+        assert_eq!(value["direct"]["value"]["meta"]["name"], "nested");
+        assert_eq!(
+            value["direct"]["value"]["meta"]["parent"],
+            json!(context.job())
+        );
         assert!(
-            value["direct"]["error"]
+            value["direct"]["value"]["error"]
                 .as_str()
                 .unwrap()
                 .contains("not available in scripts")
         );
+        assert_eq!(value["deniedResponse"]["state"], "failed");
         assert_eq!(
             (&value["denied"]["code"], &value["denied"]["executed"]),
             (&json!("permission_denied"), &json!(false))
         );
+        assert!(value["denied"]["output"].is_null());
+        assert_eq!(value["denied"]["sameResponse"], true);
         assert!(
             value["denied"]["message"]
                 .as_str()
                 .unwrap()
                 .contains("user reason")
         );
-        let error = evaluate("await tool.deny({value:'x'});", executor, context)
-            .await
-            .unwrap_err();
+        let error = evaluate(
+            "(await tool.deny({value:'x'})).unwrap();",
+            executor,
+            context,
+        )
+        .await
+        .unwrap_err();
         let JsError::Failure { details, .. } = error else {
             panic!("expected nested failure details")
         };
@@ -635,14 +670,25 @@ const __testCalls = [];
 function __skyhookHostCall(encoded) {
   const request = JSON.parse(encoded);
   __testCalls.push(request);
-  return JSON.stringify({ok: true, value: request.arguments});
+  if (request.type === "receive") {
+    return JSON.stringify({ok: true, value: {
+      id: 99, state: "completed", has_result: true, result: null,
+    }});
+  }
+  return JSON.stringify({ok: true, value: {
+    id: __testCalls.length, state: "completed", has_result: true,
+    result: request.arguments, error: null,
+    meta: {parent:null, tool:null, name:null, target:null, workspace:null,
+           last_message:null, code:null, executed:null},
+    presentation: {preview:null, truncated:[], captures:[], question:null, notice:null},
+  }, annotations: ["/result/value"]});
 }
 function __skyhookConsoleLog(message) {
   throw new Error(`unexpected console output: ${message}`);
 }
 "#;
 
-    fn evaluate_wrapper(source: &str) -> Value {
+    fn evaluate_wrapper_envelope(source: &str) -> Value {
         let runtime = Runtime::new().expect("standalone QuickJS runtime");
         // A Tokio timeout cannot interrupt a synchronous QuickJS scheduling loop. In
         // particular, a mutable zero/NaN pool limit used to spin without yielding.
@@ -663,8 +709,150 @@ function __skyhookConsoleLog(message) {
                 .expect("finish wrapper before watchdog deadline without pending host work");
             let result: Value = serde_json::from_str(&encoded).expect("wrapper JSON result");
             assert_eq!(result["ok"], true, "wrapper failed: {result:#}");
-            result["value"].clone()
+            result
         })
+    }
+
+    fn evaluate_wrapper(source: &str) -> Value {
+        evaluate_wrapper_envelope(source)["value"].clone()
+    }
+
+    #[test]
+    fn annotations_follow_full_envelopes_and_extracted_native_payloads() {
+        let result = evaluate_wrapper_envelope(
+            r#"
+const full = await tool.echo({value:["full"]});
+const extracted = (await tool.echo({value:["extracted"]})).result.value;
+return {full, extracted};
+"#,
+        );
+        let presentation = result["presentation"].as_object().unwrap();
+        assert_eq!(presentation.len(), 1);
+        let fields = presentation["fields"].as_array().unwrap();
+        assert!(fields.contains(&json!("/result/value/full/result/value")));
+        assert!(fields.contains(&json!("/result/value/extracted")));
+    }
+
+    #[test]
+    fn response_methods_are_runtime_only_and_do_not_decorate_user_json() {
+        let result = evaluate_wrapper(
+            r#"
+const payload = {id:7, state:"completed", has_result:true, result:null};
+const response = await tool.echo({value:payload});
+const encoded = JSON.stringify(response);
+const copied = JSON.parse(encoded);
+const received = await receive();
+let logged;
+__skyhookConsoleLog = message => { logged = message; };
+console.log(response);
+return {
+  response, encoded, keys:Object.keys(response), logged,
+  nonEnumerable:!Object.getOwnPropertyDescriptor(response, "unwrap").enumerable,
+  samePayload:response.unwrap() === response.result,
+  grouped:response.meta.code === null && response.presentation.preview === null,
+  noGlobalHelper:typeof tool.unwrap === "undefined",
+  plainPayload:typeof response.result.unwrap === "undefined"
+    && typeof response.result.value.unwrap === "undefined",
+  plainCopy:typeof copied.unwrap === "undefined",
+  plainReceive:typeof received.unwrap === "undefined", received,
+};
+"#,
+        );
+        for key in [
+            "nonEnumerable",
+            "samePayload",
+            "grouped",
+            "noGlobalHelper",
+            "plainPayload",
+            "plainCopy",
+            "plainReceive",
+        ] {
+            assert_eq!(result[key], true, "{key}: {result}");
+        }
+        let response = &result["response"];
+        assert!(response.get("unwrap").is_none());
+        assert!(
+            !result["keys"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("unwrap"))
+        );
+        for key in ["encoded", "logged"] {
+            assert_eq!(
+                serde_json::from_str::<Value>(result[key].as_str().unwrap()).unwrap(),
+                *response
+            );
+        }
+        assert_eq!(
+            result["received"],
+            json!({"id":99,"state":"completed","has_result":true,"result":null})
+        );
+    }
+
+    #[test]
+    fn non_object_job_responses_fail_at_the_bridge_boundary() {
+        let result = evaluate_wrapper(
+            r#"
+const errors = [];
+for (const value of [null, 17, [], "bad"]) {
+  __skyhookHostCall = () => JSON.stringify({ok:true, value});
+  try { await tool.echo({value:null}); }
+  catch (error) { errors.push(error.message); }
+}
+return errors;
+"#,
+        );
+        let errors = result.as_array().unwrap();
+        assert_eq!(errors.len(), 4);
+        for error in errors {
+            assert!(
+                error
+                    .as_str()
+                    .unwrap()
+                    .contains("invalid JobView envelope: expected an object")
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_unwrap_returns_completed_results_and_preserves_failure_responses() {
+        let result = evaluate_wrapper(
+            r#"
+const completed = await tool.echo({value:42});
+const literalNull = await tool.echo({value:null});
+literalNull.result = null;
+const errors = [];
+for (const patch of [
+  {id:8, state:"failed", error:"boom", result:{partial:true}, meta:null},
+  {id:9, state:"running", has_result:false, result:null},
+  {id:10, has_result:false, result:null},
+  {result:undefined},
+]) {
+  const response = Object.assign(await tool.echo({value:null}), patch);
+  try { response.unwrap(); }
+  catch (error) {
+    errors.push({message:error.message, sameResponse:error.response === response,
+                 ...(error.response ? {output:error.output, code:error.code, executed:error.executed} : {})});
+  }
+}
+return {value:completed.unwrap(), literalNull:literalNull.unwrap(), errors};
+"#,
+        );
+        assert_eq!(result["value"], json!({"value": 42}));
+        assert_eq!(result.get("literalNull"), Some(&Value::Null));
+        assert_eq!(
+            result["errors"],
+            json!([
+                {"message":"boom", "sameResponse":true, "output":{"partial":true},
+                 "code":null, "executed":null},
+                {"message":"job 9 is not completed (state: running)", "sameResponse":true,
+                 "output":null, "code":null, "executed":null},
+                {"message":"job 10 has no loaded result; inspect it with tool.job(id).output()",
+                 "sameResponse":true, "output":null, "code":null, "executed":null},
+                {"message":"unwrap completed response requires a JSON result field (null is allowed)",
+                 "sameResponse":false}
+            ])
+        );
     }
 
     #[test]

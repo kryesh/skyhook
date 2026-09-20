@@ -312,7 +312,10 @@ mod tests {
         assert_eq!(messages[2]["tool_calls"][0]["id"], "call-a");
         assert_eq!(messages[3]["tool_call_id"], "call-a");
         let result: Value = serde_json::from_str(messages[3]["content"].as_str().unwrap()).unwrap();
-        assert_eq!(result, json!({"result":{"ok":false},"is_error":true}));
+        assert_eq!(
+            result,
+            json!({"result":{"ok":false,"error":null},"is_error":true})
+        );
         assert_eq!(messages[4]["content"][1]["image_url"]["url"], image_url);
         assert!(messages[4]["content"].is_array());
         // Tool schemas are preserved without strict response-schema restrictions.

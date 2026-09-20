@@ -127,17 +127,12 @@ pub struct TargetRecord {
     pub r#type: TargetType,
     pub source: TargetSource,
     pub host: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
     pub workspace: PathBuf,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
     pub auth: &'static str,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub external_agent: bool,
 }
 

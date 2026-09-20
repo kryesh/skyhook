@@ -320,7 +320,6 @@ mod tests {
         assert_eq!(hydrated["result"], expected);
         assert!(
             captures::available_captures(&saved(&output), true)
-                .unwrap()
                 .iter()
                 .all(|capture| capture.complete)
         );
@@ -389,7 +388,7 @@ mod tests {
                 &["/result/ok"]
             };
             assert_eq!(referenced, expected, "{failure}");
-            let captures = captures::available_captures(&saved(&output), true).unwrap();
+            let captures = captures::available_captures(&saved(&output), true);
             let raw = captures.iter().find(|capture| capture.field == field);
             match failure {
                 "missing" => assert!(raw.is_none()),
@@ -466,7 +465,7 @@ mod tests {
                 assert_eq!(hydrated["result"][field], initial["result"][field]);
             }
             assert_eq!(output.test_fields().len(), if unknown { 3 } else { 0 });
-            for descriptor in captures::available_captures(&saved(&output), true).unwrap() {
+            for descriptor in captures::available_captures(&saved(&output), true) {
                 let shaped = matches!(
                     descriptor.field.as_str(),
                     "/result/text" | "/result/object" | "/result/array"

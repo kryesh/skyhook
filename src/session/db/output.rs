@@ -25,7 +25,6 @@ pub(crate) struct CaptureExtent {
 }
 
 pub(crate) struct Presentation {
-    pub children: Vec<(String, u64)>,
     pub fields: Vec<String>,
 }
 
@@ -333,16 +332,11 @@ impl SharedDb {
                 "DELETE FROM job_presentation WHERE job = ?1 AND generation = ?2",
                 params![job, generation],
             )?;
-            let rows = presentation
-                .children
-                .iter()
-                .map(|(pointer, child)| (pointer, Some(*child)))
-                .chain(presentation.fields.iter().map(|pointer| (pointer, None)));
-            for (pointer, child) in rows {
+            for pointer in &presentation.fields {
                 db.execute(
-                    "INSERT INTO job_presentation (job, generation, pointer, child) \
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![job, generation, pointer, child],
+                    "INSERT INTO job_presentation (job, generation, pointer) \
+                     VALUES (?1, ?2, ?3)",
+                    params![job, generation, pointer],
                 )?;
             }
             Ok(())
@@ -350,24 +344,14 @@ impl SharedDb {
     }
 
     pub(crate) fn presentation(&self, job: u64) -> Result<Presentation, DbError> {
-        let rows = self.lock().query(
-            "SELECT p.pointer, p.child FROM job_presentation p JOIN job_generation g \
+        let fields = self.lock().query(
+            "SELECT p.pointer FROM job_presentation p JOIN job_generation g \
                ON g.job = p.job AND g.generation = p.generation \
              WHERE p.job = ?1 ORDER BY p.id",
             params![job],
-            |row| Ok((row.get::<String>(0)?, row.get::<Option<i64>>(1)?)),
+            |row| Ok(row.get::<String>(0)?),
         )?;
-        let mut presentation = Presentation {
-            children: Vec::new(),
-            fields: Vec::new(),
-        };
-        for (pointer, child) in rows {
-            match child {
-                Some(child) => presentation.children.push((pointer, integer(child))),
-                None => presentation.fields.push(pointer),
-            }
-        }
-        Ok(presentation)
+        Ok(Presentation { fields })
     }
 
     #[cfg(test)]

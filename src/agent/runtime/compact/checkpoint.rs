@@ -203,7 +203,6 @@ impl SessionRuntime {
                     crate::job::output::OutputArgs::new(job),
                     &turn.capabilities,
                     crate::job::output::OutputOptions::Host {
-                        viewer: Some(turn.location),
                         presentation: crate::job::OutputPresentation::Full,
                     },
                 )

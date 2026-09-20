@@ -323,7 +323,10 @@ mod tests {
         );
         let text: Value =
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(text, json!({"result":{"ok":false},"is_error":true}));
+        assert_eq!(
+            text,
+            json!({"result":{"ok":false,"error":null},"is_error":true})
+        );
         assert_eq!(result["content"][1]["type"], "image");
         // The history breakpoint precedes the tail, which merges into the same user turn.
         assert_eq!(result["cache_control"], json!({"type":"ephemeral"}));

@@ -22,6 +22,9 @@ workflows, or embed its Rust core in your own application.
 - **Local and remote execution.** The same tools work in local workspaces and on SSH
   targets, with explicit routing and credential ownership.
 
+Model and JavaScript tool calls share a [JobView response contract](docs/src/reference/javascript.md#jobview-response-contract),
+with native payloads in `.result`; the JavaScript surface also provides `response.unwrap()`.
+
 ## Install
 
 Requires **Rust 1.88 or newer** and [just](https://github.com/casey/just). SSH support

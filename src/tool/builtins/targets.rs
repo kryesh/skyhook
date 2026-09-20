@@ -34,11 +34,8 @@ struct CompactTarget {
     name: String,
     r#type: crate::target::TargetType,
     host: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     workspace: Option<std::path::PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     via: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     origin: Option<String>,
 }
 impl From<TargetRecord> for CompactTarget {
@@ -147,6 +144,38 @@ fn add_permissions(ssh: &SshOptions) -> Vec<PermissionUse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_views_keep_null_routing_and_detailed_defaults() {
+        let detailed = TargetRecord {
+            name: "root".into(),
+            r#type: crate::target::TargetType::Local,
+            source: TargetSource::Builtin,
+            host: "localhost".into(),
+            user: None,
+            port: None,
+            workspace: ".".into(),
+            via: None,
+            origin: None,
+            auth: "local",
+            external_agent: false,
+        };
+        assert_eq!(
+            serde_json::to_value(CompactTarget::from(detailed.clone())).unwrap(),
+            serde_json::json!({
+                "name":"root", "type":"local", "host":"localhost",
+                "workspace":null, "via":null, "origin":null
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(detailed).unwrap(),
+            serde_json::json!({
+                "name":"root", "type":"local", "source":"builtin", "host":"localhost",
+                "user":null, "port":null, "workspace":".", "via":null, "origin":null,
+                "auth":"local", "external_agent":false
+            })
+        );
+    }
 
     #[test]
     fn add_requires_exec_for_options_and_ssh_agent_for_external_agents() {

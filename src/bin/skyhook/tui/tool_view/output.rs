@@ -27,9 +27,9 @@ pub(super) struct CaptureView {
 
 impl OutputShape {
     pub(super) fn wire(value: &Value) -> Self {
-        let preview = PreviewView::wire(value.get("preview"));
+        let preview = PreviewView::wire(value.pointer("/presentation/preview"));
         let captures = value
-            .get("captures")
+            .pointer("/presentation/captures")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
@@ -48,7 +48,7 @@ impl OutputShape {
                             .cloned()
                     })
                     .collect(),
-                preview: PreviewView::wire(capture.pointer("/output/preview")),
+                preview: PreviewView::wire(capture.pointer("/output/presentation/preview")),
             })
             .collect();
         Self { preview, captures }
@@ -83,7 +83,7 @@ impl OutputView {
             .and_then(PreviewView::continuation)
             .or_else(|| {
                 self.value
-                    .pointer("/truncated/0")
+                    .pointer("/presentation/truncated/0")
                     .and_then(wire_continuation)
             })
             .or_else(|| {
@@ -113,16 +113,16 @@ mod tests {
 
     #[test]
     fn historical_continuations_keep_source_coordinates_and_owner_precedence() {
-        let mut value = json!({
+        let mut value = json!({"presentation": {
             "preview": {"field": "", "lines": ["{\"result\":[1,"], "next_start": 1, "next_offset": 13},
             "truncated": [{"field": "/result/stdout", "next_start": 4, "next_offset": 7}],
             "captures": [
-                {"field": "/result/end", "output": {"preview": {
-                    "field": "/result/end", "lines": ["end"], "total_lines": 1}}},
-                {"field": "/result/custom~1field", "output": {"preview": {
-                    "field": "/result/custom~1field", "lines": ["é雪"], "next_start": 8, "next_offset": 5}}}
+                {"field": "/result/end", "output": {"presentation": {"preview": {
+                    "field": "/result/end", "lines": ["end"], "total_lines": 1}}}},
+                {"field": "/result/custom~1field", "output": {"presentation": {"preview": {
+                    "field": "/result/custom~1field", "lines": ["é雪"], "next_start": 8, "next_offset": 5}}}}
             ]
-        });
+        }});
         for (remove, expected) in [
             (None, Some(("", 1, 13))),
             (Some("preview"), Some(("/result/stdout", 4, 7))),
@@ -130,7 +130,7 @@ mod tests {
             (Some("captures"), None),
         ] {
             if let Some(key) = remove {
-                value.as_object_mut().unwrap().remove(key);
+                value["presentation"].as_object_mut().unwrap().remove(key);
             }
             let output = OutputView::historical(value.clone());
             assert_eq!(output.continuation(), expected);

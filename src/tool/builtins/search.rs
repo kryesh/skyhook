@@ -548,7 +548,7 @@ mod tests {
         let matches = serde_json::to_vec(&preview.output.value["result"]["matches"]).unwrap();
         assert!(matches.len() <= 2048);
         assert_eq!(
-            preview.output.value["truncated"][0]["field"],
+            preview.output.value["presentation"]["truncated"][0]["field"],
             "/result/matches"
         );
         let mut query = crate::job::JobOutputQuery::new(preview.job);
@@ -559,7 +559,7 @@ mod tests {
             .inspect_output(query, &Default::default())
             .await
             .unwrap();
-        let lines = page["preview"]["lines"].as_array().unwrap();
+        let lines = page["presentation"]["preview"]["lines"].as_array().unwrap();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].as_str().unwrap().contains("500: needle λ"));
     }

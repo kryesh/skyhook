@@ -27,7 +27,7 @@ mod tests {
             serde_json::from_str(r#"{"ok":true,"value":[null,42],"presentation":{}}"#).unwrap();
         assert!(success.ok);
         assert_eq!(success.value, json!([null, 42]));
-        assert!(success.presentation.jobs.is_empty() && success.error.is_null());
+        assert!(success.presentation.fields.is_empty() && success.error.is_null());
         let failure: Envelope =
             serde_json::from_str(r#"{"ok":false,"error":{"message":"boom"}}"#).unwrap();
         assert!(!failure.ok);

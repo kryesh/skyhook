@@ -503,9 +503,13 @@ mod tests {
     }
 
     fn capture_text(output: &Value, field: &str) -> String {
-        let mut captures = output["captures"].as_array().into_iter().flatten();
+        let mut captures = output["presentation"]["captures"]
+            .as_array()
+            .into_iter()
+            .flatten();
         let capture = captures.find(|capture| capture["field"].as_str() == Some(field));
-        let lines = capture.and_then(|capture| capture["output"]["preview"]["lines"].as_array());
+        let lines = capture
+            .and_then(|capture| capture["output"]["presentation"]["preview"]["lines"].as_array());
         let lines = lines.into_iter().flatten().filter_map(Value::as_str);
         lines.collect::<Vec<_>>().join("\n")
     }
@@ -587,9 +591,15 @@ mod tests {
         query.field = Some("/result/stderr".into());
         app.outputs.set_query(query);
         let selected = fetch_output(&mut app, job).await;
-        assert_eq!(selected["preview"]["field"], "/result/stderr");
-        let mut captures = selected["captures"].as_array().into_iter().flatten();
-        assert!(captures.all(|capture| capture.get("output").is_none()));
+        assert_eq!(
+            selected["presentation"]["preview"]["field"],
+            "/result/stderr"
+        );
+        let mut captures = selected["presentation"]["captures"]
+            .as_array()
+            .into_iter()
+            .flatten();
+        assert!(captures.all(|capture| capture["output"].is_null()));
         let field = app.outputs.query(job).unwrap().field.as_deref();
         assert_eq!(field, Some("/result/stderr"));
         session.shutdown().await.unwrap();
@@ -799,15 +809,22 @@ mod tests {
             let output = output.unwrap();
             let value = output.value();
             assert!(value.get("result").is_some(), "{tool}: {value}");
-            assert!(value.get("preview").is_none(), "{tool}: {value}");
-            // Unchanged child results retain their native JobView inside the
-            // script return value, including the child's truncation metadata.
-            let projected = if tool == "script" {
-                &value["result"]["value"]
-            } else {
-                value
-            };
-            let truncated = projected["truncated"].as_array();
+            assert_eq!(
+                value.pointer("/presentation/preview"),
+                Some(&serde_json::Value::Null),
+                "{tool}: {value}"
+            );
+            // Script values keep their original envelope shape. The script's
+            // own truncation markers point into its independently saved return.
+            if tool == "script" {
+                assert!(value["result"]["value"]["meta"].is_null());
+                assert!(value["result"]["value"]["presentation"].is_null());
+                assert_eq!(
+                    value["presentation"]["truncated"][0]["field"],
+                    "/result/value/result/paths"
+                );
+            }
+            let truncated = value["presentation"]["truncated"].as_array();
             assert!(
                 truncated.is_some_and(|fields| !fields.is_empty()),
                 "{tool}: {value}"
@@ -843,7 +860,7 @@ mod tests {
             .await
             .unwrap();
         assert!(source.starts_with(output["result"]["content"].as_str().unwrap()));
-        let position = output["truncated"][0].clone();
+        let position = output["presentation"]["truncated"][0].clone();
         app.outputs
             .insert_product(job, OutputView::historical(output));
         app.outputs.clear_pending();
@@ -864,8 +881,8 @@ mod tests {
         let at = |key: &str| position[key].as_u64().map(|value| value as usize);
         assert!(query.start.is_some());
         assert_eq!(
-            (query.start, query.offset),
-            (at("next_start"), at("next_offset"))
+            (query.start, query.offset.unwrap_or(0)),
+            (at("next_start"), at("next_offset").unwrap_or(0))
         );
         assert_eq!(query.field.as_deref(), Some("/result/content"));
     }

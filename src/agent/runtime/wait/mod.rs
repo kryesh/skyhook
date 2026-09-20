@@ -424,8 +424,8 @@ mod tests {
     pub(super) fn assert_child_completion(event: &Value, message: &Value) {
         assert_eq!(event["id"], message["id"]);
         assert_eq!(event["state"], "completed");
-        assert_eq!(event["last_message"], message["message"]);
-        assert!(event.get("result").is_none(), "{event}");
+        assert_eq!(event["meta"]["last_message"], message["message"]);
+        assert!(event["result"].is_null(), "{event}");
         assert!(event.get("text").is_none(), "{event}");
     }
 
@@ -657,10 +657,10 @@ mod tests {
     /// wait, not sleep until the script ends.
     #[tokio::test(start_paused = true)]
     async fn a_deferring_wait_wakes_when_its_holder_parks() {
-        let first = json!({"source":"return await tool.wait({timeout:30});"});
+        let first = json!({"source":"return (await tool.wait({timeout:30})).result;"});
         // Holds the agent for a (virtual) second, then parks in a wait of its own.
         let second = json!({"source":"await sleep(1000); \
-            await tool.wait({timeout:30}); return await tool.wait({timeout:1});"});
+            await tool.wait({timeout:30}); return (await tool.wait({timeout:1})).result;"});
         let tracking = tracking_all(vec![
             (
                 "root",
@@ -815,8 +815,8 @@ mod tests {
     /// script's waits only once.
     #[tokio::test(start_paused = true)]
     async fn queued_input_does_not_respin_a_script_wait() {
-        let source = "const first = await tool.wait({timeout:60}); \
-            const second = await tool.wait({timeout:1}); return [first, second];";
+        let source = "const first = (await tool.wait({timeout:60})).result; \
+            const second = (await tool.wait({timeout:1})).result; return [first, second];";
         let tracking = tracking(vec![
             ("root", call("run", "script", json!({"source": source}))),
             ("root", answer()),
@@ -900,10 +900,13 @@ mod tests {
             let result = executor.execute(session.root.clone(), "wait", invalid.clone(), None);
             assert!(bounded(result).await.is_err(), "accepted {invalid}");
         }
-        let source = "const direct = await tool.wait({timeout:1}); const builder = await tool.wait().timeout(1); return [direct, builder];";
+        let source = "const direct = (await tool.wait({timeout:1})).result; const builder = (await tool.wait().timeout(1)).result; return [direct, builder];";
         let output = bounded(session.run_script(source)).await.unwrap();
         let timeouts = json!([{"reason":"timeout"}, {"reason":"timeout"}]);
-        assert_eq!(output.value, json!({"value":timeouts, "console":""}));
+        assert_eq!(
+            output.value,
+            json!({"value":timeouts, "console":"", "failure":null})
+        );
         session.shutdown().await.unwrap();
     }
 

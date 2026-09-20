@@ -272,7 +272,10 @@ mod tests {
         assert_eq!(body["input"][1]["call_id"], "call_1");
         let result: Value =
             serde_json::from_str(body["input"][1]["output"].as_str().unwrap()).unwrap();
-        assert_eq!(result, json!({"result":{"answer":42},"is_error":true}));
+        assert_eq!(
+            result,
+            json!({"result":{"answer":42,"error":null},"is_error":true})
+        );
         assert_eq!(body["input"][2]["content"][1]["image_url"], image_url);
     }
 

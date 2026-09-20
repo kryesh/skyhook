@@ -37,22 +37,16 @@ impl GeneratedToolDefinition {
                     optional_defaults(&mut input_schema);
                 }
                 sanitize_schema_inner(&mut input_schema, self.preserve_schema_dialect);
+                // This schema describes the handler's stored native payload.
+                // Foreground/background presentation both wrap that payload in
+                // JobView elsewhere, so a background envelope alternative here
+                // would misdescribe the value persisted and later projected.
                 let result_schema = self.output_schema.as_ref().map(|schema| {
                     let mut schema = schema.generate(capabilities);
                     sanitize_schema(&mut schema);
                     schema
                 });
-                let output_schema = result_schema.as_ref().map(|schema| {
-                    let mut schema = schema.clone();
-                    if self.supports_background {
-                        schema = output_union(
-                            schema,
-                            crate::job::presented_job_schema(capabilities, false),
-                        );
-                    }
-                    sanitize_schema(&mut schema);
-                    schema
-                });
+                let output_schema = result_schema.clone();
                 ToolSpec {
                     supports_background: self.supports_background,
                     job_role: execution.job_role,
@@ -261,33 +255,6 @@ fn sanitize_schema_inner(value: &mut Value, preserve_dialect: bool) {
     });
 }
 
-/// Hoist definitions so both union members retain valid, unambiguous references.
-fn output_union(foreground: Value, background: Value) -> Value {
-    let mut definitions = serde_json::Map::new();
-    let variants = [("Foreground_", foreground), ("Job_", background)]
-        .into_iter()
-        .map(|(prefix, mut schema)| {
-            for_each_subschema(&mut schema, &mut |schema| {
-                if let Some(Value::String(reference)) = schema.get_mut("$ref")
-                    && let Some(name) = reference.strip_prefix("#/$defs/")
-                {
-                    *reference = format!("#/$defs/{prefix}{name}");
-                }
-            });
-            if let Some(Value::Object(defs)) = schema
-                .as_object_mut()
-                .and_then(|object| object.remove("$defs"))
-            {
-                for (name, value) in defs {
-                    definitions.insert(format!("{prefix}{name}"), value);
-                }
-            }
-            schema
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({"anyOf": variants, "$defs": definitions})
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,11 +399,14 @@ mod tests {
     }
 
     #[test]
-    fn unrestricted_output_schema_is_normalized_too() {
+    fn background_output_schema_is_the_normalized_native_payload() {
         let tool = tool(
             json!({"type": "object"}),
-            ToolOptions::default().output_schema(Value::Bool(true)),
+            ToolOptions::default()
+                .background()
+                .output_schema(Value::Bool(true)),
         );
+        assert_eq!(tool.result_schema, Some(json!({})));
         assert_eq!(tool.output_schema, Some(json!({})));
     }
 

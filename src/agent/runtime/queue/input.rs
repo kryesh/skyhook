@@ -169,10 +169,15 @@ mod tests {
     async fn running_child_receives_parent_inputs(first_calls_tool: bool) {
         let (_root, tracking, session) = start(first_calls_tool).await;
         let runtime = &session.runtime;
-        let launch = "return await tool.agent({prompt:'test:child-initial',bg:true});";
+        let launch = "return await tool.agent({prompt:'test:child-initial',name:'kid',bg:true});";
         let launched = bounded(session.run_script(launch)).await.unwrap();
         let job: JobId = serde_json::from_value(launched.value["value"]["id"].clone()).unwrap();
         let initial = tracking.request(0).await;
+        // A follow-up addressed by name is refused rather than started as a second child.
+        let again = "return await tool.agent({prompt:'test:follow-up',name:'kid'});";
+        let refused = bounded(session.run_script(again)).await.unwrap().value;
+        let error = refused["value"]["error"].as_str().unwrap();
+        assert!(error.contains(&format!("tool.job({job}).send")), "{error}");
         assert_eq!(texts(initial.messages()), ["test:child-initial"]);
         assert!(parent_inputs(initial.messages()).is_empty());
         let sender = {
@@ -197,7 +202,7 @@ mod tests {
         let second = json!("test:parent-two");
         let send = format!("return await tool.job({job}).send({{value:{first}}});");
         let accepted = bounded(session.run_script(send)).await.unwrap();
-        assert_eq!(accepted.value["value"], json!({"accepted": true}));
+        assert_eq!(accepted.value["value"]["result"], json!({"accepted": true}));
         forwarded(1).await;
         let send = runtime.jobs.send(job, second.clone());
         bounded(send).await.unwrap();
@@ -232,6 +237,109 @@ mod tests {
         drop(root_inbox);
         stop(&session).await;
         assert_eq!(count(&tracking), 2);
+    }
+
+    #[tokio::test]
+    async fn child_names_are_owner_scoped_and_survive_completion_but_not_failed_launches() {
+        let (_root, tracking, session) = start(false).await;
+        let runtime = &session.runtime;
+        let root_inbox = quiet_root(&session);
+        // Each invocation is a separate script, but the caller owns its children.
+        let call = async |owner: &AgentId, source: &str| {
+            bounded(runtime.executor.execute(
+                owner.clone(),
+                "script",
+                json!({"source":source}),
+                None,
+            ))
+            .await
+            .unwrap()
+            .output
+            .value["value"]
+                .clone()
+        };
+        let launch = |name| {
+            format!("return await tool.agent({{prompt:'test:{name}',name:'{name}',bg:true}});")
+        };
+        let id =
+            |view: &serde_json::Value| serde_json::from_value::<JobId>(view["id"].clone()).unwrap();
+        let refused = |view: &serde_json::Value, existing: JobId| {
+            assert_eq!(view["state"], "failed");
+            let error = view["error"].as_str().unwrap();
+            assert!(error.contains("already exists"), "{error}");
+            assert!(
+                error.contains(&format!("tool.job({existing}).send")),
+                "{error}"
+            );
+        };
+
+        // An admitted tool job that never installs a child must not manufacture
+        // a permanent name reservation, even though it has role Agent and a name.
+        let invalid = call(
+            &session.root,
+            "return await tool.agent({prompt:'bad-depth',name:'worker',depth:999});",
+        )
+        .await;
+        assert_eq!(invalid["state"], "failed");
+        assert!(invalid["error"].as_str().unwrap().contains("depth"));
+        assert!(runtime.jobs.snapshot(id(&invalid)).await.is_ok());
+        let first = call(&session.root, &launch("worker")).await;
+        assert_ne!(first["state"], "failed", "{first}");
+        let first = id(&first);
+        tracking.request(0).await;
+        let duplicate = "return await tool.agent({prompt:'duplicate',name:'worker'});";
+        refused(&call(&session.root, duplicate).await, first);
+
+        // A second caller may install its own worker while the root's worker is
+        // still active. Resolve its identity from the actual installation record.
+        let manager = id(&call(
+            &session.root,
+            "return await tool.agent({prompt:'test:manager',name:'manager',depth:1,bg:true});",
+        )
+        .await);
+        tracking.request(1).await;
+        let records = runtime.store.records().await;
+        let manager = records
+            .iter()
+            .find_map(|record| match &record.event {
+                SessionEvent::AgentStarted {
+                    owner_job: Some(job),
+                    ..
+                } if *job == manager => Some(record.agent.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let second = call(&manager, &launch("worker")).await;
+        assert_ne!(second["state"], "failed", "{second}");
+        let second = id(&second);
+        assert_ne!(first, second);
+        tracking.request(2).await;
+        let completed = bounded(runtime.jobs.wait(second, None, true))
+            .await
+            .unwrap();
+        assert_eq!(completed.state, crate::job::JobState::Completed);
+        refused(&call(&manager, duplicate).await, second);
+
+        tracking.release(0);
+        let completed = bounded(runtime.jobs.wait(first, None, true)).await.unwrap();
+        assert_eq!(completed.state, crate::job::JobState::Completed);
+        refused(&call(&session.root, duplicate).await, first);
+        // Rejecting a duplicate does not interfere with the intended follow-up
+        // path: the original child resumes under its existing ID and history.
+        bounded(runtime.jobs.send(first, json!("test:resume")))
+            .await
+            .unwrap();
+        let resumed = tracking.request(3).await;
+        assert!(
+            parent_inputs(resumed.messages())
+                .iter()
+                .any(|text| text.contains("test:resume"))
+        );
+        let completed = bounded(runtime.jobs.wait(first, None, true)).await.unwrap();
+        assert_eq!(completed.output, Some(json!("answer-3")));
+        drop(root_inbox);
+        stop(&session).await;
+        assert_eq!(count(&tracking), 4);
     }
 
     #[tokio::test]

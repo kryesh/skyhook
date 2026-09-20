@@ -82,12 +82,10 @@ pub(super) mod tests {
 
     async fn pending_content(
         session: &SessionHandle,
-        root: &Path,
     ) -> (Vec<UserContent>, wait::PendingEventBatch) {
         let runtime = &session.runtime;
-        let location = crate::execution::ExecutionLocation::root(root.to_path_buf());
         let capabilities = &runtime.capabilities;
-        let pending = runtime.pending_event_content(session.root_agent(), capabilities, &location);
+        let pending = runtime.pending_event_content(session.root_agent(), capabilities);
         pending.await.unwrap()
     }
 
@@ -101,12 +99,12 @@ pub(super) mod tests {
         tracking.request(0).await;
         let (job, child) = fixture_child(&session, root.path()).await;
         let first = fixture_message(&session, job, &child, "retained-progress").await;
-        let (content, batch) = pending_content(&session, root.path()).await;
+        let (content, batch) = pending_content(&session).await;
         assert_eq!(content.len(), 1);
         drop(batch);
         assert!(runtime.jobs.has_pending(session.root_agent()).await);
 
-        let (retry, batch) = pending_content(&session, root.path()).await;
+        let (retry, batch) = pending_content(&session).await;
         // abandoning a receipt must retain its source message
         assert_eq!(retry, content);
         let sequence = batch.commit().await.unwrap();
@@ -120,7 +118,7 @@ pub(super) mod tests {
         // Equal text is a new independent event when its source sequence differs.
         let second = fixture_message(&session, job, &child, "retained-progress").await;
         assert_ne!(first, second);
-        let (remaining, batch) = pending_content(&session, root.path()).await;
+        let (remaining, batch) = pending_content(&session).await;
         let remaining = serde_json::to_string(&remaining).unwrap();
         assert!(remaining.contains("retained-progress"));
         drop(batch);
@@ -156,7 +154,7 @@ pub(super) mod tests {
         };
         let (job, child) = fixture_child(&session, root.path()).await;
         fixture_message(&session, job, &child, "committed-progress").await;
-        let (content, batch) = pending_content(&session, root.path()).await;
+        let (content, batch) = pending_content(&session).await;
         // progress and completion share the same envelope
         assert_eq!(content.len(), 1);
         assert!(runtime.jobs.has_pending(session.root_agent()).await);
@@ -171,7 +169,7 @@ pub(super) mod tests {
         {
             // An immediate resumed request cannot snapshot progress still owned by
             // the interrupted caller's transaction, even without any terminal job.
-            let next_batch = pending_content(&session, root.path());
+            let next_batch = pending_content(&session);
             tokio::pin!(next_batch);
             assert!(futures_util::poll!(next_batch.as_mut()).is_pending());
         }

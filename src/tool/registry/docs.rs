@@ -3,9 +3,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{
-    provider::protocol::ToolDefinition as ProviderToolDefinition, tool::policy::CapabilitySet,
-};
+use crate::provider::protocol::ToolDefinition as ProviderToolDefinition;
 
 use super::{ScriptBinding, ToolExposure, ToolSpec, ToolSurface};
 
@@ -21,7 +19,9 @@ impl ToolSurface {
                     let mut description = self.script_description(&tool.description);
                     if let Some(schema) = &tool.result_schema {
                         let result_type = output_type(schema, job_envelope);
-                        description.push_str(&format!("\n\nScript return: `{result_type}`."));
+                        description.push_str(&format!(
+                            "\n\nScript result in `JobView.result`: `{result_type}`."
+                        ));
                     }
                     description
                 } else {
@@ -30,10 +30,10 @@ impl ToolSurface {
                         .as_ref()
                         .map(|schema| output_type(schema, job_envelope));
                     if tool.result_policy == super::ToolResultPolicy::JobView {
-                        tool.description.clone()
+                        format!("{} Result in `JobView.result`.", tool.description)
                     } else {
                         format!(
-                            "{} Result: `{}`.",
+                            "{} Result in `JobView.result`: `{}`.",
                             tool.description,
                             native.unwrap_or_else(|| "JSON".into())
                         )
@@ -96,8 +96,8 @@ fn output_type(schema: &Value, job_envelope: &Value) -> String {
     }
 }
 
-pub(crate) fn job_view_type(capabilities: &CapabilitySet) -> String {
-    let schema = crate::job::output::view_schema(capabilities);
+pub(crate) fn job_view_type() -> String {
+    let schema = crate::job::presented_job_schema(false);
     schema_type(&schema, &schema)
 }
 
@@ -208,7 +208,10 @@ fn script_documentation(tool: &ToolSpec, job_envelope: &Value) -> String {
     if tool.exposure == ToolExposure::ModelVisible
         && matches!(tool.script_binding, ScriptBinding::JobMethod { .. })
     {
-        return format!("- `{call}` — Same as `{}`.", tool.name);
+        return format!(
+            "- `{call}` — Same as `{}`; result is in `JobView.result`.",
+            tool.name
+        );
     }
     let field_docs = schema["properties"]
         .as_object()
@@ -229,15 +232,38 @@ fn script_documentation(tool: &ToolSpec, job_envelope: &Value) -> String {
 }
 
 fn schema_type(field: &Value, root: &Value) -> String {
-    schema_type_inner(field, root, false)
+    let mut references = if std::ptr::eq(field, root) {
+        vec!["#".to_owned()]
+    } else {
+        Vec::new()
+    };
+    schema_type_inner(field, root, false, &mut references)
 }
 
-fn schema_type_inner(field: &Value, root: &Value, array_item: bool) -> String {
+fn schema_type_inner(
+    field: &Value,
+    root: &Value,
+    array_item: bool,
+    references: &mut Vec<String>,
+) -> String {
     if let Some(reference) = field.get("$ref").and_then(Value::as_str)
-        && let Some(name) = reference.strip_prefix("#/$defs/")
-        && let Some(definition) = root.get("$defs").and_then(|defs| defs.get(name))
+        && let Some(pointer) = reference.strip_prefix('#')
+        && let Some(definition) = root.pointer(pointer)
     {
-        return schema_type_inner(definition, root, array_item);
+        // Recursive schemas (including capture pages containing JobView) need
+        // a named back-reference, not unbounded expansion in the tool prompt.
+        if references.iter().any(|active| active == reference) {
+            return definition
+                .get("title")
+                .and_then(Value::as_str)
+                .or_else(|| pointer.rsplit('/').next().filter(|name| !name.is_empty()))
+                .unwrap_or("JSON")
+                .to_owned();
+        }
+        references.push(reference.to_owned());
+        let rendered = schema_type_inner(definition, root, array_item, references);
+        references.pop();
+        return rendered;
     }
     if array_item
         && ["enum", "anyOf", "oneOf", "type"].iter().any(|key| {
@@ -247,7 +273,7 @@ fn schema_type_inner(field: &Value, root: &Value, array_item: bool) -> String {
                 .is_some_and(|values| values.len() > 1)
         })
     {
-        return format!("({})", schema_type(field, root));
+        return format!("({})", schema_type_inner(field, root, false, references));
     }
     if let Some(values) = field.get("enum").and_then(Value::as_array) {
         return values
@@ -263,7 +289,7 @@ fn schema_type_inner(field: &Value, root: &Value, array_item: bool) -> String {
     {
         let types = variants
             .iter()
-            .map(|variant| schema_type(variant, root))
+            .map(|variant| schema_type_inner(variant, root, false, references))
             .collect::<Vec<_>>();
         return types.join(" | ");
     }
@@ -273,7 +299,7 @@ fn schema_type_inner(field: &Value, root: &Value, array_item: bool) -> String {
             .map(|kind| {
                 let mut variant = field.clone();
                 variant["type"] = kind.clone();
-                schema_type(&variant, root)
+                schema_type_inner(&variant, root, false, references)
             })
             .collect::<Vec<_>>()
             .join(" | ");
@@ -282,7 +308,10 @@ fn schema_type_inner(field: &Value, root: &Value, array_item: bool) -> String {
         Some("string" | "integer" | "number" | "boolean" | "null") => {
             field["type"].as_str().unwrap_or("JSON").to_owned()
         }
-        Some("array") => format!("{}[]", schema_type_inner(&field["items"], root, true)),
+        Some("array") => format!(
+            "{}[]",
+            schema_type_inner(&field["items"], root, true, references)
+        ),
         Some("object") => {
             let required = field["required"]
                 .as_array()
@@ -300,14 +329,20 @@ fn schema_type_inner(field: &Value, root: &Value, array_item: bool) -> String {
                     } else {
                         "?"
                     };
-                    format!("{name}{optional}:{}", schema_type(value, root))
+                    format!(
+                        "{name}{optional}:{}",
+                        schema_type_inner(value, root, false, references)
+                    )
                 })
                 .collect::<Vec<_>>();
             if let Some(values) = field
                 .get("additionalProperties")
                 .filter(|value| **value != false)
             {
-                properties.push(format!("[key:string]:{}", schema_type(values, root)));
+                properties.push(format!(
+                    "[key:string]:{}",
+                    schema_type_inner(values, root, false, references)
+                ));
             }
             if properties.is_empty() {
                 "object".to_owned()
@@ -321,4 +356,32 @@ fn schema_type_inner(field: &Value, root: &Value, array_item: bool) -> String {
 
 fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "JSON".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn recursive_schema_descriptions_use_named_back_references() {
+        let node = json!({
+            "$ref":"#/$defs/Node",
+            "$defs":{"Node":{"type":"object", "properties":{
+                "next":{"anyOf":[{"$ref":"#/$defs/Node"},{"type":"null"}]}
+            },"required":["next"]}}
+        });
+        assert_eq!(schema_type(&node, &node), "{next:Node | null}");
+        let tree = json!({"title":"Tree","type":"object", "properties":{
+            "children":{"type":"array","items":{"$ref":"#"}}
+        },"required":["children"]});
+        assert_eq!(schema_type(&tree, &tree), "{children:Tree[]}");
+        let view = job_view_type();
+        assert!(view.contains("has_result:boolean"));
+        assert!(view.contains("JobView"));
+        assert!(
+            view.len() < 10_000,
+            "recursive response description expanded unexpectedly"
+        );
+    }
 }

@@ -42,7 +42,7 @@ impl SessionRuntime {
                 return Err(HarnessError::Interrupted);
             }
             let (content, messages) = self
-                .pending_event_content(agent, &turn.capabilities, location)
+                .pending_event_content(agent, &turn.capabilities)
                 .await?;
             if !content.is_empty() {
                 messages.commit().await?;
@@ -427,7 +427,7 @@ impl SessionRuntime {
             if response.calls.is_empty() {
                 // Events that arrived during the request precede the answer.
                 let (content, messages) = self
-                    .pending_event_content(agent, &turn.capabilities, location)
+                    .pending_event_content(agent, &turn.capabilities)
                     .await?;
                 if !content.is_empty() {
                     messages.commit().await?;

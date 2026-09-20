@@ -582,9 +582,9 @@ mod tests {
             "<skyhook_job_events>\n{}\n</skyhook_job_events>",
             serde_json::json!([
                 {"kind":"message","id":253,"name":"reviewer","message":6579,"text":"independent reply"},
-                {"id":253,"tool":"agent","state":"completed","last_message":6579},
+                {"id":253,"state":"completed","has_result":false,"result":null,"error":null,"meta":{"parent":null,"tool":"agent","name":null,"target":null,"workspace":null,"last_message":6579,"code":null,"executed":null},"presentation":null},
                 {"kind":"message","id":254,"message":6580,"text":"another child reply"},
-                {"id":255,"tool":"exec","state":"completed","result":{"stdout":"tool output"}},
+                {"id":255,"state":"completed","has_result":true,"result":{"stdout":"tool output"},"error":null,"meta":{"parent":null,"tool":"exec","name":null,"target":null,"workspace":null,"last_message":null,"code":null,"executed":null},"presentation":null},
             ]),
         );
         let message = Message::User(vec![

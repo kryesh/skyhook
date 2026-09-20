@@ -84,7 +84,6 @@ pub(super) enum FetchIoKind {
 pub(super) struct FetchOsError {
     /// OS on the execution target; numeric codes are not portable across OSes.
     platform: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<i32>,
     #[schemars(with = "String")]
     kind: FetchIoKind,
@@ -141,13 +140,8 @@ impl DiagnosticMessage {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum TimeoutAttribution {
     Unknown,
-    Total {
-        limit_ms: u64,
-    },
-    Connect {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        limit_ms: Option<u64>,
-    },
+    Total { limit_ms: u64 },
+    Connect { limit_ms: Option<u64> },
 }
 
 /// Internal evidence is not deserializable: only the typed constructors below
@@ -160,9 +154,7 @@ pub(super) struct FetchDiagnostic {
     #[schemars(with = "String")]
     error_kind: FetchErrorKind,
     message: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
     os_error: Option<FetchOsError>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     timeout: Option<TimeoutAttribution>,
 }
 
@@ -599,12 +591,28 @@ mod tests {
             let value =
                 serde_json::to_value(FetchDiagnostic::new(phase, kind).with_connect_limit(1234))
                     .unwrap();
-            assert!(value.get("timeout").is_none());
+            assert_eq!(value["timeout"], serde_json::Value::Null);
+            assert_eq!(value["os_error"], serde_json::Value::Null);
             assert_eq!(
                 [&value["phase"], &value["error_kind"]],
                 wire.map(|w| json!(w)).each_ref()
             );
         }
+    }
+
+    #[test]
+    fn nullable_diagnostic_details_are_emitted() {
+        let os_error = FetchOsError {
+            platform: "test".into(),
+            code: None,
+            kind: FetchIoKind::Other,
+        };
+        assert_eq!(serde_json::to_value(os_error).unwrap()["code"], json!(null));
+        let connect = TimeoutAttribution::Connect { limit_ms: None };
+        assert_eq!(
+            serde_json::to_value(connect).unwrap(),
+            json!({"kind":"connect", "limit_ms":null})
+        );
     }
 
     #[test]
@@ -648,8 +656,12 @@ mod tests {
             assert_eq!(diagnostic.message(), message);
             let value = serde_json::to_value(diagnostic).unwrap();
             assert!(!value.to_string().contains("secret"));
-            let timeout = (kind == Kind::Timeout).then(|| json!({"kind":"unknown"}));
-            assert_eq!(value.get("timeout"), timeout.as_ref());
+            let timeout = if kind == Kind::Timeout {
+                json!({"kind":"unknown"})
+            } else {
+                serde_json::Value::Null
+            };
+            assert_eq!(value["timeout"], timeout);
         }
         let os = io::Error::other(io::Error::from_raw_os_error(12345));
         let diagnostic = FetchDiagnostic::from_io(&os, FetchPhase::LocalIo);

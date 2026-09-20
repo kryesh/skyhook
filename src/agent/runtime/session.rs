@@ -781,7 +781,8 @@ mod tests {
         assert!(root.path().join("child.txt").exists());
         tracking.release(4);
         bounded(turn).await.unwrap().unwrap();
-        let script = "return await tool.write({path: 'script.txt', content: 'written'});";
+        let script =
+            "return (await tool.write({path: 'script.txt', content: 'written'})).unwrap();";
         assert!(session.run_script(script).await.is_err());
         assert!(!root.path().join("script.txt").exists());
         let records = session.runtime.store.records().await;
@@ -1324,7 +1325,7 @@ mod tests {
                 r#"
     const accepted = [];
     for (const value of [{{text:"hello 🌏", nested:[1,true]}}, null, false]) {{
-      accepted.push(await tool.job({id}).send({{value}}));
+      accepted.push((await tool.job({id}).send({{value}})).result);
     }}
     const pending = await tool.job({id}).output();
     return {{accepted, state:pending.state}};

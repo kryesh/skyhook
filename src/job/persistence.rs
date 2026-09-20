@@ -234,8 +234,11 @@ mod tests {
             .await
             .unwrap();
         let pending = jobs.snapshot(job).await.unwrap();
-        assert_eq!(pending.presented(&capabilities).unwrap()["state"], "queued");
-        let schema = presented_job_schema(&capabilities, false).to_string();
+        assert_eq!(
+            pending.metadata_view(&capabilities).into_value()["state"],
+            "queued"
+        );
+        let schema = presented_job_schema(false).to_string();
         assert!(!schema.contains("awaiting_approval"));
         jobs.finish(job, ToolError::Denied("user reason".to_owned()).into())
             .await
@@ -244,10 +247,14 @@ mod tests {
             .wait(job, None, true)
             .await
             .unwrap()
-            .presented(&capabilities)
-            .unwrap();
+            .metadata_view(&capabilities)
+            .into_value();
         assert_eq!(
-            (&denied["code"], &denied["executed"], &denied["error"]),
+            (
+                &denied["meta"]["code"],
+                &denied["meta"]["executed"],
+                &denied["error"]
+            ),
             (
                 &"permission_denied".into(),
                 &false.into(),
@@ -260,8 +267,8 @@ mod tests {
             .snapshot(job)
             .await
             .unwrap()
-            .presented(&capabilities)
-            .unwrap();
+            .metadata_view(&capabilities)
+            .into_value();
         assert_eq!(replayed, denied);
     }
 
@@ -317,9 +324,11 @@ mod tests {
                 .present_output(args, &CapabilitySet::default())
                 .await
                 .unwrap();
-            assert!(view.get("result").is_none());
-            let capture = serde_json::json!({"field":field,"kind":kind,"complete":false});
-            assert_eq!(view["captures"][0], capture);
+            assert!(view["result"].is_null());
+            assert!(!view["has_result"].as_bool().unwrap());
+            let capture =
+                serde_json::json!({"field":field,"kind":kind,"complete":false, "output":null});
+            assert_eq!(view["presentation"]["captures"][0], capture);
             let snapshot = restored.snapshot(id).await.unwrap();
             assert_eq!(
                 (snapshot.state, snapshot.location),

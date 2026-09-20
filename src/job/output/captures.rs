@@ -10,7 +10,7 @@ pub(crate) use stream::{
     AsyncCapture, CaptureWriter, CompletedCapture, PendingCapture, TextCaptureField,
 };
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureKind {
     Text,
@@ -59,17 +59,15 @@ fn validate_capture_field(field: &str) -> std::io::Result<()> {
 
 /// Descriptors describe raw captures, not a replacement structured result. In
 /// particular, incomplete JSON is only safe to read through explicit byte paging.
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize, JsonSchema)]
 pub(crate) struct CaptureDescriptor {
     pub(crate) field: String,
     pub(crate) kind: CaptureKind,
     pub(crate) complete: bool,
+    pub(crate) output: Option<Box<crate::job::JobView>>,
 }
 
-pub(crate) fn available_captures(
-    saved: &Saved,
-    terminal: bool,
-) -> Result<Vec<CaptureDescriptor>, ToolError> {
+pub(crate) fn available_captures(saved: &Saved, terminal: bool) -> Vec<CaptureDescriptor> {
     // Merely having a value at a registered pointer does not mean that value
     // references the capture (for example, a producer may abandon it and return
     // null). Only the saved document's field references establish completion.
@@ -78,13 +76,14 @@ pub(crate) fn available_captures(
             .document
             .as_ref()
             .is_some_and(|document| document["capture_complete"].as_bool() == Some(true));
-    Ok(saved
+    saved
         .captures
         .values()
         .map(|capture| CaptureDescriptor {
+            output: None,
             field: capture.pointer.clone(),
             kind: CaptureKind::parse(&capture.kind),
             complete: complete && capture.referenced,
         })
-        .collect())
+        .collect()
 }

@@ -199,7 +199,7 @@ fn register_child_agent(
     let modes = modes.clone();
     builder.register::<AgentArgs, String, _, _>(
         "agent",
-        "Start a child agent. Send follow-ups or answers with tool.job(id).send({value: ...}). Questions pause the child; follow-ups arrive automatically at its next model-request boundary. Replies arrive as events. Sending input to a completed child resumes its retained history under the same job ID.",
+        "Start a child agent. Names are unique among your own installed children, including terminal children; other callers may reuse the same names. Send follow-ups or answers with tool.job(id).send({value: ...}). Questions pause the child; follow-ups arrive automatically at its next model-request boundary. Replies arrive as events. Sending input to a completed child resumes its retained history under the same job ID.",
         ToolOptions::default().job_role(crate::job::JobRole::Agent)
             .named()
             .requires(Capability::Agents)
@@ -257,6 +257,14 @@ fn register_child_agent(
                 if input.depth >= available_depth {
                     return Err(ToolError::InvalidArguments(format!(
                         "depth must be less than the caller's available depth of {available_depth}"
+                    )));
+                }
+                // A reused name is a follow-up aimed at the wrong tool.
+                if let Some(name) = runtime.jobs.metadata(context.job()).await.map_err(|error| tool_error(&error))?.name
+                    && let Some(id) = runtime.jobs.child_name_owner(context.agent(), &name, context.job()).await
+                {
+                    return Err(ToolError::InvalidArguments(format!(
+                        "child `{name}` already exists as job {id}; message it with tool.job({id}).send({{value: ...}}), or pick another name"
                     )));
                 }
                 let child = runtime.next_child(context.agent()).await;
@@ -626,7 +634,7 @@ for line in sys.stdin:
         assert_eq!(direct["structuredContent"], json!({"text":"direct"}));
         let script = format!("return await tool.{name}({{text:'script'}});");
         let script = session.run_script(script).await.unwrap().value;
-        let found = &script["value"]["structuredContent"];
+        let found = &script["value"]["result"]["structuredContent"];
         assert_eq!(*found, json!({"text":"script"}));
         // Also test a discovered adapter with empty server requirements. Startup
         // omission alone would not catch a missing adapter-level global gate.
@@ -715,13 +723,14 @@ for line in sys.stdin:
             ("{model:'test'}", "unknown model `test`"),
         ];
         for (refused, reason) in refusals {
-            let script = format!("return await tool.agent({{prompt:'no', ...{refused}}});");
+            let script =
+                format!("return (await tool.agent({{prompt:'no', ...{refused}}})).unwrap();");
             let error = session.run_script(script).await.unwrap_err().to_string();
             assert!(error.contains(reason), "{refused}: {error}");
         }
         let child = "return await tool.agent({prompt:'go', depth:1, mode:'scout', model:'cheap'});";
         assert_eq!(
-            session.run_script(child).await.unwrap().value["value"],
+            session.run_script(child).await.unwrap().value["value"]["result"],
             "done"
         );
         // The child holds less than its parent, so it is offered less.
@@ -778,11 +787,11 @@ for line in sys.stdin:
             format!("return await tool.agent({{prompt:'go', mode:'scout', depth:{depth}}});")
         };
         assert_eq!(
-            session.run_script(spawn(0)).await.unwrap().value["value"],
+            session.run_script(spawn(0)).await.unwrap().value["value"]["result"],
             "leaf"
         );
         assert_eq!(
-            session.run_script(spawn(1)).await.unwrap().value["value"],
+            session.run_script(spawn(1)).await.unwrap().value["value"]["result"],
             "held"
         );
         let records = session.runtime.store.records().await;
@@ -896,7 +905,7 @@ for line in sys.stdin:
         session.prompt("root request").await.unwrap();
         let child =
             session.run_script("return await tool.agent({prompt:'child request', depth:0});");
-        assert_eq!(child.await.unwrap().value["value"], "done");
+        assert_eq!(child.await.unwrap().value["value"]["result"], "done");
         {
             let requests = requests.lock().unwrap();
             let offered = |index: usize| requests[index].tools.iter().any(|tool| tool.name == name);
@@ -999,7 +1008,7 @@ for line in sys.stdin:
                     }
                 }
                 // Nested root asks cannot escape the gate through script jobs.
-                let source = "return await tool.ask({id:'nested', prompt:'question'});";
+                let source = "return (await tool.ask({id:'nested', prompt:'question'})).unwrap();";
                 let arguments = json!({"source":source, "bg":background});
                 let result = executor
                     .execute(session.root.clone(), "script", arguments, None)

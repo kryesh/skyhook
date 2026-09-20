@@ -239,12 +239,15 @@ impl ToolExecutor {
             .await?;
         let result_policy = plan.tool.result_policy();
         let started = self.start(plan).await?;
-        if matches!(kind, InvocationKind::Model)
-            && result_policy != super::ToolResultPolicy::JobView
-        {
-            return self.collect_model_started(started).await;
+        match kind {
+            InvocationKind::Model if result_policy != super::ToolResultPolicy::JobView => {
+                self.collect_model_started(started).await
+            }
+            InvocationKind::Model | InvocationKind::Script => {
+                self.collect_full_view_started(started, result_policy).await
+            }
+            InvocationKind::Host => self.collect_started(started).await,
         }
-        self.collect_started(started).await
     }
 
     pub(crate) async fn start_scoped(

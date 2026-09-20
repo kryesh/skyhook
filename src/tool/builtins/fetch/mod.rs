@@ -65,7 +65,7 @@ pub(super) struct FetchArgs {
     /// Request headers to send.
     #[serde(default)]
     pub headers: BTreeMap<String, HeaderValues>,
-    /// Include response headers in the result (omitted by default).
+    /// Include response headers in the result (null by default).
     #[serde(default)]
     pub include_headers: bool,
     pub body: Option<RequestBody>,
@@ -154,8 +154,7 @@ pub(super) struct FetchOutput {
     ok: bool,
     url: String,
     method: String,
-    /// Response headers, present only when include_headers is true.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Response headers, or null when include_headers is false.
     headers: Option<BTreeMap<String, Vec<String>>>,
     redirects: Vec<Redirect>,
     body: ResponseBody,
@@ -176,7 +175,6 @@ enum ResponseBody {
     Text {
         #[schemars(extend("x-skyhook-truncatable" = true))]
         text: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
         metadata: Option<fetch_text::ExtractionMetadata>,
     },
     Base64 {
@@ -393,7 +391,7 @@ mod tests {
             assert!(prefix.len() < expected.len() && expected.starts_with(prefix));
             let pointer = format!("/result/body/{field}");
             let marker = json!([{"field":pointer, "next_start":1, "next_offset":prefix.len()}]);
-            let markers = view["truncated"].as_array().unwrap();
+            let markers = view["presentation"]["truncated"].as_array().unwrap();
             let projected: Vec<_> = markers
                 .iter()
                 .map(|m| json!({"field":m["field"], "next_start":m["next_start"], "next_offset":m["next_offset"]}))
@@ -407,7 +405,7 @@ mod tests {
                 .inspect_output(query.clone(), &Default::default())
                 .await
                 .unwrap();
-            assert_eq!(full["preview"]["lines"], json!([expected]));
+            assert_eq!(full["presentation"]["preview"]["lines"], json!([expected]));
             (query.start, query.offset) = (Some(1), Some(prefix.len()));
             let remainder = runtime
                 .jobs
@@ -415,7 +413,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                remainder["preview"]["lines"],
+                remainder["presentation"]["preview"]["lines"],
                 json!([&expected[prefix.len()..]])
             );
         }
@@ -434,8 +432,9 @@ mod tests {
         task.await.unwrap();
         assert_eq!(
             call.output.value["result"]["body"],
-            json!({"kind":"text", "text":"ok"})
+            json!({"kind":"text", "text":"ok", "metadata":null})
         );
-        assert!(call.output.value.get("truncated").is_none());
+        assert!(call.output.value["meta"].is_null());
+        assert!(call.output.value["presentation"].is_null());
     }
 }

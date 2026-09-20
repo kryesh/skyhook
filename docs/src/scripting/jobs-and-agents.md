@@ -3,8 +3,9 @@
 ## Delegation and child input
 
 Child agents retain their conversation for follow-up work. `tool.job(id).send({value:
-instructions})` delivers unsolicited input automatically at a running child's next model-request
-boundary, without interrupting the current request or tools. A retained child whose job is
+instructions})` returns a JobView whose native payload is in `.result` (including
+`.result.accepted`) and delivers unsolicited input automatically at a running child's next
+model-request boundary, without interrupting the current request or tools. A retained child whose job is
 `completed`, `failed`, or `interrupted` is restarted under the same job and agent identity; the
 new instruction is appended to its retained conversation. Explicitly `cancelled` jobs are not
 resumable. After a session interruption, retry resumes every retained failed/interrupted child
@@ -15,7 +16,7 @@ message.
 Children do not need `receive()` to read these updates. A background child's visible text
 replies, including text-only and final replies, are delivered independently through the
 background-job event path, without waiting for the child job to finish. A foreground child is a
-call: its result carries its final reply, its progress replies are not delivered, and nothing
+call: its JobView `.result` carries its final reply, its progress replies are not delivered, and nothing
 about it arrives as a later event. `wait` resolves when the agent can act:
 while the agent has other foreground work outstanding it keeps waiting, and the next model request
 then carries every accumulated event together; otherwise any pending event resolves it. Each
@@ -42,9 +43,13 @@ the instructions after its existing
 conversation and starts a new request under the same agent and job ID; it does not start
 over with fresh history. `job_output(id)` then exposes the latest run's saved result, not an archive
 of earlier results; already-committed parent notifications and the child conversation remain intact.
-This resumption applies to successfully completed agent jobs retained
-in the live runtime, not arbitrary completed tools or jobs restored after a process restart.
-Failed, cancelled, and interrupted agents are not resumed by `send`.
+Completed, failed, and interrupted child agents with retained history can resume under the same
+job ID, including after a process restart. Cancelled children and arbitrary non-agent jobs cannot.
+
+Child names are scoped to their caller: `A` and `B` may each create a child named `worker`, but
+all scripts owned by `A` share `A`'s child-name scope. An installed child retains its name even
+after termination; send follow-ups to its existing job instead of launching a duplicate. A
+failed launch that never installed a child does not permanently reserve the name.
 Each model-facing `ask` contains one
 `{id, prompt, options}` question; independent concurrent calls are merged by the runtime. A child
 question batch changes its stable agent job to `waiting_input`; answer that job with
@@ -80,11 +85,13 @@ may leave background services running after answering.
 
 ## Job lifecycle and cancellation
 
-Background-capable tools accept an optional `bg` argument. Model-facing calls return a job view
-with `id`, `state`, the actual `target` when enabled, and `result`. Workspace is included when it differs from the caller. Listings and notifications also include tool identity and applicable name/parent metadata. Only annotated fields are shortened; `truncated` lists their total line counts and next read positions.
-JavaScript foreground calls return the handler's full native result; background launches return
-a job reference. A child question has `state: "waiting_input"`; `job_output` returns its stable
-question IDs and text in `question`, regardless of its size.
+Background-capable tools accept an optional `bg` argument. Calls use the [common JobView
+contract](../reference/javascript.md#jobview-response-contract); background launches have
+`result: null` and `has_result: false`, while loaded literal `null` results have `has_result: true`.
+The native payload from `send` is exposed in `.result.accepted`; cancellation returns target-job
+metadata in `.result` and is a request, so inspect the target view for terminal state. A child
+question has `state: "waiting_input"`; `job_output` returns its stable question IDs and text in
+`presentation.question`, regardless of its size.
 
 Jobs normally follow `queued → running → completed`, optionally cycling through
 `waiting_input → running`; `failed`, `cancelled`, and `interrupted` are terminal alternatives.
@@ -96,7 +103,8 @@ Cancellation cascades through descendant jobs and agents and terminates managed 
 groups locally and remotely. It is a request: use job_output to confirm termination. Deliberately
 detached processes and unreachable remote hosts limit cleanup. Command timeouts are optional;
 omission or null means no deadline. Explicit timeouts of 1–3600 seconds terminate execution,
-retaining captured output. A nonzero command exit is a normal result with `exit_code`.
+retaining captured output. A nonzero command exit is a normal result. Process payloads always
+include `exit_code: number|null`, `stdout: string`, `stderr: string`, and `timed_out: boolean`.
 
 ## Job names
 

@@ -8,12 +8,9 @@ impl SessionRuntime {
         &self,
         agent: &crate::identity::AgentId,
         capabilities: &crate::tool::policy::CapabilitySet,
-        location: &crate::execution::ExecutionLocation,
     ) -> Result<(Vec<UserContent>, PendingEventBatch), crate::agent::runtime::HarnessError> {
         let pending = self.jobs.pending_delivery(agent).await?;
-        let content = self
-            .job_event_content(&pending, capabilities, location)
-            .await;
+        let content = self.job_event_content(&pending, capabilities).await;
         // Never hold an empty receipt's delivery gate across a model request.
         let jobs = (!content.is_empty()).then_some(pending);
         let batch = PendingEventBatch {
@@ -29,7 +26,6 @@ impl SessionRuntime {
         &self,
         pending: &crate::job::PendingDelivery,
         capabilities: &crate::tool::policy::CapabilitySet,
-        location: &crate::execution::ExecutionLocation,
     ) -> Vec<UserContent> {
         let mut presented = Vec::new();
         for message in pending.messages() {
@@ -44,7 +40,6 @@ impl SessionRuntime {
                     crate::job::output::OutputArgs::new(job.id),
                     capabilities,
                     crate::job::output::OutputOptions::Host {
-                        viewer: Some(location),
                         presentation: crate::job::OutputPresentation::Automatic,
                     },
                 )
@@ -182,8 +177,8 @@ mod tests {
     async fn script_foreground_child_leaves_no_pending_reply() {
         const FINAL: &str = "readme-first-lines";
         let source = "const answer = await tool.agent({prompt:'read', model:'child', name:'read-readme'}); \
-            const first = await tool.wait({timeout:1}); \
-            const second = await tool.wait({timeout:1}); \
+            const first = (await tool.wait({timeout:1})).result; \
+            const second = (await tool.wait({timeout:1})).result; \
             return [first, second];";
         let tracking = tracking_all(vec![
             (
@@ -426,7 +421,7 @@ mod tests {
             let send =
                 format!("return await tool.job({job}).send({{value:'please add an addendum'}});");
             let sent = bounded(session.run_script(send)).await.unwrap();
-            assert_eq!(sent.value["value"], json!({"accepted":true}));
+            assert_eq!(sent.value["value"]["result"], json!({"accepted":true}));
             // Occupancy proves forwarding to the child's queue while A's invoke is gated.
             bounded(async {
                 while sender.capacity() != AGENT_CHANNEL_CAPACITY - 1 {
@@ -618,7 +613,7 @@ mod tests {
         let value = "parent-reply-request-marker";
         let send = format!("return await tool.job({child_job}).send({{value:{value:?}}});");
         let sent = bounded(session.run_script(send)).await.unwrap();
-        assert_eq!(sent.value["value"], json!({"accepted":true}));
+        assert_eq!(sent.value["value"]["result"], json!({"accepted":true}));
         let child_request = tracking.pass(3).await;
         assert_reason(&child_request, "child-wait", "event");
         let messages = rendered(&child_request);

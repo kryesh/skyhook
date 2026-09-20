@@ -373,7 +373,7 @@ mod tests {
     }
 
     fn captures(output: &Output, terminal: bool) -> Vec<super::super::CaptureDescriptor> {
-        available_captures(&Saved::load(output).unwrap(), terminal).unwrap()
+        available_captures(&Saved::load(output).unwrap(), terminal)
     }
 
     fn bytes(output: &Output, field: &str) -> Option<Vec<u8>> {

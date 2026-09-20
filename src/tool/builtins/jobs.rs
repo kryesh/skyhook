@@ -16,9 +16,7 @@ pub(crate) fn register(
     builder.register::<JobsArgs, Value, _, _>(
         "jobs",
         "List this agent's active jobs, excluding this call and its containing script. Set `all` to include completed history.",
-        ToolOptions::default().generated_output_schema(|capabilities| {
-            presented_job_schema(capabilities, true)
-        }),
+        ToolOptions::default().generated_output_schema(|_| presented_job_schema(true)),
         move |context, args| {
             let jobs = list.clone();
             async move {
@@ -45,14 +43,8 @@ pub(crate) fn register(
                 Ok(Value::Array(
                     envelopes
                         .iter()
-                        .map(|job| {
-                            job.presented_for(
-                                context.capabilities(),
-                                Some(context.caller_location()),
-                                true,
-                            )
-                        })
-                        .collect::<Result<_, _>>()?,
+                        .map(|job| job.metadata_view(context.capabilities()).into_value())
+                        .collect(),
                 ))
             }
         },
@@ -69,7 +61,7 @@ pub(crate) fn register(
                 jobs.present_output_with(
                     args,
                     context.capabilities(),
-                    crate::job::output::OutputOptions::Model { viewer: Some(context.caller_location()), detailed: false, presentation: crate::job::OutputPresentation::Full },
+                    crate::job::output::OutputOptions::Model { presentation: crate::job::OutputPresentation::Full },
                 )
                 .await
             }
@@ -97,7 +89,7 @@ pub(crate) fn register(
         "job_cancel",
         "Request cancellation of job/descendants; confirm terminal state with job_output.",
         ToolOptions::default()
-            .generated_output_schema(|capabilities| presented_job_schema(capabilities, false))
+            .generated_output_schema(|_| presented_job_schema(false))
             .script_only()
             .job_method("cancel", "job"),
         move |context, args| {
@@ -106,14 +98,7 @@ pub(crate) fn register(
                 jobs.cancel(args.job)
                     .await
                     .map_err(ToolError::failed)
-                    .and_then(|job| {
-                        job.presented_for(
-                            context.capabilities(),
-                            Some(context.caller_location()),
-                            false,
-                        )
-                        .map_err(ToolError::from)
-                    })
+                    .map(|job| job.metadata_view(context.capabilities()).into_value())
             }
         },
     )?;
@@ -360,8 +345,9 @@ mod tests {
                 .await;
             let output = output.unwrap().output;
             assert_eq!(output.value["state"], "completed");
-            // Returning a tool result preserves its originating read job view.
-            assert_eq!(output.value["result"]["value"]["tool"], "read");
+            // Returning a tool response preserves its canonical read JobView.
+            assert_eq!(output.value["result"]["value"]["state"], "completed");
+            assert_eq!(output.value["result"]["value"]["result"]["kind"], "image");
             assert_eq!(output.value["result"]["console"], "");
             assert!(output.value.get("console").is_none());
             assert_loaded(&runtime.store, output.images).await;
@@ -413,12 +399,11 @@ mod tests {
             json!({"job":read.job,"pattern":"["}),
             json!({"job":999999}),
         ] {
-            assert!(
-                executor
-                    .run_model(agent, "job_output", query)
-                    .await
-                    .is_err()
-            );
+            let response = executor
+                .run_model(agent, "job_output", query)
+                .await
+                .unwrap();
+            assert_eq!(response.output.value["state"], "failed");
         }
         // A denied image-producing call never creates a retrievable attachment.
         let mut capabilities = CapabilitySet::default();
@@ -426,6 +411,8 @@ mod tests {
         let denied = executor.clone().with_capabilities(capabilities);
         let before = runtime.jobs.list(agent).await.len();
         let arguments = json!({"path":"image.png"});
+        // This is a pre-admission error: public dispatch converts it to an
+        // id:null failure envelope, while the internal executor returns Err.
         assert!(denied.run_model(agent, "read", arguments).await.is_err());
         for job in runtime.jobs.list(agent).await.into_iter().skip(before) {
             assert!(runtime.jobs.images(job.id).await.unwrap().is_empty());

@@ -3,13 +3,11 @@ const __executions = new WeakMap();
 const __callData = new WeakMap();
 const __parse = JSON.parse;
 const __stringify = JSON.stringify;
-const __resultSources = new WeakMap();
 const __annotatedArrays = new WeakSet();
 const __annotatedProperties = new WeakMap();
 
-function __rememberResult(value, job, annotations) {
+function __rememberAnnotations(value, annotations) {
   if (value === null || typeof value !== "object") return;
-  __resultSources.set(value, {job, baseline: __stringify(value)});
   for (const pointer of annotations) {
     const keys = pointer === "" ? [] : pointer.slice(1).split("/").map(key => key.replace(/~1/g, "/").replace(/~0/g, "~"));
     let child = value, parent, key;
@@ -21,15 +19,6 @@ function __rememberResult(value, job, annotations) {
       properties.add(key);
     }
   }
-}
-
-function __sameJson(left, right) {
-  if (left === right) return true;
-  if (left === null || right === null || typeof left !== "object" || typeof right !== "object"
-      || Array.isArray(left) !== Array.isArray(right)) return false;
-  const keys = Object.keys(left);
-  return keys.length === Object.keys(right).length
-    && keys.every(key => Object.hasOwn(right, key) && __sameJson(left[key], right[key]));
 }
 
 function __consoleFormat(value) {
@@ -130,6 +119,41 @@ for (const manifest of __builders) {
   if (manifest.binding === "top_level") tool[manifest.name] = (...values) => __builder(manifest, values);
 }
 
+function __jobResponseError(response, message) {
+  const error = new Error(message);
+  error.response = response;
+  error.output = response.result ?? null;
+  error.code = response.meta?.code ?? null;
+  error.executed = response.meta?.executed ?? null;
+  return error;
+}
+
+function __unwrapResponse(response) {
+  if (response.state === "completed") {
+    if (response.has_result !== true) {
+      throw __jobResponseError(
+        response,
+        `job ${response.id ?? "(unassigned)"} has no loaded result; inspect it with tool.job(id).output()`,
+      );
+    }
+    if (!Object.hasOwn(response, "result") || response.result === undefined) {
+      throw new TypeError("unwrap completed response requires a JSON result field (null is allowed)");
+    }
+    return response.result;
+  }
+  if (["failed", "cancelled", "interrupted"].includes(response.state)) {
+    throw __jobResponseError(
+      response,
+      response.error || `job ${response.id ?? "(unassigned)"} ${response.state}`,
+    );
+  }
+  const state = typeof response.state === "string" ? response.state : "unknown";
+  throw __jobResponseError(
+    response,
+    `job ${response.id ?? "(unassigned)"} is not completed (state: ${state})`,
+  );
+}
+
 tool.job = job => {
   if (job && job[__callKind] === true) {
     throw new TypeError("tool.job received an unresolved tool builder; await the background call and pass result.id");
@@ -147,13 +171,22 @@ tool.job = job => {
 async function __request(request) {
   const response = __parse(await __skyhookHostCall(__stringify(request)));
   if (!response.ok) {
-    const error = new Error(response.error);
-    for (const key of ["output", "code", "executed"]) {
-      if (Object.hasOwn(response, key)) error[key] = response[key];
-    }
-    throw error;
+    throw new Error(response.error);
   }
-  if (response.source_job) __rememberResult(response.value, response.source_job, response.annotations);
+  if (response.annotations) __rememberAnnotations(response.value, response.annotations);
+  // Only tool calls produce JobViews. A received message or a nested payload
+  // may look like one, but remains arbitrary user JSON without runtime methods.
+  if (request.type === "call") {
+    // The Rust response type owns the schema. Guard only the object boundary
+    // needed to install a runtime method; do not duplicate its field list here.
+    if (response.value === null || typeof response.value !== "object" || Array.isArray(response.value)) {
+      throw new TypeError(`tool "${request.name}" returned an invalid JobView envelope: expected an object`);
+    }
+    Object.defineProperty(response.value, "unwrap", {
+      enumerable: false,
+      value() { return __unwrapResponse(response.value); },
+    });
+  }
   return response.value;
 }
 
@@ -259,8 +292,6 @@ async function __resolve(value, path, ancestors, pointer, presentation) {
     if (properties?.has(key)) presentation.fields.push(childPointer);
     output[key] = await __resolve(value[key], Array.isArray(value) ? `${path}[${key}]` : `${path}.${key}`, nested, childPointer, presentation);
   }));
-  const source = __resultSources.get(value);
-  if (source && __sameJson(output, __parse(source.baseline))) presentation.jobs[pointer] = source.job;
   return output;
 }
 

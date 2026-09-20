@@ -233,7 +233,7 @@ impl SessionRuntime {
                     parent,
                 )
                 .await;
-            let mut result = match result {
+            match result {
                 Ok(result) => ToolResult {
                     call_id: call.id().to_owned(),
                     name: call.name().to_owned(),
@@ -242,30 +242,22 @@ impl SessionRuntime {
                     is_error: result.is_error,
                 },
                 Err(error) => {
-                    let failure = error.into_failure();
-                    let mut result = json!({"error": failure.message});
-                    if let Some(denial) = failure.denial {
-                        result["code"] = json!(denial.code);
-                        result["executed"] = json!(denial.executed);
-                    }
-                    let images = if let Some(output) = failure.output {
-                        result["output"] = output.value;
-                        output.images
-                    } else {
-                        Vec::new()
-                    };
+                    let output = error.into_response(
+                        call.name(),
+                        parent,
+                        call.arguments()
+                            .get("name")
+                            .and_then(serde_json::Value::as_str),
+                    );
                     ToolResult {
                         call_id: call.id().to_owned(),
                         name: call.name().to_owned(),
-                        result,
-                        images,
+                        result: output.value,
+                        images: output.images,
                         is_error: true,
                     }
                 }
-            };
-            // Commit the same compact presentation that the model and UI display.
-            crate::job::omit_null_fields(&mut result.result);
-            result
+            }
         })
     }
 
@@ -548,7 +540,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_tool_history_omits_null_fields() {
+    async fn preadmission_failure_history_keeps_requested_metadata() {
+        let call = tool_call(0, "missing-call", "missing", json!({"name":"unadmitted"}));
+        let (_root, requests, session) =
+            scripted_session([response(vec![call]), answer("done")]).await;
+        assert_eq!(session.prompt("run").await.unwrap(), "done");
+        let requests = requests.lock().unwrap();
+        let results = last_tool_results(&requests[1]);
+        assert!(results[0].is_error);
+        let view = &results[0].result;
+        assert_eq!(view["state"], "failed");
+        assert_eq!(view["meta"]["tool"], "missing");
+        assert_eq!(view["meta"]["name"], "unadmitted");
+        assert_eq!(view.get("id"), Some(&serde_json::Value::Null));
+        assert_eq!(view["meta"].get("parent"), Some(&serde_json::Value::Null));
+        assert_eq!(view.get("result"), Some(&serde_json::Value::Null));
+        assert_eq!(view["has_result"], false);
+    }
+
+    #[tokio::test]
+    async fn committed_tool_history_preserves_null_fields() {
         let source = "return {error: null, nested: {absent: null, ok: false}, array: [null, 0]};";
         let call = tool_call(0, "script-call", "script", json!({ "source": source }));
         let (_root, requests, session) =
@@ -557,7 +568,14 @@ mod tests {
         let records = session.runtime.store.records().await;
         let results = events!(&records, SessionEvent::MessageCommitted { message: Message::Tool(results) } => results);
         let value = &results[0][0].result["result"]["value"];
-        assert_eq!(value, &json!({"nested": {"ok": false}, "array": [null, 0]}));
+        assert_eq!(
+            value,
+            &json!({
+                "error": null,
+                "nested": {"absent": null, "ok": false},
+                "array": [null, 0]
+            })
+        );
         assert_eq!(last_tool_results(&requests.lock().unwrap()[1]), results[0]);
     }
 

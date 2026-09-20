@@ -19,13 +19,9 @@ const MAX_HTML_ELEMENTS: usize = 50_000;
 pub(super) struct ExtractionMetadata {
     pub engine: String,
     pub title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub byline: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub excerpt: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub site_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 }
 
@@ -323,6 +319,25 @@ mod tests {
         let replacements = html(vec![0xff; MAX_DECODED_HTML_BYTES / 3 + 1]);
         assert!(replacements.bytes().len() <= MAX_RAW_HTML_BYTES);
         assert!(ExtractableHtml::admit(replacements, &url).is_none());
+    }
+
+    #[test]
+    fn extraction_metadata_keeps_unknown_fields_as_null() {
+        let metadata = ExtractionMetadata {
+            engine: "dom_smoothie".into(),
+            title: String::new(),
+            byline: None,
+            excerpt: None,
+            site_name: None,
+            language: None,
+        };
+        assert_eq!(
+            serde_json::to_value(metadata).unwrap(),
+            serde_json::json!({
+                "engine":"dom_smoothie", "title":"", "byline":null,
+                "excerpt":null, "site_name":null, "language":null
+            })
+        );
     }
 
     #[tokio::test]

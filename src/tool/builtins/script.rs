@@ -60,19 +60,20 @@ struct ScriptArgs {
     source: String,
 }
 
-const SCRIPT_DESCRIPTION: &str = r#"Run an async JavaScript body in QuickJS-ng with modern ECMAScript syntax, selected standard built-ins, and top-level await/return. Native result is {value,console}: value is the returned JSON (null without return), and console is captured console.log text/JSON. The model receives a JobView with this script result. Read saved console at /result/console and returned-value fields under /result/value. No Node.js APIs or global `fetch` (use `tool.fetch(...)` for HTTP requests), `URL`, `TextEncoder`/`TextDecoder`, or `setTimeout`/`setInterval`. No recursive script execution. Built-ins include Date, RegExp, Map/Set, Proxy/Reflect, BigInt, ArrayBuffer, DataView and typed arrays; Uint8Array supports fromBase64/fromHex/toBase64/toHex. Return JSON-compatible values: convert BigInts, dates and typed arrays; undefined, non-finite numbers, functions and cycles fail serialization.
+const SCRIPT_DESCRIPTION: &str = r#"Run an async JavaScript body in QuickJS-ng with modern ECMAScript syntax, selected standard built-ins, and top-level await/return. Native script result is {value,console,failure}: value is the returned JSON (null without return), console is captured console.log text/JSON, and failure is null on success. The model receives a JobView with this script result. Read saved console at /result/console and returned-value fields under /result/value. No Node.js APIs or global `fetch` (use `tool.fetch(...)` for HTTP requests), `URL`, `TextEncoder`/`TextDecoder`, or `setTimeout`/`setInterval`. No recursive script execution. Built-ins include Date, RegExp, Map/Set, Proxy/Reflect, BigInt, ArrayBuffer, DataView and typed arrays; Uint8Array supports fromBase64/fromHex/toBase64/toHex. Return JSON-compatible values: convert BigInts, dates and typed arrays; undefined, non-finite numbers, functions and cycles fail serialization.
 
-Use direct tools' arguments/results: `tool.read({path:"Cargo.toml"})` or `tool.read().path("Cargo.toml")`; omitted arguments keep schema defaults. Builders execute once when awaited/returned. Returning nested builders runs independent calls concurrently: `return {a:tool.read({path:"a"}),b:tool.read({path:"b"})};`. Promise.all works; await ordinary promises before nesting results.
+Tool calls return JobView envelopes; operational failures are `failed` envelopes, not throws. The native result is in `.result`. `response.unwrap()` returns it for a completed response with `has_result === true`, and otherwise throws an error carrying `.response`, `.output`, `.code`, and `.executed`; inspect pending jobs with `tool.job(id).output()`. For example: `const response = await tool.read({path:"Cargo.toml"}); const file = response.unwrap();`. Builders also support `tool.read().path("Cargo.toml")`; omitted arguments keep schema defaults. Builders execute once when awaited/returned. Returning nested builders runs independent calls concurrently: `return {a:tool.read({path:"a"}),b:tool.read({path:"b"})};`. Promise.all works; await ordinary promises before nesting results.
 
 `await sleep(ms)`: finite nonnegative milliseconds within the host timer range; cancellation interrupts it. performance.now() measures elapsed milliseconds. Unawaited promises/sleeps do not keep scripts alive; use background jobs for lasting work.
 
 `new WorkPool(n).map(items,worker)` or `.run([fn1,fn2,...])` returns an async iterable of {index,value} in completion order, at most n workers. run takes exactly one array of functions called with no arguments (not variadic); invalid arguments throw before any task starts. index identifies the original input; value is its result. Task failures are logged/skipped; breaking stops scheduling and awaits running workers.
 ```js
-const {paths} = await tool.glob({pattern: "src/**/*.rs"});
+const {paths} = (await tool.glob({pattern: "src/**/*.rs"})).unwrap();
 const results = [];
-for await (const {index, value} of new WorkPool(4).map(
+for await (const {index, value: response} of new WorkPool(4).map(
   paths, path => tool.read({path})
 )) {
+  const value = response.unwrap();
   results.push({index, path: value.path, content: value.content});
 }
 return results;

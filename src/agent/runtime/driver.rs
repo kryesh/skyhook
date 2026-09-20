@@ -257,10 +257,7 @@ impl SessionRuntime {
                     options,
                 } => (content, done, options),
                 AgentCommand::JobsReady => {
-                    let content = match self
-                        .pending_event_content(&id, &turn.capabilities, &location)
-                        .await
-                    {
+                    let content = match self.pending_event_content(&id, &turn.capabilities).await {
                         Ok((content, messages)) if !content.is_empty() => {
                             pending_events = Some(messages);
                             content
@@ -520,7 +517,7 @@ mod tests {
         assert_eq!(result.result["state"], "completed");
         // A foreground call returns its answer in the result and nothing else is
         // delivered: no progress replies, and the answer only once.
-        assert!(result.result.get("last_message").is_none());
+        assert!(result.result["meta"]["last_message"].is_null());
         let serialized = rendered(last);
         assert_eq!(serialized.matches("premature child answer").count(), 0);
         let in_result = serde_json::to_string(&result.result).unwrap();
@@ -530,7 +527,7 @@ mod tests {
         for request in requests.iter() {
             let system = &request.system[0].text;
             assert!(!system.contains("compaction"));
-            assert!(system.contains("Use job_output to retrieve truncated results."));
+            assert!(system.contains("use `job_output` for more output"));
             assert!(!system.contains("Continue with the returned"));
         }
     }
@@ -829,7 +826,7 @@ mod tests {
             }
             let retry = format!("return tool.job({job}).send({{value:'try again'}});");
             let resumed = session.run_script(retry).await.unwrap();
-            assert_eq!(resumed.value["value"]["accepted"], true);
+            assert_eq!(resumed.value["value"]["result"]["accepted"], true);
             let recovered = wait().await;
             assert_eq!(recovered.state, JobState::Completed);
             assert_eq!(recovered.output, Some(json!("child recovered")));

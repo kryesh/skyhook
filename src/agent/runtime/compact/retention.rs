@@ -141,10 +141,13 @@ pub(super) fn included_output_jobs(value: &serde_json::Value, jobs: &mut BTreeSe
         serde_json::Value::Object(map) => {
             if map.get("state").is_some_and(|state| {
                 serde_json::from_value::<crate::job::JobState>(state.clone()).is_ok()
-            }) && (map.contains_key("result")
-                || ["output", "preview", "question", "error"]
-                    .iter()
-                    .any(|key| map.get(*key).is_some_and(|v| !v.is_null())))
+            }) && (map.get("has_result") == Some(&serde_json::Value::Bool(true))
+                || map.get("error").is_some_and(|error| !error.is_null())
+                || map.get("presentation").is_some_and(|presentation| {
+                    ["preview", "question"]
+                        .iter()
+                        .any(|key| presentation.get(*key).is_some_and(|value| !value.is_null()))
+                }))
                 && let Some(id) = map
                     .get("id")
                     .and_then(|id| serde_json::from_value::<JobId>(id.clone()).ok())
@@ -303,10 +306,11 @@ mod tests {
         let message = Message::Tool(vec![ToolResult {
             call_id: "script-call".into(),
             name: "script".into(),
-            result: json!({"id":1,"state":"completed","result":{
-                "nested":[{"id":2,"tool":"read","state":"completed","result":null}],
+            result: json!({"id":1,"state":"completed","has_result":true,"result":{
+                "nested":[{"id":2,"state":"completed","has_result":true,"result":null}],
                 "status":{"id":3,"state":"running"},
-                "arguments":{"id":4,"state":"completed","result":"literal"}
+                "arguments":{"id":4,"state":"completed","has_result":true,"result":"literal"},
+                "metadata":{"id":5,"state":"completed","has_result":false,"result":null,"error":null,"presentation":null}
             }}),
             images: vec![],
             is_error: false,

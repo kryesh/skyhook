@@ -216,7 +216,8 @@ fn response(
         field: selection.field.clone(),
         lines,
         total_lines: total,
-        next: next.map(|(start, offset)| OutputContinuation { start, offset }),
+        next_start: next.map(|(start, _)| start),
+        next_offset: next.map_or(0, |(_, offset)| offset),
     }
 }
 
@@ -555,8 +556,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first.lines.len(), 1);
-        assert_eq!(first.next.unwrap().start, 2);
-        assert_eq!(first.next.unwrap().offset, 0);
+        assert_eq!(first.next_start.unwrap(), 2);
+        assert_eq!(first.next_offset, 0);
         let mut query = selection(1, 0);
         let mut reconstructed = String::new();
         let mut previous = 1;
@@ -575,10 +576,10 @@ mod tests {
                 reconstructed.push_str(row.as_str());
                 previous = number;
             }
-            let Some(next) = view.next else {
+            let Some(start) = view.next_start else {
                 break;
             };
-            query = selection(next.start, next.offset);
+            query = selection(start, view.next_offset);
         }
         assert_eq!(reconstructed, text);
     }
@@ -594,7 +595,7 @@ mod tests {
         let first = page(saved(live), &query, 100, false, &Default::default()).unwrap();
         assert_eq!(first.lines.len(), 1);
         assert_eq!(first.lines[0], "before");
-        assert_eq!(first.next.unwrap().start, 2);
+        assert_eq!(first.next_start.unwrap(), 2);
         // The producer appends before the next page is read.
         let text = format!("{live}tial\nlast\n");
         query.start = 2;
@@ -606,7 +607,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["ERROR", "partial"]
         );
-        assert!(rest.next.is_none());
+        assert!(rest.next_start.is_none());
         query.start = 3;
         query.offset = 1;
         let rest = page(saved(&text), &query, 100, true, &Default::default()).unwrap();

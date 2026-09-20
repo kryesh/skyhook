@@ -1,20 +1,27 @@
 # Built-in tools
 
 `read`, `search`, `glob`, `exec`, `shell`, `fetch`, `write`, `replace`, `patch`, `remove`, `script`, `targets`,
-`target_add`, `skills`, `skill`, `jobs`, `job_output`, `wait`, `ask`, `todo`, and `agent`. `jobs()` lists the current agent's
-active jobs, excluding the listing call and its containing script. `jobs({all:true})` includes
-completed history; listings contain status and references, never saved results.
+`target_add`, `skills`, `skill`, `jobs`, `job_output`, `wait`, `ask`, `todo`, and `agent`. Calls use the
+[common JobView envelope](javascript.md#jobview-response-contract); native payloads are in `.result`.
+`jobs()` lists the current agent's active jobs, excluding the listing call and its containing script.
+`jobs({all:true})` includes completed history, and the listing payload is in the envelope's `.result`.
 
 `job_output` reads saved output and status immediately; it never waits for new output or completion.
-Scripts use `tool.job(id).output(...)`, `.send({value})`, and `.cancel()`.
+`tool.job(id).output(...)` returns the existing queried view, not another wrapper. Scripts use
+`tool.job(id).output(...)`, `.send({value})`, and `.cancel()`.
 
 Use `wait({timeout?: seconds})` (or `await tool.wait(...)` in scripts) to yield until an agent
-event or a timeout, then inspect the relevant jobs. Omitted or null `timeout` waits indefinitely;
-a supplied timeout must be a positive integer number of seconds.
-The result is `{reason:"event"}` or `{reason:"timeout"}`. An event does not guarantee a particular
+event or a timeout, then inspect the relevant jobs. The returned view's `.result` is
+`{reason:"event"}` or `{reason:"timeout"}`. Omitted or null `timeout` waits indefinitely;
+a supplied timeout must be a positive integer number of seconds. An event does not guarantee a particular
 job has completed; inspect its current status. Waiting does not stop background work.
 Do independent work first rather than polling output in a tight loop. Output reads reject the old
 `wait` argument.
+
+See the [JavaScript response contract](javascript.md#responseunwrap-and-native-results) for
+`response.unwrap()`, serialization, and operational-failure behavior. In this reference,
+`tool.job(id).output(...)` and other inspection calls return views for reading their
+`presentation` fields; use the task-specific contracts below for their payloads.
 
 ## Creating files with `write`
 

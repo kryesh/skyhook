@@ -297,8 +297,11 @@ impl ProcessResult {
     fn into_output(self) -> ToolOutput {
         let output = ProcessOutput {
             exit_code: self.exit_code,
-            stdout: None,
-            stderr: None,
+            // Completed captures replace these fields when bytes were observed. An
+            // absent capture therefore means the stream was observed to be empty,
+            // not that its value is unknown.
+            stdout: String::new(),
+            stderr: String::new(),
             timed_out: self.timed_out,
         };
         let mut output =
@@ -313,15 +316,11 @@ impl ProcessResult {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct ProcessOutput {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     #[schemars(extend("x-skyhook-truncatable" = true))]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stdout: Option<String>,
+    pub stdout: String,
     #[schemars(extend("x-skyhook-truncatable" = true))]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stderr: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stderr: String,
     pub timed_out: bool,
 }
 
@@ -357,6 +356,34 @@ mod tests {
         runtime.executor(builder).with_capabilities(capabilities)
     }
 
+    #[test]
+    fn output_schema_requires_stable_fields_but_keeps_exit_code_nullable() {
+        let schema = serde_json::to_value(
+            schemars::generate::SchemaSettings::default()
+                .for_serialize()
+                .into_generator()
+                .into_root_schema_for::<ProcessOutput>(),
+        )
+        .unwrap();
+        let required = schema["required"].as_array().unwrap();
+        for field in ["exit_code", "stdout", "stderr", "timed_out"] {
+            assert!(required.contains(&json!(field)), "{field}: {schema}");
+        }
+        fn allows_null(schema: &Value) -> bool {
+            schema["type"] == "null"
+                || schema["type"]
+                    .as_array()
+                    .is_some_and(|types| types.contains(&json!("null")))
+                || ["anyOf", "oneOf"]
+                    .into_iter()
+                    .filter_map(|key| schema[key].as_array())
+                    .flatten()
+                    .any(allows_null)
+        }
+        assert!(allows_null(&schema["properties"]["exit_code"]), "{schema}");
+        assert!(!allows_null(&schema["properties"]["stdout"]), "{schema}");
+    }
+
     /// `exec` and `shell` arguments running the same `/bin/sh` command.
     #[cfg(unix)]
     fn sh_args(tool: &str, command: &str, timeout: Option<u64>) -> Value {
@@ -377,15 +404,23 @@ mod tests {
         let (agent, jobs) = (&runtime.agent, &runtime.jobs);
         let executor = executor(&runtime, true);
         let shell = async |command: Value| executor.run_host(agent, "shell", command).await;
-        // A signal exit keeps the exit code optional.
+        // A signal exit has an unknown (null) exit code, while both observed
+        // streams and the timeout flag still have concrete defaults.
         let signal = shell(json!({"command":"kill -TERM $$"})).await.unwrap();
-        assert_eq!(signal.output.value, json!({}));
+        assert_eq!(
+            signal.output.value,
+            json!({"exit_code":null,"stdout":"","stderr":"","timed_out":false})
+        );
         for (command, expected, captures) in [
-            ("exit 0", json!({"exit_code":0}), json!([])),
+            (
+                "exit 0",
+                json!({"exit_code":0,"stdout":"","stderr":"","timed_out":false}),
+                json!([]),
+            ),
             (
                 "printf warning >&2",
-                json!({"exit_code":0,"stderr":"warning"}),
-                json!([{"field": "/result/stderr", "kind": "text", "complete": true}]),
+                json!({"exit_code":0,"stdout":"","stderr":"warning","timed_out":false}),
+                json!([{"field": "/result/stderr", "kind": "text", "complete": true, "output": null}]),
             ),
         ] {
             let output = shell(json!({"command":command})).await.unwrap();
@@ -395,8 +430,11 @@ mod tests {
                 .inspect_output(args, &Default::default())
                 .await
                 .unwrap();
-            assert!(view.get("notice").is_none());
-            assert_eq!(view.get("captures").unwrap_or(&json!([])), &captures);
+            assert_eq!(view["presentation"]["notice"], Value::Null);
+            assert_eq!(
+                view["presentation"].get("captures").unwrap_or(&json!([])),
+                &captures
+            );
         }
         let output = shell(json!({"command":"printf '\\377'; exit 3"}))
             .await
@@ -446,7 +484,7 @@ mod tests {
                         .present_output(args, &Default::default())
                         .await
                         .unwrap();
-                    if view["preview"]["lines"]
+                    if view["presentation"]["preview"]["lines"]
                         .as_array()
                         .is_some_and(|lines| !lines.is_empty())
                     {

@@ -90,19 +90,15 @@ fn optional_count(value: &Value, key: &str) -> Option<Option<usize>> {
 
 /// The one source cursor parser; `None` when the cursor fields are malformed.
 fn wire_pagination(value: &Value) -> Option<Pagination> {
-    Some(
-        match (
-            optional_count(value, "next_start")?,
-            optional_count(value, "next_offset")?,
-        ) {
-            (None, None) => Pagination::End,
-            (Some(start), offset) => Pagination::More {
-                start: NonZeroUsize::new(start)?.get(),
-                offset: offset.unwrap_or(0),
-            },
-            (None, Some(_)) => return None,
+    let offset = usize::try_from(value.get("next_offset")?.as_u64()?).ok()?;
+    Some(match optional_count(value, "next_start")? {
+        None if offset == 0 => Pagination::End,
+        None => return None,
+        Some(start) => Pagination::More {
+            start: NonZeroUsize::new(start)?.get(),
+            offset,
         },
-    )
+    })
 }
 
 /// A source cursor `(field, start, offset)` is independent of displayed text.

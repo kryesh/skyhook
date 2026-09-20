@@ -22,8 +22,9 @@ const child = await tool.agent({
   ],
   bg: true
 });
-// Yield for an event, then inspect the child; an event need not mean completion.
-await tool.wait({timeout:300});
+// Yield for an event (`event.result.reason` is `"event"` or `"timeout"`), then inspect the child;
+// an event need not mean completion.
+const event = await tool.wait({timeout:300});
 const childStatus = await tool.job(child.id).output();
 if (childStatus.state === "queued") return childStatus;
 return tool.todo({job: child.id});

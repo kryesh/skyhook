@@ -1,6 +1,5 @@
 //! Shared model-facing input conversion and opaque reasoning provenance.
 use crate::{
-    job::omit_null_fields,
     media::{AttachmentRef, ImageRef, MediaError, TextRef},
     provider::{
         ProviderError, ProviderErrorKind,
@@ -131,9 +130,7 @@ pub(crate) fn validate_openai_effort(effort: &str) -> Result<(), ProviderError> 
 pub(crate) fn tool_text(tool: &ToolResult) -> String {
     // Keep the result and failure status distinguishable; a JSON result
     // that happens to contain similarly named keys must not overwrite metadata.
-    let mut value = json!({"result":tool.result,"is_error":tool.is_error});
-    omit_null_fields(&mut value);
-    value.to_string()
+    json!({"result":tool.result,"is_error":tool.is_error}).to_string()
 }
 
 /// Attach a runtime-only tail message to the last encoded item when that item is a

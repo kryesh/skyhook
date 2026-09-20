@@ -3,69 +3,40 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{identity::JobId, tool::Denial};
-
-#[derive(Serialize)]
-pub(super) struct SourceProvenance {
-    pub(super) source_job: JobId,
-    pub(super) annotations: std::collections::BTreeSet<String>,
-}
+use std::collections::BTreeSet;
 
 /// Variant-specific fields are grouped here and serialized without patching JSON objects.
 pub(super) enum HostResponse {
     Success {
         value: Value,
-        provenance: Option<SourceProvenance>,
+        annotations: Option<BTreeSet<String>>,
     },
-    Failure {
-        message: String,
-        denial: Option<Denial>,
-        output: Option<Value>,
-    },
+    // Tool failures travel in Success.value as public JobViews; only receive
+    // failures use this private bridge error.
+    Failure(String),
 }
 
 impl HostResponse {
-    pub(super) fn failure(message: String) -> Self {
-        Self::Failure {
-            message,
-            denial: None,
-            output: None,
-        }
-    }
-
     pub(super) fn encode(&self) -> Result<String, serde_json::Error> {
         #[derive(Serialize)]
         struct Success<'a> {
             ok: bool,
             value: &'a Value,
-            #[serde(flatten, skip_serializing_if = "Option::is_none")]
-            provenance: &'a Option<SourceProvenance>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            annotations: &'a Option<BTreeSet<String>>,
         }
         #[derive(Serialize)]
         struct Failure<'a> {
             ok: bool,
             error: &'a str,
-            #[serde(flatten, skip_serializing_if = "Option::is_none")]
-            denial: &'a Option<Denial>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            output: &'a Option<Value>,
         }
         match self {
-            Self::Success { value, provenance } => serde_json::to_string(&Success {
+            Self::Success { value, annotations } => serde_json::to_string(&Success {
                 ok: true,
                 value,
-                provenance,
+                annotations,
             }),
-            Self::Failure {
-                message,
-                denial,
-                output,
-            } => serde_json::to_string(&Failure {
-                ok: false,
-                error: message,
-                denial,
-                output,
-            }),
+            Self::Failure(error) => serde_json::to_string(&Failure { ok: false, error }),
         }
     }
 }
@@ -77,40 +48,25 @@ mod tests {
 
     #[test]
     fn response_codecs_keep_omissions_and_null_payloads() {
-        let provenance = SourceProvenance {
-            source_job: serde_json::from_value(json!(1)).unwrap(),
-            annotations: Default::default(),
-        };
+        let annotations = ["/result/text".to_owned()].into_iter().collect();
         for (response, expected) in [
             (
                 HostResponse::Success {
                     value: Value::Null,
-                    provenance: None,
+                    annotations: None,
                 },
                 json!({"ok":true,"value":null}),
             ),
             (
                 HostResponse::Success {
                     value: json!(12),
-                    provenance: Some(provenance),
+                    annotations: Some(annotations),
                 },
-                json!({"ok":true,"value":12,"source_job":1,"annotations":[]}),
+                json!({"ok":true,"value":12,"annotations":["/result/text"]}),
             ),
             (
-                HostResponse::Failure {
-                    message: "failure".into(),
-                    denial: None,
-                    output: Some(Value::Null),
-                },
-                json!({"ok":false,"error":"failure","output":null}),
-            ),
-            (
-                HostResponse::Failure {
-                    message: "denied".into(),
-                    denial: Some(Denial::permission_denied()),
-                    output: Some(json!({"nested":null})),
-                },
-                json!({"ok":false,"error":"denied","code":"permission_denied","executed":false,"output":{"nested":null}}),
+                HostResponse::Failure("failure".into()),
+                json!({"ok":false,"error":"failure"}),
             ),
         ] {
             assert_eq!(

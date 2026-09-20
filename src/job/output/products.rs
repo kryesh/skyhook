@@ -2,6 +2,7 @@
 //! not an admission path for a presentation or its associated attachments.
 use super::{OutputArgs, Value};
 use crate::{job::JobState, media::ImageRef};
+use schemars::JsonSchema;
 use serde::Serialize;
 
 /// Attachment intent depends on presence, never on equality to default values:
@@ -33,37 +34,25 @@ impl OutputArgs {
     }
 }
 
-/// A source page and continuation constructed by the saved-output reader.
-/// A continuation always owns its line and optional byte offset together.
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+/// A source page with explicit continuation defaults at end of output.
+#[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
 pub(crate) struct OutputPreview {
     pub(crate) field: String,
     pub(crate) lines: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) total_lines: Option<usize>,
-    #[serde(flatten)]
-    pub(crate) next: Option<OutputContinuation>,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-pub(crate) struct OutputContinuation {
-    #[serde(rename = "next_start")]
-    pub(crate) start: usize,
-    #[serde(rename = "next_offset", skip_serializing_if = "is_zero")]
-    pub(crate) offset: usize,
-}
-
-fn is_zero(value: &usize) -> bool {
-    *value == 0
+    #[schemars(range(min = 1))]
+    pub(crate) next_start: Option<usize>,
+    pub(crate) next_offset: usize,
 }
 
 /// A truncated structured field and its source continuation.
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
 pub(crate) struct OutputTruncation {
     pub(crate) field: String,
     pub(crate) total_lines: usize,
-    #[serde(flatten)]
-    pub(crate) next: OutputContinuation,
+    #[schemars(range(min = 1))]
+    pub(crate) next_start: usize,
+    pub(crate) next_offset: usize,
 }
 
 /// A manager-produced projection, with attachments from the same job snapshot
@@ -88,9 +77,15 @@ impl PresentedOutput {
         index: usize,
         page: Result<PresentedOutput, crate::tool::ToolError>,
     ) {
-        self.view["captures"][index]["output"] = match page {
+        self.view["presentation"]["captures"][index]["output"] = match page {
             Ok(page) => page.view,
-            Err(error) => serde_json::json!({"error": error.to_string()}),
+            Err(error) => crate::job::JobView::failure(
+                error.to_string(),
+                None,
+                None,
+                crate::job::JobMetadata::default(),
+            )
+            .into_value(),
         };
     }
     pub fn view(&self) -> &Value {
@@ -101,5 +96,39 @@ impl PresentedOutput {
     }
     pub fn into_view(self) -> Value {
         self.view
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn pagination_fields_are_stable_at_end_and_at_zero_offset() {
+        let end = serde_json::to_value(OutputPreview {
+            field: "/result".into(),
+            lines: vec!["done".into()],
+            total_lines: None,
+            next_start: None,
+            next_offset: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            end,
+            json!({
+                "field":"/result", "lines":["done"], "total_lines":null,
+                "next_start":null, "next_offset":0
+            })
+        );
+
+        let truncated = serde_json::to_value(OutputTruncation {
+            field: "/result/log".into(),
+            total_lines: 101,
+            next_start: 101,
+            next_offset: 0,
+        })
+        .unwrap();
+        assert_eq!(truncated["next_offset"], 0);
     }
 }

@@ -198,7 +198,7 @@ impl JobManager {
             let saved = manager.output(id);
             // Captures have independent pointer/type metadata. A failed tool need not
             // produce a result, and unfinished JSON captures are not valid result trees.
-            let document = serde_json::json!({"capture_complete":capture_complete, "result":output, "error":error});
+            let document = serde_json::json!({"capture_complete":capture_complete, "has_result":output.is_some(), "result":output, "error":error});
             output::blocking(move || output::save_completed(&saved, &document, captures))
                 .await
                 .map_err(|e| JobError::Internal(e.to_string()))?;

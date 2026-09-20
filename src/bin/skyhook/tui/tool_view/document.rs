@@ -240,7 +240,7 @@ impl Document {
         // In particular, reaching the final preview page does not imply that
         // the original output was captured completely.
         let notice = output
-            .get("notice")
+            .pointer("/presentation/notice")
             .and_then(Value::as_str)
             .filter(|notice| !notice.trim().is_empty());
         if let Some(notice) = notice {
@@ -271,7 +271,10 @@ impl Document {
             let mut metadata = output.clone();
             omit_null_fields(&mut metadata);
             // `output` is a TUI-only selected-field view, not capture metadata.
-            if let Some(captures) = metadata.get_mut("captures").and_then(Value::as_array_mut) {
+            if let Some(captures) = metadata
+                .pointer_mut("/presentation/captures")
+                .and_then(Value::as_array_mut)
+            {
                 for capture in captures {
                     if let Some(capture) = capture.as_object_mut() {
                         capture.remove("output");
@@ -279,7 +282,9 @@ impl Document {
                 }
             }
             if notice.is_some()
-                && let Some(object) = metadata.as_object_mut()
+                && let Some(object) = metadata
+                    .get_mut("presentation")
+                    .and_then(Value::as_object_mut)
             {
                 object.remove("notice");
             }
@@ -595,11 +600,9 @@ mod tests {
     #[test]
     fn borrowed_historical_output_matches_owned_view() {
         for output in [
-            json!({"preview": {"field": "", "lines": ["{\"result\": {\"ok\": true}, \"error\": null}"], "total_lines": 1}}),
-            json!({"result": {"stdout": "out", "content": "text"}, "error": "failed", "notice": "Output incomplete."}),
-            json!({"preview": {"field": "/result", "lines": ["[1,"], "next_start": 2},
-                "captures": [{"field": "/result/a", "output": {"error": "read failed",
-                    "preview": {"field": "/result/a", "lines": ["a"], "total_lines": 1}}}]}),
+            json!({"presentation": {"preview": {"next_offset": 0, "field": "", "lines": ["{\"result\": {\"ok\": true}, \"error\": null}"], "total_lines": 1}}}),
+            json!({"result": {"stdout": "out", "content": "text"}, "error": "failed", "presentation": {"notice": "Output incomplete."}}),
+            json!({"presentation": {"preview": {"next_offset": 0, "field": "/result", "lines": ["[1,"], "next_start": 2}, "captures": [{"field": "/result/a", "output": {"error": "read failed", "presentation": {"preview": {"field": "/result/a", "lines": ["a"], "total_lines": 1}}}}]}}),
             json!("plain text"),
         ] {
             let tool_args = json!({"path": "file.rs"});
@@ -643,7 +646,7 @@ mod tests {
     fn whole_output_preview(saved: &Value) -> Value {
         let source = serde_json::to_string_pretty(saved).unwrap();
         let lines: Vec<_> = source.lines().collect();
-        json!({"field": "", "total_lines": lines.len(), "lines": lines})
+        json!({"next_offset": 0, "field": "", "total_lines": lines.len(), "lines": lines})
     }
 
     fn displayed(saved: &Value) -> String {
@@ -727,11 +730,7 @@ mod tests {
 
     #[test]
     fn error_outputs_keep_structured_details_and_exact_source_without_duplicate_summaries() {
-        let output = json!({
-            "error": "Permission was denied",
-            "code": "permission_denied", "executed": false,
-            "result": {"stdout": "  exact\toutput\n\n", "error": "Permission was denied"}
-        });
+        let output = json!({"error": "Permission was denied", "result": {"stdout": "  exact\toutput\n\n", "error": "Permission was denied"}, "meta": {"code": "permission_denied", "executed": false}});
         let before = output.clone();
         let document = with_error(&output, Some("Permission was denied"));
         let text = document.plain_text();
@@ -777,12 +776,12 @@ mod tests {
             ),
         ] {
             for byte_offset in [false, true] {
-                let mut output = json!({"preview": {
-                    "field": field, "lines": source.split('\n').collect::<Vec<_>>(),
+                let mut output = json!({"presentation": {"preview": {
+                    "next_offset": 0, "field": field, "lines": source.split('\n').collect::<Vec<_>>(),
                     "total_lines": 1000, "next_start": 10
-                }});
+                }}});
                 if byte_offset {
-                    output["preview"]["next_offset"] = json!(200);
+                    output["presentation"]["preview"]["next_offset"] = json!(200);
                 }
                 let original = output.clone();
                 let document = rendered(tool, &Value::Null, &output);
@@ -844,9 +843,9 @@ mod tests {
             ("script", "", "{\"unexpected EOF\": [", false),
         ] {
             let lines: Vec<_> = source.split('\n').collect();
-            let mut output = json!({"preview": {"field": field, "lines": lines}});
+            let mut output = json!({"presentation": {"preview": {"next_offset": 0, "field": field, "lines": lines}}});
             if next {
-                output["preview"]["next_start"] = json!(2);
+                output["presentation"]["preview"]["next_start"] = json!(2);
             }
             let document = rendered(tool, &json!({"path": "data.json"}), &output);
             assert!(has_source(&document, source), "{tool}: {source}");
@@ -858,16 +857,15 @@ mod tests {
         for (preview, footer) in [
             (Value::Null, None),
             (
-                json!({"field": "/result/stdout", "lines": ["payload"]}),
+                json!({"next_offset": 0, "field": "/result/stdout", "lines": ["payload"]}),
                 Some("End of available output"),
             ),
             (
-                json!({"field": "/result/stdout", "lines": ["payload"], "next_start": 2}),
+                json!({"next_offset": 0, "field": "/result/stdout", "lines": ["payload"], "next_start": 2}),
                 Some("More saved output available"),
             ),
         ] {
-            let output = json!({"notice": "Output incomplete.", "preview": preview,
-                                "result": {"stdout": "payload"}});
+            let output = json!({"result": {"stdout": "payload"}, "presentation": {"notice": "Output incomplete.", "preview": preview}});
             let text = rendered("exec", &Value::Null, &output).plain_text();
             assert_eq!(text.matches("Output incomplete.").count(), 1);
             assert_eq!(text.matches("payload").count(), 1);
@@ -879,20 +877,9 @@ mod tests {
     fn live_captures_keep_unique_read_errors_without_duplicate_envelopes_or_empty_panes() {
         for preview in [
             Value::Null,
-            json!({"field": "", "lines": [], "total_lines": 0}),
+            json!({"next_offset": 0, "field": "", "lines": [], "total_lines": 0}),
         ] {
-            let output = json!({
-                "state": "running", "result": null, "preview": preview,
-                "notice": "Output incomplete.", "error": "parent failure",
-                "captures": [
-                    {"field": "/result/custom", "kind": "text", "complete": false, "output": {
-                        "notice": "Output incomplete.", "error": "parent failure",
-                        "preview": {"field": "/result/custom", "lines": ["  live payload\t"], "next_start": 2}
-                    }},
-                    {"field": "/result/missing", "output": {"error": "field read failed"}},
-                    {"field": "/result/duplicate", "output": {"error": "field read failed"}}
-                ]
-            });
+            let output = json!({"state": "running", "result": null, "error": "parent failure", "presentation": {"preview": preview, "notice": "Output incomplete.", "captures": [{"field": "/result/custom", "kind": "text", "complete": false, "output": {"error": "parent failure", "presentation": {"notice": "Output incomplete.", "preview": {"field": "/result/custom", "lines": ["  live payload\t"], "next_start": 2, "next_offset": 0}}}}, {"field": "/result/missing", "output": {"error": "field read failed"}}, {"field": "/result/duplicate", "output": {"error": "field read failed"}}]}});
             let mut document = Document::default();
             let view = OutputView::historical(output);
             document.output_with_error(
@@ -931,7 +918,7 @@ mod tests {
     fn complete_whole_output_preview_owns_identical_error_summaries_without_losing_source() {
         for error in [
             json!("failed exactly"),
-            json!({"message": "failed exactly", "code": 7}),
+            json!({"message": "failed exactly", "meta": {"code": 7}}),
         ] {
             for pointer in ["/error", "/result/error", "both"] {
                 let mut saved = json!({"error": null, "result": {
@@ -943,10 +930,7 @@ mod tests {
                 if pointer != "/error" {
                     saved["result"]["error"] = error.clone();
                 }
-                let output = json!({
-                    "error": error, "result": {"error": error},
-                    "preview": whole_output_preview(&saved)
-                });
+                let output = json!({"error": error, "result": {"error": error}, "presentation": {"preview": whole_output_preview(&saved)}});
                 let before = output.clone();
                 let document = with_error(&output, error.as_str());
                 assert!(error_sources(&document).is_empty(), "{pointer}: {error}");
@@ -976,7 +960,7 @@ mod tests {
         ] {
             let mut preview = complete.clone();
             preview[key] = value;
-            let output = json!({"error": "failed exactly", "preview": preview});
+            let output = json!({"error": "failed exactly", "presentation": {"preview": preview}});
             let document = with_error(&output, Some("failed exactly"));
             assert_eq!(error_sources(&document), ["failed exactly"], "{name}");
             // The preview remains visible even when it also contains the error.
@@ -989,19 +973,19 @@ mod tests {
             "[ {\"error\": \"failed exactly\"} ]", // Not a saved document.
             "\"failed exactly\"",
         ] {
-            let output = json!({"error": "failed exactly", "preview": {
-                "field": "", "total_lines": 1, "lines": [source]
-            }});
+            let output = json!({"error": "failed exactly", "presentation": {"preview": {
+                "next_offset": 0, "field": "", "total_lines": 1, "lines": [source]
+            }}});
             let document = rendered("exec", &Value::Null, &output);
             assert_eq!(error_sources(&document), ["failed exactly"], "{source}");
             assert_eq!(document.plain_text().matches("failed exactly").count(), 2);
         }
         // Without an envelope summary only a complete preview owns the error.
-        let mut output = json!({"preview": complete});
+        let mut output = json!({"presentation": {"preview": complete}});
         let document = with_error(&output, Some("failed exactly"));
         assert!(error_sources(&document).is_empty());
         assert_eq!(document.plain_text().matches("failed exactly").count(), 1);
-        output["preview"]["next_start"] = json!(2);
+        output["presentation"]["preview"]["next_start"] = json!(2);
         let document = with_error(&output, Some("failed exactly"));
         assert_eq!(error_sources(&document), ["failed exactly"]);
         let mut document = Document::default();
@@ -1019,29 +1003,21 @@ mod tests {
             json!({"message": "failed exactly", "result": {"message": "failed exactly"}}),
             json!({"result": "failed exactly"}),
         ] {
-            let output =
-                json!({"error": "failed exactly", "preview": whole_output_preview(&saved)});
+            let output = json!({"error": "failed exactly", "presentation": {"preview": whole_output_preview(&saved)}});
             let document = rendered("exec", &Value::Null, &output);
             assert_eq!(error_sources(&document), ["failed exactly"], "{saved}");
             let source = displayed(&saved);
             assert!(has_code(&document, |shown, _, role| shown == source
                 && role == Role::Plain));
         }
-        let output = json!({
-            "error": "outer error", "result": {"error": "inner error"},
-            "preview": whole_output_preview(&json!({"error": "outer error", "result": null}))
-        });
+        let output = json!({"error": "outer error", "result": {"error": "inner error"}, "presentation": {"preview": whole_output_preview(&json!({"error": "outer error", "result": null}))}});
         let document = with_error(&output, Some("third error"));
         assert_eq!(error_sources(&document), ["third error", "inner error"]);
         assert_eq!(document.plain_text().matches("outer error").count(), 1);
         // Deduplication requires exact structured values, not similar messages.
-        let first = json!({"message": "read failed", "code": 1});
-        let second = json!({"message": "read failed", "code": 2});
-        let output = json!({
-            "error": first,
-            "result": {"error": first, "stdout": "read failed with extra source text"},
-            "captures": [{"field": "/result/stdout", "output": {"error": second}}]
-        });
+        let first = json!({"message": "read failed", "meta": {"code": 1}});
+        let second = json!({"message": "read failed", "meta": {"code": 2}});
+        let output = json!({"error": first, "result": {"error": first, "stdout": "read failed with extra source text"}, "presentation": {"captures": [{"field": "/result/stdout", "output": {"error": second}}]}});
         let text = with_error(&output, Some("read failed")).plain_text();
         assert_eq!(text.matches("\"code\": 1").count(), 1);
         assert_eq!(text.matches("\"code\": 2").count(), 1);

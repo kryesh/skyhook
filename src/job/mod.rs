@@ -44,7 +44,7 @@ pub(super) mod views;
 
 pub(crate) use delivery::PendingDelivery;
 pub use views::JobEnvelope;
-pub(crate) use views::{ActiveJob, ActiveJobLocation, presented_job_schema};
+pub(crate) use views::{ActiveJob, ActiveJobLocation, JobMetadata, JobView, presented_job_schema};
 mod persistence;
 mod progress;
 mod supervisor;

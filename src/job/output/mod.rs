@@ -3,9 +3,10 @@ mod captures;
 mod finalization;
 mod products;
 pub(crate) use finalization::save_completed;
-pub(crate) use products::{OutputContinuation, OutputPreview, OutputTruncation};
+pub(crate) use products::{OutputPreview, OutputTruncation};
 pub use products::{OutputSelection, PresentedOutput};
 mod reader;
+pub(crate) use captures::CaptureDescriptor;
 pub use captures::CaptureKind;
 pub(crate) use captures::{
     AsyncCapture, CaptureWriter, CompletedCapture, PendingCapture, TextCaptureField,
@@ -33,8 +34,8 @@ pub(crate) const CONTENT_BYTES: usize = PAGE_BYTES - 2048;
 
 pub(crate) use truncation::annotated_fields;
 
-/// Omit null-valued object fields from tool-output presentation copies.
-/// Use for model, history, and UI views, not lossless saved or script-native output.
+/// Omit null-valued object fields from human-only UI display copies.
+/// Never use for model, history, saved output, or JavaScript response data.
 /// Null array entries and literal strings stay intact to preserve indices and text.
 pub fn omit_null_fields(value: &mut Value) {
     match value {
@@ -44,12 +45,6 @@ pub fn omit_null_fields(value: &mut Value) {
         }),
         Value::Array(values) => values.iter_mut().for_each(omit_null_fields),
         _ => {}
-    }
-}
-
-fn capture_notice(output: &mut serde_json::Map<String, Value>, complete: Option<bool>) {
-    if complete == Some(false) {
-        output.insert("notice".into(), json!("Output incomplete."));
     }
 }
 
@@ -96,6 +91,14 @@ impl Saved {
         })
     }
 
+    /// Saved presence is explicit because JSON cannot distinguish `None` from
+    /// `Some(null)`.
+    fn has_result(&self) -> bool {
+        self.document
+            .as_ref()
+            .is_some_and(|document| document["has_result"] == true)
+    }
+
     /// Any registered capture at `field`, complete or not.
     fn capture(&self, field: &str) -> Option<Source> {
         self.captures.get(field).map(|capture| {
@@ -126,13 +129,10 @@ impl Saved {
     }
 }
 
-/// Presentation provenance for a script's full, independently saved return value.
-/// Pointers are rooted at /result/value. Child jobs own their native output ranges;
-/// annotated script fields own ranges in this job instead.
+/// Presentation annotations for a script's independently saved return value.
+/// Pointers are rooted at /result/value. Annotated fields opt into truncation and paging.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct ScriptPresentation {
-    #[serde(default)]
-    pub jobs: BTreeMap<String, JobId>,
     #[serde(default)]
     pub fields: BTreeSet<String>,
 }
@@ -141,15 +141,6 @@ impl ScriptPresentation {
     fn load(output: &Output) -> Result<Self, ToolError> {
         let rows = output.db.presentation(output.job.get()).map_err(database)?;
         Ok(Self {
-            jobs: rows
-                .children
-                .into_iter()
-                .map(|(field, child)| {
-                    JobId::new(child)
-                        .map(|child| (field, child))
-                        .map_err(|error| ToolError::Failed(error.to_string()))
-                })
-                .collect::<Result<_, _>>()?,
             fields: rows.fields.into_iter().collect(),
         })
     }
@@ -403,21 +394,13 @@ fn render(
 /// Who reads a presentation. Model-facing reads acknowledge the job's pending
 /// notification; host inspection never does and always shows details.
 #[derive(Clone, Copy)]
-pub(crate) enum OutputOptions<'a> {
-    Host {
-        viewer: Option<&'a crate::execution::ExecutionLocation>,
-        presentation: OutputPresentation,
-    },
-    Model {
-        viewer: Option<&'a crate::execution::ExecutionLocation>,
-        detailed: bool,
-        presentation: OutputPresentation,
-    },
+pub(crate) enum OutputOptions {
+    Host { presentation: OutputPresentation },
+    Model { presentation: OutputPresentation },
 }
 
-impl OutputOptions<'_> {
+impl OutputOptions {
     pub(crate) const HOST: Self = Self::Host {
-        viewer: None,
         presentation: OutputPresentation::Full,
     };
 }
@@ -428,28 +411,11 @@ impl JobManager {
         job: JobId,
         presentation: ScriptPresentation,
     ) -> Result<(), ToolError> {
-        // Provenance may only refer to this script's own executed child calls.
-        for child in presentation.jobs.values() {
-            if self
-                .metadata(*child)
-                .await
-                .map_err(|error| ToolError::Failed(error.to_string()))?
-                .parent
-                != Some(job)
-            {
-                return Err(ToolError::Failed("invalid script result provenance".into()));
-            }
-        }
-        if presentation.jobs.is_empty() && presentation.fields.is_empty() {
+        if presentation.fields.is_empty() {
             return Ok(());
         }
         let output = self.output(job);
         let rows = crate::session::Presentation {
-            children: presentation
-                .jobs
-                .into_iter()
-                .map(|(field, child)| (field, child.get()))
-                .collect(),
             fields: presentation.fields.into_iter().collect(),
         };
         let job = output.job.get();
@@ -479,8 +445,6 @@ impl JobManager {
             args,
             capabilities,
             OutputOptions::Model {
-                viewer: None,
-                detailed: true,
                 presentation: crate::job::OutputPresentation::Full,
             },
         )
@@ -501,8 +465,8 @@ impl JobManager {
             .map(PresentedOutput::into_view)
     }
 
-    /// Host UI field discovery uses the saved tree, never presentation wrappers
-    /// that may substitute a child's JobView for a script's original return.
+    /// Host UI field discovery uses the saved tree rather than presentation
+    /// wrappers, previews, or capture descriptors.
     pub async fn inspect_output_fields(&self, job: JobId) -> Result<Vec<String>, ToolError> {
         let terminal = self
             .metadata(job)
@@ -545,7 +509,7 @@ impl JobManager {
                     visit(result, "/result".into(), &mut paths);
                 }
             }
-            for capture in captures::available_captures(&saved, terminal)? {
+            for capture in captures::available_captures(&saved, terminal) {
                 if !paths.contains(&capture.field) {
                     paths.push(capture.field);
                 }
@@ -594,18 +558,11 @@ impl JobManager {
         &self,
         args: OutputArgs,
         capabilities: &CapabilitySet,
-        options: OutputOptions<'_>,
+        options: OutputOptions,
     ) -> Result<PresentedOutput, ToolError> {
-        let (acknowledge, viewer, detailed, presentation) = match options {
-            OutputOptions::Host {
-                viewer,
-                presentation,
-            } => (false, viewer, true, presentation),
-            OutputOptions::Model {
-                viewer,
-                detailed,
-                presentation,
-            } => (true, viewer, detailed, presentation),
+        let (acknowledge, presentation) = match options {
+            OutputOptions::Host { presentation } => (false, presentation),
+            OutputOptions::Model { presentation } => (true, presentation),
         };
         let limit = args.limit.unwrap_or(100);
         if !(1..=1000).contains(&limit) || args.start == Some(0) || args.context.unwrap_or(0) > 20 {
@@ -664,8 +621,8 @@ impl JobManager {
         };
         if last_message.is_some() {
             envelope.output = None;
-            let view =
-                envelope.presented_with_reference(capabilities, viewer, detailed, last_message)?;
+            let mut view = envelope.metadata_view(capabilities);
+            view.meta.as_mut().expect("metadata view").last_message = last_message;
             if acknowledge {
                 self.claim(args.job)
                     .await
@@ -673,7 +630,7 @@ impl JobManager {
             }
             return Ok(PresentedOutput {
                 state: envelope.state,
-                view,
+                view: view.into_value(),
                 images,
                 capture_targets: Vec::new(),
             });
@@ -681,12 +638,15 @@ impl JobManager {
         let terminal = envelope.state.is_terminal();
         let question = envelope.state == JobState::WaitingInput;
         let live_question = envelope.output.take();
-        let mut view = envelope.presented_for(capabilities, viewer, detailed)?;
-        let map = view.as_object_mut().expect("job envelope is an object");
-        map.remove("output");
+        let mut view = if !acknowledge || explicit || presentation == OutputPresentation::Full {
+            envelope.metadata_view(capabilities)
+        } else {
+            envelope.response_view(capabilities)
+        };
+        let mut annotations = views::Presentation::default();
         let output = self.output(args.job);
         let saved = blocking(move || Saved::load(&output).map(std::sync::Arc::new)).await?;
-        let captures = captures::available_captures(&saved, terminal)?;
+        let captures = captures::available_captures(&saved, terminal);
         let incomplete_capture = terminal
             && captures.iter().any(|capture| {
                 !capture.complete
@@ -698,9 +658,6 @@ impl JobManager {
                             .strip_prefix(&selection.field)
                             .is_some_and(|suffix| suffix.starts_with('/')))
             });
-        if !captures.is_empty() {
-            map.insert("captures".into(), serde_json::to_value(&captures)?);
-        }
         let structured = !explicit && terminal && saved.document.is_some();
         let mut presented_question = false;
         let mut question_page = None;
@@ -708,50 +665,27 @@ impl JobManager {
             let presentation_output = saved.output.clone();
             let script_presentation =
                 blocking(move || ScriptPresentation::load(&presentation_output)).await?;
-            let mut children = BTreeMap::new();
-            let mut replacements = BTreeMap::new();
-            for (field, child) in script_presentation.jobs {
-                if self
-                    .metadata(child)
-                    .await
-                    .map_err(|error| ToolError::Failed(error.to_string()))?
-                    .parent
-                    != Some(args.job)
-                {
-                    return Err(ToolError::Failed("invalid script result provenance".into()));
-                }
-                if let std::collections::btree_map::Entry::Vacant(entry) = children.entry(child) {
-                    let mut query = OutputArgs::new(child);
-                    query.cancellation = args.cancellation.clone();
-                    let view = Box::pin(self.present_output_with(
-                        query,
-                        capabilities,
-                        OutputOptions::Host {
-                            viewer,
-                            presentation: OutputPresentation::Full,
-                        },
-                    ))
-                    .await?;
-                    entry.insert(view.into_view());
-                }
-                replacements.insert(field, children[&child].clone());
-            }
             let projected = saved.clone();
             let cancellation = args.cancellation.clone().unwrap_or_default();
-            let view = blocking(move || {
+            let projected = blocking(move || {
                 truncation::project(
                     &projected,
                     &output_schema,
                     &cancellation,
                     &script_presentation.fields,
-                    &replacements,
                 )
             })
             .await?;
-            map.extend(view);
+            view.result = projected.result;
+            annotations.truncated = projected.truncated;
+            annotations.notice = projected.notice;
+            // A terminal document may contain only an error/capture inventory.
+            // Result presence, not document presence or non-nullness, establishes
+            // availability (an explicitly stored null is still a real result).
+            view.has_result = saved.has_result();
         } else if question && let Some(value) = live_question {
             if !explicit {
-                map.insert("question".into(), value);
+                annotations.question = Some(value);
                 presented_question = true;
             } else {
                 let bytes = serde_json::to_vec_pretty(&value)?;
@@ -767,7 +701,7 @@ impl JobManager {
                 }
             }
         }
-        if !structured && !map.contains_key("question") {
+        if !structured && annotations.question.is_none() {
             if !explicit && !question && saved.document.is_some() {
                 selection.field = String::new();
             }
@@ -796,12 +730,14 @@ impl JobManager {
                     .as_ref()
                     .and_then(|document| document.get("capture_complete"))
                     .and_then(Value::as_bool);
-                capture_notice(map, complete);
+                if complete == Some(false) {
+                    annotations.notice = Some("Output incomplete.".into());
+                }
             }
-            map.insert("preview".into(), serde_json::to_value(&page)?);
+            annotations.preview = Some(page);
         }
         if incomplete_capture {
-            capture_notice(map, Some(false));
+            annotations.notice = Some("Output incomplete.".into());
         }
         if acknowledge
             && ((terminal && !selection.field.starts_with("/questions/")) || presented_question)
@@ -810,18 +746,21 @@ impl JobManager {
                 .await
                 .map_err(|e| ToolError::Failed(e.to_string()))?;
         }
-        // Preserve presence before presentation elides object nulls. Hydration
-        // targets come from discovered records, never decoded wire descriptors.
-        let capture_targets = captures
+        // An unavailable result gets a public null placeholder, but an explicit
+        // payload null remains authoritative. Hydration targets come from
+        // discovered records, never decoded wire descriptors.
+        let mut capture_targets: Vec<_> = captures
             .iter()
             .enumerate()
-            .filter(|(_, capture)| {
-                output_selection == OutputSelection::WholeWithImages
-                    && view.pointer(&capture.field).is_none()
-            })
+            .filter(|_| output_selection == OutputSelection::WholeWithImages)
             .map(|(index, capture)| (index, capture.field.clone()))
             .collect();
-        omit_null_fields(&mut view);
+        annotations.captures = captures;
+        view.presentation = annotations.into_option();
+        let view = view.into_value();
+        capture_targets.retain(|(_, field)| {
+            view.pointer(field).is_none() || (field == "/result" && view["has_result"] == false)
+        });
         Ok(PresentedOutput {
             state: envelope.state,
             view,
@@ -848,16 +787,21 @@ impl JobManager {
         let output = self.output(envelope.id);
         let value = blocking(move || {
             let saved = Saved::load(&output)?;
+            let has_result = saved.has_result();
             saved
                 .document
                 .clone()
-                .map(|document| hydrate(&saved, document, maximum))
+                .map(|document| hydrate(&saved, document, maximum).map(|value| (has_result, value)))
                 .transpose()
         })
         .await
         .map_err(|e| JobError::Internal(e.to_string()))?;
-        if let Some(mut value) = value {
-            envelope.output = value.get_mut("result").map(Value::take);
+        if let Some((has_result, mut value)) = value {
+            envelope.output = if has_result {
+                value.get_mut("result").map(Value::take)
+            } else {
+                None
+            };
         }
         Ok(())
     }
@@ -948,45 +892,6 @@ fn materialize_field(
     Ok(Source::Memory(std::io::Cursor::new(bytes)))
 }
 
-pub(crate) fn view_schema(capabilities: &CapabilitySet) -> Value {
-    let mut schema = super::presented_job_schema(capabilities, false);
-    let properties = schema["properties"]
-        .as_object_mut()
-        .expect("envelope properties");
-    properties.remove("output");
-    for name in ["result", "question"] {
-        properties.insert(name.into(), json!({}));
-    }
-    properties.insert("notice".into(), json!({"type":"string"}));
-    properties.insert(
-        "captures".into(),
-        json!({"type":"array","items":{
-            "type":"object","properties":{
-                "field":{"type":"string"},
-                "kind":{"type":"string","enum":["text","json","unknown"]},
-                "complete":{"type":"boolean"}
-            },"required":["field","kind","complete"],"additionalProperties":false
-        }}),
-    );
-    properties.insert(
-        "truncated".into(),
-        json!({"type":"array","items":{
-            "type":"object","properties":{"field":{"type":"string"},"total_lines":{"type":"integer","minimum":0},
-                "next_start":{"type":"integer","minimum":1},"next_offset":{"type":"integer","minimum":0}},
-            "required":["field","total_lines","next_start"]
-        }}),
-    );
-    properties.insert("preview".into(), json!({"type":"object","properties":{
-        "field":{"type":"string"},"lines":{"type":"array","items":{"type":"string"}},"total_lines":{"type":"integer","minimum":0},
-        "next_start":{"type":"integer","minimum":1},"next_offset":{"type":"integer","minimum":0}
-    },"required":["field","lines"]}));
-    if let Some(required) = schema["required"].as_array_mut() {
-        required.retain(|v| v != "output");
-    }
-    schema.as_object_mut().unwrap().remove("allOf");
-    schema
-}
-
 /// Upper bound on the bytes automatic presentation would emit for this output, used
 /// to budget notification batches. Inline content counts whole; a capture-backed
 /// field counts as at most a page (`bytes * 6` covers JSON escaping).
@@ -1013,7 +918,7 @@ pub(crate) fn transfer_fields(
     output: &Output,
 ) -> Result<Vec<(String, CaptureKind, Source)>, ToolError> {
     let saved = Saved::load(output)?;
-    Ok(captures::available_captures(&saved, true)?
+    Ok(captures::available_captures(&saved, true)
         .into_iter()
         .filter(|capture| {
             // Unreferenced/unfinished captures have no result value to carry
@@ -1118,6 +1023,30 @@ mod tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn script_returned_json_is_not_replaced_by_child_output() {
+        let (_root, manager, agent) = runtime().await;
+        let mut script = JobSpec::test(agent.clone(), "script");
+        script.role = JobRole::Script;
+        let script = manager.test_create(script).await;
+        manager.transition(script, JobState::Running).await.unwrap();
+
+        let mut child = JobSpec::test(agent, "read");
+        child.parent = Some(script);
+        let child = manager.test_create(child).await;
+        manager.transition(child, JobState::Running).await.unwrap();
+        manager.test_finish(child, json!({"child":"native"})).await;
+
+        let returned = json!({"kind":"script-value", "child_id":child.get()});
+        manager
+            .test_finish(script, json!({"value":returned.clone()}))
+            .await;
+
+        let view = host(&manager, OutputArgs::new(script)).await;
+        assert_eq!(view["result"]["value"], returned);
+        assert_eq!(view["has_result"], true);
+    }
+
     async fn model(manager: &JobManager, args: OutputArgs) -> Value {
         manager
             .present_output(args, &Default::default())
@@ -1126,7 +1055,7 @@ mod tests {
     }
 
     fn incomplete(field: &str, kind: &str) -> Value {
-        json!([{ "field":field, "kind":kind, "complete":false }])
+        json!([{ "field":field, "kind":kind, "complete":false, "output":null }])
     }
 
     /// Any explicit selector, including an explicitly supplied default, also
@@ -1167,7 +1096,7 @@ mod tests {
             OutputArgs::new(id).selection(),
             OutputSelection::WholeWithImages
         );
-        assert!(whole.view().get("preview").is_none());
+        assert!(whole.view()["presentation"]["preview"].is_null());
         for field in ["field", "start", "limit", "pattern", "context", "offset"] {
             let mut args = OutputArgs::new(id);
             match field {
@@ -1196,41 +1125,52 @@ mod tests {
                 OutputSelection::Explicit
             };
             assert_eq!(selection, expected);
-            assert_eq!(product.view()["preview"].is_object(), !whole, "{field}");
-            assert_eq!(product.view()["captures"].as_array().unwrap().len(), 1);
-            assert!(product.view()["captures"][0].get("output").is_none());
+            assert_eq!(
+                product.view()["presentation"]["preview"].is_object(),
+                !whole,
+                "{field}"
+            );
+            assert_eq!(
+                product.view()["presentation"]["captures"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(product.view()["presentation"]["captures"][0]["output"].is_null());
         }
         assert_eq!(manager.images(id).await.unwrap(), images);
     }
 
     #[tokio::test]
-    async fn presentation_omits_null_fields_but_saved_output_stays_lossless() {
-        let raw = json!({
-            "error": null,
-            "nested": {"absent": null, "ok": false},
-            "array": [null, {"absent": null, "count": 0}]
-        });
-        let (_root, manager, id) = fixture(Some(raw.clone())).await;
-        let expected = json!({"nested": {"ok": false}, "array": [null, {"count": 0}]});
-        assert_eq!(
-            model(&manager, OutputArgs::new(id)).await["result"],
-            expected
-        );
-        let host_view = host(&manager, OutputArgs::new(id)).await;
-        assert_eq!(host_view["result"], expected);
-        let product = manager
-            .present_output_with(
-                OutputArgs::new(id),
-                &Default::default(),
-                OutputOptions::HOST,
-            )
-            .await
-            .unwrap();
-        // The canonical product preserves established presentation policy; it
-        // is not a new raw/lossless payload channel.
-        assert_eq!(product.view(), &host_view);
-        let saved = manager.output(id).test_document().unwrap();
-        assert_eq!(saved["result"], raw);
+    async fn presentation_preserves_nulls_defaults_and_saved_result_presence() {
+        for raw in [
+            Value::Null,
+            json!({
+                "error": null,
+                "nested": {"absent": null, "ok": false},
+                "array": [null, {"absent": null, "count": 0}]
+            }),
+        ] {
+            let (_root, manager, id) = fixture(Some(raw.clone())).await;
+            for view in [
+                model(&manager, OutputArgs::new(id)).await,
+                host(&manager, OutputArgs::new(id)).await,
+            ] {
+                assert_eq!(view.get("result"), Some(&raw));
+                assert_eq!(view["has_result"], true);
+                assert_eq!(view["presentation"], Value::Null);
+            }
+            assert!(host(&manager, OutputArgs::new(id)).await["meta"].is_object());
+            assert_eq!(manager.output(id).test_document().unwrap()["result"], raw);
+            let metadata = manager
+                .metadata(id)
+                .await
+                .unwrap()
+                .metadata_view(&Default::default())
+                .into_value();
+            assert_eq!(metadata["has_result"], false);
+        }
     }
 
     /// Unfinished captures, whether abandoned by a successful result, a failure,
@@ -1244,11 +1184,9 @@ mod tests {
             } else {
                 "/result/events~1custom/nested~0key"
             };
-            assert!(
-                host(&manager, OutputArgs::new(id))
-                    .await
-                    .get("captures")
-                    .is_none()
+            assert_eq!(
+                host(&manager, OutputArgs::new(id)).await["presentation"]["captures"],
+                json!([])
             );
             let bytes = "{\"partial\":"; // Deliberately unfinished JSON.
             let output = manager.output(id);
@@ -1270,16 +1208,52 @@ mod tests {
                 }
                 let view = host(&manager, OutputArgs::new(id)).await;
                 let page = host(&manager, field_args(id, field)).await;
-                assert_eq!(view["captures"], incomplete(field, "json"));
-                assert_eq!(page["preview"]["lines"], json!([bytes]), "{outcome}");
+                assert_eq!(view["presentation"]["captures"], incomplete(field, "json"));
+                assert_eq!(
+                    page["presentation"]["preview"]["lines"],
+                    json!([bytes]),
+                    "{outcome}"
+                );
                 if outcome == "unreferenced" && terminal {
-                    assert_eq!(view["notice"], "Output incomplete.");
-                    assert_eq!(page["notice"], "Output incomplete.");
+                    assert_eq!(view["presentation"]["notice"], "Output incomplete.");
+                    assert_eq!(page["presentation"]["notice"], "Output incomplete.");
                 } else {
-                    assert!(view.get("result").is_none(), "{outcome}");
+                    assert!(view["result"].is_null(), "{outcome}");
                 }
             }
             assert_eq!(output.test_bytes(field).unwrap(), bytes.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_presence_distinguishes_null_results_from_missing_failure_output() {
+        for (state, available) in [
+            (JobState::Completed, true),
+            (JobState::Failed, true),
+            (JobState::Failed, false),
+            (JobState::Cancelled, false),
+        ] {
+            let output = available.then(|| crate::tool::ToolOutput::new(Value::Null));
+            let outcome = match state {
+                JobState::Completed => JobOutcome::Completed(output.unwrap()),
+                JobState::Failed => JobOutcome::Failed {
+                    message: "failure".into(),
+                    output,
+                    denial: None,
+                },
+                _ => JobOutcome::Cancelled,
+            };
+            let (_root, manager, id) = fixture(None).await;
+            manager.finish(id, outcome).await.unwrap();
+            let view = model(&manager, OutputArgs::new(id)).await;
+            assert_eq!(view["has_result"], available);
+            assert_eq!(view.get("result"), Some(&Value::Null));
+            // Option<Value> in older journal decoding cannot retain Some(null).
+            // Hydration must recover availability from the saved presence bit.
+            let mut envelope = manager.snapshot(id).await.unwrap();
+            envelope.output = None;
+            manager.hydrate_envelope(&mut envelope).await.unwrap();
+            assert_eq!(envelope.output.is_some(), available);
         }
     }
 
@@ -1298,13 +1272,22 @@ mod tests {
             .test_capture("/result/console", CaptureKind::Text, console.as_bytes());
         let mut query = field_args(id, "/result/console");
         query.start = Some(101);
-        let lines = |page: &Value| page["preview"]["lines"].as_array().unwrap().len();
+        let lines = |page: &Value| {
+            page["presentation"]["preview"]["lines"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
         assert_eq!(lines(&model(&manager, query.clone()).await), 50);
         manager.finish(id, JobOutcome::Cancelled).await.unwrap();
         let view = model(&manager, OutputArgs::new(id)).await;
-        assert!(view.get("result").is_none());
-        assert_eq!(view["captures"], incomplete("/result/console", "text"));
-        assert_eq!(view["notice"], "Output incomplete.");
+        assert!(view["result"].is_null());
+        assert!(!view["has_result"].as_bool().unwrap());
+        assert_eq!(
+            view["presentation"]["captures"],
+            incomplete("/result/console", "text")
+        );
+        assert_eq!(view["presentation"]["notice"], "Output incomplete.");
         assert_eq!(lines(&model(&manager, query).await), 50);
     }
 
@@ -1325,9 +1308,10 @@ mod tests {
                 query.field = field.map(str::to_owned);
                 let view = model(&manager, query).await;
                 assert!(!view.to_string().contains("capture_complete"));
-                assert_eq!(view.get("notice").is_some(), !complete);
-                if !complete {
-                    assert_eq!(view["notice"], "Output incomplete.");
+                if complete {
+                    assert!(view["presentation"]["notice"].is_null());
+                } else {
+                    assert_eq!(view["presentation"]["notice"], "Output incomplete.");
                 }
             }
         }
@@ -1344,7 +1328,7 @@ mod tests {
             let offset = args.offset.unwrap_or(0);
             let view = model(&manager, args.clone()).await;
             assert!(serde_json::to_vec(&view).unwrap().len() <= PAGE_BYTES);
-            let page = &view["preview"];
+            let page = &view["presentation"]["preview"];
             assert_eq!(page["next_start"], 1);
             let next = page["next_offset"].as_u64().unwrap() as usize;
             assert!(next > offset);
@@ -1371,14 +1355,18 @@ mod tests {
             (args.start, args.offset) = (start, offset);
             (args.pattern, args.context, args.limit) = (Some("(?i)error".into()), Some(2), Some(2));
             let view = model(&manager, args).await;
-            let lines = view["preview"]["lines"].as_array().unwrap();
+            let lines = view["presentation"]["preview"]["lines"].as_array().unwrap();
             numbers.extend(lines.iter().map(|line| line.as_str().unwrap().to_owned()));
-            let Some(next) = view["preview"]["next_start"].as_u64() else {
+            let Some(next) = view["presentation"]["preview"]["next_start"].as_u64() else {
                 break;
             };
-            assert_eq!(view["preview"]["field"], "/result/stdout");
+            assert_eq!(view["presentation"]["preview"]["field"], "/result/stdout");
             start = Some(next as usize);
-            offset = Some(view["preview"]["next_offset"].as_u64().unwrap_or(0) as usize);
+            offset = Some(
+                view["presentation"]["preview"]["next_offset"]
+                    .as_u64()
+                    .unwrap_or(0) as usize,
+            );
         }
         assert_eq!(numbers, text.lines().skip(447).take(7).collect::<Vec<_>>());
     }
@@ -1391,10 +1379,16 @@ mod tests {
 
     async fn hydrated(manager: &JobManager, job: JobId) -> PresentedOutput {
         let args = OutputArgs::new(job);
-        manager
+        let output = manager
             .inspect_output_with_captures(args, &Default::default())
             .await
-            .unwrap()
+            .unwrap();
+        assert!(
+            jsonschema::is_valid(&crate::job::presented_job_schema(false), output.view()),
+            "{}",
+            output.view()
+        );
+        output
     }
 
     #[tokio::test]
@@ -1418,14 +1412,16 @@ mod tests {
             }
             let output = hydrated(&manager, job).await;
             assert_eq!(output.state.is_terminal(), terminal);
-            let captures = output.view()["captures"].as_array().unwrap();
+            let captures = output.view()["presentation"]["captures"]
+                .as_array()
+                .unwrap();
             assert_eq!(captures.len(), fields.len());
             for (capture, field) in captures.iter().zip(&fields) {
                 assert_eq!(
                     (&capture["field"], &capture["kind"], &capture["complete"]),
                     (&json!(field), &json!("json"), &json!(false))
                 );
-                let preview = &capture["output"]["preview"];
+                let preview = &capture["output"]["presentation"]["preview"];
                 assert_eq!(
                     (&preview["field"], &preview["lines"][0]),
                     (&json!(field), &json!("{\"partial\":"))
@@ -1435,8 +1431,11 @@ mod tests {
                     if terminal { 2 } else { 1 }
                 );
                 // Capture pages are not recursively hydrated.
-                for nested in capture["output"]["captures"].as_array().unwrap() {
-                    assert!(nested.get("output").is_none());
+                for nested in capture["output"]["presentation"]["captures"]
+                    .as_array()
+                    .unwrap()
+                {
+                    assert!(nested["output"].is_null());
                 }
             }
         }
@@ -1453,12 +1452,15 @@ mod tests {
             .await;
         let output = hydrated(&manager, job).await;
         assert_eq!(output.view()["result"]["present"], "structured value");
-        // Existing null-elision presentation stays intact, without turning its null
-        // into permission to hydrate an abandoned capture at the same pointer.
-        assert!(output.view().pointer("/result/null").is_none());
-        for capture in output.view()["captures"].as_array().unwrap() {
+        // An explicit null remains present without turning into permission to
+        // hydrate an abandoned capture at the same pointer.
+        assert!(output.view().pointer("/result/null").unwrap().is_null());
+        for capture in output.view()["presentation"]["captures"]
+            .as_array()
+            .unwrap()
+        {
             assert_eq!(
-                capture.get("output").is_some(),
+                !capture["output"].is_null(),
                 capture["field"] == "/result/absent"
             );
         }
@@ -1478,14 +1480,18 @@ mod tests {
         // The live whole-result page is empty but retains its polling position;
         // the capture has an independent source-page continuation.
         assert_eq!(
-            output.view()["preview"],
-            json!({"field": "/result", "lines": [], "next_start": 1})
+            output.view()["presentation"]["preview"],
+            json!({
+                "field": "/result", "lines": [], "total_lines": null,
+                "next_start": 1, "next_offset": 0
+            })
         );
-        let preview = &output.view()["captures"][0]["output"]["preview"];
+        let preview =
+            &output.view()["presentation"]["captures"][0]["output"]["presentation"]["preview"];
         assert_eq!(preview["field"], "/result/log");
         assert_eq!(preview["lines"].as_array().unwrap().len(), 100);
         assert_eq!(preview["next_start"], 101);
-        assert!(preview.get("next_offset").is_none());
+        assert_eq!(preview["next_offset"], 0);
     }
 
     #[tokio::test]
@@ -1495,9 +1501,12 @@ mod tests {
         capture(&manager, job, "/result/bad", CaptureKind::Text, b"\xffbad");
         capture(&manager, job, "/result/good", CaptureKind::Text, b"good");
         let output = hydrated(&manager, job).await;
-        let captures = &output.view()["captures"];
+        let captures = &output.view()["presentation"]["captures"];
         assert!(!captures[0]["output"]["error"].as_str().unwrap().is_empty());
-        assert_eq!(captures[1]["output"]["preview"]["lines"], json!(["good"]));
+        assert_eq!(
+            captures[1]["output"]["presentation"]["preview"]["lines"],
+            json!(["good"])
+        );
         let mut invalid = OutputArgs::new(job);
         invalid.start = Some(0);
         let result = manager

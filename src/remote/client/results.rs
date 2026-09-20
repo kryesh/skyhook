@@ -490,9 +490,16 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(view["state"], "failed");
-            assert_eq!(view["preview"]["lines"][0], "retained prefix");
-            assert_eq!(view["notice"], "Output incomplete.");
-            assert!(view["preview"].get("capture_complete").is_none());
+            assert_eq!(
+                view["presentation"]["preview"]["lines"][0],
+                "retained prefix"
+            );
+            assert_eq!(view["presentation"]["notice"], "Output incomplete.");
+            assert!(
+                view["presentation"]["preview"]
+                    .get("capture_complete")
+                    .is_none()
+            );
         }
     }
 }

@@ -497,7 +497,6 @@ mod tests {
                     output::OutputArgs::new(*job),
                     &capabilities,
                     output::OutputOptions::Host {
-                        viewer: None,
                         presentation: OutputPresentation::Automatic,
                     },
                 )
