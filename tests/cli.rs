@@ -1,4 +1,4 @@
-//! End-to-end behaviour of the `skyhook` binary: dotenv loading, `--dump`, and
+//! End-to-end behaviour of the `skyhook` binary: dotenv loading, `dump`, `stats`, and
 //! headless runs, each observed from outside the process.
 use std::{
     fs,
@@ -383,11 +383,7 @@ mod dump {
             "[models.first]\nmax_output=8192\n",
         );
         let project = f.path("project");
-        let merged = output(
-            f.bare_command()
-                .args(["--dump", "--workspace"])
-                .arg(&project),
-        );
+        let merged = output(f.bare_command().args(["dump", "--workspace"]).arg(&project));
         let config = successful_config(&merged);
         assert_eq!(config["approve_all"].as_bool(), Some(true));
         assert_eq!(
@@ -396,7 +392,7 @@ mod dump {
         );
         let overridden = output(
             f.bare_command()
-                .args(["--dump=config", "--workspace"])
+                .args(["dump", "config", "--workspace"])
                 .arg(&project)
                 .args(["--capabilities", "read,agents", "--approve-all"]),
         );
@@ -405,7 +401,7 @@ mod dump {
         assert_eq!(config["capabilities"].as_array().unwrap(), &capabilities);
         assert_eq!(config["approve_all"].as_bool(), Some(true));
         // The invocation directory's own workspace config is invalid: no partial dump.
-        let fatal = output(f.bare_command().arg("--dump"));
+        let fatal = output(f.bare_command().arg("dump"));
         assert!(!fatal.status.success());
         assert!(fatal.stdout.is_empty() && !fatal.stderr.is_empty());
         no_session(&f);
@@ -426,11 +422,7 @@ mod dump {
         f.write("config/skyhook/config.toml", &text);
         f.write(".skyhook/state.json", "malformed saved state");
         let path = format!("{}:/usr/bin:/bin", f.path("bin").display());
-        let dumped = output(
-            f.bare_command()
-                .env("PATH", path)
-                .args(["--dump", "config"]),
-        );
+        let dumped = output(f.bare_command().env("PATH", path).args(["dump", "config"]));
         let config = successful_config(&dumped);
         assert_eq!(
             config["providers"]["test"]["api_key_env"].as_str(),
@@ -461,7 +453,7 @@ mod dump {
             ".agents/skills/release/scripts/run.sh",
             "touch SHOULD_NOT_EXIST",
         );
-        let listed = output(f.bare_command().args(["--dump", "skills"]));
+        let listed = output(f.bare_command().args(["dump", "skills"]));
         assert!(
             listed.status.success(),
             "{}",
@@ -487,7 +479,7 @@ mod dump {
             ".agents/skills/broken/SKILL.md",
             "---\ndescription: [unterminated\n---\n",
         );
-        let errors = output(f.bare_command().args(["--dump", "skills"]));
+        let errors = output(f.bare_command().args(["dump", "skills"]));
         assert!(!errors.status.success());
         assert!(String::from_utf8_lossy(&errors.stdout).contains("release"));
         assert!(String::from_utf8_lossy(&errors.stderr).contains("broken"));
@@ -501,22 +493,88 @@ mod dump {
             ".agents/skills/evil\u{1b}[2J/SKILL.md",
             "# Skill\nDescription.\n",
         );
-        let skills = output(f.bare_command().args(["--dump", "skills"]));
+        let skills = output(f.bare_command().args(["dump", "skills"]));
         assert!(!skills.status.success());
         assert!(!skills.stderr.contains(&0x1b));
         assert!(String::from_utf8_lossy(&skills.stderr).contains("evil\\u{1b}[2J"));
 
         let path = f.path("odd\u{1b}[2J.toml");
         fs::copy(f.path("config/skyhook/config.toml"), &path).unwrap();
-        let loaded = output(f.bare_command().args(["--dump", "--config"]).arg(&path));
+        let loaded = output(f.bare_command().args(["dump", "--config"]).arg(&path));
         successful_config(&loaded);
         assert!(!loaded.stderr.contains(&0x1b));
         assert!(String::from_utf8_lossy(&loaded.stderr).contains("odd\\u{1b}[2J.toml"));
         fs::remove_file(&path).unwrap();
-        let missing = output(f.bare_command().args(["--dump", "--config"]).arg(path));
+        let missing = output(f.bare_command().args(["dump", "--config"]).arg(path));
         assert!(!missing.status.success() && missing.stdout.is_empty());
         assert!(!missing.stderr.contains(&0x1b));
         no_session(&f);
+    }
+}
+
+mod stats {
+    use super::*;
+
+    #[test]
+    fn stats_report_a_saved_session_in_every_format_without_a_config() {
+        let f = Fixture::new();
+        let run = f.script("return 7;", &[]);
+        assert!(run.status.success(), "{}", f.journal(&run));
+        let id = std::str::from_utf8(&run.stdout).unwrap().trim().to_owned();
+        let stats = |format: &[&str]| {
+            let out = output(
+                f.bare_command()
+                    .args(["stats", &id, "--workspace"])
+                    .arg(f.root.path())
+                    .args(format),
+            );
+            assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let json: serde_json::Value = serde_json::from_str(&stats(&["--format", "json"])).unwrap();
+        assert_eq!(json["session"], id);
+        assert_eq!(json["agents"].as_array().unwrap().len(), 1);
+        assert_eq!(json["agents"][0]["path"], "/");
+        assert_eq!(json["agents"][0]["name"], "root");
+        assert_eq!(json["agents"][0]["model"], "first");
+        assert_eq!(json["agents"][0]["jobs"]["scripts"], 1);
+        assert_eq!(json["totals"]["usage"]["input_tokens"], 0);
+        let rendered = stats(&[]);
+        assert!(rendered.starts_with(&format!("Session {id}\n")));
+        let row = rendered
+            .lines()
+            .find(|line| line.starts_with("/ "))
+            .unwrap();
+        assert!(row.contains("first") && row.contains("0/0"), "{rendered}");
+        let markdown = stats(&["--format", "markdown"]);
+        assert!(markdown.starts_with(&format!("# Session {id}\n")));
+        assert!(markdown.contains("| / | first | 0/0 |"), "{markdown}");
+        let tree = stats(&["--format", "tree"]);
+        assert!(
+            tree.starts_with(&id) && tree.contains("\n/ [first]"),
+            "{tree}"
+        );
+        assert!(tree.contains("\n1 agents, 0/0 calls"), "{tree}");
+        let listed = output(
+            f.bare_command()
+                .args(["stats", "--list", "--workspace"])
+                .arg(f.root.path()),
+        );
+        assert!(
+            listed.status.success() && listed.stderr.is_empty(),
+            "{listed:?}"
+        );
+        let listed = String::from_utf8(listed.stdout).unwrap();
+        assert_eq!(listed.lines().count(), 3, "{listed}");
+        let row = listed.lines().nth(2).unwrap();
+        assert!(row.starts_with(&id) && row.contains("0/0"), "{listed}");
+        let missing = output(
+            f.bare_command()
+                .args(["stats", "00000000000000000000000000000001", "--workspace"])
+                .arg(f.root.path()),
+        );
+        assert!(!missing.status.success() && missing.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&missing.stderr).contains("not found"));
     }
 }
 

@@ -18,6 +18,7 @@ use crate::{
 mod db;
 mod event;
 mod request;
+pub mod stats;
 mod template;
 
 pub(crate) use template::ModelRequestTemplate;

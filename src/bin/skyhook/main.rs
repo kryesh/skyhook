@@ -5,6 +5,7 @@ mod embedded_shims;
 mod headless;
 mod interaction;
 mod launch;
+mod stats;
 mod tui;
 use cli::{AuthCommand, AuthProvider, Invocation};
 #[global_allocator]
@@ -84,6 +85,12 @@ async fn run(invocation: Invocation) {
         Invocation::Inspect(request) => {
             if let Err(error) = dump::run(request).await {
                 eprintln!("skyhook dump: {}", dump::diagnostic_text(error));
+                std::process::exit(1);
+            }
+        }
+        Invocation::Stats(request) => {
+            if let Err(error) = stats::run(request).await {
+                eprintln!("skyhook stats: {}", dump::diagnostic_text(error));
                 std::process::exit(1);
             }
         }

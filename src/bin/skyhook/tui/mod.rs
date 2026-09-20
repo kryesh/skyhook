@@ -1,7 +1,7 @@
 mod app;
 mod composer;
 mod editor;
-mod format;
+pub(crate) mod format;
 mod host;
 mod keys;
 mod model;

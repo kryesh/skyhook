@@ -3,25 +3,27 @@
 ```text
 skyhook [OPTIONS]
 skyhook auth <login|status|logout> [codex]
+skyhook dump [config|skills] [OPTIONS]
+skyhook stats <SESSION_ID|--list> [OPTIONS]
 ```
 
-Run `skyhook --help`, `skyhook --version`, or `skyhook auth --help` for the installed
+Run `skyhook --help`, `skyhook --version`, or `skyhook <subcommand> --help` for the installed
 binary's command help. Session execution requires an interactive terminal unless
-`--non-interactive` is supplied. Dump modes do not need a terminal.
+`--non-interactive` is supplied. `dump` and `stats` do not need a terminal.
 
 ## Session options
 
 | Option | Meaning |
 | --- | --- |
-| `--config PATH` | Use only this TOML file; disable user/workspace config searching and merging. |
-| `--workspace PATH` | Set the workspace base directory (default `.`). |
+| `-c, --config PATH` | Use only this TOML file; disable user/workspace config searching and merging. |
+| `-w, --workspace PATH` | Set the workspace base directory (default `.`). |
 | `--resume SESSION_ID` | Reopen a saved session. |
 | `-m, --model PROFILE` | Choose a configured model profile for a new session. Resumed sessions retain their recorded model. |
 | `-p, --prompt TEXT` | Submit an initial user message. |
 | `-s, --script PATH` | Run a JavaScript workflow. Mutually exclusive with `--prompt`. |
 | `--image PATH` | Attach an image to the initial prompt; repeat for multiple images. Requires `--prompt`, conflicts with `--script`. |
 | `--non-interactive` | Run headlessly with exactly one prompt or script, then exit. |
-| `--approve-all` | Bypass tool approval prompts, not capability gates or authentication prompts. |
+| `-a, --approve-all` | Bypass tool approval prompts, not capability gates or authentication prompts. |
 | `--capabilities LIST` | Replace the configured policy allowlist with a comma-separated list. `--capabilities=` grants no policy capabilities. |
 | `-h, --help` | Print command help. |
 | `-V, --version` | Print the version. |
@@ -32,29 +34,37 @@ is created until a message or script is submitted.
 
 Headless stdout contains only the session ID and newline, flushed before execution; results
 remain in session logs. See the [headless guide](../guide/headless.md) for completion, errors,
-shutdown, signals, and interaction restrictions. `--non-interactive` is not an authentication
-subcommand option and cannot be combined with `auth`.
+shutdown, signals, and interaction restrictions. Session options belong to session execution
+only: a subcommand accepts just its own options, before or after its arguments.
 
 Policy capability names are `read`, `write`, `exec`, `network`, `targets`, `agents`, and `mcp`.
 The runtime supplies `interactive`; it is invalid in the CLI allowlist. See
 [permissions](../guide/permissions.md) for resolution and limitations.
 
-## Dump modes
+## Dump
 
-`--dump` defaults to `--dump config`. The only selectors are **`config`** and **`skills`**;
-unknown selectors (including `agents`) are errors. `--workspace PATH` applies to both modes.
+`skyhook dump` defaults to `skyhook dump config`. The only selectors are **`config`** and
+**`skills`**; unknown selectors (including `agents`) are errors.
+
+| Option | Meaning |
+| --- | --- |
+| `-w, --workspace PATH` | Workspace whose configuration or skills to inspect (default `.`). |
+| `-c, --config PATH` | `config` only: use only this TOML file, with no user/workspace merging. |
+| `--capabilities LIST` | `config` only: apply the CLI allowlist override. |
+| `-a, --approve-all` | `config` only: apply the approval override. |
 
 ```sh
-skyhook --dump                        # Resolved effective TOML
-skyhook --dump config > effective.toml
-skyhook --workspace /path/to/project --dump config
-skyhook --config ./standalone.toml --dump config --capabilities=read --approve-all
-skyhook --workspace /path/to/project --dump skills
+skyhook dump                          # Resolved effective TOML
+skyhook dump config > effective.toml
+skyhook dump config --workspace /path/to/project
+skyhook dump config --config ./standalone.toml --capabilities=read --approve-all
+skyhook dump skills --workspace /path/to/project
 ```
 
 Both modes are inspection-only: no terminal UI, harness, session creation, provider credential
 commands, MCP startup, or network access. API credentials are not required. They do not execute
-skill assets.
+skill assets. `dump skills` rejects `--config`, `--capabilities`, and `--approve-all` as
+irrelevant.
 
 ### Configuration dump
 
@@ -84,12 +94,50 @@ errors were reported, even if stdout contains some valid skills. This does not c
 search locations: `~/.agents/skills` plus `.agents/skills` along workspace ancestry. See
 [instructions and skills](../guide/instructions-and-skills.md).
 
-### Incompatible options
+## Stats
 
-Both dump modes reject `--prompt`, `--script`, `--resume`, `--image`, `--non-interactive`,
-`--model`, and the `auth` subcommand. `--dump skills` additionally rejects `--config`,
-`--capabilities`, and `--approve-all` as irrelevant. Invalid selectors and conflicting options
-exit nonzero rather than starting a session.
+`skyhook stats SESSION_ID` reads a saved session's journal and reports where its tokens went,
+how its model requests ended, what each agent delegated, and which tools it called. Like
+`--resume`, it finds the session in the selected workspace's history
+(`<workspace>/.skyhook/sessions`). It needs no configuration, credentials, or terminal, and it
+can read a session another process still has open.
+
+| Option | Meaning |
+| --- | --- |
+| `-l, --list` | List the workspace's sessions, newest first, instead of reporting one; takes no `--format`. |
+| `-w, --workspace PATH` | Workspace whose session history holds the session (default `.`). |
+| `-f, --format markdown\|tree\|json` | Machine-readable output; omitted, the tables are rendered for reading. |
+
+```sh
+skyhook stats 94e934f0ee9c1e314c27d91977919462
+skyhook stats 94e934f0ee9c1e314c27d91977919462 --format tree
+skyhook stats 94e934f0ee9c1e314c27d91977919462 --format json | jq '.agents[].tools'
+skyhook stats --list
+```
+
+Without `--format`, the report is a session header (initial prompt, start time, duration, request and
+token totals) followed by aligned tables: one row per agent (path, model, completed/requested
+model calls, tool calls, input, cached, and output tokens, duration) with a total row, then
+totals per model profile and per tool.
+
+- **`markdown`** prints that document as Markdown headings and tables.
+- **`tree`** lists the agents as `tree` would, each line carrying that agent's figures, followed
+  by a one-line total.
+- **`json`** writes one JSON document with every figure: per agent, its outcome, start and
+  final finish times (a resumed child counts only its last completion),
+  usage, request counts (requested, completed, failed, interrupted, attempts), compactions, jobs
+  created by role, and calls, errors, and unanswered calls per tool; plus per-model and
+  per-tool totals and the session totals.
+
+`--list` prints one row per session: id, start time, the initial prompt's first 60 characters,
+and the same totals as a report's total row. Sessions written by an earlier journal format
+are left out.
+
+Agent paths are built from names like directories: the root agent is `/`, and an agent named
+`bar` spawned by `/foo` is `/foo/bar`; a later sibling with the same name is `/foo/bar#2`.
+Names come from the job that spawned the agent. Model call counts
+cover agent turns only, while token figures include compaction requests. Sessions written by an
+earlier journal format are refused with a nonzero exit.
 
 ## Authentication commands
 

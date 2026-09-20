@@ -1,15 +1,5 @@
-use skyhook::{identity::AgentId, provider::protocol::Usage};
-pub fn agent_label(agent: &AgentId) -> String {
-    if agent.path().is_empty() {
-        return "root".into();
-    }
-    agent
-        .path()
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(":")
-}
+use skyhook::provider::protocol::Usage;
+pub use skyhook::session::stats::agent_label;
 /// Normalize only as much text as the preview needs, without allocating a full
 /// normalized copy. Whitespace-only tails still have to be inspected to preserve
 /// the distinction between an exact fit and a truncated preview.

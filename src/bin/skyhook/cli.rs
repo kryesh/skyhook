@@ -3,42 +3,29 @@ use clap::{Parser, Subcommand, ValueEnum};
 use skyhook::{identity::SessionId, tool::policy::Capability};
 use std::path::PathBuf;
 
+/// Session options belong to session execution only: a subcommand takes just its own.
 #[derive(Parser)]
-#[command(name = "skyhook", version, about = "Programmable coding-agent harness")]
+#[command(
+    name = "skyhook",
+    version,
+    about = "Programmable coding-agent harness",
+    args_conflicts_with_subcommands = true,
+    disable_help_subcommand = true
+)]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
-    /// Inspect effective config (default) or loaded skills without starting a session.
-    #[arg(
-        long,
-        value_enum,
-        num_args = 0..=1,
-        default_missing_value = "config",
-        value_name = "WHAT",
-        conflicts_with_all = ["input", "resume", "images", "non_interactive", "model"]
-    )]
-    dump: Option<DumpKind>,
-    /// Use only this TOML config; disable user/workspace config discovery and merging.
-    #[arg(long)]
-    config: Option<PathBuf>,
-    /// Workspace visible to coding tools.
-    #[arg(long, default_value = ".")]
-    workspace: PathBuf,
+    #[command(flatten)]
+    config: ConfigRequest,
     /// Resume an existing session id.
     #[arg(long)]
     resume: Option<SessionId>,
     /// Select and remember the root model for a new session.
     #[arg(short = 'm', long = "model")]
     model: Option<String>,
-    /// Approve every tool invocation without prompting.
-    #[arg(long)]
-    approve_all: bool,
     /// Run without terminal interaction; requires --prompt or --script.
     #[arg(long, requires = "input")]
     non_interactive: bool,
-    /// Exact comma-separated policy capabilities; interaction follows the runtime mode.
-    #[arg(long, value_name = "LIST", value_parser = parse_capabilities)]
-    capabilities: Option<Capabilities>,
     /// Attach images to the first prompt.
     #[arg(long = "image", requires = "prompt", conflicts_with = "script")]
     images: Vec<PathBuf>,
@@ -60,6 +47,16 @@ struct Args {
 enum DumpKind {
     Config,
     Skills,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(super) enum StatsFormat {
+    /// The agent, model, and tool tables as a Markdown document.
+    Markdown,
+    /// The agent tree with each agent's figures on its line.
+    Tree,
+    /// Every figure, including per-agent tool breakdowns.
+    Json,
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +86,28 @@ enum Command {
         #[command(subcommand)]
         command: AuthCommand,
     },
+    /// Inspect effective config (default) or loaded skills without starting a session.
+    Dump {
+        #[arg(value_enum, default_value = "config")]
+        what: DumpKind,
+        #[command(flatten)]
+        config: ConfigRequest,
+    },
+    /// Report a saved session's token usage, model requests, delegation, and tool calls.
+    Stats {
+        /// The session id, as printed by a headless run or listed by --list.
+        #[arg(required_unless_present = "list", conflicts_with = "list")]
+        session: Option<SessionId>,
+        /// List the workspace's sessions with their totals instead.
+        #[arg(short, long, conflicts_with = "format")]
+        list: bool,
+        /// Workspace whose session history holds the session.
+        #[arg(short, long, default_value = ".")]
+        workspace: PathBuf,
+        /// Machine-readable output; omitted, the tables are rendered for reading.
+        #[arg(short, long, value_enum)]
+        format: Option<StatsFormat>,
+    },
 }
 #[derive(Clone, Copy, ValueEnum)]
 pub(super) enum AuthProvider {
@@ -116,10 +135,19 @@ pub(super) enum AuthCommand {
 }
 /// Configuration discovery and CLI policy overrides, shared by execution and
 /// config inspection. No model selection, input, or session state belongs here.
+#[derive(clap::Args)]
 pub(super) struct ConfigRequest {
+    /// Workspace visible to coding tools.
+    #[arg(short, long, default_value = ".")]
     pub(super) workspace: PathBuf,
+    /// Use only this TOML config; disable user/workspace config discovery and merging.
+    #[arg(short, long)]
     pub(super) config: Option<PathBuf>,
+    /// Exact comma-separated policy capabilities; interaction follows the runtime mode.
+    #[arg(long, value_name = "LIST", value_parser = parse_capabilities)]
     pub(super) capabilities: Option<Capabilities>,
+    /// Approve every tool invocation without prompting.
+    #[arg(short, long)]
     pub(super) approve_all: bool,
 }
 
@@ -127,6 +155,13 @@ pub(super) enum Inspection {
     Config(ConfigRequest),
     /// Skill discovery only needs the workspace.
     Skills(PathBuf),
+}
+
+pub(super) struct StatsRequest {
+    /// None lists the workspace's sessions.
+    pub(super) session: Option<SessionId>,
+    pub(super) workspace: PathBuf,
+    pub(super) format: Option<StatsFormat>,
 }
 
 pub(super) struct ExecutionRequest {
@@ -145,6 +180,7 @@ pub(super) enum InitialInput {
 pub(super) enum Invocation {
     Auth(AuthCommand),
     Inspect(Inspection),
+    Stats(StatsRequest),
     Headless(ExecutionRequest, InitialInput),
     Interactive(ExecutionRequest, Option<InitialInput>),
 }
@@ -165,22 +201,38 @@ impl TryFrom<Args> for Invocation {
     type Error = clap::Error;
 
     fn try_from(args: Args) -> Result<Self, Self::Error> {
-        // Clap enforces the external grammar; only the supplemental dump and
-        // auth diagnostics that it cannot express are checked here.
-        if args.dump.is_some() && args.command.is_some() {
-            return Err(conflict("--dump cannot be combined with an auth command"));
-        }
-        if args.dump == Some(DumpKind::Skills)
-            && (args.config.is_some() || args.capabilities.is_some() || args.approve_all)
-        {
-            return Err(conflict(
-                "--dump skills uses skill discovery, not --config, --capabilities, or --approve-all",
-            ));
-        }
-        if args.non_interactive && args.command.is_some() {
-            return Err(conflict(
-                "--non-interactive cannot be combined with an auth command",
-            ));
+        // Clap enforces the external grammar; only the supplemental conflict
+        // that it cannot express is checked here.
+        match args.command {
+            Some(Command::Auth { command }) => return Ok(Self::Auth(command)),
+            Some(Command::Dump {
+                what: DumpKind::Skills,
+                config,
+            }) => {
+                if config.config.is_some() || config.capabilities.is_some() || config.approve_all {
+                    return Err(conflict(
+                        "dump skills uses skill discovery, not --config, --capabilities, or --approve-all",
+                    ));
+                }
+                return Ok(Self::Inspect(Inspection::Skills(config.workspace)));
+            }
+            Some(Command::Dump {
+                what: DumpKind::Config,
+                config,
+            }) => return Ok(Self::Inspect(Inspection::Config(config))),
+            Some(Command::Stats {
+                session,
+                list: _,
+                workspace,
+                format,
+            }) => {
+                return Ok(Self::Stats(StatsRequest {
+                    session,
+                    workspace,
+                    format,
+                }));
+            }
+            None => {}
         }
         // Clap rejects both together: `--prompt` is `conflicts_with = "script"`.
         let input = match args.prompt {
@@ -190,25 +242,8 @@ impl TryFrom<Args> for Invocation {
             }),
             None => args.script.map(InitialInput::Script),
         };
-        // Authentication historically accepts otherwise unrelated execution flags
-        // (except --dump/--non-interactive). Preserve that grammar and ignore them.
-        if let Some(Command::Auth { command }) = args.command {
-            return Ok(Self::Auth(command));
-        }
-        if args.dump == Some(DumpKind::Skills) {
-            return Ok(Self::Inspect(Inspection::Skills(args.workspace)));
-        }
-        let config = ConfigRequest {
-            workspace: args.workspace,
-            config: args.config,
-            capabilities: args.capabilities,
-            approve_all: args.approve_all,
-        };
-        if args.dump == Some(DumpKind::Config) {
-            return Ok(Self::Inspect(Inspection::Config(config)));
-        }
         let request = ExecutionRequest {
-            config,
+            config: args.config,
             resume: args.resume,
             model: args.model,
         };
@@ -268,7 +303,7 @@ mod tests {
         ] {
             assert_eq!(parse(args).is_some(), valid, "{args:?}");
         }
-        let capabilities = |args: &[&str]| parse(args).unwrap().capabilities.unwrap().0;
+        let capabilities = |args: &[&str]| parse(args).unwrap().config.capabilities.unwrap().0;
         assert!(capabilities(&["--capabilities="]).is_empty());
         assert_eq!(
             capabilities(&["--capabilities", "read,exec,targets"]),
@@ -277,62 +312,86 @@ mod tests {
     }
 
     #[test]
-    fn dump_selectors_and_execution_conflicts() {
+    fn dump_and_stats_subcommands_take_only_their_own_options() {
         for (args, expected) in [
-            (&["--dump"][..], DumpKind::Config),
-            (&["--dump", "config"], DumpKind::Config),
-            (&["--dump", "skills"], DumpKind::Skills),
+            (&["dump"][..], DumpKind::Config),
+            (&["dump", "config"], DumpKind::Config),
+            (&["dump", "skills", "-w", "w"], DumpKind::Skills),
         ] {
-            assert_eq!(parse(args).unwrap().dump, Some(expected));
+            assert!(matches!(
+                parse(args).unwrap().command,
+                Some(Command::Dump { what, .. }) if what == expected
+            ));
         }
+        // Session options are rejected around a subcommand, not silently ignored.
         for extra in [
             &["--prompt", "hello"][..],
             &["--script", "run.js"],
             &["--model", "first"],
-            &["--non-interactive"],
             &["--resume", "00000000000000000000000000000001"],
+            &["auth", "status"],
         ] {
-            assert!(parse(&[&["--dump=config"], extra].concat()).is_none());
+            assert!(parse(&[&["dump", "config"], extra].concat()).is_none());
+            assert!(parse(&[extra, &["dump", "config"]].concat()).is_none());
         }
-        assert!(parse(&["--dump", "unknown"]).is_none());
+        assert!(parse(&["--workspace", "w", "dump"]).is_none());
+        assert!(parse(&["--non-interactive", "-p", "x", "dump"]).is_none());
+        assert!(parse(&["dump", "unknown"]).is_none());
+        assert!(parse(&["help"]).is_none());
+        assert!(
+            parse(&["-c", "c.toml", "-a", "-p", "x"])
+                .unwrap()
+                .config
+                .approve_all
+        );
+        let skills = parse(&["dump", "skills", "--config", "other.toml"]).unwrap();
+        assert!(Invocation::try_from(skills).is_err());
+        let id = "00000000000000000000000000000001";
+        let stats = |args: &[&str]| match parse_from([&["skyhook", "stats"], args].concat()) {
+            Ok(Invocation::Stats(request)) => request,
+            _ => panic!("stats invocation"),
+        };
+        let request = stats(&[id]);
+        assert_eq!(request.session.unwrap().to_string(), id);
+        assert_eq!(request.workspace, Path::new("."));
+        assert_eq!(request.format, None);
+        let request = stats(&[id, "-w", "w", "-f", "json"]);
+        assert_eq!(request.workspace, Path::new("w"));
+        assert_eq!(request.format, Some(StatsFormat::Json));
+        assert_eq!(
+            stats(&["--format", "tree", id]).format,
+            Some(StatsFormat::Tree)
+        );
+        assert_eq!(
+            stats(&[id, "--format", "markdown"]).format,
+            Some(StatsFormat::Markdown)
+        );
+        assert_eq!(stats(&["-l"]).session, None);
         for args in [
-            &["--dump=config", "auth", "status"][..],
-            &["--dump", "skills", "--config", "other.toml"],
+            &["stats"][..],
+            &["stats", id, "--list"],
+            &["stats", "--list", "--format", "json"],
+            &["stats", "not-an-id"],
+            &["stats", id, "--format", "csv"],
+            &["stats", id, "--config", "c.toml"],
         ] {
-            assert!(Invocation::try_from(parse(args).unwrap()).is_err());
+            assert!(parse(args).is_none(), "{args:?}");
         }
     }
 
     #[test]
     fn invocation_conversion_matrix_preserves_input_presence_and_modes() {
-        // Auth accepts but ignores otherwise unrelated execution options.
         assert!(matches!(
-            parse_from([
-                "skyhook",
-                "--workspace",
-                "missing",
-                "--config",
-                "missing.toml",
-                "--model",
-                "unknown",
-                "--capabilities=",
-                "--approve-all",
-                "--prompt",
-                "ignored",
-                "--image",
-                "missing.png",
-                "auth",
-                "status",
-            ])
-            .unwrap(),
+            parse_from(["skyhook", "auth", "status"]).unwrap(),
             Invocation::Auth(AuthCommand::Status { .. })
         ));
+        assert!(parse_from(["skyhook", "--approve-all", "auth", "status"]).is_err());
         assert!(matches!(
-            parse_from(["skyhook", "--dump"]).unwrap(),
+            parse_from(["skyhook", "dump"]).unwrap(),
             Invocation::Inspect(Inspection::Config(_))
         ));
         assert!(matches!(
-            parse_from(["skyhook", "--dump=skills"]).unwrap(),
+            parse_from(["skyhook", "dump", "skills"]).unwrap(),
             Invocation::Inspect(Inspection::Skills(_))
         ));
         assert!(matches!(

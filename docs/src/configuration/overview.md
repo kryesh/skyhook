@@ -98,15 +98,15 @@ See [authentication](authentication.md#api-keys-and-environment-files).
 ## Inspect without starting a session
 
 ```sh
-skyhook --workspace /path/to/project --dump       # Same as --dump config
-skyhook --workspace /path/to/project --dump config --capabilities=read --approve-all
-skyhook --config ./standalone.toml --dump config  # Explicit file only
+skyhook dump --workspace /path/to/project         # Same as dump config
+skyhook dump config --workspace /path/to/project --capabilities=read --approve-all
+skyhook dump config --config ./standalone.toml    # Explicit file only
 ```
 
 These commands write resolved effective TOML to stdout and source paths/diagnostics to stderr.
 They apply defaults and applicable CLI policy overrides without requiring API credentials,
 starting MCP servers, or making network requests. Exit status is zero for a valid dump and
-nonzero if valid configuration cannot be produced. See [dump modes](../reference/cli.md#dump-modes)
+nonzero if valid configuration cannot be produced. See [dump](../reference/cli.md#dump)
 for selectors and incompatible options.
 
 ## Configuration areas

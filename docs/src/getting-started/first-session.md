@@ -62,12 +62,14 @@ its workspace trust boundary.
 To inspect configuration or available skills without a session or API credentials:
 
 ```sh
-skyhook --dump config  # Effective TOML on stdout; diagnostics/source paths on stderr.
-skyhook --dump skills  # Winning skills, frontmatter, and asset tree.
+skyhook dump config  # Effective TOML on stdout; diagnostics/source paths on stderr.
+skyhook dump skills  # Winning skills, frontmatter, and asset tree.
 ```
 
 Both return nonzero on errors; skills can still list valid entries when other entries fail.
-See [dump modes](../reference/cli.md#dump-modes) for compatible options.
+See [dump](../reference/cli.md#dump) for compatible options. After a session,
+`skyhook stats SESSION_ID` reports its token usage, model requests, delegation, and tool calls
+(see [stats](../reference/cli.md#stats)).
 
 By default, execution, remote access, target changes, and writes outside the workspace
 require confirmation. See [permissions and capabilities](../guide/permissions.md) before
