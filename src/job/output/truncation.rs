@@ -1,7 +1,7 @@
 //! Only schema-annotated fields may be shortened in automatic result presentation.
 use super::*;
 
-pub(super) const FIELD_BYTES: usize = 2 * 1024;
+pub(super) const FIELD_BYTES: usize = CONTENT_BYTES;
 pub(super) const FIELD_LINES: usize = 100;
 const ANNOTATION: &str = "x-skyhook-truncatable";
 
@@ -481,8 +481,8 @@ mod tests {
 
     #[tokio::test]
     async fn limits_are_per_field_and_unannotated_data_and_errors_survive_resume() {
-        let value = json!({"content":"line\n".repeat(150), "stdout":"é\\\"".repeat(2000),
-            "stderr":"e".repeat(10000), "metadata":"m".repeat(92000), "extra":["z".repeat(10000)], "exit_code":7});
+        let value = json!({"content":"line\n".repeat(150), "stdout":"é\\\"".repeat(FIELD_BYTES),
+            "stderr":"e".repeat(2 * FIELD_BYTES), "metadata":"m".repeat(92000), "extra":["z".repeat(10000)], "exit_code":7});
         let schema = json!({"type":"object","properties":{
             "content":{ANNOTATION:true},"stdout":{ANNOTATION:true},"stderr":{ANNOTATION:true}
         }});
@@ -545,7 +545,12 @@ mod tests {
     #[tokio::test]
     async fn initial_positions_read_remaining_service_and_container_lines_without_gaps() {
         let schema = json!({"properties":{"stdout":{ANNOTATION:true}}});
-        for (width, count) in [(94, 80), (223, 18), (2047, 2)] {
+        for (width, count) in [
+            (94, 150),
+            (223, 150),
+            (FIELD_BYTES / 2 + 1, 3),
+            (FIELD_BYTES - 1, 2),
+        ] {
             let text: String = (1..=count)
                 .map(|line| format!("{line:0width$}\r\n"))
                 .collect();
@@ -565,14 +570,20 @@ mod tests {
                     .present_output(query.clone(), &Default::default())
                     .await
                     .unwrap();
-                for row in page["presentation"]["preview"]["lines"].as_array().unwrap() {
+                let preview = &page["presentation"]["preview"];
+                for (index, row) in preview["lines"].as_array().unwrap().iter().enumerate() {
                     remaining.push_str(row.as_str().unwrap());
-                    remaining.push_str("\r\n");
+                    let line = query.start.unwrap() + index;
+                    if preview["next_start"].as_u64() != Some(line as u64)
+                        || preview["next_offset"] == 0
+                    {
+                        remaining.push_str("\r\n");
+                    }
                 }
-                if page["presentation"]["preview"]["next_start"].is_null() {
+                if preview["next_start"].is_null() {
                     break;
                 }
-                query = continuation(id, &page["presentation"]["preview"]);
+                query = continuation(id, preview);
             }
             assert_eq!(format!("{prefix}{remaining}"), text);
         }

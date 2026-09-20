@@ -29,8 +29,9 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
 };
 
-pub(crate) const PAGE_BYTES: usize = 8 * 1024;
-pub(crate) const CONTENT_BYTES: usize = PAGE_BYTES - 2048;
+// Leave room for a typical 100-line page, plus its JobView envelope.
+pub(crate) const CONTENT_BYTES: usize = 32 * 1024;
+pub(crate) const PAGE_BYTES: usize = CONTENT_BYTES + 2048;
 
 pub(crate) use truncation::annotated_fields;
 
@@ -1321,7 +1322,7 @@ mod tests {
     async fn unicode_continuations_fit_the_complete_job_envelope() {
         // Exhaustive reconstruction and replay live in reader tests. Here retain
         // the integration boundary: correct offsets and the entire view budget.
-        let expected = format!("{}\nlast", "🦀\"\\".repeat(4000));
+        let expected = format!("{}\nlast", "🦀\"\\".repeat(CONTENT_BYTES));
         let (_root, manager, id) = fixture(Some(json!({"content":expected}))).await;
         let mut args = field_args(id, "/result/content");
         for _ in 0..2 {

@@ -363,7 +363,7 @@ mod tests {
 
         let runtime = crate::tests::TestRuntime::new().await;
         let executor = executor(&runtime);
-        let payload = "body".repeat(1024);
+        let payload = "body".repeat(crate::job::output::CONTENT_BYTES / 4 + 1);
         let header = "h".repeat(3000);
         let headers = format!("Content-Type: text/plain\r\nX-Details: {header}\r\n");
         for (format, field, expected) in [
@@ -400,12 +400,27 @@ mod tests {
 
             let mut query = JobOutputQuery::new(call.job);
             query.field = Some(pointer);
-            let full = runtime
-                .jobs
-                .inspect_output(query.clone(), &Default::default())
-                .await
-                .unwrap();
-            assert_eq!(full["presentation"]["preview"]["lines"], json!([expected]));
+            let mut full = String::new();
+            let mut pages = 0;
+            loop {
+                let page = runtime
+                    .jobs
+                    .inspect_output(query.clone(), &Default::default())
+                    .await
+                    .unwrap();
+                let preview = &page["presentation"]["preview"];
+                let lines = preview["lines"].as_array().unwrap();
+                assert_eq!(lines.len(), 1);
+                full.push_str(lines[0].as_str().unwrap());
+                pages += 1;
+                let Some(start) = preview["next_start"].as_u64() else {
+                    break;
+                };
+                query.start = Some(start as usize);
+                query.offset = Some(preview["next_offset"].as_u64().unwrap() as usize);
+            }
+            assert!(pages > 1);
+            assert_eq!(full, expected);
             (query.start, query.offset) = (Some(1), Some(prefix.len()));
             let remainder = runtime
                 .jobs

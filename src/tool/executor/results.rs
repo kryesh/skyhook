@@ -303,6 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_responses_preserve_payloads_and_distinguish_invocation_from_target_failures() {
+        const PAYLOAD_BYTES: usize = crate::job::output::CONTENT_BYTES + 1;
         #[derive(serde::Deserialize, schemars::JsonSchema)]
         struct Args {
             #[serde(default)]
@@ -330,7 +331,7 @@ mod tests {
                         })
                     } else {
                         Ok(Payload {
-                            text: "x".repeat(5000),
+                            text: "x".repeat(PAYLOAD_BYTES),
                             nullable: None,
                         })
                     }
@@ -355,10 +356,10 @@ mod tests {
             assert_eq!(view["result"].get("nullable"), Some(&Value::Null));
             let length = view["result"]["text"].as_str().unwrap().len();
             if matches!(kind, InvocationKind::Script) {
-                assert_eq!(length, 5000);
+                assert_eq!(length, PAYLOAD_BYTES);
                 assert_eq!(view.get("presentation"), Some(&Value::Null));
             } else {
-                assert!(length < 5000);
+                assert!(length < PAYLOAD_BYTES);
                 assert_eq!(
                     view["presentation"]["truncated"][0]["field"],
                     "/result/text"

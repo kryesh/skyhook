@@ -546,7 +546,7 @@ mod tests {
             .await
             .unwrap();
         let matches = serde_json::to_vec(&preview.output.value["result"]["matches"]).unwrap();
-        assert!(matches.len() <= 2048);
+        assert!(matches.len() <= crate::job::output::CONTENT_BYTES);
         assert_eq!(
             preview.output.value["presentation"]["truncated"][0]["field"],
             "/result/matches"

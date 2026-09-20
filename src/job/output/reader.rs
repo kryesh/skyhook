@@ -543,9 +543,9 @@ mod tests {
     fn whole_lines_are_preferred_and_large_lines_are_fully_accessible() {
         let text = format!(
             "{}\n{}\n{}",
-            "a".repeat(4000),
-            "b".repeat(4000),
-            "🦀\"\\".repeat(4000)
+            "a".repeat(CONTENT_BYTES / 2),
+            "b".repeat(CONTENT_BYTES / 2),
+            "🦀\"\\".repeat(CONTENT_BYTES)
         );
         let first = page(
             saved(&text),

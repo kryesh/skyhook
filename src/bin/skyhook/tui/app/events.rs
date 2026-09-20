@@ -846,7 +846,8 @@ mod tests {
     #[tokio::test]
     async fn file_preview_uses_source_fields_and_can_continue_truncated_output() {
         let (_root, mut app) = fixture().await;
-        let source: String = (0..100)
+        // Exceed the automatic 100-line limit without relying on its byte budget.
+        let source: String = (0..101)
             .map(|index| format!("// original source line {index:03}\n"))
             .collect();
         std::fs::write(app.launch.workspace.join("example.rs"), &source).unwrap();

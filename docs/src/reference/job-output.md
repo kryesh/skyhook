@@ -41,7 +41,7 @@ rooted in subdirectories inherit ancestor ignore rules; explicitly requested pat
 Model-facing direct responses and JavaScript tool calls use the same fully populated JobView
 (core fields, including `has_result`, are never omitted); JavaScript receives hydrated result data
 while model previews may shorten annotated fields. Only output fields annotated with `x-skyhook-truncatable: true` may be shortened. Each annotated
-field independently retains at most 100 lines or 2 KiB (2048 bytes), whichever is reached first.
+field independently retains at most 100 lines or 32 KiB (32768 bytes), whichever is reached first.
 Strings count UTF-8 content bytes before JSON escaping; arrays and grouped maps count their saved JSON text and
 retain only complete items. Grouped maps share one budget across all groups. All other fields remain intact regardless of size, so there is no
 aggregate response-size limit or whole-result fallback.
@@ -70,7 +70,8 @@ returning the same data explicitly produces both outputs.
 ## Paging and searching
 
 Script console text uses the shared per-field limit. Explicit `job_output` selections return a view whose `presentation.preview` defaults to
-100 lines with bounded page content. Unannotated job metadata is always returned in full.
+100 lines with up to 32 KiB of JSON-encoded line content, so typical 100-line pages fit without
+byte truncation. Unannotated job metadata is always returned in full.
 
 ```js
 // Read a selected part of a saved result.
