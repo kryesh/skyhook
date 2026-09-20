@@ -229,12 +229,13 @@ mod tests {
     const IMAGE: &[u8] = b"\x89PNG\r\n\x1a\nattachment test";
 
     fn executor(
-        store: SessionStore,
         jobs: JobManager,
         root: &std::path::Path,
     ) -> (ToolExecutor, Arc<OnceLock<ToolExecutor>>) {
         let mut builder = ToolRegistryBuilder::default();
-        super::super::filesystem::register(&mut builder, store).unwrap();
+        builder
+            .register_local(crate::tool::builtins::filesystem::register)
+            .unwrap();
         super::register(&mut builder, jobs.clone()).unwrap();
         let slot = Arc::new(OnceLock::new());
         super::super::install_script_tool(&mut builder, Arc::downgrade(&slot)).unwrap();
@@ -248,11 +249,7 @@ mod tests {
         tokio::fs::write(runtime.root.path().join("image.png"), IMAGE)
             .await
             .unwrap();
-        let (executor, slot) = executor(
-            runtime.store.clone(),
-            runtime.jobs.clone(),
-            runtime.root.path(),
-        );
+        let (executor, slot) = executor(runtime.jobs.clone(), runtime.root.path());
         (runtime, executor, slot)
     }
 
@@ -443,7 +440,7 @@ mod tests {
         let (store, records) = SessionStore::open(&sessions, id).await.unwrap();
         let jobs = JobManager::restore(store.clone(), &records).await.unwrap();
         let agent = AgentId::root(id);
-        let (executor, _slot) = executor(store.clone(), jobs, runtime.root.path());
+        let (executor, _slot) = executor(jobs, runtime.root.path());
         let output = executor.run_model(&agent, "job_output", json!({"job":job}));
         let output = output.await.unwrap().output;
         assert_eq!(output.value["state"], "failed");

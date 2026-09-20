@@ -1,4 +1,7 @@
 //! File snapshots, directory listings, images, and expected read failures.
+use crate::tool::ToolOptions;
+use crate::tool::invocation::{LocalCatalogBuilder, LocalContext, LocalError};
+use crate::tool::output::ProducedOutput;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -7,19 +10,15 @@ use tokio::fs;
 use super::super::workspace::relative_path;
 use crate::{
     bounded_io::{BoundedReadError, read_bounded},
-    job::output::{CompletedCapture, TextCaptureField},
     media::{ImageRef, MAX_IMAGE_BYTES},
-    session::SessionStore,
+    tool::output::{FinishedOutput, TextCaptureField},
     tool::{
-        PathKind, RegistryError, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder,
+        PathKind, RegistryError,
         policy::{Capability, PathAccess},
     },
 };
 
-pub(super) fn register(
-    builder: &mut ToolRegistryBuilder,
-    store: SessionStore,
-) -> Result<(), RegistryError> {
+pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
     builder.register_product::<ReadArgs, ReadOutput, _, _>(
         "read",
         "Capture a complete UTF-8 file or directory listing, or attach a supported image. Use job_output to page or search the saved snapshot. Missing or OS-inaccessible paths return {kind:\"error\",path,error:{code:\"not_found\"|\"permission_denied\",message}} as a completed result; policy/approval denials remain denials.",
@@ -27,9 +26,7 @@ pub(super) fn register(
             .read_error_output(read_error_output)
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .path_argument("path", PathAccess::Read, PathKind::Existing),
-        move |context, args| {
-            let store = store.clone();
-            async move {
+        move |context, args| async move {
                 let path = std::path::PathBuf::from(&args.path);
                 if fs::metadata(&path).await?.is_dir() {
                     let mut directory = fs::read_dir(&path).await?;
@@ -43,7 +40,7 @@ pub(super) fn register(
                     entries.sort_by(|left, right| left.name().cmp(right.name()));
                     let directory_path =
                         relative_path(&context.execution_location().workspace, &path);
-                    return Ok(ToolOutput::new(serde_json::to_value(
+                    return Ok(ProducedOutput::new(serde_json::to_value(
                         ReadOutput::Directory {
                             path: directory_path,
                             entries: if args.details { DirectoryEntries::Detailed(entries) } else { DirectoryEntries::Grouped(DirectoryGroups::from(entries)) },
@@ -54,7 +51,7 @@ pub(super) fn register(
                 let output_path = relative_path(&context.execution_location().workspace, &path);
                 match read_text(&path, &context).await {
                     Ok(TextReadOutcome::Captured(capture)) => {
-                        return Ok(ToolOutput::new(serde_json::to_value(ReadOutput::File {
+                        return Ok(ProducedOutput::new(serde_json::to_value(ReadOutput::File {
                             path: output_path,
                             content: String::new(),
                         })?)
@@ -66,43 +63,42 @@ pub(super) fn register(
 
                 let metadata = fs::metadata(&path).await?;
                 if metadata.len() > MAX_IMAGE_BYTES {
-                    return Err(ToolError::Failed(format!(
+                    return Err(LocalError::Failed(format!(
                         "non-UTF-8 file exceeds the {MAX_IMAGE_BYTES}-byte image limit"
                     )));
                 }
                 let mut input = fs::File::open(&path).await?;
                 let bytes = read_bounded(&mut input, MAX_IMAGE_BYTES as usize).await
                     .map_err(|error| match error {
-                        BoundedReadError::Io(error) => ToolError::Io(error),
-                        error => ToolError::Failed(error.to_string()),
+                        BoundedReadError::Io(error) => LocalError::Io(error),
+                        error => LocalError::Failed(error.to_string()),
                     })?;
                 let image = crate::media::Image::new(bytes).map_err(|_| {
-                    ToolError::Failed("file is neither UTF-8 nor a supported image".to_owned())
+                    LocalError::Failed("file is neither UTF-8 nor a supported image".to_owned())
                 })?;
-                let reference = store
+                let reference = context
                     .store_image(Some(output_path.clone()), &image)
                     .await
-                    .map_err(ToolError::failed)?;
-                Ok(ToolOutput::new(serde_json::to_value(ReadOutput::Image {
+                    .map_err(LocalError::failed)?;
+                Ok(ProducedOutput::new(serde_json::to_value(ReadOutput::Image {
                     path: output_path,
                     image: reference.clone(),
                 })?)
                 .with_images(vec![reference]))
-            }
         },
     )?;
     Ok(())
 }
 
 enum TextReadOutcome {
-    Captured(CompletedCapture),
+    Captured(FinishedOutput),
     NotUtf8,
 }
 
 async fn read_text(
     path: &std::path::Path,
-    context: &crate::tool::ToolContext,
-) -> Result<TextReadOutcome, ToolError> {
+    context: &LocalContext,
+) -> Result<TextReadOutcome, LocalError> {
     let mut capture = context
         .text_capture(TextCaptureField::Content)
         .await?
@@ -112,7 +108,7 @@ async fn read_text(
     let _cancel_on_drop = cancellation.clone().drop_guard();
     // Reading, capture writes and finishing run in one blocking owner; an abandoned
     // capture discards itself.
-    let completed = tokio::task::spawn_blocking(move || -> Result<_, ToolError> {
+    let completed = tokio::task::spawn_blocking(move || -> Result<_, LocalError> {
         let mut input = std::fs::File::open(path)?;
         match copy_utf8(&mut input, |text| capture.write_text(text), &cancellation)? {
             Utf8Read::Complete => Ok(Some(capture.finish()?)),
@@ -120,7 +116,7 @@ async fn read_text(
         }
     })
     .await
-    .map_err(ToolError::failed)??;
+    .map_err(LocalError::failed)??;
     if let Some(completed) = completed {
         Ok(TextReadOutcome::Captured(completed))
     } else {
@@ -137,17 +133,17 @@ enum Utf8Read {
 fn copy_utf8(
     input: &mut impl std::io::Read,
     mut output: impl FnMut(&str) -> std::io::Result<()>,
-    cancellation: &crate::job::CancellationToken,
-) -> Result<Utf8Read, ToolError> {
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<Utf8Read, LocalError> {
     let mut buffer = [0; 64 * 1024];
     let mut pending = Vec::new();
     loop {
         if cancellation.is_cancelled() {
-            return Err(ToolError::Cancelled);
+            return Err(LocalError::Cancelled);
         }
         let size = input.read(&mut buffer)?;
         if cancellation.is_cancelled() {
-            return Err(ToolError::Cancelled);
+            return Err(LocalError::Cancelled);
         }
         pending.extend_from_slice(&buffer[..size]);
         match std::str::from_utf8(&pending) {
@@ -192,16 +188,13 @@ enum ReadErrorCode {
     PermissionDenied,
 }
 
-fn read_error_output(path: &str, error: &ToolError) -> Option<ToolOutput> {
-    let ToolError::Io(error) = error else {
-        return None;
-    };
+fn read_error_output(path: &str, error: &std::io::Error) -> Option<serde_json::Value> {
     let code = match error.kind() {
         std::io::ErrorKind::NotFound => ReadErrorCode::NotFound,
         std::io::ErrorKind::PermissionDenied => ReadErrorCode::PermissionDenied,
         _ => return None,
     };
-    Some(ToolOutput::new(
+    Some(
         serde_json::to_value(ReadOutput::Error {
             path: path.to_owned(),
             error: ReadError {
@@ -210,7 +203,7 @@ fn read_error_output(path: &str, error: &ToolError) -> Option<ToolOutput> {
             },
         })
         .expect("read errors serialize"),
-    ))
+    )
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -318,13 +311,14 @@ mod tests {
 
     use super::*;
     use crate::job::{CancellationToken, JobState};
+    use crate::tool::ToolRegistryBuilder;
     use crate::tool::executor::{ExecutionError, ToolExecutor};
 
     fn read_executor(
         runtime: &crate::tests::TestRuntime,
     ) -> (ToolExecutor, Arc<std::sync::OnceLock<ToolExecutor>>) {
         let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder, runtime.store.clone()).unwrap();
+        builder.register_local(register).unwrap();
         let slot = Arc::new(std::sync::OnceLock::new());
         crate::tool::builtins::install_script_tool(&mut builder, Arc::downgrade(&slot)).unwrap();
         let executor = runtime.executor(builder);
@@ -418,16 +412,16 @@ mod tests {
         let result = copy_utf8(&mut &b"valid\xff"[..], |_| Ok(()), &cancellation);
         assert_eq!(result.unwrap(), Utf8Read::NotUtf8);
         assert!(
-            matches!(copy_utf8(&mut Reader(None), |_| Ok(()), &cancellation), Err(ToolError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData)
+            matches!(copy_utf8(&mut Reader(None), |_| Ok(()), &cancellation), Err(LocalError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData)
         );
         let during = Reader(Some(cancellation.clone()));
         assert!(matches!(
             copy_utf8(&mut { during }, |_| Ok(()), &cancellation),
-            Err(ToolError::Cancelled)
+            Err(LocalError::Cancelled)
         ));
         assert!(matches!(
             copy_utf8(&mut &b"data"[..], |_| Ok(()), &cancellation),
-            Err(ToolError::Cancelled)
+            Err(LocalError::Cancelled)
         ));
     }
 

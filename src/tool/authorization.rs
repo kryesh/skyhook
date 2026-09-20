@@ -25,7 +25,6 @@ pub(crate) struct AuthorizationSubject {
     pub agent: AgentId,
     pub job: JobId,
     pub parent: Option<JobId>,
-    pub scope: Option<u64>,
     pub capabilities: CapabilitySet,
     pub cancellation: CancellationToken,
 }
@@ -257,7 +256,6 @@ impl AuthorizationCoordinator {
             agent: subject.agent.clone(),
             job: subject.job,
             parent: subject.parent,
-            scope: subject.scope,
             tool,
             permissions,
             arguments,
@@ -338,7 +336,6 @@ mod tests {
             agent: AgentId::root(SessionId::from_bytes([9; 16])),
             job: JobId::new(1).unwrap(),
             parent: None,
-            scope: None,
             capabilities: CapabilitySet::default(),
             cancellation,
         }

@@ -38,7 +38,6 @@ impl JobManager {
                     job: *id,
                     owner: entry.agent.clone(),
                     parent: entry.parent,
-                    scope: entry.authorization_scope,
                     child: entry.child.clone()?,
                     location: entry.location.clone(),
                     cancellation: entry.cancellation.clone(),

@@ -1,24 +1,24 @@
 use crate::{
-    job::output::{AsyncCapture, CompletedCapture, PendingCapture},
-    tool::ToolError,
+    tool::invocation::LocalError,
+    tool::output::{AsyncOutput, FinishedOutput, PendingOutput},
 };
 
 /// The decoder tail belongs to the same owner as the text writer, not the
 /// cancellable stream pump. The shared writer retains partial-write progress.
 pub(super) struct Capture {
-    writer: AsyncCapture,
+    writer: AsyncOutput,
     pending: Vec<u8>,
 }
 
 impl Capture {
-    pub(super) fn new(writer: PendingCapture) -> Self {
+    pub(super) fn new(writer: PendingOutput) -> Self {
         Self {
             writer: writer.open_async(),
             pending: Vec::new(),
         }
     }
 
-    pub(super) async fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), ToolError> {
+    pub(super) async fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), LocalError> {
         self.pending.extend_from_slice(bytes);
         let mut text = String::new();
         let mut consumed = 0;
@@ -48,7 +48,7 @@ impl Capture {
         Ok(())
     }
 
-    pub(super) async fn finish(mut self) -> Result<Option<CompletedCapture>, ToolError> {
+    pub(super) async fn finish(mut self) -> Result<Option<FinishedOutput>, LocalError> {
         // EOF, deadline and cancellation deliberately share lossy-tail policy.
         // No recovery after arbitrary IO errors or a dropped finalizer is claimed.
         self.writer
@@ -62,8 +62,9 @@ impl Capture {
 mod tests {
     use super::*;
     use crate::{
-        job::output::{CaptureKind, TextCaptureField},
+        job::output::HostOutput,
         tests::TestRuntime,
+        tool::output::{ProducedOutput, TextCaptureField},
     };
 
     /// Writes `chunks` into a fresh stdout capture; returns the stored text, if published.
@@ -71,21 +72,26 @@ mod tests {
         let spec = crate::job::JobSpec::test(runtime.agent.clone(), "capture");
         let job = runtime.jobs.test_create(spec).await;
         let output = runtime.jobs.output(job);
-        let writer = runtime
-            .jobs
-            .pending_capture(
-                job,
-                TextCaptureField::Stdout.pointer(),
-                CaptureKind::Text,
-                true,
-            )
+        let host = HostOutput::new(runtime.store.clone(), job);
+        let context = host.context();
+        let writer = context
+            .text_capture(TextCaptureField::Stdout)
             .await
             .unwrap();
         let mut capture = Capture::new(writer);
         for chunk in chunks {
             capture.write_bytes(chunk).await.unwrap();
         }
-        let published = capture.finish().await.unwrap().is_some();
+        let finished = capture.finish().await.unwrap();
+        context.settle().await.unwrap();
+        let published = !host
+            .finish(
+                ProducedOutput::new(serde_json::Value::Null)
+                    .with_captures(finished.into_iter().collect()),
+            )
+            .unwrap()
+            .captures
+            .is_empty();
         let bytes = output.test_bytes("/result/stdout");
         assert_eq!(published, bytes.is_some());
         bytes.map(|bytes| String::from_utf8(bytes).unwrap())

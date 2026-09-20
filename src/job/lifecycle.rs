@@ -35,8 +35,8 @@ impl JobManager {
     }
 
     async fn create_owned(&self, mut spec: JobSpec) -> Result<JobLease, JobError> {
-        // Pruning takes the same operation gate. Do not hold the map lock across
-        // append: cancellation must still be able to reach the parent token.
+        // Do not hold the map lock across append: cancellation must still be
+        // able to reach the parent token.
         if let Some(parent) = spec.parent
             && !self.inner.jobs.lock().await.contains_key(&parent)
         {
@@ -422,7 +422,7 @@ mod tests {
         }
     }
 
-    // Creation ownership, admission, and pruning ordering tests.
+    // Creation ownership and admission tests.
 
     use crate::job::tests::terminal;
     use crate::session::AppendBoundary;
@@ -440,25 +440,6 @@ mod tests {
             matches!(event, SessionEvent::JobCreated { .. })
         })
         .await
-    }
-
-    async fn claimed(jobs: &JobManager, agent: &AgentId, tool: &str) -> JobId {
-        let id = jobs.test_create(JobSpec::test(agent.clone(), tool)).await;
-        jobs.test_finish(id, serde_json::json!("done")).await;
-        jobs.claim(id).await.unwrap();
-        id
-    }
-
-    fn prune(jobs: &JobManager) -> tokio::task::JoinHandle<Result<usize, JobError>> {
-        let jobs = jobs.clone();
-        tokio::spawn(async move { jobs.prune_claimed().await })
-    }
-
-    fn child_of(parent: JobId, agent: &AgentId, tool: &str) -> JobSpec {
-        JobSpec {
-            parent: Some(parent),
-            ..JobSpec::test(agent.clone(), tool)
-        }
     }
 
     #[tokio::test]
@@ -669,114 +650,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creation_pins_parent_against_prune_and_inherits_concurrent_cancellation() {
+    async fn creation_inherits_concurrent_parent_cancellation() {
         let (_root, jobs, agent) = crate::job::tests::runtime().await;
-        let parent = claimed(&jobs, &agent, "parent").await;
+        let parent = jobs
+            .test_create(JobSpec::test(agent.clone(), "parent"))
+            .await;
+        jobs.test_finish(parent, serde_json::json!("done")).await;
         let (reached, resume) = jobs
             .store()
             .pause_append_at(AppendBoundary::Publication)
             .await;
         let creating = tokio::spawn({
-            let (jobs, spec) = (jobs.clone(), child_of(parent, &agent, "child"));
+            let jobs = jobs.clone();
+            let spec = JobSpec {
+                parent: Some(parent),
+                ..JobSpec::test(agent, "child")
+            };
             async move { jobs.create(spec).await }
         });
         tokio::time::timeout(Duration::from_secs(3), reached)
             .await
             .unwrap()
             .unwrap();
-        let mut pruning = prune(&jobs);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut pruning)
-                .await
-                .is_err()
-        );
         // Cancellation does not need the creation gate or the session writer lock.
         let cancel = tokio::time::timeout(Duration::from_secs(1), jobs.cancel(parent));
         cancel.await.unwrap().unwrap();
         resume.send(()).unwrap();
         let child = creating.await.unwrap().unwrap();
         assert!(child.cancellation_token().is_cancelled());
-        let pruned = tokio::time::timeout(Duration::from_secs(3), pruning)
-            .await
-            .unwrap();
-        assert_eq!(pruned.unwrap().unwrap(), 1);
-        assert!(matches!(
-            jobs.metadata(parent).await,
-            Err(JobError::Unknown(_))
-        ));
         assert_eq!(terminal(&jobs, child.id()).await.state, JobState::Cancelled);
         assert_eq!(creation_count(&jobs).await, 2);
-    }
-
-    #[tokio::test]
-    async fn pruning_before_creation_rejects_parent_without_event_or_identity_gap() {
-        let (_root, jobs, agent) = crate::job::tests::runtime().await;
-        let parent = claimed(&jobs, &agent, "parent").await;
-        assert_eq!(jobs.prune_claimed().await.unwrap(), 1);
-        let rejected = jobs.create(child_of(parent, &agent, "rejected")).await;
-        assert!(matches!(rejected, Err(JobError::Unknown(id)) if id == parent));
-        assert_eq!(creation_count(&jobs).await, 1);
-        assert_eq!(
-            jobs.test_create(JobSpec::test(agent, "next")).await.get(),
-            2
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn prune_create_race_is_linearized_under_bounded_stress() {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            for _ in 0..22 {
-                let (_root, jobs, agent) = crate::job::tests::runtime().await;
-                let parent = claimed(&jobs, &agent, "parent").await;
-                let mut creates = tokio::task::JoinSet::new();
-                for _ in 0..8 {
-                    let (jobs, spec) = (jobs.clone(), child_of(parent, &agent, "child"));
-                    creates.spawn(async move { jobs.create(spec).await });
-                }
-                let pruning = prune(&jobs);
-                let mut accepted = 0;
-                while let Some(result) = creates.join_next().await {
-                    match result.unwrap() {
-                        Ok(lease) => {
-                            assert_eq!(
-                                jobs.metadata(lease.id()).await.unwrap().parent,
-                                Some(parent)
-                            );
-                            accepted += 1;
-                        }
-                        Err(JobError::Unknown(id)) if id == parent => {}
-                        Err(error) => panic!("unexpected create/prune outcome: {error}"),
-                    }
-                }
-                assert_eq!(pruning.await.unwrap().unwrap(), 1);
-                assert_eq!(creation_count(&jobs).await, accepted + 1);
-                assert_eq!(jobs.inner.jobs.lock().await.len(), accepted);
-            }
-        })
-        .await
-        .expect("bounded create/prune stress must not deadlock");
-    }
-
-    #[tokio::test]
-    async fn cancelled_prune_finishes_membership_and_artifact_cleanup() {
-        let (_root, jobs, agent) = crate::job::tests::runtime().await;
-        let id = claimed(&jobs, &agent, "pruned").await;
-        let output = jobs.output(id);
-        assert!(output.test_document().is_some());
-        let operation = jobs.operation(id).await.unwrap().lock_owned().await;
-        let pruning = prune(&jobs);
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while jobs.inner.creation_operation.try_write().is_ok() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        pruning.abort();
-        assert!(pruning.await.unwrap_err().is_cancelled());
-        drop(operation);
-        jobs.drain_creations().await;
-        assert!(matches!(jobs.metadata(id).await, Err(JobError::Unknown(job)) if job == id));
-        assert!(output.test_document().is_none());
     }
 }

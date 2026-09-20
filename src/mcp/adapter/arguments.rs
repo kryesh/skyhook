@@ -1,5 +1,5 @@
 //! Preserve upstream JSON Schema semantics while reserving the host job envelope.
-use crate::tool::ToolError;
+use crate::tool::AdmissionError;
 use serde_json::{Map, Value, json};
 
 struct NoExternalSchemas;
@@ -126,11 +126,13 @@ impl Arguments {
     pub(super) fn extract<'a>(
         &self,
         value: &'a Value,
-    ) -> Result<&'a Map<String, Value>, ToolError> {
-        let object = value.as_object().ok_or(ToolError::ArgumentsMustBeObject)?;
+    ) -> Result<&'a Map<String, Value>, AdmissionError> {
+        let object = value
+            .as_object()
+            .ok_or(AdmissionError::ArgumentsMustBeObject)?;
         if self.wrapped {
             if let Some(name) = object.keys().find(|name| name.as_str() != "arguments") {
-                return Err(ToolError::InvalidArguments(format!(
+                return Err(AdmissionError::InvalidArguments(format!(
                     "unknown argument `{name}`"
                 )));
             }
@@ -138,18 +140,18 @@ impl Arguments {
                 .get("arguments")
                 .and_then(Value::as_object)
                 .ok_or_else(|| {
-                    ToolError::InvalidArguments("`arguments` must be an object".to_owned())
+                    AdmissionError::InvalidArguments("`arguments` must be an object".to_owned())
                 })
         } else {
             Ok(object)
         }
     }
 
-    pub(super) fn validate(&self, value: &Value) -> Result<(), ToolError> {
+    pub(super) fn validate(&self, value: &Value) -> Result<(), AdmissionError> {
         let object = self.extract(value)?;
         self.validator
             .validate(&Value::Object(object.clone()))
-            .map_err(|error| ToolError::InvalidArguments(error.to_string()))
+            .map_err(|error| AdmissionError::InvalidArguments(error.to_string()))
     }
 }
 

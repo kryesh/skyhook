@@ -12,15 +12,15 @@ use crate::{
     tool::{ToolContext, ToolOutput, authorization::AuthorizationCoordinator},
 };
 
-use super::{
+use crate::remote::{
     manager::RemoteError,
     protocol::{
-        PROTOCOL_VERSION, PromptId, RemoteToolError, RemoteToolOutput, Request, RequestId,
-        Response, read_frame, spawn_owned_write, write_frame,
+        PromptId, RemoteToolResult, Request, RequestId, Response, read_frame, spawn_owned_write,
+        write_frame,
     },
 };
 
-pub(super) type Session = Arc<PooledConnection>;
+pub(in crate::remote) type Session = Arc<PooledConnection>;
 
 mod permissions;
 mod results;
@@ -43,7 +43,8 @@ struct RequestWriter {
     next_request_id: Option<RequestId>,
 }
 
-type RemoteToolResult = Result<RemoteToolOutput, RemoteToolError>;
+#[cfg(test)]
+use crate::remote::protocol::{RemoteToolError, RemoteToolOutput};
 type PendingResult = Result<results::ReceivedResult, RemoteError>;
 
 struct PendingCall {
@@ -110,18 +111,10 @@ impl PooledConnection {
             mut output,
             owner,
         } = transport;
-        write_frame(
-            &mut input,
-            &Request::Hello {
-                version: PROTOCOL_VERSION,
-            },
-        )
-        .await?;
+        write_frame(&mut input, &Request::Hello).await?;
         if !matches!(
             read_frame::<_, Response>(&mut output).await?,
-            Some(Response::Ready {
-                version: PROTOCOL_VERSION
-            })
+            Some(Response::Ready)
         ) {
             return Err(RemoteError::Protocol("invalid shim handshake".into()));
         }
@@ -159,10 +152,7 @@ async fn call_tool(
     context: &ToolContext,
 ) -> Result<ToolOutput, RemoteError> {
     if context.is_cancelled() {
-        return Err(RemoteError::Remote {
-            message: "tool was cancelled".into(),
-            output: None,
-        });
+        return Err(RemoteError::Cancelled);
     }
     let (request_id, receiver) = connection
         .submit(move |request_id, state| {
@@ -195,13 +185,10 @@ async fn call_tool(
         result = &mut received => result?,
         () = context.cancelled() => {
             send_cancel(connection, request_id).await?;
-            return Err(RemoteError::Remote {
-                message: "tool was cancelled".to_owned(),
-                output: None,
-            });
+            return Err(RemoteError::Cancelled);
         }
     };
-    result.into_output(context.store()).await
+    result.0
 }
 
 async fn send_cancel(
@@ -215,14 +202,11 @@ async fn send_cancel(
 }
 
 async fn fail_connection(state: &Mutex<ConnectionState>, failure: RemoteError) {
-    let pending = {
+    let (failure, pending) = {
         let mut state = state.lock().await;
-        if state.failure.is_some() {
-            return;
-        }
-        state.failure = Some(failure.clone());
+        let failure = state.failure.get_or_insert(failure).clone();
         state.streams.clear();
-        std::mem::take(&mut state.pending)
+        (failure, std::mem::take(&mut state.pending))
     };
     for pending in pending.into_values() {
         let _ = pending.sender.send(Err(failure.clone()));
@@ -261,10 +245,6 @@ mod tests {
 
     /// A live fake shim transport for manager/router tests, including the real handshake.
     pub(crate) fn test_transport() -> crate::remote::transport::Transport {
-        shim_replying(serde_json::json!({"type":"ready", "version":PROTOCOL_VERSION}))
-    }
-
-    fn shim_replying(ready: serde_json::Value) -> crate::remote::transport::Transport {
         struct FakeShim(tokio::task::JoinHandle<()>);
         impl Drop for FakeShim {
             fn drop(&mut self) {
@@ -275,12 +255,8 @@ mod tests {
         let (client, mut shim) = tokio::io::duplex(4096);
         let owner = FakeShim(tokio::spawn(async move {
             let hello = read_frame::<_, Request>(&mut shim).await;
-            if !matches!(
-                hello,
-                Ok(Some(Request::Hello {
-                    version: PROTOCOL_VERSION
-                }))
-            ) || write_frame(&mut shim, &ready).await.is_err()
+            if !matches!(hello, Ok(Some(Request::Hello)))
+                || write_frame(&mut shim, &Response::Ready).await.is_err()
             {
                 return;
             }
@@ -319,31 +295,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incompatible_worker_handshakes_are_rejected() {
-        let version = PROTOCOL_VERSION - 1;
-        for ready in [
-            serde_json::json!({"type":"ready"}),
-            serde_json::json!({"type":"ready", "version":version}),
-        ] {
-            let prompts = Arc::new(crate::remote::RejectSensitivePrompts);
-            let connection = PooledConnection::from_transport(
-                shim_replying(ready),
-                "test",
-                allow_all(),
-                prompts,
-            );
-            assert!(connection.await.is_err());
-        }
-    }
-
-    #[tokio::test]
     async fn cancellation_before_submission_creates_no_remote_registration() {
         let runtime = crate::tests::TestRuntime::new().await;
         let context = fixture_context(&runtime);
         context.cancellation_token().cancel();
         let connection = test_connection().await;
         let result = connection.execute("read".into(), serde_json::json!({}), &context);
-        assert!(result.await.is_err());
+        assert!(matches!(result.await, Err(RemoteError::Cancelled)));
         assert!(connection.state.lock().await.pending.is_empty());
         let next = connection.writer.lock().await.next_request_id;
         assert_eq!(next, Some(RequestId::FIRST));
@@ -384,7 +342,6 @@ mod tests {
             agent: runtime.agent.clone(),
             job: crate::identity::JobId::new(1).unwrap(),
             parent: None,
-            scope: None,
             capabilities,
             cancellation: CancellationToken::new(),
         };
@@ -404,7 +361,36 @@ mod tests {
             streams: Default::default(),
             value: serde_json::json!(value),
             images: Vec::new(),
+            captures: Vec::new(),
         })
+    }
+
+    pub(super) async fn write_result<W: tokio::io::AsyncWrite + Unpin>(
+        writer: &mut W,
+        request_id: RequestId,
+        result: RemoteToolResult,
+    ) {
+        use crate::remote::protocol::{PayloadEvent, PayloadId, PayloadOpen};
+        let bytes = serde_json::to_vec(&result).unwrap();
+        let events =
+            std::iter::once(PayloadEvent::Open(PayloadOpen::Result))
+                .chain(bytes.chunks(crate::remote::flow::CHUNK_BYTES).map(|data| {
+                    PayloadEvent::Data {
+                        id: PayloadId::Result,
+                        data: data.to_vec(),
+                    }
+                }))
+                .chain(std::iter::once(PayloadEvent::Finish {
+                    id: PayloadId::Result,
+                }));
+        for event in events {
+            write_frame(writer, &Response::Payload { request_id, event })
+                .await
+                .unwrap();
+        }
+        write_frame(writer, &Response::Tool { request_id })
+            .await
+            .unwrap();
     }
 
     pub(super) async fn route_fixture<R: tokio::io::AsyncRead + Unpin>(
@@ -452,13 +438,19 @@ mod tests {
             );
             assert!(!capabilities.contains(&Capability::Interactive));
             assert!(!capabilities.contains(&Capability::Read));
-            results::Results::default()
-                .finish(&connection.state, request_id, output("done"))
+            let pending = connection
+                .state
+                .lock()
                 .await
+                .pending
+                .remove(&request_id)
                 .unwrap();
+            let _ = pending
+                .sender
+                .send(Err(RemoteError::OperationDenied("fixture".into())));
         };
         let (result, ()) = tokio::join!(call, inspect);
-        assert!(result.is_ok());
+        assert!(matches!(result, Err(RemoteError::OperationDenied(_))));
     }
 
     #[tokio::test]

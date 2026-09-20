@@ -4,14 +4,15 @@ use std::{
     sync::Arc,
 };
 
-use super::skill_transfer::MAX_COPY_BYTES;
 use crate::bounded_io::{BoundedReadError, read_bounded};
+use crate::tool::builtins::skill_transfer::MAX_COPY_BYTES;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use crate::tool::{
-    RegistryError, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder, policy::Capability,
+    AdmissionError, RegistryError, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder,
+    policy::Capability,
 };
 use crate::{
     media::{ImageRef, MAX_IMAGE_BYTES},
@@ -42,7 +43,7 @@ enum SkillOperation {
 }
 
 impl TryFrom<SkillArgs> for SkillRequest {
-    type Error = ToolError;
+    type Error = AdmissionError;
 
     fn try_from(args: SkillArgs) -> Result<Self, Self::Error> {
         // Check blank fields in the existing order, but never trim the retained
@@ -53,7 +54,7 @@ impl TryFrom<SkillArgs> for SkillRequest {
             ("to", args.to.as_deref()),
         ] {
             if value.is_some_and(|value| value.trim().is_empty()) {
-                return Err(ToolError::InvalidArguments(format!(
+                return Err(AdmissionError::InvalidArguments(format!(
                     "{name} must not be empty"
                 )));
             }
@@ -61,7 +62,9 @@ impl TryFrom<SkillArgs> for SkillRequest {
         let operation = match (args.path, args.to) {
             (None, None) => SkillOperation::Instructions,
             (None, Some(_)) => {
-                return Err(ToolError::InvalidArguments("to requires path".to_owned()));
+                return Err(AdmissionError::InvalidArguments(
+                    "to requires path".to_owned(),
+                ));
             }
             (Some(asset), None) => SkillOperation::Inspect { asset },
             // Destination is an ordinary authorized workspace path, NOT a
@@ -365,7 +368,7 @@ pub(super) fn register(
         // Copy permissions are scoped to the caller by skill_transfer, not this host tool.
         ToolOptions::new(vec![Capability::Read]).argument_validator(|arguments| {
             let args: SkillArgs = serde_json::from_value(arguments.clone())
-                .map_err(ToolError::invalid)?;
+                .map_err(AdmissionError::invalid)?;
             SkillRequest::try_from(args).map(drop)
         }),
         move |context, args| {
@@ -765,7 +768,7 @@ mod tests {
     fn skill_requests_admit_operations_and_reject_blank_or_malformed_fields() {
         let request = |value| {
             serde_json::from_value::<SkillArgs>(value)
-                .map_err(ToolError::invalid)
+                .map_err(AdmissionError::invalid)
                 .and_then(SkillRequest::try_from)
         };
         let operation = |value| request(value).unwrap().operation;
@@ -795,7 +798,7 @@ mod tests {
         ] {
             let result = request(value.clone());
             assert!(
-                matches!(result, Err(ToolError::InvalidArguments(_))),
+                matches!(result, Err(AdmissionError::InvalidArguments(_))),
                 "{value}"
             );
         }

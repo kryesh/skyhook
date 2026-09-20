@@ -13,7 +13,14 @@ pub(super) async fn route_responses<R>(
 ) where
     R: AsyncRead + Unpin,
 {
-    let Err(error) = route(output, state, host, target, prompts).await;
+    let mut results = super::results::Results::default();
+    let Err(error) = route(output, state, host, target, prompts, &mut results).await;
+    {
+        let mut state = state.lock().await;
+        state.failure.get_or_insert_with(|| error.clone());
+        state.streams.clear();
+    }
+    results.shutdown(state).await;
     fail_connection(state, error).await;
 }
 
@@ -23,13 +30,13 @@ async fn route<R>(
     host: (&Arc<Mutex<RequestWriter>>, &AuthorizationCoordinator),
     target: String,
     prompts: Arc<dyn SensitivePromptHandler>,
+    results: &mut super::results::Results,
 ) -> Result<std::convert::Infallible, RemoteError>
 where
     R: AsyncRead + Unpin,
 {
     let mut callbacks = tokio::task::JoinSet::<Result<Option<PromptId>, RemoteError>>::new();
     let mut prompt_tasks = HashMap::<PromptId, crate::job::CancellationToken>::new();
-    let mut results = super::results::Results::default();
     loop {
         // Keep the frame read alive while servicing callbacks: read_exact is not
         // cancellation-safe, so restarting it could lose part of a frame.
@@ -39,6 +46,9 @@ where
             loop {
                 tokio::select! {
                     response = &mut reading => break response,
+                    completed = results.tasks.join_next(), if !results.tasks.is_empty() => {
+                        results.complete(state, completed.expect("nonempty ingestion set")).await?;
+                    }
                     completed = callbacks.join_next(), if !callbacks.is_empty() => {
                         match completed {
                             Some(Ok(Ok(Some(id)))) => { prompt_tasks.remove(&id); }
@@ -56,17 +66,8 @@ where
             .map_err(RemoteError::io)?
             .ok_or_else(|| RemoteError::Protocol("shim closed before replying".to_owned()))?;
         match response {
-            frame @ Response::ToolArtifact { .. } => results.artifact(state, frame).await?,
-            Response::ToolChunk {
-                request_id,
-                offset,
-                data,
-                finished,
-            } => {
-                let chunk = results.chunk(request_id, offset, data, finished);
-                if let Some(result) = chunk.map_err(RemoteError::io)? {
-                    results.finish(state, request_id, result).await?;
-                }
+            Response::Payload { request_id, event } => {
+                results.payload(state, host.0, request_id, event).await?;
             }
             Response::SensitiveCancelled { prompt_id } => {
                 if let Some(cancellation) = prompt_tasks.remove(&prompt_id) {
@@ -74,7 +75,7 @@ where
                 }
             }
             Response::StreamData { channel, data } => {
-                let invalid = data.len() > 32 * 1024;
+                let invalid = data.len() > crate::remote::flow::CHUNK_BYTES;
                 let overflow = {
                     let state = state.lock().await;
                     state.streams.get(&channel).is_some_and(|sender| {
@@ -97,14 +98,10 @@ where
             Response::StreamAck { channel } => {
                 let invalid = {
                     let state = state.lock().await;
-                    state.streams.get(&channel).is_some_and(|stream| {
-                        if stream.credit.available_permits() >= 16 {
-                            true
-                        } else {
-                            stream.credit.add_permits(1);
-                            false
-                        }
-                    })
+                    state
+                        .streams
+                        .get(&channel)
+                        .is_some_and(|stream| stream.credit.acknowledge().is_err())
                 };
                 if invalid {
                     return Err(RemoteError::Protocol("invalid stream credit".into()));
@@ -143,9 +140,7 @@ where
                 });
                 prompt_tasks.insert(prompt_id, cancellation);
             }
-            Response::Tool { request_id, result } => {
-                results.finish(state, request_id, result).await?;
-            }
+            Response::Tool { request_id } => results.terminal(request_id)?,
             Response::Authorization {
                 request_id,
                 authorization_id,
@@ -204,7 +199,7 @@ where
                     Ok(None)
                 });
             }
-            Response::Ready { .. } => {
+            Response::Ready => {
                 return Err(RemoteError::Protocol(
                     "received a second remote ready response".to_owned(),
                 ));
@@ -215,7 +210,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{fixture_context, output, route_fixture, test_connection};
+    use super::super::tests::{
+        fixture_context, output, route_fixture, test_connection, write_result,
+    };
     use super::*;
     use crate::remote::protocol::AuthorizationId;
     use crate::tool::policy::{Capability, PermissionUse, ResourceId};
@@ -223,6 +220,15 @@ mod tests {
 
     const PROMPT: PromptId = PromptId(9);
     const AUTHORIZATION: AuthorizationId = AuthorizationId(7);
+
+    async fn control(reader: &mut tokio::io::DuplexStream) -> Option<Request> {
+        loop {
+            let request = read_frame(reader).await.unwrap();
+            if !matches!(request, Some(Request::PayloadAck)) {
+                return request;
+            }
+        }
+    }
 
     async fn register(
         state: &Mutex<ConnectionState>,
@@ -295,19 +301,12 @@ mod tests {
             };
             write_frame(&mut requests, &request).await.unwrap();
             entered.notified().await;
-            let second = Response::Tool {
-                request_id: RequestId::new(2).unwrap(),
-                result: output("second"),
-            };
-            write_frame(&mut requests, &second).await.unwrap();
+            write_result(&mut requests, RequestId::new(2).unwrap(), output("second")).await;
             let completed = receiver.await.unwrap().unwrap();
-            assert_eq!(
-                completed.into_output(&runtime.store).await.unwrap().value,
-                "second"
-            );
+            assert_eq!(completed.0.unwrap().value, "second");
             write_frame(&mut requests, &prompt).await.unwrap();
             assert!(matches!(
-                read_frame::<_, Request>(&mut replies).await.unwrap(),
+                control(&mut replies).await,
                 Some(Request::SensitiveAnswer {
                     prompt_id: PROMPT,
                     answer: crate::remote::prompt::PromptAnswer::Rejected
@@ -315,7 +314,7 @@ mod tests {
             ));
             release.notify_one();
             assert!(matches!(
-                read_frame::<_, Request>(&mut replies).await.unwrap(),
+                control(&mut replies).await,
                 Some(Request::AuthorizationDecision {
                     authorization_id: AUTHORIZATION,
                     allowed: true,
@@ -340,10 +339,7 @@ mod tests {
     async fn invalid_or_closed_response_fails_pending_requests() {
         let runtime = crate::tests::TestRuntime::new().await;
         let context = fixture_context(&runtime);
-        for (orphan, expected) in [
-            (true, "unknown request ID 99"),
-            (false, "closed before replying"),
-        ] {
+        for orphan in [true, false] {
             let (mut peer, stream) = tokio::io::duplex(4096);
             let state = Arc::new(Mutex::new(ConnectionState::default()));
             let receiver = register(&state, 1, &context).await;
@@ -351,14 +347,14 @@ mod tests {
             if orphan {
                 let orphaned = Response::Tool {
                     request_id: RequestId::new(99).unwrap(),
-                    result: output("orphaned"),
                 };
                 write_frame(&mut peer, &orphaned).await.unwrap();
             }
             drop(peer);
-            assert!(
-                matches!(receiver.await.unwrap(), Err(RemoteError::Protocol(message)) if message.contains(expected))
-            );
+            assert!(matches!(
+                receiver.await.unwrap(),
+                Err(RemoteError::Protocol(_))
+            ));
             reader.await.unwrap();
         }
     }

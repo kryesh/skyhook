@@ -2,9 +2,9 @@
 
 ## Remote transport
 
-The crate-private `ConnectionFactory` (`remote/backend.rs`) opens an owned `Transport` byte stream
-to a route; the manager performs the shim handshake over it, pools one connection per workspace,
-and test doubles implement the same trait. `remote/protocol.rs` is the shim wire protocol carried over that stream.
+A shim executes individual tool operations on its machine. Job state, saved output, and image
+attachments belong to the host; output streams back while requests run. The shim does not create
+a session database. Connections are pooled per workspace.
 
 SSH configuration is generated only from target definitions. An SSH process runs on root or on
 the shim of the destination's `origin`; `via` hops are native `ProxyJump` hops of that process.

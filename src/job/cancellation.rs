@@ -2,7 +2,7 @@
 
 use super::*;
 
-const CANCELLATION_GRACE: Duration = Duration::from_millis(250);
+use crate::tool::invocation::CANCELLATION_GRACE;
 
 impl JobManager {
     pub async fn cancel(&self, id: JobId) -> Result<JobEnvelope, JobError> {

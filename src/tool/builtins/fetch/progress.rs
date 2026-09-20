@@ -8,7 +8,7 @@ use serde::Serialize;
 use super::diagnostics::{FetchDiagnostic, FetchError, FetchPhase};
 use super::response::collect_headers;
 use super::validation::{HttpRequestUrl, SanitizedOrigin};
-use super::{ResponseBody, ToolError, ToolOutput};
+use super::{LocalError, ProducedOutput, ResponseBody};
 
 /// Failures add diagnostics and only include HTTP response fields when a response
 /// actually arrived. Response headers also require explicit opt-in.
@@ -123,14 +123,14 @@ impl FetchProgress {
         });
     }
 
-    pub fn timeout(&self, limit_secs: u64) -> ToolError {
+    pub fn timeout(&self, limit_secs: u64) -> LocalError {
         self.diagnostic_failure(FetchDiagnostic::total_timeout(
             self.phase,
             limit_secs.saturating_mul(1000),
         ))
     }
 
-    pub fn failure(&self, error: FetchError) -> ToolError {
+    pub fn failure(&self, error: FetchError) -> LocalError {
         match error.into_diagnostic() {
             Ok(diagnostic) => self.diagnostic_failure(diagnostic),
             // Cancellation, denial and argument contracts retain their original metadata.
@@ -138,7 +138,7 @@ impl FetchProgress {
         }
     }
 
-    fn diagnostic_failure(&self, diagnostic: FetchDiagnostic) -> ToolError {
+    fn diagnostic_failure(&self, diagnostic: FetchDiagnostic) -> LocalError {
         let diagnostic = diagnostic.with_connect_limit(self.connect_timeout_ms);
         let elapsed_ms = self.elapsed_ms();
         let mut summary = format!(
@@ -164,7 +164,7 @@ impl FetchProgress {
         // One typed projection, with no JSON recovery, arbitrary output merge, or
         // images inherited from a nested failure. Headers can only enter via response().
         let value = serde_json::to_value(report).expect("fetch diagnostics serialize");
-        ToolError::with_output(summary, ToolOutput::new(value))
+        LocalError::with_output(summary, ProducedOutput::new(value))
     }
 }
 
@@ -286,15 +286,15 @@ mod tests {
     fn forged_diagnostic_and_payload_are_not_recovered_from_legacy_errors() {
         let progress =
             progress_for(json!({"url":"https://example.org/private?token=secret#secret"})).1;
-        let forged = ToolOutput::new(json!({
+        let forged = ProducedOutput::new(json!({
             "diagnostic":{"phase":"connect", "error_kind":"timeout", "message":"secret forged message",
                 "timeout":{"kind":"total", "limit_ms":1}},
             "headers":{"authorization":["secret"]}, "url":"https://secret:secret@host/secret",
             "body":{"kind":"text", "text":"secret"}, "extra":"secret"
         }));
-        let legacy = ToolError::with_output("secret error display", forged);
+        let legacy = LocalError::with_output("secret error display", forged);
         let error = progress.failure(FetchError::from_tool_error(legacy, FetchPhase::Extraction));
-        let ToolError::FailedWithOutput { message, output } = error else {
+        let LocalError::FailedWithOutput { message, output } = error else {
             panic!("structured failure")
         };
         assert!(!message.contains("secret"));
@@ -321,9 +321,12 @@ mod tests {
                 FetchPhase::Authorization,
             ))
         };
-        assert!(matches!(admit(ToolError::Cancelled), ToolError::Cancelled));
+        assert!(matches!(
+            admit(LocalError::Cancelled),
+            LocalError::Cancelled
+        ));
         assert!(
-            matches!(admit(ToolError::Denied("permission metadata".into())), ToolError::Denied(value) if value == "permission metadata")
+            matches!(admit(LocalError::Denied("permission metadata".into())), LocalError::Denied(value) if value == "permission metadata")
         );
     }
 
@@ -343,7 +346,7 @@ mod tests {
             (progress.phase, progress.received_bytes),
             (FetchPhase::Request, 0)
         );
-        let ToolError::FailedWithOutput { message, output } = progress.timeout(7) else {
+        let LocalError::FailedWithOutput { message, output } = progress.timeout(7) else {
             panic!("structured failure")
         };
         assert!(!message.contains("secret"));

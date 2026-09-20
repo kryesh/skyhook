@@ -1,10 +1,11 @@
 //! Flow-controlled SSH byte streams relayed over a shim connection.
 use super::*;
+use crate::remote::flow::{CHUNK_BYTES, Credits, WINDOW};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 pub(super) struct ClientStream {
     pub(super) output: tokio::sync::mpsc::Sender<Result<Vec<u8>, RemoteError>>,
-    pub(super) credit: Arc<tokio::sync::Semaphore>,
+    pub(super) credit: Credits,
 }
 impl Drop for ClientStream {
     fn drop(&mut self) {
@@ -42,8 +43,8 @@ impl PooledConnection {
         route: Vec<TargetDefinition>,
         command: String,
     ) -> Result<crate::remote::transport::Transport, RemoteError> {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
-        let credit = Arc::new(tokio::sync::Semaphore::new(16));
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(WINDOW + 1);
+        let credit = Credits::default();
         let (channel, ()) = self
             .submit(|channel, state| {
                 state.streams.insert(
@@ -67,12 +68,11 @@ impl PooledConnection {
         let (mut input, mut output) = tokio::io::split(peer);
         let parent = self.clone();
         let write_task = tokio::spawn(async move {
-            let mut bytes = vec![0; 32 * 1024];
+            let mut bytes = vec![0; CHUNK_BYTES];
             while let Ok(count) = input.read(&mut bytes).await {
-                let Ok(permit) = credit.acquire().await else {
+                let Ok(()) = credit.take().await else {
                     break;
                 };
-                permit.forget();
                 let request = if count == 0 {
                     Request::StreamEnd { channel }
                 } else {

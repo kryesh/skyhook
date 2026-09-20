@@ -19,8 +19,7 @@ use crate::{
     tool::{
         ToolPlacement,
         authorization::{AuthorizationCoordinator, AuthorizationError, AuthorizationSubject},
-        builtins::workspace::{lexical_path, resolve_for_authorization},
-        policy::{ApprovalGrant, Capability, CapabilitySet, PermissionUse, Policy, ResourceId},
+        policy::{Capability, CapabilitySet, PermissionUse, Policy, ResourceId},
     },
 };
 
@@ -62,7 +61,7 @@ struct InvocationPlan {
 /// connection afterwards; local dispatch is unchanged by that transition.
 enum InvocationDispatch<R> {
     /// Admission failures are reported by the job, after approval, as a handler would.
-    Local(Result<super::registry::AdmittedInvocation, ToolError>),
+    Local(Result<super::registry::AdmittedInvocation, super::AdmissionError>),
     ReadError(ToolOutput),
     Remote {
         remote: R,
@@ -90,7 +89,6 @@ struct ExecutorServices {
     jobs: JobManager,
     root_location: ExecutionLocation,
     router: Option<TargetRouter>,
-    process_environment: crate::remote::backend::ProcessEnvironment,
 }
 
 impl ToolExecutor {
@@ -125,7 +123,6 @@ impl ToolExecutor {
                 jobs,
                 root_location: ExecutionLocation::root(workspace),
                 router: None,
-                process_environment: Default::default(),
             }),
             caller_location,
             capabilities: CapabilitySet::default(),
@@ -170,12 +167,6 @@ impl ToolExecutor {
     }
 
     #[must_use]
-    pub(crate) fn with_authorization_root(mut self, root: PathBuf) -> Self {
-        Arc::make_mut(&mut self.shared).root_location = ExecutionLocation::root(root);
-        self
-    }
-
-    #[must_use]
     pub fn registry(&self) -> &ToolRegistry {
         &self.shared.registry
     }
@@ -183,14 +174,6 @@ impl ToolExecutor {
     #[must_use]
     pub fn jobs(&self) -> &JobManager {
         &self.shared.jobs
-    }
-
-    pub(crate) fn with_process_environment(
-        mut self,
-        environment: crate::remote::backend::ProcessEnvironment,
-    ) -> Self {
-        Arc::make_mut(&mut self.shared).process_environment = environment;
-        self
     }
 
     pub async fn execute(
@@ -235,7 +218,7 @@ impl ToolExecutor {
         parent: Option<JobId>,
     ) -> Result<ExecutionResult, ExecutionError> {
         let plan = self
-            .plan_registered(kind, agent, name, arguments, parent, None)
+            .plan_registered(kind, agent, name, arguments, parent)
             .await?;
         let result_policy = plan.tool.result_policy();
         let started = self.start(plan).await?;
@@ -248,26 +231,5 @@ impl ToolExecutor {
             }
             InvocationKind::Host => self.collect_started(started).await,
         }
-    }
-
-    pub(crate) async fn start_scoped(
-        &self,
-        agent: AgentId,
-        name: &str,
-        arguments: Value,
-        parent: Option<JobId>,
-        authorization_scope: u64,
-    ) -> Result<StartedExecution, ExecutionError> {
-        let plan = self
-            .plan_registered(
-                InvocationKind::Host,
-                agent,
-                name,
-                arguments,
-                parent,
-                Some(authorization_scope),
-            )
-            .await?;
-        self.start(plan).await
     }
 }

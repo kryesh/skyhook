@@ -420,7 +420,6 @@ mod tests {
             agent: AgentId::root(SessionId::from_bytes([7; 16])),
             job: JobId::new(17).unwrap(),
             parent: Some(JobId::new(11).unwrap()),
-            scope: Some(23),
             capabilities,
             cancellation: CancellationToken::new(),
         }

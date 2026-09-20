@@ -1,24 +1,20 @@
 //! Workspace filesystem tools.
+use crate::tool::invocation::LocalCatalogBuilder;
 
 mod mutations;
 mod read;
 
-use crate::{
-    session::SessionStore,
-    tool::{RegistryError, ToolRegistryBuilder},
-};
+use crate::tool::RegistryError;
 
-pub(super) fn register(
-    builder: &mut ToolRegistryBuilder,
-    store: SessionStore,
-) -> Result<(), RegistryError> {
-    read::register(builder, store)?;
+pub(crate) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
+    read::register(builder)?;
     mutations::register(builder)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::ToolRegistryBuilder;
     use crate::{
         tests::RecordingPolicy,
         tool::{
@@ -38,7 +34,7 @@ mod tests {
         std::fs::write(child_workspace.join("input.txt"), "child").unwrap();
         std::fs::write(root.join("outside.txt"), "outside").unwrap();
         let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder, runtime.store.clone()).unwrap();
+        builder.register_local(register).unwrap();
         let policy = RecordingPolicy::allowing();
         let workspace = std::fs::canonicalize(root.join("workspace")).unwrap();
         let executor = ToolExecutor::new(

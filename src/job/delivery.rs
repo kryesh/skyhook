@@ -144,15 +144,6 @@ impl JobManager {
             .map(drop)
     }
 
-    /// Transfer observes the same readiness as foreground execution without
-    /// acknowledging either completion or question delivery.
-    pub(crate) async fn wait_foreground_for_transfer(
-        &self,
-        id: JobId,
-    ) -> Result<JobEnvelope, JobError> {
-        self.wait_inner(id, None, WaitMode::Transfer).await
-    }
-
     pub(super) async fn wait_inner(
         &self,
         id: JobId,
@@ -173,7 +164,6 @@ impl JobManager {
                         entry.deliverable() || entry.background,
                         entry.state == JobState::WaitingInput,
                     ),
-                    WaitMode::Transfer => (entry.deliverable() || entry.background, false),
                     WaitMode::Explicit { claim } => (
                         !entry.suspended() && (entry.state.is_terminal() || pending_question),
                         claim,
@@ -242,55 +232,6 @@ impl JobManager {
             (entry.delivery == DeliveryState::Pending).then(|| entry.agent.clone())
         };
         self.persist_claim(id, agent, delivery).await
-    }
-
-    pub(crate) async fn prune_claimed(&self) -> Result<usize, JobError> {
-        let creation = self.inner.creation_operation.clone().write_owned().await;
-        self.spawn_owned(creation, "prune", move |manager| async move {
-            // Pin candidates before the delivery gate: operation -> delivery lock order.
-            let candidates = manager
-                .inner
-                .jobs
-                .lock()
-                .await
-                .iter()
-                .filter(|(_, entry)| {
-                    entry.state.is_terminal()
-                        && entry.delivery == DeliveryState::Claimed
-                        && entry.resume.is_none()
-                })
-                .map(|(&id, entry)| (id, entry.operation.clone()))
-                .collect::<Vec<_>>();
-            let mut pinned = Vec::with_capacity(candidates.len());
-            for (id, operation) in candidates {
-                pinned.push((id, operation.lock_owned().await));
-            }
-            let _delivery = manager.inner.delivery_operation.lock().await;
-            let removed = {
-                let mut jobs = manager.inner.jobs.lock().await;
-                let removed = pinned
-                    .iter()
-                    .filter_map(|(id, _)| {
-                        jobs.get(id)
-                            .filter(|entry| {
-                                entry.state.is_terminal()
-                                    && entry.delivery == DeliveryState::Claimed
-                                    && entry.resume.is_none()
-                            })
-                            .map(|_| *id)
-                    })
-                    .collect::<Vec<_>>();
-                for id in &removed {
-                    jobs.remove(id);
-                }
-                removed
-            };
-            for id in &removed {
-                manager.inner.store.remove_job_artifacts(*id).await?;
-            }
-            Ok(removed.len())
-        })
-        .await
     }
 
     /// Snapshot a bounded pending batch without acknowledging it. The receipt
@@ -415,17 +356,6 @@ mod tests {
             pending,
             "replay {case}"
         );
-    }
-
-    #[tokio::test]
-    async fn foreground_transfer_does_not_claim_questions() {
-        let (_root, manager, owner, job) = question_job().await;
-        let transferred = manager.wait_foreground_for_transfer(job).await.unwrap();
-        assert_eq!(transferred.state, JobState::WaitingInput);
-        assert!(transferred.output.is_some());
-        assert!(manager.has_pending(&owner).await);
-        assert_eq!(manager.wait_foreground(job).await.unwrap(), transferred);
-        assert!(!manager.has_pending(&owner).await);
     }
 
     /// An open receipt serializes an explicit claim; either the claim wins after

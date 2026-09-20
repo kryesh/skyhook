@@ -9,7 +9,7 @@ mod reader;
 pub(crate) use captures::CaptureDescriptor;
 pub use captures::CaptureKind;
 pub(crate) use captures::{
-    AsyncCapture, CaptureWriter, CompletedCapture, PendingCapture, TextCaptureField,
+    CaptureCollector, CaptureWriter, CompletedCapture, HostOutput, PendingCapture, TextCaptureField,
 };
 pub(crate) use reader::Source;
 mod truncation;
@@ -289,16 +289,9 @@ fn save_document(
         .map_err(database)
 }
 
-/// Install referenced fields no larger than `maximum` bytes into the document.
-fn hydrate(saved: &Saved, mut value: Value, maximum: u64) -> Result<Value, ToolError> {
+/// Install referenced fields into the document.
+fn hydrate(saved: &Saved, mut value: Value) -> Result<Value, ToolError> {
     for field in &saved.fields {
-        if saved
-            .captures
-            .get(field)
-            .is_some_and(|capture| capture.bytes > maximum)
-        {
-            continue;
-        }
         hydrate_field(saved, &mut value, field)?;
     }
     Ok(value)
@@ -421,12 +414,6 @@ impl JobManager {
         };
         let job = output.job.get();
         blocking(move || output.db.save_presentation(job, &rows).map_err(database)).await
-    }
-
-    pub(crate) async fn output_changed(&self, id: JobId) {
-        if let Some(entry) = self.inner.jobs.lock().await.get(&id) {
-            entry.notify.notify_waiters();
-        }
     }
 
     pub(crate) fn output(&self, id: JobId) -> Output {
@@ -774,14 +761,6 @@ impl JobManager {
         &self,
         envelope: &mut super::JobEnvelope,
     ) -> Result<(), JobError> {
-        self.hydrate_envelope_up_to(envelope, u64::MAX).await
-    }
-
-    pub(crate) async fn hydrate_envelope_up_to(
-        &self,
-        envelope: &mut super::JobEnvelope,
-        maximum: u64,
-    ) -> Result<(), JobError> {
         if !envelope.state.is_terminal() {
             return Ok(());
         }
@@ -792,7 +771,7 @@ impl JobManager {
             saved
                 .document
                 .clone()
-                .map(|document| hydrate(&saved, document, maximum).map(|value| (has_result, value)))
+                .map(|document| hydrate(&saved, document).map(|value| (has_result, value)))
                 .transpose()
         })
         .await
@@ -914,25 +893,6 @@ pub(crate) fn presentation_size(output: &Output) -> usize {
     })
 }
 
-/// Captures a remote worker streams separately from its result frame.
-pub(crate) fn transfer_fields(
-    output: &Output,
-) -> Result<Vec<(String, CaptureKind, Source)>, ToolError> {
-    let saved = Saved::load(output)?;
-    Ok(captures::available_captures(&saved, true)
-        .into_iter()
-        .filter(|capture| {
-            // Unreferenced/unfinished captures have no result value to carry
-            // their bytes, even when they fit in a normal result frame.
-            !capture.complete || saved.captures[&capture.field].bytes > PAGE_BYTES as u64
-        })
-        .filter_map(|capture| {
-            let source = saved.capture(&capture.field)?;
-            Some((capture.field, capture.kind, source))
-        })
-        .collect())
-}
-
 #[cfg(test)]
 impl Output {
     /// Register `field` holding `bytes`, as an unfinished producer leaves it,
@@ -963,32 +923,6 @@ impl Output {
 
     pub(crate) fn test_delete_capture(&self, capture: &CompletedCapture) {
         self.db.delete_capture(capture.capture_id()).unwrap();
-    }
-}
-
-/// A running job's output for synchronous tests, with the runtime that owns it.
-#[cfg(test)]
-pub(crate) struct TestOutput {
-    pub output: Output,
-    _manager: JobManager,
-    _root: tempfile::TempDir,
-    _runtime: tokio::runtime::Runtime,
-}
-
-#[cfg(test)]
-impl TestOutput {
-    pub(crate) fn new() -> Self {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (root, manager, job) = runtime.block_on(tests::fixture(None));
-        Self {
-            output: manager.output(job),
-            _manager: manager,
-            _root: root,
-            _runtime: runtime,
-        }
     }
 }
 

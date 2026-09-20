@@ -1,4 +1,7 @@
 //! Bounded HTTP requests. Redirects are deliberately handled here, never by reqwest.
+use crate::tool::ToolOptions;
+use crate::tool::invocation::{LocalCatalogBuilder, LocalContext, LocalError};
+use crate::tool::output::ProducedOutput;
 use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
@@ -7,8 +10,7 @@ use serde_json::Value;
 
 use super::fetch_text;
 use crate::tool::{
-    PathArgument, PathKind, RegistryError, ToolContext, ToolError, ToolOptions, ToolOutput,
-    ToolPlacement, ToolRegistryBuilder,
+    PathArgument, PathKind, RegistryError, ToolPlacement,
     policy::{Capability, PathAccess, PermissionUse, ResourceId},
 };
 
@@ -188,24 +190,24 @@ enum ResponseBody {
     Empty,
 }
 
-pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
+pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
     builder.register_product::<FetchArgs, FetchResultSchema, _, _>(
         "fetch",
         "HTTP(S) from the selected target. HTTP error statuses are normal results. Safe redirects follow GET/HEAD only; no HTTPS downgrade or retries.",
         ToolOptions::new(vec![Capability::Network])
             .argument_validator(|arguments| {
-                let args: FetchArgs = serde_json::from_value(arguments.clone()).map_err(invalid)?;
+                let args: FetchArgs = serde_json::from_value(arguments.clone()).map_err(crate::tool::invocation::AdmissionError::invalid)?;
                 FetchPlan::try_from(args).map(drop)
             })
             // These callbacks still parse wire data to discover permissions and paths;
             // they do not construct or discard the retained domain plan.
             .argument_permissions(|location, arguments| {
-                let args: FetchArgs = serde_json::from_value(arguments.clone()).map_err(invalid)?;
+                let args: FetchArgs = serde_json::from_value(arguments.clone()).map_err(crate::tool::invocation::AdmissionError::invalid)?;
                 let url = HttpRequestUrl::parse(&args.url)?;
                 Ok(vec![PermissionUse::new(Capability::Network, ResourceId::network(&location.target, url.origin().as_str()))])
             })
             .argument_paths(|arguments| {
-                let args: FetchArgs = serde_json::from_value(arguments.clone()).map_err(invalid)?;
+                let args: FetchArgs = serde_json::from_value(arguments.clone()).map_err(crate::tool::invocation::AdmissionError::invalid)?;
                 let mut paths = Vec::new();
                 if args.save_to.is_some() { paths.push(PathArgument::pointer("/save_to", PathAccess::Write, PathKind::Writable)); }
                 if matches!(args.body, Some(RequestBody::File { .. })) {
@@ -221,11 +223,11 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
                 plan.client.connect_timeout, plan.client.proxy_origin());
             let outcome = tokio::select! {
                 biased;
-                () = context.cancelled() => return Err(ToolError::Cancelled),
+                () = context.cancelled() => return Err(LocalError::Cancelled),
                 result = tokio::time::timeout(timeout, execute(&context, plan, &mut progress)) => result,
             };
             match outcome {
-                Ok(Ok(result)) => Ok(ToolOutput::new(serde_json::to_value(result).map_err(ToolError::failed)?)),
+                Ok(Ok(result)) => Ok(ProducedOutput::new(serde_json::to_value(result).map_err(LocalError::failed)?)),
                 Ok(Err(error)) => Err(progress.failure(error)),
                 Err(_) => Err(progress.timeout(timeout.as_secs())),
             }
@@ -234,13 +236,14 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
     Ok(())
 }
 
-fn invalid(error: impl std::fmt::Display) -> ToolError {
-    ToolError::invalid(error)
+fn invalid(error: impl std::fmt::Display) -> LocalError {
+    LocalError::invalid(error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::ToolRegistryBuilder;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -268,7 +271,7 @@ mod tests {
         runtime: &crate::tests::TestRuntime,
     ) -> crate::tool::executor::ToolExecutor {
         let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder).unwrap();
+        builder.register_local(register).unwrap();
         runtime.executor(builder)
     }
 

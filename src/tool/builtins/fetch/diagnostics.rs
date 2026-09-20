@@ -10,7 +10,7 @@ use std::{error::Error, fmt, io};
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use super::ToolError;
+use super::LocalError;
 
 /// The operation which was in progress, not a guess at a transport substage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -273,8 +273,8 @@ impl FetchDiagnostic {
 pub(super) enum FetchError {
     Diagnostic(FetchDiagnostic),
     /// Only control-flow/admission metadata crosses unchanged. A generic failed
-    /// error, arbitrary ToolOutput, or secret IO display is never retained.
-    Passthrough(ToolError),
+    /// error, arbitrary ProducedOutput, or secret IO display is never retained.
+    Passthrough(LocalError),
 }
 
 impl From<FetchDiagnostic> for FetchError {
@@ -286,24 +286,24 @@ impl From<FetchDiagnostic> for FetchError {
 impl FetchError {
     /// Explicit admission for authorization, validation and the legacy fetch_text
     /// API. Never inspect diagnostic JSON, preserve arbitrary outputs, or copy display text.
-    pub fn from_tool_error(error: ToolError, phase: FetchPhase) -> Self {
+    pub fn from_tool_error(error: LocalError, phase: FetchPhase) -> Self {
         match error {
-            ToolError::Io(error) => FetchDiagnostic::from_io(&error, phase).into(),
-            ToolError::Failed(_) | ToolError::FailedWithOutput { .. } | ToolError::Json(_) => {
+            LocalError::Io(error) => FetchDiagnostic::from_io(&error, phase).into(),
+            LocalError::Failed(_) | LocalError::FailedWithOutput { .. } | LocalError::Json(_) => {
                 Self::Diagnostic(FetchDiagnostic::new(phase, fallback(phase)))
             }
-            ToolError::Cancelled
-            | ToolError::Interrupted
-            | ToolError::Denied(_)
-            | ToolError::InvalidArguments(_)
-            | ToolError::ArgumentsMustBeObject
-            | ToolError::InvalidBackground
-            | ToolError::BackgroundUnsupported(_)
-            | ToolError::InputClosed => Self::Passthrough(error),
+            LocalError::Cancelled
+            | LocalError::Interrupted
+            | LocalError::Denied(_)
+            | LocalError::InvalidArguments(_)
+            | LocalError::ArgumentsMustBeObject
+            | LocalError::InvalidBackground
+            | LocalError::BackgroundUnsupported(_)
+            | LocalError::InputClosed => Self::Passthrough(error),
         }
     }
 
-    pub fn into_diagnostic(self) -> Result<FetchDiagnostic, ToolError> {
+    pub fn into_diagnostic(self) -> Result<FetchDiagnostic, LocalError> {
         match self {
             Self::Diagnostic(diagnostic) => Ok(diagnostic),
             Self::Passthrough(error) => Err(error),

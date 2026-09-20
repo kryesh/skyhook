@@ -1,4 +1,5 @@
 //! Validate URLs, request framing, authentication, and bounded fetch options.
+use crate::tool::invocation::AdmissionError;
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -8,17 +9,17 @@ use reqwest::{
 };
 
 use super::diagnostics::DiagnosticMessage;
-use super::{Auth, FetchArgs, HeaderValues, MAX_BYTES, ResponseFormat, ToolError, invalid};
+use super::{Auth, FetchArgs, HeaderValues, MAX_BYTES, ResponseFormat};
 
 /// Request endpoints are not proxy endpoints: credentials are never accepted.
 #[derive(Clone, Debug)]
 pub(in crate::tool::builtins) struct HttpRequestUrl(Url);
 impl HttpRequestUrl {
-    pub(in crate::tool::builtins) fn parse(value: &str) -> Result<Self, ToolError> {
-        let url = Url::parse(value).map_err(|_| invalid("invalid absolute URL"))?;
+    pub(in crate::tool::builtins) fn parse(value: &str) -> Result<Self, AdmissionError> {
+        let url = Url::parse(value).map_err(|_| AdmissionError::invalid("invalid absolute URL"))?;
         Self::admit(url)
     }
-    fn admit(mut url: Url) -> Result<Self, ToolError> {
+    fn admit(mut url: Url) -> Result<Self, AdmissionError> {
         check_url(&url)?;
         url.set_fragment(None);
         Ok(Self(url))
@@ -67,49 +68,55 @@ impl SanitizedOrigin {
     }
 }
 
-fn check_url(url: &Url) -> Result<(), ToolError> {
+fn check_url(url: &Url) -> Result<(), AdmissionError> {
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(invalid("URL must use HTTP or HTTPS and have a host"));
+        return Err(AdmissionError::invalid(
+            "URL must use HTTP or HTTPS and have a host",
+        ));
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(invalid(
+        return Err(AdmissionError::invalid(
             "embedded URL credentials are not supported; use auth",
         ));
     }
     Ok(())
 }
-fn validate_options(args: &FetchArgs) -> Result<(), ToolError> {
+fn validate_options(args: &FetchArgs) -> Result<(), AdmissionError> {
     if args.timeout == 0
         || args.timeout > 3600
         || args.connect_timeout == 0
         || args.connect_timeout > 3600
     {
-        return Err(invalid("timeouts must be between 1 and 3600 seconds"));
+        return Err(AdmissionError::invalid(
+            "timeouts must be between 1 and 3600 seconds",
+        ));
     }
     if args.max_bytes == 0 || args.max_bytes > MAX_BYTES {
-        return Err(invalid("max_bytes must be between 1 and 104857600"));
+        return Err(AdmissionError::invalid(
+            "max_bytes must be between 1 and 104857600",
+        ));
     }
     if args.max_redirects > 20 {
-        return Err(invalid("max_redirects must not exceed 20"));
+        return Err(AdmissionError::invalid("max_redirects must not exceed 20"));
     }
     if args.text && (args.save_to.is_some() || args.response_format == ResponseFormat::Base64) {
-        return Err(invalid(
+        return Err(AdmissionError::invalid(
             "text conflicts with save_to and response_format base64",
         ));
     }
     if args.overwrite && args.save_to.is_none() {
-        return Err(invalid("overwrite requires save_to"));
+        return Err(AdmissionError::invalid("overwrite requires save_to"));
     }
     Ok(())
 }
 
-fn request_headers(args: &FetchArgs) -> Result<HeaderMap, ToolError> {
+fn request_headers(args: &FetchArgs) -> Result<HeaderMap, AdmissionError> {
     let mut headers = HeaderMap::new();
     for (key, values) in &args.headers {
-        let name = HeaderName::from_bytes(key.as_bytes()).map_err(invalid)?;
+        let name = HeaderName::from_bytes(key.as_bytes()).map_err(AdmissionError::invalid)?;
         // Let the HTTP implementation compute framing; conflicting framing is unsafe.
         if matches!(name.as_str(), "content-length" | "transfer-encoding") {
-            return Err(invalid(
+            return Err(AdmissionError::invalid(
                 "content-length and transfer-encoding are managed by fetch",
             ));
         }
@@ -118,17 +125,24 @@ fn request_headers(args: &FetchArgs) -> Result<HeaderMap, ToolError> {
             HeaderValues::Many(values) => values.as_slice(),
         };
         for value in values {
-            headers.append(name.clone(), HeaderValue::from_str(value).map_err(invalid)?);
+            headers.append(
+                name.clone(),
+                HeaderValue::from_str(value).map_err(AdmissionError::invalid)?,
+            );
         }
     }
     if let Some(auth) = &args.auth {
         if headers.contains_key("authorization") {
-            return Err(invalid("auth conflicts with the authorization header"));
+            return Err(AdmissionError::invalid(
+                "auth conflicts with the authorization header",
+            ));
         }
         let value = match auth {
             Auth::Basic { username, password } => {
                 if username.contains(':') {
-                    return Err(invalid("basic auth username must not contain ':'"));
+                    return Err(AdmissionError::invalid(
+                        "basic auth username must not contain ':'",
+                    ));
                 }
                 format!(
                     "Basic {}",
@@ -137,7 +151,7 @@ fn request_headers(args: &FetchArgs) -> Result<HeaderMap, ToolError> {
             }
             Auth::Bearer { token } => format!("Bearer {token}"),
         };
-        let mut value = HeaderValue::from_str(&value).map_err(invalid)?;
+        let mut value = HeaderValue::from_str(&value).map_err(AdmissionError::invalid)?;
         value.set_sensitive(true);
         headers.insert("authorization", value);
     }
@@ -224,11 +238,11 @@ pub(super) struct FetchPlan {
     pub(super) include_headers: bool,
 }
 impl TryFrom<FetchArgs> for FetchPlan {
-    type Error = ToolError;
-    fn try_from(args: FetchArgs) -> Result<Self, ToolError> {
+    type Error = AdmissionError;
+    fn try_from(args: FetchArgs) -> Result<Self, AdmissionError> {
         // Preserve the admission error ordering of URL, method, options and headers.
         let mut url = HttpRequestUrl::parse(&args.url)?;
-        let method = Method::from_bytes(args.method.as_bytes()).map_err(invalid)?;
+        let method = Method::from_bytes(args.method.as_bytes()).map_err(AdmissionError::invalid)?;
         validate_options(&args)?;
         let headers = request_headers(&args)?;
         url.append_query(&args.query);

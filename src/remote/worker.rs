@@ -1,396 +1,355 @@
-use base64::Engine as _;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    sync::{Mutex, mpsc, oneshot},
-    task::JoinSet,
+    sync::{Arc, Mutex as StdMutex, PoisonError},
 };
 
-use crate::{
-    identity::AgentId,
-    job::JobManager,
-    remote::protocol::{
-        AuthorizationId, PROTOCOL_VERSION, RemoteToolError, Request, RequestId, Response,
-        read_frame, write_frame,
-    },
-    session::SessionStore,
-    tool::{
-        ToolRegistryBuilder,
-        builtins::register_worker_tools,
-        executor::{ExecutionError, ExecutionResult, ToolExecutor},
-        policy::{AuthorizationRequest, Policy, PolicyDecision, PolicyFuture},
+use futures_util::future::BoxFuture;
+use serde_json::Value;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::{Mutex, oneshot},
+    task::JoinSet,
+};
+use tokio_util::sync::CancellationToken;
+
+use super::{
+    payload::PayloadSender,
+    protocol::{
+        AuthorizationId, RemoteToolError, Request, RequestId, Response, read_frame,
+        spawn_owned_write, write_frame,
     },
 };
+use crate::tool::{
+    invocation::{
+        AdmissionError, CANCELLATION_GRACE, LocalAuthorizer, LocalCatalog, LocalContext, LocalError,
+    },
+    policy::{Capability, PermissionUse, ResourceId},
+};
+
+type WorkerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 pub async fn serve_with_authorization_root(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let root = std::fs::canonicalize(root)?;
-    serve_io_at(tokio::io::stdin(), tokio::io::stdout(), root).await
+    serve_io_at(tokio::io::stdin(), tokio::io::stdout(), root)
+        .await
+        .map_err(|error| error as Box<dyn std::error::Error>)
 }
 
 async fn serve_io_at<R, W>(
     mut input: R,
     mut output: W,
     authorization_root: std::path::PathBuf,
-) -> Result<(), Box<dyn std::error::Error>>
+) -> WorkerResult
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     match read_frame::<_, Request>(&mut input).await? {
-        Some(Request::Hello {
-            version: PROTOCOL_VERSION,
-        }) => {
-            write_frame(
-                &mut output,
-                &Response::Ready {
-                    version: PROTOCOL_VERSION,
-                },
-            )
-            .await?
-        }
+        Some(Request::Hello) => write_frame(&mut output, &Response::Ready).await?,
         Some(request) => return Err(format!("expected hello, received {request:?}").into()),
         None => return Ok(()),
     }
-
     let output = Arc::new(Mutex::new(output));
-    let authorizations = Arc::new(Mutex::new(HashMap::new()));
-    let mut services = super::service::WorkerServices::new(output.clone())?;
-    let temporary = tempfile::Builder::new()
-        .prefix("skyhook-worker-")
-        .tempdir()?;
-    let store = SessionStore::create_ephemeral(temporary.path()).await?;
-    let worker_agent = AgentId::root(store.id());
-    let workspace = std::fs::canonicalize(".")?;
-    // Worker jobs belong to a tool-only root agent; each request carries its exact capabilities.
-    store
-        .append_all(vec![
-            (
-                worker_agent.clone(),
-                crate::session::SessionEvent::SessionStarted {
-                    targets: Vec::new(),
-                    capabilities: crate::tool::policy::Capability::ALL.to_vec(),
-                },
-            ),
-            (
-                worker_agent.clone(),
-                crate::session::SessionEvent::AgentStarted {
-                    parent: None,
-                    owner_job: None,
-                    profile: None,
-                    available_depth: 0,
-                    mode: None,
-                    capabilities: crate::tool::policy::Capability::ALL.to_vec(),
-                    location: crate::execution::ExecutionLocation::root(workspace.clone()),
-                },
-            ),
-        ])
-        .await?;
-    let jobs = JobManager::new(store.clone());
-    let mut builder = ToolRegistryBuilder::default();
-    register_worker_tools(&mut builder, store.clone())?;
-    crate::tool::builtins::skill_transfer::register_worker(&mut builder)?;
-    let executor = ToolExecutor::new(
-        builder.build(),
-        Arc::new(ForwardPolicy {
-            output: output.clone(),
-            authorizations: authorizations.clone(),
-            next_id: AtomicU64::new(1),
-        }),
-        jobs.clone(),
-        workspace,
-    )
-    .with_authorization_root(authorization_root)
-    .with_process_environment(services.environment.clone());
-    let (requests, mut incoming) = mpsc::channel(32);
-    let (started_jobs, mut started) = mpsc::channel(32);
-    let mut reader = tokio::spawn(read_requests(input, requests));
-    // Dropping the task set on return aborts every running request.
+    let services = super::service::WorkerServices::new(output.clone())?;
+    let catalog = Arc::new(LocalCatalog::builtins()?);
+    let workspace = crate::execution::ExecutionLocation::root(std::fs::canonicalize(".")?);
+    let (payloads, receiver) = PayloadSender::new();
+    let credits = receiver.credits();
     let mut tasks = JoinSet::new();
-    let mut active = HashMap::new();
-    let mut cancelled = HashSet::new();
+    let writer = output.clone();
+    tasks.spawn(async move { (WorkerTask::Output, receiver.forward(writer).await) });
+    let mut worker = Worker {
+        output,
+        services,
+        catalog,
+        workspace,
+        authorization_root: Arc::new(authorization_root),
+        payloads,
+        credits,
+        tasks,
+        active: HashMap::new(),
+    };
     let result = async {
-    loop {
-        tokio::select! {
-            request = incoming.recv() => {
-                let Some(request) = request else {
-                    jobs.cancel_all(&worker_agent).await;
-                    tasks.abort_all();
-                    while tasks.join_next().await.is_some() {}
-                    let ended: Result<(), Box<dyn std::error::Error>> = match (&mut reader).await {
-                        Ok(Ok(())) => Ok(()),
-                        Ok(Err(error)) => Err(error.into()),
-                        Err(error) => Err(error.into()),
-                    };
-                    return ended;
-                };
-                match request {
-                    Request::Tool { request_id, name, arguments, capabilities } => {
-                        if active.insert(request_id, None).is_some() {
-                            return Err(format!("duplicate request ID {}", request_id.get()).into());
-                        }
-                        // Collect an exact set: defaults would restore capabilities the caller lacks.
-                        let executor = executor.clone().with_capabilities(capabilities.into_iter().collect());
-                        let store = store.clone();
-                        let output = output.clone();
-                        let worker_agent = worker_agent.clone();
-                        let started_jobs = started_jobs.clone();
-                        tasks.spawn(async move {
-                            let mut captured_job = None;
-                            let result = match executor
-                                .start_scoped(worker_agent, &name, arguments, None, request_id.get())
-                                .await
-                            {
-                                Ok(started) => {
-                                    let _ = started_jobs.send((request_id, started.job)).await;
-                                    captured_job = Some(started.job);
-                                    executor.collect_for_transfer(started).await
-                                }
-                                Err(error) => Err(error),
-                            };
-                            let mut result = externalize_result(result, &store).await;
-                            if let Some(job) = captured_job {
-                                let saved = executor.jobs().output(job);
-                                match tokio::task::spawn_blocking(move || crate::job::output::transfer_fields(&saved)).await.map_err(|error| crate::tool::ToolError::Failed(error.to_string())).and_then(|fields| fields) {
-                                    Ok(fields) => for (field, kind, source) in fields {
-                                        if let Err(error) = super::protocol::write_artifact(&output, request_id, field, kind, source).await {
-                                            return (request_id, Err(error));
-                                        }
-                                    },
-                                    Err(error) => result = Err(remote_error(error)),
-                                }
-                            }
-                            let result = super::protocol::write_tool_result(&output, request_id, &result).await;
-                            if result.is_ok() && let Some(job) = captured_job { let _ = executor.jobs().claim(job).await; }
-                            (request_id, result)
-                        });
+        loop {
+            let reading = read_frame::<_, Request>(&mut input);
+            tokio::pin!(reading);
+            let request = loop {
+                tokio::select! {
+                    request = &mut reading => break request?,
+                    completed = worker.services.tasks.join_next(), if !worker.services.tasks.is_empty() => {
+                        completed.expect("nonempty service task set")??;
                     }
-                    Request::Cancel { request_id } => {
-                        match active.get(&request_id) {
-                            Some(Some(job)) => {
-                                let _ = jobs.cancel(*job).await;
-                            }
-                            Some(None) => {
-                                cancelled.insert(request_id);
-                            }
-                            None => {}
+                    completed = worker.tasks.join_next() => {
+                        let (task, result) = completed.expect("live output task")?;
+                        result?;
+                        match task {
+                            WorkerTask::Request(id) => { worker.active.remove(&id); }
+                            WorkerTask::Output => return Err("shim output stopped unexpectedly".into()),
                         }
                     }
-                    Request::AuthorizationDecision {
-                        request_id,
-                        authorization_id,
-                        allowed,
-                        reason,
-                    } => {
-                        if let Some(sender) = authorizations
-                            .lock()
-                            .await
-                            .remove(&(request_id, authorization_id))
-                        {
-                            let decision = if allowed {
-                                PolicyDecision::allow()
-                            } else {
-                                PolicyDecision::Deny {
-                                    reason: reason.unwrap_or_else(|| "denied by host".to_owned()),
-                                }
-                            };
-                            let _ = sender.send(decision);
-                        }
-                    }
-                    control @ (Request::OpenSsh { .. } | Request::StreamData { .. } | Request::StreamEnd { .. } | Request::StreamClose { .. } | Request::StreamAck { .. } | Request::SensitiveAnswer { .. }) => services.handle(control).await?,
-                    Request::Hello { .. } => return Err("received a second hello".into()),
                 }
-            }
-            completed = services.tasks.join_next(), if !services.tasks.is_empty() => {
-                let error: Option<Box<dyn std::error::Error>> = match completed {
-                    Some(Ok(Ok(()))) => None,
-                    Some(Ok(Err(error))) => Some(error.into()),
-                    Some(Err(error)) => Some(error.into()),
-                    None => unreachable!("nonempty service task set"),
-                };
-                if let Some(error) = error {
-                    return Err(error);
-                }
-            }
-            completed = tasks.join_next(), if !tasks.is_empty() => {
-                let (request_id, result) = match completed {
-                    Some(Ok(completed)) => completed,
-                    Some(Err(error)) => return Err(error.into()),
-                    None => return Err("remote request set ended unexpectedly".into()),
-                };
-                active.remove(&request_id);
-                cancelled.remove(&request_id);
-                result?;
-                if tasks.is_empty() {
-                    jobs.prune_claimed().await?;
-                }
-            }
-            started_job = started.recv() => {
-                if let Some((request_id, job)) = started_job
-                    && let Some(active_job) = active.get_mut(&request_id)
-                {
-                    *active_job = Some(job);
-                    if cancelled.remove(&request_id) {
-                        let _ = jobs.cancel(job).await;
-                    }
-                }
-            }
+            };
+            let Some(request) = request else { return Ok(()); };
+            worker.handle(request).await?;
         }
-    }
-    }
-    .await;
-    reader.abort();
+    }.await;
+    worker.active.clear();
+    worker.credits.close();
+    worker.tasks.abort_all();
+    while worker.tasks.join_next().await.is_some() {}
     result
 }
 
-struct ForwardPolicy<W> {
+struct Worker<W> {
     output: Arc<Mutex<W>>,
-    authorizations: PendingAuthorizations,
-    next_id: AtomicU64,
+    services: super::service::WorkerServices<W>,
+    catalog: Arc<LocalCatalog>,
+    workspace: crate::execution::ExecutionLocation,
+    authorization_root: Arc<std::path::PathBuf>,
+    payloads: PayloadSender,
+    credits: super::flow::Credits,
+    tasks: JoinSet<(WorkerTask, std::io::Result<()>)>,
+    active: HashMap<RequestId, ActiveRequest>,
+}
+
+impl<W: AsyncWrite + Unpin + Send + 'static> Worker<W> {
+    async fn handle(&mut self, request: Request) -> WorkerResult {
+        match request {
+            Request::Tool {
+                request_id,
+                name,
+                arguments,
+                capabilities,
+            } => {
+                self.start(request_id, name, arguments, capabilities)?;
+            }
+            Request::Cancel { request_id } => {
+                if let Some(request) = self.active.get(&request_id) {
+                    request.cancellation.cancel();
+                }
+            }
+            Request::PayloadAck => self.credits.acknowledge()?,
+            Request::AuthorizationDecision {
+                request_id,
+                authorization_id,
+                allowed,
+                reason,
+            } => {
+                if let Some(request) = self.active.get(&request_id)
+                    && let Some(sender) = request
+                        .authorizations
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&authorization_id)
+                {
+                    let decision = if allowed {
+                        Ok(())
+                    } else {
+                        Err(AdmissionError::Denied(
+                            reason.unwrap_or_else(|| "denied by host".into()),
+                        ))
+                    };
+                    let _ = sender.send(decision);
+                }
+            }
+            control @ (Request::OpenSsh { .. }
+            | Request::StreamData { .. }
+            | Request::StreamEnd { .. }
+            | Request::StreamClose { .. }
+            | Request::StreamAck { .. }
+            | Request::SensitiveAnswer { .. }) => {
+                self.services.handle(control).await?;
+            }
+            Request::Hello => return Err("received a second hello".into()),
+        }
+        Ok(())
+    }
+
+    fn start(
+        &mut self,
+        id: RequestId,
+        name: String,
+        arguments: Value,
+        capabilities: Vec<Capability>,
+    ) -> WorkerResult {
+        if self.active.contains_key(&id) {
+            return Err(format!("duplicate request ID {}", id.get()).into());
+        }
+        let sender = self.payloads.request(id);
+        let produced = sender.context();
+        let cancellation = CancellationToken::new();
+        let authorizations = Arc::new(StdMutex::new(HashMap::new()));
+        let context = LocalContext::new(
+            self.workspace.clone(),
+            capabilities.into_iter().collect(),
+            self.services.environment.clone(),
+            cancellation.clone(),
+            produced.clone(),
+            Arc::new(ForwardAuthorization {
+                request_id: id,
+                tool: name.clone(),
+                output: self.output.clone(),
+                pending: authorizations.clone(),
+                next: StdMutex::new(Some(AuthorizationId(0))),
+            }),
+            arguments.clone(),
+        );
+        self.active.insert(
+            id,
+            ActiveRequest {
+                cancellation: cancellation.clone(),
+                authorizations,
+            },
+        );
+        let catalog = self.catalog.clone();
+        let root = self.authorization_root.clone();
+        self.tasks.spawn(async move {
+            let execution = async {
+                let call = catalog.run(&name, arguments, context, &root);
+                tokio::pin!(call);
+                let result = tokio::select! {
+                    result = &mut call => result,
+                    () = cancellation.cancelled() => {
+                        let _ = tokio::time::timeout(CANCELLATION_GRACE, &mut call).await;
+                        Err(LocalError::Cancelled)
+                    }
+                };
+                if cancellation.is_cancelled() {
+                    Err(LocalError::Cancelled)
+                } else {
+                    result
+                }
+            }
+            .await;
+            let result = match produced.settle().await {
+                Ok(()) => execution.map(Into::into).map_err(remote_error),
+                Err(error) => Err(remote_error(LocalError::Io(error))),
+            };
+            (WorkerTask::Request(id), sender.finish(result).await)
+        });
+        Ok(())
+    }
 }
 
 type PendingAuthorizations =
-    Arc<Mutex<HashMap<(RequestId, AuthorizationId), oneshot::Sender<PolicyDecision>>>>;
+    Arc<StdMutex<HashMap<AuthorizationId, oneshot::Sender<Result<(), AdmissionError>>>>>;
 
-impl<W> Policy for ForwardPolicy<W>
-where
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    fn authorize(&self, mut request: AuthorizationRequest) -> PolicyFuture<'_> {
-        let Some(request_id) = request.scope.and_then(RequestId::new) else {
-            return Box::pin(async {
-                PolicyDecision::Deny {
-                    reason: "remote authorization scope is unavailable".to_owned(),
-                }
-            });
-        };
-        if request.parent.is_none() {
-            // Only the ordinary static workspace permissions were approved by
-            // the caller before dispatch. Preserve destination-derived resources
-            // (network origins, paths, and other namespaces), including redirects
-            // from a top-level worker invocation whose parent remains None.
-            request.permissions.retain(|permission| {
-                !(matches!(
-                    permission.resource,
-                    crate::tool::policy::ResourceId::Workspace { .. }
-                ) && matches!(
+enum WorkerTask {
+    Output,
+    Request(RequestId),
+}
+
+struct ActiveRequest {
+    cancellation: CancellationToken,
+    authorizations: PendingAuthorizations,
+}
+
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.authorizations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+}
+
+struct ForwardAuthorization<W> {
+    request_id: RequestId,
+    tool: String,
+    output: Arc<Mutex<W>>,
+    pending: PendingAuthorizations,
+    next: StdMutex<Option<AuthorizationId>>,
+}
+
+struct PendingAuthorization {
+    id: AuthorizationId,
+    pending: PendingAuthorizations,
+}
+
+impl Drop for PendingAuthorization {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
+impl<W: AsyncWrite + Unpin + Send + 'static> LocalAuthorizer for ForwardAuthorization<W> {
+    fn authorize(
+        &self,
+        mut permissions: Vec<PermissionUse>,
+        arguments: Value,
+    ) -> BoxFuture<'static, Result<(), AdmissionError>> {
+        // The host already admitted static workspace access; destination-derived
+        // paths and network origins still require its policy decision.
+        permissions.retain(|permission| {
+            !(matches!(permission.resource, ResourceId::Workspace { .. })
+                && matches!(
                     permission.capability,
-                    crate::tool::policy::Capability::Read
-                        | crate::tool::policy::Capability::Write
-                        | crate::tool::policy::Capability::Exec
+                    Capability::Read | Capability::Write | Capability::Exec
                 ))
-            });
-            if request.permissions.is_empty() {
-                return Box::pin(async { PolicyDecision::allow() });
-            }
+        });
+        if permissions.is_empty() {
+            return Box::pin(async { Ok(()) });
         }
-        let authorization_id = AuthorizationId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let id = {
+            let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
+            let id = *next;
+            *next = id.and_then(|id| id.0.checked_add(1).map(AuthorizationId));
+            id
+        };
+        let pending = self.pending.clone();
         let output = self.output.clone();
-        let authorizations = self.authorizations.clone();
+        let request_id = self.request_id;
+        let tool = self.tool.clone();
         Box::pin(async move {
+            let id = id
+                .ok_or_else(|| AdmissionError::Failed("authorization ID space exhausted".into()))?;
             let (sender, receiver) = oneshot::channel();
-            authorizations
+            pending
                 .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(id, sender);
+            let _registration = PendingAuthorization { id, pending };
+            spawn_owned_write(
+                output.lock_owned().await,
+                Response::Authorization {
+                    request_id,
+                    authorization_id: id,
+                    tool,
+                    permissions,
+                    arguments,
+                },
+            )
+            .await?;
+            receiver
                 .await
-                .insert((request_id, authorization_id), sender);
-            let response = Response::Authorization {
-                request_id,
-                authorization_id,
-                tool: request.tool,
-                permissions: request.permissions,
-                arguments: request.arguments,
-            };
-            if let Err(error) = write_frame(&mut *output.lock().await, &response).await {
-                authorizations
-                    .lock()
-                    .await
-                    .remove(&(request_id, authorization_id));
-                return PolicyDecision::Deny {
-                    reason: format!("could not request host authorization: {error}"),
-                };
-            }
-            receiver.await.unwrap_or_else(|_| PolicyDecision::Deny {
-                reason: "host authorization channel closed".to_owned(),
-            })
+                .map_err(|_| AdmissionError::Denied("host authorization channel closed".into()))?
         })
     }
 }
 
-async fn read_requests<R>(
-    mut input: R,
-    requests: mpsc::Sender<Request>,
-) -> Result<(), std::io::Error>
-where
-    R: AsyncRead + Unpin,
-{
-    while let Some(request) = read_frame(&mut input).await? {
-        if requests.send(request).await.is_err() {
-            break;
-        }
+fn remote_error(error: LocalError) -> RemoteToolError {
+    match error {
+        LocalError::Denied(message) => RemoteToolError {
+            message,
+            denial: Some(crate::tool::Denial::permission_denied()),
+            output: None,
+        },
+        LocalError::FailedWithOutput { message, output } => RemoteToolError {
+            message,
+            denial: None,
+            output: Some(Box::new((*output).into())),
+        },
+        error => RemoteToolError {
+            message: error.to_string(),
+            denial: None,
+            output: None,
+        },
     }
-    Ok(())
-}
-
-async fn externalize_result(
-    result: Result<ExecutionResult, ExecutionError>,
-    store: &SessionStore,
-) -> Result<crate::remote::protocol::RemoteToolOutput, RemoteToolError> {
-    match result {
-        Ok(result) => externalize_images(result.output, store)
-            .await
-            .map_err(remote_error),
-        Err(error) => {
-            let failure = error.into_failure();
-            let output = match failure.output {
-                Some(output) => Some(
-                    externalize_images(output, store)
-                        .await
-                        .map_err(remote_error)?,
-                ),
-                None => None,
-            };
-            Err(RemoteToolError {
-                message: failure.message,
-                denial: failure.denial,
-                output: output.map(Box::new),
-            })
-        }
-    }
-}
-
-fn remote_error(error: impl ToString) -> RemoteToolError {
-    RemoteToolError {
-        message: error.to_string(),
-        denial: None,
-        output: None,
-    }
-}
-
-async fn externalize_images(
-    output: crate::tool::ToolOutput,
-    store: &SessionStore,
-) -> Result<crate::remote::protocol::RemoteToolOutput, Box<dyn std::error::Error>> {
-    let mut images = Vec::new();
-    for image in output.images {
-        let bytes = store
-            .read_blob(&image.blob, crate::media::MAX_IMAGE_BYTES as usize)
-            .await?;
-        images.push(crate::remote::protocol::RemoteImage {
-            file: image.file,
-            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
-        });
-    }
-    Ok(crate::remote::protocol::RemoteToolOutput {
-        value: output.value,
-        images,
-        streams: output.streams,
-    })
 }
 
 pub async fn self_check(expected: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -404,382 +363,395 @@ pub async fn self_check(expected: &str) -> Result<(), Box<dyn std::error::Error>
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-    use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
-
     use super::*;
-    use crate::remote::protocol::RemoteToolOutput;
-    use crate::tool::policy::{Capability, CapabilitySet};
+    use crate::{
+        execution::ExecutionLocation,
+        identity::JobId,
+        job::{JobEnvelope, JobSpec, JobState},
+        remote::{RejectSensitivePrompts, client::PooledConnection, transport::Transport},
+        tests::{RecordingPolicy, TestRuntime},
+        tool::{
+            ToolContext,
+            authorization::{AuthorizationCoordinator, AuthorizationSubject},
+            policy::{AuthorizationRequest, CapabilitySet, Policy, PolicyDecision, PolicyFuture},
+        },
+    };
+    use std::{future::Future, time::Duration};
+    use tokio::sync::mpsc;
 
-    fn id(value: u64) -> RequestId {
-        RequestId::new(value).unwrap()
+    async fn bounded<T>(future: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(20), future)
+            .await
+            .expect("worker operation stalled")
     }
 
-    /// A handshaken client connection to a worker serving over an in-memory duplex.
     struct Harness {
-        input: ReadHalf<DuplexStream>,
-        output: WriteHalf<DuplexStream>,
+        runtime: TestRuntime,
+        connection: Arc<PooledConnection>,
+        authorization: AuthorizationCoordinator,
         worker: tokio::task::JoinHandle<Result<(), String>>,
     }
 
     impl Harness {
-        async fn start(root: std::path::PathBuf) -> Self {
+        async fn start(root: std::path::PathBuf, policy: Arc<dyn Policy>) -> Self {
+            let runtime = TestRuntime::new().await;
+            let authorization = AuthorizationCoordinator::new(policy);
             let (client, server) = tokio::io::duplex(64 * 1024);
-            let (input, output) = tokio::io::split(client);
+            let (output, input) = tokio::io::split(client);
             let (server_input, server_output) = tokio::io::split(server);
             let worker = tokio::spawn(async move {
                 serve_io_at(server_input, server_output, root)
                     .await
                     .map_err(|error| error.to_string())
             });
-            let mut harness = Self {
-                input,
-                output,
+            let connection = PooledConnection::from_transport(
+                Transport {
+                    input: Box::new(input),
+                    output: Box::new(output),
+                    owner: Box::new(()),
+                },
+                "remote",
+                authorization.clone(),
+                Arc::new(RejectSensitivePrompts),
+            )
+            .await
+            .unwrap();
+            Self {
+                runtime,
+                connection: Arc::new(connection),
+                authorization,
                 worker,
+            }
+        }
+
+        async fn tool(&self, capabilities: CapabilitySet, name: &str, arguments: Value) -> JobId {
+            let mut spec = JobSpec::test(self.runtime.agent.clone(), name);
+            spec.arguments = arguments.clone();
+            spec.location = ExecutionLocation {
+                target: "remote".into(),
+                workspace: std::fs::canonicalize(".").unwrap(),
             };
-            harness
-                .send(Request::Hello {
-                    version: PROTOCOL_VERSION,
-                })
-                .await;
-            assert!(matches!(
-                harness.recv().await,
-                Response::Ready {
-                    version: PROTOCOL_VERSION
-                }
-            ));
-            harness
-        }
-
-        async fn send(&mut self, request: Request) {
-            write_frame(&mut self.output, &request).await.unwrap();
-        }
-
-        async fn tool(
-            &mut self,
-            request_id: u64,
-            capabilities: Vec<Capability>,
-            name: &str,
-            arguments: serde_json::Value,
-        ) {
-            self.send(Request::Tool {
-                request_id: id(request_id),
-                capabilities,
-                name: name.to_owned(),
-                arguments,
-            })
-            .await;
-        }
-
-        async fn recv(&mut self) -> Response {
-            tokio::time::timeout(Duration::from_secs(10), read_frame(&mut self.input))
+            let location = spec.location.clone();
+            let mut lease = self.runtime.jobs.create(spec).await.unwrap();
+            let job = lease.id();
+            self.runtime
+                .jobs
+                .transition(job, JobState::Running)
                 .await
-                .unwrap()
-                .unwrap()
-                .unwrap()
+                .unwrap();
+            let context = ToolContext::new(
+                AuthorizationSubject {
+                    agent: self.runtime.agent.clone(),
+                    job,
+                    parent: None,
+                    capabilities,
+                    cancellation: lease.cancellation_token(),
+                },
+                location,
+                ExecutionLocation::root(self.runtime.root.path().to_owned()),
+                lease.take_input(),
+                self.runtime.jobs.clone(),
+            )
+            .with_invocation_authority(
+                self.authorization.clone(),
+                name.to_owned(),
+                arguments.clone(),
+            );
+            let connection = self.connection.clone();
+            let name = name.to_owned();
+            lease
+                .start_supervised(async move {
+                    let result = connection.execute(name, arguments, &context).await;
+                    if context.is_cancelled() {
+                        Err(crate::tool::ToolError::Cancelled)
+                    } else {
+                        result.map_err(crate::remote::RemoteError::into_tool_error)
+                    }
+                })
+                .await
+                .unwrap();
+            job
+        }
+
+        async fn result(&self, job: JobId) -> JobEnvelope {
+            bounded(self.runtime.jobs.wait_settled(job)).await.unwrap();
+            let mut envelope = self.runtime.jobs.metadata(job).await.unwrap();
+            self.runtime
+                .jobs
+                .hydrate_envelope(&mut envelope)
+                .await
+                .unwrap();
+            envelope
         }
 
         async fn finish(self) {
-            drop((self.input, self.output));
-            tokio::time::timeout(Duration::from_secs(2), self.worker)
-                .await
-                .expect("worker should stop on EOF")
-                .unwrap()
-                .unwrap();
-        }
-    }
-
-    fn defaults() -> Vec<Capability> {
-        CapabilitySet::default().iter().collect()
-    }
-
-    #[tokio::test]
-    async fn tool_image_externalization_reads_verified_bounded_blobs() {
-        use crate::{media::MAX_IMAGE_BYTES, tool::ToolOutput};
-        use base64::engine::general_purpose::STANDARD;
-        let directory = tempfile::tempdir().unwrap();
-        let store = SessionStore::create(directory.path()).await.unwrap();
-        let png = crate::tests::png(b"image bytes");
-        let image = store
-            .store_image(Some("image.png".into()), &png)
-            .await
-            .unwrap();
-        let output = |image| ToolOutput::default().with_images(vec![image]);
-        let result = externalize_images(output(image.clone()), &store)
-            .await
-            .unwrap();
-        assert_eq!(result.images[0].data_base64, STANDARD.encode(png.bytes()));
-        assert_eq!(result.images[0].file.as_deref(), Some("image.png"));
-        let corruptions: [fn(&mut crate::media::ImageRef); 3] = [
-            |image| image.blob.sha256 = crate::media::BlobDigest::of(b"wrong bytes"),
-            |image| image.blob.bytes += 1,
-            |image| image.blob.bytes = MAX_IMAGE_BYTES + 1,
-        ];
-        for corrupt in corruptions {
-            let mut corrupted = image.clone();
-            corrupt(&mut corrupted);
-            assert!(externalize_images(output(corrupted), &store).await.is_err());
-        }
-    }
-
-    #[tokio::test]
-    async fn incompatible_client_handshakes_are_rejected() {
-        for hello in [
-            serde_json::json!({"type":"hello"}),
-            serde_json::json!({"type":"hello", "version": PROTOCOL_VERSION - 1}),
-        ] {
-            let (mut client, server) = tokio::io::duplex(4096);
-            write_frame(&mut client, &hello).await.unwrap();
-            let (input, output) = tokio::io::split(server);
-            let root = std::fs::canonicalize(".").unwrap();
-            assert!(serve_io_at(input, output, root).await.is_err());
-            let response = read_frame::<_, Response>(&mut client).await.unwrap();
-            assert!(response.is_none());
+            drop(self.connection);
+            bounded(self.worker).await.unwrap().unwrap();
         }
     }
 
     #[tokio::test]
     async fn worker_enforces_exact_capabilities_and_noninteractive_exec_sessions() {
-        let mut worker = Harness::start(std::fs::canonicalize(".").unwrap()).await;
-        let exact = serde_json::json!({"argv":["/bin/sh", "-c", "printf exact"]});
-        for (index, capabilities) in [
+        let worker = Harness::start(
+            std::fs::canonicalize(".").unwrap(),
+            RecordingPolicy::allowing(),
+        )
+        .await;
+        for capabilities in [
             vec![],
             vec![Capability::Read],
             vec![Capability::Exec],
             vec![],
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        ] {
             let allowed = capabilities.contains(&Capability::Exec);
-            worker
-                .tool(index as u64 + 1, capabilities, "exec", exact.clone())
+            let job = worker
+                .tool(
+                    capabilities.into_iter().collect(),
+                    "exec",
+                    serde_json::json!({"argv":["/bin/sh", "-c", "printf exact"]}),
+                )
                 .await;
-            let response = worker.recv().await;
-            let Response::Tool { request_id, result } = response else {
-                panic!("expected tool result, got {response:?}")
-            };
-            assert_eq!(request_id, id(index as u64 + 1));
+            let result = worker.result(job).await;
+            assert_eq!(result.state == JobState::Completed, allowed);
             if allowed {
-                assert_eq!(result.unwrap().value["stdout"], "exact");
-            } else {
-                assert_eq!(
-                    result.unwrap_err().message,
-                    "invalid tool arguments: tool `exec` is unavailable",
-                    "missing Exec must be rejected locally, not forwarded to host"
-                );
+                assert_eq!(result.output.unwrap()["stdout"], "exact");
             }
         }
         #[cfg(target_os = "linux")]
-        for (index, interactive) in [false, true, false].into_iter().enumerate() {
-            let mut capabilities = vec![Capability::Exec];
+        for interactive in [false, true, false] {
+            let mut capabilities: CapabilitySet = [Capability::Exec].into_iter().collect();
             if interactive {
-                capabilities.push(Capability::Interactive);
+                capabilities.insert(Capability::Interactive);
             }
             let stat = "read pid comm state ppid pgrp sid rest < /proc/self/stat; printf '%s %s' \"$pid\" \"$sid\"";
-            let argv = serde_json::json!({"argv":["/bin/sh", "-c", stat]});
-            worker
-                .tool(index as u64 + 10, capabilities, "exec", argv)
+            let job = worker
+                .tool(
+                    capabilities,
+                    "exec",
+                    serde_json::json!({"argv":["/bin/sh", "-c", stat]}),
+                )
                 .await;
-            let Response::Tool { result, .. } = worker.recv().await else {
-                panic!("expected tool result")
-            };
-            let result = result.unwrap();
-            let ids: Vec<_> = result.value["stdout"]
+            let result = worker.result(job).await.output.unwrap();
+            let ids: Vec<_> = result["stdout"]
                 .as_str()
                 .unwrap()
                 .split_whitespace()
                 .collect();
             assert_eq!(ids.len(), 2);
-            assert_eq!(
-                ids[0] == ids[1],
-                !interactive,
-                "only noninteractive exec should be a session leader: {ids:?}"
-            );
+            assert_eq!(ids[0] == ids[1], !interactive);
         }
         worker.finish().await;
     }
 
     #[tokio::test]
-    async fn workspace_suppression_preserves_dynamic_and_nested_permissions() {
-        use crate::{
-            identity::{JobId, SessionId},
-            tool::policy::{PermissionUse, ResourceId},
-        };
-        let (mut host, worker) = tokio::io::duplex(16 * 1024);
-        let pending = Arc::new(Mutex::new(HashMap::new()));
-        let policy = Arc::new(ForwardPolicy {
-            output: Arc::new(Mutex::new(worker)),
-            authorizations: pending.clone(),
-            next_id: AtomicU64::new(0),
-        });
-        for (origin, allow, parent) in [
-            ("https://initial.test", true, None),
-            ("https://redirect.test:8443", false, None),
-            ("https://nested.test", true, Some(JobId::new(2).unwrap())),
-        ] {
-            let workspace = ResourceId::workspace("root", std::path::Path::new("/workspace"));
-            let mut permissions: Vec<_> = [Capability::Read, Capability::Write, Capability::Exec]
-                .into_iter()
-                .map(|capability| PermissionUse::new(capability, workspace.clone()))
-                .collect();
-            // Workspace permissions are suppressed only for top-level jobs.
-            let mut expected_permissions = if parent.is_some() {
-                permissions.clone()
-            } else {
-                vec![]
-            };
-            let dynamic = vec![
-                PermissionUse::new(Capability::Network, ResourceId::network("root", origin)),
-                PermissionUse::new(Capability::Interactive, workspace),
-                PermissionUse::new(
-                    Capability::Read,
-                    ResourceId::path("root", "/outside".as_ref()),
-                ),
-                PermissionUse::new(Capability::Mcp, ResourceId::mcp("root", "tool")),
-            ];
-            permissions.extend(dynamic.clone());
-            expected_permissions.extend(dynamic);
-            let arguments = serde_json::json!({"url":"https://initial.test", "network_origin":origin, "insecure":true});
-            let request = AuthorizationRequest {
-                agent: crate::identity::AgentId::root(SessionId::from_bytes([1; 16])),
-                job: JobId::new(1).unwrap(),
-                parent,
-                scope: Some(7),
-                tool: "fetch".to_owned(),
-                permissions,
-                arguments: arguments.clone(),
-            };
-            let policy = policy.clone();
-            let decision = tokio::spawn(async move { policy.authorize(request).await });
-            let response =
-                tokio::time::timeout(Duration::from_secs(2), read_frame::<_, Response>(&mut host))
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap();
-            let Response::Authorization {
-                request_id,
-                authorization_id,
-                tool,
-                permissions,
-                arguments: forwarded,
-            } = response
-            else {
-                panic!("expected network authorization");
-            };
-            assert_eq!(
-                (request_id.get(), tool.as_str(), &permissions, &forwarded),
-                (7, "fetch", &expected_permissions, &arguments)
-            );
-            let expected = if allow {
-                PolicyDecision::allow()
-            } else {
-                PolicyDecision::Deny {
-                    reason: "redirect denied".to_owned(),
-                }
-            };
-            let sender = pending.lock().await.remove(&(request_id, authorization_id));
-            sender.unwrap().send(expected.clone()).unwrap();
-            assert_eq!(decision.await.unwrap(), expected);
-        }
-        assert!(pending.lock().await.is_empty());
-    }
-
-    fn stdout(response: &Response) -> (u64, Result<&str, &str>) {
-        match response {
-            Response::Tool { request_id, result } => (
-                request_id.get(),
-                result
-                    .as_ref()
-                    .map(|RemoteToolOutput { value, .. }| value["stdout"].as_str().unwrap())
-                    .map_err(|RemoteToolError { message, .. }| message.as_str()),
-            ),
-            response => panic!("unexpected response: {response:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn tool_requests_execute_concurrently_and_reply_on_completion() {
-        let mut worker = Harness::start(std::fs::canonicalize(".").unwrap()).await;
-        let shell = |command: &str| serde_json::json!({ "command": command });
-        // The first request can only finish while the second one runs.
-        let flag = tempfile::tempdir().unwrap();
-        let flag = flag.path().join("flag").display().to_string();
-        let wait = format!("while [ ! -e '{flag}' ]; do sleep 0.01; done; printf slow");
-        worker.tool(1, defaults(), "shell", shell(&wait)).await;
-        let touch = format!("touch '{flag}'; printf fast");
-        worker.tool(2, defaults(), "shell", shell(&touch)).await;
-        let mut responses = [worker.recv().await, worker.recv().await];
-        responses.sort_by_key(|response| stdout(response).0);
+    async fn remote_captures_and_images_are_persisted_on_the_host() {
+        let root = tempfile::tempdir().unwrap();
+        let text = "aé🦀\n".repeat(20_000);
+        let path = root.path().join("text");
+        std::fs::write(&path, &text).unwrap();
+        let image_path = root.path().join("image.png");
+        let image = crate::tests::png(b"remote source bytes");
+        std::fs::write(&image_path, image.bytes()).unwrap();
+        let policy = RecordingPolicy::allowing();
+        let worker = Harness::start(std::fs::canonicalize(".").unwrap(), policy.clone()).await;
+        let job = worker
+            .tool(
+                CapabilitySet::default(),
+                "read",
+                serde_json::json!({"path":path}),
+            )
+            .await;
+        let result = worker.result(job).await;
+        assert_eq!(result.state, JobState::Completed);
+        assert_eq!(result.output.unwrap()["content"], text);
         assert_eq!(
-            responses.each_ref().map(stdout),
-            [(1, Ok("slow")), (2, Ok("fast"))]
+            worker
+                .runtime
+                .jobs
+                .output(job)
+                .test_bytes("/result/content")
+                .unwrap(),
+            text.as_bytes()
         );
-
-        worker
-            .tool(3, defaults(), "shell", shell("sleep 10; printf cancelled"))
-            .await;
-        worker
-            .tool(4, defaults(), "shell", shell("printf sibling"))
-            .await;
-        assert_eq!(stdout(&worker.recv().await), (4, Ok("sibling")));
-        worker.send(Request::Cancel { request_id: id(3) }).await;
-        let cancelled = worker.recv().await;
-        assert!(matches!(stdout(&cancelled), (3, Err(message)) if message.contains("cancelled")));
-
-        worker
-            .tool(5, defaults(), "shell", shell("printf reusable"))
-            .await;
-        assert_eq!(stdout(&worker.recv().await), (5, Ok("reusable")));
-        worker.finish().await;
-    }
-
-    #[tokio::test]
-    async fn external_paths_request_host_authorization() {
-        let authorization_root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let path = outside.path().join("outside.txt");
-        std::fs::write(&path, "visible after approval").unwrap();
-        let path = std::fs::canonicalize(path).unwrap();
-        let mut worker =
-            Harness::start(std::fs::canonicalize(authorization_root.path()).unwrap()).await;
-        worker
-            .tool(10, defaults(), "read", serde_json::json!({"path": path}))
-            .await;
-        let Response::Authorization {
-            request_id,
-            authorization_id,
-            permissions,
-            ..
-        } = worker.recv().await
-        else {
-            panic!("expected authorization request");
-        };
-        assert_eq!(request_id, id(10));
-        let resource = crate::tool::policy::ResourceId::path("root", &path);
-        assert_eq!(
-            permissions
+        let expected = ResourceId::path("remote", &path);
+        assert!(
+            policy
+                .requests
+                .lock()
+                .unwrap()
                 .iter()
-                .map(|permission| (permission.capability, &permission.resource))
-                .collect::<Vec<_>>(),
-            [(Capability::Read, &resource)]
+                .flat_map(|request| &request.permissions)
+                .any(|permission| permission.resource == expected)
         );
-        worker
-            .send(Request::AuthorizationDecision {
-                request_id,
-                authorization_id,
-                allowed: true,
-                reason: None,
-            })
+
+        let job = worker
+            .tool(
+                CapabilitySet::default(),
+                "read",
+                serde_json::json!({"path":image_path}),
+            )
             .await;
-        assert!(matches!(
-            worker.recv().await,
-            Response::Tool {
-                result: Ok(RemoteToolOutput { value, .. }),
-                ..
-            } if value["content"] == "visible after approval"
-        ));
+        assert_eq!(worker.result(job).await.state, JobState::Completed);
+        let images = worker.runtime.jobs.images(job).await.unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].file.as_deref(), image_path.to_str());
+        let bytes = worker
+            .runtime
+            .store
+            .read_blob(&images[0].blob, crate::media::MAX_IMAGE_BYTES as usize)
+            .await
+            .unwrap();
+        assert_eq!(bytes, image.bytes());
+        assert!(
+            worker
+                .runtime
+                .jobs
+                .output(job)
+                .test_bytes("/result/content")
+                .is_none()
+        );
+
+        let job = worker
+            .tool(
+                CapabilitySet::default(),
+                "read",
+                serde_json::json!({"path":root.path().join("missing")}),
+            )
+            .await;
+        let result = worker.result(job).await;
+        assert_eq!(result.state, JobState::Completed);
+        assert_eq!(result.output.unwrap()["kind"], "error");
+        worker.finish().await;
+    }
+
+    struct GatedPolicy {
+        requests: mpsc::UnboundedSender<AuthorizationRequest>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl Policy for GatedPolicy {
+        fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
+            self.requests.send(request).unwrap();
+            Box::pin(async {
+                let _permit = self.release.acquire().await.unwrap();
+                PolicyDecision::allow()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_cancellation_during_authorization_does_not_block_siblings() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let (requests, mut observed) = mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let policy = Arc::new(GatedPolicy {
+            requests,
+            release: release.clone(),
+        });
+        let worker = Harness::start(std::fs::canonicalize(".").unwrap(), policy).await;
+        let blocked = worker
+            .tool(
+                CapabilitySet::default(),
+                "read",
+                serde_json::json!({"path":file.path()}),
+            )
+            .await;
+        let request = bounded(observed.recv()).await.unwrap();
+        assert!(
+            request
+                .permissions
+                .iter()
+                .any(|permission| permission.resource == ResourceId::path("remote", file.path()))
+        );
+        let sibling = worker
+            .tool(
+                CapabilitySet::default(),
+                "exec",
+                serde_json::json!({"argv":["/bin/sh", "-c", "printf sibling"]}),
+            )
+            .await;
+        assert_eq!(
+            worker.result(sibling).await.output.unwrap()["stdout"],
+            "sibling"
+        );
+        worker.runtime.jobs.cancel(blocked).await.unwrap();
+        assert_eq!(worker.result(blocked).await.state, JobState::Cancelled);
+        release.add_permits(1);
+        let followup = worker
+            .tool(
+                CapabilitySet::default(),
+                "exec",
+                serde_json::json!({"argv":["/bin/sh", "-c", "printf reusable"]}),
+            )
+            .await;
+        assert_eq!(
+            worker.result(followup).await.output.unwrap()["stdout"],
+            "reusable"
+        );
+        assert_eq!(
+            worker.runtime.jobs.metadata(blocked).await.unwrap().state,
+            JobState::Cancelled
+        );
+        worker.finish().await;
+    }
+
+    #[tokio::test]
+    async fn remote_output_is_live_and_timeout_preserves_cut_streams() {
+        let worker = Harness::start(
+            std::fs::canonicalize(".").unwrap(),
+            RecordingPolicy::allowing(),
+        )
+        .await;
+        let job = worker
+            .tool(
+                CapabilitySet::default(),
+                "exec",
+                serde_json::json!({"argv":["/bin/sh", "-c", "printf before; sleep 3600"]}),
+            )
+            .await;
+        bounded(async {
+            loop {
+                if worker
+                    .runtime
+                    .jobs
+                    .output(job)
+                    .test_bytes("/result/stdout")
+                    .as_deref()
+                    == Some(b"before")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            !worker
+                .runtime
+                .jobs
+                .metadata(job)
+                .await
+                .unwrap()
+                .state
+                .is_terminal()
+        );
+        worker.runtime.jobs.cancel(job).await.unwrap();
+        assert_eq!(worker.result(job).await.state, JobState::Cancelled);
+        let job = worker.tool(CapabilitySet::default(), "exec", serde_json::json!({"argv":["/bin/sh", "-c", "printf before; sleep 30"], "timeout":1})).await;
+        let result = worker.result(job).await;
+        assert_eq!(result.state, JobState::Failed);
+        assert_eq!(result.output.unwrap()["timed_out"], true);
+        let saved = worker.runtime.jobs.output(job).test_document().unwrap();
+        assert_eq!(saved["capture_complete"], false);
+        assert_eq!(
+            worker
+                .runtime
+                .jobs
+                .output(job)
+                .test_bytes("/result/stdout")
+                .unwrap(),
+            b"before"
+        );
         worker.finish().await;
     }
 }

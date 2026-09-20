@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
+use crate::tool::invocation::AdmissionError;
 use serde_json::Value;
-use thiserror::Error;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::{
@@ -109,7 +109,7 @@ impl ToolContext {
     pub(crate) fn invocation_subject(
         &self,
     ) -> Result<&super::authorization::AuthorizationSubject, ToolError> {
-        self.invocation().map(|_| &self.subject)
+        self.invocation().map(|_| &self.subject).map_err(Into::into)
     }
 
     /// The invocation authority's coordinator, tool name and admitted arguments.
@@ -121,7 +121,7 @@ impl ToolContext {
             &str,
             &Value,
         ),
-        ToolError,
+        AdmissionError,
     > {
         match &self.authority {
             Authority::Invocation {
@@ -129,19 +129,18 @@ impl ToolContext {
                 tool,
                 arguments,
             } => Ok((coordinator, tool, arguments)),
-            Authority::UnavailableForResume => Err(ToolError::Denied(
+            Authority::UnavailableForResume => Err(AdmissionError::Denied(
                 "runtime authorization is unavailable".to_owned(),
             )),
         }
     }
 
-    /// Authorize an additional operation using this invocation's identity,
-    /// capability ceiling, cancellation and (on workers) forwarding scope.
-    async fn authorize(
+    /// Authorize an additional operation under this invocation's capabilities.
+    pub(crate) async fn authorize(
         &self,
         permissions: Vec<PermissionUse>,
         arguments: Value,
-    ) -> Result<(), ToolError> {
+    ) -> Result<(), AdmissionError> {
         let (coordinator, tool, _) = self.invocation()?;
         coordinator
             .authorize(&self.subject, tool.to_owned(), permissions, arguments)
@@ -149,11 +148,11 @@ impl ToolContext {
             .map_err(|error| {
                 use super::authorization::AuthorizationError;
                 match error {
-                    AuthorizationError::Cancelled => ToolError::Cancelled,
+                    AuthorizationError::Cancelled => AdmissionError::Cancelled,
                     AuthorizationError::Denied(reason)
-                    | AuthorizationError::InvalidGrant(reason) => ToolError::Denied(reason),
+                    | AuthorizationError::InvalidGrant(reason) => AdmissionError::Denied(reason),
                     AuthorizationError::Unavailable => {
-                        ToolError::Denied("required capability is unavailable".to_owned())
+                        AdmissionError::Denied("required capability is unavailable".to_owned())
                     }
                 }
             })
@@ -178,6 +177,7 @@ impl ToolContext {
             arguments,
         )
         .await
+        .map_err(Into::into)
     }
 
     #[must_use]
@@ -225,18 +225,6 @@ impl ToolContext {
         self.subject.cancellation.clone()
     }
 
-    /// Reserve one job-bound streaming capture without exposing its file path.
-    pub(crate) async fn pending_stream_capture(
-        &self,
-        field: &str,
-        kind: crate::job::output::CaptureKind,
-    ) -> Result<crate::job::output::PendingCapture, ToolError> {
-        let field = field.to_owned();
-        self.jobs
-            .pending_capture(self.job(), field, kind, false)
-            .await
-    }
-
     /// Reserve one builtin text capture, removed if abandoned before finishing.
     pub(crate) async fn text_capture(
         &self,
@@ -246,10 +234,6 @@ impl ToolContext {
         self.jobs
             .pending_capture(self.job(), field, kind, true)
             .await
-    }
-
-    pub(crate) async fn output_changed(&self) {
-        self.jobs.output_changed(self.job()).await;
     }
 }
 
@@ -328,58 +312,4 @@ impl Denial {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum ToolError {
-    #[error("operation denied: {0}")]
-    Denied(String),
-    #[error("tool arguments must be a JSON object")]
-    ArgumentsMustBeObject,
-    #[error("`bg` must be a boolean")]
-    InvalidBackground,
-    #[error("tool `{0}` does not support background execution")]
-    BackgroundUnsupported(String),
-    #[error("invalid tool arguments: {0}")]
-    InvalidArguments(String),
-    #[error("tool input channel is closed")]
-    InputClosed,
-    #[error("tool was cancelled")]
-    Cancelled,
-    #[error("tool was interrupted")]
-    Interrupted,
-    #[error("tool failed: {0}")]
-    Failed(String),
-    #[error("tool failed: {message}")]
-    FailedWithOutput {
-        message: String,
-        output: Box<ToolOutput>,
-    },
-    #[error("tool I/O failed: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("tool JSON failed: {0}")]
-    Json(#[from] serde_json::Error),
-}
-
-impl ToolError {
-    pub(crate) fn invalid(error: impl std::fmt::Display) -> Self {
-        Self::InvalidArguments(error.to_string())
-    }
-
-    pub(crate) fn failed(error: impl std::fmt::Display) -> Self {
-        Self::Failed(error.to_string())
-    }
-
-    pub(crate) fn concise_message(&self) -> String {
-        match self {
-            Self::Failed(message) | Self::FailedWithOutput { message, .. } => message.clone(),
-            _ => self.to_string(),
-        }
-    }
-
-    #[must_use]
-    pub fn with_output(message: impl Into<String>, output: ToolOutput) -> Self {
-        Self::FailedWithOutput {
-            message: message.into(),
-            output: Box::new(output),
-        }
-    }
-}
+pub type ToolError = crate::tool::invocation::OperationError<ToolOutput>;

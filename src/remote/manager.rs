@@ -249,7 +249,7 @@ pub(crate) mod tests {
         RejectSensitivePrompts,
         backend::{ConnectionFactory, ConnectionRequest, Transport},
         client::test_transport,
-        protocol::{PROTOCOL_VERSION, Request, Response, read_frame, write_frame},
+        protocol::{Request, Response, read_frame, write_frame},
     };
     use crate::{target::TargetDefinition, tool::policy::AllowAll};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -363,15 +363,12 @@ pub(crate) mod tests {
                 let (client, mut shim) = tokio::io::duplex(4096);
                 let shim = tokio::spawn(async move {
                     let request = read_frame::<_, Request>(&mut shim).await;
-                    if !matches!(request, Ok(Some(Request::Hello { .. }))) {
+                    if !matches!(request, Ok(Some(Request::Hello))) {
                         return;
                     }
                     hello.add_permits(1);
                     ready.acquire().await.unwrap().forget();
-                    let response = Response::Ready {
-                        version: PROTOCOL_VERSION,
-                    };
-                    if write_frame(&mut shim, &response).await.is_ok() {
+                    if write_frame(&mut shim, &Response::Ready).await.is_ok() {
                         while let Ok(Some(_)) = read_frame::<_, Request>(&mut shim).await {}
                     }
                 });

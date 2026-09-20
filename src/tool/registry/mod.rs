@@ -27,31 +27,49 @@ use crate::{
 };
 
 use super::{ToolContext, ToolError, ToolOutput};
+use crate::tool::invocation::{AdmissionError, OperationError};
+
+pub type RegisteredTool = CatalogEntry<ToolContext, ToolOutput>;
+pub type ToolRegistry = Catalog<ToolContext, ToolOutput>;
+pub type ToolRegistryBuilder = CatalogBuilder<ToolContext, ToolOutput>;
+pub(crate) type AdmittedInvocation = Invocation<ToolContext, ToolOutput>;
+
+pub trait OutputValue: std::fmt::Debug + Send + 'static {
+    fn from_value(value: Value) -> Self;
+}
+
+impl OutputValue for ToolOutput {
+    fn from_value(value: Value) -> Self {
+        Self::new(value)
+    }
+}
 
 #[derive(Clone)]
-pub struct RegisteredTool {
+pub struct CatalogEntry<C, O: OutputValue> {
     definition: GeneratedToolDefinition,
     execution: ToolExecution,
-    admit: ArgumentAdmission,
+    admit: ArgumentAdmission<C, O>,
 }
 
 /// A one-shot handler with its admitted input retained, not reconstructed from JSON.
 /// The closure erases the input type without a downcast or a mismatched tool/input pair.
-pub(crate) struct AdmittedInvocation(
-    Box<dyn FnOnce(ToolContext) -> BoxFuture<'static, Result<ToolOutput, ToolError>> + Send>,
-);
+type InvocationFuture<O> = BoxFuture<'static, Result<O, OperationError<O>>>;
 
-impl AdmittedInvocation {
-    pub(crate) async fn call(self, context: ToolContext) -> Result<ToolOutput, ToolError> {
-        (self.0)(context).await
+pub(crate) struct Invocation<C, O>(Box<dyn FnOnce(C) -> InvocationFuture<O> + Send>);
+
+impl<C, O> Invocation<C, O> {
+    pub(crate) fn call(self, context: C) -> InvocationFuture<O> {
+        (self.0)(context)
     }
 }
 
-type ArgumentAdmission = Arc<dyn Fn(Value) -> Result<AdmittedInvocation, ToolError> + Send + Sync>;
-type ArgumentPermissions =
-    Arc<dyn Fn(&ExecutionLocation, &Value) -> Result<Vec<PermissionUse>, ToolError> + Send + Sync>;
-type ArgumentPaths = Arc<dyn Fn(&Value) -> Result<Vec<PathArgument>, ToolError> + Send + Sync>;
-type ArgumentValidator = Arc<dyn Fn(&Value) -> Result<(), ToolError> + Send + Sync>;
+type ArgumentAdmission<C, O> =
+    Arc<dyn Fn(Value) -> Result<Invocation<C, O>, AdmissionError> + Send + Sync>;
+type ArgumentPermissions = Arc<
+    dyn Fn(&ExecutionLocation, &Value) -> Result<Vec<PermissionUse>, AdmissionError> + Send + Sync,
+>;
+type ArgumentPaths = Arc<dyn Fn(&Value) -> Result<Vec<PathArgument>, AdmissionError> + Send + Sync>;
+type ArgumentValidator = Arc<dyn Fn(&Value) -> Result<(), AdmissionError> + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub struct ToolSpec {
@@ -69,10 +87,10 @@ pub struct ToolSpec {
 }
 
 impl ToolSpec {
-    pub(crate) fn validate_arguments(&self, arguments: &Value) -> Result<(), ToolError> {
+    pub(crate) fn validate_arguments(&self, arguments: &Value) -> Result<(), AdmissionError> {
         let arguments = arguments
             .as_object()
-            .ok_or(ToolError::ArgumentsMustBeObject)?;
+            .ok_or(AdmissionError::ArgumentsMustBeObject)?;
         if self.input_schema["additionalProperties"] == false
             && let Some(argument) = arguments.keys().find(|argument| {
                 !self.input_schema["properties"]
@@ -80,7 +98,7 @@ impl ToolSpec {
                     .is_some_and(|properties| properties.contains_key(*argument))
             })
         {
-            return Err(ToolError::InvalidArguments(format!(
+            return Err(AdmissionError::InvalidArguments(format!(
                 "unknown argument `{argument}`"
             )));
         }
@@ -170,8 +188,8 @@ pub struct PathArgument {
     pub(crate) kind: PathKind,
 }
 
-fn unidentified_pointer(pointer: &str) -> ToolError {
-    ToolError::InvalidArguments(format!(
+fn unidentified_pointer(pointer: &str) -> AdmissionError {
+    AdmissionError::InvalidArguments(format!(
         "path pointer `{pointer}` does not identify an argument"
     ))
 }
@@ -207,14 +225,17 @@ impl PathArgument {
         }
     }
 
-    pub(crate) fn input<'a>(&'a self, arguments: &'a Value) -> Result<Option<&'a str>, ToolError> {
+    pub(crate) fn input<'a>(
+        &'a self,
+        arguments: &'a Value,
+    ) -> Result<Option<&'a str>, AdmissionError> {
         let value = match &self.binding {
             PathBinding::TopLevel { name, .. } => arguments.get(name),
             PathBinding::Pointer(pointer) => arguments.pointer(pointer),
         };
         match value {
             Some(Value::String(value)) => Ok(Some(value)),
-            Some(_) => Err(ToolError::InvalidArguments(format!(
+            Some(_) => Err(AdmissionError::InvalidArguments(format!(
                 "{} must be a string",
                 self.name()
             ))),
@@ -225,12 +246,16 @@ impl PathArgument {
         }
     }
 
-    pub(crate) fn rewrite(&self, arguments: &mut Value, value: Value) -> Result<(), ToolError> {
+    pub(crate) fn rewrite(
+        &self,
+        arguments: &mut Value,
+        value: Value,
+    ) -> Result<(), AdmissionError> {
         match &self.binding {
             PathBinding::TopLevel { name, .. } => {
                 arguments
                     .as_object_mut()
-                    .ok_or(ToolError::ArgumentsMustBeObject)?
+                    .ok_or(AdmissionError::ArgumentsMustBeObject)?
                     .insert(name.clone(), value);
             }
             PathBinding::Pointer(pointer) => {
@@ -260,7 +285,6 @@ pub struct ToolOptions {
 
 type ComputedInput = Arc<dyn Fn(&CapabilitySet) -> Option<Value> + Send + Sync>;
 
-/// Internal execution metadata.
 #[derive(Clone, Default)]
 struct ToolExecution {
     job_role: crate::job::JobRole,
@@ -271,11 +295,11 @@ struct ToolExecution {
     placement: ToolPlacement,
     permission_resource: Option<ResourceId>,
     path_arguments: Vec<PathArgument>,
-    argument_validator: Option<ArgumentValidator>,
-    argument_permissions: Option<ArgumentPermissions>,
-    argument_paths: Option<ArgumentPaths>,
-    read_error_output: Option<fn(&str, &ToolError) -> Option<ToolOutput>>,
+    read_error_output: Option<fn(&str, &std::io::Error) -> Option<Value>>,
     target_authentication: bool,
+    validator: Option<ArgumentValidator>,
+    permissions: Option<ArgumentPermissions>,
+    paths: Option<ArgumentPaths>,
 }
 
 impl ToolOptions {
@@ -288,7 +312,7 @@ impl ToolOptions {
     /// Built-in read only: expected OS read failures are successful structured results.
     pub(crate) fn read_error_output(
         mut self,
-        convert: fn(&str, &ToolError) -> Option<ToolOutput>,
+        convert: fn(&str, &std::io::Error) -> Option<Value>,
     ) -> Self {
         self.execution.read_error_output = Some(convert);
         self
@@ -479,12 +503,12 @@ impl ToolOptions {
     #[must_use]
     pub fn argument_permissions(
         mut self,
-        extract: impl Fn(&ExecutionLocation, &Value) -> Result<Vec<PermissionUse>, ToolError>
+        extract: impl Fn(&ExecutionLocation, &Value) -> Result<Vec<PermissionUse>, AdmissionError>
         + Send
         + Sync
         + 'static,
     ) -> Self {
-        self.execution.argument_permissions = Some(Arc::new(extract));
+        self.execution.permissions = Some(Arc::new(extract));
         self
     }
 
@@ -494,9 +518,9 @@ impl ToolOptions {
     #[must_use]
     pub fn argument_paths(
         mut self,
-        extract: impl Fn(&Value) -> Result<Vec<PathArgument>, ToolError> + Send + Sync + 'static,
+        extract: impl Fn(&Value) -> Result<Vec<PathArgument>, AdmissionError> + Send + Sync + 'static,
     ) -> Self {
-        self.execution.argument_paths = Some(Arc::new(extract));
+        self.execution.paths = Some(Arc::new(extract));
         self
     }
 
@@ -504,9 +528,9 @@ impl ToolOptions {
     #[must_use]
     pub fn argument_validator(
         mut self,
-        validate: impl Fn(&Value) -> Result<(), ToolError> + Send + Sync + 'static,
+        validate: impl Fn(&Value) -> Result<(), AdmissionError> + Send + Sync + 'static,
     ) -> Self {
-        self.execution.argument_validator = Some(Arc::new(validate));
+        self.execution.validator = Some(Arc::new(validate));
         self
     }
 
@@ -538,7 +562,7 @@ impl Default for ToolOptions {
     }
 }
 
-impl RegisteredTool {
+impl<C: Send + 'static, O: OutputValue> CatalogEntry<C, O> {
     #[must_use]
     pub const fn job_role(&self) -> crate::job::JobRole {
         self.execution.job_role
@@ -556,28 +580,27 @@ impl RegisteredTool {
             .map(|schema| schema.generate(capabilities))
     }
 
-    pub(crate) fn take_job_name(&self, arguments: &mut Value) -> Result<Option<String>, ToolError> {
+    pub(crate) fn take_job_name(
+        &self,
+        arguments: &mut Value,
+    ) -> Result<Option<String>, AdmissionError> {
         if !self.execution.supports_name {
             return Ok(None);
         }
         let value = arguments
             .as_object_mut()
-            .ok_or(ToolError::ArgumentsMustBeObject)?
+            .ok_or(AdmissionError::ArgumentsMustBeObject)?
             .remove("name");
         match value {
             None | Some(Value::Null) => Ok(None),
             Some(Value::String(name)) if valid_job_name(&name) => Ok(Some(name)),
-            _ => Err(ToolError::InvalidArguments(
+            _ => Err(AdmissionError::InvalidArguments(
                 "name must be lowercase kebab-case: start with a letter, use only a-z, 0-9, and single hyphens between nonempty words".to_owned(),
             )),
         }
     }
 
-    pub async fn call(
-        &self,
-        context: ToolContext,
-        arguments: Value,
-    ) -> Result<ToolOutput, ToolError> {
+    pub async fn call(&self, context: C, arguments: Value) -> Result<O, OperationError<O>> {
         self.validate_arguments(&arguments)?;
         self.admit(arguments)?.call(context).await
     }
@@ -585,7 +608,7 @@ impl RegisteredTool {
     /// Admit handler input before allocating a job or requesting approval.
     /// Native-path consumers retain wire spelling before IO; other consumers
     /// retain path-rewritten input. Neither reconstructs the typed value later.
-    pub(crate) fn admit(&self, arguments: Value) -> Result<AdmittedInvocation, ToolError> {
+    pub(crate) fn admit(&self, arguments: Value) -> Result<Invocation<C, O>, AdmissionError> {
         // The declared path argument, in its wire spelling, names the failed read.
         let read_path = self.execution.read_error_output.and_then(|convert| {
             let spec = self.execution.path_arguments.first()?;
@@ -593,12 +616,15 @@ impl RegisteredTool {
             Some((path, convert))
         });
         let admitted = (self.admit)(arguments)?;
-        Ok(AdmittedInvocation(Box::new(move |context| {
+        Ok(Invocation(Box::new(move |context| {
             Box::pin(async move {
                 match admitted.call(context).await {
                     Err(error) => {
-                        match read_path.and_then(|(path, convert)| convert(&path, &error)) {
-                            Some(output) => Ok(output),
+                        match read_path.and_then(|(path, convert)| match &error {
+                            OperationError::Io(error) => convert(&path, error),
+                            _ => None,
+                        }) {
+                            Some(output) => Ok(O::from_value(output)),
                             None => Err(error),
                         }
                     }
@@ -608,8 +634,8 @@ impl RegisteredTool {
         })))
     }
 
-    pub(crate) fn validate_arguments(&self, arguments: &Value) -> Result<(), ToolError> {
-        if let Some(validate) = &self.execution.argument_validator {
+    pub(crate) fn validate_arguments(&self, arguments: &Value) -> Result<(), AdmissionError> {
+        if let Some(validate) = &self.execution.validator {
             validate(arguments)?;
         }
         Ok(())
@@ -639,15 +665,19 @@ impl RegisteredTool {
         self.execution.placement
     }
 
-    pub(crate) fn read_error_output(&self, path: &str, error: &ToolError) -> Option<ToolOutput> {
-        self.execution
-            .read_error_output
-            .and_then(|convert| convert(path, error))
+    pub(crate) fn read_error_output(&self, path: &str, error: &AdmissionError) -> Option<Value> {
+        match error {
+            AdmissionError::Io(error) => self.execution.read_error_output?(path, error),
+            _ => None,
+        }
     }
 
-    pub(crate) fn path_arguments(&self, arguments: &Value) -> Result<Vec<PathArgument>, ToolError> {
+    pub(crate) fn path_arguments(
+        &self,
+        arguments: &Value,
+    ) -> Result<Vec<PathArgument>, AdmissionError> {
         let mut paths = self.execution.path_arguments.clone();
-        if let Some(extract) = &self.execution.argument_paths {
+        if let Some(extract) = &self.execution.paths {
             paths.extend(extract(arguments)?);
         }
         Ok(paths)
@@ -657,9 +687,9 @@ impl RegisteredTool {
         &self,
         location: &ExecutionLocation,
         arguments: &Value,
-    ) -> Result<Vec<PermissionUse>, ToolError> {
+    ) -> Result<Vec<PermissionUse>, AdmissionError> {
         self.execution
-            .argument_permissions
+            .permissions
             .as_ref()
             .map_or_else(|| Ok(Vec::new()), |extract| extract(location, arguments))
     }
@@ -690,10 +720,10 @@ impl ToolSurface {
         self.tools.get(name)
     }
 
-    pub fn validate_arguments(&self, name: &str, arguments: &Value) -> Result<(), ToolError> {
-        let tool = self
-            .get(name)
-            .ok_or_else(|| ToolError::InvalidArguments(format!("tool `{name}` is unavailable")))?;
+    pub fn validate_arguments(&self, name: &str, arguments: &Value) -> Result<(), AdmissionError> {
+        let tool = self.get(name).ok_or_else(|| {
+            AdmissionError::InvalidArguments(format!("tool `{name}` is unavailable"))
+        })?;
         tool.validate_arguments(arguments)
     }
 
@@ -705,18 +735,35 @@ impl ToolSurface {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct ToolRegistry {
-    tools: Arc<BTreeMap<String, Arc<RegisteredTool>>>,
+impl<C, O: OutputValue> Default for Catalog<C, O> {
+    fn default() -> Self {
+        Self {
+            tools: Arc::default(),
+        }
+    }
+}
+impl<C, O: OutputValue> Default for CatalogBuilder<C, O> {
+    fn default() -> Self {
+        Self {
+            tools: BTreeMap::new(),
+        }
+    }
 }
 
-impl ToolRegistry {
+type CatalogTools<C, O> = BTreeMap<String, Arc<CatalogEntry<C, O>>>;
+
+#[derive(Clone)]
+pub struct Catalog<C, O: OutputValue> {
+    tools: Arc<CatalogTools<C, O>>,
+}
+
+impl<C: Send + 'static, O: OutputValue> Catalog<C, O> {
     #[must_use]
-    pub fn get(&self, name: &str) -> Option<Arc<RegisteredTool>> {
+    pub fn get(&self, name: &str) -> Option<Arc<CatalogEntry<C, O>>> {
         self.tools.get(name).cloned()
     }
 
-    pub fn tools(&self) -> impl Iterator<Item = &Arc<RegisteredTool>> {
+    pub fn tools(&self) -> impl Iterator<Item = &Arc<CatalogEntry<C, O>>> {
         self.tools.values()
     }
 
@@ -755,34 +802,33 @@ impl ToolRegistry {
         &self,
         tool: &ToolSpec,
         mut arguments: Value,
-    ) -> Result<(Value, bool), ToolError> {
+    ) -> Result<(Value, bool), AdmissionError> {
         let object = arguments
             .as_object_mut()
-            .ok_or(ToolError::ArgumentsMustBeObject)?;
+            .ok_or(AdmissionError::ArgumentsMustBeObject)?;
         let background = match object.remove("bg") {
             None => false,
             Some(Value::Bool(value)) if tool.supports_background => value,
             Some(Value::Bool(_)) => {
-                return Err(ToolError::BackgroundUnsupported(tool.name.clone()));
+                return Err(AdmissionError::BackgroundUnsupported(tool.name.clone()));
             }
-            Some(_) => return Err(ToolError::InvalidBackground),
+            Some(_) => return Err(AdmissionError::InvalidBackground),
         };
         Ok((arguments, background))
     }
 }
 
-#[derive(Default)]
-pub struct ToolRegistryBuilder {
-    tools: BTreeMap<String, Arc<RegisteredTool>>,
+pub struct CatalogBuilder<C, O: OutputValue> {
+    tools: CatalogTools<C, O>,
 }
 
-impl ToolRegistryBuilder {
+impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
     /// Check names already claimed by builtin or host-supplied tools.
     pub(crate) fn contains_name(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }
 
-    pub fn extend(&mut self, registry: &ToolRegistry) -> Result<&mut Self, RegistryError> {
+    pub fn extend(&mut self, registry: &Catalog<C, P>) -> Result<&mut Self, RegistryError> {
         for (name, tool) in registry.tools.iter() {
             if self.tools.insert(name.clone(), tool.clone()).is_some() {
                 return Err(RegistryError::Duplicate(name.clone()));
@@ -800,13 +846,13 @@ impl ToolRegistryBuilder {
         handler: F,
     ) -> Result<&mut Self, RegistryError>
     where
-        F: Fn(ToolContext, Value) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
+        F: Fn(C, Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<P, OperationError<P>>> + Send + 'static,
     {
         let handler = Arc::new(handler);
         self.register_admission(name, description, input_schema, options, move |arguments| {
             let handler = handler.clone();
-            Ok(AdmittedInvocation(Box::new(move |context| {
+            Ok(Invocation(Box::new(move |context| {
                 Box::pin(handler(context, arguments))
             })))
         })
@@ -818,7 +864,7 @@ impl ToolRegistryBuilder {
         description: impl Into<String>,
         mut input_schema: Value,
         mut options: ToolOptions,
-        admit: impl Fn(Value) -> Result<AdmittedInvocation, ToolError> + Send + Sync + 'static,
+        admit: impl Fn(Value) -> Result<Invocation<C, P>, AdmissionError> + Send + Sync + 'static,
     ) -> Result<&mut Self, RegistryError> {
         tags_first(&mut input_schema);
         if options.execution.placement == ToolPlacement::TargetedWorkspace {
@@ -906,7 +952,7 @@ impl ToolRegistryBuilder {
         }
         self.tools.insert(
             definition.name.clone(),
-            Arc::new(RegisteredTool {
+            Arc::new(CatalogEntry {
                 definition,
                 execution,
                 admit: Arc::new(admit),
@@ -925,14 +971,14 @@ impl ToolRegistryBuilder {
     where
         I: DeserializeOwned + JsonSchema + Send + 'static,
         O: Serialize + JsonSchema + Send + 'static,
-        F: Fn(ToolContext, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<O, ToolError>> + Send + 'static,
+        F: Fn(C, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<O, OperationError<P>>> + Send + 'static,
     {
         self.register_product::<I, O, _, _>(name, description, options, move |context, input| {
             let future = handler(context, input);
             async move {
                 let output = future.await?;
-                Ok(ToolOutput::new(serde_json::to_value(output)?))
+                Ok(P::from_value(serde_json::to_value(output)?))
             }
         })
     }
@@ -951,8 +997,8 @@ impl ToolRegistryBuilder {
     where
         I: DeserializeOwned + JsonSchema + Send + 'static,
         O: JsonSchema,
-        F: Fn(ToolContext, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
+        F: Fn(C, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<P, OperationError<P>>> + Send + 'static,
     {
         // Handler results are described by their serialization contract. In
         // particular, an `Option<T>` that is always emitted is required and
@@ -970,6 +1016,46 @@ impl ToolRegistryBuilder {
         self.register_typed::<I, _, _>(name, description, options, handler)
     }
 
+    fn register_typed<I, F, Fut>(
+        &mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        options: ToolOptions,
+        handler: F,
+    ) -> Result<&mut Self, RegistryError>
+    where
+        I: DeserializeOwned + JsonSchema + Send + 'static,
+        F: Fn(C, I) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<P, OperationError<P>>> + Send + 'static,
+    {
+        // Typed arguments keep the deserialization contract: defaults and
+        // `Option` fields remain omissible even when the output type would emit
+        // the same fields.
+        let input_schema = serde_json::to_value(
+            SchemaSettings::default()
+                .for_deserialize()
+                .into_generator()
+                .into_root_schema_for::<I>(),
+        )
+        .map_err(|error| RegistryError::Schema(error.to_string()))?;
+        let handler = Arc::new(handler);
+        self.register_admission(name, description, input_schema, options, move |arguments| {
+            let input = serde_json::from_value::<I>(arguments).map_err(AdmissionError::invalid)?;
+            let handler = handler.clone();
+            Ok(Invocation(Box::new(move |context| {
+                Box::pin(handler(context, input))
+            })))
+        })
+    }
+
+    pub fn build(self) -> Catalog<C, P> {
+        Catalog {
+            tools: Arc::new(self.tools),
+        }
+    }
+}
+
+impl ToolRegistryBuilder {
     /// Register the concrete manager-produced presentation product. This
     /// derives JobView presentation and the canonical capability-scoped schema;
     /// an options policy/schema cannot override the product's contract. Images
@@ -1009,44 +1095,6 @@ impl ToolRegistryBuilder {
                 Ok(ToolOutput::new(view).with_images(images))
             }
         })
-    }
-
-    fn register_typed<I, F, Fut>(
-        &mut self,
-        name: impl Into<String>,
-        description: impl Into<String>,
-        options: ToolOptions,
-        handler: F,
-    ) -> Result<&mut Self, RegistryError>
-    where
-        I: DeserializeOwned + JsonSchema + Send + 'static,
-        F: Fn(ToolContext, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
-    {
-        // Typed arguments keep the deserialization contract: defaults and
-        // `Option` fields remain omissible even when the output type would emit
-        // the same fields.
-        let input_schema = serde_json::to_value(
-            SchemaSettings::default()
-                .for_deserialize()
-                .into_generator()
-                .into_root_schema_for::<I>(),
-        )
-        .map_err(|error| RegistryError::Schema(error.to_string()))?;
-        let handler = Arc::new(handler);
-        self.register_admission(name, description, input_schema, options, move |arguments| {
-            let input = serde_json::from_value::<I>(arguments).map_err(ToolError::invalid)?;
-            let handler = handler.clone();
-            Ok(AdmittedInvocation(Box::new(move |context| {
-                Box::pin(handler(context, input))
-            })))
-        })
-    }
-
-    pub fn build(self) -> ToolRegistry {
-        ToolRegistry {
-            tools: Arc::new(self.tools),
-        }
     }
 }
 
@@ -1091,6 +1139,72 @@ pub enum RegistryError {
     ReservedTarget,
     #[error("presented tool `{0}` must run on the host without read-error outputs")]
     PresentedPlacement(String),
+}
+
+struct HostAuthorizer(ToolContext);
+
+impl crate::tool::invocation::LocalAuthorizer for HostAuthorizer {
+    fn authorize(
+        &self,
+        permissions: Vec<PermissionUse>,
+        arguments: Value,
+    ) -> BoxFuture<'static, Result<(), AdmissionError>> {
+        let context = self.0.clone();
+        Box::pin(async move { context.authorize(permissions, arguments).await })
+    }
+}
+
+impl ToolRegistryBuilder {
+    pub(crate) fn register_local(
+        &mut self,
+        register: impl FnOnce(
+            &mut crate::tool::invocation::LocalCatalogBuilder,
+        ) -> Result<(), RegistryError>,
+    ) -> Result<(), RegistryError> {
+        use crate::tool::invocation::LocalContext;
+        let mut builder = crate::tool::invocation::LocalCatalogBuilder::default();
+        register(&mut builder)?;
+        for (name, tool) in builder.tools {
+            if self.tools.contains_key(&name) {
+                return Err(RegistryError::Duplicate(name));
+            }
+            let local = tool.clone();
+            let host = CatalogEntry {
+                definition: tool.definition.clone(),
+                execution: tool.execution.clone(),
+                admit: Arc::new(move |arguments: Value| {
+                    let admitted = (local.admit)(arguments.clone())?;
+                    Ok(Invocation(Box::new(move |context: ToolContext| {
+                        Box::pin(async move {
+                            let output = crate::job::output::HostOutput::new(
+                                context.store().clone(),
+                                context.job(),
+                            );
+                            let local = LocalContext::new(
+                                context.execution_location().clone(),
+                                context.capabilities().clone(),
+                                context.process_environment.clone(),
+                                context.cancellation_token(),
+                                output.context(),
+                                Arc::new(HostAuthorizer(context)),
+                                arguments,
+                            );
+                            let result = admitted.call(local).await;
+                            output.context().settle().await?;
+                            match result {
+                                Ok(value) => Ok(output.finish(value)?),
+                                Err(error) => {
+                                    Err(error.try_map_output(|value| output.finish(value))?)
+                                }
+                            }
+                        })
+                    })))
+                }),
+            };
+            self.tools.insert(name, Arc::new(host));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1212,13 +1326,13 @@ mod admission_tests {
     async fn product_registration_preserves_capture_evidence_without_serialization() {
         #[derive(serde::Deserialize, JsonSchema)]
         struct Input {
-            text: String,
+            content: String,
         }
         // This is a schema-only declaration, deliberately not Serialize.
         #[derive(JsonSchema)]
         struct Output {
-            #[serde(rename = "text")]
-            _text: String,
+            #[serde(rename = "content")]
+            _content: String,
         }
         let runtime = crate::tests::TestRuntime::new().await;
         let lease = runtime
@@ -1235,9 +1349,9 @@ mod admission_tests {
                 ToolOptions::default(),
                 |context, input| async move {
                     let capture =
-                        context.pending_stream_capture("/result/text", output::CaptureKind::Text);
+                        context.text_capture(crate::tool::output::TextCaptureField::Content);
                     let mut capture = capture.await?.open();
-                    capture.write_all(input.text.as_bytes())?;
+                    capture.write_all(input.content.as_bytes())?;
                     let completed = capture.finish()?;
                     Ok(ToolOutput::new(serde_json::json!({})).with_captures(vec![completed]))
                 },
@@ -1249,15 +1363,15 @@ mod admission_tests {
             .spec(&CapabilitySet::default(), &runtime.agent)
             .unwrap();
         assert_eq!(
-            spec.result_schema.unwrap()["properties"]["text"]["type"],
+            spec.result_schema.unwrap()["properties"]["content"]["type"],
             "string"
         );
-        let arguments = serde_json::json!({"text":"native evidence"});
+        let arguments = serde_json::json!({"content":"native evidence"});
         let mut output = tool.call(context, arguments).await.unwrap();
         assert_eq!(output.value, serde_json::json!({}));
         let captures = output.take_captures();
         assert_eq!(captures.len(), 1);
-        assert!(captures[0].matches(job, "/result/text"));
+        assert!(captures[0].matches(job, "/result/content"));
         assert!(output.take_captures().is_empty());
         lease.fail(JobOutcome::Cancelled).await;
     }
@@ -1425,7 +1539,7 @@ mod admission_tests {
     fn presented_registration_rejects_workspace_placement_and_read_error_outputs() {
         #[derive(serde::Deserialize, JsonSchema)]
         struct Input {}
-        fn read_error(_: &str, _: &ToolError) -> Option<ToolOutput> {
+        fn read_error(_: &str, _: &std::io::Error) -> Option<Value> {
             None
         }
         for options in [

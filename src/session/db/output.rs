@@ -358,15 +358,4 @@ impl SharedDb {
     pub(crate) fn test_batch(&self, sql: &str) {
         self.lock().batch(sql).unwrap();
     }
-
-    /// Delete every generation's output rows for a pruned job.
-    pub(crate) fn remove_job_output(&self, job: u64) -> Result<(), DbError> {
-        let db = self.lock();
-        db.atomic(|| {
-            for table in ["job_presentation", "job_output", "job_capture"] {
-                db.execute(&format!("DELETE FROM {table} WHERE job = ?1"), params![job])?;
-            }
-            Ok(())
-        })
-    }
 }

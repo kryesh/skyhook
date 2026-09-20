@@ -989,7 +989,6 @@ mod tests {
                     agent: session.root.clone(),
                     job: lease.id(),
                     parent: None,
-                    scope: None,
                     capabilities: session.runtime.capabilities.clone(),
                     cancellation: lease.cancellation_token(),
                 };

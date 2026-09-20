@@ -15,7 +15,7 @@ use super::response::{collect_headers, read_body};
 use super::tls::client;
 use super::validation::{FetchPlan, HttpRequestUrl, OutputPlan, redirect_headers};
 use super::{
-    FetchOutput, MAX_UPLOAD_BYTES, Redirect, RedirectPolicy, RequestBody, ToolContext, ToolError,
+    FetchOutput, LocalContext, LocalError, MAX_UPLOAD_BYTES, Redirect, RedirectPolicy, RequestBody,
     invalid,
 };
 
@@ -31,7 +31,7 @@ impl FileUpload {
     fn len(&self) -> u64 {
         self.length
     }
-    async fn body(&self) -> Result<reqwest::Body, ToolError> {
+    async fn body(&self) -> Result<reqwest::Body, LocalError> {
         let file = tokio::fs::File::open(self.snapshot.path()).await?;
         Ok(reqwest::Body::wrap_stream(
             tokio_util::io::ReaderStream::new(file),
@@ -43,7 +43,7 @@ enum Upload {
     File(FileUpload),
 }
 
-async fn snapshot_file(path: &Path, remaining: u64) -> Result<FileUpload, ToolError> {
+async fn snapshot_file(path: &Path, remaining: u64) -> Result<FileUpload, LocalError> {
     let sentinel = remaining + 1;
     if !tokio::fs::metadata(&path).await?.is_file() {
         return Err(invalid("upload path must be a regular file"));
@@ -72,14 +72,14 @@ async fn snapshot_file(path: &Path, remaining: u64) -> Result<FileUpload, ToolEr
     }
     Ok(FileUpload { snapshot, length })
 }
-fn check_upload_size(size: usize) -> Result<(), ToolError> {
+fn check_upload_size(size: usize) -> Result<(), LocalError> {
     if size as u64 > MAX_UPLOAD_BYTES {
         Err(invalid("upload exceeds 100 MiB limit"))
     } else {
         Ok(())
     }
 }
-fn decode_base64(value: &str) -> Result<Vec<u8>, ToolError> {
+fn decode_base64(value: &str) -> Result<Vec<u8>, LocalError> {
     crate::media::decode_base64_bounded(value, MAX_UPLOAD_BYTES as usize).map_err(|error| {
         invalid(match error {
             crate::media::MediaError::TooLarge => "upload exceeds 100 MiB limit",
@@ -87,7 +87,7 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, ToolError> {
         })
     })
 }
-async fn prepare_body(body: Option<&RequestBody>) -> Result<Option<Upload>, ToolError> {
+async fn prepare_body(body: Option<&RequestBody>) -> Result<Option<Upload>, LocalError> {
     let Some(body) = body else { return Ok(None) };
     let (bytes, content_type) = match body {
         RequestBody::Text { value } => (
@@ -179,12 +179,12 @@ impl RequestState {
         (self, hop)
     }
 }
-fn local_error(error: ToolError) -> FetchError {
+fn local_error(error: LocalError) -> FetchError {
     FetchError::from_tool_error(error, FetchPhase::LocalIo)
 }
 
 pub(super) async fn execute(
-    context: &ToolContext,
+    context: &LocalContext,
     plan: FetchPlan,
     progress: &mut FetchProgress,
 ) -> Result<FetchOutput, FetchError> {
@@ -228,7 +228,7 @@ pub(super) async fn execute(
     let response = loop {
         if context.is_cancelled() {
             return Err(FetchError::from_tool_error(
-                ToolError::Cancelled,
+                LocalError::Cancelled,
                 progress.phase,
             ));
         }

@@ -1,6 +1,9 @@
 //! Validate and authorize arguments, then select where an invocation runs.
 
 use super::*;
+use crate::tool::invocation::{
+    PathOutcome, PathPreflight, path_text, preflight_path_arguments, scope_capabilities,
+};
 
 impl ToolExecutor {
     async fn resolve_workspace_invocation(
@@ -89,7 +92,6 @@ impl ToolExecutor {
         name: &str,
         mut arguments: Value,
         parent: Option<JobId>,
-        authorization_scope: Option<u64>,
     ) -> Result<PreparedInvocation, ExecutionError> {
         let tool = self
             .shared
@@ -115,9 +117,7 @@ impl ToolExecutor {
             handler_arguments,
             background,
             job_name,
-            authorization_scope: self
-                .authorization_scope(parent, authorization_scope)
-                .await?,
+            authorization_scope: self.authorization_scope(parent).await?,
         })
     }
 
@@ -128,7 +128,6 @@ impl ToolExecutor {
         name: &str,
         arguments: Value,
         parent: Option<JobId>,
-        authorization_scope: Option<u64>,
     ) -> Result<InvocationPlan, ExecutionError> {
         let PreparedInvocation {
             tool,
@@ -138,7 +137,7 @@ impl ToolExecutor {
             job_name,
             authorization_scope,
         } = self
-            .prepare_invocation(kind, &agent, name, arguments, parent, authorization_scope)
+            .prepare_invocation(kind, &agent, name, arguments, parent)
             .await?;
         let selected = self
             .resolve_workspace_invocation(&tool, &original_arguments)
@@ -150,7 +149,10 @@ impl ToolExecutor {
                 .remove("target");
         }
         tool.validate_arguments(&arguments)?;
-        let (path_permissions, read_error) = if selected.route.is_none() {
+        let PathPreflight {
+            permissions: path_permissions,
+            outcome,
+        } = if selected.route.is_none() {
             preflight_path_arguments(
                 &tool,
                 &selected.location.target,
@@ -160,7 +162,10 @@ impl ToolExecutor {
             )
             .await?
         } else {
-            (Vec::new(), None)
+            PathPreflight {
+                permissions: Vec::new(),
+                outcome: PathOutcome::Ready,
+            }
         };
         // Remote location frames spell the workspace as text. Local handlers use
         // the native path, and argument paths are checked where they are spelled.
@@ -177,7 +182,7 @@ impl ToolExecutor {
         }
         // An unresolved read still requires the ordinary workspace authorization,
         // as well as approval for the unresolved path below.
-        if read_error.is_none() {
+        if matches!(outcome, PathOutcome::Ready) {
             for permission in &path_permissions {
                 capabilities.retain(|candidate| *candidate != permission.capability);
             }
@@ -206,10 +211,12 @@ impl ToolExecutor {
         };
         // Schema-valid input that the typed handler rejects still owns a job,
         // approval, and failure. A remote dispatch admits only on its destination.
-        let dispatch = match (read_error, selected.route) {
-            (Some(output), _) => InvocationDispatch::ReadError(output),
-            (None, Some(remote)) => InvocationDispatch::Remote { remote, arguments },
-            (None, None) => InvocationDispatch::Local(tool.admit(arguments)),
+        let dispatch = match (outcome, selected.route) {
+            (PathOutcome::ReadError(output), _) => {
+                InvocationDispatch::ReadError(ToolOutput::new(output))
+            }
+            (PathOutcome::Ready, Some(remote)) => InvocationDispatch::Remote { remote, arguments },
+            (PathOutcome::Ready, None) => InvocationDispatch::Local(tool.admit(arguments)),
         };
         Ok(InvocationPlan {
             origin: if matches!(kind, InvocationKind::Model) {
@@ -232,15 +239,10 @@ impl ToolExecutor {
         })
     }
 
-    async fn authorization_scope(
-        &self,
-        parent: Option<JobId>,
-        requested: Option<u64>,
-    ) -> Result<Option<u64>, JobError> {
-        Ok(match (requested, parent) {
-            (Some(scope), _) => Some(scope),
-            (None, Some(parent)) => self.shared.jobs.authorization_scope(parent).await?,
-            (None, None) => None,
+    async fn authorization_scope(&self, parent: Option<JobId>) -> Result<Option<u64>, JobError> {
+        Ok(match parent {
+            Some(parent) => self.shared.jobs.authorization_scope(parent).await?,
+            None => None,
         })
     }
 }
@@ -248,82 +250,6 @@ impl ToolExecutor {
 struct SelectedLocation {
     location: ExecutionLocation,
     route: Option<PlannedRemote>,
-}
-
-async fn preflight_path_arguments(
-    tool: &crate::tool::RegisteredTool,
-    target: &str,
-    workspace: &std::path::Path,
-    authorization_root: &std::path::Path,
-    arguments: &mut Value,
-) -> Result<(Vec<PermissionUse>, Option<ToolOutput>), ToolError> {
-    if !arguments.is_object() {
-        return Err(ToolError::ArgumentsMustBeObject);
-    }
-    let mut permissions = Vec::new();
-    let mut read_error = None;
-    for spec in tool.path_arguments(arguments)? {
-        let Some(input) = spec.input(arguments)?.map(str::to_owned) else {
-            continue;
-        };
-        let resolved = match resolve_for_authorization(workspace, &input, spec.kind).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let Some(output) = tool.read_error_output(&input, &error) else {
-                    return Err(error);
-                };
-                // Canonicalization failed, so this path is not proven to be within
-                // the authorization root. Require exact path authorization even for
-                // apparently local paths, then return the captured failure without
-                // retrying the handler (which could now access a changed target).
-                let path = lexical_path(workspace, &input)?;
-                let capability = spec.access.capability();
-                path_text(&path)?;
-                let resource = ResourceId::path(target, &path);
-                permissions.push(
-                    PermissionUse::new(capability, resource.clone())
-                        .with_grant(ApprovalGrant::exact(capability, resource)),
-                );
-                read_error = Some(output);
-                continue;
-            }
-        };
-        // Both the existing handler JSON and permission resource are Unicode
-        // boundaries. Never authorize a replacement-character alias.
-        let value = Value::String(path_text(&resolved.path)?.to_owned());
-        spec.rewrite(arguments, value)?;
-        if matches!(spec.binding, crate::tool::registry::PathBinding::Pointer(_))
-            || !resolved.path.starts_with(authorization_root)
-        {
-            permissions.push(resolved.permission(spec.access.capability(), target));
-        }
-    }
-    Ok((permissions, read_error))
-}
-
-/// Validate the existing string-only permission/wire boundary without changing
-/// native path identity. Lossless byte-path protocols are a separate migration.
-fn path_text(path: &std::path::Path) -> Result<&str, ToolError> {
-    path.to_str().ok_or_else(|| {
-        ToolError::InvalidArguments(
-            "native path cannot be represented losslessly by the permission or wire format"
-                .to_owned(),
-        )
-    })
-}
-
-fn scope_capabilities(
-    capabilities: Vec<Capability>,
-    location: &ExecutionLocation,
-    override_resource: Option<&ResourceId>,
-) -> Vec<PermissionUse> {
-    let resource = override_resource
-        .cloned()
-        .unwrap_or_else(|| ResourceId::workspace(&location.target, &location.workspace));
-    capabilities
-        .into_iter()
-        .map(|capability| PermissionUse::new(capability, resource.clone()))
-        .collect()
 }
 
 fn validate_invocation(
@@ -414,7 +340,9 @@ pub(super) mod tests {
                     .named()
                     .argument_validator(|arguments| {
                         if arguments["url"] != "https://initial.test" {
-                            return Err(ToolError::InvalidArguments("invalid test URL".to_owned()));
+                            return Err(crate::tool::AdmissionError::InvalidArguments(
+                                "invalid test URL".to_owned(),
+                            ));
                         }
                         Ok(())
                     })
@@ -460,14 +388,7 @@ pub(super) mod tests {
         arguments: Value,
     ) -> InvocationPlan {
         executor
-            .plan_registered(
-                InvocationKind::Host,
-                agent.clone(),
-                name,
-                arguments,
-                None,
-                None,
-            )
+            .plan_registered(InvocationKind::Host, agent.clone(), name, arguments, None)
             .await
             .unwrap()
     }
@@ -690,7 +611,9 @@ pub(super) mod tests {
         }
         let runtime = crate::tests::TestRuntime::new().await;
         let mut builder = ToolRegistryBuilder::default();
-        crate::tool::builtins::register_worker_tools(&mut builder, runtime.store.clone()).unwrap();
+        builder
+            .register_local(crate::tool::builtins::register_local_tools)
+            .unwrap();
         let executor = runtime.executor_with_policy(builder, Arc::new(DenyReads));
         for path in ["missing/nested/file", "../outside/missing"] {
             let arguments = serde_json::json!({"path":path});

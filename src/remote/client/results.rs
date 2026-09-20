@@ -1,504 +1,649 @@
-//! Capture streamed result artifacts and assemble chunked tool results.
+//! Persist accepted payloads independently of frame routing.
 use super::*;
-use crate::job::output::{AsyncCapture, CaptureKind, CompletedCapture};
+use crate::{
+    job::output::CaptureCollector,
+    media::{Image, ImageRef, MAX_IMAGE_BYTES},
+    remote::{
+        flow::{CHUNK_BYTES, Credits, WINDOW},
+        protocol::{ImageId, PayloadEvent, PayloadId, PayloadOpen, RemoteToolOutput},
+    },
+    tool::output::{CaptureEvent, OutputEvent, OutputSink},
+};
+use tokio::{
+    io::{AsyncSeekExt as _, AsyncWriteExt as _},
+    sync::mpsc,
+    task::JoinSet,
+};
 
-/// Local evidence travels alongside the unchanged wire result, never inside it.
 #[derive(Debug)]
-pub(super) struct ReceivedResult {
-    result: RemoteToolResult,
-    captures: Vec<CompletedCapture>,
+pub(super) struct ReceivedResult(pub(super) Result<ToolOutput, RemoteError>);
+
+enum Message {
+    Payload(PayloadEvent, tokio::sync::OwnedSemaphorePermit),
+    Terminal,
 }
 
-impl ReceivedResult {
-    pub(super) async fn into_output(
-        self,
-        store: &crate::session::SessionStore,
-    ) -> Result<ToolOutput, RemoteError> {
-        // A bad attached image must not cost either outcome its value, captures
-        // or stream-end marker; only that image is dropped.
-        match self.result {
-            Ok(output) => Ok(output.store(store).await.with_captures(self.captures)),
-            Err(error) if error.denial.is_some() => {
-                Err(RemoteError::OperationDenied(error.message))
-            }
-            Err(error) => {
-                let output = match error.output {
-                    Some(output) => Some(Box::new(
-                        output.store(store).await.with_captures(self.captures),
-                    )),
-                    None => None,
-                };
-                Err(RemoteError::Remote {
-                    message: error.message,
-                    output,
-                })
-            }
-        }
-    }
-}
-
-// The terminal frame consumes the only writer.
-struct Artifact {
-    kind: CaptureKind,
-    offset: u64,
-    state: ArtifactState,
-}
-
-enum ArtifactState {
-    Receiving(AsyncCapture),
-    Finished(CompletedCapture),
-}
-
-impl Artifact {
-    async fn receive(
-        mut self,
-        kind: CaptureKind,
-        offset: u64,
-        data: &[u8],
-        finished: bool,
-    ) -> std::io::Result<Self> {
-        // Capture kind is bound by registration, not mutable frame metadata.
-        let ArtifactState::Receiving(mut writer) = self.state else {
-            return Err(std::io::Error::other("artifact already finished"));
-        };
-        if offset != self.offset || kind != self.kind {
-            return Err(std::io::Error::other("invalid artifact offset or kind"));
-        }
-        self.offset = self
-            .offset
-            .checked_add(data.len() as u64)
-            .ok_or_else(|| std::io::Error::other("artifact offset overflow"))?;
-        writer.write_all(data).await?;
-        self.state = if finished {
-            ArtifactState::Finished(writer.finish().await?)
-        } else {
-            ArtifactState::Receiving(writer)
-        };
-        Ok(self)
-    }
+enum Transfer {
+    Receiving(mpsc::Sender<Message>),
+    Finishing,
 }
 
 #[derive(Default)]
 pub(super) struct Results {
-    artifacts: HashMap<(RequestId, String), Artifact>,
-    transfers: HashMap<RequestId, (std::fs::File, u64)>,
+    transfers: HashMap<RequestId, Transfer>,
+    admission: Credits,
+    stopped: tokio_util::sync::CancellationToken,
+    pub(super) tasks: JoinSet<(RequestId, Result<ReceivedResult, RemoteError>)>,
 }
+
 impl Results {
-    /// Receives one `Response::ToolArtifact` frame.
-    pub(super) async fn artifact(
+    pub(super) async fn payload(
         &mut self,
         state: &Mutex<ConnectionState>,
-        frame: Response,
-    ) -> Result<(), RemoteError> {
-        let Response::ToolArtifact {
-            request_id,
-            field,
-            kind,
-            offset,
-            data,
-            finished,
-        } = frame
-        else {
-            unreachable!("only artifact frames are routed here");
-        };
-        let context = state
-            .lock()
-            .await
-            .pending
-            .get(&request_id)
-            .map(|pending| pending.context.clone())
-            .ok_or_else(|| RemoteError::Protocol("artifact for unknown request".into()))?;
-        if !(field == "/error" || field == "/result" || field.starts_with("/result/"))
-            || data.len() > 64 * 1024
-            || (finished && !data.is_empty())
-        {
-            return Err(RemoteError::Protocol("invalid artifact frame".into()));
-        }
-        let key = (request_id, field.clone());
-        // Any error below fails the connection, so a removed artifact is never revisited.
-        let received = async {
-            let artifact = match self.artifacts.remove(&key) {
-                Some(artifact) => artifact,
-                None if offset != 0 => {
-                    return Err(std::io::Error::other("invalid initial artifact offset"));
-                }
-                None => Artifact {
-                    kind,
-                    offset: 0,
-                    state: ArtifactState::Receiving(
-                        context
-                            .pending_stream_capture(&field, kind)
-                            .await
-                            .map_err(|e| std::io::Error::other(e.to_string()))?
-                            .open_async(),
-                    ),
-                },
-            };
-            let artifact = artifact.receive(kind, offset, &data, finished).await?;
-            self.artifacts.insert(key, artifact);
-            Ok(())
-        }
-        .await;
-        received.map_err(RemoteError::io)
-    }
-    pub(super) fn chunk(
-        &mut self,
+        writer: &Arc<Mutex<RequestWriter>>,
         request_id: RequestId,
-        offset: u64,
-        data: Vec<u8>,
-        finished: bool,
-    ) -> std::io::Result<Option<RemoteToolResult>> {
-        use std::io::{Seek as _, Write as _};
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.transfers.entry(request_id) {
-            if offset != 0 {
-                return Err(std::io::Error::other("invalid initial result offset"));
+        event: PayloadEvent,
+    ) -> Result<(), RemoteError> {
+        let bytes = match &event {
+            PayloadEvent::Data { data, .. }
+            | PayloadEvent::Capture(CaptureEvent::Write { data, .. }) => data.len(),
+            PayloadEvent::Capture(CaptureEvent::Open { field, .. }) => field.len(),
+            PayloadEvent::Open(PayloadOpen::Image { file, .. }) => {
+                file.as_ref().map_or(0, String::len)
             }
-            entry.insert((tempfile::tempfile()?, 0));
+            _ => 0,
+        };
+        if bytes > CHUNK_BYTES {
+            return Err(protocol("oversized payload chunk or metadata"));
         }
-        let (file, expected) = self
-            .transfers
-            .get_mut(&request_id)
-            .expect("inserted transfer");
-        if offset != *expected || data.len() > 64 * 1024 || (finished && !data.is_empty()) {
-            return Err(std::io::Error::other("invalid result chunk"));
+        let permit = self
+            .admission
+            .reserve()
+            .map_err(|_| protocol("payload flow-control overflow"))?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.transfers.entry(request_id) {
+            let context = state
+                .lock()
+                .await
+                .pending
+                .get(&request_id)
+                .map(|pending| pending.context.clone())
+                .ok_or_else(|| protocol("payload for unknown request"))?;
+            let (sender, receiver) = mpsc::channel(WINDOW + 1);
+            let writer = writer.clone();
+            let stopped = self.stopped.clone();
+            self.tasks.spawn(async move {
+                let result = Ingestion::new(&context)
+                    .run(context, writer, receiver, stopped)
+                    .await;
+                (request_id, result)
+            });
+            entry.insert(Transfer::Receiving(sender));
         }
-        file.write_all(&data)?;
-        *expected = expected
-            .checked_add(data.len() as u64)
-            .ok_or_else(|| std::io::Error::other("result offset overflow"))?;
-        if !finished {
-            return Ok(None);
-        }
-        let (mut file, _) = self
-            .transfers
-            .remove(&request_id)
-            .expect("completed transfer");
-        file.rewind()?;
-        Ok(Some(serde_json::from_reader(std::io::BufReader::new(
-            file,
-        ))?))
+        let Some(Transfer::Receiving(sender)) = self.transfers.get(&request_id) else {
+            return Err(protocol("payload after terminal response"));
+        };
+        sender
+            .try_send(Message::Payload(event, permit))
+            .map_err(|_| protocol("payload flow-control overflow"))
     }
-    pub(super) async fn finish(
+
+    pub(super) fn terminal(&mut self, request_id: RequestId) -> Result<(), RemoteError> {
+        let Some(transfer) = self.transfers.get_mut(&request_id) else {
+            return Err(protocol("terminal response for unknown request"));
+        };
+        let Transfer::Receiving(sender) = std::mem::replace(transfer, Transfer::Finishing) else {
+            return Err(protocol("duplicate terminal response"));
+        };
+        sender
+            .try_send(Message::Terminal)
+            .map_err(|_| protocol("payload flow-control overflow"))
+    }
+
+    pub(super) async fn shutdown(&mut self, state: &Mutex<ConnectionState>) {
+        self.stopped.cancel();
+        self.transfers.clear();
+        while let Some(completed) = self.tasks.join_next().await {
+            let _ = self.complete(state, completed).await;
+        }
+    }
+
+    pub(super) async fn complete(
         &mut self,
         state: &Mutex<ConnectionState>,
-        request_id: RequestId,
-        result: RemoteToolResult,
+        completed: Result<(RequestId, Result<ReceivedResult, RemoteError>), tokio::task::JoinError>,
     ) -> Result<(), RemoteError> {
-        if self.artifacts.iter().any(|((id, _), artifact)| {
-            *id == request_id && matches!(artifact.state, ArtifactState::Receiving(_))
-        }) {
-            return Err(RemoteError::Protocol(
-                "result before artifact completion".into(),
-            ));
-        }
-        if self.transfers.contains_key(&request_id) {
-            return Err(RemoteError::Protocol(
-                "result before chunk completion".into(),
-            ));
-        }
+        let (request_id, result) =
+            completed.map_err(|error| RemoteError::ConnectionTask(error.to_string()))?;
+        self.transfers.remove(&request_id);
+        let result = result?;
         let pending = state
             .lock()
             .await
             .pending
             .remove(&request_id)
-            .ok_or_else(|| {
-                RemoteError::Protocol(format!(
-                    "response used unknown request ID {}",
-                    request_id.get()
-                ))
-            })?;
-        let mut captures: Vec<_> = self
-            .artifacts
-            .extract_if(|(id, _), _| *id == request_id)
-            .filter_map(|(_, artifact)| match artifact.state {
-                ArtifactState::Finished(capture) => Some(capture),
-                ArtifactState::Receiving(_) => None,
+            .ok_or_else(|| protocol("response for unknown request"))?;
+        let _ = pending.sender.send(Ok(result));
+        Ok(())
+    }
+}
+
+fn protocol(message: &str) -> RemoteError {
+    RemoteError::Protocol(message.into())
+}
+
+async fn temporary_file() -> Result<tokio::fs::File, RemoteError> {
+    let file = tokio::task::spawn_blocking(tempfile::tempfile)
+        .await
+        .map_err(|error| RemoteError::ConnectionTask(error.to_string()))??;
+    Ok(tokio::fs::File::from_std(file))
+}
+
+enum ImagePayload {
+    Receiving {
+        file: Option<String>,
+        bytes: Vec<u8>,
+    },
+    Invalid,
+    Finished(Option<ImageRef>),
+}
+
+#[derive(Default)]
+enum ResultPayload {
+    #[default]
+    Absent,
+    Receiving(tokio::fs::File),
+    Finished(RemoteToolResult),
+}
+
+struct Ingestion {
+    captures: Arc<CaptureCollector>,
+    images: HashMap<ImageId, ImagePayload>,
+    result: ResultPayload,
+}
+
+impl Ingestion {
+    fn new(context: &ToolContext) -> Self {
+        Self {
+            captures: Arc::new(CaptureCollector::new(
+                context.store().clone(),
+                context.job(),
+            )),
+            images: HashMap::new(),
+            result: ResultPayload::Absent,
+        }
+    }
+
+    async fn run(
+        mut self,
+        context: ToolContext,
+        writer: Arc<Mutex<RequestWriter>>,
+        mut receiver: mpsc::Receiver<Message>,
+        stopped: tokio_util::sync::CancellationToken,
+    ) -> Result<ReceivedResult, RemoteError> {
+        while let Some(message) = receiver.recv().await {
+            match message {
+                Message::Payload(event, permit) => {
+                    self.receive(&context, event).await?;
+                    let acknowledging = async {
+                        let mut writer = writer.lock().await;
+                        drop(permit);
+                        write_frame(&mut writer.input, &Request::PayloadAck).await
+                    };
+                    let acknowledgement = tokio::select! {
+                        biased;
+                        () = stopped.cancelled() => Ok(()),
+                        result = acknowledging => result,
+                    };
+                    if let Err(error) = acknowledgement {
+                        receiver.close();
+                        while let Some(message) = receiver.recv().await {
+                            if let Message::Payload(event, _) = message {
+                                self.receive(&context, event).await?;
+                            }
+                        }
+                        return Err(error.into());
+                    }
+                }
+                Message::Terminal => return self.finish(),
+            }
+        }
+        Err(protocol("payload stream closed before terminal response"))
+    }
+
+    async fn receive(
+        &mut self,
+        context: &ToolContext,
+        event: PayloadEvent,
+    ) -> Result<(), RemoteError> {
+        match event {
+            PayloadEvent::Capture(event) => {
+                if let CaptureEvent::Open { field, .. } = &event
+                    && !(field == "/error" || field == "/result" || field.starts_with("/result/"))
+                {
+                    return Err(protocol("invalid capture field"));
+                }
+                let captures = self.captures.clone();
+                tokio::task::spawn_blocking(move || captures.send(OutputEvent::Capture(event)))
+                    .await
+                    .map_err(|error| RemoteError::ConnectionTask(error.to_string()))??;
+            }
+            PayloadEvent::Open(PayloadOpen::Image { id, file }) => {
+                let std::collections::hash_map::Entry::Vacant(entry) = self.images.entry(id) else {
+                    return Err(protocol("duplicate image payload"));
+                };
+                entry.insert(ImagePayload::Receiving {
+                    file,
+                    bytes: Vec::new(),
+                });
+            }
+            PayloadEvent::Data {
+                id: PayloadId::Image(id),
+                data,
+            } => match self.images.get_mut(&id) {
+                Some(ImagePayload::Receiving { bytes, .. })
+                    if bytes.len() + data.len() <= MAX_IMAGE_BYTES as usize =>
+                {
+                    bytes.extend_from_slice(&data);
+                }
+                Some(image @ ImagePayload::Receiving { .. }) => *image = ImagePayload::Invalid,
+                Some(ImagePayload::Invalid) => {}
+                _ => return Err(protocol("data for inactive image")),
+            },
+            PayloadEvent::Finish {
+                id: PayloadId::Image(id),
+            } => {
+                let image = match self.images.remove(&id) {
+                    Some(ImagePayload::Receiving { file, bytes }) => match Image::new(bytes) {
+                        Ok(image) => context.store().store_image(file, &image).await.ok(),
+                        Err(_) => None,
+                    },
+                    Some(ImagePayload::Invalid) => None,
+                    _ => return Err(protocol("finish for inactive image")),
+                };
+                self.images.insert(id, ImagePayload::Finished(image));
+            }
+            PayloadEvent::Open(PayloadOpen::Result) => {
+                if !matches!(self.result, ResultPayload::Absent) {
+                    return Err(protocol("duplicate result payload"));
+                }
+                self.result = ResultPayload::Receiving(temporary_file().await?);
+            }
+            PayloadEvent::Data {
+                id: PayloadId::Result,
+                data,
+            } => {
+                let ResultPayload::Receiving(file) = &mut self.result else {
+                    return Err(protocol("data for inactive result"));
+                };
+                file.write_all(&data).await?;
+            }
+            PayloadEvent::Finish {
+                id: PayloadId::Result,
+            } => {
+                let ResultPayload::Receiving(mut file) = std::mem::take(&mut self.result) else {
+                    return Err(protocol("finish for inactive result"));
+                };
+                file.flush().await?;
+                file.rewind().await?;
+                let file = file.into_std().await;
+                let result = tokio::task::spawn_blocking(move || {
+                    serde_json::from_reader(std::io::BufReader::new(file))
+                })
+                .await
+                .map_err(|error| RemoteError::ConnectionTask(error.to_string()))?
+                .map_err(|error| RemoteError::Protocol(error.to_string()))?;
+                self.result = ResultPayload::Finished(result);
+            }
+        }
+        Ok(())
+    }
+
+    fn output(&mut self, output: RemoteToolOutput) -> Result<ToolOutput, RemoteError> {
+        let captures = self.captures.select(output.captures)?;
+        let images = output
+            .images
+            .into_iter()
+            .filter(|image| {
+                self.images.values().any(|payload| {
+            matches!(payload, ImagePayload::Finished(Some(stored)) if stored == image)
+        })
             })
             .collect();
-        // A terminal stream frame also transfers incomplete, unreferenced
-        // captures. Keep their bytes available for explicit paging, but
-        // only carry result-referenced evidence to output projection.
-        let value = match &result {
-            Ok(output) => Some(&output.value),
-            Err(error) => error.output.as_ref().map(|output| &output.value),
+        let mut local = ToolOutput::new(output.value)
+            .with_images(images)
+            .with_captures(captures);
+        local.streams = output.streams;
+        Ok(local)
+    }
+
+    fn finish(mut self) -> Result<ReceivedResult, RemoteError> {
+        if self
+            .images
+            .values()
+            .any(|image| !matches!(image, ImagePayload::Finished(_)))
+        {
+            return Err(protocol("terminal response before image completion"));
+        }
+        let ResultPayload::Finished(result) = std::mem::take(&mut self.result) else {
+            return Err(protocol(
+                "terminal response without completed result payload",
+            ));
         };
-        captures.retain(|capture| {
-            capture
-                .field()
-                .strip_prefix("/result")
-                .filter(|pointer| pointer.is_empty() || pointer.starts_with('/'))
-                .is_some_and(|pointer| value.is_some_and(|value| value.pointer(pointer).is_some()))
-        });
-        let _ = pending.sender.send(Ok(ReceivedResult { result, captures }));
-        Ok(())
+        Ok(match result {
+            Ok(output) => ReceivedResult(Ok(self.output(output)?)),
+            Err(mut error) => {
+                let error_output = error
+                    .output
+                    .take()
+                    .map(|output| self.output(*output))
+                    .transpose()?;
+                ReceivedResult(Err(if error.denial.is_some() {
+                    RemoteError::OperationDenied(error.message)
+                } else {
+                    RemoteError::Remote {
+                        message: error.message,
+                        output: error_output.map(Box::new),
+                    }
+                }))
+            }
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::route_fixture;
+    use super::super::tests::{fixture_context, route_fixture, test_connection, write_result};
     use super::*;
-    use crate::job::output::transfer_fields;
-    use base64::Engine as _;
+    use crate::{
+        job::output::CaptureKind,
+        media::BlobRef,
+        tool::{StreamEnd, output::CaptureId},
+    };
+    use serde_json::json;
 
-    fn read(source: &mut crate::job::output::Source) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(source, &mut bytes).unwrap();
-        bytes
+    async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(5), future)
+            .await
+            .unwrap()
     }
 
-    fn artifact(
-        field: &str,
-        kind: CaptureKind,
-        offset: u64,
-        data: &[u8],
-        finished: bool,
-    ) -> Response {
-        let (request_id, field, data) = (RequestId::FIRST, field.into(), data.into());
-        Response::ToolArtifact {
-            request_id,
-            field,
-            kind,
-            offset,
-            data,
-            finished,
-        }
+    fn open(id: u64, field: &str) -> PayloadEvent {
+        PayloadEvent::Capture(CaptureEvent::Open {
+            id: CaptureId::new(id).unwrap(),
+            field: field.into(),
+            kind: CaptureKind::Text,
+        })
+    }
+
+    fn data(id: u64, bytes: &[u8]) -> PayloadEvent {
+        PayloadEvent::Capture(CaptureEvent::Write {
+            id: CaptureId::new(id).unwrap(),
+            data: bytes.to_vec(),
+        })
+    }
+
+    fn finish(id: u64) -> PayloadEvent {
+        PayloadEvent::Capture(CaptureEvent::Finish {
+            id: CaptureId::new(id).unwrap(),
+        })
     }
 
     #[tokio::test]
-    async fn owned_artifact_finalizes_exact_bytes_and_materializes_explicit_empty_content() {
-        for (field, bytes, kind) in [
-            ("/result/content", &b""[..], CaptureKind::Text),
-            (
-                "/result/stdout",
-                &b"a\xf0\x9f\x8c\x8d\n"[..],
-                CaptureKind::Unknown,
-            ),
-            (
-                "/result/custom~1partial",
-                &b"{\"key\":"[..],
-                CaptureKind::Json,
-            ),
+    async fn streamed_payloads_preserve_cut_errors_and_only_host_finished_receipts() {
+        for (failed, selected) in [
+            (false, &[1, 2, 4][..]),
+            (true, &[1, 2, 4][..]),
+            (false, &[5][..]),
+            (false, &[3][..]),
+            (false, &[99][..]),
+            (false, &[1, 1][..]),
         ] {
+            let valid_selection = selected == [1, 2, 4];
             let runtime = crate::tests::TestRuntime::new().await;
-            let spec = crate::job::JobSpec::test(runtime.agent.clone(), "artifact");
-            let job = runtime.jobs.test_create(spec).await;
-            let output = runtime.jobs.output(job);
-            let pending = crate::job::output::PendingCapture::create(&output, field, kind).unwrap();
-            let state = ArtifactState::Receiving(pending.open_async());
-            let mut artifact = Artifact {
-                kind,
-                offset: 0,
-                state,
-            };
-            // Transport chunks need not align with UTF-8 boundaries and JSON
-            // streams may be prefixes only. Neither is a text decoder input.
-            for (offset, byte) in bytes.iter().enumerate() {
-                artifact = artifact
-                    .receive(kind, offset as u64, &[*byte], false)
-                    .await
-                    .unwrap();
-            }
-            let end = bytes.len() as u64;
-            let artifact = artifact.receive(kind, end, b"", true).await.unwrap();
-            let ArtifactState::Finished(capture) = &artifact.state else {
-                panic!("missing completion evidence")
-            };
-            assert!(capture.matches(job, field));
-            assert_eq!(capture.kind(), kind);
-            // Exactly one field: no absent sibling streams are manufactured.
-            let mut fields = transfer_fields(&output).unwrap();
-            assert_eq!(fields.len(), 1);
-            assert_eq!(fields[0].0, field);
-            assert_eq!(read(&mut fields[0].2), bytes);
-            assert!(artifact.receive(kind, end, b"", true).await.is_err());
-        }
-    }
-
-    #[tokio::test]
-    async fn terminal_result_carries_only_referenced_proofs_on_success_and_failure() {
-        for failed in [false, true] {
-            let runtime = crate::tests::TestRuntime::new().await;
-            // The fixture context runs as job 1.
-            let spec = crate::job::JobSpec::test(runtime.agent.clone(), "remote");
-            runtime.jobs.test_create(spec).await;
-            let context = super::super::tests::fixture_context(&runtime);
-            let job = context.job();
-            let (sender, receiver) = oneshot::channel();
-            let pending = HashMap::from([(RequestId::FIRST, PendingCall { sender, context })]);
-            let state = Mutex::new(ConnectionState {
-                pending,
-                ..Default::default()
-            });
-            let mut results = Results::default();
-            for (field, bytes, kind) in [
-                ("/result/content", &b""[..], CaptureKind::Unknown),
-                (
-                    "/result/custom~1partial",
-                    &b"{\"key\":"[..],
-                    CaptureKind::Json,
-                ),
-                ("/error", &b"error prefix"[..], CaptureKind::Text),
+            runtime
+                .jobs
+                .test_create(crate::job::JobSpec::test(runtime.agent.clone(), "payload"))
+                .await;
+            let context = fixture_context(&runtime);
+            let saved = runtime.jobs.output(context.job());
+            let mut ingest = Ingestion::new(&context);
+            for event in [
+                open(1, "/result/content"),
+                data(1, b"a unwanted"),
+                PayloadEvent::Capture(CaptureEvent::Truncate {
+                    id: CaptureId::FIRST,
+                    length: 1,
+                }),
+                data(1, b"\xf0\x9f"),
+                data(1, b"\x8c\x8d\n"),
+                finish(1),
+                open(2, "/result/empty"),
+                finish(2),
+                open(3, "/result/replaced"),
+                data(3, b"discard"),
+                PayloadEvent::Capture(CaptureEvent::Discard {
+                    id: CaptureId::new(3).unwrap(),
+                }),
+                open(4, "/result/replaced"),
+                data(4, b"new"),
+                finish(4),
+                open(5, "/result/partial"),
+                data(5, b"retained prefix"),
             ] {
-                results
-                    .artifact(&state, artifact(field, kind, 0, bytes, false))
+                ingest.receive(&context, event).await.unwrap();
+            }
+            let png = crate::tests::png(b"remote source bytes");
+            let valid = ImageRef {
+                file: Some("source.png".into()),
+                format: png.format(),
+                blob: BlobRef::of(png.bytes()),
+            };
+            let invalid = ImageRef {
+                file: None,
+                format: png.format(),
+                blob: BlobRef::of(b"not an image"),
+            };
+            let id = |id| ImageId(std::num::NonZeroU64::new(id).unwrap());
+            let mut payloads = vec![
+                (valid.file.clone(), png.bytes().to_vec()),
+                (None, b"not an image".to_vec()),
+            ];
+            if !failed && valid_selection {
+                payloads.push((None, vec![0; MAX_IMAGE_BYTES as usize + 1]));
+            }
+            for (index, (file, bytes)) in payloads.iter().enumerate() {
+                let id = id(index as u64 + 1);
+                let events = std::iter::once(PayloadEvent::Open(PayloadOpen::Image {
+                    id,
+                    file: file.clone(),
+                }))
+                .chain(bytes.chunks(CHUNK_BYTES).map(|data| {
+                    PayloadEvent::Data {
+                        id: PayloadId::Image(id),
+                        data: data.to_vec(),
+                    }
+                }));
+                for event in events {
+                    ingest.receive(&context, event).await.unwrap();
+                }
+            }
+            if !failed && valid_selection {
+                assert!(matches!(ingest.images[&id(3)], ImagePayload::Invalid));
+            }
+            for index in 1..=payloads.len() {
+                ingest
+                    .receive(
+                        &context,
+                        PayloadEvent::Finish {
+                            id: PayloadId::Image(id(index as u64)),
+                        },
+                    )
                     .await
                     .unwrap();
-                let end = artifact(field, kind, bytes.len() as u64, b"", true);
-                results.artifact(&state, end).await.unwrap();
             }
-            let value = serde_json::json!({"content": ""});
-            // One valid and one undecodable image on a cut-short result: the
-            // bad image alone is dropped, never the value, captures or marker.
-            let png = crate::tests::png(b"remote result image");
-            let image = |data_base64| crate::remote::protocol::RemoteImage {
-                file: None,
-                data_base64,
+            let large = if failed {
+                "x".repeat(17 * 1024 * 1024)
+            } else {
+                String::new()
             };
             let output = RemoteToolOutput {
-                streams: crate::tool::StreamEnd::Cut,
-                value: value.clone(),
-                images: vec![
-                    image(base64::engine::general_purpose::STANDARD.encode(png.bytes())),
-                    image(base64::engine::general_purpose::STANDARD.encode(b"not an image")),
-                ],
+                value: json!({"content":"", "empty":"", "replaced":"", "partial":"", "large": large}),
+                images: vec![valid.clone(), invalid],
+                captures: selected
+                    .iter()
+                    .map(|&id| CaptureId::new(id).unwrap())
+                    .collect(),
+                streams: StreamEnd::Cut,
             };
-            let completion = if failed {
-                let output = Some(Box::new(output));
+            let result = if failed {
                 Err(RemoteToolError {
-                    message: "failed".into(),
+                    message: "failure with output".into(),
                     denial: None,
-                    output,
+                    output: Some(Box::new(output)),
                 })
             } else {
                 Ok(output)
             };
-            results
-                .finish(&state, RequestId::FIRST, completion)
+            ingest
+                .receive(&context, PayloadEvent::Open(PayloadOpen::Result))
                 .await
                 .unwrap();
-            assert!(results.artifacts.is_empty());
-            let received = receiver.await.unwrap().unwrap();
-            assert_eq!(received.captures.len(), 1);
-            assert!(received.captures[0].matches(job, "/result/content"));
-            let output = match received.into_output(&runtime.store).await {
+            for data in serde_json::to_vec(&result).unwrap().chunks(CHUNK_BYTES) {
+                ingest
+                    .receive(
+                        &context,
+                        PayloadEvent::Data {
+                            id: PayloadId::Result,
+                            data: data.to_vec(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            ingest
+                .receive(
+                    &context,
+                    PayloadEvent::Finish {
+                        id: PayloadId::Result,
+                    },
+                )
+                .await
+                .unwrap();
+            let received = ingest.finish();
+            if !valid_selection {
+                assert!(received.is_err());
+                continue;
+            }
+            let output = match received.unwrap().0 {
                 Ok(output) if !failed => output,
                 Err(RemoteError::Remote {
-                    message,
                     output: Some(output),
-                }) if failed => {
-                    assert_eq!(message, "failed");
-                    *output
-                }
-                other => panic!("unexpected output: {other:?}"),
+                    ..
+                }) if failed => *output,
+                other => panic!("unexpected result: {other:?}"),
             };
-            assert_eq!(output.value, value);
-            assert_eq!(output.streams, crate::tool::StreamEnd::Cut);
-            let [stored] = output.images.as_slice() else {
-                panic!("expected only the valid image")
-            };
-            assert_eq!(stored.blob, crate::media::BlobRef::of(png.bytes()));
-            assert_eq!(output.captures.len(), 1);
-            assert_eq!(output.captures[0].kind(), CaptureKind::Unknown);
-            let mut fields = transfer_fields(&runtime.jobs.output(job)).unwrap();
-            assert_eq!(fields.len(), 3);
-            let partial = fields
-                .iter_mut()
-                .find(|(field, _, _)| field == "/result/custom~1partial");
-            assert_eq!(read(&mut partial.unwrap().2), b"{\"key\":");
+            assert_eq!(output.value["large"].as_str().unwrap(), large);
+            assert_eq!(output.streams, StreamEnd::Cut);
+            assert_eq!(output.images, vec![valid]);
+            assert_eq!(output.captures.len(), 3);
+            for field in ["/result/content", "/result/empty", "/result/replaced"] {
+                assert!(
+                    output
+                        .captures
+                        .iter()
+                        .any(|capture| capture.matches(context.job(), field))
+                );
+            }
+            assert_eq!(
+                saved.test_bytes("/result/content").unwrap(),
+                "a🌍\n".as_bytes()
+            );
+            assert_eq!(saved.test_bytes("/result/empty").unwrap(), b"");
+            assert_eq!(saved.test_bytes("/result/replaced").unwrap(), b"new");
+            assert_eq!(
+                saved.test_bytes("/result/partial").unwrap(),
+                b"retained prefix"
+            );
         }
     }
 
     #[tokio::test]
-    async fn artifact_transfer_hydrates_native_results_and_preserves_interrupted_prefixes() {
-        // Just over two 64 KiB transfer frames.
-        const LINES: usize = 2 * 64 * 1024 / 5 + 1;
-        for complete in [true, false] {
+    async fn cancelled_call_keeps_late_payloads_until_terminal_and_disconnect_keeps_prefixes() {
+        for terminal in [false, true] {
             let runtime = crate::tests::TestRuntime::new().await;
-            let schema = schemars::schema_for!(crate::tool::builtins::ProcessOutput);
-            let options = crate::tool::ToolOptions::default()
-                .output_schema(serde_json::to_value(schema).unwrap());
-            let input =
-                serde_json::json!({"type":"object","properties":{},"additionalProperties":false});
-            let mut builder = crate::tool::ToolRegistryBuilder::default();
-            let tool = move |context: ToolContext, _| async move {
-                let store = context.store().clone();
-                let (peer, stream) = tokio::io::duplex(64 * 1024);
-                let (sender, receiver) = oneshot::channel();
-                let pending = HashMap::from([(RequestId::FIRST, PendingCall { sender, context })]);
-                let state = Mutex::new(ConnectionState {
-                    pending,
-                    ..Default::default()
-                });
-                let peer = Mutex::new(peer);
-                let write = async {
-                    let (field, kind) = ("/result/stdout".to_owned(), CaptureKind::Text);
-                    if complete {
-                        let source = std::io::Cursor::new(b"line\n".repeat(LINES));
-                        let source = crate::job::output::Source::Memory(source);
-                        crate::remote::protocol::write_artifact(
-                            &peer,
-                            RequestId::FIRST,
-                            field,
-                            kind,
-                            source,
-                        )
-                        .await
-                        .unwrap();
-                        let result = Ok(RemoteToolOutput {
-                            streams: Default::default(),
-                            value: serde_json::json!({"stdout":"","exit_code":0}),
-                            images: Vec::new(),
-                        });
-                        let request_id = RequestId::FIRST;
-                        let frame = Response::Tool { request_id, result };
-                        write_frame(&mut *peer.lock().await, &frame).await.unwrap();
-                    } else {
-                        let frame = artifact(&field, kind, 0, b"retained prefix\n", false);
-                        write_frame(&mut *peer.lock().await, &frame).await.unwrap();
-                    }
-                    drop(peer);
-                };
-                let ((), ()) = tokio::join!(write, route_fixture(stream, &state, "fixture"));
-                let result = receiver.await.unwrap();
-                let result = result.map_err(RemoteError::into_tool_error)?;
-                let output = result.into_output(&store).await;
-                output.map_err(RemoteError::into_tool_error)
-            };
-            builder
-                .register_dynamic("remote_fixture", "remote fixture", input, options, tool)
-                .unwrap();
-            let executor = runtime.executor(builder);
-            let arguments = serde_json::json!({});
-            let result = executor
-                .execute(runtime.agent.clone(), "remote_fixture", arguments, None)
-                .await;
-            if complete {
-                assert_eq!(
-                    result.unwrap().output.value["stdout"],
-                    "line\n".repeat(LINES)
-                );
-                continue;
-            }
-            assert!(result.is_err());
-            let job = runtime.jobs.list(&runtime.agent).await[0].id;
-            let mut args = crate::job::output::OutputArgs::new(job);
-            args.field = Some("/result/stdout".into());
-            let view = runtime
+            runtime
                 .jobs
-                .present_output(args, &Default::default())
+                .test_create(crate::job::JobSpec::test(runtime.agent.clone(), "payload"))
+                .await;
+            let context = fixture_context(&runtime);
+            let saved = runtime.jobs.output(context.job());
+            let connection = Arc::new(test_connection().await);
+            let (input, mut requests) = tokio::io::duplex(4096);
+            connection.writer.lock().await.input = Box::new(input);
+            let call_connection = connection.clone();
+            let call_context = context.clone();
+            let call = tokio::spawn(async move {
+                call_tool(&call_connection, "read".into(), json!({}), &call_context).await
+            });
+            assert!(matches!(
+                bounded(read_frame::<_, Request>(&mut requests))
+                    .await
+                    .unwrap(),
+                Some(Request::Tool { .. })
+            ));
+            context.cancellation_token().cancel();
+            assert!(matches!(
+                bounded(read_frame::<_, Request>(&mut requests))
+                    .await
+                    .unwrap(),
+                Some(Request::Cancel { .. })
+            ));
+            assert!(matches!(
+                bounded(call).await.unwrap(),
+                Err(RemoteError::Cancelled)
+            ));
+            assert!(
+                connection
+                    .state
+                    .lock()
+                    .await
+                    .pending
+                    .contains_key(&RequestId::FIRST)
+            );
+            let (mut peer, responses) = tokio::io::duplex(4096);
+            let state = connection.state.clone();
+            let route =
+                tokio::spawn(async move { route_fixture(responses, &state, "fixture").await });
+            for event in [open(1, "/result/content"), data(1, b"late accepted prefix")] {
+                write_frame(
+                    &mut peer,
+                    &Response::Payload {
+                        request_id: RequestId::FIRST,
+                        event,
+                    },
+                )
                 .await
                 .unwrap();
-            assert_eq!(view["state"], "failed");
+            }
+            if terminal {
+                write_result(
+                    &mut peer,
+                    RequestId::FIRST,
+                    Ok(RemoteToolOutput {
+                        value: json!({}),
+                        images: Vec::new(),
+                        captures: Vec::new(),
+                        streams: StreamEnd::Cut,
+                    }),
+                )
+                .await;
+            }
+            drop(peer);
+            bounded(route).await.unwrap();
+            assert!(connection.state.lock().await.pending.is_empty());
             assert_eq!(
-                view["presentation"]["preview"]["lines"][0],
-                "retained prefix"
-            );
-            assert_eq!(view["presentation"]["notice"], "Output incomplete.");
-            assert!(
-                view["presentation"]["preview"]
-                    .get("capture_complete")
-                    .is_none()
+                saved.test_bytes("/result/content").unwrap(),
+                b"late accepted prefix"
             );
         }
     }

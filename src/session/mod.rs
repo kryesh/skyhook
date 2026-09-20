@@ -531,6 +531,7 @@ impl SessionStore {
         Self::create_with_durability(root, true).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn create_ephemeral(root: &Path) -> Result<Self, SessionError> {
         Self::create_with_durability(root, false).await
     }
@@ -793,14 +794,6 @@ impl SessionStore {
     /// The connection job output streams read and write through.
     pub(crate) fn outputs(&self) -> SharedDb {
         self.inner.db.clone()
-    }
-
-    pub(crate) async fn remove_job_artifacts(
-        &self,
-        job: crate::identity::JobId,
-    ) -> Result<(), SessionError> {
-        let db = self.outputs();
-        Ok(blocking(move || db.remove_job_output(job.get())).await??)
     }
 
     /// Store bytes in the content-addressed blob store.

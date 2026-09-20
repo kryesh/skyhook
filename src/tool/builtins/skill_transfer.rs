@@ -8,13 +8,13 @@ use crate::{
     target::TargetRouter,
     tool::{
         PathKind, RegistryError, ToolContext, ToolError, ToolOptions, ToolPlacement,
-        ToolRegistryBuilder,
+        invocation::{AdmissionError, LocalCatalogBuilder, LocalError},
         policy::{Capability, PathAccess, PermissionUse, ResourceId},
     },
 };
 
 const COPY_TOOL: &str = "__skill_copy";
-pub(super) const MAX_COPY_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_COPY_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -29,7 +29,7 @@ struct CopyOutput {
 }
 
 /// Only installed in remote workers, never in the host/model/script registry.
-pub(crate) fn register_worker(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
+pub(crate) fn register_worker(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
     builder.register::<CopyArgs, CopyOutput, _, _>(
         COPY_TOOL,
         "Receive a host-owned skill asset.",
@@ -41,7 +41,7 @@ pub(crate) fn register_worker(builder: &mut ToolRegistryBuilder) -> Result<(), R
         |_context, args| async move {
             let bytes = crate::media::decode_base64_bounded(&args.data_base64, MAX_COPY_BYTES)
                 .map_err(|error| {
-                    ToolError::invalid(match error {
+                    LocalError::invalid(match error {
                         crate::media::MediaError::TooLarge => "skill asset is too large",
                         _ => "skill asset has invalid base64",
                     })
@@ -53,12 +53,12 @@ pub(crate) fn register_worker(builder: &mut ToolRegistryBuilder) -> Result<(), R
     Ok(())
 }
 
-async fn write(path: &std::path::Path, bytes: &[u8]) -> Result<String, ToolError> {
+async fn write(path: &std::path::Path, bytes: &[u8]) -> Result<String, AdmissionError> {
     if tokio::fs::metadata(path)
         .await
         .is_ok_and(|metadata| metadata.is_dir())
     {
-        return Err(ToolError::InvalidArguments(
+        return Err(AdmissionError::InvalidArguments(
             "to must name a file, not a directory".into(),
         ));
     }
@@ -94,7 +94,7 @@ pub(super) async fn copy(
                 serde_json::json!({"to": resolved.path}),
             )
             .await?;
-        return write(&resolved.path, bytes).await;
+        return write(&resolved.path, bytes).await.map_err(Into::into);
     }
     router
         .authorize_transfer(
@@ -142,6 +142,7 @@ pub(super) async fn copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::ToolRegistryBuilder;
     use crate::{
         execution::ExecutionLocation,
         remote::{

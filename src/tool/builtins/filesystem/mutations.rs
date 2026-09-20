@@ -1,4 +1,6 @@
 //! Atomic writes, exact replacements, unified patches, and removals.
+use crate::tool::ToolOptions;
+use crate::tool::invocation::{LocalCatalogBuilder, LocalError};
 
 use diffy::{Patch, apply};
 use schemars::JsonSchema;
@@ -7,13 +9,13 @@ use tokio::fs;
 
 use super::super::workspace::{atomic_write, relative_path};
 use crate::tool::{
-    PathKind, RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
+    PathKind, RegistryError,
     policy::{Capability, PathAccess},
 };
 
 const MAX_WRITE_BYTES: usize = 4 * 1024 * 1024;
 
-pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
+pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
     builder.register::<WriteArgs, WriteOutput, _, _>(
         "write",
         "Atomically create or replace a UTF-8 workspace file. Set create_parents to create missing parent directories recursively.",
@@ -21,7 +23,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             .placement(crate::tool::ToolPlacement::InheritWorkspace)
             .argument_paths(|arguments| {
                 let args: WriteArgs = serde_json::from_value(arguments.clone())
-                    .map_err(ToolError::invalid)?;
+                    .map_err(crate::tool::invocation::AdmissionError::invalid)?;
                 Ok(vec![crate::tool::PathArgument::top_level(
                     "path", None, PathAccess::Write,
                     if args.create_parents { PathKind::WritableWithParents } else { PathKind::Writable },
@@ -33,7 +35,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             if args.create_parents {
                 let parent = path
                     .parent()
-                    .ok_or_else(|| ToolError::Failed("path has no parent".to_owned()))?;
+                    .ok_or_else(|| LocalError::Failed("path has no parent".to_owned()))?;
                 fs::create_dir_all(parent).await?;
             }
             atomic_write(&path, args.content.as_bytes()).await?;
@@ -52,12 +54,12 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
         |context, args| async move {
             // Reject oversized input before reading or building a replacement.
             if args.old.len().saturating_add(args.new.len()) > MAX_WRITE_BYTES {
-                return Err(ToolError::InvalidArguments(format!(
+                return Err(LocalError::InvalidArguments(format!(
                     "replace input exceeds the {MAX_WRITE_BYTES}-byte limit"
                 )));
             }
             if args.old.is_empty() {
-                return Err(ToolError::InvalidArguments(
+                return Err(LocalError::InvalidArguments(
                     "old cannot be empty".to_owned(),
                 ));
             }
@@ -65,7 +67,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             let text = fs::read_to_string(&path).await?;
             let replacements = text.matches(&args.old).count();
             if replacements != args.count {
-                return Err(ToolError::Failed(format!(
+                return Err(LocalError::Failed(format!(
                     "expected {} matches, found {replacements}",
                     args.count
                 )));
@@ -90,9 +92,9 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             check_write_size(&args.patch)?;
             let path = std::path::PathBuf::from(&args.path);
             let text = fs::read_to_string(&path).await?;
-            let patch = Patch::from_str(&args.patch).map_err(ToolError::failed)?;
+            let patch = Patch::from_str(&args.patch).map_err(LocalError::failed)?;
             let replacements = patch.hunks().len();
-            let output = apply(&text, &patch).map_err(ToolError::failed)?;
+            let output = apply(&text, &patch).map_err(LocalError::failed)?;
             check_write_size(&output)?;
             atomic_write(&path, output.as_bytes()).await?;
             Ok(EditOutput {
@@ -125,7 +127,9 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
                 }
                 RemoveKind::Directory
             } else {
-                return Err(ToolError::Failed("unsupported filesystem entry".to_owned()));
+                return Err(LocalError::Failed(
+                    "unsupported filesystem entry".to_owned(),
+                ));
             };
             Ok(RemoveOutput {
                 path: relative_path(&context.execution_location().workspace, &path),
@@ -136,9 +140,9 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
     Ok(())
 }
 
-fn check_write_size(text: &str) -> Result<(), ToolError> {
+fn check_write_size(text: &str) -> Result<(), LocalError> {
     if text.len() > MAX_WRITE_BYTES {
-        Err(ToolError::Failed(format!(
+        Err(LocalError::Failed(format!(
             "write exceeds the {MAX_WRITE_BYTES}-byte limit"
         )))
     } else {
@@ -228,6 +232,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::tool::ToolRegistryBuilder;
     use crate::{
         tests::{RecordingPolicy, TestRuntime},
         tool::{
@@ -238,7 +243,7 @@ mod tests {
 
     fn builder() -> ToolRegistryBuilder {
         let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder).unwrap();
+        builder.register_local(register).unwrap();
         builder
     }
 
@@ -267,7 +272,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                matches!(error, ExecutionError::Tool(ToolError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound),
+                matches!(error, ExecutionError::Tool(crate::tool::ToolError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound),
                 "{error:?}"
             );
             assert!(!runtime.root.path().join("missing").exists());

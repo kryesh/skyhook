@@ -465,8 +465,6 @@ pub struct AuthorizationRequest {
     pub agent: AgentId,
     pub job: JobId,
     pub parent: Option<JobId>,
-    #[serde(skip)]
-    pub(crate) scope: Option<u64>,
     pub tool: String,
     pub permissions: Vec<PermissionUse>,
     pub arguments: Value,

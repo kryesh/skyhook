@@ -7,18 +7,10 @@ use super::*;
 
 mod stream;
 pub(crate) use stream::{
-    AsyncCapture, CaptureWriter, CompletedCapture, PendingCapture, TextCaptureField,
+    CaptureCollector, CaptureWriter, CompletedCapture, HostOutput, PendingCapture, TextCaptureField,
 };
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CaptureKind {
-    Text,
-    Json,
-    /// Transports may stream a capture before its final JSON type is known.
-    #[default]
-    Unknown,
-}
+pub use crate::tool::output::CaptureKind;
 
 impl CaptureKind {
     pub(crate) fn as_str(self) -> &'static str {
@@ -38,24 +30,7 @@ impl CaptureKind {
     }
 }
 
-fn validate_capture_field(field: &str) -> std::io::Result<()> {
-    let mut chars = field.chars();
-    let valid_root = field.is_empty() || field.starts_with('/');
-    let mut valid_escapes = true;
-    while let Some(character) = chars.next() {
-        if character == '~' && !matches!(chars.next(), Some('0' | '1')) {
-            valid_escapes = false;
-            break;
-        }
-    }
-    if !valid_root || !valid_escapes {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "capture field must be a JSON Pointer",
-        ));
-    }
-    Ok(())
-}
+use crate::tool::output::validate_field as validate_capture_field;
 
 /// Descriptors describe raw captures, not a replacement structured result. In
 /// particular, incomplete JSON is only safe to read through explicit byte paging.

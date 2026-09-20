@@ -129,7 +129,6 @@ mod tests {
                 agent: self.agent.clone(),
                 job,
                 parent: None,
-                scope: None,
                 capabilities: Default::default(),
                 cancellation,
             }

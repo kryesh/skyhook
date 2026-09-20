@@ -1,3 +1,6 @@
+use crate::tool::ToolOptions;
+use crate::tool::invocation::{LocalCatalogBuilder, LocalError};
+use crate::tool::output::ProducedOutput;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -11,13 +14,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::workspace::relative_path;
-use crate::job::output::{CaptureWriter, CompletedCapture, PendingCapture};
+use crate::tool::output::{FinishedOutput, OutputWriter, PendingOutput};
 use crate::tool::{
-    PathKind, RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
+    PathKind, RegistryError,
     policy::{Capability, PathAccess},
 };
 
-pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
+pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
     builder.register_product::<SearchArgs, SearchOutput, _, _>(
         "search",
         "Search files with ripgrep regex, glob, and ignore semantics. Matches map file paths to arrays of \"line: text\" strings; details returns structured matches.",
@@ -26,16 +29,16 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             .default_path_argument("path", ".", PathAccess::Read, PathKind::Existing),
         |context, args| async move {
             let root = PathBuf::from(&args.path);
-            let capture = context.pending_stream_capture("/result/matches", crate::job::output::CaptureKind::Json).await?;
+            let capture = context.pending_stream_capture("/result/matches", crate::tool::output::CaptureKind::Json).await?;
             let workspace = context.execution_location().workspace.clone();
             tokio::task::spawn_blocking(move || {
                 search_blocking(&workspace, &root, &args, capture, &context.cancellation_token())
             })
             .await
-            .map_err(ToolError::failed)?
+            .map_err(LocalError::failed)?
             .and_then(|capture| {
                 let output = SearchOutput { matches: SearchMatches::Grouped(BTreeMap::new()) };
-                Ok(crate::tool::ToolOutput::new(serde_json::to_value(output)?).with_captures(vec![capture]))
+                Ok(ProducedOutput::new(serde_json::to_value(output)?).with_captures(vec![capture]))
             })
         },
     )?;
@@ -48,7 +51,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
         |context, args| async move {
             let root = PathBuf::from(&args.path);
             let capture = context
-                .pending_stream_capture("/result/paths", crate::job::output::CaptureKind::Json)
+                .pending_stream_capture("/result/paths", crate::tool::output::CaptureKind::Json)
                 .await?;
             let workspace = context.execution_location().workspace.clone();
             tokio::task::spawn_blocking(move || {
@@ -61,10 +64,8 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
                 )
             })
             .await
-            .map_err(ToolError::failed)?
-            .map(|capture| {
-                crate::tool::ToolOutput::new(serde_json::json!({})).with_captures(vec![capture])
-            })
+            .map_err(LocalError::failed)?
+            .map(|capture| ProducedOutput::new(serde_json::json!({})).with_captures(vec![capture]))
         },
     )?;
     Ok(())
@@ -75,7 +76,7 @@ fn walk_builder(
     hidden: bool,
     no_ignore: bool,
     patterns: &[String],
-) -> Result<WalkBuilder, ToolError> {
+) -> Result<WalkBuilder, LocalError> {
     let patterns = overrides(root, patterns)?;
     let mut walk = WalkBuilder::new(root);
     walk.hidden(!hidden)
@@ -100,21 +101,21 @@ fn walk_builder(
     Ok(walk)
 }
 
-fn overrides(root: &Path, patterns: &[String]) -> Result<ignore::overrides::Override, ToolError> {
+fn overrides(root: &Path, patterns: &[String]) -> Result<ignore::overrides::Override, LocalError> {
     let mut builder = OverrideBuilder::new(root);
     for pattern in patterns {
-        builder.add(pattern).map_err(ToolError::invalid)?;
+        builder.add(pattern).map_err(LocalError::invalid)?;
     }
-    builder.build().map_err(ToolError::invalid)
+    builder.build().map_err(LocalError::invalid)
 }
 
 fn search_blocking(
     workspace: &Path,
     root: &Path,
     args: &SearchArgs,
-    capture: PendingCapture,
-    cancellation: &crate::job::CancellationToken,
-) -> Result<CompletedCapture, ToolError> {
+    capture: PendingOutput,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<FinishedOutput, LocalError> {
     let mut matcher_builder = common_matcher();
     matcher_builder.fixed_strings(args.fixed).word(args.word);
     match args.case {
@@ -130,9 +131,9 @@ fn search_blocking(
     }
     let matcher = matcher_builder
         .build(&args.pattern)
-        .map_err(ToolError::invalid)?;
+        .map_err(LocalError::invalid)?;
 
-    let files: Box<dyn Iterator<Item = Result<PathBuf, ToolError>>> = if root.is_file() {
+    let files: Box<dyn Iterator<Item = Result<PathBuf, LocalError>>> = if root.is_file() {
         Box::new(std::iter::once(Ok(root.to_owned())))
     } else if root.is_dir() {
         let walk = walk_builder(root, args.hidden, args.no_ignore, &args.glob)?;
@@ -141,10 +142,10 @@ fn search_blocking(
                 Some(Ok(entry.into_path()))
             }
             Ok(_) => None,
-            Err(error) => Some(Err(ToolError::Failed(error.to_string()))),
+            Err(error) => Some(Err(LocalError::Failed(error.to_string()))),
         }))
     } else {
-        return Err(ToolError::Failed(
+        return Err(LocalError::Failed(
             "search root is not a file or directory".into(),
         ));
     };
@@ -156,7 +157,7 @@ fn search_blocking(
     let mut matches = CapturedOutput::new(capture, !args.details)?;
     for path in files {
         if cancellation.is_cancelled() {
-            return Err(ToolError::Cancelled);
+            return Err(LocalError::Cancelled);
         }
         let path = path?;
         let checkpoint = matches.checkpoint()?;
@@ -181,11 +182,11 @@ fn glob_blocking(
     workspace: &Path,
     root: &Path,
     args: &GlobArgs,
-    capture: PendingCapture,
-    cancellation: &crate::job::CancellationToken,
-) -> Result<CompletedCapture, ToolError> {
+    capture: PendingOutput,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<FinishedOutput, LocalError> {
     if !root.is_dir() {
-        return Err(ToolError::Failed("glob root is not a directory".into()));
+        return Err(LocalError::Failed("glob root is not a directory".into()));
     }
     let walk = walk_builder(
         root,
@@ -196,9 +197,9 @@ fn glob_blocking(
     let mut paths = CapturedOutput::new(capture, false)?;
     for entry in walk.build() {
         if cancellation.is_cancelled() {
-            return Err(ToolError::Cancelled);
+            return Err(LocalError::Cancelled);
         }
-        let entry = entry.map_err(ToolError::failed)?;
+        let entry = entry.map_err(LocalError::failed)?;
         if entry.depth() != 0 && entry.file_type().is_some_and(|kind| kind.is_file()) {
             paths.push(relative_path(workspace, entry.path()))?;
         }
@@ -209,13 +210,13 @@ fn glob_blocking(
 /// Streams the complete result into the owning job's capture. The handler returns
 /// completed ownership evidence; the finalizer publishes the captured field.
 struct CapturedOutput {
-    file: CaptureWriter,
+    file: OutputWriter,
     count: usize,
     grouped: bool,
     group: Option<String>,
 }
 impl CapturedOutput {
-    fn new(capture: PendingCapture, grouped: bool) -> std::io::Result<Self> {
+    fn new(capture: PendingOutput, grouped: bool) -> std::io::Result<Self> {
         use std::io::Write as _;
         let mut file = capture.open();
         file.write_all(if grouped { b"{\n" } else { b"[\n" })?;
@@ -248,7 +249,7 @@ impl CapturedOutput {
         self.file.seek(std::io::SeekFrom::Start(checkpoint.1))?;
         Ok(())
     }
-    fn finish(mut self) -> std::io::Result<CompletedCapture> {
+    fn finish(mut self) -> std::io::Result<FinishedOutput> {
         use std::io::Write as _;
         if self.grouped {
             if self.group.is_some() {
@@ -305,11 +306,11 @@ impl From<std::io::Error> for SearchStop {
 }
 
 impl SearchStop {
-    fn into_tool_error(self) -> ToolError {
+    fn into_tool_error(self) -> LocalError {
         match self {
-            Self::Cancelled => ToolError::Cancelled,
+            Self::Cancelled => LocalError::Cancelled,
             // Preserve the existing grep IO failure presentation.
-            Self::Io(error) => ToolError::Failed(error.to_string()),
+            Self::Io(error) => LocalError::Failed(error.to_string()),
         }
     }
 }
@@ -319,7 +320,7 @@ struct SearchSink<'a> {
     path: String,
     matches: &'a mut CapturedOutput,
     binary: bool,
-    cancellation: &'a crate::job::CancellationToken,
+    cancellation: &'a tokio_util::sync::CancellationToken,
 }
 impl Sink for SearchSink<'_> {
     type Error = SearchStop;
@@ -452,31 +453,62 @@ fn common_matcher() -> RegexMatcherBuilder {
     builder
 }
 
-pub(crate) fn output_matcher(pattern: &str) -> Result<grep_regex::RegexMatcher, ToolError> {
-    common_matcher().build(pattern).map_err(ToolError::invalid)
+pub(crate) fn output_matcher(
+    pattern: &str,
+) -> Result<grep_regex::RegexMatcher, crate::tool::invocation::AdmissionError> {
+    common_matcher()
+        .build(pattern)
+        .map_err(crate::tool::invocation::AdmissionError::invalid)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::ToolRegistryBuilder;
     use serde_json::{Value, json};
 
-    fn pending_capture(output: &crate::job::output::TestOutput) -> PendingCapture {
-        let kind = crate::job::output::CaptureKind::Json;
-        PendingCapture::create(&output.output, "/result/test", kind).unwrap()
+    struct CaptureFixture {
+        runtime: tokio::runtime::Runtime,
+        sink: std::sync::Arc<crate::tool::invocation::tests::CapturedOutput>,
+        output: crate::tool::output::OutputContext,
+    }
+
+    impl CaptureFixture {
+        fn new() -> Self {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let sink =
+                std::sync::Arc::new(crate::tool::invocation::tests::CapturedOutput::default());
+            let output = crate::tool::output::OutputContext::new(sink.clone());
+            Self {
+                runtime,
+                sink,
+                output,
+            }
+        }
+
+        fn pending(&self) -> PendingOutput {
+            self.runtime
+                .block_on(
+                    self.output.pending_stream_capture(
+                        "/result/test",
+                        crate::tool::output::CaptureKind::Json,
+                    ),
+                )
+                .unwrap()
+        }
     }
 
     /// Runs a blocking walker into a fresh capture and decodes what it wrote.
     fn captured<T: serde::de::DeserializeOwned, R>(
-        walk: impl FnOnce(PendingCapture, &crate::job::CancellationToken) -> Result<R, ToolError>,
-    ) -> Result<T, ToolError> {
-        let output = crate::job::output::TestOutput::new();
+        walk: impl FnOnce(PendingOutput, &tokio_util::sync::CancellationToken) -> Result<R, LocalError>,
+    ) -> Result<T, LocalError> {
+        let fixture = CaptureFixture::new();
         walk(
-            pending_capture(&output),
-            &crate::job::CancellationToken::new(),
+            fixture.pending(),
+            &tokio_util::sync::CancellationToken::new(),
         )?;
-        let bytes = output.output.test_bytes("/result/test").unwrap();
-        Ok(serde_json::from_slice(&bytes)?)
+        fixture.runtime.block_on(fixture.output.settle())?;
+        Ok(serde_json::from_slice(&fixture.sink.bytes())?)
     }
 
     fn search(root: &Path, path: &Path, args: Value) -> Vec<SearchMatch> {
@@ -504,12 +536,12 @@ mod tests {
         let input = root.path().join("input");
         std::fs::write(&input, "needle").unwrap();
         let args: SearchArgs = serde_json::from_value(json!({"pattern":"needle"})).unwrap();
-        let cancellation = crate::job::CancellationToken::new();
+        let cancellation = tokio_util::sync::CancellationToken::new();
         cancellation.cancel();
-        let output = crate::job::output::TestOutput::new();
-        let capture = pending_capture(&output);
+        let output = CaptureFixture::new();
+        let capture = output.pending();
         let result = search_blocking(root.path(), &input, &args, capture, &cancellation);
-        assert!(matches!(result, Err(ToolError::Cancelled)));
+        assert!(matches!(result, Err(LocalError::Cancelled)));
     }
 
     #[tokio::test]
@@ -521,7 +553,7 @@ mod tests {
         std::fs::write(directory.join("b.bin"), b"needle\n\0hidden").unwrap();
         std::fs::write(directory.join("z.txt"), "needle last\n").unwrap();
         let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder).unwrap();
+        builder.register_local(register).unwrap();
         let executor = runtime.executor(builder);
         let search = async |args| {
             executor

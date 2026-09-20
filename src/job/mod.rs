@@ -159,7 +159,6 @@ pub(crate) struct RetainedChild {
     pub job: JobId,
     pub owner: AgentId,
     pub parent: Option<JobId>,
-    pub scope: Option<u64>,
     pub child: AgentId,
     pub location: ExecutionLocation,
     pub cancellation: CancellationToken,
@@ -350,11 +349,7 @@ enum DeliveryState {
 #[derive(Clone, Copy)]
 enum WaitMode {
     Foreground,
-    /// Foreground readiness without acknowledging completion or question delivery.
-    Transfer,
-    Explicit {
-        claim: bool,
-    },
+    Explicit { claim: bool },
     Terminal,
 }
 
@@ -364,9 +359,8 @@ struct JobManagerInner {
     progress: Mutex<progress::Progress>,
     supervision: Arc<supervisor::Supervision>,
     delivery_operation: Arc<Mutex<()>>,
-    /// Serializes parent validation/creation publication against map pruning.
+    /// Shared by concurrent creations; exclusive for drain.
     /// Never acquired while holding a jobs, delivery, or per-job operation lock.
-    /// Shared by concurrent creations; exclusive for pruning and drain.
     creation_operation: Arc<tokio::sync::RwLock<()>>,
     next_id: AtomicU64,
     completions: broadcast::Sender<JobCompletion>,

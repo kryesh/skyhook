@@ -35,7 +35,6 @@ impl ToolExecutor {
             agent: plan.agent.clone(),
             job: lease.id(),
             parent: plan.parent,
-            scope: plan.authorization_scope,
             capabilities: self.capabilities.clone(),
             cancellation: lease.cancellation_token(),
         };
@@ -120,7 +119,6 @@ impl ToolExecutor {
             tool.name().to_owned(),
             plan.authorization_arguments,
         );
-        context.process_environment = self.shared.process_environment.clone();
         let authentication = if context.capabilities().contains(Capability::Targets)
             && context.execution_location().is_root()
             && tool.target_authentication()

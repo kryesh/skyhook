@@ -6,7 +6,6 @@ use thiserror::Error;
 #[derive(Clone, Copy)]
 enum CollectionPurpose {
     Native,
-    Transfer,
     Public(crate::tool::ToolResultPolicy),
 }
 
@@ -48,7 +47,7 @@ impl ToolExecutor {
     }
 
     /// The public script contract is the same envelope as model calls, but with
-    /// complete captured data rather than an automatic preview. Host/transport
+    /// complete captured data rather than an automatic preview. Host
     /// collectors intentionally retain the handler's native payload.
     pub(super) async fn collect_full_view_started(
         &self,
@@ -64,14 +63,6 @@ impl ToolExecutor {
         started: StartedExecution,
     ) -> Result<ExecutionResult, ExecutionError> {
         self.collect_result(started, CollectionPurpose::Native)
-            .await
-    }
-
-    pub(crate) async fn collect_for_transfer(
-        &self,
-        started: StartedExecution,
-    ) -> Result<ExecutionResult, ExecutionError> {
-        self.collect_result(started, CollectionPurpose::Transfer)
             .await
     }
 
@@ -91,25 +82,8 @@ impl ToolExecutor {
                 output: ToolOutput::new(value),
             });
         }
-        let mut envelope = match purpose {
-            CollectionPurpose::Native | CollectionPurpose::Public(_) => {
-                self.shared.jobs.wait_foreground(job).await?
-            }
-            CollectionPurpose::Transfer => {
-                self.shared.jobs.wait_foreground_for_transfer(job).await?
-            }
-        };
-        match purpose {
-            CollectionPurpose::Native | CollectionPurpose::Public(_) => {
-                self.shared.jobs.hydrate_envelope(&mut envelope).await?
-            }
-            CollectionPurpose::Transfer => {
-                self.shared
-                    .jobs
-                    .hydrate_envelope_up_to(&mut envelope, crate::job::output::PAGE_BYTES as u64)
-                    .await?
-            }
-        }
+        let mut envelope = self.shared.jobs.wait_foreground(job).await?;
+        self.shared.jobs.hydrate_envelope(&mut envelope).await?;
         if !envelope.state.is_terminal() {
             return Ok(ExecutionResult {
                 job,
@@ -118,15 +92,13 @@ impl ToolExecutor {
                 output: ToolOutput::new(
                     match purpose {
                         CollectionPurpose::Public(_) => envelope.response_view(&self.capabilities),
-                        _ => envelope.metadata_view(&self.capabilities),
+                        CollectionPurpose::Native => envelope.metadata_view(&self.capabilities),
                     }
                     .into_value(),
                 ),
             });
         }
-        if !matches!(purpose, CollectionPurpose::Transfer) {
-            self.shared.jobs.claim(job).await?;
-        }
+        self.shared.jobs.claim(job).await?;
         let images = self.shared.jobs.images(job).await?;
         if let CollectionPurpose::Public(policy) = purpose {
             // A successful output query already returns the target view. The
@@ -226,6 +198,12 @@ pub enum ExecutionError {
     },
     #[error("could not serialize tool result: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+impl From<crate::tool::AdmissionError> for ExecutionError {
+    fn from(error: crate::tool::AdmissionError) -> Self {
+        Self::Tool(error.into())
+    }
 }
 
 impl ExecutionError {
@@ -444,36 +422,6 @@ mod tests {
             runtime.jobs.snapshot(job).await.unwrap().output,
             Some(payload)
         );
-    }
-
-    #[tokio::test]
-    async fn transfer_collection_does_not_consume_delivery() {
-        let runtime = crate::tests::TestRuntime::new().await;
-        let executor = runtime.executor(ToolRegistryBuilder::default());
-        // Both paths collect the same small completed payload. Only native
-        // consumption acknowledges delivery; transfer is not consumption.
-        let spec = JobSpec {
-            background: true,
-            ..JobSpec::test(runtime.agent.clone(), "transfer")
-        };
-        let job = created(&runtime, spec).await;
-        complete(&runtime, job, json!(42)).await;
-        let started = StartedExecution {
-            job,
-            background: false,
-        };
-        let transfer = executor.collect_for_transfer(started).await.unwrap();
-        assert_eq!(transfer.output.value, 42);
-        assert!(runtime.jobs.has_pending(&runtime.agent).await);
-        let native = executor
-            .collect_started(StartedExecution {
-                job,
-                background: false,
-            })
-            .await
-            .unwrap();
-        assert_eq!(native.output.value, 42);
-        assert!(!runtime.jobs.has_pending(&runtime.agent).await);
     }
 
     #[tokio::test]

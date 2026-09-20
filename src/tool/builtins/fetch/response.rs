@@ -11,7 +11,7 @@ use super::diagnostics::{
 };
 use super::progress::FetchProgress;
 use super::validation::{HttpRequestUrl, InlineMode, OutputPlan};
-use super::{ResponseBody, ToolContext, ToolError, fetch_text, invalid};
+use super::{LocalContext, LocalError, ResponseBody, fetch_text, invalid};
 
 enum BodySink {
     Memory {
@@ -51,7 +51,7 @@ impl PendingDownload {
     /// synchronous: cancellation cannot undo a rename that has already completed.
     async fn finish(
         mut self,
-        context: &ToolContext,
+        context: &LocalContext,
         received: u64,
     ) -> Result<ResponseBody, FetchError> {
         let path = self.destination.to_string_lossy().into_owned();
@@ -61,7 +61,7 @@ impl PendingDownload {
         self.writer.sync_all().await.map_err(local_io)?;
         if context.is_cancelled() {
             return Err(FetchError::from_tool_error(
-                ToolError::Cancelled,
+                LocalError::Cancelled,
                 FetchPhase::LocalIo,
             ));
         }
@@ -121,7 +121,7 @@ impl BodySink {
 
     async fn finish(
         self,
-        context: &ToolContext,
+        context: &LocalContext,
         progress: &mut FetchProgress,
         content_type: Option<&str>,
         url: &HttpRequestUrl,
@@ -209,7 +209,7 @@ fn local_io(error: std::io::Error) -> FetchError {
 }
 
 pub(super) async fn read_body(
-    context: &ToolContext,
+    context: &LocalContext,
     progress: &mut FetchProgress,
     response: reqwest::Response,
     output: OutputPlan,

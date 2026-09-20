@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::fs;
 
-use crate::tool::ToolError;
+use crate::tool::invocation::AdmissionError;
 use crate::tool::policy::{ApprovalGrant, Capability, PermissionUse, ResourceId};
 use crate::tool::registry::PathKind;
 
@@ -30,7 +30,7 @@ pub(crate) async fn resolve_for_authorization(
     workspace: &Path,
     input: &str,
     kind: PathKind,
-) -> Result<ResolvedWorkspacePath, ToolError> {
+) -> Result<ResolvedWorkspacePath, AdmissionError> {
     let path = match kind {
         PathKind::Existing => resolve_existing(workspace, input).await?,
         PathKind::Writable => resolve_writable(workspace, input).await?,
@@ -49,7 +49,7 @@ pub(crate) async fn resolve_for_authorization(
 pub(crate) async fn resolve_existing(
     workspace: &Path,
     relative: &str,
-) -> Result<PathBuf, ToolError> {
+) -> Result<PathBuf, AdmissionError> {
     let joined = lexical_path(workspace, relative)?;
     Ok(fs::canonicalize(joined).await?)
 }
@@ -57,18 +57,18 @@ pub(crate) async fn resolve_existing(
 pub(crate) async fn resolve_writable(
     workspace: &Path,
     relative: &str,
-) -> Result<PathBuf, ToolError> {
+) -> Result<PathBuf, AdmissionError> {
     let joined = lexical_path(workspace, relative)?;
     if fs::try_exists(&joined).await? {
         return resolve_existing(workspace, relative).await;
     }
     let parent = joined
         .parent()
-        .ok_or_else(|| ToolError::Failed("path has no parent".to_owned()))?;
+        .ok_or_else(|| AdmissionError::Failed("path has no parent".to_owned()))?;
     let parent = fs::canonicalize(parent).await?;
     let name = joined
         .file_name()
-        .ok_or_else(|| ToolError::Failed("path has no filename".to_owned()))?;
+        .ok_or_else(|| AdmissionError::Failed("path has no filename".to_owned()))?;
     Ok(parent.join(name))
 }
 
@@ -77,7 +77,7 @@ pub(crate) async fn resolve_writable(
 pub(crate) async fn resolve_writable_with_parents(
     workspace: &Path,
     relative: &str,
-) -> Result<PathBuf, ToolError> {
+) -> Result<PathBuf, AdmissionError> {
     let joined = lexical_path(workspace, relative)?;
     let mut resolved = PathBuf::new();
     for component in joined.components() {
@@ -103,10 +103,10 @@ pub(crate) async fn resolve_writable_with_parents(
     Ok(resolved)
 }
 
-pub(crate) fn lexical_path(workspace: &Path, relative: &str) -> Result<PathBuf, ToolError> {
+pub(crate) fn lexical_path(workspace: &Path, relative: &str) -> Result<PathBuf, AdmissionError> {
     let path = Path::new(relative);
     if path.as_os_str().is_empty() {
-        return Err(ToolError::Failed("path cannot be empty".to_owned()));
+        return Err(AdmissionError::Failed("path cannot be empty".to_owned()));
     }
     if path.is_absolute() {
         return Ok(path.to_path_buf());
@@ -117,7 +117,7 @@ pub(crate) fn lexical_path(workspace: &Path, relative: &str) -> Result<PathBuf, 
 pub(crate) async fn resolve_removable(
     workspace: &Path,
     relative: &str,
-) -> Result<PathBuf, ToolError> {
+) -> Result<PathBuf, AdmissionError> {
     let joined = lexical_path(workspace, relative)?;
     // A final .. has no filename; resolve it before removing the directory entry.
     let joined = if joined.file_name().is_none() {
@@ -127,14 +127,14 @@ pub(crate) async fn resolve_removable(
     };
     let parent = joined
         .parent()
-        .ok_or_else(|| ToolError::Failed("path has no parent".to_owned()))?;
+        .ok_or_else(|| AdmissionError::Failed("path has no parent".to_owned()))?;
     let parent = fs::canonicalize(parent).await?;
     let name = joined
         .file_name()
-        .ok_or_else(|| ToolError::Failed("path has no filename".to_owned()))?;
+        .ok_or_else(|| AdmissionError::Failed("path has no filename".to_owned()))?;
     let resolved = parent.join(name);
     if resolved == fs::canonicalize(workspace).await? {
-        return Err(ToolError::Failed(
+        return Err(AdmissionError::Failed(
             "cannot remove the workspace root".to_owned(),
         ));
     }
@@ -156,7 +156,7 @@ pub(crate) fn relative_path(workspace: &Path, path: &Path) -> String {
     }
 }
 
-pub(super) async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+pub(super) async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AdmissionError> {
     Ok(crate::fs::atomic_write(path, bytes).await?)
 }
 

@@ -2,7 +2,7 @@
 
 mod fetch;
 mod fetch_text;
-mod filesystem;
+pub(crate) mod filesystem;
 pub(crate) mod jobs;
 mod process;
 mod script;
@@ -22,10 +22,6 @@ pub use process::ProcessOutput;
 pub(crate) use script::install_script_tool;
 pub use skills::HostSkills;
 
-fn default_dot() -> String {
-    ".".to_owned()
-}
-
 /// Register the standard workspace, process, and job-control tool set.
 pub(crate) fn register_coding_tools(
     builder: &mut ToolRegistryBuilder,
@@ -34,19 +30,21 @@ pub(crate) fn register_coding_tools(
     skills: HostSkills,
     router: crate::target::TargetRouter,
 ) -> Result<(), RegistryError> {
-    register_worker_tools(builder, store.clone())?;
+    builder.register_local(register_local_tools)?;
     jobs::register(builder, jobs)?;
     skills::register(builder, skills, store.clone(), router.clone())?;
     targets::register(builder, store, router)?;
     Ok(())
 }
 
-/// Register only tools whose effects are local to a worker workspace.
-pub(crate) fn register_worker_tools(
-    builder: &mut ToolRegistryBuilder,
-    store: SessionStore,
+fn default_dot() -> String {
+    ".".to_owned()
+}
+
+pub(crate) fn register_local_tools(
+    builder: &mut crate::tool::invocation::LocalCatalogBuilder,
 ) -> Result<(), RegistryError> {
-    filesystem::register(builder, store)?;
+    filesystem::register(builder)?;
     search::register(builder)?;
     process::register(builder)?;
     fetch::register(builder)?;

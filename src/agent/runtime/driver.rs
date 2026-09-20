@@ -867,7 +867,6 @@ mod tests {
         assert_eq!(first.output.value, "first answer");
         let job = first.job;
         let child = session.root.child(1);
-        assert_eq!(jobs.prune_claimed().await.unwrap(), 0);
         let follow_ups = [
             ("follow-up one", "second answer"),
             ("follow-up two", "third answer"),

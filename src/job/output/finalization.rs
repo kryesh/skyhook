@@ -315,7 +315,7 @@ mod tests {
             referenced,
             ["/result/a~1b/~0key", "/result/matches", "/result/text"]
         );
-        let hydrated = hydrate(&saved(&output), document, u64::MAX).unwrap();
+        let hydrated = hydrate(&saved(&output), document).unwrap();
         let expected = json!({"text":"é\ntext","matches":{"a":[1,true]},"a/b":{"~key":[null,"x"]}});
         assert_eq!(hydrated["result"], expected);
         assert!(
@@ -452,7 +452,7 @@ mod tests {
                 .map(|(field, bytes)| completed(&output, &format!("/result/{field}"), kind, bytes))
                 .collect();
             save_completed(&output, &initial, captures).unwrap();
-            let hydrated = hydrate(&saved(&output), document(&output), u64::MAX).unwrap();
+            let hydrated = hydrate(&saved(&output), document(&output)).unwrap();
             if unknown {
                 assert_eq!(hydrated["result"]["text"], r#"{"looks":"json"}"#);
                 assert_eq!(hydrated["result"]["object"], json!({"x":1}));

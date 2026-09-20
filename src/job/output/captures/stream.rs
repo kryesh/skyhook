@@ -1,43 +1,22 @@
-//! Job/field-bound capture streams. Completion proves successful IO, not valid JSON.
-//!
-//! Streamed captures (search, remote artifacts) keep failed or abandoned partial
-//! output readable as incomplete output, and an explicitly streamed empty capture
-//! is materialized. Builtin text captures delete their row when abandoned;
-//! `finish_nonempty` is the process/console contract that omits empty streams.
+//! Host capture storage and publication receipts.
 use std::{
-    io::{self, Seek, Write},
+    collections::HashMap,
+    io,
     sync::{Arc, Mutex, PoisonError},
 };
 
 use super::{CaptureKind, Output};
-use crate::{identity::JobId, job::JobManager, session::CaptureExtent, tool::ToolError};
-
-/// Buffered bytes are committed once they reach this size, or on flush.
-const FLUSH_BYTES: usize = 64 * 1024;
-
-/// The current builtin text fields. JSON/remote captures retain their distinct
-/// admission APIs; this is not an unchecked arbitrary-pointer capture token.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TextCaptureField {
-    Stdout,
-    Stderr,
-    Content,
-    Console,
-}
-
-impl TextCaptureField {
-    pub(crate) fn pointer(self) -> String {
-        format!(
-            "/result/{}",
-            match self {
-                Self::Stdout => "stdout",
-                Self::Stderr => "stderr",
-                Self::Content => "content",
-                Self::Console => "console",
-            }
-        )
-    }
-}
+pub(crate) use crate::tool::output::TextCaptureField;
+use crate::{
+    identity::JobId,
+    job::JobManager,
+    session::{CaptureExtent, SessionStore},
+    tool::output::{
+        Abandon, Abandonment, CaptureEvent, CaptureId, CaptureTarget, OutputContext, OutputEvent,
+        OutputSink, PendingProducer, ProducedOutput, Producer,
+    },
+    tool::{ToolError, ToolOutput},
+};
 
 /// Only successful consuming finalization constructs this evidence; it has no
 /// Serialize implementation. Finalizing a writer is not publication: discovery
@@ -51,7 +30,6 @@ pub(crate) struct CompletedCapture {
 }
 
 impl CompletedCapture {
-    /// Bound to `job` and still the row registered at its pointer.
     pub(crate) fn belongs_to(&self, job: JobId, capture: i64) -> bool {
         self.job == job && self.capture == capture
     }
@@ -64,11 +42,9 @@ impl CompletedCapture {
     pub(crate) fn field(&self) -> &str {
         &self.field
     }
-
     pub(crate) fn capture_id(&self) -> i64 {
         self.capture
     }
-
     pub(crate) fn kind(&self) -> CaptureKind {
         self.kind
     }
@@ -78,23 +54,32 @@ fn database(error: crate::session::DbError) -> io::Error {
     io::Error::other(error)
 }
 
-/// A reserved capture row, not yet opened for writing.
-pub(crate) struct PendingCapture {
-    writer: CaptureWriter,
-}
+pub(crate) type PendingCapture = PendingProducer<StoredCapture>;
+pub(crate) type CaptureWriter = Producer<StoredCapture>;
 
 impl PendingCapture {
     pub(crate) fn create(output: &Output, field: &str, kind: CaptureKind) -> io::Result<Self> {
-        Self::reserve(output, field, kind, false)
+        Ok(Self::new(
+            StoredCapture::reserve(output, field, kind, false)?,
+            Abandon::Retain,
+        ))
     }
 
-    /// Reserve a cached rendering of a saved value, discarded unless finished.
     pub(crate) fn rendering(output: &Output, field: &str) -> io::Result<Self> {
-        let mut pending = Self::reserve(output, field, CaptureKind::Unknown, true)?;
-        pending.writer.remove_on_abandon = true;
-        Ok(pending)
+        Ok(Self::new(
+            StoredCapture::reserve(output, field, CaptureKind::Unknown, true)?,
+            Abandon::Discard,
+        ))
     }
+}
 
+pub(crate) struct StoredCapture {
+    output: Output,
+    completed: CompletedCapture,
+    extent: CaptureExtent,
+}
+
+impl StoredCapture {
     fn reserve(
         output: &Output,
         field: &str,
@@ -102,8 +87,6 @@ impl PendingCapture {
         rendered: bool,
     ) -> io::Result<Self> {
         super::validate_capture_field(field)?;
-        // Reservation is atomic: a losing producer, even with a different kind,
-        // neither rewrites nor truncates the existing owner's capture.
         let capture = output
             .db
             .create_capture(output.job.get(), field, kind.as_str(), rendered)
@@ -112,233 +95,62 @@ impl PendingCapture {
                 io::Error::new(io::ErrorKind::AlreadyExists, "capture field is reserved")
             })?;
         Ok(Self {
-            writer: CaptureWriter {
-                output: output.clone(),
-                completed: CompletedCapture {
-                    job: output.job,
-                    capture,
-                    field: field.into(),
-                    kind,
-                },
-                remove_on_abandon: false,
-                extent: CaptureExtent::default(),
-                buffer: Vec::new(),
-                failure: None,
+            output: output.clone(),
+            completed: CompletedCapture {
+                job: output.job,
+                capture,
+                field: field.into(),
+                kind,
             },
+            extent: CaptureExtent::default(),
         })
     }
-
-    pub(crate) fn open(self) -> CaptureWriter {
-        self.writer
-    }
-
-    pub(crate) fn open_async(self) -> AsyncCapture {
-        AsyncCapture {
-            writer: Arc::new(Mutex::new(self.writer)),
-            pending: None,
-        }
-    }
 }
 
-/// Appends to one capture row. Seek/truncate serve grep's binary-match rollback but
-/// cannot change the bound job or field. An IO failure poisons completion.
-pub(crate) struct CaptureWriter {
-    output: Output,
-    completed: CompletedCapture,
-    /// Builtin text captures delete their row unless finished.
-    remove_on_abandon: bool,
-    extent: CaptureExtent,
-    buffer: Vec<u8>,
-    failure: Option<io::ErrorKind>,
-}
+impl CaptureTarget for StoredCapture {
+    type Finished = CompletedCapture;
 
-impl CaptureWriter {
-    fn healthy(&self) -> io::Result<()> {
-        match self.failure {
-            Some(kind) => Err(io::Error::new(
-                kind,
-                "capture cannot finish after an IO error",
-            )),
-            None => Ok(()),
-        }
-    }
-
-    fn track<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
-        if let Err(error) = &result {
-            self.failure = Some(error.kind());
-        }
-        result
-    }
-
-    fn position(&self) -> u64 {
-        self.extent.bytes + self.buffer.len() as u64
-    }
-
-    /// Append text and commit it, so a live console capture is pageable at once.
-    pub(crate) fn write_text(&mut self, text: &str) -> io::Result<()> {
-        self.write_all(text.as_bytes())?;
-        self.flush()
-    }
-
-    pub(crate) fn truncate(&mut self, length: u64) -> io::Result<()> {
-        self.flush()?;
-        let result = if length > self.extent.bytes {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "capture cannot be extended by truncation",
-            ))
-        } else {
-            self.output
-                .db
-                .truncate_capture(self.completed.capture, length)
-                .map_err(database)
-        };
-        self.extent = self.track(result)?;
+    fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.extent = self
+            .output
+            .db
+            .append_capture(self.completed.capture, self.extent, bytes)
+            .map_err(database)?;
         Ok(())
     }
 
-    fn close(&mut self) -> io::Result<CompletedCapture> {
-        self.flush()?;
-        let result = self
+    fn truncate(&mut self, length: u64) -> io::Result<()> {
+        if length > self.extent.bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "capture cannot be extended by truncation",
+            ));
+        }
+        self.extent = self
             .output
             .db
+            .truncate_capture(self.completed.capture, length)
+            .map_err(database)?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<CompletedCapture> {
+        self.output
+            .db
             .finish_capture(self.completed.capture)
-            .map_err(database);
-        self.track(result)?;
-        self.remove_on_abandon = false;
+            .map_err(database)?;
         Ok(self.completed.clone())
     }
 
-    pub(crate) fn finish(mut self) -> io::Result<CompletedCapture> {
-        self.close()
-    }
-
-    /// Omit and delete empty streams (process and console contract).
-    pub(crate) fn finish_nonempty(mut self) -> io::Result<Option<CompletedCapture>> {
-        self.close_nonempty()
-    }
-
-    fn close_nonempty(&mut self) -> io::Result<Option<CompletedCapture>> {
-        self.flush()?;
-        if self.extent.bytes == 0 {
-            self.output
-                .db
-                .delete_capture(self.completed.capture)
-                .map_err(database)?;
-            self.remove_on_abandon = false;
-            return Ok(None);
-        }
-        self.close().map(Some)
-    }
-}
-
-impl Drop for CaptureWriter {
-    fn drop(&mut self) {
-        if self.remove_on_abandon {
-            // Best effort: a retained row is only reported as an incomplete capture.
-            let _ = self.output.db.delete_capture(self.completed.capture);
-        } else {
-            // An abandoned stream keeps its partial output readable.
-            let _ = self.flush();
-        }
-    }
-}
-
-impl Write for CaptureWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.healthy()?;
-        self.buffer.extend_from_slice(bytes);
-        if self.buffer.len() >= FLUSH_BYTES {
-            self.flush()?;
-        }
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.healthy()?;
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-        let result = self
-            .output
+    fn discard(&mut self) -> io::Result<()> {
+        self.output
             .db
-            .append_capture(self.completed.capture, self.extent, &self.buffer)
-            .map_err(database);
-        self.extent = self.track(result)?;
-        self.buffer.clear();
-        Ok(())
-    }
-}
-
-/// Only the current end is addressable; rollback truncates before seeking to it.
-impl Seek for CaptureWriter {
-    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
-        self.healthy()?;
-        let end = self.position();
-        match position {
-            io::SeekFrom::Start(offset) if offset == end => Ok(end),
-            io::SeekFrom::Current(0) | io::SeekFrom::End(0) => Ok(end),
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "captures only append at their end",
-            )),
-        }
-    }
-}
-
-/// Async producers' view of a capture. Writes run in order on the blocking pool;
-/// one whose caller is dropped still completes before the next starts, so accepted
-/// bytes are neither lost nor duplicated.
-pub(crate) struct AsyncCapture {
-    writer: Arc<Mutex<CaptureWriter>>,
-    pending: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl AsyncCapture {
-    async fn run<T: Send + 'static>(
-        &mut self,
-        operation: impl FnOnce(&mut CaptureWriter) -> io::Result<T> + Send + 'static,
-    ) -> io::Result<T> {
-        if let Some(pending) = &mut self.pending {
-            let _ = pending.await;
-        }
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        let writer = self.writer.clone();
-        self.pending = Some(tokio::task::spawn_blocking(move || {
-            let mut writer = writer.lock().unwrap_or_else(PoisonError::into_inner);
-            let _ = sender.send(operation(&mut writer));
-        }));
-        let result = receiver.await.map_err(io::Error::other)?;
-        self.pending = None;
-        result
-    }
-
-    pub(crate) async fn write_text(&mut self, text: &str) -> io::Result<()> {
-        self.write_all(text.as_bytes()).await
-    }
-
-    pub(crate) async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let bytes = bytes.to_vec();
-        self.run(move |writer| {
-            writer.write_all(&bytes)?;
-            writer.flush()
-        })
-        .await
-    }
-
-    /// Materialize even an empty capture (the read snapshot contract).
-    pub(crate) async fn finish(mut self) -> io::Result<CompletedCapture> {
-        self.run(CaptureWriter::close).await
-    }
-
-    pub(crate) async fn finish_nonempty(mut self) -> io::Result<Option<CompletedCapture>> {
-        self.run(CaptureWriter::close_nonempty).await
+            .delete_capture(self.completed.capture)
+            .map_err(database)
     }
 }
 
 impl JobManager {
-    /// Reserve one job-bound capture. Builtin text captures set `remove_on_abandon`;
-    /// streams keep partial output readable.
     pub(crate) async fn pending_capture(
         &self,
         job: JobId,
@@ -348,11 +160,156 @@ impl JobManager {
     ) -> Result<PendingCapture, ToolError> {
         let output = self.output(job);
         crate::job::output::blocking(move || {
-            let mut pending = PendingCapture::create(&output, &field, kind)?;
-            pending.writer.remove_on_abandon = remove_on_abandon;
-            Ok(pending)
+            let abandon = if remove_on_abandon {
+                Abandon::Discard
+            } else {
+                Abandon::Retain
+            };
+            Ok(PendingCapture::new(
+                StoredCapture::reserve(&output, &field, kind, false)?,
+                abandon,
+            ))
         })
         .await
+    }
+}
+
+/// Imports locally produced output without exposing persistence to its producer.
+pub(crate) struct HostOutput {
+    context: OutputContext,
+    collector: Arc<CaptureCollector>,
+}
+
+pub(crate) struct CaptureCollector {
+    output: Output,
+    store: SessionStore,
+    runtime: tokio::runtime::Handle,
+    captures: Mutex<HashMap<CaptureId, CollectedCapture>>,
+}
+
+enum CollectedCapture {
+    Writing(StoredCapture),
+    Finished(CompletedCapture),
+    Closed,
+}
+
+impl HostOutput {
+    pub(crate) fn new(store: SessionStore, job: JobId) -> Self {
+        let collector = Arc::new(CaptureCollector::new(store, job));
+        Self {
+            context: OutputContext::new(collector.clone()),
+            collector,
+        }
+    }
+
+    pub(crate) fn context(&self) -> OutputContext {
+        self.context.clone()
+    }
+
+    pub(crate) fn finish(&self, output: ProducedOutput) -> io::Result<ToolOutput> {
+        if output
+            .captures
+            .iter()
+            .any(|capture| !self.context.owns(capture))
+        {
+            return Err(io::Error::other("capture belongs to another producer"));
+        }
+        let captures = self
+            .collector
+            .select(output.captures.iter().map(|capture| capture.id()))?;
+        let mut imported = ToolOutput::new(output.value)
+            .with_captures(captures)
+            .with_images(output.images);
+        imported.streams = output.streams;
+        Ok(imported)
+    }
+}
+
+impl CaptureCollector {
+    pub(crate) fn new(store: SessionStore, job: JobId) -> Self {
+        Self {
+            output: Output {
+                db: store.outputs(),
+                job,
+            },
+            store,
+            runtime: tokio::runtime::Handle::current(),
+            captures: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn select(
+        &self,
+        ids: impl IntoIterator<Item = CaptureId>,
+    ) -> io::Result<Vec<CompletedCapture>> {
+        let mut captures = self.captures.lock().unwrap_or_else(PoisonError::into_inner);
+        ids.into_iter()
+            .map(|id| match captures.remove(&id) {
+                Some(CollectedCapture::Finished(capture)) => Ok(capture),
+                _ => Err(io::Error::other("selected capture is not finished")),
+            })
+            .collect()
+    }
+}
+
+impl OutputSink for CaptureCollector {
+    fn abandon(&self, event: OutputEvent) -> Abandonment {
+        // Preserve local capture durability even when execution is forcibly dropped.
+        let _ = self.send(event);
+        Abandonment::Handled
+    }
+
+    fn send(&self, event: OutputEvent) -> io::Result<()> {
+        let event = match event {
+            OutputEvent::Capture(event) => event,
+            OutputEvent::Image { file, image } => {
+                self.runtime
+                    .block_on(self.store.store_image(file, &image))
+                    .map_err(io::Error::other)?;
+                return Ok(());
+            }
+        };
+        let mut captures = self.captures.lock().unwrap_or_else(PoisonError::into_inner);
+        match event {
+            CaptureEvent::Open { id, field, kind } => {
+                let std::collections::hash_map::Entry::Vacant(entry) = captures.entry(id) else {
+                    return Err(io::Error::other("duplicate capture"));
+                };
+                entry.insert(CollectedCapture::Writing(StoredCapture::reserve(
+                    &self.output,
+                    &field,
+                    kind,
+                    false,
+                )?));
+            }
+            CaptureEvent::Write { id, data } => {
+                let Some(CollectedCapture::Writing(target)) = captures.get_mut(&id) else {
+                    return Err(io::Error::other("capture is not open"));
+                };
+                target.append(&data)?;
+            }
+            CaptureEvent::Truncate { id, length } => {
+                let Some(CollectedCapture::Writing(target)) = captures.get_mut(&id) else {
+                    return Err(io::Error::other("capture is not open"));
+                };
+                target.truncate(length)?;
+            }
+            CaptureEvent::Discard { id } => {
+                let Some(CollectedCapture::Writing(target)) = captures.get_mut(&id) else {
+                    return Err(io::Error::other("capture is not open"));
+                };
+                target.discard()?;
+                captures.insert(id, CollectedCapture::Closed);
+            }
+            CaptureEvent::Finish { id } => {
+                let Some(CollectedCapture::Writing(target)) = captures.get_mut(&id) else {
+                    return Err(io::Error::other("capture is not open"));
+                };
+                let completed = target.finish()?;
+                captures.insert(id, CollectedCapture::Finished(completed));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -362,22 +319,19 @@ mod tests {
     use crate::job::output::{Saved, captures::available_captures, tests::fixture};
     use std::{
         future::{Future, poll_fn},
+        io::{Seek, Write},
         task::Poll,
     };
 
     fn text(output: &Output, field: TextCaptureField) -> PendingCapture {
-        let mut pending =
-            PendingCapture::create(output, &field.pointer(), CaptureKind::Text).unwrap();
-        pending.writer.remove_on_abandon = true;
-        pending
+        PendingCapture::new(
+            StoredCapture::reserve(output, &field.pointer(), CaptureKind::Text, false).unwrap(),
+            Abandon::Discard,
+        )
     }
 
     fn captures(output: &Output, terminal: bool) -> Vec<super::super::CaptureDescriptor> {
         available_captures(&Saved::load(output).unwrap(), terminal)
-    }
-
-    fn bytes(output: &Output, field: &str) -> Option<Vec<u8>> {
-        Saved::load(output).unwrap().bytes(field).unwrap()
     }
 
     /// Polls a write exactly once, then drops it mid-flight.
@@ -388,6 +342,94 @@ mod tests {
             Poll::Ready(())
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn host_output_preserves_abandonment_and_validates_origin() {
+        let (_root, manager, job) = fixture(None).await;
+        let host = HostOutput::new(manager.store().clone(), job);
+        let context = host.context();
+        let mut retained = context
+            .pending_stream_capture("/result/partial", CaptureKind::Text)
+            .await
+            .unwrap()
+            .open();
+        retained.write_all(b"buffered tail").unwrap();
+        let mut discarded = context
+            .text_capture(TextCaptureField::Content)
+            .await
+            .unwrap()
+            .open();
+        discarded.write_all(b"unpublished text").unwrap();
+        // A forced abort can drop the outer context before it reaches settlement.
+        drop(context);
+        drop(host);
+        drop(retained);
+        drop(discarded);
+        let output = manager.output(job);
+        assert_eq!(
+            output.test_bytes("/result/partial").unwrap(),
+            b"buffered tail"
+        );
+        assert!(output.test_bytes("/result/content").is_none());
+        let host = HostOutput::new(manager.store().clone(), job);
+        let context = host.context();
+        assert!(
+            context
+                .text_capture(TextCaptureField::Stdout)
+                .await
+                .unwrap()
+                .open_async()
+                .finish_nonempty()
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let mut writer = context
+            .pending_stream_capture("/result/matches", CaptureKind::Json)
+            .await
+            .unwrap()
+            .open();
+        writer.write_all(b"[1,2").unwrap();
+        writer.truncate(2).unwrap();
+        writer.write_all(b"]").unwrap();
+        let selected = writer.finish().unwrap();
+        let image = crate::media::Image::new(b"\x89PNG\r\n\x1a\nsource".to_vec()).unwrap();
+        let reference = context
+            .store_image(Some("image.png".into()), &image)
+            .await
+            .unwrap();
+        context.settle().await.unwrap();
+        assert_eq!(
+            manager
+                .store()
+                .read_blob(&reference.blob, image.bytes().len())
+                .await
+                .unwrap(),
+            image.bytes()
+        );
+        let foreign = HostOutput::new(manager.store().clone(), job);
+        assert!(
+            foreign
+                .finish(
+                    ProducedOutput::new(serde_json::Value::Null)
+                        .with_captures(vec![selected.clone()])
+                )
+                .is_err()
+        );
+        let output = host
+            .finish(
+                ProducedOutput::new(serde_json::json!({"matches": []}))
+                    .with_captures(vec![selected])
+                    .with_images(vec![reference]),
+            )
+            .unwrap();
+        assert!(output.captures[0].matches(job, "/result/matches"));
+        assert_eq!(
+            manager.output(job).test_bytes("/result/matches").unwrap(),
+            b"[1]"
+        );
     }
 
     #[tokio::test]
@@ -414,43 +456,30 @@ mod tests {
         let inventory = captures(&output, false);
         assert!(matches!(inventory[0].kind, CaptureKind::Json));
         let completed = writer.finish().unwrap();
-        assert!(completed.matches(job, "/result/matches"));
-        assert!(!completed.matches(JobId::new(job.get() + 1).unwrap(), "/result/matches"));
-        assert!(!completed.matches(job, "/result/paths"));
-        assert_eq!(bytes(&output, "/result/matches").unwrap(), b"[\"a\"]");
-    }
-
-    #[tokio::test]
-    async fn completion_is_bound_to_job_field_and_explicit_empty_policy() {
-        let (_root, manager, job) = fixture(None).await;
-        let output = manager.output(job);
-        let completed = text(&output, TextCaptureField::Console)
+        assert_eq!(output.test_bytes("/result/matches").unwrap(), b"[\"a\"]");
+        let empty = text(&output, TextCaptureField::Console)
             .open()
             .finish()
             .unwrap();
         let descriptors = captures(&output, true);
-        assert_eq!(
-            descriptors.len(),
-            1,
-            "finished empty captures stay registered"
-        );
-        assert_eq!(descriptors[0].field, "/result/console");
-        assert!(matches!(descriptors[0].kind, CaptureKind::Text));
-        assert!(
-            !descriptors[0].complete,
-            "a finalized but unpublished capture is not a completed job result"
-        );
-        assert!(completed.matches(job, "/result/console"));
-        assert!(!completed.matches(JobId::new(job.get() + 1).unwrap(), "/result/console"));
-        // Exercise the canonical producer publication path, not the terminal flag alone.
+        assert_eq!(descriptors.len(), 2);
+        assert!(descriptors.iter().all(|capture| !capture.complete));
         let document = serde_json::json!({"result": {}, "capture_complete": true});
-        crate::job::output::save_completed(&output, &document, vec![completed]).unwrap();
-        assert!(captures(&output, true)[0].complete);
-        assert!(!captures(&output, false)[0].complete);
+        crate::job::output::save_completed(&output, &document, vec![completed, empty]).unwrap();
+        assert!(
+            captures(&output, true)
+                .iter()
+                .all(|capture| capture.complete)
+        );
+        assert!(
+            captures(&output, false)
+                .iter()
+                .all(|capture| !capture.complete)
+        );
     }
 
     #[tokio::test]
-    async fn abandoned_and_failed_sync_writers_cannot_publish_completion() {
+    async fn writer_failures_and_interrupted_writes_preserve_capture_policy() {
         let (_root, manager, job) = fixture(None).await;
         let output = manager.output(job);
         let console = TextCaptureField::Console.pointer();
@@ -459,30 +488,27 @@ mod tests {
         let collision = PendingCapture::create(&output, &console, CaptureKind::Text);
         assert!(collision.is_err());
         assert_eq!(
-            bytes(&output, &console).unwrap(),
+            output.test_bytes(&console).unwrap(),
             b"before failure\n",
             "collision must not truncate or delete a live writer"
         );
         drop(capture);
-        assert!(bytes(&output, &console).is_none());
+        assert!(output.test_bytes(&console).is_none());
 
         let mut capture = text(&output, TextCaptureField::Console).open();
         // Deterministic storage fault: the capture row disappears under the writer.
-        output.db.delete_capture(capture.completed.capture).unwrap();
+        let capture_id = Saved::load(&output).unwrap().captures[&console].id;
+        output.db.delete_capture(capture_id).unwrap();
         assert!(capture.write_text("cannot write").is_err());
         assert!(capture.finish().is_err(), "an IO error poisons completion");
-        assert!(bytes(&output, &console).is_none());
-    }
-
-    #[tokio::test]
-    async fn interrupted_async_write_finishes_without_loss_or_duplication() {
-        let (_root, manager, job) = fixture(None).await;
-        let output = manager.output(job);
+        assert!(output.test_bytes(&console).is_none());
         let mut capture = text(&output, TextCaptureField::Stdout).open_async();
         let payload = "é🦀".repeat(700_000);
         poll_once(capture.write_text(&payload)).await;
         assert!(capture.finish_nonempty().await.unwrap().is_some());
-        let stdout = bytes(&output, &TextCaptureField::Stdout.pointer()).unwrap();
+        let stdout = output
+            .test_bytes(&TextCaptureField::Stdout.pointer())
+            .unwrap();
         assert_eq!(stdout, payload.as_bytes());
 
         let mut capture = text(&output, TextCaptureField::Stderr).open_async();
@@ -491,7 +517,7 @@ mod tests {
         // The in-flight write finishes, then the abandoned capture is discarded.
         let stderr = TextCaptureField::Stderr.pointer();
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while bytes(&output, &stderr).is_some() {
+            while output.test_bytes(&stderr).is_some() {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })

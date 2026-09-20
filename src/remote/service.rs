@@ -2,6 +2,7 @@
 use super::{
     SensitivePrompt, SensitivePromptError, SensitivePromptFuture, SensitivePromptHandler,
     backend::ProcessEnvironment,
+    flow::{CHUNK_BYTES, Credits, WINDOW},
     prompt::PromptAnswer,
     protocol::{PromptId, Request, RequestId, Response, spawn_owned_write, write_frame},
 };
@@ -94,7 +95,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> SensitivePromptHandler for ForwardP
 
 struct WorkerStream {
     input: mpsc::Sender<Option<Vec<u8>>>,
-    credit: Arc<tokio::sync::Semaphore>,
+    credit: Credits,
     cancellation: tokio_util::sync::CancellationToken,
 }
 impl Drop for WorkerStream {
@@ -152,8 +153,8 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
                 if self.streams.contains_key(&channel) {
                     return Err(std::io::Error::other("duplicate SSH stream"));
                 }
-                let (sender, mut input) = mpsc::channel(128);
-                let credit = Arc::new(tokio::sync::Semaphore::new(16));
+                let (sender, mut input) = mpsc::channel(WINDOW + 1);
+                let credit = Credits::default();
                 let cancellation = tokio_util::sync::CancellationToken::new();
                 self.streams.insert(
                     channel,
@@ -213,15 +214,14 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
                             Ok::<(), std::io::Error>(())
                         };
                         let read = async {
-                            let mut bytes = vec![0; 32 * 1024];
+                            let mut bytes = vec![0; CHUNK_BYTES];
                             loop {
-                                let permit =
-                                    credit.acquire().await.map_err(std::io::Error::other)?;
+                                credit.take().await?;
                                 let count = stdout.read(&mut bytes).await?;
                                 if count == 0 {
+                                    credit.acknowledge()?;
                                     break;
                                 }
-                                permit.forget();
                                 write_frame(
                                     &mut *output.lock().await,
                                     &Response::StreamData {
@@ -252,7 +252,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
                 });
             }
             Request::StreamData { channel, data } => {
-                if data.len() > 32 * 1024 {
+                if data.len() > CHUNK_BYTES {
                     return Err(std::io::Error::other("oversized stream chunk"));
                 }
                 if let Some(sender) = self.streams.get(&channel) {
@@ -268,10 +268,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
             }
             Request::StreamAck { channel } => {
                 if let Some(stream) = self.streams.get(&channel) {
-                    if stream.credit.available_permits() >= 16 {
-                        return Err(std::io::Error::other("invalid stream credit"));
-                    }
-                    stream.credit.add_permits(1);
+                    stream.credit.acknowledge()?;
                 }
             }
             Request::StreamClose { channel } => {

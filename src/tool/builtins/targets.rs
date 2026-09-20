@@ -7,7 +7,7 @@ use crate::{
         SshOptions, TargetConfig, TargetDefinition, TargetRecord, TargetRouter, TargetSource,
     },
     tool::{
-        RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
+        AdmissionError, RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
         policy::{Capability, PermissionUse, ResourceId},
     },
 };
@@ -107,7 +107,7 @@ ssh.options can run commands, so it also requires exec."#,
             )
             .argument_permissions(|_, arguments| {
                 let args: TargetAddArgs =
-                    serde_json::from_value(arguments.clone()).map_err(ToolError::invalid)?;
+                    serde_json::from_value(arguments.clone()).map_err(AdmissionError::invalid)?;
                 Ok(add_permissions(&args.config.ssh))
             }),
         move |context, args| {

@@ -403,7 +403,6 @@ impl SessionRuntime {
                 agent: retained.owner,
                 job: retained.job,
                 parent: retained.parent,
-                scope: retained.scope,
                 capabilities: owner.capabilities,
                 cancellation: retained.cancellation,
             };

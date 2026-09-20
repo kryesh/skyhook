@@ -1,3 +1,6 @@
+use crate::tool::ToolOptions;
+use crate::tool::invocation::{LocalCatalogBuilder, LocalContext, LocalError};
+use crate::tool::output::ProducedOutput;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
@@ -8,10 +11,10 @@ use tokio::{
     process::Command,
 };
 
-use crate::job::output::{CompletedCapture, TextCaptureField};
 use crate::tool::StreamEnd;
+use crate::tool::output::{FinishedOutput, TextCaptureField};
 use crate::tool::{
-    PathKind, RegistryError, ToolContext, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder,
+    PathKind, RegistryError,
     policy::{Capability, PathAccess},
 };
 
@@ -20,7 +23,7 @@ use capture::Capture;
 
 const PROCESS_CHUNK: usize = 8 * 1024;
 
-pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), RegistryError> {
+pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
     let options = || {
         ToolOptions::new(vec![Capability::Exec])
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
@@ -37,7 +40,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
             let (program, arguments) = args
                 .argv
                 .split_first()
-                .ok_or_else(|| ToolError::InvalidArguments("argv cannot be empty".to_owned()))?;
+                .ok_or_else(|| LocalError::InvalidArguments("argv cannot be empty".to_owned()))?;
             let cwd = working_directory(&args.cwd).await?;
             let mut command = Command::new(program);
             command.args(arguments).current_dir(cwd);
@@ -52,7 +55,7 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
         options(),
         move |context, args| async move {
             if args.command.is_empty() {
-                return Err(ToolError::InvalidArguments(
+                return Err(LocalError::InvalidArguments(
                     "command cannot be empty".to_owned(),
                 ));
             }
@@ -67,10 +70,10 @@ pub(super) fn register(builder: &mut ToolRegistryBuilder) -> Result<(), Registry
     Ok(())
 }
 
-async fn working_directory(cwd: &str) -> Result<&std::path::Path, ToolError> {
+async fn working_directory(cwd: &str) -> Result<&std::path::Path, LocalError> {
     let path = std::path::Path::new(cwd);
     if !tokio::fs::metadata(path).await?.is_dir() {
-        return Err(ToolError::Failed(format!(
+        return Err(LocalError::Failed(format!(
             "working directory is not a directory: {}",
             path.display()
         )));
@@ -79,12 +82,12 @@ async fn working_directory(cwd: &str) -> Result<&std::path::Path, ToolError> {
 }
 
 async fn run_process(
-    context: ToolContext,
+    context: LocalContext,
     mut command: Command,
     timeout: Option<u64>,
-) -> Result<ProcessResult, ToolError> {
+) -> Result<ProcessResult, LocalError> {
     if timeout.is_some_and(|seconds| !(1..=3_600).contains(&seconds)) {
-        return Err(ToolError::InvalidArguments(
+        return Err(LocalError::InvalidArguments(
             "timeout must be 1 through 3600".to_owned(),
         ));
     }
@@ -98,7 +101,7 @@ async fn run_process(
                 crate::remote::RejectSensitivePrompts,
             ))
             .map_err(|error| {
-                ToolError::Failed(format!("failed to start noninteractive askpass: {error}"))
+                LocalError::Failed(format!("failed to start noninteractive askpass: {error}"))
             })?,
         )
     };
@@ -131,22 +134,22 @@ async fn run_process(
         }
     }
     if context.is_cancelled() {
-        return Err(ToolError::Cancelled);
+        return Err(LocalError::Cancelled);
     }
     let mut child = command.spawn()?;
     #[cfg(unix)]
     let group = ProcessGroup(
         i32::try_from(child.id().expect("spawned process has an ID"))
-            .map_err(|_| ToolError::Failed("process ID is out of range".to_owned()))?,
+            .map_err(|_| LocalError::Failed("process ID is out of range".to_owned()))?,
     );
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| ToolError::Failed("process stdout unavailable".to_owned()))?;
+        .ok_or_else(|| LocalError::Failed("process stdout unavailable".to_owned()))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| ToolError::Failed("process stderr unavailable".to_owned()))?;
+        .ok_or_else(|| LocalError::Failed("process stderr unavailable".to_owned()))?;
 
     let deadline = async {
         match timeout {
@@ -163,11 +166,11 @@ async fn run_process(
     let completion = {
         let execution = async {
             let (status, (), ()) = tokio::try_join!(
-                async { child.wait().await.map_err(ToolError::from) },
-                capture_stream(context.clone(), stdout, &mut stdout_capture),
-                capture_stream(context.clone(), stderr, &mut stderr_capture),
+                async { child.wait().await.map_err(LocalError::from) },
+                capture_stream(stdout, &mut stdout_capture),
+                capture_stream(stderr, &mut stderr_capture),
             )?;
-            Ok::<_, ToolError>(status)
+            Ok::<_, LocalError>(status)
         };
         tokio::pin!(execution);
         tokio::select! {
@@ -180,10 +183,10 @@ async fn run_process(
         #[cfg(unix)]
         group.kill();
         child.kill().await?;
-        child.wait().await.map_err(ToolError::from)
+        child.wait().await.map_err(LocalError::from)
     };
     let finish = async move |status: ExitStatus| {
-        Ok::<_, ToolError>(ProcessResult {
+        Ok::<_, LocalError>(ProcessResult {
             exit_code: status.code(),
             captures: [
                 stdout_capture.finish().await?,
@@ -204,14 +207,14 @@ async fn run_process(
                 timed_out: true,
                 ..finish(stop().await?).await?
             };
-            Err(ToolError::with_output(
+            Err(LocalError::with_output(
                 format!("process timed out after {seconds} seconds"),
                 output.into_output(),
             ))
         }
         ProcessCompletion::Cancelled => {
             finish(stop().await?).await?;
-            Err(ToolError::Cancelled)
+            Err(LocalError::Cancelled)
         }
     }
 }
@@ -240,11 +243,7 @@ impl Drop for ProcessGroup {
     }
 }
 
-async fn capture_stream<R>(
-    context: ToolContext,
-    mut stream: R,
-    capture: &mut Capture,
-) -> Result<(), ToolError>
+async fn capture_stream<R>(mut stream: R, capture: &mut Capture) -> Result<(), LocalError>
 where
     R: AsyncRead + Unpin,
 {
@@ -255,7 +254,6 @@ where
             break;
         }
         capture.write_bytes(&buffer[..read]).await?;
-        context.output_changed().await;
     }
     Ok(())
 }
@@ -289,12 +287,12 @@ struct ShellArgs {
 /// Internal output retains completed field bindings until the canonical product handoff.
 struct ProcessResult {
     exit_code: Option<i32>,
-    captures: Vec<CompletedCapture>,
+    captures: Vec<FinishedOutput>,
     timed_out: bool,
 }
 
 impl ProcessResult {
-    fn into_output(self) -> ToolOutput {
+    fn into_output(self) -> ProducedOutput {
         let output = ProcessOutput {
             exit_code: self.exit_code,
             // Completed captures replace these fields when bytes were observed. An
@@ -305,7 +303,7 @@ impl ProcessResult {
             timed_out: self.timed_out,
         };
         let mut output =
-            ToolOutput::new(serde_json::to_value(output).expect("process output serializes"))
+            ProducedOutput::new(serde_json::to_value(output).expect("process output serializes"))
                 .with_captures(self.captures);
         if self.timed_out {
             output.streams = StreamEnd::Cut;
@@ -330,16 +328,17 @@ mod tests {
     use std::{
         io::Read as _,
         os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd},
+        sync::Arc,
     };
 
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::tool::ToolRegistryBuilder;
     use crate::{
         job::{JobState, output::OutputArgs},
         tests::TestRuntime,
         tool::{
-            ToolRegistryBuilder,
             executor::{ExecutionError, ToolExecutor},
             policy::CapabilitySet,
         },
@@ -347,7 +346,7 @@ mod tests {
 
     fn executor(runtime: &TestRuntime, interactive: bool) -> ToolExecutor {
         let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder).unwrap();
+        builder.register_local(register).unwrap();
         let mut capabilities = CapabilitySet::default();
         capabilities.remove(Capability::Targets);
         if !interactive {
@@ -654,17 +653,39 @@ mod tests {
         ];
         let command = r#"printf '%s\n' "$SSH_ASKPASS" "$SSH_ASKPASS_REQUIRE" "$DISPLAY" "$SKYHOOK_ASKPASS_SOCKET" "$SSH_AUTH_SOCK"; if test -x "$SSH_ASKPASS" && test -S "$SKYHOOK_ASKPASS_SOCKET"; then printf live; fi"#;
         for interactive in [false, true] {
-            let runtime = TestRuntime::new().await;
-            let environment = inherited
+            let root = tempfile::tempdir().unwrap();
+            let environment: crate::remote::backend::ProcessEnvironment = inherited
                 .iter()
                 .map(|(k, v)| ((*k).into(), (*v).into()))
                 .collect();
-            let executor = executor(&runtime, interactive).with_process_environment(environment);
+            let catalog = crate::tool::invocation::LocalCatalog::builtins().unwrap();
+            let mut capabilities: crate::tool::policy::CapabilitySet =
+                [Capability::Exec].into_iter().collect();
+            if interactive {
+                capabilities.insert(Capability::Interactive);
+            }
             for tool in ["exec", "shell"] {
-                let output = executor.run_host(&runtime.agent, tool, sh_args(tool, command, None));
-                let output = output.await.unwrap().output.value;
+                let sink = Arc::new(crate::tool::invocation::tests::CapturedOutput::default());
+                let producer = crate::tool::output::OutputContext::new(sink.clone());
+                let arguments = sh_args(tool, command, None);
+                let context = crate::tool::invocation::LocalContext::new(
+                    crate::execution::ExecutionLocation::root(root.path().to_owned()),
+                    capabilities.clone(),
+                    environment.clone(),
+                    tokio_util::sync::CancellationToken::new(),
+                    producer.clone(),
+                    Arc::new(crate::tool::invocation::tests::Authorizations::default()),
+                    arguments.clone(),
+                );
+                let output = catalog
+                    .run(tool, arguments, context, root.path())
+                    .await
+                    .unwrap()
+                    .value;
+                producer.settle().await.unwrap();
+                let stdout = String::from_utf8(sink.bytes()).unwrap();
                 assert_eq!(output["exit_code"], 0);
-                let lines: Vec<_> = output["stdout"].as_str().unwrap().lines().collect();
+                let lines: Vec<_> = stdout.lines().collect();
                 assert_eq!(
                     lines[4], "/inherited/agent-socket",
                     "nonprompting credentials remain usable"
