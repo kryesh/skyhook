@@ -17,7 +17,7 @@
   Handles survive turns, retries, questions, and compaction, and are released when the agent exits.
   Model-profile changes prepare a replacement before committing, preserve history, and reset token
   calibration. Equivalent profiles retain their handle. Resuming opens a fresh handle with the
-  same agent cache identity; compaction clears calibration from the previous history projection.
+  same agent cache identity; calibration carries across compaction.
 - `tool::ToolRegistryBuilder` supports typed and JSON-based tools, while `tool::executor::ToolExecutor`
   turns every invocation into a supervised job. Typed registrations generate both input and output
   schemas; compact result shapes are included in model and script documentation.

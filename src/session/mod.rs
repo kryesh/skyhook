@@ -356,9 +356,24 @@ impl Writer {
             entries.extend(follow(first));
         }
         let mut records = Vec::with_capacity(entries.len());
-        for (offset, (agent, event)) in entries.into_iter().enumerate() {
+        // A mode's first use pins its definition. Appends are serialized here, so
+        // agents applying one mode at once still pin it once.
+        let mut pinned: Option<std::collections::HashSet<String>> = None;
+        for (offset, (agent, mut event)) in entries.into_iter().enumerate() {
             if agent.session() != self.shared.id {
                 return Err(SessionError::WrongSession);
+            }
+            if let SessionEvent::AgentStarted {
+                mode: Some(mode), ..
+            }
+            | SessionEvent::ModeChanged { mode, .. } = &mut event
+                && mode.definition.is_some()
+            {
+                let pinned = pinned
+                    .get_or_insert_with(|| pinned_modes(&state.records).into_keys().collect());
+                if !pinned.insert(mode.name.clone()) {
+                    mode.definition = None;
+                }
             }
             records.push(EventRecord {
                 id: EventId::generate()?,
@@ -1056,7 +1071,10 @@ pub(crate) mod fixture {
     pub(crate) fn profile() -> ProfileSnapshot {
         ProfileSnapshot {
             name: "test".into(),
-            profile: ModelProfile::new("test", "test", None, 128_000, 4096, false),
+            profile: ModelProfile {
+                hint: Some("Test model.".into()),
+                ..ModelProfile::new("test", "test", None, 128_000, 4096, false)
+            },
         }
     }
 

@@ -139,10 +139,8 @@ impl PreparedAgentLaunch {
                     profile: agent_loop.context.profile.clone(),
                 }),
                 available_depth: u32::try_from(available_depth).unwrap_or(u32::MAX),
-                mode: match &agent_loop.settings.mode {
-                    Some(mode) => Some(runtime.mode_selection(mode).await),
-                    None => None,
-                },
+                mode: (agent_loop.settings.mode.as_deref())
+                    .map(|mode| runtime.mode_selection(mode)),
                 capabilities: agent_loop.settings.capabilities.iter().collect(),
                 location: agent_loop.location.clone(),
             };
@@ -292,14 +290,12 @@ impl SessionRuntime {
         Ok((profile, system))
     }
 
-    /// The journal form of a mode about to be applied: its first use in the session
-    /// pins the definition it is used under.
-    pub(super) async fn mode_selection(&self, name: &str) -> crate::session::ModeSelection {
-        let pinned = crate::session::pinned_modes(&self.store.records().await);
-        let definition = self.modes.get(name);
+    /// The journal form of a mode about to be applied. The session keeps the
+    /// definition of a mode's first use only.
+    pub(super) fn mode_selection(&self, name: &str) -> crate::session::ModeSelection {
         crate::session::ModeSelection {
             name: name.to_owned(),
-            definition: definition.filter(|_| !pinned.contains_key(name)).cloned(),
+            definition: self.modes.get(name).cloned(),
         }
     }
 

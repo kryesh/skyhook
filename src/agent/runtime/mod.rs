@@ -258,7 +258,7 @@ struct AgentLaunch {
     todos: Option<Vec<TodoItem>>,
     available_depth: usize,
     location: crate::execution::ExecutionLocation,
-    /// The root agent's mode; children have none.
+    /// The agent's mode; a child has one only when its parent chose it.
     mode: Option<String>,
     /// The most this agent may hold: its mode's set, or its parent's current set.
     capabilities: CapabilitySet,
@@ -277,7 +277,7 @@ struct AgentLoop {
 /// What an agent currently runs under; a consumed input may change any of it.
 struct AgentSettings {
     model_profile: String,
-    /// The root agent's mode; children and sessions without modes have none.
+    /// The agent's mode, when it runs in one. Only the root's can change.
     mode: Option<String>,
     capabilities: CapabilitySet,
 }

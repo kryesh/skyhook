@@ -15,7 +15,7 @@ impl SessionRuntime {
         request: ModelRequest,
         request_sequence: u64,
         model_attempt: &mut u64,
-    ) -> Result<compaction::Continuation, HarnessError> {
+    ) -> Result<(compaction::Continuation, Usage), HarnessError> {
         let mut transient_attempt = 0u64;
         loop {
             if turn.cancellation.is_cancelled() {
@@ -63,7 +63,7 @@ impl SessionRuntime {
         provider: &mut dyn ProviderContext,
         request: ModelRequest,
         request_sequence: u64,
-    ) -> Result<compaction::Continuation, HarnessError> {
+    ) -> Result<(compaction::Continuation, Usage), HarnessError> {
         let agent = turn.agent;
         let mut stream = tokio::select! {
             result = provider.invoke(request) => result?,
@@ -121,7 +121,8 @@ impl SessionRuntime {
             ));
         }
         let text = crate::provider::protocol::visible_text(&blocks);
-        compaction::continuation(&text).map_err(HarnessError::Compaction)
+        let continuation = compaction::continuation(&text).map_err(HarnessError::Compaction)?;
+        Ok((continuation, usage))
     }
 }
 

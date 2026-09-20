@@ -150,9 +150,12 @@ impl std::ops::BitAnd for &CapabilitySet {
 pub struct Mode {
     #[serde(deserialize_with = "deserialize_policy_capabilities")]
     pub capabilities: Vec<Capability>,
-    /// Added to the root agent's system prompt while the mode is active.
+    /// Added to the system prompt of an agent running in the mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Describes the mode to agents choosing one for a child; without it they cannot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 fn deserialize_policy_capabilities<'de, D>(deserializer: D) -> Result<Vec<Capability>, D::Error>

@@ -48,13 +48,13 @@ fn timeout_error(phase: &str) -> ProviderError {
 }
 
 /// Make one HTTP/SSE attempt with default timeouts; the agent runtime owns retries.
-/// Dropping the returned stream cancels its body.
+/// Returns the response headers with the stream. Dropping the stream cancels its body.
 pub(crate) async fn post_sse(
     client: &Client,
     url: &str,
     headers: HeaderMap,
     body: &Value,
-) -> Result<SseStream, ProviderError> {
+) -> Result<(HeaderMap, SseStream), ProviderError> {
     post_sse_with_timeouts(client, url, headers, body, ProviderTimeouts::default()).await
 }
 
@@ -64,7 +64,7 @@ pub(crate) async fn post_sse_with_timeouts(
     mut headers: HeaderMap,
     body: &Value,
     timeouts: ProviderTimeouts,
-) -> Result<SseStream, ProviderError> {
+) -> Result<(HeaderMap, SseStream), ProviderError> {
     headers.insert(ACCEPT, "text/event-stream".parse().expect("static header"));
     let deadline = tokio::time::Instant::now() + timeouts.startup;
     let sent = tokio::time::timeout_at(
@@ -80,23 +80,22 @@ pub(crate) async fn post_sse_with_timeouts(
     if !response.status().is_success() {
         return Err(status_error(response, deadline, timeouts.read_idle).await);
     }
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|header| header.to_str().ok())
-        .unwrap_or("");
-    if !content_type
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .eq_ignore_ascii_case("text/event-stream")
-    {
+    // Some services stream events without labelling them; only a declared
+    // other type is refused, and the event parser judges the rest.
+    let declared = response.headers().get(CONTENT_TYPE);
+    if declared.is_some_and(|header| {
+        let essence = header.to_str().unwrap_or("").split(';').next();
+        !essence
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("text/event-stream")
+    }) {
         return Err(ProviderError::protocol(
             "provider returned a non-SSE content type",
         ));
     }
-    Ok(response_stream(response, timeouts.read_idle))
+    let headers = response.headers().clone();
+    Ok((headers, response_stream(response, timeouts.read_idle)))
 }
 
 /// Parse a single Retry-After field without retaining server-controlled text.
@@ -373,18 +372,22 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn wire_headers_body_and_eof() {
-        let server = Server::start(vec![Plan::reply(reply(
-            "200 OK",
-            "Content-Type: text/event-stream; charset=utf-8\r\n",
-            "data: one\r\n\r\ndata: two",
-        ))])
-        .await;
+        // An unlabelled event stream is accepted as readily as a labelled one.
+        for content_type in ["Content-Type: text/event-stream; charset=utf-8\r\n", ""] {
+            wire_round_trip(content_type).await;
+        }
+    }
+
+    async fn wire_round_trip(content_type: &str) {
+        let body = "data: one\r\n\r\ndata: two";
+        let server = Server::start(vec![Plan::reply(reply("200 OK", content_type, body))]).await;
         let body = serde_json::json!({"model":"literal-model", "stream":true});
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer test-key".parse().unwrap());
-        let events = post_sse(&client().unwrap(), &server.url, headers, &body)
+        let (_, events) = post_sse(&client().unwrap(), &server.url, headers, &body)
             .await
-            .unwrap()
+            .unwrap();
+        let events = events
             .map(|event| event.map(|event| (event.event, event.data)))
             .collect::<Vec<_>>()
             .await;
@@ -503,7 +506,7 @@ pub(crate) mod tests {
         assert_eq!(error.message, "provider HTTP startup timeout");
         let first = server.request().await;
         assert!(server.unclaimed().await.is_empty(), "unexpected replay");
-        let mut stream = post().await.unwrap();
+        let (_, mut stream) = post().await.unwrap();
         assert_eq!(stream.next().await.unwrap().unwrap().data, "done");
         assert!(stream.next().await.is_none());
         assert_eq!(first, server.request().await);

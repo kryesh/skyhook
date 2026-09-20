@@ -155,7 +155,6 @@ pub struct App {
     unsaved_status: Vec<(AgentId, String)>,
     stopping: bool,
     pub animating: bool,
-    pub thinking: bool,
     pub details: bool,
     pub outputs: OutputStore,
     last_output: Instant,
@@ -195,7 +194,6 @@ impl App {
             model::EntryView {
                 agent: &self.selected,
                 view: &view,
-                thinking: false,
                 all_details: false,
             },
             &OutputStore::default(),
@@ -268,7 +266,6 @@ impl App {
             unsaved_status: Vec::new(),
             stopping: false,
             animating: false,
-            thinking: false,
             details: false,
             outputs: OutputStore::default(),
             last_output: Instant::now(),

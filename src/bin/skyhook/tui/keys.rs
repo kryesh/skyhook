@@ -42,7 +42,7 @@ commands! {
     Sessions => ("sessions", "Switch session", "ctrl+x s", &["switch"], true),
     Close => ("close", "Close session", "ctrl+x w", &[], true),
     Model => ("model", "Model", "ctrl+x m", &["models"], true),
-    Mode => ("mode", "Mode", "", &["modes"], true),
+    Mode => ("mode", "Mode", "ctrl+x p", &["modes"], true),
     Agents => ("agents", "Inspect agent", "ctrl+x a", &[], true),
     Inspect => ("inspect", "Focus conversation", "", &[], false),
     Copy => ("copy", "Copy message", "ctrl+x y", &[], true),
@@ -55,14 +55,13 @@ commands! {
     PreviousTab => ("previous-tab", "Previous tab", "ctrl+x left", &[], false),
     NextTab => ("next-tab", "Next tab", "ctrl+x right", &[], false),
     Commands => ("commands", "Command palette", "ctrl+p", &[], false),
-    Thinking => ("thinking", "Expand/collapse saved reasoning", "", &[], true),
     Details => ("details", "Toggle tool details", "ctrl+x t", &[], true),
     Attachments => ("attachments", "Inspect or remove attachments", "", &[], true),
     Queue => ("queue", "Edit queued follow-ups", "ctrl+x i", &[], true),
     Resume => ("resume", "Resume queued input", "", &[], true),
     Retry => ("retry", "Continue failed or interrupted turns", "ctrl+x c", &["continue"], true),
     Attention => ("attention", "Reopen questions and permissions", "ctrl+x r", &[], true),
-    Help => ("help", "Help and shortcuts", "", &[], true),
+    Help => ("help", "Help and shortcuts", "ctrl+x h", &[], true),
     Files => ("files", "Attach workspace file", "ctrl+x f", &[], true),
     Sidebar => ("sidebar", "Toggle sidebar", "ctrl+x b", &[], true),
 }
@@ -239,10 +238,13 @@ mod tests {
         );
         assert_eq!(keys.action(None, key("ctrl+p")), Some(Command::Commands));
         assert!(keys.prefix(leader));
-        assert_eq!(keys.binding(Command::Mode), None);
+        assert_eq!(keys.binding(Command::Attachments), None);
         let hint = keys.leader_hint(
             leader,
-            &[(Command::Mode, "Mode"), (Command::Model, "Model")],
+            &[
+                (Command::Attachments, "Attachments"),
+                (Command::Model, "Model"),
+            ],
         );
         assert_eq!(hint, "Ctrl+X: M Model");
     }

@@ -43,9 +43,11 @@ impl Message {
     }
 
     /// Drop replay bound to the conversation that produced it, keeping display text. Changing
-    /// that conversation, as compaction does, invalidates such replay; other replay is kept.
-    pub fn strip_bound_reasoning(&mut self) {
-        if let Self::Assistant(items) = self {
+    /// that conversation, as compaction or a mode switch does, invalidates such replay; other
+    /// replay is kept. A message left content-free cannot be encoded and is dropped whole.
+    #[must_use]
+    pub fn without_bound_reasoning(mut self) -> Option<Self> {
+        if let Self::Assistant(items) = &mut self {
             for item in items {
                 if item
                     .replay
@@ -56,6 +58,7 @@ impl Message {
                 }
             }
         }
+        (!self.is_content_free()).then_some(self)
     }
 }
 
@@ -149,7 +152,7 @@ pub struct ReplayEnvelope {
     pub scope: String,
     pub payload: Value,
     /// Signed state bound to the exact conversation before it; changing that history, as
-    /// compaction does, invalidates it.
+    /// compaction or a mode switch does, invalidates it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub conversation_bound: bool,
 }

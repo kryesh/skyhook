@@ -260,7 +260,6 @@ impl Entry {
 pub struct EntryView<'a> {
     pub agent: &'a AgentId,
     pub view: &'a View,
-    pub thinking: bool,
     pub all_details: bool,
 }
 

@@ -512,6 +512,7 @@ mod tests {
         let mode = |capabilities: &[Capability], instructions: Option<&str>| Mode {
             capabilities: capabilities.to_vec(),
             instructions: instructions.map(str::to_owned),
+            hint: None,
         };
         let look = mode(&[Capability::Read, Capability::Agents], Some("Only look."));
         // The session's ceiling has no targets, so no mode grants them. A mode is a
@@ -554,6 +555,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(session.prompt("delegate").await.unwrap(), "first");
+        let signed = crate::provider::protocol::ReplayEnvelope {
+            version: 1,
+            protocol: "test".into(),
+            model: "test".into(),
+            scope: String::new(),
+            payload: json!({"signature": "bound to the look conversation"}),
+            conversation_bound: true,
+        };
+        let signed = AssistantContent::reasoning("signed", 0, "visible", Some(signed));
+        let signed = Message::Assistant(vec![signed]);
+        session.runtime.commit(&session.root, signed).await.unwrap();
         let prompt = session.prompt_with_options("write", &[], in_mode("work"));
         assert_eq!(prompt.await.unwrap(), "second");
         let prompt = session.prompt_with_options("again", &[], in_mode("work"));
@@ -578,6 +590,16 @@ mod tests {
         assert!(!prompt(child).contains("<mode") && !offers(child, "write"));
         assert!(!prompt(working).contains("<mode") && offers(working, "write"));
         assert_eq!(captured[4].system, working.system);
+        // The switch replaced the conversation its signed reasoning was bound to.
+        let replays = |request: &ModelRequest| {
+            let items = request.messages().filter_map(|message| match message {
+                Message::Assistant(items) => Some(items),
+                _ => None,
+            });
+            let signed = items.flatten().find(|item| item.id == "signed").cloned();
+            signed.unwrap().replay.is_some()
+        };
+        assert!(!replays(working) && !replays(&captured[4]));
 
         let records = session.runtime.store.records().await;
         let changes = events!(&records, SessionEvent::ModeChanged { mode, capabilities } => (mode.clone(), capabilities.clone()));
@@ -681,9 +703,13 @@ mod tests {
         let mode = |capabilities: &[Capability]| Mode {
             capabilities: capabilities.to_vec(),
             instructions: None,
+            hint: None,
         };
         let work = mode(&[Capability::Read, Capability::Write, Capability::Agents]);
-        let profile = |model: &str| ModelProfile::new("test", model, None, 128_000, 4096, false);
+        let profile = |model: &str| ModelProfile {
+            hint: Some(model.to_owned()),
+            ..ModelProfile::new("test", model, None, 128_000, 4096, false)
+        };
         let harness = HarnessBuilder::new(root.path())
             .session_root(root.path().join("sessions"))
             .provider("test", tracking.clone())
@@ -774,6 +800,7 @@ mod tests {
         let mode = |capabilities: &[Capability], instructions: &str| Mode {
             capabilities: capabilities.to_vec(),
             instructions: Some(instructions.to_owned()),
+            hint: None,
         };
         let build = |ceiling: CapabilitySet, modes: &[(&str, Mode)], reply: &str| {
             let provider = scripted_provider(&requests, [answer(reply)]);
@@ -1231,6 +1258,49 @@ mod tests {
         assert!(captured[0].messages().eq(captured[1].messages()));
         session.shutdown().await.unwrap();
         tokio::task::yield_now().await;
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_job_finishing_after_an_interrupt_waits_for_the_next_input() {
+        let root = tempfile::tempdir().unwrap();
+        let requests = Requests::default();
+        let steps = [
+            Step::new(answer("initial")).midstream(),
+            Step::new(answer("jobs handled")),
+        ];
+        let provider = Script::new(steps, &requests);
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        let task = tokio::spawn({
+            let session = session.clone();
+            async move { session.prompt("start").await }
+        });
+        provider.request(0).await;
+        session.interrupt().await;
+        assert!(task.await.unwrap().is_err());
+        // Background work owned by the interrupted root completes afterwards.
+        let arguments = json!({"source": "return 1", "bg": true});
+        let executor = &session.runtime.executor;
+        let running = executor.execute(session.root.clone(), "script", arguments, None);
+        let job = running.await.unwrap().job;
+        bounded(async {
+            while session.runtime.jobs.has_running(&session.root).await {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(requests.lock().unwrap().len(), 1, "job {job} woke the root");
+        // The completion reaches the model with the next request instead.
+        assert_eq!(session.continue_turn().await.unwrap(), "jobs handled");
+        let captured = requests.lock().unwrap().clone();
+        let delivered = captured[1].messages().any(|message| {
+            matches!(message, Message::User(blocks) if blocks.iter().any(|block|
+                matches!(block, UserContent::Runtime { text } if text.contains("skyhook_job_events"))))
+        });
+        assert!(captured.len() == 2 && delivered);
         session.shutdown().await.unwrap();
     }
 

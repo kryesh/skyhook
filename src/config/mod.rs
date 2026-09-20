@@ -83,6 +83,7 @@ fn default_modes() -> indexmap::IndexMap<String, Mode> {
     let general = Mode {
         capabilities,
         instructions: None,
+        hint: None,
     };
     [(default_mode(), general)].into()
 }
@@ -177,17 +178,25 @@ impl Config {
             profile
                 .validate_limits()
                 .map_err(|message| ConfigError::Model(name.clone(), message.to_owned()))?;
+            if profile
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.trim().is_empty())
+            {
+                return Err(ConfigError::Model(
+                    name.clone(),
+                    "hint must not be empty".into(),
+                ));
+            }
         }
         for (name, mode) in &self.modes {
-            if mode
-                .instructions
-                .as_deref()
-                .is_some_and(|text| text.trim().is_empty())
-            {
-                return Err(ConfigError::Mode(
-                    name.clone(),
-                    "instructions are empty".into(),
-                ));
+            for (field, text) in [("instructions", &mode.instructions), ("hint", &mode.hint)] {
+                if text.as_deref().is_some_and(|text| text.trim().is_empty()) {
+                    return Err(ConfigError::Mode(
+                        name.clone(),
+                        format!("{field} must not be empty"),
+                    ));
+                }
             }
         }
         Ok(providers)
@@ -407,6 +416,16 @@ mod tests {
             [Capability::Read, Capability::Targets]
         );
         assert_eq!(declared.modes["a"].instructions.as_deref(), Some("look"));
+        let hinted = mode("capabilities = []\nhint = 'Thinks'").unwrap();
+        assert_eq!(hinted.modes["m"].hint.as_deref(), Some("Thinks"));
+        for blank in ["instructions", "hint"] {
+            let error = mode(&format!("capabilities = []\n{blank} = ' '")).unwrap();
+            let error = error.into_runtime().err().unwrap().to_string();
+            assert!(
+                error.contains(&format!("{blank} must not be empty")),
+                "{error}"
+            );
+        }
         assert!(replaced.ceiling().iter().eq([Capability::Targets]));
         assert!(
             mode("")

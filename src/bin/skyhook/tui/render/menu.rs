@@ -77,7 +77,7 @@ pub(super) fn draw_menu_item(
 ) {
     let label = model::clean(item.label);
     let detail = model::clean(item.detail);
-    let fg = if selected && !matches!(kind, MenuKind::Info(_) | MenuKind::Output(_, _)) {
+    let fg = if selected && !matches!(kind, MenuKind::Output(_, _)) {
         p.content.primary
     } else {
         p.fg
@@ -132,7 +132,9 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
     };
     let margin = 7.min(area.width.saturating_sub(minimum_width) / 2);
     let width = area.width.saturating_sub(margin * 2);
-    let rect = r(area.x + margin, area.y, width, area.height);
+    // Likewise a short transcript keeps every row for the palette.
+    let gap = 1.min(area.height.saturating_sub(6) / 2);
+    let rect = r(area.x + margin, area.y + gap, width, area.height - gap * 2);
     fill(frame, rect, p.input);
     text(
         frame,
@@ -181,10 +183,16 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
         );
     }
     let height = rect.height.saturating_sub(3 + header_height) as usize;
-    let top = menu.selected.saturating_sub(height.saturating_sub(1));
+    // A text page has nothing to pick: its selection is the first visible line.
+    let page = matches!(menu.kind, MenuKind::Info(_));
+    let top = if page {
+        menu.selected.min(items.len().saturating_sub(height))
+    } else {
+        menu.selected.saturating_sub(height.saturating_sub(1))
+    };
     for (i, item) in items.iter().enumerate().skip(top).take(height) {
         let y = rect.y + 2 + header_height + (i - top) as u16;
-        let selected = i == menu.selected;
+        let selected = i == menu.selected && !page;
         let bg = if selected { p.selected } else { p.input };
         let row = r(rect.x + 1, y, width.saturating_sub(2), 1);
         if let MenuKind::Agents(agents) = &menu.kind {
@@ -287,6 +295,27 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     #[tokio::test]
+    async fn only_pickable_rows_are_highlighted() {
+        let (_root, mut app) = crate::tui::app::tests::fixture().await;
+        let p = Palette::new();
+        for (command, highlighted) in [
+            (crate::tui::keys::Command::Help, false),
+            (crate::tui::keys::Command::Commands, true),
+        ] {
+            app.command(command);
+            let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+            app.content_rect = r(0, 0, 80, 20);
+            terminal
+                .draw(|frame| draw_menu(frame, &mut app, p))
+                .unwrap();
+            let cells = &terminal.backend().buffer().content;
+            let found = cells.iter().any(|cell| cell.bg == p.selected);
+            assert_eq!(found, highlighted, "{command}");
+            app.menu = None;
+        }
+    }
+
+    #[tokio::test]
     async fn agents_palette_hides_columns_without_stacking_rows() {
         let (_root, mut app) = crate::tui::app::tests::fixture().await;
         let root = app.projection.agents[0].clone();
@@ -322,7 +351,9 @@ mod tests {
                     .map(|x| buffer[(x, y)].symbol())
                     .collect::<String>()
             };
-            assert_eq!(line(2).contains("Input (uncached)"), stats);
+            // One clear row separates the palette from the bars above and below it.
+            assert!(line(0).trim().is_empty() && line(9).trim().is_empty());
+            assert_eq!(line(3).contains("Input (uncached)"), stats);
             let hits = app.hits.iter();
             let rows: Vec<_> = hits
                 .filter_map(|(rect, hit)| matches!(hit, Hit::Menu(_)).then_some(*rect))
@@ -331,7 +362,7 @@ mod tests {
             for (index, row) in rows.iter().enumerate() {
                 assert_eq!(
                     (row.height, row.y),
-                    (1, 2 + u16::from(stats) + index as u16)
+                    (1, 3 + u16::from(stats) + index as u16)
                 );
                 let text = line(row.y);
                 assert!(text.contains(&format!("agent-{index}")));

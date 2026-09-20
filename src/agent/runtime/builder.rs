@@ -113,12 +113,15 @@ impl HarnessBuilder {
         self
     }
 
-    /// The modes the root agent can run in; each is limited by `capabilities`.
-    /// With none, the root agent holds `capabilities` itself. Clears the selected mode.
+    /// The modes the root agent can run in, and with a hint its descendants; each is
+    /// limited by `capabilities`. With none, the root agent holds `capabilities` itself.
+    /// Clears the selected mode.
     #[must_use]
     pub fn modes(mut self, mut modes: indexmap::IndexMap<String, Mode>) -> Self {
-        // A mode is a set: the journal pins it sorted and without repeats.
+        // A mode is a set: the journal pins it sorted and without repeats. Interaction
+        // follows the host, so a mode never lists it.
         for mode in modes.values_mut() {
+            (mode.capabilities).retain(|capability| *capability != Capability::Interactive);
             mode.capabilities.sort();
             mode.capabilities.dedup();
         }

@@ -329,8 +329,10 @@ mod tests {
     /// A session whose "root" and "child" profiles are answered by `tracking`.
     pub(super) async fn start(tracking: &Arc<Script>) -> (tempfile::TempDir, Arc<SessionHandle>) {
         let root = tempfile::tempdir().unwrap();
-        let profile =
-            |model: &str| ModelProfile::new("wait-test", model, None, 128_000, 4096, true);
+        let profile = |model: &str| ModelProfile {
+            hint: Some(model.to_owned()),
+            ..ModelProfile::new("wait-test", model, None, 128_000, 4096, true)
+        };
         let harness = HarnessBuilder::new(root.path())
             .session_root(root.path().join("sessions"))
             .provider("wait-test", tracking.clone())

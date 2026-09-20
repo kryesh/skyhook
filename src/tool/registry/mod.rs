@@ -253,10 +253,12 @@ pub struct ToolOptions {
     script_binding: ScriptBinding,
     required: BTreeSet<Capability>,
     root_required: BTreeSet<Capability>,
-    /// (object pointer, property name, required capability, property schema)
-    conditional_inputs: Vec<(String, String, Capability, Value)>,
+    /// (object pointer, property name, the property's schema under an agent's capabilities)
+    conditional_inputs: Vec<(String, String, ComputedInput)>,
     output_schema: Option<OutputSchema>,
 }
+
+type ComputedInput = Arc<dyn Fn(&CapabilitySet) -> Option<Value> + Send + Sync>;
 
 /// Internal execution metadata.
 #[derive(Clone, Default)]
@@ -401,8 +403,23 @@ impl ToolOptions {
         capability: Capability,
         schema: Value,
     ) -> Self {
+        let schema = move |capabilities: &CapabilitySet| {
+            capabilities.contains(capability).then(|| schema.clone())
+        };
         self.conditional_inputs
-            .push((pointer.into(), name.into(), capability, schema));
+            .push((pointer.into(), name.into(), Arc::new(schema)));
+        self
+    }
+
+    /// An input whose schema, or absence, follows the agent's capabilities.
+    #[must_use]
+    pub fn computed_input(
+        mut self,
+        name: impl Into<String>,
+        schema: impl Fn(&CapabilitySet) -> Option<Value> + Send + Sync + 'static,
+    ) -> Self {
+        self.conditional_inputs
+            .push((String::new(), name.into(), Arc::new(schema)));
         self
     }
 
@@ -850,9 +867,9 @@ impl ToolRegistryBuilder {
                     }),
                 );
             }
-            for (pointer, name, capability, property) in &conditional_inputs {
-                if capabilities.contains(*capability) {
-                    add_nested_schema_property(&mut schema, pointer, name, property.clone());
+            for (pointer, name, property) in &conditional_inputs {
+                if let Some(property) = property(capabilities) {
+                    add_nested_schema_property(&mut schema, pointer, name, property);
                 }
             }
             schema

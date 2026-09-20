@@ -64,7 +64,12 @@ impl SessionRuntime {
             router.clone(),
         )?;
         install_script_tool(&mut builder, Arc::downgrade(&executor_slot))?;
-        tools::register(&mut builder, runtime_slot.clone())?;
+        tools::register(
+            &mut builder,
+            runtime_slot.clone(),
+            &harness.model_profiles,
+            &modes,
+        )?;
         builder.extend(&harness.extra_tools)?;
         let (mcp, startup_warnings) =
             tools::connect_mcp(&mut builder, &harness, &capabilities, &store).await;

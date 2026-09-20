@@ -120,7 +120,7 @@ pub enum SessionEvent {
         /// None for a tool-only agent without a model, such as a remote worker.
         profile: Option<ProfileSnapshot>,
         available_depth: u32,
-        /// The root agent's mode, when the session has modes.
+        /// The mode the agent starts in, when it has one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<ModeSelection>,
         capabilities: Vec<Capability>,

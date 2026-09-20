@@ -7,7 +7,8 @@ type Completion = RequestCompletion;
 // This is only the retained command loop's state. Shared job liveness, pending
 // deliveries and owner forwarding remain authoritative in their own managers.
 enum DriverPhase {
-    Root,
+    // The root has no waiter to settle, only whether its last turn ended in error.
+    Root { parked: bool },
     Child(ChildPhase),
 }
 
@@ -20,7 +21,7 @@ enum ChildPhase {
         answer: String,
         completion: Option<Completion>,
     },
-    // Failed invocations retain context, but notifications cannot resume them.
+    // Failed or interrupted turns retain context, but notifications cannot resume them.
     Parked,
 }
 
@@ -33,9 +34,20 @@ fn take_completion(phase: &mut ChildPhase, next: ChildPhase) -> Option<Completio
 }
 
 impl DriverPhase {
+    fn parked(&self) -> bool {
+        matches!(
+            self,
+            Self::Root { parked: true } | Self::Child(ChildPhase::Parked)
+        )
+    }
+
     fn begin(&mut self, completion: Option<Completion>) -> Option<Completion> {
-        let Self::Child(phase) = self else {
-            return completion;
+        let phase = match self {
+            Self::Root { parked } => {
+                *parked = false;
+                return completion;
+            }
+            Self::Child(phase) => phase,
         };
         // A new explicit waiter supersedes the old one; callback-free queued
         // input and descendant turns keep the current invocation's waiter.
@@ -56,8 +68,12 @@ impl DriverPhase {
     // Parking is unconditional; the returned flag is only whether the failure
     // reached this invocation's waiter, which is what finishes the owning job.
     fn fail(&mut self, error: RequestFailure) -> bool {
-        let Self::Child(phase) = self else {
-            return false;
+        let phase = match self {
+            Self::Root { parked } => {
+                *parked = true;
+                return false;
+            }
+            Self::Child(phase) => phase,
         };
         let Some(completion) = take_completion(phase, ChildPhase::Parked) else {
             return false;
@@ -149,7 +165,7 @@ impl SessionRuntime {
         let mut phase = if owner_job.is_some() {
             DriverPhase::Child(ChildPhase::Idle)
         } else {
-            DriverPhase::Root
+            DriverPhase::Root { parked: false }
         };
         let child = matches!(phase, DriverPhase::Child(_));
         let owner_cancellation = match owner_job {
@@ -185,15 +201,10 @@ impl SessionRuntime {
                     command = rx.recv() => match command { Some(command) => command, None => break },
                 }
             };
-            if matches!(
-                (&phase, &command),
-                (
-                    DriverPhase::Child(ChildPhase::Parked),
-                    AgentCommand::JobsReady
-                )
-            ) {
+            if phase.parked() && matches!(command, AgentCommand::JobsReady) {
                 // Leave durable notifications pending without rearming a failed
-                // turn or clearing its interruption marker before explicit resume.
+                // turn or clearing its interruption marker before explicit resume;
+                // the next input's request carries them.
                 continue;
             }
             // Register before claiming/persisting a queued message: interrupt must
@@ -376,6 +387,9 @@ impl SessionRuntime {
                         .map(Clone::clone)
                         .map_err(RequestFailure::from),
                 );
+            }
+            if !child && let Err(error) = &result {
+                phase.fail(error.into());
             }
             if child && result.is_err() {
                 if matches!(&result, Err(HarnessError::Interrupted))

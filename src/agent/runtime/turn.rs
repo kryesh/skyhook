@@ -77,9 +77,11 @@ impl SessionRuntime {
             let state = self.runtime_state(&turn).await;
             let mut request = agent_context.request(state);
             if force_compaction {
+                let (provider, meter) = (agent_context.provider.as_mut(), &mut agent_context.meter);
                 self.compact_history(
                     &turn,
-                    agent_context.provider.as_mut(),
+                    provider,
+                    meter,
                     context,
                     &request,
                     profile.max_context,
@@ -403,14 +405,20 @@ impl SessionRuntime {
             }
             if compact_completed_response {
                 // The tool exchange is closed first: checkpoints retain whole exchanges.
-                self.compact_history(
-                    &turn,
-                    agent_context.provider.as_mut(),
-                    context,
-                    &current,
-                    profile.max_context,
-                )
-                .await?;
+                let (provider, meter) = (agent_context.provider.as_mut(), &mut agent_context.meter);
+                let installed = self
+                    .compact_history(
+                        &turn,
+                        provider,
+                        meter,
+                        context,
+                        &current,
+                        profile.max_context,
+                    )
+                    .await?;
+                if !installed {
+                    agent_context.compaction_skipped(response.usage);
+                }
                 agent_context.refresh(&self.store, agent).await?;
                 context_sequence = None;
             }
@@ -985,8 +993,10 @@ mod tests {
      {
         for max_output in [1, 120_000] {
             let final_answer = with_usage(answer("original final"), &[threshold_usage()]);
-            let responses = [final_answer, answer(summary_json().to_string())];
-            let (_root, requests, session) = session_with_max_output(max_output, responses).await;
+            let summary = answer(summary_json().to_string());
+            let summary = with_usage(summary, &[usage(1_000_000, 0, 1)]);
+            let (_root, requests, session) =
+                session_with_max_output(max_output, [final_answer, summary]).await;
             seed_history(&session, 6_000).await;
             assert_eq!(session.prompt("Finish.").await.unwrap(), "original final");
             // Live state must already show the reduced context, without further catch-up.
@@ -1005,6 +1015,10 @@ mod tests {
             {
                 let captured = requests.lock().unwrap();
                 assert_eq!(captured.len(), 2);
+                // The summary's reported prompt size calibrates both sides of the checkpoint.
+                let estimate = super::super::compaction::estimate_request;
+                let scaled = estimate(&captured[0]) * 1_000_000 / estimate(&captured[1]);
+                assert!(checkpoint.before_tokens >= scaled);
                 assert!(captured[0].response_schema.is_none());
                 assert!(captured[1].response_schema.is_some());
                 assert!(captured[1].messages().any(|message| matches!(message,

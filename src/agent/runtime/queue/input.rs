@@ -48,7 +48,10 @@ impl SessionRuntime {
                 .await?;
             let opening =
                 self.open_agent_context(agent, profile.clone(), system, capabilities, None, false);
-            Some(opening.await?)
+            // Projected before its `ModeChanged` is journaled, which later projections see.
+            let mut replacement = opening.await?;
+            replacement.strip_bound_reasoning();
+            Some(replacement)
         } else if profile != context.profile {
             let system = context.template.system().to_vec();
             // The tools stay pinned across a model change.
@@ -77,7 +80,7 @@ impl SessionRuntime {
         }
         if let Some((name, _, capabilities)) = &mode {
             let event = SessionEvent::ModeChanged {
-                mode: self.mode_selection(name).await,
+                mode: self.mode_selection(name),
                 capabilities: capabilities.iter().collect(),
             };
             events.push((agent.clone(), event));

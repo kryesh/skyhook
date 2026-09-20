@@ -87,7 +87,6 @@ impl App {
                 model::EntryView {
                     agent: &self.selected,
                     view,
-                    thinking: self.thinking,
                     all_details: self.details,
                 },
                 &self.outputs,

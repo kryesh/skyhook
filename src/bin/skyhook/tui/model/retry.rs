@@ -64,7 +64,6 @@ pub(super) fn retry_entry(
     projection: &Projection,
     agent: &AgentId,
     request: u64,
-    thinking: bool,
 ) -> Option<Entry> {
     let info = projection.requests.get(&request)?;
     let state = info.retry.as_ref()?;
@@ -118,10 +117,6 @@ pub(super) fn retry_entry(
             match block.kind {
                 BlockKind::Text if !block.text.trim().is_empty() => {
                     text.push('\n');
-                    text.push_str(&block.text);
-                }
-                BlockKind::Reasoning if thinking && !block.text.trim().is_empty() => {
-                    text.push_str("\nReasoning\n");
                     text.push_str(&block.text);
                 }
                 _ => {}
@@ -191,19 +186,19 @@ mod tests {
         ] {
             assert_eq!(state.has_error(), expected.is_some());
             projection.requests.entry(4).or_default().retry = Some(state);
-            let entry = retry_entry(&snapshot, &projection, &agent, 4, false);
+            let entry = retry_entry(&snapshot, &projection, &agent, 4);
             assert_eq!(entry.as_ref().map(Entry::text), expected);
             assert_eq!(entry.as_ref().is_some_and(|entry| entry.running), running);
         }
         snapshot
             .activity
             .insert(agent.clone(), AgentActivity::Interrupted);
-        let entry = retry_entry(&snapshot, &projection, &agent, 4, false).unwrap();
+        let entry = retry_entry(&snapshot, &projection, &agent, 4).unwrap();
         assert_eq!(entry.text(), "Interrupted · attempt 3\nfailure");
         assert!(!entry.running);
         // Historical schedules retain their diagnostic but do not animate.
         projection.active_request.insert(agent.clone(), 5);
-        let entry = retry_entry(&snapshot, &projection, &agent, 4, false).unwrap();
+        let entry = retry_entry(&snapshot, &projection, &agent, 4).unwrap();
         assert_eq!(
             entry.text(),
             "Retrying · attempt 3 · retry delay 100 ms\nfailure"

@@ -73,7 +73,7 @@ the lifetime: Anthropic places a cache breakpoint on the last history block unle
 automatic prefix caching with the tail sent last. Chat Completions and Responses append a runtime-only
 tail message to the final tool output or user message rather than sending a separate user message,
 which models read as the user speaking again after every tool call.
-Session databases use format version 7; there is no compatibility or migration layer for earlier layouts.
+Session databases use format version 8; there is no compatibility or migration layer for earlier layouts.
 
 Source: [session module](https://github.com/kryesh/skyhook/tree/main/src/session)
 and [agent module](https://github.com/kryesh/skyhook/tree/main/src/agent).

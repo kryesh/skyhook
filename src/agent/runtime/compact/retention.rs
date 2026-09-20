@@ -25,12 +25,20 @@ impl RetainedSource<'_> {
     }
 }
 
+/// The verbatim tail's share of the context, so a small window still shrinks.
+pub(in crate::agent::runtime) fn retention_budget(max_context: u64) -> u64 {
+    (max_context / 16).min(8_000)
+}
+
 /// Select complete original exchanges, including creators no longer in the visible tail.
+/// The tail is what `model` would be sent of it after compaction, within `budget` tokens.
 pub(super) fn retained_sources<'a>(
     records: &'a [EventRecord],
     agent: &AgentId,
     projected: &[(u64, Message)],
     origins: &[ModelCallOrigin],
+    model: &str,
+    budget: u64,
 ) -> Result<Vec<RetainedSource<'a>>, HarnessError> {
     let originals: Vec<_> = records
         .iter()
@@ -53,8 +61,9 @@ pub(super) fn retained_sources<'a>(
     let mut total = 0u64;
     let mut start = visible.len();
     for (index, (_, message)) in visible.iter().enumerate().rev() {
-        let tokens = compaction::estimate_message(message);
-        if total > 0 && total.saturating_add(tokens) > 8_000 {
+        let kept = message.clone().without_bound_reasoning();
+        let tokens = kept.map_or(0, |kept| compaction::estimate_message(&kept, model));
+        if total > 0 && total.saturating_add(tokens) > budget {
             break;
         }
         total = total.saturating_add(tokens);
@@ -239,7 +248,9 @@ mod tests {
                 message: 1,
                 call_id: "call".into(),
             };
-            let retained = retained_sources(&records, &agent, &[(3, tail)], &[origin]).unwrap();
+            let retained =
+                retained_sources(&records, &agent, &[(3, tail)], &[origin], "model", 8_000)
+                    .unwrap();
             let sequences = retained
                 .iter()
                 .map(|source| source.sequence)
@@ -263,14 +274,20 @@ mod tests {
         ];
         let records = committed(&agent, messages.clone());
         let mut projected: Vec<_> = (1..).zip(messages).collect();
-        let sequences = |projected: &[(u64, Message)]| {
-            let retained = retained_sources(&records, &agent, projected, &[]).unwrap();
+        let sequences = |projected: &[(u64, Message)], max_context| {
+            let budget = retention_budget(max_context);
+            let retained =
+                retained_sources(&records, &agent, projected, &[], "model", budget).unwrap();
             retained
                 .into_iter()
                 .map(RetainedSource::into_sequence)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(sequences(&projected), vec![2, 3, 4]);
+        assert_eq!(sequences(&projected, 128_000), vec![2, 3, 4]);
+        // A larger window keeps the same tail; a smaller one keeps proportionally less.
+        assert_eq!(sequences(&projected, 1_000_000), vec![2, 3, 4]);
+        assert_eq!(sequences(&projected, 127_000), vec![4]);
+        let sequences = |projected: &[(u64, Message)]| sequences(projected, 128_000);
         // Even an oversized final message survives; its payload is the original,
         // not the temporary projection used for token accounting.
         projected[3].1 = user("x".repeat(40_000));

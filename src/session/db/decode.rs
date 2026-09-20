@@ -306,7 +306,7 @@ fn profiles(db: &Db) -> DbResult<HashMap<i64, ProfileSnapshot>> {
     keyed(
         db,
         "SELECT id, name, provider, model, reasoning, max_context, max_output, supports_images, \
-         state_mode FROM model_profile",
+         state_mode, hint FROM model_profile",
         |row| {
             Ok(ProfileSnapshot {
                 name: row.get(1)?,
@@ -318,6 +318,7 @@ fn profiles(db: &Db) -> DbResult<HashMap<i64, ProfileSnapshot>> {
                     max_output: row.get(6)?,
                     supports_images: row.get(7)?,
                     state_mode: parse_variant(row.get(8)?)?,
+                    hint: row.get(9)?,
                 },
             })
         },
@@ -504,15 +505,16 @@ pub(in crate::session) fn decode_records(
     })?;
     // Mode definitions by the entry that pinned them.
     let pinned_modes = db.query(
-        "SELECT id, name, instructions, entry FROM mode",
+        "SELECT id, name, instructions, hint, entry FROM mode",
         Vec::new(),
         |row| {
             let capabilities = mode_capabilities.get(&row.get::<i64>(0)?);
             let mode = crate::tool::policy::Mode {
                 capabilities: sorted(capabilities.cloned().unwrap_or_default()),
                 instructions: row.get(2)?,
+                hint: row.get(3)?,
             };
-            Ok((row.get::<i64>(3)?, mode))
+            Ok((row.get::<i64>(4)?, mode))
         },
     )?;
     let pinned_modes: HashMap<i64, _> = pinned_modes.into_iter().collect();

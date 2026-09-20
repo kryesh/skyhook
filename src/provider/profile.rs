@@ -12,6 +12,9 @@ pub struct ModelProfile {
     pub supports_images: bool,
     #[serde(default)]
     pub state_mode: StateMode,
+    /// Describes the model to agents choosing one for a child; without it they cannot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 /// How per-request runtime state (date, jobs, todos) reaches the model.
@@ -45,6 +48,7 @@ impl ModelProfile {
             max_output,
             supports_images,
             state_mode: StateMode::default(),
+            hint: None,
         }
     }
 

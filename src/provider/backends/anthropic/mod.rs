@@ -54,7 +54,7 @@ enum Block {
     EmittedOther,
 }
 
-/// Signed thinking is bound to the exact conversation before it, so compaction drops it.
+/// Signed thinking is bound to the exact conversation before it, so compaction and mode switches drop it.
 fn bound_envelope(model: &str, native: &Value) -> ReplayEnvelope {
     ReplayEnvelope {
         conversation_bound: true,

@@ -1,6 +1,7 @@
 //! Agent-specific tools layered on top of the general coding tool set.
 
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, OnceLock, Weak},
 };
@@ -12,8 +13,12 @@ use tokio::sync::oneshot;
 
 use crate::{
     agent::{Question, TodoItem, todo::TodoStore},
+    provider::profile::ModelProfile,
     provider::protocol::UserContent,
-    tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, policy::Capability},
+    tool::{
+        RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
+        policy::{Capability, CapabilitySet, Mode},
+    },
 };
 
 use super::{AgentCommand, AgentLaunch, RequestFailure, SessionRuntime, queue::QueuedInput};
@@ -54,7 +59,11 @@ pub(super) struct AgentArgs {
     #[serde(default)]
     pub(super) depth: usize,
     /// Model override; omitted/null inherits the parent's active model.
+    #[schemars(skip)]
     pub(super) model: Option<String>,
+    /// Mode for the child; omitted/null inherits the parent's capabilities.
+    #[schemars(skip)]
+    pub(super) mode: Option<String>,
     /// Execution target; defaults to the parent's.
     #[schemars(skip)]
     pub(super) target: Option<String>,
@@ -72,11 +81,34 @@ enum TodoOutput {
 pub(super) fn register(
     builder: &mut ToolRegistryBuilder,
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
+    models: &BTreeMap<String, ModelProfile>,
+    modes: &indexmap::IndexMap<String, Mode>,
 ) -> Result<(), RegistryError> {
     register_wait(builder, runtime_slot.clone())?;
     register_ask(builder, runtime_slot.clone())?;
     register_todo(builder, runtime_slot.clone())?;
-    register_child_agent(builder, runtime_slot)
+    register_child_agent(builder, runtime_slot, models, modes)
+}
+
+/// Whether an agent holding `capabilities` may give a child this mode: it carries a
+/// hint and grants nothing the agent lacks.
+fn offers_mode(mode: &Mode, capabilities: &CapabilitySet) -> bool {
+    let held = |capability: &Capability| capabilities.contains(*capability);
+    mode.hint.is_some() && mode.capabilities.iter().all(held)
+}
+
+/// A nullable choice among `(name, description)` pairs; None without any.
+fn choice_input(summary: &str, choices: &[(&str, String)]) -> Option<Value> {
+    if choices.is_empty() {
+        return None;
+    }
+    let names = choices.iter().map(|(name, _)| json!(name));
+    let names: Vec<Value> = names.chain([Value::Null]).collect();
+    let lines = choices
+        .iter()
+        .map(|(name, text)| format!("\n- {name}{text}"));
+    let description = format!("{summary}{}", lines.collect::<String>());
+    Some(json!({"type": ["string", "null"], "enum": names, "description": description}))
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -156,7 +188,15 @@ fn register_ask(
 fn register_child_agent(
     builder: &mut ToolRegistryBuilder,
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
+    models: &BTreeMap<String, ModelProfile>,
+    modes: &indexmap::IndexMap<String, Mode>,
 ) -> Result<(), RegistryError> {
+    let hinted = |(name, profile): (&String, &ModelProfile)| {
+        let hint = profile.hint.as_ref()?;
+        Some((name.clone(), format!(": {hint}")))
+    };
+    let models: Vec<_> = models.iter().filter_map(hinted).collect();
+    let modes = modes.clone();
     builder.register::<AgentArgs, String, _, _>(
         "agent",
         "Start a child agent. Send follow-ups or answers with tool.job(id).send({value: ...}). Questions pause the child; follow-ups arrive automatically at its next model-request boundary. Replies arrive as events. Sending input to a completed child resumes its retained history under the same job ID.",
@@ -171,12 +211,44 @@ fn register_child_agent(
                     "description": "Child target; omitted inherits."
                 }),
             )
+            .computed_input("model", move |_| {
+                let choices: Vec<_> = models.iter().map(|(name, text)| (name.as_str(), text.clone())).collect();
+                choice_input("Model for the child; omitted inherits yours.", &choices)
+            })
+            .computed_input("mode", move |capabilities| {
+                let offered = modes.iter().filter(|(_, mode)| offers_mode(mode, capabilities));
+                let choices: Vec<_> = offered
+                    .map(|(name, mode)| {
+                        let granted: Vec<_> = mode.capabilities.iter().map(|capability| capability.as_str()).collect();
+                        let granted = if granted.is_empty() { "none".to_owned() } else { granted.join(", ") };
+                        let hint = mode.hint.as_deref().unwrap_or_default();
+                        (name.as_str(), format!(" [{granted}]: {hint}"))
+                    })
+                    .collect();
+                choice_input("Mode limiting what the child can do; omitted inherits what you can.", &choices)
+            })
             .background()
             .input(),
         move |context, input| {
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
             async move {
                 let runtime = runtime.ok_or_else(runtime_unavailable)?;
+                let hinted = |name: &String| runtime.harness.model_profiles.get(name).is_some_and(|profile| profile.hint.is_some());
+                if let Some(name) = input.model.as_ref().filter(|name| !hinted(name)) {
+                    return Err(ToolError::InvalidArguments(format!("unknown model `{name}`")));
+                }
+                let capabilities = match &input.mode {
+                    None => context.capabilities().clone(),
+                    Some(name) => {
+                        let offered = |mode: &&Mode| offers_mode(mode, context.capabilities());
+                        if runtime.modes.get(name).filter(offered).is_none() {
+                            return Err(ToolError::InvalidArguments(format!("unknown mode `{name}`")));
+                        }
+                        // Interaction follows the caller, as the root's follows the host.
+                        let granted = runtime.mode_capabilities(name).map_err(|error| tool_error(&error))?;
+                        &granted & context.capabilities()
+                    }
+                };
                 let available_depth = runtime.available_depth(context.agent());
                 let todos = input.todos;
                 if let Some(items) = &todos {
@@ -221,8 +293,8 @@ fn register_child_agent(
                     todos,
                     available_depth: input.depth,
                     location,
-                    mode: None,
-                    capabilities: context.capabilities().clone(),
+                    mode: input.mode,
+                    capabilities,
                 }).await.map_err(|error| tool_error(&error))?;
                 // Associate immediately so a failed first turn is selectable for retry
                 // even when it never emitted visible assistant text.
@@ -568,6 +640,246 @@ for line in sys.stdin:
         assert_eq!(script_type(&disabled, &session, &name).await, "undefined");
         shutdown_session(session).await;
         assert_eq!(launched(root.path()), "launched\n");
+    }
+
+    /// An agent may name only hinted models, and hinted modes within what it holds
+    /// itself; with none to name, the input is absent. A chosen mode is the child's.
+    #[tokio::test]
+    async fn children_take_only_hinted_models_and_modes_their_parent_could_hold() {
+        use crate::tool::policy::Mode;
+        let root = tempfile::tempdir().unwrap();
+        let requests = Requests::default();
+        let agent_input = |index: usize, name: &str| {
+            let requests = requests.lock().unwrap();
+            let agent = requests[index]
+                .tools
+                .iter()
+                .find(|tool| tool.name == "agent");
+            agent.unwrap().input_schema["properties"][name].clone()
+        };
+        let plain = builder(root.path(), requests.clone())
+            .build()
+            .await
+            .unwrap();
+        let session = plain.new_session().await.unwrap();
+        session.prompt("root request").await.unwrap();
+        assert!(agent_input(0, "model").is_null() && agent_input(0, "mode").is_null());
+        shutdown_session(session).await;
+        requests.lock().unwrap().clear();
+
+        let mode = |capabilities: &[Capability], hint: Option<&str>| Mode {
+            capabilities: capabilities.to_vec(),
+            instructions: Some(format!("Holds {}.", capabilities.len())),
+            hint: hint.map(str::to_owned),
+        };
+        let (read, agents) = (Capability::Read, Capability::Agents);
+        let modes = [
+            (
+                "work",
+                mode(&[read, Capability::Write, agents], Some("Works")),
+            ),
+            ("scout", mode(&[read, agents], Some("Delegates reading"))),
+            ("idle", mode(&[], Some("Thinks"))),
+            (
+                "online",
+                mode(&[read, Capability::Network], Some("Looks things up")),
+            ),
+            ("secret", mode(&[read], None)),
+        ];
+        let cheap = ModelProfile {
+            hint: Some("Cheap".into()),
+            ..ModelProfile::new("test", "cheap", None, 128_000, 4096, false)
+        };
+        let provider = scripted_provider(&requests, (0..3).map(|_| answer("done")));
+        let harness = test_builder(root.path(), &root.path().join("hinted"), provider, false)
+            .max_child_depth(2)
+            .model_profile("cheap", cheap)
+            .modes(modes.map(|(name, mode)| (name.to_owned(), mode)).into())
+            .build()
+            .await
+            .unwrap();
+        let session = harness.new_session().await.unwrap();
+        session.prompt("root request").await.unwrap();
+        // `work` holds no network, and `secret` has no hint.
+        assert_eq!(agent_input(0, "model")["enum"], json!(["cheap", null]));
+        let offered = agent_input(0, "mode");
+        assert_eq!(offered["enum"], json!(["work", "scout", "idle", null]));
+        let description = offered["description"].as_str().unwrap();
+        assert!(description.contains("\n- scout [read, agents]: Delegates reading"));
+        assert!(description.contains("\n- idle [none]: Thinks"));
+        assert!(!description.contains("interactive"));
+
+        let refusals = [
+            ("{mode:'secret'}", "unknown mode `secret`"),
+            ("{mode:'online'}", "unknown mode `online`"),
+            ("{model:'test'}", "unknown model `test`"),
+        ];
+        for (refused, reason) in refusals {
+            let script = format!("return await tool.agent({{prompt:'no', ...{refused}}});");
+            let error = session.run_script(script).await.unwrap_err().to_string();
+            assert!(error.contains(reason), "{refused}: {error}");
+        }
+        let child = "return await tool.agent({prompt:'go', depth:1, mode:'scout', model:'cheap'});";
+        assert_eq!(
+            session.run_script(child).await.unwrap().value["value"],
+            "done"
+        );
+        // The child holds less than its parent, so it is offered less.
+        assert_eq!(
+            agent_input(1, "mode")["enum"],
+            json!(["scout", "idle", null])
+        );
+        let child = requests.lock().unwrap()[1].clone();
+        assert_eq!(child.model, "cheap");
+        assert!(
+            child.system[0]
+                .text
+                .contains("<mode name=\"scout\">\nHolds 2.")
+        );
+        let records = session.runtime.store.records().await;
+        let started = events!(&records, SessionEvent::AgentStarted { mode, capabilities, .. } => (mode.clone().map(|mode| mode.name), capabilities.clone()));
+        // Interaction follows the parent; the mode grants the rest.
+        let held = vec![read, agents, Capability::Interactive];
+        assert_eq!(started[1], (Some("scout".to_owned()), held));
+        shutdown_session(session).await;
+    }
+
+    /// A child in a mode is held to it: depth still withholds `agents`, a mode it could
+    /// not hold is unknown to it, and a restart returns it to the mode as pinned.
+    #[tokio::test]
+    async fn a_child_keeps_its_mode_through_depth_delegation_and_restart() {
+        use crate::tool::policy::Mode;
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let requests = Requests::default();
+        let mode = |capabilities: &[Capability], instructions: &str| Mode {
+            capabilities: capabilities.to_vec(),
+            instructions: Some(instructions.to_owned()),
+            hint: Some("Hinted".into()),
+        };
+        let (read, write, agents) = (Capability::Read, Capability::Write, Capability::Agents);
+        let build = |scout: Mode, responses: Vec<Vec<ResponseChunk>>| {
+            let provider = scripted_provider(&requests, responses);
+            let modes = [
+                ("work", mode(&[read, write, agents], "Work.")),
+                ("scout", scout),
+            ];
+            test_builder(root.path(), &sessions, provider, false)
+                .max_child_depth(2)
+                .modes(modes.map(|(name, mode)| (name.to_owned(), mode)).into())
+                .build()
+        };
+        let scout = mode(&[read, agents], "Scout.");
+        let widen = tool_call(0, "widen", "agent", json!({"prompt": "no", "mode": "work"}));
+        let responses = vec![answer("leaf"), response(vec![widen]), answer("held")];
+        let session = build(scout.clone(), responses).await.unwrap();
+        let session = session.new_session().await.unwrap();
+        let spawn = |depth: usize| {
+            format!("return await tool.agent({{prompt:'go', mode:'scout', depth:{depth}}});")
+        };
+        assert_eq!(
+            session.run_script(spawn(0)).await.unwrap().value["value"],
+            "leaf"
+        );
+        assert_eq!(
+            session.run_script(spawn(1)).await.unwrap().value["value"],
+            "held"
+        );
+        let records = session.runtime.store.records().await;
+        let started = events!(&records, SessionEvent::AgentStarted { mode: Some(mode), capabilities, .. } if mode.name == "scout" => capabilities.clone());
+        let interactive = Capability::Interactive;
+        assert_eq!(
+            started,
+            [vec![read, interactive], vec![read, agents, interactive]]
+        );
+        let job = events!(&records, SessionEvent::JobCreated { job, tool, .. } if tool == "agent" => *job)
+            [1];
+        {
+            let captured = requests.lock().unwrap();
+            let offers = |index: usize| {
+                captured[index]
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == "agent")
+            };
+            assert_eq!((offers(0), offers(1)), (false, true));
+            let Some(Message::Tool(results)) = captured[2].history.last() else {
+                panic!("expected the refused delegation");
+            };
+            let refusal = results[0].result.to_string();
+            assert!(
+                results[0].is_error && refusal.contains("unknown mode `work`"),
+                "{refusal}"
+            );
+        }
+        let id = session.id();
+        shutdown_session(session).await;
+
+        // The configuration now widens `scout`; the session keeps the one it pinned.
+        let widened = mode(&[read, write, agents], "Changed.");
+        let harness = build(widened, vec![answer("again")]).await.unwrap();
+        let resumed = harness.resume_session(id).await.unwrap();
+        resumed.runtime.jobs.send(job, json!("more")).await.unwrap();
+        assert_eq!(
+            terminal(&resumed, job).await.state,
+            crate::job::JobState::Completed
+        );
+        let child = requests.lock().unwrap().last().unwrap().clone();
+        assert!(
+            child.system[0].text.contains("Scout.") && !child.system[0].text.contains("Changed.")
+        );
+        assert!(!child.tools.iter().any(|tool| tool.name == "write"));
+        let agent = child
+            .tools
+            .iter()
+            .find(|tool| tool.name == "agent")
+            .unwrap();
+        assert_eq!(
+            agent.input_schema["properties"]["mode"]["enum"],
+            json!(["scout", null])
+        );
+        shutdown_session(resumed).await;
+        // As decoded from the journal: pinned once, with its hint, by the first child.
+        let (_store, records) = crate::session::SessionStore::open(&sessions, id)
+            .await
+            .unwrap();
+        let pinned = events!(&records, SessionEvent::AgentStarted { mode: Some(mode), .. } if mode.name == "scout" => mode.definition.clone());
+        assert_eq!(pinned, [Some(scout), None]);
+    }
+
+    /// Children starting at once in a mode the session has not used pin it once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn children_starting_together_pin_their_mode_once() {
+        use crate::tool::policy::Mode;
+        let root = tempfile::tempdir().unwrap();
+        let requests = Requests::default();
+        let mode = |capabilities: &[Capability]| Mode {
+            capabilities: capabilities.to_vec(),
+            instructions: None,
+            hint: Some("Hinted".into()),
+        };
+        let modes = [
+            ("work", mode(&[Capability::Read, Capability::Agents])),
+            ("look", mode(&[Capability::Read])),
+        ];
+        let provider = scripted_provider(&requests, (0..8).map(|_| answer("done")));
+        let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
+            .max_child_depth(1)
+            .modes(modes.map(|(name, mode)| (name.to_owned(), mode)).into())
+            .build()
+            .await
+            .unwrap();
+        let session = harness.new_session().await.unwrap();
+        let script = "const all = [...Array(8)].map(() => tool.agent({prompt:'go', mode:'look'})); \
+                      return (await Promise.all(all)).length;";
+        assert_eq!(session.run_script(script).await.unwrap().value["value"], 8);
+        let records = session.runtime.store.records().await;
+        let looks = events!(&records, SessionEvent::AgentStarted { mode: Some(mode), .. } if mode.name == "look" => mode.definition.is_some());
+        assert_eq!(
+            (looks.len(), looks.iter().filter(|pinned| **pinned).count()),
+            (8, 1)
+        );
+        shutdown_session(session).await;
     }
 
     #[tokio::test]

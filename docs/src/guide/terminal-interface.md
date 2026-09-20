@@ -77,7 +77,7 @@ expanded block with an animated spinner and collapses as soon as answer text sta
 finishes). Single-line reasoning stays inline without an expand/collapse control and is not
 selectable, even when it wraps in a narrow terminal. Reasoning uses the same Markdown rendering as replies. A separate working
 spinner appears while a request is active without a reasoning spinner. Click a multi-line block or press Enter when selected to
-reopen it, including after resuming a session. `/thinking` toggles expansion of saved reasoning.
+reopen it, including after resuming a session.
 
 ## Model selection and UI state
 
@@ -139,7 +139,7 @@ The command palette and `/help` also list these shortcuts. `Ctrl+X` is a leader:
 | `↑`, `↓` in the tree | View the agent above/below at its latest activity |
 | `Ctrl+X Y`, `Ctrl+X X` | Copy message/selection, export conversation |
 | `Tab`, `Shift+Tab` | Next/previous [mode](permissions.md#modes) in the composer; next/previous row in the tree or conversation |
-| `/mode` | Choose the mode from a list |
+| `Ctrl+X P`, `/mode` | Choose the mode from a list |
 | Click a pane | Focus composer, tree, or conversation |
 | `Enter` | Send/queue, select, expand |
 | `Alt+Enter`, `Ctrl+J`, supported `Shift+Enter` | Newline |
@@ -150,6 +150,7 @@ The command palette and `/help` also list these shortcuts. `Ctrl+X` is a leader:
 | `[`, `]` in content | Previous/next inspector tab |
 | `Esc` | Close local UI, dismiss/cancel prompts, otherwise interrupt work, cancelling the running foreground tool |
 | `Ctrl+C` | Clear draft, otherwise interrupt (as `Esc`)/quit |
+| `Ctrl+X H`, `/help` | Help and shortcuts |
 | `Ctrl+X Q` | Quit |
 
 The `Ctrl+X` preview stays open until the next key; `Esc` cancels it. It shows Model

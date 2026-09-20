@@ -33,7 +33,6 @@ pub fn entries(
     let EntryView {
         agent,
         view,
-        thinking,
         all_details,
     } = presentation;
     let records: Vec<_> = projection
@@ -124,13 +123,9 @@ pub fn entries(
                 let key = EntryKey::Record(record.sequence);
                 match &record.event {
                     SessionEvent::ModelRequested { .. } => {
-                        if let Some(entry) = super::retry::retry_entry(
-                            snapshot,
-                            projection,
-                            agent,
-                            record.sequence,
-                            thinking,
-                        ) {
+                        if let Some(entry) =
+                            super::retry::retry_entry(snapshot, projection, agent, record.sequence)
+                        {
                             entries.push(entry);
                             continue;
                         }
@@ -144,7 +139,6 @@ pub fn entries(
                                 record.sequence,
                                 response,
                                 view,
-                                thinking,
                                 agent_name,
                             ));
                         }
@@ -258,7 +252,6 @@ pub fn entries(
                                             reasoning_key(request, &item.id, &block.id),
                                             text,
                                             view,
-                                            thinking,
                                             super::live::ReasoningStatus::Complete,
                                         ));
                                     }
@@ -394,7 +387,7 @@ pub fn entries(
             }
             let responses = super::live::live_tail_responses(snapshot, projection, agent);
             entries.extend(responses.into_iter().flat_map(|(request, response)| {
-                response_entries(request, response, view, thinking, agent_name)
+                response_entries(request, response, view, agent_name)
             }));
             if let Some(entry) = working_entry(
                 snapshot,
@@ -420,22 +413,16 @@ mod tests {
     use skyhook::provider::protocol::{AssistantItem, ToolCall};
 
     fn render(snapshot: &ObservationSnapshot, agent: &AgentId, details: bool) -> Vec<Entry> {
-        render_with(snapshot, agent, false, details)
+        render_with(snapshot, agent, details)
     }
 
-    fn render_with(
-        snapshot: &ObservationSnapshot,
-        agent: &AgentId,
-        thinking: bool,
-        details: bool,
-    ) -> Vec<Entry> {
+    fn render_with(snapshot: &ObservationSnapshot, agent: &AgentId, details: bool) -> Vec<Entry> {
         let mut projection = Projection::default();
         projection.rebuild(snapshot);
         let (view, outputs) = (View::default(), OutputStore::default());
         let view = EntryView {
             agent,
             view: &view,
-            thinking,
             all_details: details,
         };
         entries(snapshot, &projection, view, &outputs, true)
@@ -830,11 +817,9 @@ mod tests {
                     _ => _ = commit(snapshot, &agent, message.clone()),
                 }
             }
-            for thinking in [false, true] {
-                let normal = render_with(&plain, &agent, thinking, true);
-                assert!(normal == render_with(&tracked, &agent, thinking, true));
-                assert!(normal.iter().all(|entry| !entry.text().contains("attempt")));
-            }
+            let normal = render_with(&plain, &agent, true);
+            assert!(normal == render_with(&tracked, &agent, true));
+            assert!(normal.iter().all(|entry| !entry.text().contains("attempt")));
         }
     }
 

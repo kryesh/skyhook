@@ -623,8 +623,8 @@ impl Encoder {
         let profile = &snapshot.profile;
         db.execute(
             "INSERT INTO model_profile (name, provider, model, reasoning, max_context, \
-             max_output, supports_images, state_mode, digest) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT (digest) DO NOTHING",
+             max_output, supports_images, state_mode, hint, digest) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT (digest) DO NOTHING",
             params![
                 &snapshot.name,
                 &profile.provider,
@@ -634,6 +634,7 @@ impl Encoder {
                 profile.max_output,
                 profile.supports_images,
                 variant(&profile.state_mode)?,
+                profile.hint.clone(),
                 digest.clone(),
             ],
         )?;
@@ -927,8 +928,14 @@ fn pin_mode(
     mode: &crate::tool::policy::Mode,
 ) -> DbResult<()> {
     db.execute(
-        "INSERT INTO mode (entry, kind, name, instructions) VALUES (?1, ?2, ?3, ?4)",
-        params![seq, kind, name, mode.instructions.as_deref()],
+        "INSERT INTO mode (entry, kind, name, instructions, hint) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            seq,
+            kind,
+            name,
+            mode.instructions.as_deref(),
+            mode.hint.as_deref()
+        ],
     )?;
     for capability in &mode.capabilities {
         db.execute(
@@ -1149,6 +1156,7 @@ mod tests {
                 let definition = first.then(|| crate::tool::policy::Mode {
                     capabilities: capabilities.clone(),
                     instructions: (!capabilities.is_empty()).then(|| "Only look.".into()),
+                    hint: (!capabilities.is_empty()).then(|| "Read-only.".into()),
                 });
                 one!(SessionEvent::ModeChanged {
                     mode: crate::session::ModeSelection {

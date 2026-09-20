@@ -73,27 +73,40 @@ pub fn project_history(
             let SessionEvent::MessageCommitted { message } = &source.event else {
                 unreachable!()
             };
-            let mut message = message.clone();
-            message.strip_bound_reasoning();
-            if message.is_content_free() {
-                continue;
+            if let Some(message) = message.clone().without_bound_reasoning() {
+                result.push((*sequence, message));
             }
-            result.push((*sequence, message));
         }
         checkpoint.frontier
     } else {
         0
     };
+    let switched = mode_boundary(records, agent);
     result.extend(records.iter().filter_map(|record| {
         if &record.agent == agent
             && record.sequence > frontier
             && let SessionEvent::MessageCommitted { message } = &record.event
         {
-            return Some((record.sequence, message.clone()));
+            let message = message.clone();
+            return if record.sequence < switched {
+                message.without_bound_reasoning()
+            } else {
+                Some(message)
+            }
+            .map(|message| (record.sequence, message));
         }
         None
     }));
     Ok(result)
+}
+
+/// A mode switch replaces the system prompt and tools, which invalidates bound
+/// reasoning before it exactly as compaction does.
+fn mode_boundary(records: &[EventRecord], agent: &AgentId) -> u64 {
+    let switched = records.iter().rev().find(|record| {
+        &record.agent == agent && matches!(record.event, SessionEvent::ModeChanged { .. })
+    });
+    switched.map_or(0, |record| record.sequence)
 }
 
 pub(super) fn validate_compaction(
@@ -316,14 +329,19 @@ pub fn reconstruct_model_request(
             _ => None,
         }
     });
-    for (source, message) in sources.iter().zip(&mut history) {
-        if *purpose == ModelPurpose::Compaction || frontier.is_some_and(|last| *source <= last) {
-            message.strip_bound_reasoning();
+    let switched = mode_boundary(&records[..index], &records[index].agent);
+    // Unencodable history drops out of the pairing itself, which depends on
+    // `sources` and `history` being index-aligned.
+    let history = sources.iter().zip(history).filter_map(|(source, message)| {
+        if *purpose == ModelPurpose::Compaction
+            || *source < switched
+            || frontier.is_some_and(|last| *source <= last)
+        {
+            message.without_bound_reasoning()
+        } else {
+            (!message.is_content_free()).then_some(message)
         }
-    }
-    // Drop unencodable history only after the pairing above, which depends on
-    // `sources` and `history` staying index-aligned.
-    history.retain(|message| !message.is_content_free());
+    });
     let request = ModelRequest {
         history: merge_tool_results(history),
         tail: tail.to_vec(),
@@ -794,25 +812,49 @@ mod tests {
             assert_eq!(request.history[index], stripped);
         }
         // Bound reasoning after the latest checkpoint is kept; replay matches projection.
-        let mut append = |sequence: u64, event: SessionEvent| {
+        let append = |records: &mut Vec<EventRecord>, sequence: u64, event: SessionEvent| {
             let mut record = records[8].clone();
             (record.sequence, record.event) = (sequence, event);
             records.push(record);
         };
-        append(10, committed(signed.clone()));
+        append(&mut records, 10, committed(signed.clone()));
         let lifetime = HistoryLifetime::Continuing;
         append(
+            &mut records,
             11,
             requested(3, ModelPurpose::Agent, &[9, 1, 5, 10], "state", lifetime),
         );
         let projected = project_history(&records, &agent).unwrap();
         assert_eq!(projected[3].1, signed);
-        let (_, request) = reconstruct_model_request(&records, 11).unwrap();
-        assert!(
-            request
-                .history
-                .iter()
-                .eq(projected.iter().map(|(_, message)| message))
+        let replays_projection =
+            |records: &[EventRecord], request, projected: &[(u64, Message)]| {
+                let (_, request) = reconstruct_model_request(records, request).unwrap();
+                let projected = projected.iter().map(|(_, message)| message);
+                assert!(request.history.iter().eq(projected));
+            };
+        replays_projection(&records, 11, &projected);
+        // A mode switch changes the conversation too: bound reasoning before it is
+        // dropped from later requests, while the earlier request replays as sent.
+        let mode = crate::session::ModeSelection {
+            name: "plan".into(),
+            definition: None,
+        };
+        let capabilities = Vec::new();
+        append(
+            &mut records,
+            12,
+            SessionEvent::ModeChanged { mode, capabilities },
         );
+        append(&mut records, 13, committed(signed.clone()));
+        let sources = &[9, 1, 5, 10, 13];
+        append(
+            &mut records,
+            14,
+            requested(3, ModelPurpose::Agent, sources, "state", lifetime),
+        );
+        let switched = project_history(&records, &agent).unwrap();
+        assert_eq!((&switched[3].1, &switched[4].1), (&stripped, &signed));
+        replays_projection(&records, 14, &switched);
+        replays_projection(&records, 11, &projected);
     }
 }

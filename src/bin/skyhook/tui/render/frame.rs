@@ -142,11 +142,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         tree_y.saturating_sub(2 + notice_height),
     );
     if content_width < width {
+        // The notice row belongs to the conversation; the sidebar runs beside it.
         let rect = r(
             content_width,
             2,
             width - content_width,
-            app.content_rect.height,
+            app.content_rect.height + notice_height,
         );
         draw_sidebar(frame, app, rect, p);
     }
@@ -356,6 +357,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             }
         }
     }
+    // The popup and any notice share the row above the tree and composer.
+    let mut latest_width = 0;
     if app.content_rows > app.content_rect.height as usize && app.content_rect.height > 0 {
         let thumb = app.content_rect.y
             + ((scroll as u64 * app.content_rect.height.saturating_sub(1) as u64)
@@ -372,10 +375,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .get(&app.selected)
             .is_some_and(|v| v.scroll.is_some())
         {
+            latest_width = 17.min(content_width.saturating_sub(2));
             let rect = r(
-                content_width.saturating_sub(18),
-                app.content_rect.bottom().saturating_sub(1),
-                17,
+                content_width.saturating_sub(1 + latest_width),
+                tree_y.saturating_sub(1),
+                latest_width,
                 1,
             );
             // Text-only overlay: retain every underlying cell's background.
@@ -423,7 +427,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         } else {
             String::new()
         };
-        let rect = r(1, tree_y.saturating_sub(1), width.saturating_sub(2), 1);
+        let taken = if latest_width > 0 {
+            latest_width + 3
+        } else {
+            2
+        };
+        let rect = r(
+            1,
+            tree_y.saturating_sub(1),
+            content_width.saturating_sub(taken),
+            1,
+        );
         text(frame, rect, model::clean(&message), p.warning, p.base);
         if app.leader.is_none() && app.toast.is_none() {
             app.hits.push((
@@ -511,7 +525,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .models
         .get(model)
         .map_or(model, |profile| profile.model.as_str());
-    // The root composer's next message goes out in this mode; children have none.
+    // The root composer's next message goes out in this mode; a child's is fixed.
     let root_label = format!("{} · {model}", app.mode);
     let model = if app.selected.path().is_empty() {
         &root_label
@@ -681,6 +695,14 @@ mod tests {
         // A blank row under the title; what it lists sits one column further in.
         assert!(column(4).trim().is_empty() && column(5).starts_with("  ✓ parse"));
         assert!(column(bottom).trim().is_empty() && column(bottom - 1).contains("· Use MCP tools"));
+        // A notice spans the conversation only; the sidebar runs on beside it.
+        app.toast = Some(("notice ".repeat(30), std::time::Instant::now()));
+        let noticed = screen(&mut app, 120);
+        let rows: Vec<_> = noticed.lines().collect();
+        let notice = rows.iter().position(|row| row.contains("notice notice"));
+        let beside: String = rows[notice.unwrap()].chars().skip(88).collect();
+        assert!(!beside.contains("notice") && noticed.contains("· Use MCP tools"));
+        app.toast = None;
         // A pending mode shows what the next message will be granted.
         app.mode = "missing".into();
         assert!(!screen(&mut app, 120).contains("Capabilities"));
@@ -862,6 +884,15 @@ mod tests {
             .collect();
         assert_eq!(label, "↓ Latest activity");
         assert_eq!(app.view().scroll, Some(0));
+        // A notice shares that row without moving the popup, and gives way to it.
+        app.toast = Some(("notice ".repeat(30), std::time::Instant::now()));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(latest(&app), Some(rect));
+        let buffer = terminal.backend().buffer();
+        let row: String = (0..80).map(|x| buffer[(x, rect.y)].symbol()).collect();
+        assert!(row.starts_with(" notice notice") && row.contains("noti ↓ Latest activity"));
+        app.toast = None;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         // Use the rendered hit coordinates and the real event handler. The
         // overlay overlaps selectable text, which must not repin the view.

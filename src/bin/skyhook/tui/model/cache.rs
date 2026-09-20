@@ -27,7 +27,7 @@ pub struct ContentChanges {
 pub struct ContentCache {
     entries: Vec<Entry>,
     overlay_len: usize,
-    identity: Option<(AgentId, Tab, bool, bool, u64, u64)>,
+    identity: Option<(AgentId, Tab, bool, u64, u64)>,
     history_len: usize,
     history_running: bool,
     live: Vec<LiveContent>,
@@ -148,13 +148,11 @@ impl ContentCache {
         let EntryView {
             agent,
             view,
-            thinking,
             all_details,
         } = presentation;
         let identity = (
             agent.clone(),
             view.tab,
-            thinking,
             all_details,
             revision,
             projection.through,
@@ -183,7 +181,7 @@ impl ContentCache {
             // the affected card, including authoritative equal-length updates.
             for request in &dirty_responses {
                 if let Some(entry) =
-                    super::retry::retry_entry(snapshot, projection, agent, *request, thinking)
+                    super::retry::retry_entry(snapshot, projection, agent, *request)
                     && let Some(index) = entries[..self.history_len]
                         .iter()
                         .position(|old| old.key() == entry.key())
@@ -232,7 +230,7 @@ impl ContentCache {
         if reset {
             let responses = super::live::live_tail_responses(snapshot, projection, agent);
             for (request, response) in responses {
-                let content = response_entries(request, response, view, thinking, agent_name);
+                let content = response_entries(request, response, view, agent_name);
                 self.push_live(entries, request, content);
             }
         }
@@ -253,7 +251,7 @@ impl ContentCache {
                 if let Some(response) =
                     super::live::live_tail_response(snapshot, projection, agent, request)
                 {
-                    let content = response_entries(request, response, view, thinking, agent_name);
+                    let content = response_entries(request, response, view, agent_name);
                     self.push_live(entries, request, content);
                 }
             }
@@ -323,7 +321,6 @@ mod tests {
         EntryView {
             agent,
             view,
-            thinking: false,
             all_details,
         }
     }

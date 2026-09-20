@@ -70,7 +70,9 @@ is omitted from both model tools and script bindings. Its optional `workspace` a
 absolute directories for both local and remote children. Relative overrides resolve against the
 workspace selected by the target rules. Children receive a fresh conversation, shared harness
 instructions and host-owned skills, and their parent's active model, including model switches and
-restored session selections. An explicit child `model` overrides the inherited model.
+restored session selections. An explicit child `model` overrides the inherited model, and `mode` runs the child in a mode in
+place of the caller's capabilities. Both take only entries configured with a `hint`, and `mode` only
+those granting nothing the caller lacks; an input with nothing to offer is absent.
 This applies equally to local children, remote children, and deeper descendants. Agents on
 the same target share files; a workspace override creates no filesystem isolation. Children must
 finish or cancel all owned jobs and descendants before their agent job completes. Only root agents

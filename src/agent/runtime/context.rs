@@ -2,7 +2,10 @@
 
 use std::collections::HashMap;
 
-use super::{HarnessError, compact::TokenMeter};
+use super::{
+    HarnessError,
+    compact::{TokenMeter, retention_budget},
+};
 use crate::{
     agent::ContextUsage,
     identity::AgentId,
@@ -26,6 +29,8 @@ pub(super) struct AgentContext {
     through: u64,
     /// Checkpoint and retained messages, which precede later commits in `projected`.
     prefix: usize,
+    /// Occupancy at which a summary last failed to shrink the context.
+    skipped_at: Option<u64>,
 }
 
 impl AgentContext {
@@ -40,7 +45,7 @@ impl AgentContext {
         let projected = project_history(records, agent)?;
         let provider = factory.open_context(agent.to_string())?;
         let meter = if restore_meter {
-            TokenMeter::restore(records, agent, &template.to_request())
+            TokenMeter::restore(records, agent)
         } else {
             TokenMeter::default()
         };
@@ -53,6 +58,7 @@ impl AgentContext {
             provider,
             unavailable_tools: Default::default(),
             through: records.last().map_or(0, |record| record.sequence),
+            skipped_at: None,
         })
     }
 
@@ -83,7 +89,7 @@ impl AgentContext {
             let records = store.records().await;
             self.projected = project_history(&records, agent)?;
             self.prefix = history_prefix(&self.projected, &records, agent);
-            self.meter = TokenMeter::default();
+            self.skipped_at = None;
             self.through = records.last().map_or(0, |record| record.sequence);
             return Ok(());
         }
@@ -104,10 +110,8 @@ impl AgentContext {
 
     /// Build the next agent request: projected history, then runtime state as tail unless the
     /// state mode is none.
-    /// When this request's calibrated input estimate alone already reaches the
-    /// compaction threshold, its completed response will compact and replace this
-    /// history. The estimate excludes output, so it never predicts earlier than
-    /// `needs_compaction` decides.
+    /// Its history is marked as ending once the request itself reaches the
+    /// compaction threshold.
     pub fn request(&self, runtime: UserContent) -> ModelRequest {
         let mut request = ModelRequest {
             history: crate::session::merge_tool_results(
@@ -129,8 +133,27 @@ impl AgentContext {
     pub fn needs_compaction(&self, usage: Usage) -> bool {
         // Only the completed response's reported occupancy, including cached input
         // and generated output; estimates and output limits never trigger it.
-        let input = usage.input_tokens.saturating_add(usage.cached_input_tokens);
-        self.reaches_compaction(input.saturating_add(usage.output_tokens))
+        let tokens = occupancy(usage);
+        // A summary that could not shrink this context is not worth repeating until
+        // there is another retained tail's worth of history to fold into it.
+        let grown = self.skipped_at.is_none_or(|skipped| {
+            tokens >= skipped.saturating_add(retention_budget(self.profile.max_context))
+        });
+        grown && self.reaches_compaction(tokens)
+    }
+
+    /// A summary at this occupancy could not shrink the context.
+    pub fn compaction_skipped(&mut self, usage: Usage) {
+        self.skipped_at = Some(occupancy(usage));
+    }
+
+    /// A mode switch invalidates bound reasoning in the history before it.
+    pub fn strip_bound_reasoning(&mut self) {
+        let later = self.projected.split_off(self.prefix);
+        let kept = later
+            .into_iter()
+            .filter_map(|(sequence, message)| Some((sequence, message.without_bound_reasoning()?)));
+        self.projected.extend(kept);
     }
 
     fn reaches_compaction(&self, tokens: u64) -> bool {
@@ -142,6 +165,11 @@ impl AgentContext {
             .iter()
             .any(|(_, message)| super::contains_images(std::slice::from_ref(message)))
     }
+}
+
+fn occupancy(usage: Usage) -> u64 {
+    let input = usage.input_tokens.saturating_add(usage.cached_input_tokens);
+    input.saturating_add(usage.output_tokens)
 }
 
 /// The projected checkpoint and the retained messages at or before its frontier.
@@ -203,7 +231,7 @@ pub(in crate::agent) fn recorded_context(
         let tail = std::mem::take(&mut request.tail);
         request.history.clear();
         request.history_lifetime = HistoryLifetime::default();
-        let meter = TokenMeter::restore(records, agent, &request);
+        let meter = TokenMeter::restore(records, agent);
         let Ok(history) = crate::session::project_history(records, agent) else {
             continue;
         };
@@ -337,6 +365,7 @@ mod tests {
             unavailable_tools: Default::default(),
             through: 0,
             prefix: 0,
+            skipped_at: None,
         }
     }
 
@@ -360,6 +389,42 @@ mod tests {
         // The input alone reaches 80%: the response will compact this history away.
         context.projected.push(text(40_000));
         assert_eq!(context.request(runtime()).history_lifetime, Ending);
+    }
+
+    #[test]
+    fn meter_scales_later_estimates_by_the_reported_prompt_in_either_direction() {
+        let mut context = test_context(128_000, 1_000);
+        let request = |context: &super::AgentContext| {
+            let text = "x".repeat(40_000);
+            context.request(UserContent::Runtime { text })
+        };
+        let raw = context.meter.estimate(&request(&context));
+        for actual in [raw / 2, raw * 3] {
+            context.meter.observe(raw, tests::usage(actual, 0, 7));
+            assert_eq!(context.meter.estimate(&request(&context)), actual);
+            // A zero report keeps that baseline.
+            context.meter.observe(raw, Usage::default());
+            assert_eq!(context.meter.estimate(&request(&context)), actual);
+            // New history is scaled by the same ratio.
+            let text = "y".repeat(80_000);
+            context.projected = vec![(1, Message::User(vec![UserContent::Text { text }]))];
+            let grown = super::super::compaction::estimate_request(&request(&context));
+            let expected = u128::from(grown) * u128::from(actual) / u128::from(raw);
+            let found = context.meter.estimate(&request(&context));
+            assert_eq!(u128::from(found), expected);
+            context.projected.clear();
+        }
+    }
+
+    #[test]
+    fn a_skipped_compaction_waits_for_another_retained_tail_of_growth() {
+        let mut context = test_context(128_000, 1_000);
+        let full = tests::usage(100_000, 2_000, 400);
+        assert!(context.needs_compaction(full));
+        context.compaction_skipped(full);
+        assert!(!context.needs_compaction(full));
+        assert!(!context.needs_compaction(tests::usage(100_000, 9_999, 400)));
+        assert!(context.needs_compaction(tests::usage(100_000, 10_000, 400)));
     }
 
     #[test]

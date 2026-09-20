@@ -221,7 +221,7 @@ impl ProviderContext for NativeContext {
                     }
                 }
             }
-            let events = transport::post_sse_with_timeouts(
+            let (_, events) = transport::post_sse_with_timeouts(
                 &provider.client,
                 &provider.endpoint,
                 headers,

@@ -8,7 +8,7 @@ use super::{
 };
 use crate::provider::{
     Provider, ProviderContext, ProviderError, ProviderErrorKind, ProviderFuture,
-    protocol::ModelRequest,
+    protocol::{Message, ModelRequest, UserContent},
 };
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
@@ -49,6 +49,7 @@ impl Provider for CodexProvider {
         Ok(Box::new(Context {
             provider: self.clone(),
             correlation,
+            routing: Default::default(),
         }))
     }
 }
@@ -56,12 +57,29 @@ impl Provider for CodexProvider {
 struct Context {
     provider: CodexProvider,
     correlation: String,
+    /// The service's sticky-routing token: received on a turn's first response and
+    /// replayed on that turn's later requests, never on another turn's.
+    routing: std::sync::Arc<std::sync::Mutex<Option<HeaderValue>>>,
+}
+
+const TURN_STATE: &str = "x-codex-turn-state";
+
+/// Whether the request answers tool calls, rather than opening a turn with user
+/// input or a wake. Runtime state after the results is part of the same request.
+fn continues_turn(request: &ModelRequest) -> bool {
+    let runtime_only = |message: &&Message| {
+        matches!(message, Message::User(parts)
+            if parts.iter().all(|part| matches!(part, UserContent::Runtime { .. })))
+    };
+    let mut history = request.history.iter().rev().skip_while(runtime_only);
+    matches!(history.next(), Some(Message::Tool(_)))
 }
 
 impl ProviderContext for Context {
     fn invoke(&mut self, mut request: ModelRequest) -> ProviderFuture {
         let provider = self.provider.clone();
         let correlation = self.correlation.clone();
+        let routing = self.routing.clone();
         Box::pin(async move {
             let scope = provider.replay_scope();
             filter_reasoning_scope(&mut request, &scope);
@@ -78,13 +96,26 @@ impl ProviderContext for Context {
                 ));
             }
             let credentials = provider.auth.credentials().await.map_err(auth_error)?;
-            let headers = auth_headers(
+            let mut headers = auth_headers(
                 &credentials.access_token,
                 &credentials.account_id,
                 &correlation,
             )?;
-            let events =
+            {
+                let mut token = routing.lock().expect("routing lock");
+                if !continues_turn(&request) {
+                    *token = None;
+                }
+                if let Some(token) = &*token {
+                    headers.insert(TURN_STATE, token.clone());
+                }
+            }
+            let (response, events) =
                 transport::post_sse(&provider.client, &provider.endpoint, headers, &body).await?;
+            if let Some(received) = response.get(TURN_STATE) {
+                let mut token = routing.lock().expect("routing lock");
+                token.get_or_insert_with(|| received.clone());
+            }
             Ok(super::decode_stream(
                 events,
                 super::Decoder::Codex(responses::Decoder::codex(request.model)),
@@ -111,12 +142,9 @@ fn auth_headers(token: &str, account: &str, correlation: &str) -> Result<HeaderM
         sensitive(account, "invalid Codex account identifier")?,
     );
     headers.insert("originator", HeaderValue::from_static("skyhook"));
+    // The service derives cache affinity from this header.
     headers.insert(
-        "openai-beta",
-        HeaderValue::from_static("responses_websockets=2026-02-06"),
-    );
-    headers.insert(
-        "session_id",
+        "session-id",
         HeaderValue::from_str(correlation).map_err(|_| {
             error(
                 ProviderErrorKind::InvalidRequest,
@@ -281,14 +309,84 @@ mod tests {
         let requests = server.finish().await;
         assert!(requests[0].starts_with("POST "));
         assert!(requests[0].contains("Bearer test-access-token"));
-        assert!(requests[0].contains("session_id: context"));
-        assert!(requests[0].contains("openai-beta: responses_websockets=2026-02-06"));
+        assert!(requests[0].contains("session-id: context"));
         let body: Value =
             serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert!(body.get("max_output_tokens").is_none());
         assert_eq!(body["instructions"], "");
         assert_eq!(body["input"][0], reasoning_item());
         assert_eq!(body["input"][1]["call_id"], body["input"][2]["call_id"]);
+    }
+
+    #[tokio::test]
+    async fn turn_state_is_replayed_within_its_turn_only() {
+        let done = json!({"type":"response.completed","response":{"id":"r","status":"completed","output":[]}});
+        let reply_with = |token: &str| {
+            let headers =
+                format!("Content-Type: text/event-stream\r\nx-codex-turn-state: {token}\r\n");
+            Plan::reply(reply("200 OK", &headers, &format!("data: {done}\n\n")))
+        };
+        let plans = ["first", "ignored", "second", "unused", "unused"].map(reply_with);
+        let server = Server::start(plans.into()).await;
+        let directory = tempfile::tempdir().unwrap();
+        let provider = CodexProvider {
+            name: "codex".into(),
+            auth: auth::test_manager(directory.path().to_owned()),
+            client: transport::client().unwrap(),
+            endpoint: server.url.clone(),
+        };
+        let mut context = provider.open_context("context".into()).unwrap();
+        let mut request = reasoning_tool_request(&provider.replay_scope());
+        let exchange = request.history.clone();
+        let user = |part| Message::User(vec![part]);
+        let state = || {
+            user(UserContent::Runtime {
+                text: "state".into(),
+            })
+        };
+        // The opening request, a tool-loop request with persisted state, a wake by a
+        // runtime event alone, that new turn's own tool loop, then queued user input.
+        let steps: [Vec<Message>; 5] = [
+            vec![user(UserContent::Text {
+                text: "start".into(),
+            })],
+            [exchange.clone(), vec![state()]].concat(),
+            vec![
+                Message::Assistant(vec![AssistantItem::text("t", 0, "done")]),
+                state(),
+            ],
+            exchange,
+            vec![user(UserContent::Text {
+                text: "queued".into(),
+            })],
+        ];
+        request.history.clear();
+        for step in steps {
+            request.history.extend(step);
+            let chunks: Vec<_> = context
+                .invoke(request.clone())
+                .await
+                .unwrap()
+                .collect()
+                .await;
+            assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+        }
+        let requests = server.finish().await;
+        let sent = |request: &String| {
+            let line = request.lines().find(|line| line.starts_with(TURN_STATE));
+            line.map(|line| line.rsplit(' ').next().unwrap().to_owned())
+        };
+        let sent: Vec<_> = requests.iter().map(sent).collect();
+        assert_eq!(
+            sent,
+            [
+                None,
+                Some("first".into()),
+                None,
+                Some("second".into()),
+                None
+            ]
+        );
     }
 
     #[test]

@@ -62,14 +62,18 @@ default_mode = "readonly"
 [modes.readonly]
 capabilities = ["read", "network"]
 instructions = "Investigate and report. Do not change anything."
+hint = "Look things up without changing anything"
 
 # Built in, and listed first. Declare it only to change what it grants.
 [modes.general]
 capabilities = ["read", "write", "exec", "network", "agents", "mcp"]
 ```
 
-`capabilities` is required, and `default_mode` must name `general` or a declared mode. Optional `instructions` are added to the root agent's system prompt
-while the mode is active; they guide the model, whereas capabilities are enforced. A workspace
+`capabilities` is required, and `default_mode` must name `general` or a declared mode. Optional `instructions` are added to the system prompt of an agent
+running in the mode; they guide the model, whereas capabilities are enforced. An optional `hint`
+offers the mode to agents starting a child: the `agent` tool lists each hinted mode whose
+capabilities the caller holds itself, with those capabilities and the hint. A mode without a hint
+cannot be given to a child. A workspace
 config that declares a mode replaces the whole definition of a user-config mode with that name;
 modes it does not name are kept, in declaration order.
 
@@ -77,8 +81,9 @@ modes it does not name are kept, in declaration order.
 that workspace, and a batch job in `default_mode`. In the terminal, `Tab`/`Shift+Tab` in the composer (or
 `/mode`) choose the mode the next message is sent in; the footer shows it. A change takes effect
 with that message: the root agent's tools and system prompt are rebuilt, which forfeits the
-provider's prompt cache. Child agents get the capabilities their parent holds when they start
-and keep them, as do background jobs and scripts already running; mode instructions are not passed to them. A session can only hold capabilities
+provider's prompt cache. Child agents keep what they start with: the capabilities and instructions of the mode their
+parent chose for them, or otherwise the capabilities their parent holds and no mode instructions.
+Background jobs and scripts already running keep their capabilities too. A session can only hold capabilities
 that some configured mode grants, and MCP servers start under that union, so switching modes
 never starts or stops a server. Approvals granted earlier stay recorded but cannot be used while
 the mode lacks their capability. A resumed session continues in the mode it was last in. A

@@ -8,7 +8,8 @@ approve_all = false
 # Modes are named permission presets. A mode's capabilities are an exact allowlist ([] grants
 # none); add "targets" for remote-target tools, arguments, JavaScript APIs, and guidance.
 # Interaction is supplied by the terminal and absent from batch jobs, never listed here.
-# Optional instructions are added to the root agent's system prompt while the mode is active.
+# Optional instructions are added to the system prompt of an agent running in the mode.
+# A hint, on a mode or a model, offers it to agents starting a child; others cannot be chosen.
 # The terminal switches modes with Tab/Shift+Tab in the composer; --mode picks the starting one.
 # This built-in mode always exists; declare it to change what it grants:
 # [modes.general]
@@ -17,6 +18,7 @@ approve_all = false
 # [modes.readonly]
 # capabilities = ["read", "network"]
 # instructions = "Investigate and report. Do not change anything."
+# hint = "Look things up without changing anything"
 
 # The CLI loads .env from its invocation directory (not --workspace or the config directory).
 # Existing process environment variables take precedence; no parent-directory search.
@@ -99,6 +101,8 @@ max_context = 262144
 max_output = 131072
 # The text-only server above has no multimodal projector configured.
 supports_images = false
+# Adding a hint makes the model available to be used for delegation by other agents
+hint = "Local model, good at exploration and logic but not writing"
 
 # Targets are defined only here or by target_add; SSH configuration files are never read.
 

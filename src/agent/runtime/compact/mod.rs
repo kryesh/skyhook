@@ -7,7 +7,7 @@ use crate::{
         ProviderContext,
         protocol::{Message, ModelRequest, Usage},
     },
-    session::{EventRecord, ModelPurpose, SessionEvent},
+    session::{EventRecord, SessionEvent},
 };
 
 /// Context/validation recovery is bounded independently of transient retries.
@@ -17,6 +17,7 @@ mod checkpoint;
 mod retention;
 mod summary;
 use checkpoint::CompactionInput;
+pub(super) use retention::retention_budget;
 
 pub(super) async fn retry_delay(
     cancellation: &crate::job::CancellationToken,
@@ -28,69 +29,53 @@ pub(super) async fn retry_delay(
     }
 }
 
-/// Calibrate the next estimate against the last successful request with the same template.
+/// Scale estimates by the last provider-reported prompt size. A ratio, unlike an
+/// offset, stays valid when compaction shrinks the history.
 #[derive(Default)]
 pub(super) struct TokenMeter {
     baseline: Option<(u64, u64)>,
 }
 
 impl TokenMeter {
-    pub(super) fn restore(
-        records: &[EventRecord],
-        agent: &AgentId,
-        template: &ModelRequest,
-    ) -> Self {
+    /// The agent's latest reported request since its model or mode last changed.
+    pub(super) fn restore(records: &[EventRecord], agent: &AgentId) -> Self {
         let mut meter = Self::default();
         for record in records.iter().rev().filter(|record| &record.agent == agent) {
-            if matches!(
-                record.event,
-                SessionEvent::Compaction { .. }
-                    | SessionEvent::ModelChanged { .. }
-                    | SessionEvent::ModeChanged { .. }
-            ) {
-                break;
+            match &record.event {
+                SessionEvent::ModelChanged { .. } | SessionEvent::ModeChanged { .. } => break,
+                SessionEvent::Usage {
+                    request: Some(request),
+                    usage,
+                } => {
+                    if let Ok((_, request)) =
+                        crate::session::reconstruct_model_request(records, *request)
+                    {
+                        meter.observe(compaction::estimate_request(&request), *usage);
+                    }
+                    if meter.baseline.is_some() {
+                        break;
+                    }
+                }
+                _ => {}
             }
-            let SessionEvent::Usage {
-                request: Some(request),
-                usage,
-            } = &record.event
-            else {
-                continue;
-            };
-            let Some(request_event) = records.iter().find(|record| record.sequence == *request)
-            else {
-                continue;
-            };
-            let SessionEvent::ModelRequested {
-                context,
-                purpose: ModelPurpose::Agent,
-                ..
-            } = &request_event.event
-            else {
-                continue;
-            };
-            let same_template = records.iter().any(|record| record.sequence == *context && matches!(&record.event, SessionEvent::ModelContext { context } if context.template(agent) == *template));
-            if same_template
-                && let Ok((_, request)) =
-                    crate::session::reconstruct_model_request(records, *request)
-            {
-                meter.observe(compaction::estimate_request(&request), *usage);
-            }
-            break;
         }
         meter
     }
 
     pub(super) fn estimate(&self, request: &ModelRequest) -> u64 {
-        let estimate = compaction::estimate_request(request);
+        self.scale(compaction::estimate_request(request))
+    }
+
+    pub(super) fn scale(&self, estimate: u64) -> u64 {
         self.baseline.map_or(estimate, |(old_estimate, actual)| {
-            estimate.max(actual.saturating_add(estimate).saturating_sub(old_estimate))
+            let scaled = u128::from(estimate) * u128::from(actual) / u128::from(old_estimate);
+            u64::try_from(scaled).unwrap_or(u64::MAX)
         })
     }
 
     pub(super) fn observe(&mut self, estimate: u64, usage: Usage) {
         let actual = usage.input_tokens.saturating_add(usage.cached_input_tokens);
-        if actual > 0 {
+        if actual > 0 && estimate > 0 {
             self.baseline = Some((estimate, actual));
         }
     }
@@ -101,14 +86,16 @@ pub(super) fn context_sources(projected: &[(u64, Message)]) -> Vec<u64> {
 }
 
 impl SessionRuntime {
+    /// Whether a checkpoint was installed; a summary that cannot shrink the context is skipped.
     pub(super) async fn compact_history(
         &self,
         turn: &TurnContext<'_>,
         provider: &mut dyn ProviderContext,
+        meter: &mut TokenMeter,
         context: u64,
         input: &ModelRequest,
         max_context: u64,
-    ) -> Result<(), HarnessError> {
+    ) -> Result<bool, HarnessError> {
         let mut launches = self.jobs.active_launches(turn.agent).await;
         let mut model_attempt = 0;
         for attempt in 1..=MAX_COMPACTION_ATTEMPTS {
@@ -119,6 +106,7 @@ impl SessionRuntime {
                     turn,
                     provider,
                     CompactionInput {
+                        meter,
                         context,
                         request: input,
                         max_context,
@@ -131,7 +119,7 @@ impl SessionRuntime {
             // Only an attempt of this summary request belongs to its outcome.
             let summary_attempt = (model_attempt > attempted).then_some(model_attempt);
             match result {
-                Ok(()) => return Ok(()),
+                Ok(installed) => return Ok(installed),
                 Err(error) => {
                     self.store
                         .append(
@@ -381,7 +369,7 @@ mod tests {
                 .map(|record| record.event.clone())
                 .expect("the fixture prompt journaled a model context");
             let store = &runtime.store;
-            let context = store.append(agent.clone(), context).await.unwrap().sequence;
+            let sequence = store.append(agent.clone(), context).await.unwrap().sequence;
             let mut input = self.template.clone();
             let history = project_history(&runtime.store.records().await, agent).unwrap();
             input.history = history.into_iter().map(|(_, message)| message).collect();
@@ -399,9 +387,10 @@ mod tests {
                 capabilities: capabilities.clone(),
             };
             let mut provider = self.provider.open_context(agent.to_string())?;
-            runtime
-                .compact_history(&turn, provider.as_mut(), context, &input, 128_000)
-                .await
+            let (provider, meter) = (provider.as_mut(), &mut Default::default());
+            let compacted =
+                runtime.compact_history(&turn, provider, meter, sequence, &input, 128_000);
+            compacted.await.map(drop)
         }
     }
 

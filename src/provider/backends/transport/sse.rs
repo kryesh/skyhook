@@ -209,7 +209,7 @@ mod tests {
                 &Value::Null,
                 timeouts(100, 100),
             );
-            let mut stream = post.await.unwrap();
+            let (_, mut stream) = post.await.unwrap();
             if partial_output {
                 assert_eq!(stream.next().await.unwrap().unwrap().data, "first");
             }

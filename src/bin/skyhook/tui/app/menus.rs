@@ -426,7 +426,6 @@ impl App {
             Command::PreviousAgent | Command::NextAgent => {
                 self.step_agent(command == Command::PreviousAgent);
             }
-            Command::Thinking => self.thinking = !self.thinking,
             Command::Details => {
                 self.details = !self.details;
                 if self.details { for view in self.views.values_mut() { view.clear_collapsed(); } }
@@ -571,7 +570,7 @@ impl App {
             Command::Export => {
                 let view = model::EntryView {
                     agent: &self.selected, view: &View::default(),
-                    thinking: self.thinking, all_details: true,
+                    all_details: true,
                 };
                 let entries = model::entries(&self.snapshot, &self.projection, view, &self.outputs, true);
                 let text = entries.iter().map(|entry| entry.text()).collect::<Vec<_>>().join("\n\n");
@@ -609,10 +608,7 @@ impl App {
                 "Copy message uses the terminal clipboard (OSC 52).",
             ), self.keys.help())),
         }
-        if matches!(
-            command,
-            Command::Inspect | Command::Thinking | Command::Details
-        ) {
+        if matches!(command, Command::Inspect | Command::Details) {
             self.invalidate_content();
         }
         self.dirty = true;
@@ -1144,7 +1140,9 @@ mod tests {
         assert_eq!(shown, expected);
         for (command, label, shortcut) in [
             (Command::New, "New session", "Ctrl+X N"),
-            (Command::Mode, "Mode", ""),
+            (Command::Mode, "Mode", "Ctrl+X P"),
+            (Command::Help, "Help and shortcuts", "Ctrl+X H"),
+            (Command::Resume, "Resume queued input", ""),
             (Command::Model, "Model", "Ctrl+X M"),
         ] {
             let item = items.iter().find(|item| item.value == command).unwrap();
@@ -1160,7 +1158,6 @@ mod tests {
             ("attention", Command::Attention),
             ("/ATTENTION", Command::Attention),
             ("retry", Command::Retry),
-            ("thinking", Command::Thinking),
             ("sessions", Command::Sessions),
             ("agents", Command::Agents),
             ("exit", Command::Exit),

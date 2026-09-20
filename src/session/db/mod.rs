@@ -22,7 +22,7 @@ pub use state::SessionSummary;
 pub(super) use state::{interrupted_work, summary};
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 7;
+pub(super) const USER_VERSION: i64 = 8;
 const SCHEMA: &str = include_str!("../schema.sql");
 /// Payload tables outside the append-only ledger: blob writes, output upserts and pruning.
 const MUTABLE_TABLES: [&str; 6] = [

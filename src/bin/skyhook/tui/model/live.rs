@@ -56,7 +56,6 @@ pub(super) fn reasoning_entry(
     key: EntryKey,
     text: &str,
     view: &View,
-    thinking: bool,
     status: ReasoningStatus,
 ) -> Entry {
     let title = match status {
@@ -65,7 +64,7 @@ pub(super) fn reasoning_entry(
         ReasoningStatus::Incomplete => "Reasoning · incomplete",
     };
     let running = status == ReasoningStatus::Running;
-    let default_open = running || thinking;
+    let default_open = running;
     // Source lines determine collapsibility; terminal wrapping must not change interaction.
     let text = text.trim_matches(['\r', '\n']);
     if text.lines().count() <= 1 {
@@ -144,7 +143,6 @@ pub(super) fn response_entries(
     request: u64,
     response: &LiveResponse,
     view: &View,
-    thinking: bool,
     agent_name: &str,
 ) -> Vec<Entry> {
     let mut entries = Vec::new();
@@ -158,7 +156,6 @@ pub(super) fn response_entries(
                         reasoning_key(request, &item.id, &block.id),
                         &block.text,
                         view,
-                        thinking,
                         if running {
                             ReasoningStatus::Running
                         } else if response.error.is_some() {
@@ -233,35 +230,33 @@ mod tests {
         use ReasoningStatus::{Complete, Running};
         let mut view = View::default();
         let key = reasoning_key(4, "item", "block");
-        let entry = |view: &View, text: &str, open: bool, status| {
-            reasoning_entry(key.clone(), text, view, open, status)
-        };
-        let active = entry(&view, "\nFirst\nSecond\r\n", true, Running);
+        let entry =
+            |view: &View, text: &str, status| reasoning_entry(key.clone(), text, view, status);
+        let active = entry(&view, "\nFirst\nSecond\r\n", Running);
         assert_eq!(active.text(), "▾   Reasoning\nFirst\nSecond");
         assert!(active.expandable() && active.default_open);
         view.set_expanded(key.clone(), false);
         assert_eq!(
-            entry(&view, "First\nSecond", true, Running).text(),
+            entry(&view, "First\nSecond", Running).text(),
             "▸   Reasoning"
         );
         view.clear_collapsed();
         assert_eq!(
-            entry(&view, "First\nSecond", false, Complete).text(),
+            entry(&view, "First\nSecond", Complete).text(),
             "▸ Reasoning"
         );
         view.set_expanded(key.clone(), true);
         assert!(
-            entry(&view, "First\nSecond", false, Complete)
+            entry(&view, "First\nSecond", Complete)
                 .text()
                 .contains("Second")
         );
-        assert!(!entry(&view, "single line", false, Complete).expandable());
+        assert!(!entry(&view, "single line", Complete).expandable());
     }
 
     #[test]
     fn text_visibility_preserves_whitespace_and_failed_response_attribution() {
-        let rows =
-            |live: &LiveResponse| response_entries(4, live, &View::default(), false, "Agent");
+        let rows = |live: &LiveResponse| response_entries(4, live, &View::default(), "Agent");
         for text in ["", "\n\n", "  "] {
             assert!(rows(&response(text)).is_empty());
         }

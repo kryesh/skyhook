@@ -148,6 +148,8 @@ replay native reasoning items (including encrypted state), and Anthropic replays
 redacted-thinking blocks. Native replay is automatic when provider, endpoint, protocol, and model
 provenance match. Visible summaries are not substituted for opaque or signed state. Switching to an
 incompatible provider/model filters replay from that request without deleting the original history.
+Signed thinking is bound to its conversation, so compaction and mode switches drop it from the
+history before them.
 Reasoning that the service never returns cannot be reconstructed.
 
 Standard Chat Completions has no portable request-side reasoning field. Compatible Chat providers

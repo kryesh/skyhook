@@ -59,7 +59,7 @@ pub(super) struct PromptInputs<'a> {
     /// None on the session host.
     pub target: Option<&'a crate::target::TargetDefinition>,
     pub available_depth: usize,
-    /// The root agent's mode and its name.
+    /// The agent's mode and its name.
     pub mode: Option<(&'a str, &'a Mode)>,
     pub capabilities: &'a CapabilitySet,
 }

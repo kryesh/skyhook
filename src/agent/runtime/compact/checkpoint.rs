@@ -1,7 +1,9 @@
 //! Build and atomically install compaction checkpoints against current runtime state.
 
-use super::retention::{included_message_jobs, included_output_jobs, retained_sources};
-use super::{HarnessError, SessionRuntime, TurnContext, compaction, context_sources};
+use super::retention::{
+    included_message_jobs, included_output_jobs, retained_sources, retention_budget,
+};
+use super::{HarnessError, SessionRuntime, TokenMeter, TurnContext, compaction, context_sources};
 use crate::{
     agent::runtime::state,
     identity::JobId,
@@ -14,6 +16,7 @@ use crate::{
 use std::collections::BTreeSet;
 
 pub(super) struct CompactionInput<'a> {
+    pub(super) meter: &'a mut TokenMeter,
     pub(super) context: u64,
     pub(super) request: &'a ModelRequest,
     pub(super) max_context: u64,
@@ -28,8 +31,9 @@ impl SessionRuntime {
         source: CompactionInput<'_>,
         request_sequence: &mut Option<u64>,
         launches: &mut Vec<(JobId, Option<ModelCallOrigin>)>,
-    ) -> Result<(), HarnessError> {
+    ) -> Result<bool, HarnessError> {
         let CompactionInput {
+            meter,
             context,
             request: input,
             max_context,
@@ -92,17 +96,11 @@ impl SessionRuntime {
             schema: compaction::response_schema(),
         });
         let template = summary_request.clone();
-        summary_request.history = summary_history;
         // Dropping tools changes the conversation, invalidating bound reasoning.
-        summary_request
-            .history
-            .iter_mut()
-            .for_each(Message::strip_bound_reasoning);
-        // Stripping can empty a message that carried only bound replay. Filter
-        // after stripping, as projection does, so no unencodable message is sent.
-        summary_request
-            .history
-            .retain(|message| !message.is_content_free());
+        summary_request.history = summary_history
+            .into_iter()
+            .filter_map(Message::without_bound_reasoning)
+            .collect();
         summary_request.tail = summary_tail;
         summary_request.tail.push(directive);
         // The checkpoint replaces this history once the summary completes.
@@ -150,8 +148,9 @@ impl SessionRuntime {
             .await?;
         *request_sequence = Some(requested.sequence);
         self.activity(agent, crate::agent::runtime::AgentActivity::Compacting);
+        let summary_estimate = compaction::estimate_request(&summary_request);
         self.store.load_blobs(&mut summary_request).await?;
-        let continuation = self
+        let (continuation, usage) = self
             .summarize(
                 turn,
                 provider,
@@ -160,6 +159,8 @@ impl SessionRuntime {
                 model_attempt,
             )
             .await?;
+        meter.observe(summary_estimate, usage);
+        let before_tokens = meter.scale(before_tokens);
         let mut message = continuation.message;
         for launch in self.jobs.active_launches(agent).await {
             if !launches.contains(&launch) {
@@ -170,7 +171,9 @@ impl SessionRuntime {
             .iter()
             .filter_map(|(_, origin)| origin.clone())
             .collect();
-        let retained = retained_sources(&records, agent, &projected, &origins)?;
+        let budget = retention_budget(max_context);
+        let retained =
+            retained_sources(&records, agent, &projected, &origins, &input.model, budget)?;
         let mut included = BTreeSet::new();
         for source in &retained {
             included_message_jobs(source.message(), &mut included);
@@ -248,13 +251,11 @@ impl SessionRuntime {
         compacted.history = vec![message.clone()];
         // Estimate what projection sends: retained bound reasoning is dropped,
         // and a message left content-free by that is dropped with it.
-        compacted
-            .history
-            .extend(retained.iter().filter_map(|source| {
-                let mut message = source.message().clone();
-                message.strip_bound_reasoning();
-                (!message.is_content_free()).then_some(message)
-            }));
+        compacted.history.extend(
+            retained
+                .iter()
+                .filter_map(|source| source.message().clone().without_bound_reasoning()),
+        );
         compacted.history = crate::session::merge_tool_results(compacted.history);
         if !compacted.tail.is_empty() {
             let runtime = state::runtime_state_with_todos(
@@ -267,14 +268,14 @@ impl SessionRuntime {
             .await;
             compacted.tail = vec![Message::User(vec![runtime])];
         }
-        let after_tokens = compaction::estimate_request(&compacted);
+        let after_tokens = meter.estimate(&compacted);
         if after_tokens >= before_tokens {
             self.store.append(agent.clone(), SessionEvent::CompactionSkipped {
                 request: requested.sequence,
                 attempt: *model_attempt,
                 reason: "continuation and retained messages do not reduce context; continuing with original history".into(),
             }).await?;
-            return Ok(());
+            return Ok(false);
         }
         if turn.cancellation.is_cancelled() {
             return Err(HarnessError::Interrupted);
@@ -313,7 +314,7 @@ impl SessionRuntime {
                 tokens: after_tokens,
                 capacity: max_context,
             });
-        Ok(())
+        Ok(true)
     }
 }
 

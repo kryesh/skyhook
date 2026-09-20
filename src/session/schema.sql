@@ -1,4 +1,4 @@
--- Skyhook session database (application_id 0x534B5948, user_version 7). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 8). Tables are STRICT;
 -- subtype rows key (entry, kind) -> entry(seq, kind). db/mod.rs adds append-only triggers
 -- to tables outside MUTABLE_TABLES. u64 values saturate to i64::MAX.
 
@@ -110,6 +110,7 @@ CREATE TABLE model_profile (
   max_output INTEGER NOT NULL CHECK (max_output > 0),
   supports_images INTEGER NOT NULL CHECK (supports_images IN (0,1)),
   state_mode TEXT NOT NULL CHECK (state_mode IN ('none','dynamic','persist')),
+  hint TEXT,
   digest BLOB NOT NULL UNIQUE CHECK (length(digest) = 32),
   CHECK (max_output < max_context)
 ) STRICT;
@@ -141,6 +142,7 @@ CREATE TABLE mode (
   kind TEXT NOT NULL CHECK (kind IN ('agent_started','mode_changed')),
   name TEXT NOT NULL UNIQUE,
   instructions TEXT,
+  hint TEXT,
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
 
@@ -152,7 +154,7 @@ CREATE TABLE mode_capability (
   PRIMARY KEY (mode, capability)
 ) STRICT, WITHOUT ROWID;
 
--- The root agent's mode as of this entry.
+-- The agent's mode as of this entry.
 CREATE TABLE agent_mode (
   entry INTEGER PRIMARY KEY,
   kind TEXT NOT NULL CHECK (kind IN ('agent_started','mode_changed')),
