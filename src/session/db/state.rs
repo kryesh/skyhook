@@ -15,11 +15,13 @@ pub struct SessionSummary {
     pub entries: u64,
     /// The root agent's applied model profile.
     pub model: Option<String>,
+    /// The root agent's applied mode.
+    pub mode: Option<String>,
 }
 
 pub(in crate::session) fn summary(db: &Db) -> DbResult<SessionSummary> {
     db.query_row(
-        "SELECT title, preview, coalesce(last_millis, 0), entries, model FROM session_summary",
+        "SELECT title, preview, coalesce(last_millis, 0), entries, model, mode FROM session_summary",
         Vec::new(),
         |row| {
             Ok(SessionSummary {
@@ -28,6 +30,7 @@ pub(in crate::session) fn summary(db: &Db) -> DbResult<SessionSummary> {
                 last_millis: row.get(2)?,
                 entries: row.get(3)?,
                 model: row.get(4)?,
+                mode: row.get(5)?,
             })
         },
     )?

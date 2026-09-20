@@ -17,6 +17,7 @@ pub struct QueuedInput {
     pub(super) unknown: bool,
     pub(super) submission: Submission,
     pub(super) model: String,
+    pub(super) mode: String,
 }
 
 pub(super) struct QueueDelivery {
@@ -83,12 +84,13 @@ impl App {
         }
         self.send_input(queued);
     }
-    /// Select the queued input's model, or retain the input and pause when
-    /// that model is no longer configured.
+    /// Select the queued input's model and mode for a new session, or retain the
+    /// input and pause when that model is no longer configured.
     fn select_queued_model(&mut self, input: QueuedInput) -> Option<QueuedInput> {
         match self.launch.model.config().select_model(&input.model) {
             Ok(model) => {
                 self.launch.model = model;
+                self.launch.permissions = crate::launch::Permissions::Mode(input.mode.clone());
                 Some(input)
             }
             Err(_) => {
@@ -110,6 +112,7 @@ impl App {
         let QueuedInput {
             submission: Submission { text, attachments },
             model,
+            mode,
             ..
         } = queued;
         self.operation = true;
@@ -130,7 +133,10 @@ impl App {
                 .prompt_with_options(
                     text,
                     &attachments,
-                    skyhook::agent::PromptOptions { model: Some(model) },
+                    skyhook::agent::PromptOptions {
+                        model: Some(model),
+                        mode: Some(mode),
+                    },
                 )
                 .await;
             let _ = tx.send(Work::Done {
@@ -139,18 +145,20 @@ impl App {
         });
         self.dirty = true;
     }
-    fn remember_model(&mut self, model: &str) {
-        if self.remembered_model.as_deref() == Some(model) {
+    fn remember_selection(&mut self, model: &str, mode: &str) {
+        let selection = (Some(model.to_owned()), Some(mode.to_owned()));
+        if (&self.remembered_model, &self.remembered_mode) == (&selection.0, &selection.1) {
             return;
         }
-        self.remembered_model = Some(model.to_owned());
-        let remembered = model.to_owned();
+        (self.remembered_model, self.remembered_mode) = selection.clone();
         let notices = self.root_notifier();
         let workspace = self.launch.workspace.clone();
         tokio::task::spawn_blocking(move || {
-            let saved = state::update(&workspace, |state| state.model = Some(remembered));
+            let saved = state::update(&workspace, |state| {
+                (state.model, state.mode) = selection;
+            });
             if let Err(error) = saved {
-                notices.send(format!("Could not save model selection: {error}"));
+                notices.send(format!("Could not save model and mode selection: {error}"));
             }
         });
     }
@@ -162,7 +170,7 @@ impl App {
         self.history.push(input.submission.text.clone());
         self.history_browse = None;
         self.set_title(&input.submission.text);
-        self.remember_model(&input.model);
+        self.remember_selection(&input.model, &input.mode);
     }
     /// Withdraw every dispatched row that is still cancellable.
     pub(super) fn cancel_queue_delivery(&mut self) {
@@ -218,6 +226,7 @@ impl App {
                     attachments: input.submission.attachments.clone(),
                     options: PromptOptions {
                         model: Some(input.model.clone()),
+                        mode: Some(input.mode.clone()),
                     },
                     cancellation,
                 },
@@ -286,6 +295,7 @@ impl App {
             unknown: false,
             submission,
             model: self.model.clone(),
+            mode: self.mode.clone(),
         }
     }
     pub(super) fn queue_items(&self) -> Vec<Item<QueuedInputId>> {

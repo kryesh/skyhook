@@ -1,7 +1,7 @@
 # Execution targets
 
-Include `"targets"` in the top-level `capabilities` array (or CLI `--capabilities` allowlist) to
-grant the session's target capability. It is not enabled by default. Without it, target-management
+Include `"targets"` in a [mode](permissions.md#modes)'s `capabilities` (or a batch job's
+`--capabilities` allowlist) to grant the target capability. It is not enabled by default. Without it, target-management
 tools, target arguments, JavaScript target setters, and target prompt guidance are all omitted
 from the model-visible surface. The former `targets_enabled` setting is no longer accepted.
 
@@ -107,8 +107,8 @@ commands.
 Skyhook's askpass handler routes passwords, key passphrases, keyboard-interactive challenges, host
 confirmations, and agent confirmations to the host UI, including prompts from SSH started on a
 remote origin. Interactivity is controlled by the handler, not target configuration.
-`--non-interactive` disables authentication prompts; invocations without an interactive terminal
-must use that mode and fail operations that require input; `--approve-all` does not approve
+`skyhook batch` has no authentication prompts; invocations without an interactive terminal
+must use it and fail operations that require input; `--approve-all` does not approve
 authentication prompts. Secrets are never included in tool results or session logs.
 
 ## Using targets

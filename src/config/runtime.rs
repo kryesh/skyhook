@@ -48,6 +48,10 @@ impl Config {
                 });
             }
         }
+        if !self.modes.contains_key(&self.default_mode) {
+            let message = "default_mode is not a declared mode";
+            return Err(ConfigError::Mode(self.default_mode.clone(), message.into()));
+        }
         Ok(RuntimeConfig(Arc::new(AdmittedConfig {
             config: self,
             providers,
@@ -70,6 +74,17 @@ impl RuntimeConfig {
             config: self.clone(),
             index,
         })
+    }
+
+    /// Admit an external mode name, or the configured default when none is given.
+    pub fn select_mode(&self, name: Option<&str>) -> Result<&str, ConfigError> {
+        let config = self.config();
+        let name = name.unwrap_or(&config.default_mode);
+        let (_, name, _) = config
+            .modes
+            .get_full(name)
+            .ok_or_else(|| ConfigError::Mode(name.into(), "mode is not configured".into()))?;
+        Ok(name)
     }
 
     /// The first configured model in source/merge order. Runtime admission proves
@@ -115,7 +130,9 @@ impl ConfiguredModel {
         let mut builder = HarnessBuilder::new(workspace)
             .default_model_profile(self.name())
             .max_child_depth(config.max_child_depth)
-            .capabilities(config.capabilities.iter().copied().collect())
+            .capabilities(config.ceiling())
+            .modes(config.modes.clone())
+            .mode(self.config.select_mode(None)?)
             .mcp(config.mcp.clone())
             .targets_config(config.targets.clone());
         for (name, settings) in &self.config.0.providers {

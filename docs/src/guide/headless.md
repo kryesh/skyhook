@@ -1,14 +1,16 @@
 # Headless execution
 
-Use `--non-interactive` with exactly one initial prompt or script:
+Use `skyhook batch` with exactly one prompt or script:
 
 ```sh
-session_id=$(skyhook --non-interactive -p "Review this repository" --capabilities read,agents)
-skyhook --non-interactive -s workflow.js --approve-all
-skyhook --non-interactive --resume "$session_id" -p "Summarize the findings"
+session_id=$(skyhook batch -p "Review this repository" --capabilities read,agents)
+skyhook batch -s workflow.js --approve-all
+skyhook batch -p "What does this service do?" --mode readonly
+skyhook batch --resume "$session_id" -p "Summarize the findings"
 ```
 
-Headless mode does not require a terminal or read answers from stdin.
+A batch job runs in the default [mode](permissions.md#modes), in the one `--mode` names, or
+with the exact `--capabilities` list. Headless mode does not require a terminal or read answers from stdin.
 It creates or opens the session, prints **only its session ID followed by a newline to stdout**, and
 flushes that line before executing the prompt or workflow. It then exits automatically. The ID lets
 external programs locate and follow the normal session logs under `<workspace>/.skyhook/sessions`.
@@ -26,7 +28,7 @@ The submitted root turn or workflow defines completion. A workflow must explicit
 work it needs completed; outstanding jobs are cancelled and drained during shutdown. Interrupt and
 termination signals also trigger cleanup and journaled status rather than a terminal prompt.
 
-`--non-interactive` always disables human interaction. Root `ask` is unavailable (also inside scripts and with `bg:true`). Child agents
+A batch job never has human interaction. Root `ask` is unavailable (also inside scripts and with `bg:true`). Child agents
 can still ask their owning parent agent. Operations requiring human approval fail immediately;
 ordinary automatically allowed operations still work. `--approve-all` (or config `approve_all = true`)
 bypasses tool approvals but does not enable questions, SSH passwords/passphrases, or host/agent

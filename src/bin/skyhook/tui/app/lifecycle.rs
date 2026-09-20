@@ -141,6 +141,7 @@ impl App {
                 return;
             };
             self.launch.model = model;
+            self.launch.permissions = crate::launch::Permissions::Mode(self.mode.clone());
             self.begin_session(PendingStart::Script(path));
             return;
         };

@@ -9,6 +9,9 @@ and session ownership boundaries.
 
 `config.into_runtime()?.select_model(name)?.harness_builder(workspace)?` admits the configuration,
 selects the host's explicit model choice, and returns a `HarnessBuilder` for that workspace.
+The builder carries the configured modes, starts in the default one (`mode(name)` selects another),
+and limits every mode to `capabilities(set)`; `PromptOptions::mode` switches the root agent's mode
+with a submitted message. A builder without modes gives the root agent `capabilities` itself.
 `SessionHandle::observe()` returns an atomic snapshot/receiver pair with revisioned updates,
 request-scoped live responses, current activity, and context estimates. On receiver lag, replace
 both with a fresh observation. Durable records are identified by their original sequence.
@@ -70,7 +73,7 @@ the lifetime: Anthropic places a cache breakpoint on the last history block unle
 automatic prefix caching with the tail sent last. Chat Completions and Responses append a runtime-only
 tail message to the final tool output or user message rather than sending a separate user message,
 which models read as the user speaking again after every tool call.
-Session databases use format version 5; there is no compatibility or migration layer for earlier layouts.
+Session databases use format version 7; there is no compatibility or migration layer for earlier layouts.
 
 Source: [session module](https://github.com/kryesh/skyhook/tree/main/src/session)
 and [agent module](https://github.com/kryesh/skyhook/tree/main/src/agent).

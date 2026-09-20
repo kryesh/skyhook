@@ -2,14 +2,15 @@
 
 ```text
 skyhook [OPTIONS]
+skyhook batch [OPTIONS] <--prompt TEXT|--script PATH>
 skyhook auth <login|status|logout> [codex]
 skyhook dump [config|skills] [OPTIONS]
 skyhook stats <SESSION_ID|--list> [OPTIONS]
 ```
 
 Run `skyhook --help`, `skyhook --version`, or `skyhook <subcommand> --help` for the installed
-binary's command help. Session execution requires an interactive terminal unless
-`--non-interactive` is supplied. `dump` and `stats` do not need a terminal.
+binary's command help. `skyhook` itself requires an interactive terminal; `batch`, `dump` and
+`stats` do not.
 
 ## Session options
 
@@ -22,23 +23,32 @@ binary's command help. Session execution requires an interactive terminal unless
 | `-p, --prompt TEXT` | Submit an initial user message. |
 | `-s, --script PATH` | Run a JavaScript workflow. Mutually exclusive with `--prompt`. |
 | `--image PATH` | Attach an image to the initial prompt; repeat for multiple images. Requires `--prompt`, conflicts with `--script`. |
-| `--non-interactive` | Run headlessly with exactly one prompt or script, then exit. |
+| `--mode NAME` | Start the new-session prompt in this configured [mode](../guide/permissions.md#modes) instead of the default. With `--resume`, the next message switches the session to it. |
 | `-a, --approve-all` | Bypass tool approval prompts, not capability gates or authentication prompts. |
-| `--capabilities LIST` | Replace the configured policy allowlist with a comma-separated list. `--capabilities=` grants no policy capabilities. |
 | `-h, --help` | Print command help. |
 | `-V, --version` | Print the version. |
 
-Without `--non-interactive`, an initial prompt or script runs in the terminal interface,
-which remains open afterward. Startup without initial input opens an empty draft; no session
-is created until a message or script is submitted.
+An initial prompt or script runs in the terminal interface, which remains open afterward.
+Startup without initial input opens an empty draft; no session is created until a message or
+script is submitted. These options belong to session execution only: a subcommand accepts
+just its own options, after its name.
 
-Headless stdout contains only the session ID and newline, flushed before execution; results
-remain in session logs. See the [headless guide](../guide/headless.md) for completion, errors,
-shutdown, signals, and interaction restrictions. Session options belong to session execution
-only: a subcommand accepts just its own options, before or after its arguments.
+## Batch
 
-Policy capability names are `read`, `write`, `exec`, `network`, `targets`, `agents`, and `mcp`.
-The runtime supplies `interactive`; it is invalid in the CLI allowlist. See
+`skyhook batch` runs exactly one prompt or script without a terminal, then exits. It takes the
+session options above except that `--prompt` or `--script` is required, plus:
+
+| Option | Meaning |
+| --- | --- |
+| `--mode NAME` | Run in this configured mode instead of the default. With `--resume`, the prompt switches the session to it; a script has no prompt, so that combination is an error. |
+| `--capabilities LIST` | Run with exactly this comma-separated policy allowlist instead of a mode. `--capabilities=` grants none. Conflicts with `--mode`. |
+
+Stdout contains only the session ID and newline, flushed before execution; results remain in
+session logs. See the [headless guide](../guide/headless.md) for completion, errors, shutdown,
+signals, and interaction restrictions.
+
+Policy capability names are `read`, `write`, `exec`, `network`, `targets`, `ssh_agent`,
+`agents`, and `mcp`. The terminal supplies `interactive`; a batch job never has it. See
 [permissions](../guide/permissions.md) for resolution and limitations.
 
 ## Dump
@@ -50,28 +60,26 @@ The runtime supplies `interactive`; it is invalid in the CLI allowlist. See
 | --- | --- |
 | `-w, --workspace PATH` | Workspace whose configuration or skills to inspect (default `.`). |
 | `-c, --config PATH` | `config` only: use only this TOML file, with no user/workspace merging. |
-| `--capabilities LIST` | `config` only: apply the CLI allowlist override. |
 | `-a, --approve-all` | `config` only: apply the approval override. |
 
 ```sh
 skyhook dump                          # Resolved effective TOML
 skyhook dump config > effective.toml
 skyhook dump config --workspace /path/to/project
-skyhook dump config --config ./standalone.toml --capabilities=read --approve-all
+skyhook dump config --config ./standalone.toml --approve-all
 skyhook dump skills --workspace /path/to/project
 ```
 
 Both modes are inspection-only: no terminal UI, harness, session creation, provider credential
 commands, MCP startup, or network access. API credentials are not required. They do not execute
-skill assets. `dump skills` rejects `--config`, `--capabilities`, and `--approve-all` as
-irrelevant.
+skill assets. `dump skills` rejects `--config` and `--approve-all` as irrelevant.
 
 ### Configuration dump
 
 The config dump writes the resolved effective configuration as TOML to **stdout**. It follows
 normal [file selection and layering](../configuration/overview.md#file-selection-and-layering),
-including explicit-file-only behavior for `--config`, and includes defaults plus any
-`--capabilities` and `--approve-all` overrides. Source paths and diagnostics go to **stderr**,
+including explicit-file-only behavior for `--config`, and includes defaults (such as the
+built-in `general` mode) plus any `--approve-all` override. Source paths and diagnostics go to **stderr**,
 so redirected stdout remains TOML. It exits with status **0** when a valid config can be produced,
 and **nonzero** otherwise; it does not require provider credentials to validate configuration.
 
@@ -150,7 +158,7 @@ skyhook auth logout
 
 The optional provider argument currently accepts only `codex`, which is the default.
 `auth login --headless` selects device authorization rather than a browser; it is separate
-from session `--non-interactive`. Login does not require model configuration.
+from `skyhook batch`. Login does not require model configuration.
 See [authentication](../configuration/authentication.md) for credential ownership and storage.
 
 ## Related settings

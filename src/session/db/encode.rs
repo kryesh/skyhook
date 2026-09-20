@@ -140,6 +140,7 @@ impl Encoder {
             }
             SessionEvent::AgentStarted {
                 profile,
+                mode,
                 capabilities,
                 location,
                 ..
@@ -154,12 +155,14 @@ impl Encoder {
                      location_workspace) VALUES (?1, ?2, ?3, ?4)",
                     params![seq, profile, target, path_bytes(&location.workspace)],
                 )?;
-                for capability in capabilities {
-                    db.execute(
-                        "INSERT INTO agent_capability (entry, capability) VALUES (?1, ?2)",
-                        params![seq, capability.as_str()],
-                    )?;
+                if let Some(mode) = mode {
+                    self.mode(db, seq, kind, mode)?;
                 }
+                capabilities_at(db, seq, kind, capabilities)?;
+            }
+            SessionEvent::ModeChanged { mode, capabilities } => {
+                self.mode(db, seq, kind, mode)?;
+                capabilities_at(db, seq, kind, capabilities)?;
             }
             SessionEvent::TodosReplaced { items } => todos(db, seq, kind, items)?,
             SessionEvent::ModelChanged { profile } => {
@@ -530,6 +533,30 @@ impl Encoder {
         Ok(id)
     }
 
+    fn mode(
+        &self,
+        db: &Db,
+        seq: u64,
+        kind: &str,
+        mode: &crate::session::ModeSelection,
+    ) -> DbResult<()> {
+        let name = mode.name.as_str();
+        if let Some(definition) = &mode.definition {
+            pin_mode(db, seq, kind, name, definition)?;
+        }
+        let inserted = db.execute(
+            "INSERT INTO agent_mode (entry, kind, mode) \
+             SELECT ?1, ?2, id FROM mode WHERE name = ?3",
+            params![seq, kind, name],
+        )?;
+        if inserted == 0 {
+            return Err(rejected(format!(
+                "mode {name:?} is not pinned by the session"
+            )));
+        }
+        Ok(())
+    }
+
     fn target(&self, db: &Db, name: &str) -> DbResult<i64> {
         db.execute(
             "INSERT INTO target (name) VALUES (?1) ON CONFLICT (name) DO NOTHING",
@@ -891,6 +918,42 @@ fn model_attempt(db: &Db, request: u64, attempt: u64) -> DbResult<i64> {
     .ok_or_else(|| rejected(format!("request {request} has no attempt {attempt}")))
 }
 
+/// Pin a mode's definition to the entry that first uses it.
+fn pin_mode(
+    db: &Db,
+    seq: u64,
+    kind: &str,
+    name: &str,
+    mode: &crate::tool::policy::Mode,
+) -> DbResult<()> {
+    db.execute(
+        "INSERT INTO mode (entry, kind, name, instructions) VALUES (?1, ?2, ?3, ?4)",
+        params![seq, kind, name, mode.instructions.as_deref()],
+    )?;
+    for capability in &mode.capabilities {
+        db.execute(
+            "INSERT INTO mode_capability (mode, capability) SELECT id, ?2 FROM mode WHERE name = ?1",
+            params![name, capability.as_str()],
+        )?;
+    }
+    Ok(())
+}
+
+fn capabilities_at(
+    db: &Db,
+    seq: u64,
+    kind: &str,
+    capabilities: &[crate::tool::policy::Capability],
+) -> DbResult<()> {
+    for capability in capabilities {
+        db.execute(
+            "INSERT INTO agent_capability (entry, kind, capability) VALUES (?1, ?2, ?3)",
+            params![seq, kind, capability.as_str()],
+        )?;
+    }
+    Ok(())
+}
+
 fn todos(db: &Db, seq: u64, kind: &str, items: &[crate::agent::TodoItem]) -> DbResult<()> {
     for (position, item) in items.iter().enumerate() {
         db.execute(
@@ -957,6 +1020,7 @@ fn kind(event: &SessionEvent) -> &'static str {
         SessionEvent::AgentStarted { .. } => "agent_started",
         SessionEvent::TodosReplaced { .. } => "todos_replaced",
         SessionEvent::ModelChanged { .. } => "model_selected",
+        SessionEvent::ModeChanged { .. } => "mode_changed",
         SessionEvent::MessageCommitted { .. } => "message_committed",
         SessionEvent::Status { .. } => "status",
         SessionEvent::ModelContext { .. } => "model_context",
@@ -1075,6 +1139,26 @@ mod tests {
         let context = one!(SessionEvent::ModelContext {
             context: agent_context.clone(),
         });
+        // A mode that grants nothing still records the change.
+        for (mode, capabilities) in [
+            ("look", vec![crate::tool::policy::Capability::Read]),
+            ("none", vec![]),
+        ] {
+            // The first use of a mode pins its definition; a later one names it.
+            for first in [true, false] {
+                let definition = first.then(|| crate::tool::policy::Mode {
+                    capabilities: capabilities.clone(),
+                    instructions: (!capabilities.is_empty()).then(|| "Only look.".into()),
+                });
+                one!(SessionEvent::ModeChanged {
+                    mode: crate::session::ModeSelection {
+                        name: mode.into(),
+                        definition,
+                    },
+                    capabilities: capabilities.clone(),
+                });
+            }
+        }
         let prompt = one!(SessionEvent::MessageCommitted {
             message: Message::User(vec![
                 UserContent::Text {

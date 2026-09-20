@@ -53,7 +53,7 @@ pub struct QueuedPrompt {
 
 pub(super) struct QueuedInput {
     pub content: Vec<UserContent>,
-    pub model: Option<String>,
+    pub options: PromptOptions,
     pub cancellation: QueuedPromptCancellation,
     pub committed: oneshot::Sender<Result<(), HarnessError>>,
 }
@@ -91,7 +91,7 @@ impl SessionHandle {
             match prepared {
                 Ok(content) => batch.push(QueuedInput {
                     content,
-                    model: prompt.options.model,
+                    options: prompt.options,
                     cancellation: prompt.cancellation,
                     committed,
                 }),
@@ -136,13 +136,12 @@ impl SessionRuntime {
     /// failed: the caller must then `reject_pending` the batches queued behind it.
     pub(super) async fn consume_queued_batch(
         &self,
-        agent: &AgentId,
+        turn: &mut TurnContext<'_>,
         context: &mut AgentContext,
-        model_profile: &mut String,
-        capabilities: &CapabilitySet,
-        cancellation: &CancellationToken,
+        settings: &mut AgentSettings,
         inputs: Vec<QueuedInput>,
     ) -> (bool, bool) {
+        let cancellation = turn.cancellation;
         let (mut consumed, mut failed) = (false, false);
         for input in inputs {
             if failed || cancellation.is_cancelled() {
@@ -150,7 +149,7 @@ impl SessionRuntime {
             } else {
                 let claim = input.cancellation.clone();
                 let committed = self
-                    .consume_queued_input(agent, context, model_profile, capabilities, input)
+                    .consume_queued_input(turn, context, settings, input)
                     .await;
                 failed = !committed && claim.is_claimed();
                 consumed |= committed;
@@ -163,9 +162,9 @@ impl SessionRuntime {
     /// for the outer loop (notably JobsReady and ordinary prompt completion).
     pub(super) async fn consume_queued_inputs(
         &self,
-        turn: &TurnContext<'_>,
+        turn: &mut TurnContext<'_>,
         context: &mut AgentContext,
-        model_profile: &mut String,
+        settings: &mut AgentSettings,
         rx: &mut mpsc::Receiver<AgentCommand>,
         deferred: &mut VecDeque<AgentCommand>,
     ) -> bool {
@@ -179,14 +178,7 @@ impl SessionRuntime {
             match command {
                 AgentCommand::QueuedInputs(inputs) => {
                     let (committed, failed) = self
-                        .consume_queued_batch(
-                            turn.agent,
-                            context,
-                            model_profile,
-                            turn.capabilities,
-                            turn.cancellation,
-                            inputs,
-                        )
+                        .consume_queued_batch(turn, context, settings, inputs)
                         .await;
                     consumed |= committed;
                     if failed {
@@ -360,6 +352,7 @@ mod tests {
             attachments,
             options: PromptOptions {
                 model: model.map(str::to_owned),
+                mode: None,
             },
             cancellation: QueuedPromptCancellation::default(),
         }

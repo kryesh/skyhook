@@ -22,9 +22,10 @@ use super::{AgentCommand, AgentLaunch, RequestFailure, SessionRuntime, queue::Qu
 pub(super) async fn connect_mcp(
     builder: &mut ToolRegistryBuilder,
     harness: &super::HarnessInner,
+    capabilities: &crate::tool::policy::CapabilitySet,
     store: &crate::session::SessionStore,
 ) -> (Arc<crate::mcp::manager::McpManager>, Vec<String>) {
-    let capabilities = harness.capabilities.for_agent(harness.max_child_depth);
+    let capabilities = capabilities.for_agent(harness.max_child_depth);
     let manager = Arc::new(
         crate::mcp::manager::McpManager::connect(
             &harness.mcp,
@@ -220,6 +221,8 @@ fn register_child_agent(
                     todos,
                     available_depth: input.depth,
                     location,
+                    mode: None,
+                    capabilities: context.capabilities().clone(),
                 }).await.map_err(|error| tool_error(&error))?;
                 // Associate immediately so a failed first turn is selectable for retry
                 // even when it never emitted visible assistant text.
@@ -278,6 +281,9 @@ pub(super) fn child_resume_handler(
                         todos: None,
                         available_depth: 0,
                         location: execution_location.clone(),
+                        mode: None,
+                        // The journaled contract narrows this.
+                        capabilities: runtime.capabilities.clone(),
                     })
                     .await
                     .map_err(|error| tool_error(&error))?,
@@ -307,11 +313,10 @@ async fn send_child_input(
     content: Vec<UserContent>,
 ) -> Result<oneshot::Receiver<Result<String, RequestFailure>>, ToolError> {
     let (done, received) = oneshot::channel();
-    let (model, done) = (None, Some(done));
     let input = AgentCommand::Input {
-        model,
+        options: Default::default(),
         content,
-        done,
+        done: Some(done),
     };
     let sent = sender.send(input).await;
     sent.map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?;
@@ -377,7 +382,7 @@ async fn run_child_request(
                     // queued root prompts, rather than waiting for a new turn.
                     let (committed, _receipt) = oneshot::channel();
                     sender.send(AgentCommand::QueuedInputs(vec![QueuedInput {
-                        model: None,
+                        options: Default::default(),
                         content: vec![owner_input(&value)],
                         cancellation: Default::default(),
                         committed,
@@ -585,7 +590,7 @@ for line in sys.stdin:
             let offered = |index: usize| requests[index].tools.iter().any(|tool| tool.name == name);
             assert_eq!((requests.len(), offered(0), offered(1)), (2, true, false));
         }
-        let child_capabilities = session.runtime.harness.capabilities.for_agent(0);
+        let child_capabilities = session.runtime.capabilities.for_agent(0);
         let child_executor = session.runtime.executor.clone();
         let child_executor = child_executor.with_capabilities(child_capabilities);
         let denied =

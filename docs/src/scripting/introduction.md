@@ -21,7 +21,7 @@ A workflow file runs in the same runtime:
 ```sh
 skyhook --script workflow.js
 # Run headlessly and exit when the workflow and shutdown finish:
-skyhook --non-interactive --script workflow.js
+skyhook batch --script workflow.js
 ```
 
 There is no Node.js environment or recursive `script` call. Calls use the same tool schemas,

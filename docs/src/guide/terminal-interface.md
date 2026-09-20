@@ -83,6 +83,9 @@ reopen it, including after resuming a session. `/thinking` toggles expansion of 
 
 Models are listed in configuration declaration order. For a new session, selection uses
 `--model`, then the most recently submitted configured model, then the first model in the list.
+The starting [mode](permissions.md#modes) is chosen the same way: `--mode`, then the mode of the
+most recently submitted message if it is still configured, then `default_mode`. Batch jobs
+ignore the remembered mode.
 `/model` (or `Ctrl+X M`)
 selects the model for subsequent user messages in the current session. Selection stays in the UI
 until a message is sent; cancelling the picker or leaving without sending does not change the
@@ -94,15 +97,16 @@ shows the choice for the next message; reply footers identify the model that act
 Resumed sessions retain their last applied model. `/models` remains an alias for `/model`.
 Restore a missing recorded model profile before resuming rather than substituting another model.
 
-The interface stores the last submitted model and the sidebar setting in the workspace's
+The interface stores the last submitted model and mode and the sidebar setting in the workspace's
 `.skyhook/state.json`, beside its sessions. Writes are atomic and do not rewrite the model
 configuration.
 Session titles are recorded in each session's database alongside its history.
 
 A sidebar beside the conversation lists each configured MCP server with its startup status and the
-viewed agent's todos. It is shown by default; `Ctrl+X B` or `/sidebar` toggles it. Terminals
-narrower than 100 columns, or having no servers and no todos to list, hide it without changing the
-saved setting.
+viewed agent's todos, with the viewed agent's capabilities pinned to its bottom. For the root agent
+these are what the mode of the next message grants. A section with nothing to list
+is left out, title included. The sidebar is shown by default; `Ctrl+X B` or `/sidebar` toggles it.
+Terminals narrower than 100 columns hide it without changing the saved setting.
 
 The bottom bar uses this format:
 
@@ -130,10 +134,13 @@ The command palette and `/help` also list these shortcuts. `Ctrl+X` is a leader:
 | `Ctrl+X F`, `@` | Attach a workspace file |
 | `Ctrl+X B`, `/sidebar` | Toggle the sidebar |
 | `Ctrl+X R`, `/attention` | Reopen pending questions and permissions |
-| `/requests`, `/jobs` | Requests, jobs |
-| `Ctrl+X ↑`, `Ctrl+X ↓` | Parent, first child |
+| `Ctrl+X ←`, `Ctrl+X →` | Previous/next of Conversation, Requests, Jobs (wrapping) |
+| `Ctrl+X ↑`, `Ctrl+X ↓` | View the agent above/below in the tree (wrapping) and focus the tree |
+| `↑`, `↓` in the tree | View the agent above/below at its latest activity |
 | `Ctrl+X Y`, `Ctrl+X X` | Copy message/selection, export conversation |
-| `Tab`, `Shift+Tab` | Focus composer, tree, content |
+| `Tab`, `Shift+Tab` | Next/previous [mode](permissions.md#modes) in the composer; next/previous row in the tree or conversation |
+| `/mode` | Choose the mode from a list |
+| Click a pane | Focus composer, tree, or conversation |
 | `Enter` | Send/queue, select, expand |
 | `Alt+Enter`, `Ctrl+J`, supported `Shift+Enter` | Newline |
 | `PageUp`, `PageDown` | Scroll history |
@@ -152,8 +159,8 @@ from the preview.
 
 Type `/` in an empty composer to open the command palette. Search by command name
 (with or without `/`), label, or configured shortcut; exact command names take priority over label matches.
-The command palette omits navigation-only actions; `Ctrl+X ↑` and `Ctrl+X ↓`
-remain available to select the parent and the first child. Use `Tab` / `Shift+Tab` to focus the conversation.
+The command palette omits navigation-only actions; the `Ctrl+X` arrows step through
+agents and inspector tabs. Click the conversation, or pick an agent with `Ctrl+X A`, to focus it.
 Menus use arrows, mouse hover, the mouse wheel, or `Ctrl+P/N`; Enter or Tab activates
 the selected item. Open palettes isolate hover from the conversation underneath. The Agents
 palette labels its Output, Input (uncached), and Context statistics. The composer

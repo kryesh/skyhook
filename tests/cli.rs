@@ -58,8 +58,16 @@ impl Fixture {
         cmd
     }
     fn command(&self) -> Command {
+        self.configured(&[])
+    }
+    /// A batch job; a subcommand's options follow it.
+    fn batch(&self) -> Command {
+        self.configured(&["batch"])
+    }
+    fn configured(&self, subcommand: &[&str]) -> Command {
         let mut cmd = self.bare_command();
-        cmd.arg("--config")
+        cmd.args(subcommand)
+            .arg("--config")
             .arg(self.path("config/skyhook/config.toml"))
             .arg("--workspace")
             .arg(self.root.path());
@@ -67,12 +75,7 @@ impl Fixture {
     }
     fn script(&self, source: &str, extra: &[&str]) -> Output {
         self.write("run.js", source);
-        output(
-            self.command()
-                .args(["--non-interactive", "-s"])
-                .arg(self.path("run.js"))
-                .args(extra),
-        )
+        output(self.batch().arg("-s").arg(self.path("run.js")).args(extra))
     }
     /// Saved job outputs and captures as text.
     fn artifacts(&self, output: &Output) -> String {
@@ -205,19 +208,23 @@ fn mock_provider() -> (String, thread::JoinHandle<(String, String)>) {
 fn parse_early_runtime_and_redirected_terminal_failures_are_reported_correctly() {
     let f = Fixture::new();
     let run = |args: &[&str]| output(f.command().args(args));
+    let batch = |args: &[&str]| output(f.batch().args(args));
     for args in [
-        &["--non-interactive", "--unknown"][..],
-        &["--non-interactive=true", "-p", "x"],
-        &["--non-interactive", "-p", "x", "-m", "missing"],
+        &["--unknown"][..],
+        &["-p", "x", "-m", "missing"],
+        &["-p", "x", "--mode", "missing"],
+        &["-p", "x", "--mode", "general", "--capabilities", "read"],
+        &[],
     ] {
-        assert_reported_failure(&run(args));
+        assert_reported_failure(&batch(args));
     }
+    assert_reported_failure(&run(&["--non-interactive", "-p", "x"]));
     // Terminal mode still rejects redirected IO.
     let out = run(&["-p", "hello"]);
     assert!(!out.status.success() && out.stdout.is_empty());
     assert!(String::from_utf8_lossy(&out.stderr).contains("interactive terminal"));
     f.write("config/skyhook/config.toml", "invalid [");
-    assert_reported_failure(&run(&["--non-interactive", "-p", "x"]));
+    assert_reported_failure(&batch(&["-p", "x"]));
 }
 
 mod dotenv {
@@ -250,8 +257,8 @@ mod dotenv {
             "const result = await tool.exec({{argv: ['sh', '-c', {}]}}); if (result.exit_code !== 0) throw new Error('command failed'); return result;",
             serde_json::to_string(&command).unwrap()
         ));
-        let mut command = f.command();
-        command.args(["--non-interactive", "--approve-all", "-s", "run.js"]);
+        let mut command = f.batch();
+        command.args(["--approve-all", "-s", "run.js"]);
         if let Some(value) = inherited {
             command.env(KEY, value);
         }
@@ -298,10 +305,9 @@ mod dotenv {
             assert!(!out.status.success() && out.stdout.is_empty());
             let stderr = String::from_utf8(out.stderr).unwrap();
             assert_eq!(stderr, "skyhook: invalid invocation directory .env file\n");
-            let headless = ["--non-interactive", "-p", "unused"];
-            assert_reported_failure(&output(f.command().args(headless)));
-            for flag in ["--help", "--version"] {
-                let out = output(f.bare_command().args(["--non-interactive", flag]));
+            assert_reported_failure(&output(f.batch().args(["-p", "unused"])));
+            for args in [&["batch", "--help"][..], &["--version"]] {
+                let out = output(f.bare_command().args(args));
                 assert!(out.status.success(), "{out:?}");
                 assert!(!out.stdout.is_empty() && out.stderr.is_empty());
             }
@@ -330,9 +336,9 @@ mod dotenv {
             let mut command = f.bare_command();
             command
                 .env_remove("XDG_CONFIG_HOME")
-                .arg("--workspace")
+                .args(["batch", "--workspace"])
                 .arg(f.path("workspace"))
-                .args(["--non-interactive", "-p", "hello"]);
+                .args(["-p", "hello"]);
             assert_headless_success(&output(&mut command));
             let (headers, _) = server.join().unwrap();
             let headers = headers.to_ascii_lowercase();
@@ -375,7 +381,7 @@ mod dump {
         let f = Fixture::new();
         f.config(
             "http://127.0.0.1:1/v1",
-            "approve_all=true\ncapabilities=['read']",
+            "approve_all=true\ndefault_mode='look'\n[modes.look]\ncapabilities=['read']",
         );
         f.write(".skyhook/config.toml", "[models.first]\nmax_output=0\n");
         f.write(
@@ -394,11 +400,12 @@ mod dump {
             f.bare_command()
                 .args(["dump", "config", "--workspace"])
                 .arg(&project)
-                .args(["--capabilities", "read,agents", "--approve-all"]),
+                .arg("--approve-all"),
         );
         let config = successful_config(&overridden);
-        let capabilities = ["read", "agents"].map(|name| toml::Value::String(name.into()));
-        assert_eq!(config["capabilities"].as_array().unwrap(), &capabilities);
+        let capabilities = [toml::Value::String("read".into())];
+        let look = &config["modes"]["look"]["capabilities"];
+        assert_eq!(look.as_array().unwrap(), &capabilities);
         assert_eq!(config["approve_all"].as_bool(), Some(true));
         // The invocation directory's own workspace config is invalid: no partial dump.
         let fatal = output(f.bare_command().arg("dump"));
@@ -600,8 +607,8 @@ mod headless {
         let fifo = f.path("workflow.fifo");
         let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
         assert!(made.success());
-        let args = ["--non-interactive", "--approve-all", "-s", "workflow.fifo"];
-        let mut child = f.command().args(args).spawn().unwrap();
+        let args = ["--approve-all", "-s", "workflow.fifo"];
+        let mut child = f.batch().args(args).spawn().unwrap();
         let stdout = child.stdout.take().unwrap();
         let (tx, rx) = mpsc::channel();
         let reader = thread::spawn(move || {
@@ -665,7 +672,7 @@ mod headless {
             &["-s", "missing.js"][..],
             &["-p", "image", "--image", "missing.png"],
         ] {
-            let out = output(f.command().arg("--non-interactive").args(args));
+            let out = output(f.batch().args(args));
             assert!(!out.status.success());
             assert!(f.journal(&out).contains("Failed:"));
         }
@@ -674,15 +681,38 @@ mod headless {
     #[test]
     fn exact_capability_override_and_approve_all_respect_permissions() {
         let f = Fixture::new();
-        f.config("http://127.0.0.1:1/v1", "capabilities=[]");
+        f.config(
+            "http://127.0.0.1:1/v1",
+            "default_mode='none'\n[modes.none]\ncapabilities=[]\n[modes.look]\ncapabilities=['read']",
+        );
         let empty = f.script("return 7;", &[]);
         assert!(empty.status.success(), "{empty:?}");
         f.journal(&empty);
         let denied = f.script(READ_CONFIG, &["--approve-all"]);
         assert!(!denied.status.success());
         assert!(f.journal(&denied).contains("Failed:"));
-        let allowed = f.script(READ_CONFIG, &["--capabilities", "read"]);
-        assert!(allowed.status.success(), "{}", f.journal(&allowed));
+        for args in [&["--capabilities", "read"], &["--mode", "look"]] {
+            let allowed = f.script(READ_CONFIG, args);
+            assert!(allowed.status.success(), "{}", f.journal(&allowed));
+        }
+        // A resumed job keeps the mode it was last in, not the default.
+        let started = f.script(READ_CONFIG, &["--mode", "look"]);
+        let id = String::from_utf8(started.stdout).unwrap();
+        let resumed = f.script(READ_CONFIG, &["--resume", id.trim()]);
+        assert!(resumed.status.success(), "{}", f.journal(&resumed));
+        // It also keeps a mode the configuration has since dropped.
+        f.config(
+            "http://127.0.0.1:1/v1",
+            "default_mode='none'\n[modes.none]\ncapabilities=[]",
+        );
+        for args in [&["--resume", id.trim()][..], &["--resume", id.trim(), "-a"]] {
+            let resumed = f.script(READ_CONFIG, args);
+            assert!(resumed.status.success(), "{}", f.journal(&resumed));
+        }
+        f.config(
+            "http://127.0.0.1:1/v1",
+            "default_mode='none'\n[modes.none]\ncapabilities=[]\n[modes.look]\ncapabilities=['read']",
+        );
         f.config("http://127.0.0.1:1/v1", "");
         let unapproved = "return await tool.exec({argv:['sh','-c','echo not-approved']});";
         for (source, args) in [
@@ -728,14 +758,8 @@ mod headless {
         fs::write(f.path("pixel.png"), pixel).unwrap();
         let (endpoint, server) = mock_provider();
         f.config(&endpoint, "");
-        let args = [
-            "--non-interactive",
-            "-p",
-            "mock-user-prompt",
-            "--image",
-            "pixel.png",
-        ];
-        let out = output(f.command().args(args));
+        let args = ["-p", "mock-user-prompt", "--image", "pixel.png"];
+        let out = output(f.batch().args(args));
         assert!(out.status.success(), "{}", f.journal(&out));
         let log = f.journal(&out);
         assert!(log.contains("mock-user-prompt") && log.contains("mock-final-answer"));
@@ -783,13 +807,10 @@ mod headless {
     fn missing_resume_fails_before_id_and_authentication_fails_without_prompting() {
         let f = Fixture::new();
         let missing_id = "00000000000000000000000000000001";
-        let args = ["--non-interactive", "-p", "hello", "--resume", missing_id];
-        assert_reported_failure(&output(f.command().args(args)));
+        let args = ["-p", "hello", "--resume", missing_id];
+        assert_reported_failure(&output(f.batch().args(args)));
         f.write("config/skyhook/config.toml", "[providers.test]\nkind='codex'\n[models.first]\nprovider='test'\nmodel='fixture'\nmax_context=128000\nmax_output=4096\n");
-        let out = output(
-            f.command()
-                .args(["--non-interactive", "--approve-all", "-p", "hello"]),
-        );
+        let out = output(f.batch().args(["--approve-all", "-p", "hello"]));
         assert!(!out.status.success());
         assert!(f.journal(&out).contains("Failed:"));
     }
@@ -814,8 +835,8 @@ mod headless {
         f.write("run.js", &format!("return await tool.exec({argv});"));
         let (inherited, agent) = (f.path("ambient.sock"), f.path("existing-agent.sock"));
         let out = output(
-            f.command()
-                .args(["--non-interactive", "--approve-all", "-s", "run.js"])
+            f.batch()
+                .args(["--approve-all", "-s", "run.js"])
                 .env("SSH_ASKPASS", ambient)
                 .env("SKYHOOK_ASKPASS_SOCKET", &inherited)
                 .env("SSH_ASKPASS_REQUIRE", "never")

@@ -8,19 +8,14 @@ const ABORTED: &str = "provider aborted response";
 impl SessionRuntime {
     pub(super) async fn run_turn(
         &self,
-        turn: TurnContext<'_>,
+        mut turn: TurnContext<'_>,
         agent_context: &mut AgentContext,
-        model_profile: &mut String,
+        settings: &mut AgentSettings,
         rx: &mut mpsc::Receiver<AgentCommand>,
         deferred: &mut VecDeque<AgentCommand>,
     ) -> Result<String, HarnessError> {
-        let TurnContext {
-            agent,
-            owner_job,
-            cancellation,
-            location,
-            capabilities,
-        } = turn;
+        let (agent, owner_job) = (turn.agent, turn.owner_job);
+        let (cancellation, location) = (turn.cancellation, turn.location);
         let mut context_sequence = None;
         let mut final_text = String::new();
         let mut force_compaction = false;
@@ -35,10 +30,10 @@ impl SessionRuntime {
                 return Err(HarnessError::Interrupted);
             }
             if self
-                .consume_queued_inputs(&turn, agent_context, model_profile, rx, deferred)
+                .consume_queued_inputs(&mut turn, agent_context, settings, rx, deferred)
                 .await
             {
-                // A model change can replace both the template and its token meter.
+                // A mode or model change can replace both the template and its token meter.
                 context_sequence = None;
                 provider_attempt = 0;
                 context_failures = 0;
@@ -47,7 +42,7 @@ impl SessionRuntime {
                 return Err(HarnessError::Interrupted);
             }
             let (content, messages) = self
-                .pending_event_content(agent, capabilities, location)
+                .pending_event_content(agent, &turn.capabilities, location)
                 .await?;
             if !content.is_empty() {
                 messages.commit().await?;
@@ -63,7 +58,7 @@ impl SessionRuntime {
                     let context = crate::session::ModelContext {
                         purpose: crate::session::ModelPurpose::Agent,
                         profile: crate::session::ProfileSnapshot {
-                            name: model_profile.clone(),
+                            name: settings.model_profile.clone(),
                             profile: profile.clone(),
                         },
                         system: template.system.clone(),
@@ -380,7 +375,7 @@ impl SessionRuntime {
                     .map(|call| {
                         if !agent_context.unavailable_tools.contains(call.name()) {
                             return self
-                                .execute_call(agent, owner_job, call, origin, location, capabilities);
+                                .execute_call(agent, owner_job, call, origin, location, &turn.capabilities);
                         }
                         // A pinned tool the live registry no longer provides as journaled.
                         Box::pin(std::future::ready(ToolResult {
@@ -424,7 +419,7 @@ impl SessionRuntime {
             if response.calls.is_empty() {
                 // Events that arrived during the request precede the answer.
                 let (content, messages) = self
-                    .pending_event_content(agent, capabilities, location)
+                    .pending_event_content(agent, &turn.capabilities, location)
                     .await?;
                 if !content.is_empty() {
                     messages.commit().await?;
@@ -438,7 +433,7 @@ impl SessionRuntime {
                 // A response without tools is a request boundary too: consume prompts
                 // received in flight before returning a stale answer.
                 if self
-                    .consume_queued_inputs(&turn, agent_context, model_profile, rx, deferred)
+                    .consume_queued_inputs(&mut turn, agent_context, settings, rx, deferred)
                     .await
                 {
                     context_sequence = None;
@@ -459,8 +454,8 @@ impl SessionRuntime {
 }
 impl SessionRuntime {
     async fn runtime_state(&self, turn: &TurnContext<'_>) -> UserContent {
-        let (agent, capabilities) = (turn.agent, turn.capabilities);
-        prompt::runtime_state_content(&self.jobs, &self.todos, agent, capabilities, turn.location)
+        let (agent, capabilities) = (turn.agent, &turn.capabilities);
+        state::runtime_state_content(&self.jobs, &self.todos, agent, capabilities, turn.location)
             .await
     }
 }

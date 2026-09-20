@@ -60,7 +60,6 @@ Then configure Skyhook to match:
 
 ```toml
 approve_all = false
-capabilities = ["read", "write", "exec", "network", "agents", "mcp"]
 
 [providers.local]
 kind = "openai"

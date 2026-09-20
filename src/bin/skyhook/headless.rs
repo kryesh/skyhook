@@ -14,10 +14,20 @@ pub async fn run(
     // Model memory is shared with terminal launches, but UI settings are never read.
     let (saved, state_warning) = super::tui::state::load(&request.config.workspace);
     let model = launch::select_model(&config, request.model.as_deref(), saved.model.as_deref())?;
-    let launch = Launch::from_request(&request.config, model, None).await?;
+    let launch = Launch::from_request(&request, model, None).await?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    // A named mode also applies to a resumed session, from this prompt on.
+    let mode = match &request.permissions {
+        super::cli::PermissionArgs::Mode(Some(_)) => launch.mode().map(str::to_owned),
+        _ => None,
+    };
+    if request.resume.is_some() && mode.is_some() && matches!(input, InitialInput::Script(_)) {
+        return Err(
+            "--mode changes a resumed session with its next prompt; a script has none".into(),
+        );
+    }
     let session = launch.create(request.resume).await?;
 
     // This must be the first action after open, before reading a workflow/image or
@@ -58,7 +68,7 @@ pub async fn run(
                     .await
                     .map_err(|error| error.to_string())?;
             }
-            run_input(&session, &launch.workspace, input).await
+            run_input(&session, &launch.workspace, input, mode).await
         };
         tokio::select! {
             result = operation => result,
@@ -88,6 +98,7 @@ async fn run_input(
     session: &SessionHandle,
     workspace: &std::path::Path,
     input: InitialInput,
+    mode: Option<String>,
 ) -> Result<(), String> {
     match input {
         InitialInput::Script(path) => {
@@ -102,7 +113,14 @@ async fn run_input(
         InitialInput::Prompt { text, images } => {
             let attachments = launch::read_images(workspace, &images).await?;
             session
-                .prompt_with_options(text, &attachments, skyhook::agent::PromptOptions::default())
+                .prompt_with_options(
+                    text,
+                    &attachments,
+                    skyhook::agent::PromptOptions {
+                        mode,
+                        ..Default::default()
+                    },
+                )
                 .await
                 .map_err(|error| error.to_string())?;
         }

@@ -75,6 +75,14 @@ impl App {
         self.dirty = true;
         self.invalidate_content();
     }
+    /// The modes a message can be sent in: the session's once it exists.
+    pub fn modes(&self) -> &indexmap::IndexMap<String, skyhook::tool::policy::Mode> {
+        match self.session() {
+            Some(session) => session.modes(),
+            None => &self.launch.model.config().config().modes,
+        }
+    }
+
     /// Another session's app, inheriting this one's UI preferences.
     pub fn sibling(
         &self,
@@ -85,11 +93,16 @@ impl App {
         let draft = observation.is_none();
         let saved = state::SavedState {
             model: self.remembered_model.clone(),
+            mode: self.remembered_mode.clone(),
             sidebar: self.sidebar,
         };
         let mut app = Self::new(observation, launch, saved, tx);
         if draft {
             app.model.clone_from(&self.model);
+            // A session can hold a mode the configuration, and so a draft, no longer has.
+            if app.modes().contains_key(&self.mode) {
+                app.mode.clone_from(&self.mode);
+            }
         }
         app
     }

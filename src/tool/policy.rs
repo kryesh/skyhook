@@ -136,6 +136,38 @@ impl Default for CapabilitySet {
     }
 }
 
+impl std::ops::BitAnd for &CapabilitySet {
+    type Output = CapabilitySet;
+
+    fn bitand(self, other: Self) -> CapabilitySet {
+        CapabilitySet(&self.0 & &other.0)
+    }
+}
+
+/// A named permission preset. Interaction is supplied by the runtime host, never listed.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Mode {
+    #[serde(deserialize_with = "deserialize_policy_capabilities")]
+    pub capabilities: Vec<Capability>,
+    /// Added to the root agent's system prompt while the mode is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+fn deserialize_policy_capabilities<'de, D>(deserializer: D) -> Result<Vec<Capability>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let capabilities = Vec::<Capability>::deserialize(deserializer)?;
+    if capabilities.contains(&Capability::Interactive) {
+        return Err(serde::de::Error::custom(
+            "interactive is controlled by the runtime host, not the capability allowlist",
+        ));
+    }
+    Ok(capabilities)
+}
+
 /// The wire format is `{namespace, segments}`; unknown namespaces and malformed
 /// shapes are rejected. Decoding never normalizes paths.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]

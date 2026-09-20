@@ -16,6 +16,16 @@ struct Args {
     #[command(subcommand)]
     command: Option<Command>,
     #[command(flatten)]
+    session: SessionArgs,
+    /// Start the new session prompt in this mode instead of the default.
+    #[arg(long, value_name = "NAME")]
+    mode: Option<String>,
+}
+
+/// What a session runs with, in the terminal or as a batch job.
+#[derive(clap::Args)]
+struct SessionArgs {
+    #[command(flatten)]
     config: ConfigRequest,
     /// Resume an existing session id.
     #[arg(long)]
@@ -23,9 +33,6 @@ struct Args {
     /// Select and remember the root model for a new session.
     #[arg(short = 'm', long = "model")]
     model: Option<String>,
-    /// Run without terminal interaction; requires --prompt or --script.
-    #[arg(long, requires = "input")]
-    non_interactive: bool,
     /// Attach images to the first prompt.
     #[arg(long = "image", requires = "prompt", conflicts_with = "script")]
     images: Vec<PathBuf>,
@@ -60,7 +67,7 @@ pub(super) enum StatsFormat {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct Capabilities(pub(super) Vec<Capability>);
+struct Capabilities(Vec<Capability>);
 
 fn parse_capabilities(value: &str) -> Result<Capabilities, String> {
     if value.is_empty() {
@@ -69,9 +76,12 @@ fn parse_capabilities(value: &str) -> Result<Capabilities, String> {
     value
         .split(',')
         .map(|name| {
-            let capability = name.trim().parse::<Capability>().map_err(|error| error.to_string())?;
+            let capability = name
+                .trim()
+                .parse::<Capability>()
+                .map_err(|error| error.to_string())?;
             if capability == Capability::Interactive {
-                return Err("interactive is controlled by the runtime mode; use --non-interactive to disable it".into());
+                return Err("interactive is never available to a batch job".into());
             }
             Ok(capability)
         })
@@ -81,6 +91,17 @@ fn parse_capabilities(value: &str) -> Result<Capabilities, String> {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run one prompt or script without terminal interaction, printing the session id.
+    Batch {
+        #[command(flatten)]
+        session: SessionArgs,
+        /// Run in this mode instead of the default.
+        #[arg(long, value_name = "NAME", conflicts_with = "capabilities")]
+        mode: Option<String>,
+        /// Exact comma-separated policy capabilities, instead of a mode.
+        #[arg(long, value_name = "LIST", value_parser = parse_capabilities)]
+        capabilities: Option<Capabilities>,
+    },
     /// Manage Skyhook-owned provider credentials.
     Auth {
         #[command(subcommand)]
@@ -143,9 +164,6 @@ pub(super) struct ConfigRequest {
     /// Use only this TOML config; disable user/workspace config discovery and merging.
     #[arg(short, long)]
     pub(super) config: Option<PathBuf>,
-    /// Exact comma-separated policy capabilities; interaction follows the runtime mode.
-    #[arg(long, value_name = "LIST", value_parser = parse_capabilities)]
-    pub(super) capabilities: Option<Capabilities>,
     /// Approve every tool invocation without prompting.
     #[arg(short, long)]
     pub(super) approve_all: bool,
@@ -164,10 +182,17 @@ pub(super) struct StatsRequest {
     pub(super) format: Option<StatsFormat>,
 }
 
+/// A configured mode (the default when unnamed), or a batch job's exact capabilities.
+pub(super) enum PermissionArgs {
+    Mode(Option<String>),
+    Exact(Vec<Capability>),
+}
+
 pub(super) struct ExecutionRequest {
     pub(super) config: ConfigRequest,
     pub(super) resume: Option<SessionId>,
     pub(super) model: Option<String>,
+    pub(super) permissions: PermissionArgs,
 }
 
 /// Only paths are admitted here: in particular headless input I/O must remain
@@ -209,9 +234,9 @@ impl TryFrom<Args> for Invocation {
                 what: DumpKind::Skills,
                 config,
             }) => {
-                if config.config.is_some() || config.capabilities.is_some() || config.approve_all {
+                if config.config.is_some() || config.approve_all {
                     return Err(conflict(
-                        "dump skills uses skill discovery, not --config, --capabilities, or --approve-all",
+                        "dump skills uses skill discovery, not --config or --approve-all",
                     ));
                 }
                 return Ok(Self::Inspect(Inspection::Skills(config.workspace)));
@@ -232,28 +257,48 @@ impl TryFrom<Args> for Invocation {
                     format,
                 }));
             }
+            Some(Command::Batch {
+                session,
+                mode,
+                capabilities,
+            }) => {
+                let permissions = match capabilities {
+                    Some(Capabilities(capabilities)) => PermissionArgs::Exact(capabilities),
+                    None => PermissionArgs::Mode(mode),
+                };
+                let (request, input) = session.into_request(permissions);
+                let input = input.ok_or_else(|| {
+                    clap::Error::raw(
+                        clap::error::ErrorKind::MissingRequiredArgument,
+                        "batch requires --prompt or --script\n",
+                    )
+                })?;
+                return Ok(Self::Headless(request, input));
+            }
             None => {}
         }
+        let (request, input) = args.session.into_request(PermissionArgs::Mode(args.mode));
+        Ok(Self::Interactive(request, input))
+    }
+}
+
+impl SessionArgs {
+    fn into_request(self, permissions: PermissionArgs) -> (ExecutionRequest, Option<InitialInput>) {
         // Clap rejects both together: `--prompt` is `conflicts_with = "script"`.
-        let input = match args.prompt {
+        let input = match self.prompt {
             Some(text) => Some(InitialInput::Prompt {
                 text,
-                images: args.images,
+                images: self.images,
             }),
-            None => args.script.map(InitialInput::Script),
+            None => self.script.map(InitialInput::Script),
         };
         let request = ExecutionRequest {
-            config: args.config,
-            resume: args.resume,
-            model: args.model,
+            config: self.config,
+            resume: self.resume,
+            model: self.model,
+            permissions,
         };
-        if args.non_interactive {
-            // Clap enforces `--non-interactive` `requires = "input"`.
-            let input = input.expect("clap: --non-interactive requires --prompt or --script");
-            Ok(Self::Headless(request, input))
-        } else {
-            Ok(Self::Interactive(request, input))
-        }
+        (request, input)
     }
 }
 
@@ -267,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_headless_and_capability_arguments_parse_or_are_rejected() {
+    fn auth_batch_and_permission_arguments_parse_or_are_rejected() {
         let command = |args: &[&str]| parse(args).unwrap().command;
         assert!(matches!(
             command(&["auth", "login", "--headless"]),
@@ -288,27 +333,53 @@ mod tests {
             })
         ));
         assert!(command(&["--prompt", "hello"]).is_none());
-        // Headless mode requires exactly one input; allowlists must name real capabilities.
-        assert!(
-            parse(&["--non-interactive", "-p", "hello"])
-                .unwrap()
-                .non_interactive
-        );
+        // A batch job takes exactly one input; allowlists must name real capabilities.
         for (args, valid) in [
-            (&["--non-interactive"][..], false),
-            (&["--non-interactive", "-s", "run.js"], true),
-            (&["--non-interactive", "-p", "hello", "-s", "run.js"], false),
-            (&["--capabilities", "read,typo"], false),
-            (&["--capabilities", "read,"], false),
+            (&["batch"][..], false),
+            (&["batch", "-p", "hello"], true),
+            (&["batch", "-s", "run.js"], true),
+            (&["batch", "-p", "hello", "-s", "run.js"], false),
+            (&["batch", "-p", "x", "--mode", "readonly"], true),
+            (
+                &["batch", "-p", "x", "--mode", "m", "--capabilities", "read"],
+                false,
+            ),
+            (&["batch", "-p", "x", "--capabilities", "read,typo"], false),
+            (&["batch", "-p", "x", "--capabilities", "read,"], false),
+            (
+                &["batch", "-p", "x", "--capabilities", "interactive"],
+                false,
+            ),
+            (&["--non-interactive", "-p", "hello"], false),
+            (&["--capabilities", "read"], false),
+            (&["--mode", "readonly", "-p", "hello"], true),
+            (&["--mode", "readonly", "batch", "-p", "hello"], false),
         ] {
-            assert_eq!(parse(args).is_some(), valid, "{args:?}");
+            let parsed = parse_from(std::iter::once(&"skyhook").chain(args));
+            assert_eq!(parsed.is_ok(), valid, "{args:?}");
         }
-        let capabilities = |args: &[&str]| parse(args).unwrap().config.capabilities.unwrap().0;
-        assert!(capabilities(&["--capabilities="]).is_empty());
-        assert_eq!(
-            capabilities(&["--capabilities", "read,exec,targets"]),
-            [Capability::Read, Capability::Exec, Capability::Targets]
-        );
+        let permissions = |args: &[&str]| match parse_from([&["skyhook"], args].concat()) {
+            Ok(Invocation::Headless(request, _) | Invocation::Interactive(request, _)) => {
+                request.permissions
+            }
+            _ => panic!("session invocation"),
+        };
+        assert!(matches!(
+            permissions(&["batch", "-p", "x", "--capabilities="]),
+            PermissionArgs::Exact(capabilities) if capabilities.is_empty()
+        ));
+        assert!(matches!(
+            permissions(&["batch", "-p", "x", "--capabilities", "read,exec,targets"]),
+            PermissionArgs::Exact(capabilities)
+                if capabilities == [Capability::Read, Capability::Exec, Capability::Targets]
+        ));
+        for args in [&["batch", "-p", "x", "--mode", "m"][..], &["--mode", "m"]] {
+            assert!(matches!(permissions(args), PermissionArgs::Mode(Some(mode)) if mode == "m"));
+        }
+        assert!(matches!(
+            permissions(&["batch", "-s", "x"]),
+            PermissionArgs::Mode(None)
+        ));
     }
 
     #[test]
@@ -335,12 +406,14 @@ mod tests {
             assert!(parse(&[extra, &["dump", "config"]].concat()).is_none());
         }
         assert!(parse(&["--workspace", "w", "dump"]).is_none());
-        assert!(parse(&["--non-interactive", "-p", "x", "dump"]).is_none());
+        assert!(parse(&["batch", "-p", "x", "dump"]).is_none());
+        assert!(parse(&["dump", "--capabilities", "read"]).is_none());
         assert!(parse(&["dump", "unknown"]).is_none());
         assert!(parse(&["help"]).is_none());
         assert!(
             parse(&["-c", "c.toml", "-a", "-p", "x"])
                 .unwrap()
+                .session
                 .config
                 .approve_all
         );
@@ -400,11 +473,7 @@ mod tests {
         ));
         for headless in [false, true] {
             for script in [false, true] {
-                let mode = if headless {
-                    &["--non-interactive"][..]
-                } else {
-                    &[]
-                };
+                let mode = if headless { &["batch"][..] } else { &[] };
                 let input = if script {
                     &["--script", "relative/workflow.js"][..]
                 } else {

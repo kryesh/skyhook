@@ -49,7 +49,7 @@ skyhook --prompt "inspect this repository"
 Skyhook opens a full-screen terminal interface. `--prompt` submits an initial message;
 `--script workflow.js` starts a JavaScript workflow in the same interface. Both remain open
 for inspection and follow-up input after the work finishes. These interface modes require an
-interactive terminal. Add `--non-interactive` to `-p/--prompt` or `-s/--script` for headless execution
+interactive terminal. Use `skyhook batch` with `-p/--prompt` or `-s/--script` for headless execution
 with redirected input/output support and automatic exit; see [Headless execution](../guide/headless.md).
 
 An unused startup draft creates no saved session. The first sent message or explicitly run

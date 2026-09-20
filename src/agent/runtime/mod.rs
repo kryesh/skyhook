@@ -32,7 +32,7 @@ use crate::{
     target::{TargetDefinition, TargetRegistry, TargetsConfig},
     tool::builtins::{HostSkills, install_script_tool, register_coding_tools},
     tool::policy::{AllowAll, Policy},
-    tool::policy::{Capability, CapabilitySet},
+    tool::policy::{Capability, CapabilitySet, Mode},
     tool::{ToolRegistry, ToolRegistryBuilder, executor::ToolExecutor},
 };
 
@@ -63,6 +63,7 @@ mod driver;
 mod lifecycle;
 mod recovery;
 mod session;
+mod state;
 mod turn;
 pub use builder::HarnessBuilder;
 
@@ -84,10 +85,27 @@ struct HarnessInner {
     instructions: Vec<String>,
     skills: HostSkills,
     max_child_depth: usize,
+    /// The most a new session can hold.
     capabilities: CapabilitySet,
+    modes: indexmap::IndexMap<String, Mode>,
+    /// The mode a new session starts in; None when no modes are configured.
+    mode: Option<String>,
     target_definitions: Vec<TargetDefinition>,
     shim_catalog: EmbeddedShimCatalog,
     sensitive_prompts: Arc<dyn SensitivePromptHandler>,
+}
+
+impl SessionRuntime {
+    /// What `mode` grants under the ceiling. Interaction follows the host, not the mode.
+    fn mode_capabilities(&self, name: &str) -> Result<CapabilitySet, HarnessError> {
+        let mode = self.modes.get(name);
+        let mode = mode.ok_or_else(|| HarnessError::UnknownMode(name.to_owned()))?;
+        let mut capabilities = &mode.capabilities.iter().copied().collect() & &self.capabilities;
+        if self.capabilities.contains(Capability::Interactive) {
+            capabilities.insert(Capability::Interactive);
+        }
+        Ok(capabilities)
+    }
 }
 
 #[derive(Clone)]
@@ -105,9 +123,9 @@ pub struct ContinueOutcome {
     pub answer: Option<String>,
     /// Retained child agents restarted by this call.
     pub children_resumed: usize,
-    /// Whether a requested model change was applied. Only the continued root turn
-    /// can adopt one; resumed children keep their own model.
-    pub model_applied: bool,
+    /// Whether a requested model or mode change was applied. Only the continued root
+    /// turn can adopt one; resumed children keep their own.
+    pub selection_applied: bool,
 }
 
 impl ContinueOutcome {
@@ -124,6 +142,8 @@ pub struct ContinueOptions {
     /// Model profile to apply before continuing. Omitted retains the agent's active
     /// model, which for a refusal would deterministically refuse again.
     pub model: Option<String>,
+    /// Mode to apply before continuing. Omitted retains the active mode.
+    pub mode: Option<String>,
 }
 
 /// Options captured when a user submits a message, including queued messages.
@@ -132,10 +152,19 @@ pub struct PromptOptions {
     /// Configured model profile when this input is consumed. Omitted retains the
     /// agent's active model; later explicit queued selections can change it.
     pub model: Option<String>,
+    /// Configured mode when this input is consumed: the root agent's capabilities,
+    /// tools and mode instructions from then on. Omitted retains the active mode.
+    pub mode: Option<String>,
 }
 
 struct SessionRuntime {
     harness: Arc<HarnessInner>,
+    /// The most any agent can hold: the harness ceiling, never more than the session
+    /// started with. A mode grants the root agent a subset.
+    capabilities: CapabilitySet,
+    /// The harness modes, except that a mode the session has used keeps the
+    /// definition it was used under.
+    modes: indexmap::IndexMap<String, Mode>,
     store: SessionStore,
     jobs: JobManager,
     todos: TodoStore,
@@ -159,6 +188,7 @@ struct SessionRuntime {
 
 struct LiveAgent {
     model_profile: String,
+    capabilities: CapabilitySet,
     sender: AgentSender,
     cancellation: CancellationToken,
     control: AgentControl,
@@ -213,7 +243,7 @@ type RequestCompletion = oneshot::Sender<Result<String, RequestFailure>>;
 enum AgentCommand {
     QueuedInputs(Vec<queue::QueuedInput>),
     Input {
-        model: Option<String>,
+        options: PromptOptions,
         content: Vec<UserContent>,
         done: Option<RequestCompletion>,
     },
@@ -228,6 +258,10 @@ struct AgentLaunch {
     todos: Option<Vec<TodoItem>>,
     available_depth: usize,
     location: crate::execution::ExecutionLocation,
+    /// The root agent's mode; children have none.
+    mode: Option<String>,
+    /// The most this agent may hold: its mode's set, or its parent's current set.
+    capabilities: CapabilitySet,
 }
 
 struct AgentLoop {
@@ -235,10 +269,17 @@ struct AgentLoop {
     id: AgentId,
     owner_job: Option<JobId>,
     context: AgentContext,
-    model_profile: String,
     location: crate::execution::ExecutionLocation,
-    capabilities: CapabilitySet,
+    settings: AgentSettings,
     rx: mpsc::Receiver<AgentCommand>,
+}
+
+/// What an agent currently runs under; a consumed input may change any of it.
+struct AgentSettings {
+    model_profile: String,
+    /// The root agent's mode; children and sessions without modes have none.
+    mode: Option<String>,
+    capabilities: CapabilitySet,
 }
 
 struct TurnContext<'a> {
@@ -246,7 +287,8 @@ struct TurnContext<'a> {
     owner_job: Option<JobId>,
     cancellation: &'a CancellationToken,
     location: &'a crate::execution::ExecutionLocation,
-    capabilities: &'a CapabilitySet,
+    /// The agent's set as of this request; a consumed mode change replaces it.
+    capabilities: CapabilitySet,
 }
 
 type LiveAgents = HashMap<AgentId, LiveAgent>;
@@ -676,6 +718,8 @@ mod tests {
             todos: None,
             available_depth: 0,
             location: crate::execution::ExecutionLocation::root(workspace),
+            mode: None,
+            capabilities: session.runtime.capabilities.clone(),
         }
     }
 
@@ -880,6 +924,7 @@ mod tests {
     pub(super) fn model(profile: &str) -> PromptOptions {
         PromptOptions {
             model: Some(profile.to_owned()),
+            mode: None,
         }
     }
 

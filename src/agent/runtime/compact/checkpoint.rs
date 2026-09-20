@@ -3,7 +3,7 @@
 use super::retention::{included_message_jobs, included_output_jobs, retained_sources};
 use super::{HarnessError, SessionRuntime, TurnContext, compaction, context_sources};
 use crate::{
-    agent::runtime::prompt,
+    agent::runtime::state,
     identity::JobId,
     provider::{
         ProviderContext,
@@ -50,11 +50,11 @@ impl SessionRuntime {
         }
         // Retry against current history and runtime state, including any todo
         // changes that invalidated an earlier attempt's snapshot.
-        let runtime = prompt::runtime_state_content(
+        let runtime = state::runtime_state_content(
             &self.jobs,
             &self.todos,
             agent,
-            turn.capabilities,
+            &turn.capabilities,
             turn.location,
         )
         .await;
@@ -198,7 +198,7 @@ impl SessionRuntime {
                 .jobs
                 .present_output_with(
                     crate::job::output::OutputArgs::new(job),
-                    turn.capabilities,
+                    &turn.capabilities,
                     crate::job::output::OutputOptions::Host {
                         viewer: Some(turn.location),
                         presentation: crate::job::OutputPresentation::Full,
@@ -257,10 +257,10 @@ impl SessionRuntime {
             }));
         compacted.history = crate::session::merge_tool_results(compacted.history);
         if !compacted.tail.is_empty() {
-            let runtime = prompt::runtime_state_with_todos(
+            let runtime = state::runtime_state_with_todos(
                 &self.jobs,
                 agent,
-                turn.capabilities,
+                &turn.capabilities,
                 continuation.todos.clone(),
                 turn.location,
             )

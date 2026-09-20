@@ -75,7 +75,14 @@ pub async fn run(
     let (saved, warning) = state::load(&request.config.workspace);
     let model =
         super::launch::select_model(&config, request.model.as_deref(), saved.model.as_deref())?;
-    let launch = Launch::from_request(&request.config, model, None).await?;
+    let mut launch = Launch::from_request(&request, model, None).await?;
+    // Like the model: an explicit mode, then the last one used, then the default.
+    if let super::cli::PermissionArgs::Mode(None) = &request.permissions
+        && let Some(mode) = saved.mode.as_deref()
+        && let Ok(mode) = config.select_mode(Some(mode))
+    {
+        launch.permissions = super::launch::Permissions::Mode(mode.to_owned());
+    }
     let (launch, prompts) = host::with_prompts(launch);
     let session = match request.resume {
         Some(id) => Some(launch.create(Some(id)).await?),
@@ -87,6 +94,23 @@ pub async fn run(
     };
     let (tx, rx) = mpsc::unbounded_channel();
     let mut app = App::new(observation, launch, saved, tx);
+    // An explicit mode outranks the one a resumed session was last in, if it has it.
+    if let super::cli::PermissionArgs::Mode(Some(mode)) = &request.permissions {
+        if app.modes().contains_key(mode) {
+            app.mode.clone_from(mode);
+        } else {
+            app.notice(format!("Unknown mode: {mode}"));
+        }
+        // Later drafts start from the launch, which must name a configured mode: a
+        // resumed session may know one the configuration no longer has.
+        if config.select_mode(Some(mode)).is_err() {
+            let default = config.select_mode(None)?.to_owned();
+            if !app.modes().contains_key(&app.mode) {
+                app.mode.clone_from(&default);
+            }
+            app.launch.permissions = super::launch::Permissions::Mode(default);
+        }
+    }
     if let Some(warning) = warning {
         app.notice(warning);
     }

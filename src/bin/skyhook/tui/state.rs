@@ -8,12 +8,14 @@ use std::{
 #[serde(default)]
 pub struct SavedState {
     pub model: Option<String>,
+    pub mode: Option<String>,
     pub sidebar: bool,
 }
 impl Default for SavedState {
     fn default() -> Self {
         Self {
             model: None,
+            mode: None,
             sidebar: true,
         }
     }
@@ -79,13 +81,20 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         assert!(load(root.path()).0.sidebar);
         update(root.path(), |state| state.model = Some("m".into())).unwrap();
+        update(root.path(), |state| state.mode = Some("look".into())).unwrap();
         update(root.path(), |state| state.sidebar = false).unwrap();
         let (state, warning) = load(root.path());
         assert_eq!(
-            (state.model.as_deref(), state.sidebar, warning),
-            (Some("m"), false, None)
+            (
+                state.model.as_deref(),
+                state.mode.as_deref(),
+                state.sidebar,
+                warning
+            ),
+            (Some("m"), Some("look"), false, None)
         );
         std::fs::write(state_path(root.path()), br#"{"model":"m"}"#).unwrap();
-        assert!(load(root.path()).0.sidebar);
+        let (state, _) = load(root.path());
+        assert!(state.sidebar && state.mode.is_none());
     }
 }

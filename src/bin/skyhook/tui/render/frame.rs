@@ -511,6 +511,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .models
         .get(model)
         .map_or(model, |profile| profile.model.as_str());
+    // The root composer's next message goes out in this mode; children have none.
+    let root_label = format!("{} · {model}", app.mode);
+    let model = if app.selected.path().is_empty() {
+        &root_label
+    } else {
+        model
+    };
     let session = app.session().as_ref().map_or_else(
         || "new session".to_owned(),
         |session| session.id().to_string(),
@@ -647,21 +654,37 @@ mod tests {
             let rows = (0..24).map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect());
             rows.collect::<Vec<String>>().join("\n")
         };
-        // Nothing to show yet: no configured servers and no todos.
-        assert!(!screen(&mut app, 120).contains("MCP servers"));
-        assert_eq!(app.content_rect.width, 120);
+        // Sections with nothing to list are left out, title included.
+        let bare = screen(&mut app, 120);
+        assert!(bare.contains("Capabilities") && bare.contains("· Read files"));
+        assert!(!bare.contains("MCP servers") && !bare.contains("Todos"));
         app.refresh();
         let wide = screen(&mut app, 120);
         for expected in [
-            "MCP servers",
-            "No servers configured",
             "Todos 1/2",
             "✓ parse",
             "● render the wrapped todo   ",
             "    text wholeword",
+            "Capabilities",
         ] {
             assert!(wide.contains(expected), "{expected}\n{wide}");
         }
+        assert!(!wide.contains("MCP servers"));
+        // Capabilities are pinned to the bottom: a gap separates them from the todos.
+        let rows: Vec<_> = wide.lines().collect();
+        let row = |text: &str| rows.iter().position(|row| row.contains(text)).unwrap();
+        assert!(row("Capabilities") > row("text wholeword") + 2);
+        // One padding row above the first section and below the last.
+        let column = |y: usize| rows[y].chars().skip(88).collect::<String>();
+        let bottom = app.content_rect.bottom() as usize - 1;
+        assert!(column(2).trim().is_empty() && column(3).starts_with(" Todos 1/2"));
+        // A blank row under the title; what it lists sits one column further in.
+        assert!(column(4).trim().is_empty() && column(5).starts_with("  ✓ parse"));
+        assert!(column(bottom).trim().is_empty() && column(bottom - 1).contains("· Use MCP tools"));
+        // A pending mode shows what the next message will be granted.
+        app.mode = "missing".into();
+        assert!(!screen(&mut app, 120).contains("Capabilities"));
+        app.mode = "general".into();
         assert_eq!(app.content_rect.width, 88);
         assert!(
             app.hits

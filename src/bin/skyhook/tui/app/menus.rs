@@ -60,6 +60,7 @@ pub enum OutputAction {
 pub enum MenuKind {
     Commands(Vec<Item<Command>>),
     Models(Vec<Item<String>>),
+    Modes(Vec<Item<String>>),
     Agents(Vec<Item<AgentId>>),
     Sessions(Vec<Item<SessionRef>>),
     /// Workspace files, plus the composer offset just after the `@` that opened
@@ -95,6 +96,7 @@ impl MenuKind {
         match self {
             Self::Commands(items) => rows(items),
             Self::Models(items) => rows(items),
+            Self::Modes(items) => rows(items),
             Self::Agents(items) => rows(items),
             Self::Sessions(items) => rows(items),
             Self::Files(items, _) => rows(items),
@@ -234,10 +236,12 @@ async fn load_saved(root: PathBuf) -> Result<Vec<Item<SessionId>>, String> {
                     .map(|text| crate::tui::format::brief(&text, 100))
             })
             .unwrap_or_else(|| id.to_string());
-        sessions.push((
-            summary.last_millis,
-            Item::new(id, title, format!("{} events · {id}", summary.entries)),
-        ));
+        let mode = summary
+            .mode
+            .map(|mode| format!("{mode} · "))
+            .unwrap_or_default();
+        let detail = format!("{mode}{} events · {id}", summary.entries);
+        sessions.push((summary.last_millis, Item::new(id, title, detail)));
     }
     sessions.sort_by_key(|(timestamp, _)| std::cmp::Reverse(*timestamp));
     Ok(sessions.into_iter().map(|(_, item)| item).collect())
@@ -400,18 +404,27 @@ impl App {
                     menu.selected = items.iter().position(|item| item.value == self.model).unwrap_or(0);
                 }
             },
+            Command::Mode => {
+                let items: Vec<_> = self.modes().iter().map(|(name, mode)| {
+                    let capabilities: Vec<_> = mode.capabilities.iter().map(|c| c.as_str()).collect();
+                    Item::new(name.clone(), name, capabilities.join(" "))
+                }).collect();
+                let selected = items.iter().position(|item| item.value == self.mode);
+                self.open("Mode", MenuKind::Modes(items));
+                if let Some(menu) = &mut self.menu {
+                    menu.selected = selected.unwrap_or(0);
+                }
+            },
             Command::Agents => self.open("Agents", MenuKind::Agents(self.agent_items())),
             Command::Inspect => {
                 self.focus = Focus::Content;
                 self.view().tab = Tab::Conversation;
             }
-            Command::Jobs | Command::Requests => {
-                self.focus = Focus::Content;
-                self.view().tab = match command {
-                    Command::Jobs => Tab::Jobs,
-                    _ => Tab::Requests,
-                };
-                self.view().scroll = None;
+            Command::PreviousTab | Command::NextTab => {
+                self.cycle_tab(command == Command::PreviousTab);
+            }
+            Command::PreviousAgent | Command::NextAgent => {
+                self.step_agent(command == Command::PreviousAgent);
             }
             Command::Thinking => self.thinking = !self.thinking,
             Command::Details => {
@@ -446,23 +459,21 @@ impl App {
                     Some(AgentActivity::Failed(_) | AgentActivity::Interrupted),
                 );
                 if owns_operation { self.operation = true; }
-                // A pending model choice is otherwise captured only by a submitted
+                // A pending model or mode choice is otherwise captured only by a submitted
                 // message. Forward it here too: a refusal repeats deterministically
                 // on the same model, so "swap then continue" must actually swap.
-                let active = self
-                    .projection
-                    .agents
-                    .iter()
-                    .find(|agent| &agent.id == self.root_agent())
-                    .map(|agent| agent.model.clone());
-                let model = (active.as_ref() != Some(&self.model)).then(|| self.model.clone());
+                let active = self.projection.agents.iter().find(|agent| &agent.id == self.root_agent());
+                let model = active.map(|agent| &agent.model);
+                let model = (model != Some(&self.model)).then(|| self.model.clone());
+                let mode = active.and_then(|agent| agent.mode.as_ref());
+                let mode = (mode != Some(&self.mode)).then(|| self.mode.clone());
                 let tx = self.tx.clone();
                 let notices = self.root_notifier();
                 notices.send("Continue requested");
-                let requested_model = model.clone();
+                let requested = model.is_some() || mode.is_some();
                 tokio::spawn(async move {
                     let outcome = session
-                        .continue_turn_with(skyhook::agent::ContinueOptions { model })
+                        .continue_turn_with(skyhook::agent::ContinueOptions { model, mode })
                         .await;
                     let result = match &outcome {
                         // Only a continued root turn adopts a model change, and the
@@ -476,9 +487,9 @@ impl App {
                             Ok(())
                         }
                         Ok(outcome) => {
-                            if requested_model.is_some() && !outcome.model_applied {
+                            if requested && !outcome.selection_applied {
                                 notices.send(format!(
-                                    "Continued {} child agent(s) on their own model; a model change applies to the root turn only",
+                                    "Continued {} child agent(s) unchanged; a model or mode change applies to the root turn only",
                                     outcome.children_resumed,
                                 ));
                             }
@@ -582,7 +593,7 @@ impl App {
             }
             Command::Help => self.info("Skyhook help", format!(concat!(
                 "{}\n\n",
-                "Tab / Shift+Tab: composer, tree, content\n",
+                "Tab / Shift+Tab: next/previous mode in the composer, row in the tree or conversation; click a pane to focus it\n",
                 "Enter: send / queue / expand\n",
                 "Alt+Enter / Ctrl+J: newline\n",
                 "PageUp / PageDown: scroll\n",
@@ -592,7 +603,7 @@ impl App {
                 "Footer: session output · total input(uncached) · estimated context (current/capacity)\n",
                 "Context belongs to the selected agent and includes system, tools and runtime state.\n",
                 "Messages always go to skyhook, including while viewing a child.\n",
-                "Model changes apply from the next submitted message, or from continuing a failed root turn. Instruction changes apply to new sessions.\n",
+                "Model and mode changes apply from the next submitted message, or from continuing a failed root turn. Instruction changes apply to new sessions.\n",
                 "Mouse: click agent or tool, scroll, drag text then copy.\n",
                 "The workspace and session ID are plain text; use terminal selection to copy them.\n",
                 "Copy message uses the terminal clipboard (OSC 52).",
@@ -600,11 +611,7 @@ impl App {
         }
         if matches!(
             command,
-            Command::Inspect
-                | Command::Jobs
-                | Command::Requests
-                | Command::Thinking
-                | Command::Details
+            Command::Inspect | Command::Thinking | Command::Details
         ) {
             self.invalidate_content();
         }
@@ -690,6 +697,11 @@ impl App {
                         }
                         Err(error) => self.notice(error.to_string()),
                     }
+                }
+            }
+            MenuKind::Modes(items) => {
+                if let Some(index) = selected {
+                    self.mode.clone_from(&items[index].value);
                 }
             }
             MenuKind::Agents(items) => {
@@ -1132,7 +1144,7 @@ mod tests {
         assert_eq!(shown, expected);
         for (command, label, shortcut) in [
             (Command::New, "New session", "Ctrl+X N"),
-            (Command::Jobs, "Agent jobs", ""),
+            (Command::Mode, "Mode", ""),
             (Command::Model, "Model", "Ctrl+X M"),
         ] {
             let item = items.iter().find(|item| item.value == command).unwrap();

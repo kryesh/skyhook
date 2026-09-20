@@ -2,11 +2,21 @@
 # With no saved selection, the first declared model below is used.
 # Set to true to skip interactive approval for every tool call.
 approve_all = false
-# Exact policy-capability allowlist. Omitted uses this default; [] grants no policy capabilities.
-# Add "targets" for remote-target tools, arguments, JavaScript APIs, and guidance.
-# CLI --capabilities replaces this list. Interaction is runtime-controlled, not configurable here.
-# Use --non-interactive to disable human interaction.
-capabilities = ["read", "write", "exec", "network", "agents", "mcp"]
+# The mode a new session starts in: the built-in general, or one declared below.
+# default_mode = "general"
+
+# Modes are named permission presets. A mode's capabilities are an exact allowlist ([] grants
+# none); add "targets" for remote-target tools, arguments, JavaScript APIs, and guidance.
+# Interaction is supplied by the terminal and absent from batch jobs, never listed here.
+# Optional instructions are added to the root agent's system prompt while the mode is active.
+# The terminal switches modes with Tab/Shift+Tab in the composer; --mode picks the starting one.
+# This built-in mode always exists; declare it to change what it grants:
+# [modes.general]
+# capabilities = ["read", "write", "exec", "network", "agents", "mcp"]
+#
+# [modes.readonly]
+# capabilities = ["read", "network"]
+# instructions = "Investigate and report. Do not change anything."
 
 # The CLI loads .env from its invocation directory (not --workspace or the config directory).
 # Existing process environment variables take precedence; no parent-directory search.

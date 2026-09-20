@@ -499,6 +499,29 @@ pub(in crate::session) fn decode_records(
         |row| image(row, 1),
     )?;
 
+    let mode_capabilities = grouped(db, "SELECT mode, capability FROM mode_capability", |row| {
+        capability(row.get(1)?)
+    })?;
+    // Mode definitions by the entry that pinned them.
+    let pinned_modes = db.query(
+        "SELECT id, name, instructions, entry FROM mode",
+        Vec::new(),
+        |row| {
+            let capabilities = mode_capabilities.get(&row.get::<i64>(0)?);
+            let mode = crate::tool::policy::Mode {
+                capabilities: sorted(capabilities.cloned().unwrap_or_default()),
+                instructions: row.get(2)?,
+            };
+            Ok((row.get::<i64>(3)?, mode))
+        },
+    )?;
+    let pinned_modes: HashMap<i64, _> = pinned_modes.into_iter().collect();
+    let selection = |entry: i64, name: Option<String>| {
+        name.map(|name| crate::session::ModeSelection {
+            name,
+            definition: pinned_modes.get(&entry).cloned(),
+        })
+    };
     // Every other entry's event, built by its subtype's loader.
     let mut events: HashMap<i64, SessionEvent> = HashMap::new();
     macro_rules! load {
@@ -514,23 +537,33 @@ pub(in crate::session) fn decode_records(
             _ => SessionEvent::AgentFailed { error: text },
         }
     });
+    let capabilities_at = |entry: i64| {
+        let capabilities = agent_capabilities.get(&entry);
+        sorted(capabilities.cloned().unwrap_or_default())
+    };
     load!(
         "SELECT s.entry, a.id, a.parent, a.owner_job, a.available_depth, t.name, \
-         s.location_workspace, s.profile FROM agent_start s \
+         s.location_workspace, s.profile, m.name FROM agent_start s \
          JOIN entry e ON e.seq = s.entry JOIN agent a ON a.id = e.agent \
-         JOIN target t ON t.id = s.location_target",
+         JOIN target t ON t.id = s.location_target \
+         LEFT JOIN agent_mode am ON am.entry = s.entry LEFT JOIN mode m ON m.id = am.mode",
         |row| SessionEvent::AgentStarted {
             parent: row.get::<Option<i64>>(2)?.map(agent_of).transpose()?,
             owner_job: row.get::<Option<i64>>(3)?.map(job).transpose()?,
             profile: row.get::<Option<i64>>(7)?.map(profile).transpose()?,
             available_depth: row.get(4)?,
-            capabilities: sorted(
-                agent_capabilities
-                    .get(&row.get::<i64>(0)?)
-                    .cloned()
-                    .unwrap_or_default(),
-            ),
+            mode: selection(row.get(0)?, row.get(8)?),
+            capabilities: capabilities_at(row.get(0)?),
             location: location(row.get(5)?, row.get(6)?),
+        }
+    );
+    load!(
+        "SELECT am.entry, m.name FROM agent_mode am JOIN mode m ON m.id = am.mode \
+         WHERE am.kind = 'mode_changed'",
+        |row| SessionEvent::ModeChanged {
+            mode: selection(row.get(0)?, row.get(1)?)
+                .ok_or_else(|| corrupt("mode_changed entry has no mode"))?,
+            capabilities: capabilities_at(row.get(0)?),
         }
     );
     load!("SELECT entry, profile FROM model_selection", |row| {

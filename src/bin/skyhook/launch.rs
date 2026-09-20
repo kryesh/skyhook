@@ -1,6 +1,6 @@
 //! Session launch settings shared by terminal and headless hosts.
 use super::{
-    cli::{Capabilities, ConfigRequest},
+    cli::{self, ConfigRequest},
     interaction::{HostApprovalPolicy, UiInteraction},
 };
 use skyhook::{
@@ -76,9 +76,17 @@ pub(crate) async fn read_images(
     Ok(images)
 }
 
+/// A configured mode, or the exact capabilities of a batch job that named none.
+#[derive(Clone)]
+pub(crate) enum Permissions {
+    Mode(String),
+    Exact(CapabilitySet),
+}
+
 #[derive(Clone)]
 pub struct Launch {
     pub model: ConfiguredModel,
+    pub(crate) permissions: Permissions,
     pub workspace: PathBuf,
     pub sessions: PathBuf,
     pub(crate) catalog: EmbeddedShimCatalog,
@@ -100,11 +108,17 @@ impl Launch {
                 })?;
             }
         }
-        let capabilities =
-            session_capabilities(model.config().config(), self.interaction.is_some());
+        let capabilities = self.ceiling(model.config().config(), resume.is_some());
         let builder = model
             .harness_builder(&self.workspace)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        let builder = match &self.permissions {
+            // A resumed session continues in its own mode, which may not be configured.
+            Permissions::Mode(_) if resume.is_some() => builder,
+            Permissions::Mode(mode) => builder.mode(mode),
+            Permissions::Exact(_) => builder.modes(Default::default()),
+        };
+        let builder = builder
             // Keep creation/resume aligned with the workspace-local history menu,
             // even when inherited configuration supplies a library storage override.
             .session_root(self.sessions.clone())
@@ -134,14 +148,33 @@ impl Launch {
     }
 }
 
-/// Human interaction is a runtime fact, separate from the configured permissions.
-fn session_capabilities(config: &Config, interactive: bool) -> CapabilitySet {
-    let mut capabilities: CapabilitySet = config.capabilities.iter().copied().collect();
-    capabilities.remove(Capability::Interactive);
-    if interactive {
-        capabilities.insert(Capability::Interactive);
+impl Launch {
+    pub(crate) fn mode(&self) -> Option<&str> {
+        match &self.permissions {
+            Permissions::Mode(mode) => Some(mode),
+            Permissions::Exact(_) => None,
+        }
     }
-    capabilities
+
+    /// The most the session can hold. The terminal can switch between every mode; a
+    /// new batch job keeps its own, and a resumed session is held to what it started
+    /// with. Human interaction is a runtime fact, never configured.
+    fn ceiling(&self, config: &Config, resumed: bool) -> CapabilitySet {
+        let mut capabilities = match &self.permissions {
+            Permissions::Mode(_) if resumed || self.interaction.is_some() => config.ceiling(),
+            Permissions::Mode(mode) => {
+                let mode = config.modes.get(mode);
+                mode.map(|mode| mode.capabilities.iter().copied().collect())
+                    .unwrap_or_else(CapabilitySet::empty)
+            }
+            Permissions::Exact(capabilities) => capabilities.clone(),
+        };
+        capabilities.remove(Capability::Interactive);
+        if self.interaction.is_some() {
+            capabilities.insert(Capability::Interactive);
+        }
+        capabilities
+    }
 }
 
 /// Resolve exactly the configuration shared by startup and inspection.
@@ -151,21 +184,11 @@ pub async fn resolve_config(
     // The core resolver owns ordering and workspace resolution, including its
     // diagnostics. Explicit files bypass workspace probing there entirely.
     let mut resolved = Config::resolve(&request.workspace, request.config.as_deref()).await?;
-    let config = &mut resolved.config;
-    if let Some(Capabilities(capabilities)) = &request.capabilities {
-        // Interaction is runtime-controlled, never part of the TOML allowlist.
-        config.capabilities = capabilities
-            .iter()
-            .copied()
-            .filter(|capability| *capability != Capability::Interactive)
-            .collect();
-    }
-    config.approve_all |= request.approve_all;
+    resolved.config.approve_all |= request.approve_all;
 
     Ok(resolved)
 }
 
-/// CLI policy capabilities replace the configured allowlist.
 pub async fn load_config(
     request: &ConfigRequest,
     display_diagnostics: bool,
@@ -200,10 +223,24 @@ pub fn select_model(
 
 impl Launch {
     pub async fn from_request(
-        request: &ConfigRequest,
+        request: &cli::ExecutionRequest,
         model: ConfiguredModel,
         interaction: Option<Arc<UiInteraction>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let permissions = match &request.permissions {
+            // A resumed session knows modes the configuration may no longer have; it
+            // admits the name when a message selects it.
+            cli::PermissionArgs::Mode(Some(mode)) if request.resume.is_some() => {
+                Permissions::Mode(mode.clone())
+            }
+            cli::PermissionArgs::Mode(mode) => {
+                Permissions::Mode(model.config().select_mode(mode.as_deref())?.to_owned())
+            }
+            cli::PermissionArgs::Exact(capabilities) => {
+                Permissions::Exact(capabilities.iter().copied().collect())
+            }
+        };
+        let request = &request.config;
         let workspace = tokio::fs::canonicalize(&request.workspace).await?;
         // CLI history belongs only to the selected workspace, never to an
         // inherited/global session_root or an ancestor workspace's history.
@@ -211,6 +248,7 @@ impl Launch {
         let approve_all = request.approve_all || model.config().config().approve_all;
         Ok(Self {
             model,
+            permissions,
             workspace,
             sessions,
             approve_all,
@@ -237,7 +275,7 @@ mod tests {
         let Invocation::Interactive(request, _) = cli::parse_from(args).unwrap() else {
             panic!("interactive request")
         };
-        Launch::from_request(&request.config, config.first_model(), None)
+        Launch::from_request(&request, config.first_model(), None)
             .await
             .unwrap()
     }
@@ -371,17 +409,47 @@ mod tests {
         resumed.shutdown().await.unwrap();
     }
 
-    #[test]
-    fn interaction_follows_the_host_even_with_an_empty_allowlist() {
-        for text in ["capabilities = []", "capabilities = ['read']"] {
-            let config: Config = toml::from_str(text).unwrap();
-            for interactive in [false, true] {
-                let capabilities = session_capabilities(&config, interactive);
-                assert_eq!(capabilities.contains(Capability::Interactive), interactive);
-                let read = config.capabilities.contains(&Capability::Read);
-                assert_eq!(capabilities.contains(Capability::Read), read);
-                assert!(!capabilities.contains(Capability::Exec));
-            }
+    #[tokio::test]
+    async fn ceiling_follows_the_host_and_the_permissions() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = history_config(None).config().clone();
+        config.modes = toml::from_str("[wide]\ncapabilities = ['read', 'exec']\n[narrow]\ncapabilities = ['read']\n[none]\ncapabilities = []").unwrap();
+        config.default_mode = "wide".into();
+        let config = config.into_runtime().unwrap();
+        let mut launch = launch(root.path(), &config).await;
+        assert!(matches!(&launch.permissions, Permissions::Mode(mode) if mode == "wide"));
+        let (interaction, _prompts) = UiInteraction::new();
+        for (permissions, interactive, expected) in [
+            // The terminal can switch modes, so its ceiling is their union.
+            (
+                Permissions::Mode("none".into()),
+                true,
+                &[Capability::Read, Capability::Exec, Capability::Interactive][..],
+            ),
+            (
+                Permissions::Mode("narrow".into()),
+                false,
+                &[Capability::Read],
+            ),
+            (Permissions::Mode("none".into()), false, &[]),
+            (
+                Permissions::Exact(
+                    [Capability::Targets, Capability::Interactive]
+                        .into_iter()
+                        .collect(),
+                ),
+                false,
+                &[Capability::Targets],
+            ),
+        ] {
+            launch.permissions = permissions;
+            launch.interaction = interactive.then(|| Arc::new(interaction.clone()));
+            let ceiling = launch.ceiling(config.config(), false);
+            assert!(ceiling.iter().eq(expected.iter().copied()), "{ceiling:?}");
         }
+        // A resumed batch session may be in any mode; its journaled ceiling narrows this.
+        launch.permissions = Permissions::Mode("none".into());
+        let resumed = launch.ceiling(config.config(), true);
+        assert!(resumed.iter().eq([Capability::Read, Capability::Exec]));
     }
 }

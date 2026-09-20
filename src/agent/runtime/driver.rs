@@ -142,9 +142,8 @@ impl SessionRuntime {
             id,
             owner_job,
             mut context,
-            mut model_profile,
             location,
-            capabilities,
+            mut settings,
             mut rx,
         } = agent_loop;
         let mut phase = if owner_job.is_some() {
@@ -214,17 +213,17 @@ impl SessionRuntime {
                 let _ = sender.flush_events(&cancellation).await;
             }
             let mut pending_events = None;
-            let (content, done, selected_model) = match command {
+            let mut turn = TurnContext {
+                agent: &id,
+                owner_job,
+                cancellation: &cancellation,
+                location: &location,
+                capabilities: settings.capabilities.clone(),
+            };
+            let (content, done, options) = match command {
                 AgentCommand::QueuedInputs(inputs) => {
                     let (consumed, failed) = self
-                        .consume_queued_batch(
-                            &id,
-                            &mut context,
-                            &mut model_profile,
-                            &capabilities,
-                            &cancellation,
-                            inputs,
-                        )
+                        .consume_queued_batch(&mut turn, &mut context, &mut settings, inputs)
                         .await;
                     if failed {
                         queue::reject_pending(&mut rx, &mut deferred);
@@ -232,7 +231,7 @@ impl SessionRuntime {
                     if !consumed {
                         continue;
                     }
-                    (Vec::new(), None, None)
+                    (Vec::new(), None, PromptOptions::default())
                 }
                 AgentCommand::Shutdown => {
                     let _ = self
@@ -244,11 +243,11 @@ impl SessionRuntime {
                 AgentCommand::Input {
                     content,
                     done,
-                    model,
-                } => (content, done, model),
+                    options,
+                } => (content, done, options),
                 AgentCommand::JobsReady => {
                     let content = match self
-                        .pending_event_content(&id, &capabilities, &location)
+                        .pending_event_content(&id, &turn.capabilities, &location)
                         .await
                     {
                         Ok((content, messages)) if !content.is_empty() => {
@@ -270,23 +269,16 @@ impl SessionRuntime {
                         }
                         _ => continue,
                     };
-                    (content, None, None)
+                    (content, None, PromptOptions::default())
                 }
             };
-            let selected = self.select_model(
-                &id,
-                &mut context,
-                &mut model_profile,
-                &capabilities,
-                selected_model,
-                false,
-            );
+            let selected = self.select(&mut turn, &mut context, &mut settings, options, false);
             if let Err(error) = selected.await {
                 if let Some(done) = done {
                     let _ = done.send(Err((&error).into()));
                 }
                 // The phase is untouched: a parked child stays parked until an
-                // input with an admissible model resumes its retained task.
+                // input with an admissible selection resumes its retained task.
                 continue;
             }
             let done = phase.begin(done);
@@ -322,15 +314,9 @@ impl SessionRuntime {
                 biased;
                 () = owner_cancellation.cancelled() => Err(HarnessError::Interrupted),
                 result = self.run_turn(
-                    TurnContext {
-                        agent: &id,
-                        owner_job,
-                        cancellation: &cancellation,
-                        location: &location,
-                        capabilities: &capabilities,
-                    },
+                    turn,
                     &mut context,
-                    &mut model_profile,
+                    &mut settings,
                     &mut rx,
                     &mut deferred,
                 ) => result,
@@ -964,7 +950,7 @@ mod tests {
         let text = if model.is_some() { "" } else { "task" };
         let content = vec![UserContent::Text { text: text.into() }];
         AgentCommand::Input {
-            model,
+            options: PromptOptions { model, mode: None },
             content,
             done,
         }
@@ -1031,7 +1017,7 @@ mod tests {
         let text = "cancelled update".to_owned();
         let queued = queue::QueuedInput {
             content: vec![UserContent::Text { text }],
-            model: None,
+            options: Default::default(),
             cancellation,
             committed,
         };

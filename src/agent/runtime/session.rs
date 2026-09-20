@@ -52,6 +52,19 @@ impl SessionHandle {
         self.runtime.mcp.servers()
     }
 
+    /// The modes the root agent can be sent into: the configured ones, except that a
+    /// mode the session has used keeps the definition it was used under.
+    pub fn modes(&self) -> &indexmap::IndexMap<String, crate::tool::policy::Mode> {
+        &self.runtime.modes
+    }
+
+    /// What sending the root agent into `mode` would grant it.
+    pub fn mode_capabilities(&self, mode: &str) -> Option<crate::tool::policy::CapabilitySet> {
+        let depth = self.runtime.available_depth(&self.root);
+        let granted = self.runtime.mode_capabilities(mode).ok()?;
+        Some(granted.for_agent(depth))
+    }
+
     /// Host skill diagnostics that must not write directly to a terminal.
     pub fn warnings(&self) -> &[String] {
         self.runtime.harness.skills.warnings()
@@ -96,7 +109,7 @@ impl SessionHandle {
     ) -> Result<serde_json::Value, crate::tool::ToolError> {
         self.runtime
             .jobs
-            .inspect_output(query, &self.runtime.harness.capabilities)
+            .inspect_output(query, &self.runtime.capabilities)
             .await
     }
 
@@ -107,7 +120,7 @@ impl SessionHandle {
     ) -> Result<crate::job::PresentedOutput, crate::tool::ToolError> {
         self.runtime
             .jobs
-            .inspect_output_with_captures(query, &self.runtime.harness.capabilities)
+            .inspect_output_with_captures(query, &self.runtime.capabilities)
             .await
     }
 
@@ -159,7 +172,12 @@ impl SessionHandle {
         {
             return Err(HarnessError::UnknownModelProfile(model.clone()));
         }
-        let model = options.model;
+        if let Some(mode) = &options.mode
+            && !self.runtime.modes.contains_key(mode)
+        {
+            return Err(HarnessError::UnknownMode(mode.clone()));
+        }
+        let ContinueOptions { model, mode } = options;
         // An immediate resume must not miss children still journaling.
         self.runtime.settle_interrupts().await;
         let children_resumed = self.runtime.jobs.continue_resumable_children().await?;
@@ -173,22 +191,23 @@ impl SessionHandle {
         if root_retryable && holding.is_none() {
             // An independently failed root has no live wait to preserve; continue
             // it after scheduling descendant recovery.
-            let model_applied = model.is_some();
-            let answer = self.submit(Vec::new(), model).await?;
+            let selection_applied = model.is_some() || mode.is_some();
+            let options = PromptOptions { model, mode };
+            let answer = self.submit(Vec::new(), options).await?;
             return Ok(ContinueOutcome {
                 answer: Some(answer),
                 children_resumed,
-                model_applied,
+                selection_applied,
             });
         }
         // Child-only recovery deliberately leaves a live/waiting root request
         // untouched. Its normal delivery path observes the replacement result.
-        // A model change cannot apply here: only a continued root turn adopts one,
-        // so report it as unapplied rather than dropping it silently.
+        // A model or mode change cannot apply here: only a continued root turn adopts
+        // one, so report it as unapplied rather than dropping it silently.
         Ok(ContinueOutcome {
             answer: None,
             children_resumed,
-            model_applied: false,
+            selection_applied: false,
         })
     }
 
@@ -197,16 +216,18 @@ impl SessionHandle {
         &self,
         source: impl Into<String>,
     ) -> Result<crate::tool::ToolOutput, HarnessError> {
+        // A host script is the root agent's work: it runs under the root's current mode.
+        let root = self
+            .runtime
+            .agents()
+            .get(&self.root)
+            .map(|root| root.capabilities.clone());
+        let capabilities = root.ok_or(HarnessError::AgentStopped)?;
         let result = self
             .runtime
             .executor
             .clone()
-            .with_capabilities(
-                self.runtime
-                    .harness
-                    .capabilities
-                    .for_agent(self.runtime.harness.max_child_depth),
-            )
+            .with_capabilities(capabilities)
             .execute(
                 self.root.clone(),
                 "script",
@@ -229,7 +250,7 @@ impl SessionHandle {
             .prepare_prompt(text.into(), attachments, &options)
             .await?;
         self.runtime.redirect(&self.root, true).await;
-        self.submit(content, options.model).await
+        self.submit(content, options).await
     }
 
     pub(super) async fn prepare_prompt(
@@ -243,6 +264,11 @@ impl SessionHandle {
             && !self.runtime.harness.model_profiles.contains_key(model)
         {
             return Err(HarnessError::UnknownModelProfile(model.clone()));
+        }
+        if let Some(mode) = &options.mode
+            && !self.runtime.modes.contains_key(mode)
+        {
+            return Err(HarnessError::UnknownMode(mode.clone()));
         }
         // Check every limit before storing any blob.
         let mut images = 0;
@@ -271,12 +297,12 @@ impl SessionHandle {
     async fn submit(
         &self,
         content: Vec<UserContent>,
-        model: Option<String>,
+        options: PromptOptions,
     ) -> Result<String, HarnessError> {
         let (done_tx, done_rx) = oneshot::channel();
         self.root_tx
             .send(AgentCommand::Input {
-                model,
+                options,
                 content,
                 done: Some(done_tx),
             })
@@ -473,6 +499,356 @@ mod tests {
         let records = resumed.runtime.store.records().await;
         assert_eq!(count!(&records, SessionEvent::ModelChanged { .. }), 0);
         shutdown_session(resumed).await;
+    }
+
+    /// A mode decides the root agent's capabilities, tools and instructions from the
+    /// input that selects it. A child gets what its parent holds when it starts.
+    #[tokio::test]
+    async fn modes_switch_the_root_contract_and_survive_resume() {
+        use crate::tool::policy::{Capability, CapabilitySet, Mode};
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let requests = Requests::default();
+        let mode = |capabilities: &[Capability], instructions: Option<&str>| Mode {
+            capabilities: capabilities.to_vec(),
+            instructions: instructions.map(str::to_owned),
+        };
+        let look = mode(&[Capability::Read, Capability::Agents], Some("Only look."));
+        // The session's ceiling has no targets, so no mode grants them. A mode is a
+        // set however it is listed.
+        let work = [
+            Capability::Write,
+            Capability::Read,
+            Capability::Agents,
+            Capability::Targets,
+            Capability::Read,
+        ];
+        let modes: indexmap::IndexMap<_, _> = [
+            ("look".to_owned(), look),
+            ("work".to_owned(), mode(&work, None)),
+        ]
+        .into();
+        let builder = |provider| {
+            test_builder(root.path(), &sessions, provider, false)
+                .capabilities(CapabilitySet::default())
+                .modes(modes.clone())
+        };
+        let delegate = tool_call(0, "delegate", "agent", json!({"prompt": "work"}));
+        let responses = [
+            response(vec![delegate]),
+            answer("child done"),
+            answer("first"),
+            answer("second"),
+            answer("third"),
+        ];
+        let provider = scripted_provider(&requests, responses);
+        let session = builder(provider)
+            .build()
+            .await
+            .unwrap()
+            .new_session()
+            .await
+            .unwrap();
+        let in_mode = |mode: &str| PromptOptions {
+            mode: Some(mode.to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(session.prompt("delegate").await.unwrap(), "first");
+        let prompt = session.prompt_with_options("write", &[], in_mode("work"));
+        assert_eq!(prompt.await.unwrap(), "second");
+        let prompt = session.prompt_with_options("again", &[], in_mode("work"));
+        assert_eq!(prompt.await.unwrap(), "third");
+        let unknown = session
+            .prompt_with_options("no", &[], in_mode("missing"))
+            .await;
+        assert!(matches!(unknown, Err(HarnessError::UnknownMode(mode)) if mode == "missing"));
+
+        let captured = requests.lock().unwrap().clone();
+        let offers = |request: &ModelRequest, tool: &str| {
+            request
+                .tools
+                .iter()
+                .any(|definition| definition.name == tool)
+        };
+        let prompt = |request: &ModelRequest| request.system[0].text.clone();
+        let (looking, child, working) = (&captured[0], &captured[1], &captured[3]);
+        assert!(prompt(looking).contains("<mode name=\"look\">\nOnly look.\n</mode>"));
+        assert!(offers(looking, "read") && !offers(looking, "write"));
+        // The child inherits the narrowed set, but a mode's instructions are the root's.
+        assert!(!prompt(child).contains("<mode") && !offers(child, "write"));
+        assert!(!prompt(working).contains("<mode") && offers(working, "write"));
+        assert_eq!(captured[4].system, working.system);
+
+        let records = session.runtime.store.records().await;
+        let changes = events!(&records, SessionEvent::ModeChanged { mode, capabilities } => (mode.clone(), capabilities.clone()));
+        let granted = [
+            Capability::Read,
+            Capability::Write,
+            Capability::Agents,
+            Capability::Interactive,
+        ];
+        // The first use of a mode pins the definition it was used under.
+        let pinned = |name: &str| {
+            let mut definition = modes[name].clone();
+            definition.capabilities.sort();
+            definition.capabilities.dedup();
+            crate::session::ModeSelection {
+                name: name.to_owned(),
+                definition: Some(definition),
+            }
+        };
+        assert_eq!(changes, [(pinned("work"), granted.to_vec())]);
+        let started = events!(&records, SessionEvent::AgentStarted { mode, .. } => mode.clone());
+        assert_eq!(started, [Some(pinned("look")), None]);
+        let id = session.id();
+        shutdown_session(session).await;
+
+        // The launch's default mode does not replace the journaled one.
+        let rejected = crate::provider::ProviderError {
+            kind: crate::provider::ProviderErrorKind::InvalidRequest,
+            message: "scripted rejection".into(),
+            retry_after: None,
+        };
+        let steps = [
+            Step::new(answer("resumed")),
+            Step::fail(rejected),
+            Step::new(answer("continued")),
+        ];
+        let provider = Script::new(steps, &requests);
+        let harness = builder(provider).mode("look").build().await.unwrap();
+        let resumed = harness.resume_session(id).await.unwrap();
+        assert_eq!(resumed.prompt("continue").await.unwrap(), "resumed");
+        let captured = requests.lock().unwrap().clone();
+        let last = captured.last().unwrap();
+        assert_eq!(
+            (&last.system, &last.tools),
+            (&working.system, &working.tools)
+        );
+        let records = resumed.runtime.store.records().await;
+        let mode = crate::session::agent_mode(&records, &resumed.root);
+        assert_eq!(mode.as_deref(), Some("work"));
+        assert_eq!(count!(&records, SessionEvent::ModeChanged { .. }), 1);
+
+        // Continuing a failed turn can change the mode it continues in.
+        assert!(resumed.prompt("fails").await.is_err());
+        let in_mode = |mode: &str| ContinueOptions {
+            mode: Some(mode.to_owned()),
+            ..Default::default()
+        };
+        let unknown = resumed.continue_turn_with(in_mode("missing")).await;
+        assert!(matches!(unknown, Err(HarnessError::UnknownMode(_))));
+        let outcome = resumed.continue_turn_with(in_mode("look")).await.unwrap();
+        assert_eq!(outcome.answer.as_deref(), Some("continued"));
+        assert!(outcome.selection_applied);
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.last().unwrap().system, looking.system);
+        let records = resumed.runtime.store.records().await;
+        assert_eq!(count!(&records, SessionEvent::ModeChanged { .. }), 2);
+        shutdown_session(resumed).await;
+    }
+
+    /// A mode consumed at a request boundary narrows the root's next tool call and its
+    /// host scripts, while a child it already started keeps what it was given.
+    #[tokio::test]
+    async fn a_mid_turn_mode_switch_narrows_the_root_but_not_its_running_child() {
+        use crate::tool::policy::{Capability, Mode};
+        let call = |id: &str, name: &str, arguments: serde_json::Value| {
+            let call = ToolCall::new(id, name, arguments).unwrap();
+            response(vec![AssistantContent::tool_call(id, 0, call)])
+        };
+        let write = |path: &str| json!({"path": path, "content": "written"});
+        let launch = json!({"prompt": "child task", "model": "child", "bg": true});
+        let done = || Step::new(answer("done")).model("root");
+        let tracking = Script::new(
+            [
+                Step::new(call("launch", "agent", launch))
+                    .model("root")
+                    .gated(),
+                Step::new(call("child-write", "write", write("child.txt")))
+                    .model("child")
+                    .gated(),
+                Step::new(call("root-write", "write", write("root.txt")))
+                    .model("root")
+                    .gated(),
+                Step::new(answer("child done")).model("child"),
+                done().gated(),
+                // The child's completion reaches the root as one more request.
+                done(),
+            ],
+            &Default::default(),
+        );
+        let root = tempfile::tempdir().unwrap();
+        let mode = |capabilities: &[Capability]| Mode {
+            capabilities: capabilities.to_vec(),
+            instructions: None,
+        };
+        let work = mode(&[Capability::Read, Capability::Write, Capability::Agents]);
+        let profile = |model: &str| ModelProfile::new("test", model, None, 128_000, 4096, false);
+        let harness = HarnessBuilder::new(root.path())
+            .session_root(root.path().join("sessions"))
+            .provider("test", tracking.clone())
+            .model_profile("root", profile("root"))
+            .model_profile("child", profile("child"))
+            .default_model_profile("root")
+            .modes(
+                [
+                    ("work".to_owned(), work),
+                    ("look".to_owned(), mode(&[Capability::Read])),
+                ]
+                .into(),
+            )
+            .build()
+            .await
+            .unwrap();
+        let session = Arc::new(harness.new_session().await.unwrap());
+        let turn = tokio::spawn({
+            let session = session.clone();
+            async move { session.prompt("delegate, then write").await }
+        });
+        tracking.request(0).await;
+        // Queued while the root's first request is in flight; consumed at its next one.
+        let queued = QueuedPrompt {
+            text: "only look from here".into(),
+            attachments: Vec::new(),
+            options: PromptOptions {
+                mode: Some("look".into()),
+                ..Default::default()
+            },
+            cancellation: Default::default(),
+        };
+        let receipt = tokio::spawn({
+            let session = session.clone();
+            async move { enqueue_prompts(&session, vec![queued]).await }
+        });
+        // A spawned enqueue proves nothing: observe the root's mailbox.
+        bounded(async {
+            while session.root_tx.capacity() == AGENT_CHANNEL_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        tracking.release(0);
+        tracking.request(1).await;
+        let narrowed = tracking.request(2).await;
+        let offered: Vec<_> = narrowed
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert!(offered.contains(&"read"), "{offered:?}");
+        assert!(
+            !offered.contains(&"write") && !offered.contains(&"agent"),
+            "{offered:?}"
+        );
+        assert!(bounded(receipt).await.unwrap().iter().all(Result::is_ok));
+        // The model calls `write` regardless: it is refused.
+        tracking.release(2);
+        tracking.request(4).await;
+        assert!(!root.path().join("root.txt").exists());
+        // The child started under `work` and still writes. Its reply and completion
+        // are both pending before the root's answer, so they reach it together.
+        tracking.release(1);
+        let records = session.runtime.store.records().await;
+        let child = events!(&records, SessionEvent::JobCreated { job, tool, .. } if tool == "agent" => *job)
+            [0];
+        terminal(&session, child).await;
+        assert!(root.path().join("child.txt").exists());
+        tracking.release(4);
+        bounded(turn).await.unwrap().unwrap();
+        let script = "return await tool.write({path: 'script.txt', content: 'written'});";
+        assert!(session.run_script(script).await.is_err());
+        assert!(!root.path().join("script.txt").exists());
+        let records = session.runtime.store.records().await;
+        assert_eq!(count!(&records, SessionEvent::ModeChanged { .. }), 1);
+        session.shutdown().await.unwrap();
+    }
+
+    /// A session never outgrows the ceiling it started with. A mode it has used keeps
+    /// the definition it was used under; a mode new to it is pinned on first use.
+    #[tokio::test]
+    async fn resume_keeps_the_session_ceiling_and_its_pinned_modes() {
+        use crate::tool::policy::{Capability, CapabilitySet, Mode};
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let requests = Requests::default();
+        let mode = |capabilities: &[Capability], instructions: &str| Mode {
+            capabilities: capabilities.to_vec(),
+            instructions: Some(instructions.to_owned()),
+        };
+        let build = |ceiling: CapabilitySet, modes: &[(&str, Mode)], reply: &str| {
+            let provider = scripted_provider(&requests, [answer(reply)]);
+            let modes = modes.iter().cloned();
+            test_builder(root.path(), &sessions, provider, false)
+                .capabilities(ceiling)
+                .modes(modes.map(|(name, mode)| (name.to_owned(), mode)).collect())
+                .build()
+        };
+        let look = ("look", mode(&[Capability::Read], "Look."));
+        let work = (
+            "work",
+            mode(&[Capability::Read, Capability::Write], "Work."),
+        );
+        let narrow: CapabilitySet = [Capability::Read].into_iter().collect();
+        let harness = build(narrow, &[look.clone(), work.clone()], "one").await;
+        let session = harness.unwrap().new_session().await.unwrap();
+        session.prompt("start").await.unwrap();
+        let id = session.id();
+        shutdown_session(session).await;
+
+        let in_mode = |mode: &str| PromptOptions {
+            mode: Some(mode.to_owned()),
+            ..Default::default()
+        };
+        let changes = |records: &[EventRecord]| events!(records, SessionEvent::ModeChanged { mode, capabilities } => (mode.clone(), capabilities.clone()));
+        // A wider live ceiling does not widen the session: `work` grants no write here.
+        let wide = CapabilitySet::default;
+        let harness = build(wide(), &[look.clone(), work.clone()], "two")
+            .await
+            .unwrap();
+        let resumed = harness.resume_session(id).await.unwrap();
+        let prompt = resumed.prompt_with_options("widen", &[], in_mode("work"));
+        assert_eq!(prompt.await.unwrap(), "two");
+        let first = crate::session::ModeSelection {
+            name: "work".into(),
+            definition: Some(work.1.clone()),
+        };
+        let records = resumed.runtime.store.records().await;
+        assert_eq!(changes(&records), [(first.clone(), vec![Capability::Read])]);
+        shutdown_session(resumed).await;
+
+        // The configuration now redefines both modes and adds one. The session keeps
+        // its own `look`, pins the new `extra` when a message first uses it, and keeps
+        // that after it leaves the configuration again.
+        let relook = ("look", mode(&[], "Changed."));
+        let extra = ("extra", mode(&[Capability::Read], "Extra."));
+        for (configured, selected, reply) in [
+            (vec![relook.clone(), extra.clone()], "extra", "three"),
+            (vec![relook.clone()], "look", "four"),
+            (vec![relook], "extra", "five"),
+        ] {
+            let harness = build(wide(), &configured, reply).await.unwrap();
+            let resumed = harness.resume_session(id).await.unwrap();
+            let prompt = resumed.prompt_with_options("next", &[], in_mode(selected));
+            assert_eq!(prompt.await.unwrap(), reply);
+            shutdown_session(resumed).await;
+        }
+        let (_store, records) = SessionStore::open(&sessions, id).await.unwrap();
+        let named = |name: &str, definition: Option<&Mode>| crate::session::ModeSelection {
+            name: name.to_owned(),
+            definition: definition.cloned(),
+        };
+        let read = vec![Capability::Read];
+        let expected = [
+            (first, read.clone()),
+            (named("extra", Some(&extra.1)), read.clone()),
+            (named("look", None), read.clone()),
+            (named("extra", None), read),
+        ];
+        assert_eq!(changes(&records), expected);
+        let captured = requests.lock().unwrap().clone();
+        let prompt = |index: usize| captured[index].system[0].text.clone();
+        assert!(prompt(3).contains("Look.") && !prompt(3).contains("Changed."));
+        assert!(prompt(4).contains("Extra."));
     }
 
     /// A retained child accepts owner input after a restart: its loop starts again

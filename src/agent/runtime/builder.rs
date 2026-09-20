@@ -15,6 +15,8 @@ pub struct HarnessBuilder {
     instructions: Vec<String>,
     max_child_depth: usize,
     capabilities: CapabilitySet,
+    modes: indexmap::IndexMap<String, Mode>,
+    mode: Option<String>,
     targets: TargetsConfig,
     shim_catalog: EmbeddedShimCatalog,
     sensitive_prompts: Arc<dyn SensitivePromptHandler>,
@@ -36,6 +38,8 @@ impl HarnessBuilder {
             instructions: Vec::new(),
             max_child_depth: 4,
             capabilities: CapabilitySet::default(),
+            modes: indexmap::IndexMap::new(),
+            mode: None,
             targets: TargetsConfig::default(),
             shim_catalog: EmbeddedShimCatalog::default(),
             sensitive_prompts: Arc::new(RejectSensitivePrompts),
@@ -109,6 +113,27 @@ impl HarnessBuilder {
         self
     }
 
+    /// The modes the root agent can run in; each is limited by `capabilities`.
+    /// With none, the root agent holds `capabilities` itself. Clears the selected mode.
+    #[must_use]
+    pub fn modes(mut self, mut modes: indexmap::IndexMap<String, Mode>) -> Self {
+        // A mode is a set: the journal pins it sorted and without repeats.
+        for mode in modes.values_mut() {
+            mode.capabilities.sort();
+            mode.capabilities.dedup();
+        }
+        self.modes = modes;
+        self.mode = None;
+        self
+    }
+
+    /// The mode a new session starts in; by default the first.
+    #[must_use]
+    pub fn mode(mut self, mode: impl Into<String>) -> Self {
+        self.mode = Some(mode.into());
+        self
+    }
+
     #[must_use]
     pub fn targets_config(mut self, targets: TargetsConfig) -> Self {
         self.targets = targets;
@@ -144,6 +169,12 @@ impl HarnessBuilder {
         let session_root = self
             .session_root
             .unwrap_or_else(|| workspace.join(".skyhook/sessions"));
+        let mode = self.mode.or_else(|| self.modes.keys().next().cloned());
+        if let Some(mode) = &mode
+            && !self.modes.contains_key(mode)
+        {
+            return Err(HarnessError::UnknownMode(mode.clone()));
+        }
         let mut instructions = load_agent_instructions(&workspace).await?;
         let skills = HostSkills::discover(&workspace).await;
         let target_definitions = self.targets.definitions()?;
@@ -171,6 +202,8 @@ impl HarnessBuilder {
                 skills,
                 max_child_depth: self.max_child_depth,
                 capabilities: self.capabilities,
+                modes: self.modes,
+                mode,
                 target_definitions,
                 shim_catalog: self.shim_catalog,
                 sensitive_prompts,

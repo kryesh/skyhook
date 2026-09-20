@@ -42,16 +42,19 @@ commands! {
     Sessions => ("sessions", "Switch session", "ctrl+x s", &["switch"], true),
     Close => ("close", "Close session", "ctrl+x w", &[], true),
     Model => ("model", "Model", "ctrl+x m", &["models"], true),
+    Mode => ("mode", "Mode", "", &["modes"], true),
     Agents => ("agents", "Inspect agent", "ctrl+x a", &[], true),
     Inspect => ("inspect", "Focus conversation", "", &[], false),
     Copy => ("copy", "Copy message", "ctrl+x y", &[], true),
     Export => ("export", "Export conversation", "ctrl+x x", &[], true),
     Exit => ("exit", "Quit", "ctrl+x q", &[], true),
-    Child => ("child", "First child", "ctrl+x down", &[], false),
-    Parent => ("parent", "Parent agent", "ctrl+x up", &[], false),
+    Child => ("child", "First child", "", &[], false),
+    Parent => ("parent", "Parent agent", "", &[], false),
+    PreviousAgent => ("previous-agent", "Agent above", "ctrl+x up", &[], false),
+    NextAgent => ("next-agent", "Agent below", "ctrl+x down", &[], false),
+    PreviousTab => ("previous-tab", "Previous tab", "ctrl+x left", &[], false),
+    NextTab => ("next-tab", "Next tab", "ctrl+x right", &[], false),
     Commands => ("commands", "Command palette", "ctrl+p", &[], false),
-    Jobs => ("jobs", "Agent jobs", "", &[], true),
-    Requests => ("requests", "Model requests", "", &[], true),
     Thinking => ("thinking", "Expand/collapse saved reasoning", "", &[], true),
     Details => ("details", "Toggle tool details", "ctrl+x t", &[], true),
     Attachments => ("attachments", "Inspect or remove attachments", "", &[], true),
@@ -236,10 +239,10 @@ mod tests {
         );
         assert_eq!(keys.action(None, key("ctrl+p")), Some(Command::Commands));
         assert!(keys.prefix(leader));
-        assert_eq!(keys.binding(Command::Jobs), None);
+        assert_eq!(keys.binding(Command::Mode), None);
         let hint = keys.leader_hint(
             leader,
-            &[(Command::Jobs, "Jobs"), (Command::Model, "Model")],
+            &[(Command::Mode, "Mode"), (Command::Model, "Model")],
         );
         assert_eq!(hint, "Ctrl+X: M Model");
     }

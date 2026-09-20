@@ -90,6 +90,15 @@ impl ModelContext {
     }
 }
 
+/// The mode an entry applies. The session pins a mode's definition on its first use
+/// and keeps it whatever the configuration later says.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ModeSelection {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<crate::tool::policy::Mode>,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
@@ -111,6 +120,9 @@ pub enum SessionEvent {
         /// None for a tool-only agent without a model, such as a remote worker.
         profile: Option<ProfileSnapshot>,
         available_depth: u32,
+        /// The root agent's mode, when the session has modes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<ModeSelection>,
         capabilities: Vec<Capability>,
         location: ExecutionLocation,
     },
@@ -120,6 +132,11 @@ pub enum SessionEvent {
     /// Model applied to a submitted user turn; never a pending UI selection.
     ModelChanged {
         profile: ProfileSnapshot,
+    },
+    /// Mode applied to a submitted user turn, with the capabilities it granted.
+    ModeChanged {
+        mode: ModeSelection,
+        capabilities: Vec<Capability>,
     },
     MessageCommitted {
         message: Message,

@@ -10,6 +10,50 @@ pub(super) enum InputTarget {
 }
 
 impl App {
+    /// The inspector tab before or after the shown one, wrapping.
+    pub(super) fn cycle_tab(&mut self, backwards: bool) {
+        self.selection = None;
+        let tab = self.view().tab.next(backwards);
+        self.view().tab = tab;
+        self.view().scroll = None;
+        self.invalidate_content();
+    }
+
+    /// View the agent above or below the viewed one in the tree, wrapping, at its
+    /// latest activity, and keep the tree focused for the next step.
+    pub(super) fn step_agent(&mut self, backwards: bool) {
+        let agents = self.projection.visible(&self.selected);
+        let Some(current) = agents.iter().position(|agent| agent.id == self.selected) else {
+            return;
+        };
+        let step = if backwards { agents.len() - 1 } else { 1 };
+        let next = agents[(current + step) % agents.len()].id.clone();
+        self.select(next);
+        let shown = self.projection.visible(&self.selected);
+        let cursor = shown.iter().position(|agent| agent.id == self.selected);
+        self.tree_cursor = cursor.unwrap_or(0);
+        self.view().scroll = None;
+        self.focus = Focus::Tree;
+    }
+
+    /// Step the mode the next message is sent in, through the configured order.
+    fn cycle_mode(&mut self, reverse: bool) {
+        let modes = self.modes();
+        let current = modes.get_index_of(&self.mode).unwrap_or(0);
+        let step = if reverse {
+            modes.len().saturating_sub(1)
+        } else {
+            1
+        };
+        let next = modes.get_index((current + step) % modes.len().max(1));
+        if let Some(mode) = next.map(|(mode, _)| mode.clone()) {
+            self.mode = mode;
+        }
+        self.dirty = true;
+    }
+}
+
+impl App {
     pub(super) fn input_target(&self) -> InputTarget {
         if self.menu.is_some() {
             InputTarget::Menu
@@ -138,47 +182,18 @@ impl App {
             self.leader = Some(key);
             return;
         }
+        // Tab steps through whatever has focus: modes in the composer, rows elsewhere.
+        let key = match key.code {
+            KeyCode::Tab | KeyCode::BackTab if self.focus != Focus::Composer => {
+                let reverse = key.code == KeyCode::BackTab || key.modifiers.contains(M::SHIFT);
+                KeyEvent::new(if reverse { KeyCode::Up } else { KeyCode::Down }, M::NONE)
+            }
+            _ => key,
+        };
         match key.code {
             KeyCode::Tab | KeyCode::BackTab => {
                 let reverse = key.code == KeyCode::BackTab || key.modifiers.contains(M::SHIFT);
-                self.focus = match (self.focus, reverse) {
-                    (Focus::Composer, false) | (Focus::Content, true) => Focus::Tree,
-                    (Focus::Tree, false) | (Focus::Composer, true) => Focus::Content,
-                    _ => Focus::Composer,
-                };
-                if self.focus == Focus::Tree && self.tree_rect.height == 0 {
-                    self.focus = if reverse {
-                        Focus::Composer
-                    } else {
-                        Focus::Content
-                    };
-                }
-                if !self.selected.path().is_empty() && self.focus == Focus::Composer {
-                    self.focus = if reverse && self.tree_rect.height > 0 {
-                        Focus::Tree
-                    } else {
-                        Focus::Content
-                    };
-                }
-                if self.focus == Focus::Content {
-                    let current = self.view().row;
-                    let visible: Vec<_> = self
-                        .hits
-                        .iter()
-                        .filter_map(|(_, hit)| {
-                            if let Hit::Entry(index, _) = hit {
-                                Some(*index)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if !visible.contains(&current)
-                        && let Some(first) = visible.first()
-                    {
-                        self.view().row = *first;
-                    }
-                }
+                self.cycle_mode(reverse);
                 return;
             }
             KeyCode::PageUp => {
@@ -274,11 +289,7 @@ impl App {
             Focus::Tree => {
                 let agents = self.projection.visible(&self.selected);
                 match key.code {
-                    KeyCode::Up => self.tree_cursor = self.tree_cursor.saturating_sub(1),
-                    KeyCode::Down => {
-                        self.tree_cursor =
-                            (self.tree_cursor + 1).min(agents.len().saturating_sub(1))
-                    }
+                    KeyCode::Up | KeyCode::Down => self.step_agent(key.code == KeyCode::Up),
                     KeyCode::Enter => {
                         if let Some(agent) = agents.get(self.tree_cursor) {
                             self.select(agent.id.clone());
@@ -309,13 +320,7 @@ impl App {
                     }
                 }
                 KeyCode::Enter => self.toggle(),
-                KeyCode::Char('[' | ']') => {
-                    self.selection = None;
-                    let tab = self.view().tab.next(key.code == KeyCode::Char('['));
-                    self.view().tab = tab;
-                    self.view().scroll = None;
-                    self.invalidate_content();
-                }
+                KeyCode::Char('[' | ']') => self.cycle_tab(key.code == KeyCode::Char('[')),
                 KeyCode::Char('/') => self.search_editor = Some(Editor::default()),
                 KeyCode::Char('n' | 'N') => self.find(key.code == KeyCode::Char('N')),
                 KeyCode::Char('y') => self.copy(),
@@ -550,8 +555,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tab_focus_marks_visible_messages_and_tracks_tree_navigation() {
-        let (_root, mut app) = fixture().await;
+    async fn tab_steps_modes_in_the_composer_and_rows_in_the_focused_pane() {
+        let (_root, mut app) = draft_fixture().await;
+        let mut config = app.launch.model.config().config().clone();
+        config.modes = toml::from_str(
+            "[general]\ncapabilities=['read']\n[look]\ncapabilities=[]\n[none]\ncapabilities=[]",
+        )
+        .unwrap();
+        app.launch.model = config.into_runtime().unwrap().first_model();
+        // A session offers the modes it was opened with.
+        let session = app.launch.create(None).await.unwrap();
+        attach(&mut app, session).await;
         let entries = (0..12).map(|index| {
             let text = format!("skyhook\nMessage {index}");
             model::Entry::new(model::EntryKey::Record(index), text, model::Surface::Agent)
@@ -562,42 +576,70 @@ mod tests {
             let cells = buffer.content.iter().filter(|cell| cell.symbol() == "▌");
             cells.map(|cell| cell.fg).collect::<Vec<_>>()
         };
-        let buffer = draw_buffer(&mut app);
-        assert_eq!(buffer[(0, 3)].bg, ratatui::style::Color::Rgb(0, 0, 0));
-        assert!(markers(&buffer).is_empty());
+        assert!(markers(&draw_buffer(&mut app)).is_empty());
+        for (code, mode) in [
+            (KeyCode::Tab, "look"),
+            (KeyCode::Tab, "none"),
+            (KeyCode::Tab, "general"),
+            (KeyCode::BackTab, "none"),
+        ] {
+            key(&mut app, code, M::NONE);
+            assert!(app.mode == mode && app.focus == Focus::Composer, "{mode}");
+        }
+        assert!(draw(&mut app).contains("none · "));
         assert_eq!(app.view().row, 0);
+
+        app.focus = Focus::Content;
         key(&mut app, KeyCode::Tab, M::NONE);
-        let buffer = draw_buffer(&mut app);
-        assert!(app.view().row > 0, "Tab should select a visible message");
+        key(&mut app, KeyCode::Tab, M::NONE);
+        key(&mut app, KeyCode::BackTab, M::NONE);
+        assert_eq!((app.view().row, app.mode.as_str()), (1, "none"));
         assert_eq!(
-            markers(&buffer),
+            markers(&draw_buffer(&mut app)),
             [ratatui::style::Color::Rgb(255, 255, 255)]
         );
-        key(&mut app, KeyCode::Tab, M::NONE);
-        assert!(!draw(&mut app).contains('▌'));
 
         let mut child = app.projection.agents[0].clone();
         child.id = child.id.child(1);
         app.projection.agents.push(child);
         draw(&mut app);
-        key(&mut app, KeyCode::Tab, M::NONE);
-        let tree_y = app.tree_rect.y;
-        assert_eq!(draw_buffer(&mut app)[(2, tree_y + 1)].symbol(), "▌");
-        key(&mut app, KeyCode::Down, M::NONE);
-        let buffer = draw_buffer(&mut app);
-        assert_ne!(buffer[(2, tree_y + 1)].symbol(), "▌");
-        assert_eq!(buffer[(6, tree_y + 2)].symbol(), "▌");
-        app.command(Command::Commands);
-        let buffer = draw_buffer(&mut app);
-        assert_ne!(buffer[(6, tree_y + 2)].symbol(), "▌");
-        assert_eq!(markers(&buffer).len(), 1);
+        let (root, child) = (
+            app.projection.agents[0].id.clone(),
+            app.projection.agents[1].id.clone(),
+        );
+        // In the tree, a step views the next agent at its latest activity, wrapping.
+        app.focus = Focus::Tree;
+        app.view().scroll = Some(0);
+        for (code, viewed) in [
+            (KeyCode::Tab, &child),
+            (KeyCode::BackTab, &root),
+            (KeyCode::Down, &child),
+            (KeyCode::Down, &root),
+            (KeyCode::Up, &child),
+        ] {
+            key(&mut app, code, M::NONE);
+            assert!(app.selected == *viewed && app.focus == Focus::Tree);
+            assert_eq!(app.view().scroll, None);
+        }
+        assert!(draw(&mut app).contains('▌'));
+        // The leader arrows do the same from anywhere, and step the inspector tabs.
         key(&mut app, KeyCode::Esc, M::NONE);
-        chord(&mut app, KeyCode::Up);
-        assert_eq!(app.selected, app.projection.agents[0].id);
-        chord(&mut app, KeyCode::Down);
-        assert_eq!(app.selected, app.projection.agents[1].id);
-        chord(&mut app, KeyCode::Char('i'));
-        assert!(matches!(app.focus, Focus::Content));
-        assert_eq!(app.view().tab, Tab::Conversation);
+        for (code, viewed) in [
+            (KeyCode::Up, &root),
+            (KeyCode::Up, &child),
+            (KeyCode::Down, &root),
+        ] {
+            chord(&mut app, code);
+            assert!(app.selected == *viewed && app.focus == Focus::Tree);
+        }
+        for (code, tab) in [
+            (KeyCode::Right, Tab::Requests),
+            (KeyCode::Right, Tab::Jobs),
+            (KeyCode::Right, Tab::Conversation),
+            (KeyCode::Left, Tab::Jobs),
+        ] {
+            chord(&mut app, code);
+            assert_eq!(app.view().tab, tab);
+        }
     }
 }

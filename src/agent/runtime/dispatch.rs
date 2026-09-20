@@ -29,12 +29,14 @@ impl PreparedAgentLaunch {
             todos,
             mut available_depth,
             mut location,
+            mode,
+            capabilities,
         } = launch;
         // An agent that started before resumes under its journaled contract. Live
         // configuration may narrow its capabilities but never widen them.
         let records = runtime.store.records().await;
         let first = records.is_empty();
-        let recorded = recorded_contract(&records, &id, &runtime.harness.capabilities);
+        let recorded = recorded_contract(&records, &id, &runtime.capabilities);
         drop(records);
         let resumed = recorded.is_some();
         if id.depth() > runtime.harness.max_child_depth {
@@ -50,7 +52,16 @@ impl PreparedAgentLaunch {
         if available_depth > remaining_depth {
             return Err(HarnessError::ChildDepth);
         }
-        let allowed = runtime.harness.capabilities.for_agent(available_depth);
+        // A journaled contract is narrowed by the session, not by the launch's mode.
+        let mode = recorded
+            .as_ref()
+            .map_or(mode, |recorded| recorded.mode.clone());
+        let bound = if resumed {
+            &runtime.capabilities
+        } else {
+            &capabilities
+        };
+        let allowed = bound.for_agent(available_depth);
         let capabilities = match &recorded {
             Some(recorded) => recorded
                 .capabilities
@@ -73,6 +84,7 @@ impl PreparedAgentLaunch {
                         &id,
                         &location,
                         available_depth,
+                        mode.as_deref(),
                         &capabilities,
                     )
                     .await?;
@@ -92,9 +104,12 @@ impl PreparedAgentLaunch {
                 id,
                 owner_job,
                 context,
-                model_profile,
                 location,
-                capabilities,
+                settings: AgentSettings {
+                    model_profile,
+                    mode,
+                    capabilities,
+                },
                 rx,
             },
             sender,
@@ -120,18 +135,21 @@ impl PreparedAgentLaunch {
                 parent: agent_loop.id.parent(),
                 owner_job: agent_loop.owner_job,
                 profile: Some(crate::session::ProfileSnapshot {
-                    name: agent_loop.model_profile.clone(),
+                    name: agent_loop.settings.model_profile.clone(),
                     profile: agent_loop.context.profile.clone(),
                 }),
                 available_depth: u32::try_from(available_depth).unwrap_or(u32::MAX),
-                capabilities: agent_loop.capabilities.iter().collect(),
+                mode: match &agent_loop.settings.mode {
+                    Some(mode) => Some(runtime.mode_selection(mode).await),
+                    None => None,
+                },
+                capabilities: agent_loop.settings.capabilities.iter().collect(),
                 location: agent_loop.location.clone(),
             };
-            let harness = &runtime.harness;
             // Every entry references an agent, so the session starts with its root.
             let session = first.then(|| SessionEvent::SessionStarted {
-                targets: harness.target_definitions.clone(),
-                capabilities: harness.capabilities.iter().collect(),
+                targets: runtime.harness.target_definitions.clone(),
+                capabilities: runtime.capabilities.iter().collect(),
             });
             let events = session.into_iter().chain([started]);
             let id = &agent_loop.id;
@@ -160,7 +178,8 @@ impl PreparedAgentLaunch {
             agents.insert(
                 agent_loop.id.clone(),
                 LiveAgent {
-                    model_profile: agent_loop.model_profile.clone(),
+                    model_profile: agent_loop.settings.model_profile.clone(),
+                    capabilities: agent_loop.settings.capabilities.clone(),
                     sender: sender.clone(),
                     cancellation: CancellationToken::new(),
                     control: agent_loop.control.clone(),
@@ -258,6 +277,7 @@ impl SessionRuntime {
         agent: &AgentId,
         location: &crate::execution::ExecutionLocation,
         available_depth: usize,
+        mode: Option<&str>,
         capabilities: &CapabilitySet,
     ) -> Result<(ModelProfile, Vec<SystemSegment>), HarnessError> {
         let profile = self
@@ -266,20 +286,46 @@ impl SessionRuntime {
             .get(model_profile)
             .cloned()
             .ok_or_else(|| HarnessError::UnknownModelProfile(model_profile.to_owned()))?;
+        let system = self
+            .system_prompt(agent, location, available_depth, mode, capabilities)
+            .await?;
+        Ok((profile, system))
+    }
+
+    /// The journal form of a mode about to be applied: its first use in the session
+    /// pins the definition it is used under.
+    pub(super) async fn mode_selection(&self, name: &str) -> crate::session::ModeSelection {
+        let pinned = crate::session::pinned_modes(&self.store.records().await);
+        let definition = self.modes.get(name);
+        crate::session::ModeSelection {
+            name: name.to_owned(),
+            definition: definition.filter(|_| !pinned.contains_key(name)).cloned(),
+        }
+    }
+
+    pub(super) async fn system_prompt(
+        &self,
+        agent: &AgentId,
+        location: &crate::execution::ExecutionLocation,
+        available_depth: usize,
+        mode: Option<&str>,
+        capabilities: &CapabilitySet,
+    ) -> Result<Vec<SystemSegment>, HarnessError> {
         let target = if location.is_root() {
             None
         } else {
             Some(self.router.targets().get(&location.target).await?)
         };
-        let system = vec![prompt::system_segment(
-            &self.harness.instructions,
+        let system = vec![prompt::system_segment(&prompt::PromptInputs {
+            instructions: &self.harness.instructions,
             agent,
             location,
-            target.as_ref(),
+            target: target.as_ref(),
             available_depth,
+            mode: mode.and_then(|name| Some((name, self.modes.get(name)?))),
             capabilities,
-        )];
-        Ok((profile, system))
+        })];
+        Ok(system)
     }
 
     /// Open a context offering the live tool surface, or `pinned` tools journaled
@@ -350,7 +396,7 @@ impl SessionRuntime {
     pub(super) async fn install_retained_children(self: &Arc<Self>) {
         let records = self.store.records().await;
         for retained in self.jobs.retained_children().await {
-            let live = &self.harness.capabilities;
+            let live = &self.capabilities;
             let Some(mut owner) = recorded_contract(&records, &retained.owner, live) else {
                 continue;
             };
@@ -390,6 +436,7 @@ impl SessionRuntime {
 struct RecordedContract {
     profile: crate::session::ProfileSnapshot,
     available_depth: usize,
+    mode: Option<String>,
     /// The journaled set narrowed to the live configuration, never widened.
     capabilities: CapabilitySet,
     location: crate::execution::ExecutionLocation,
@@ -403,11 +450,18 @@ fn recorded_contract(
     live: &CapabilitySet,
 ) -> Option<RecordedContract> {
     let mut contract: Option<RecordedContract> = None;
+    let narrowed = |capabilities: &[Capability]| {
+        let capabilities = capabilities.iter().copied();
+        capabilities
+            .filter(|capability| live.contains(*capability))
+            .collect()
+    };
     for record in records.iter().filter(|record| &record.agent == agent) {
         match &record.event {
             SessionEvent::AgentStarted {
                 profile: Some(profile),
                 available_depth,
+                mode,
                 capabilities,
                 location,
                 ..
@@ -415,11 +469,8 @@ fn recorded_contract(
                 contract = Some(RecordedContract {
                     profile: profile.clone(),
                     available_depth: *available_depth as usize,
-                    capabilities: capabilities
-                        .iter()
-                        .copied()
-                        .filter(|capability| live.contains(*capability))
-                        .collect(),
+                    mode: mode.as_ref().map(|mode| mode.name.clone()),
+                    capabilities: narrowed(capabilities),
                     location: location.clone(),
                     system: None,
                     tools: None,
@@ -428,6 +479,14 @@ fn recorded_contract(
             SessionEvent::ModelChanged { profile } => {
                 if let Some(contract) = &mut contract {
                     contract.profile = profile.clone();
+                }
+            }
+            SessionEvent::ModeChanged { mode, capabilities } => {
+                if let Some(contract) = &mut contract {
+                    contract.mode = Some(mode.name.clone());
+                    contract.capabilities = narrowed(capabilities);
+                    // The mode's prompt and tools are pinned by its next model context.
+                    (contract.system, contract.tools) = (None, None);
                 }
             }
             SessionEvent::ModelContext { context }

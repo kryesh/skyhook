@@ -26,8 +26,8 @@ pub(crate) use template::ModelRequestTemplate;
 pub(crate) use db::{CaptureExtent, CaptureRow, Presentation, SharedDb};
 pub use db::{DbError, SessionSummary};
 pub use event::{
-    CompactionCheckpoint, EventRecord, ModelCallOrigin, ModelContext, ModelFailureKind,
-    ModelPurpose, ProfileSnapshot, SessionEvent,
+    CompactionCheckpoint, EventRecord, ModeSelection, ModelCallOrigin, ModelContext,
+    ModelFailureKind, ModelPurpose, ProfileSnapshot, SessionEvent,
 };
 pub use request::{merge_tool_results, project_history, reconstruct_model_request};
 
@@ -53,6 +53,33 @@ pub fn agent_selection(records: &[EventRecord], agent: &AgentId) -> Option<Strin
         }
     }
     selection
+}
+
+/// The mode definitions the session has pinned, in order of first use.
+pub fn pinned_modes(
+    records: &[EventRecord],
+) -> indexmap::IndexMap<String, crate::tool::policy::Mode> {
+    let selections = records.iter().filter_map(|record| match &record.event {
+        SessionEvent::AgentStarted { mode, .. } => mode.as_ref(),
+        SessionEvent::ModeChanged { mode, .. } => Some(mode),
+        _ => None,
+    });
+    selections
+        .filter_map(|mode| Some((mode.name.clone(), mode.definition.clone()?)))
+        .collect()
+}
+
+/// Restore the agent's last applied mode.
+pub fn agent_mode(records: &[EventRecord], agent: &AgentId) -> Option<String> {
+    let records = records.iter().rev();
+    records
+        .filter(|record| &record.agent == agent)
+        .find_map(|record| match &record.event {
+            SessionEvent::AgentStarted { mode, .. } => Some(mode.as_ref()),
+            SessionEvent::ModeChanged { mode, .. } => Some(Some(mode)),
+            _ => None,
+        })?
+        .map(|mode| mode.name.clone())
 }
 
 struct SessionLock(std::fs::File);
@@ -1052,6 +1079,7 @@ pub(crate) mod fixture {
             owner_job,
             profile: Some(profile()),
             available_depth: 0,
+            mode: None,
             capabilities: vec![Capability::Read],
             location,
         }

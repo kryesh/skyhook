@@ -60,6 +60,7 @@ path = "~/.ssh/old-build"
 Then use this `<workspace>/.skyhook/config.toml`:
 
 ```toml
+[modes.general]
 capabilities = ["read", "write", "exec", "targets"]
 
 [targets.build]
@@ -69,12 +70,13 @@ workspace = "/srv/project"
 ```
 
 The effective configuration retains `providers.openai`, `models.default`, and `targets.bastion`.
-The capabilities array is replaced, not extended. `targets.build` uses the new host and workspace,
+A named mode or target is replaced whole, not merged: `modes.general` grants exactly the listed
+capabilities, and `targets.build` uses the new host and workspace,
 with default authentication/routing behavior: neither the old key nor `via = "bastion"` survives.
 If a route or key is needed, repeat it explicitly in the workspace entry.
 
 **Trust boundary:** workspace configuration is full configuration, not a restricted project hint.
-It can change approvals, capabilities, provider credential commands, and MCP server startup.
+It can change approvals, modes, provider credential commands, and MCP server startup.
 Review it before starting Skyhook in an untrusted checkout. This repository currently ignores
 `.skyhook/`, so creating `.skyhook/config.toml` does **not** automatically make it versioned.
 
@@ -99,7 +101,7 @@ See [authentication](authentication.md#api-keys-and-environment-files).
 
 ```sh
 skyhook dump --workspace /path/to/project         # Same as dump config
-skyhook dump config --workspace /path/to/project --capabilities=read --approve-all
+skyhook dump config --workspace /path/to/project --approve-all
 skyhook dump config --config ./standalone.toml    # Explicit file only
 ```
 
@@ -115,8 +117,8 @@ for selectors and incompatible options.
   context/output limits, reasoning replay, and connection recovery.
 - [Authentication](authentication.md): environment variables, secret-manager commands,
   `.env`, and Skyhook-owned Codex login.
-- [Permissions and capabilities](../guide/permissions.md): `approve_all` and the exact
-  `capabilities` allowlist.
+- [Permissions and capabilities](../guide/permissions.md): `approve_all`, modes, and their exact
+  capability allowlists.
 - [Execution targets](../guide/execution-targets.md): SSH destinations, origins, routing,
   and optional SSH-config import.
 - [MCP servers](mcp.md): trusted local server startup and imported tools.

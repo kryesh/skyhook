@@ -44,7 +44,9 @@ impl TokenMeter {
         for record in records.iter().rev().filter(|record| &record.agent == agent) {
             if matches!(
                 record.event,
-                SessionEvent::Compaction { .. } | SessionEvent::ModelChanged { .. }
+                SessionEvent::Compaction { .. }
+                    | SessionEvent::ModelChanged { .. }
+                    | SessionEvent::ModeChanged { .. }
             ) {
                 break;
             }
@@ -172,7 +174,7 @@ mod tests {
     pub(super) use crate::agent::runtime::tests::{
         count, events, summary_json, test_builder, todo, usage,
     };
-    use crate::agent::runtime::{HarnessError, SessionHandle, TurnContext, compaction, prompt};
+    use crate::agent::runtime::{HarnessError, SessionHandle, TurnContext, compaction, state};
     use crate::{
         agent::TodoStatus,
         execution::ExecutionLocation,
@@ -387,14 +389,14 @@ mod tests {
             let location = ExecutionLocation::root(self.workspace.path().to_path_buf());
             let (jobs, todos) = (&runtime.jobs, &runtime.todos);
             let state =
-                prompt::runtime_state_content(jobs, todos, agent, &capabilities, &location).await;
+                state::runtime_state_content(jobs, todos, agent, &capabilities, &location).await;
             input.tail = vec![Message::User(vec![state])];
             let turn = TurnContext {
                 agent,
                 owner_job: None,
                 cancellation,
                 location: &location,
-                capabilities: &capabilities,
+                capabilities: capabilities.clone(),
             };
             let mut provider = self.provider.open_context(agent.to_string())?;
             runtime

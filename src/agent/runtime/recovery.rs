@@ -534,7 +534,7 @@ mod tests {
             text: "recover".into(),
         }];
         let input = AgentCommand::Input {
-            model: None,
+            options: Default::default(),
             content,
             done: Some(done),
         };

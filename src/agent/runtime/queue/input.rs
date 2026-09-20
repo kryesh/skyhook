@@ -3,20 +3,25 @@
 use super::*;
 
 impl SessionRuntime {
-    /// Switch the agent to profile `name`, if given and different. Everything is
-    /// resolved before the journal append, so a rejected selection changes nothing;
-    /// `images` rejects an unsupported profile before any provider context opens.
-    pub(in crate::agent::runtime) async fn select_model(
+    /// Apply an input's model and mode, where given and different. A mode is the root
+    /// agent's capabilities, the tools they allow and its instructions; children it
+    /// already started keep their own. Everything is resolved before one journal
+    /// append, so a rejected selection changes nothing; `images` rejects an
+    /// unsupported profile before any provider context opens.
+    pub(in crate::agent::runtime) async fn select(
         &self,
-        agent: &AgentId,
+        turn: &mut TurnContext<'_>,
         context: &mut AgentContext,
-        model_profile: &mut String,
-        capabilities: &CapabilitySet,
-        name: Option<String>,
+        settings: &mut AgentSettings,
+        options: PromptOptions,
         images: bool,
     ) -> Result<(), HarnessError> {
-        let name = name.filter(|name| name != model_profile);
-        let profile = match &name {
+        let agent = turn.agent;
+        let model = options.model.filter(|name| name != &settings.model_profile);
+        let mode = options
+            .mode
+            .filter(|name| settings.mode.as_ref() != Some(name));
+        let profile = match &model {
             Some(name) => self
                 .harness
                 .model_profiles
@@ -28,47 +33,85 @@ impl SessionRuntime {
         if images && !profile.supports_images {
             return Err(HarnessError::ImagesUnsupported(profile.model));
         }
-        let Some(name) = name else {
-            return Ok(());
+        let mode = match mode {
+            Some(name) if agent.depth() != 0 => return Err(HarnessError::UnknownMode(name)),
+            Some(name) => {
+                let depth = self.available_depth(agent);
+                let capabilities = self.mode_capabilities(&name)?.for_agent(depth);
+                Some((name, depth, capabilities))
+            }
+            None => None,
         };
-        let mut replacement = None;
-        if profile != context.profile {
+        let replacement = if let Some((name, depth, capabilities)) = &mode {
+            let system = self
+                .system_prompt(agent, turn.location, *depth, Some(name), capabilities)
+                .await?;
+            let opening =
+                self.open_agent_context(agent, profile.clone(), system, capabilities, None, false);
+            Some(opening.await?)
+        } else if profile != context.profile {
             let system = context.template.system().to_vec();
             // The tools stay pinned across a model change.
             let tools = Some(context.template.to_request().tools);
-            let opened = self
-                .open_agent_context(agent, profile.clone(), system, capabilities, tools, false)
-                .await?;
-            if !profile.supports_images && opened.contains_images() {
-                return Err(HarnessError::ImagesUnsupported(profile.model));
-            }
-            replacement = Some(opened);
-        }
-        let profile = crate::session::ProfileSnapshot {
-            name: name.clone(),
-            profile,
+            let capabilities = &settings.capabilities;
+            let opening =
+                self.open_agent_context(agent, profile.clone(), system, capabilities, tools, false);
+            Some(opening.await?)
+        } else {
+            None
         };
-        let event = SessionEvent::ModelChanged { profile };
-        self.store.append(agent.clone(), event).await?;
+        if !profile.supports_images
+            && replacement
+                .as_ref()
+                .is_some_and(AgentContext::contains_images)
+        {
+            return Err(HarnessError::ImagesUnsupported(profile.model));
+        }
+        let mut events = Vec::new();
+        if let Some(name) = &model {
+            let profile = crate::session::ProfileSnapshot {
+                name: name.clone(),
+                profile,
+            };
+            events.push((agent.clone(), SessionEvent::ModelChanged { profile }));
+        }
+        if let Some((name, _, capabilities)) = &mode {
+            let event = SessionEvent::ModeChanged {
+                mode: self.mode_selection(name).await,
+                capabilities: capabilities.iter().collect(),
+            };
+            events.push((agent.clone(), event));
+        }
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.store.append_all(events).await?;
         // No await between installation and its routing projection.
         if let Some(replacement) = replacement {
             *context = replacement;
         }
-        *model_profile = name;
+        if let Some(name) = model {
+            settings.model_profile = name;
+        }
+        if let Some((name, _, capabilities)) = mode {
+            turn.capabilities.clone_from(&capabilities);
+            (settings.mode, settings.capabilities) = (Some(name), capabilities);
+        }
         if let Some(live) = self.agents_mut().get_mut(agent) {
-            live.model_profile.clone_from(model_profile);
+            live.model_profile.clone_from(&settings.model_profile);
+            live.capabilities.clone_from(&settings.capabilities);
         }
         Ok(())
     }
 
     pub(in crate::agent::runtime) async fn consume_queued_input(
         &self,
-        agent: &AgentId,
+        turn: &mut TurnContext<'_>,
         context: &mut AgentContext,
-        model_profile: &mut String,
-        capabilities: &CapabilitySet,
+        settings: &mut AgentSettings,
         input: QueuedInput,
     ) -> bool {
+        let agent = turn.agent;
         if self.shutting_down.load(Ordering::Acquire) {
             input.reject(HarnessError::AgentStopped);
             return false;
@@ -79,14 +122,14 @@ impl SessionRuntime {
         }
         let QueuedInput {
             content,
-            model,
+            options,
             committed,
             ..
         } = input;
         let images = content.iter().any(UserContent::is_image);
-        // ModelChanged precedes the MessageCommitted it applies to.
+        // ModelChanged and ModeChanged precede the MessageCommitted they apply to.
         let result = async {
-            self.select_model(agent, context, model_profile, capabilities, model, images)
+            self.select(turn, context, settings, options, images)
                 .await?;
             let message = Message::User(content);
             let event = SessionEvent::MessageCommitted {
@@ -337,6 +380,7 @@ mod tests {
                 attachments,
                 options: PromptOptions {
                     model: model.map(str::to_owned),
+                    mode: None,
                 },
                 cancellation: QueuedPromptCancellation::default(),
             };

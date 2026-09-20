@@ -110,7 +110,10 @@ pub struct App {
     pub launch: Launch,
     /// UI-only choice, captured by each submitted user message.
     pub model: String,
+    /// UI-only choice like `model`; a new session starts in it.
+    pub mode: String,
     remembered_model: Option<String>,
+    remembered_mode: Option<String>,
     pub sidebar: bool,
     pub snapshot: ObservationSnapshot,
     pub projection: Projection,
@@ -225,7 +228,9 @@ impl App {
             .unwrap_or_else(draft_root);
         let mut app = Self {
             model: launch.model.name().to_owned(),
+            mode: launch.mode().unwrap_or_default().to_owned(),
             remembered_model: saved.model,
+            remembered_mode: saved.mode,
             sidebar: saved.sidebar,
             observation: None,
             launch,
@@ -293,6 +298,14 @@ impl App {
         app.refresh();
         if let Some(root) = app.projection.agents.iter().find(|a| a.id == app.selected) {
             app.model.clone_from(&root.model);
+            // A recorded mode that is no longer configured cannot be sent again.
+            if let Some(mode) = root
+                .mode
+                .as_ref()
+                .filter(|mode| app.modes().contains_key(*mode))
+            {
+                app.mode.clone_from(mode);
+            }
         }
         app.show_warnings();
         app
@@ -317,6 +330,7 @@ pub(super) mod tests {
                 .unwrap()
                 .select_model("first")
                 .unwrap(),
+            permissions: crate::launch::Permissions::Mode("general".into()),
             workspace: root.path().to_path_buf(),
             sessions: root.path().join(".skyhook/sessions"),
             catalog: EmbeddedShimCatalog::default(),
@@ -327,6 +341,7 @@ pub(super) mod tests {
         let mut app = App::new(None, launch, Default::default(), tx);
         // Unit fixtures must not change the user's global model preference.
         app.remembered_model = Some("first".into());
+        app.remembered_mode = Some("general".into());
         (root, app)
     }
     pub(in super::super) async fn fixture() -> (tempfile::TempDir, App) {

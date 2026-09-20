@@ -1,4 +1,4 @@
--- Skyhook session database (application_id 0x534B5948, user_version 6). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 7). Tables are STRICT;
 -- subtype rows key (entry, kind) -> entry(seq, kind). db/mod.rs adds append-only triggers
 -- to tables outside MUTABLE_TABLES. u64 values saturate to i64::MAX.
 
@@ -9,10 +9,16 @@ CREATE TABLE session (
   public_id BLOB NOT NULL CHECK (length(public_id) = 16)
 ) STRICT;
 
+-- The capability names, which every capability column references.
+CREATE TABLE capability (
+  name TEXT PRIMARY KEY
+) STRICT, WITHOUT ROWID;
+INSERT INTO capability (name) VALUES
+  ('read'),('write'),('exec'),('network'),('targets'),('ssh_agent'),('agents'),('interactive'),('mcp');
+
 -- Pinned harness capability ceiling; every agent's set must be a subset (FK below).
 CREATE TABLE session_capability (
-  capability TEXT PRIMARY KEY CHECK (capability IN
-    ('read','write','exec','network','targets','ssh_agent','agents','interactive','mcp'))
+  capability TEXT PRIMARY KEY REFERENCES capability(name)
 ) STRICT, WITHOUT ROWID;
 
 -- 'root' is seeded at create; it has no revision rows.
@@ -41,6 +47,7 @@ CREATE TABLE entry (
   kind TEXT NOT NULL CHECK (kind IN (
     'session_started','title_set','targets_upserted',
     'agent_started','agent_completed','agent_interrupted','agent_failed','model_selected',
+    'mode_changed',
     'todos_replaced','message_committed','status',
     'model_context','model_requested','model_attempt_started','model_failed',
     'model_recovery_scheduled','model_attempt_interrupted','response_completed','usage',
@@ -120,11 +127,38 @@ CREATE TABLE agent_start (
 
 CREATE TABLE agent_capability (
   entry INTEGER NOT NULL,
-  kind TEXT NOT NULL DEFAULT 'agent_started' CHECK (kind = 'agent_started'),
+  kind TEXT NOT NULL CHECK (kind IN ('agent_started','mode_changed')),
   capability TEXT NOT NULL REFERENCES session_capability(capability),
   PRIMARY KEY (entry, capability),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT, WITHOUT ROWID;
+
+-- Mode definitions pinned by the entry that first used them; the session keeps them
+-- whatever the configuration later says.
+CREATE TABLE mode (
+  id INTEGER PRIMARY KEY,
+  entry INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('agent_started','mode_changed')),
+  name TEXT NOT NULL UNIQUE,
+  instructions TEXT,
+  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+) STRICT;
+
+-- What the mode lists, which may exceed the session ceiling; agent_capability rows
+-- hold what an agent was actually granted.
+CREATE TABLE mode_capability (
+  mode INTEGER NOT NULL REFERENCES mode(id),
+  capability TEXT NOT NULL REFERENCES capability(name),
+  PRIMARY KEY (mode, capability)
+) STRICT, WITHOUT ROWID;
+
+-- The root agent's mode as of this entry.
+CREATE TABLE agent_mode (
+  entry INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('agent_started','mode_changed')),
+  mode INTEGER NOT NULL REFERENCES mode(id),
+  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+) STRICT;
 
 CREATE TABLE model_selection (                   -- ModelChanged only
   entry INTEGER PRIMARY KEY,
@@ -561,8 +595,7 @@ CREATE TABLE job_delivery (
 CREATE TABLE approval_grant (
   entry INTEGER PRIMARY KEY,
   kind TEXT NOT NULL DEFAULT 'approval_granted' CHECK (kind = 'approval_granted'),
-  capability TEXT NOT NULL CHECK (capability IN
-    ('read','write','exec','network','targets','ssh_agent','agents','interactive','mcp')),
+  capability TEXT NOT NULL REFERENCES capability(name),
   resource TEXT NOT NULL CHECK (json_valid(resource)),   -- ResourceId wire form
   coverage TEXT NOT NULL CHECK (coverage IN ('exact','descendants')),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
@@ -608,4 +641,6 @@ SELECT
      (SELECT ms.profile FROM model_selection ms JOIN entry x ON x.seq = ms.entry
        JOIN agent a ON a.id = x.agent AND a.parent IS NULL ORDER BY ms.entry DESC LIMIT 1),
      (SELECT s.profile FROM agent_start s JOIN entry x ON x.seq = s.entry
-       JOIN agent a ON a.id = x.agent AND a.parent IS NULL))) AS model;
+       JOIN agent a ON a.id = x.agent AND a.parent IS NULL))) AS model,
+  (SELECT m.name FROM agent_mode am JOIN mode m ON m.id = am.mode JOIN entry x ON x.seq = am.entry
+     JOIN agent a ON a.id = x.agent AND a.parent IS NULL ORDER BY am.entry DESC LIMIT 1) AS mode;

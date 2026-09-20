@@ -989,7 +989,7 @@ mod tests {
                     job: lease.id(),
                     parent: None,
                     scope: None,
-                    capabilities: session.runtime.harness.capabilities.clone(),
+                    capabilities: session.runtime.capabilities.clone(),
                     cancellation: lease.cancellation_token(),
                 };
                 let input = lease.take_input();

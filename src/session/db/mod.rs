@@ -22,7 +22,7 @@ pub use state::SessionSummary;
 pub(super) use state::{interrupted_work, summary};
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 6;
+pub(super) const USER_VERSION: i64 = 7;
 const SCHEMA: &str = include_str!("../schema.sql");
 /// Payload tables outside the append-only ledger: blob writes, output upserts and pruning.
 const MUTABLE_TABLES: [&str; 6] = [
@@ -544,6 +544,19 @@ mod tests {
             .query("PRAGMA foreign_key_check", Vec::new(), |_| Ok(()))
             .unwrap();
         assert!(foreign_keys.is_empty());
+    }
+
+    #[test]
+    fn a_new_database_lists_every_supported_capability() {
+        let fixture = Fixture::new();
+        let query = "SELECT name FROM capability";
+        let mut names = fixture
+            .db
+            .query(query, Vec::new(), |row| Ok(row.get::<String>(0)?));
+        names.as_mut().unwrap().sort();
+        let mut supported = crate::tool::policy::Capability::ALL.map(|c| c.as_str().to_owned());
+        supported.sort();
+        assert_eq!(names.unwrap(), supported);
     }
 
     #[test]

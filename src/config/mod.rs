@@ -10,7 +10,7 @@ use crate::{
     provider::backends::OpenAiApi,
     provider::profile::ModelProfile,
     target::TargetsConfig,
-    tool::policy::{Capability, CapabilitySet},
+    tool::policy::{Capability, CapabilitySet, Mode},
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -36,12 +36,13 @@ pub struct Config {
     /// Approve all tool calls without consulting an interactive policy.
     #[serde(default)]
     pub approve_all: bool,
-    /// Exact policy capabilities. Interaction is supplied separately by the runtime host.
-    #[serde(
-        default = "default_capabilities",
-        deserialize_with = "deserialize_capabilities"
-    )]
-    pub capabilities: Vec<Capability>,
+    /// The mode a new session starts in: `general` or a declared mode.
+    #[serde(default = "default_mode")]
+    pub default_mode: String,
+    /// Named permission presets in declaration order, after the built-in `general`
+    /// unless that name is declared.
+    #[serde(default = "default_modes", deserialize_with = "deserialize_modes")]
+    pub modes: indexmap::IndexMap<String, Mode>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)]
@@ -59,24 +60,31 @@ const fn default_child_depth() -> usize {
     4
 }
 
-fn default_capabilities() -> Vec<Capability> {
-    CapabilitySet::default()
-        .iter()
-        .filter(|capability| *capability != Capability::Interactive)
-        .collect()
+fn default_mode() -> String {
+    "general".to_owned()
 }
 
-fn deserialize_capabilities<'de, D>(deserializer: D) -> Result<Vec<Capability>, D::Error>
+fn deserialize_modes<'de, D>(deserializer: D) -> Result<indexmap::IndexMap<String, Mode>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let capabilities = Vec::<Capability>::deserialize(deserializer)?;
-    if capabilities.contains(&Capability::Interactive) {
-        return Err(serde::de::Error::custom(
-            "interactive is controlled by the runtime host, not the capability allowlist",
-        ));
-    }
-    Ok(capabilities)
+    let mut modes = default_modes();
+    modes.extend(indexmap::IndexMap::<String, Mode>::deserialize(
+        deserializer,
+    )?);
+    Ok(modes)
+}
+
+fn default_modes() -> indexmap::IndexMap<String, Mode> {
+    let capabilities = CapabilitySet::default()
+        .iter()
+        .filter(|capability| *capability != Capability::Interactive)
+        .collect();
+    let general = Mode {
+        capabilities,
+        instructions: None,
+    };
+    [(default_mode(), general)].into()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -134,6 +142,14 @@ impl Config {
         Ok(Self::resolve(workspace, explicit).await?.config)
     }
 
+    /// Every capability some mode grants: the most a session can switch to.
+    pub fn ceiling(&self) -> CapabilitySet {
+        let modes = self.modes.values();
+        modes
+            .flat_map(|mode| mode.capabilities.iter().copied())
+            .collect()
+    }
+
     /// Serialize effective configuration, including defaults and caller overrides.
     pub fn to_toml(&self) -> Result<String, ConfigError> {
         Ok(toml::to_string_pretty(self)?)
@@ -162,6 +178,18 @@ impl Config {
                 .validate_limits()
                 .map_err(|message| ConfigError::Model(name.clone(), message.to_owned()))?;
         }
+        for (name, mode) in &self.modes {
+            if mode
+                .instructions
+                .as_deref()
+                .is_some_and(|text| text.trim().is_empty())
+            {
+                return Err(ConfigError::Mode(
+                    name.clone(),
+                    "instructions are empty".into(),
+                ));
+            }
+        }
         Ok(providers)
     }
 }
@@ -189,6 +217,8 @@ pub enum ConfigError {
     UnknownModelProvider { model: String, provider: String },
     #[error("invalid model profile `{0}`: {1}")]
     Model(String, String),
+    #[error("invalid mode `{0}`: {1}")]
+    Mode(String, String),
 }
 
 impl ConfigError {
@@ -216,7 +246,7 @@ mod tests {
         let config = Config::load(Some(&path)).await.unwrap();
         assert_eq!(config.models.first().unwrap().0, "local");
         assert!(!config.approve_all);
-        assert_eq!(config.capabilities, default_capabilities());
+        assert_eq!(config.modes, default_modes());
         assert!(config.mcp.is_empty());
     }
 
@@ -337,8 +367,11 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_are_exact_and_validate_names() {
+    fn modes_are_exact_ordered_and_validate_names() {
         let parse = |text: &str| toml::from_str::<Config>(text);
+        let mode = |text: &str| parse(&format!("[modes.m]\n{text}"));
+        let general = parse("").unwrap();
+        assert_eq!(general.modes.keys().collect::<Vec<_>>(), ["general"]);
         let expected = [
             Capability::Read,
             Capability::Write,
@@ -347,29 +380,80 @@ mod tests {
             Capability::Agents,
             Capability::Mcp,
         ];
-        assert_eq!(parse("").unwrap().capabilities, expected);
-        assert!(parse("capabilities = []").unwrap().capabilities.is_empty());
-        let exact = parse("capabilities = ['read', 'targets']").unwrap();
-        assert_eq!(exact.capabilities, [Capability::Read, Capability::Targets]);
+        assert_eq!(general.modes["general"].capabilities, expected);
+        assert!(
+            general.ceiling().iter().eq(CapabilitySet::default()
+                .iter()
+                .filter(|c| *c != Capability::Interactive))
+        );
+        // Declared modes follow the built-in one, in declaration order.
+        let declared = parse("[modes.z]\ncapabilities = []\n[modes.a]\ncapabilities = ['read', 'targets']\ninstructions = 'look'").unwrap();
+        assert_eq!(
+            declared.modes.keys().collect::<Vec<_>>(),
+            ["general", "z", "a"]
+        );
+        assert_eq!(declared.modes["general"], general.modes["general"]);
+        // A declaration of that name replaces it.
+        let replaced =
+            parse("[modes.z]\ncapabilities = []\n[modes.general]\ncapabilities = ['targets']")
+                .unwrap();
+        assert_eq!(replaced.modes.keys().collect::<Vec<_>>(), ["general", "z"]);
+        assert_eq!(
+            replaced.modes["general"].capabilities,
+            [Capability::Targets]
+        );
+        assert_eq!(
+            declared.modes["a"].capabilities,
+            [Capability::Read, Capability::Targets]
+        );
+        assert_eq!(declared.modes["a"].instructions.as_deref(), Some("look"));
+        assert!(replaced.ceiling().iter().eq([Capability::Targets]));
+        assert!(
+            mode("")
+                .unwrap_err()
+                .to_string()
+                .contains("missing field `capabilities`")
+        );
         for name in ["unknown", "Mcp", "Interactive", "READ"] {
-            let error = parse(&format!("capabilities = ['{name}']")).unwrap_err();
-            let error = error.to_string();
+            let error = mode(&format!("capabilities = ['{name}']"))
+                .unwrap_err()
+                .to_string();
             assert!(
                 error.contains(name) && error.contains("unknown variant"),
                 "{error}"
             );
         }
-        let all = "'read', 'write', 'exec', 'network', 'targets', 'ssh_agent', 'agents', 'mcp'";
-        let all = parse(&format!("capabilities = [{all}]"))
-            .unwrap()
-            .capabilities;
-        let non_interactive = Capability::ALL.into_iter();
-        let non_interactive = non_interactive.filter(|c| *c != Capability::Interactive);
-        assert!(non_interactive.eq(all));
-        let scalar = parse("capabilities = 'read'").unwrap_err().to_string();
+        let scalar = mode("capabilities = 'read'").unwrap_err().to_string();
         assert!(scalar.contains("expected a sequence"), "{scalar}");
-        let error = parse("capabilities = ['interactive']").unwrap_err();
+        let error = mode("capabilities = ['interactive']").unwrap_err();
         assert!(error.to_string().contains("controlled by the runtime host"));
-        assert!(parse("targets_enabled = true").is_err());
+        assert!(mode("capabilities = []\nextra = 1").is_err());
+        assert!(parse("capabilities = ['read']").is_err());
+    }
+
+    #[test]
+    fn default_mode_and_instructions_are_admitted_with_the_catalog() {
+        const BASE: &str = "[providers.p]\nkind='openai'\napi='chat_completions'\nbase_url='http://127.0.0.1:1/v1'\n[models.m]\nprovider='p'\nmodel='x'\nmax_context=128000\nmax_output=4096\n";
+        let runtime = |top: &str, modes: &str| {
+            toml::from_str::<Config>(&format!("{top}\n{BASE}{modes}"))
+                .unwrap()
+                .into_runtime()
+        };
+        let two = "[modes.first]\ncapabilities = []\n[modes.second]\ncapabilities = ['read']\n";
+        let config = runtime("default_mode = 'second'", two).unwrap();
+        assert_eq!(config.select_mode(None).unwrap(), "second");
+        assert_eq!(config.select_mode(Some("first")).unwrap(), "first");
+        assert!(config.select_mode(Some("missing")).is_err());
+        // `general` stays the default, and declared, until the config says otherwise.
+        for (top, modes) in [("", ""), ("", two), ("modes = {}", "")] {
+            let config = runtime(top, modes).unwrap();
+            assert_eq!(config.select_mode(None).unwrap(), "general");
+        }
+        for (top, modes) in [
+            ("default_mode = 'missing'", two),
+            ("", "[modes.blank]\ncapabilities = []\ninstructions = '  '"),
+        ] {
+            assert!(runtime(top, modes).is_err(), "{top} {modes}");
+        }
     }
 }

@@ -8,6 +8,18 @@ impl SessionRuntime {
         store: SessionStore,
         prior_records: Vec<EventRecord>,
     ) -> Result<Arc<Self>, HarnessError> {
+        // A session never holds more than it started with: its journaled ceiling
+        // narrows the live one for as long as it is open.
+        let started = prior_records.iter().find_map(|record| match &record.event {
+            SessionEvent::SessionStarted { capabilities, .. } => Some(capabilities),
+            _ => None,
+        });
+        let capabilities = match started {
+            Some(started) => &harness.capabilities & &started.iter().copied().collect(),
+            None => harness.capabilities.clone(),
+        };
+        let mut modes = harness.modes.clone();
+        modes.extend(crate::session::pinned_modes(&prior_records));
         let jobs = JobManager::restore(store.clone(), &prior_records).await?;
         let definitions = prior_records
             .iter()
@@ -54,7 +66,8 @@ impl SessionRuntime {
         install_script_tool(&mut builder, Arc::downgrade(&executor_slot))?;
         tools::register(&mut builder, runtime_slot.clone())?;
         builder.extend(&harness.extra_tools)?;
-        let (mcp, startup_warnings) = tools::connect_mcp(&mut builder, &harness, &store).await;
+        let (mcp, startup_warnings) =
+            tools::connect_mcp(&mut builder, &harness, &capabilities, &store).await;
         let executor = ToolExecutor::with_authorization(
             builder.build(),
             authorization,
@@ -94,6 +107,8 @@ impl SessionRuntime {
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             todos: TodoStore::restore(store.clone(), &prior_records),
             harness,
+            capabilities,
+            modes,
             store: store.clone(),
             jobs: jobs.clone(),
             executor,
@@ -165,6 +180,11 @@ impl SessionRuntime {
     ) -> Result<SessionHandle, HarnessError> {
         let root = AgentId::root(self.store.id());
         let model_profile = selection.unwrap_or_else(|| self.harness.default_model_profile.clone());
+        let mode = self.harness.mode.clone();
+        let capabilities = match &mode {
+            Some(mode) => self.mode_capabilities(mode)?,
+            None => self.capabilities.clone(),
+        };
         let root_tx = self
             .spawn_agent(AgentLaunch {
                 id: root.clone(),
@@ -173,6 +193,8 @@ impl SessionRuntime {
                 todos: None,
                 available_depth: self.harness.max_child_depth,
                 location: crate::execution::ExecutionLocation::root(self.harness.workspace.clone()),
+                mode,
+                capabilities,
             })
             .await?;
         Ok(SessionHandle {

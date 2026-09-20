@@ -255,8 +255,8 @@ fn merge(base: &mut toml::Value, overlay: toml::Value, path: &mut Vec<String>) {
     match (base, overlay) {
         (toml::Value::Table(base), toml::Value::Table(overlay)) => {
             for (key, value) in overlay {
-                // A target's omitted fields must never leak in from another layer.
-                if path.as_slice() == ["targets"] {
+                // A target's or mode's omitted fields must never leak in from another layer.
+                if matches!(path.as_slice(), [table] if table == "targets" || table == "modes") {
                     base.insert(key, value);
                 } else if let Some(previous) = base.get_mut(&key) {
                     path.push(key);
@@ -349,7 +349,7 @@ mod tests {
         Some(b"approve_all = true\n[malformed"), // TOML
         Some(b"approve_all = true\nmax_child_depth = 'bad'"), // serde type
         Some(b"approve_all = true\nunrecognized = 1"), // serde unknown field
-        Some(b"approve_all = true\ncapabilities = ['interactive']"),
+        Some(b"approve_all = true\n[modes.bad]\ncapabilities = ['interactive']"),
         Some(b"approve_all = true\n[models.bad]\nprovider = 'local'\nmodel = 'bad'\nmax_context = 10\nmax_output = 10"),
         Some(b"approve_all = true\n[targets.bad]\ntype = 'ssh'\nhost = 'bad host'"),
         Some(b"approve_all = true\n[mcp.bad]\ntransport = 'stdio'\nstart_command = []"),
@@ -493,20 +493,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn named_modes_replace_whole_definition_but_other_names_survive() {
+        let f = Fixture::new();
+        write(
+            &f.xdg,
+            format!(
+                "{MODEL}\n[modes.changed]\ncapabilities = ['read', 'exec']\ninstructions = 'old'\n[modes.retained]\ncapabilities = ['read']\n"
+            ),
+        );
+        write(
+            &f.local,
+            "default_mode = 'retained'\n[modes.changed]\ncapabilities = []\n",
+        );
+        let config = f.resolve().await.unwrap().config;
+        assert_eq!(
+            config.modes.keys().collect::<Vec<_>>(),
+            ["general", "changed", "retained"]
+        );
+        assert_eq!(config.default_mode, "retained");
+        let changed = &config.modes["changed"];
+        assert!(changed.capabilities.is_empty() && changed.instructions.is_none());
+        write(&f.local, "[modes.changed]\ninstructions = 'new'\n");
+        assert!(
+            f.resolve().await.is_err(),
+            "mode must not inherit capabilities"
+        );
+    }
+
+    #[tokio::test]
     async fn arrays_replace_and_defaults_are_applied_only_after_merge() {
         let f = Fixture::new();
         write(
             &f.xdg,
             format!(
-                "capabilities = ['exec']\nmax_child_depth = 8\n{MODEL}\n[mcp.test]\ntransport = 'stdio'\nstart_command = ['old', 'arg']\ncapabilities = ['read']\nstartup_timeout_secs = 77\nenv = {{ A = 'a', B = 'b' }}\n"
+                "max_child_depth = 8\n{MODEL}\n[mcp.test]\ntransport = 'stdio'\nstart_command = ['old', 'arg']\ncapabilities = ['read']\nstartup_timeout_secs = 77\nenv = {{ A = 'a', B = 'b' }}\n"
             ),
         );
         write(
             &f.local,
-            "capabilities = []\n[mcp.test]\nstart_command = ['new']\ncapabilities = []\nenv = { B = 'changed', C = 'c' }\n",
+            "[mcp.test]\nstart_command = ['new']\ncapabilities = []\nenv = { B = 'changed', C = 'c' }\n",
         );
         let resolved = f.resolve().await.unwrap();
-        assert!(resolved.config.capabilities.is_empty());
         assert_eq!(resolved.config.max_child_depth, 8);
         let server = &resolved.config.mcp["test"];
         let raw = crate::mcp::RawMcpServerConfig::from(server.clone());
@@ -523,7 +550,6 @@ mod tests {
         assert_eq!((&*env["A"], &*env["B"], &*env["C"]), ("a", "changed", "c"));
         let round_trip: Config = toml::from_str(&resolved.normalized_toml).unwrap();
         assert_eq!(round_trip.mcp["test"].startup_timeout().as_secs(), 77);
-        assert!(round_trip.capabilities.is_empty());
         assert!(resolved.normalized_toml.contains("call_timeout_secs = 120"));
     }
 
@@ -570,10 +596,10 @@ mod tests {
         assert!(resolved.report.diagnostics.is_empty());
         assert!(resolved.normalized_toml.contains("api_key_env"));
         resolved.config.approve_all = true;
-        resolved.config.capabilities.clear();
+        resolved.config.modes[0].capabilities.clear();
         let config: Config = toml::from_str(&resolved.config.to_toml().unwrap()).unwrap();
         assert!(config.approve_all);
-        assert!(config.capabilities.is_empty());
+        assert!(config.modes[0].capabilities.is_empty());
         assert!(!marker.exists());
     }
 

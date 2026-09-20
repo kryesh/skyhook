@@ -86,7 +86,7 @@ pub(super) mod tests {
     ) -> (Vec<UserContent>, wait::PendingEventBatch) {
         let runtime = &session.runtime;
         let location = crate::execution::ExecutionLocation::root(root.to_path_buf());
-        let capabilities = &runtime.harness.capabilities;
+        let capabilities = &runtime.capabilities;
         let pending = runtime.pending_event_content(session.root_agent(), capabilities, &location);
         pending.await.unwrap()
     }

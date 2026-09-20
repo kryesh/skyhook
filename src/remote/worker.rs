@@ -85,6 +85,7 @@ where
                     owner_job: None,
                     profile: None,
                     available_depth: 0,
+                    mode: None,
                     capabilities: crate::tool::policy::Capability::ALL.to_vec(),
                     location: crate::execution::ExecutionLocation::root(workspace.clone()),
                 },

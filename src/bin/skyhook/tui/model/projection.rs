@@ -104,6 +104,9 @@ pub struct AgentInfo {
     pub id: AgentId,
     pub name: String,
     pub model: String,
+    /// The root agent's applied mode.
+    pub mode: Option<String>,
+    pub capabilities: Vec<skyhook::tool::policy::Capability>,
     pub target: String,
     pub owner: Option<JobId>,
     pub lifecycle: AgentLifecycle,
@@ -241,6 +244,8 @@ impl Projection {
             match &record.event {
                 SessionEvent::AgentStarted {
                     profile,
+                    mode,
+                    capabilities,
                     location,
                     owner_job,
                     ..
@@ -257,6 +262,8 @@ impl Projection {
                             .as_ref()
                             .map(|profile| profile.name.clone())
                             .unwrap_or_default(),
+                        mode: mode.as_ref().map(|mode| mode.name.clone()),
+                        capabilities: capabilities.clone(),
                         target: location.target.clone(),
                         owner: *owner_job,
                         lifecycle: AgentLifecycle::Active,
@@ -333,6 +340,12 @@ impl Projection {
                 SessionEvent::ModelChanged { profile } => {
                     if let Some(agent) = self.agents.iter_mut().find(|a| a.id == record.agent) {
                         agent.model.clone_from(&profile.name);
+                    }
+                }
+                SessionEvent::ModeChanged { mode, capabilities } => {
+                    if let Some(agent) = self.agents.iter_mut().find(|a| a.id == record.agent) {
+                        agent.mode = Some(mode.name.clone());
+                        agent.capabilities.clone_from(capabilities);
                     }
                 }
                 SessionEvent::Usage { request, usage } => {
@@ -572,6 +585,8 @@ mod tests {
             id: AgentId::root(SessionId::from_bytes([1; 16])),
             name: "Failed Waiting for permission".into(),
             model: "test".into(),
+            mode: None,
+            capabilities: Vec::new(),
             target: "root".into(),
             owner: None,
             lifecycle: AgentLifecycle::Active,
@@ -673,6 +688,7 @@ mod tests {
             owner_job,
             profile: None,
             available_depth: 0,
+            mode: None,
             capabilities: Vec::new(),
             location: ExecutionLocation::root("/workspace".into()),
         }
