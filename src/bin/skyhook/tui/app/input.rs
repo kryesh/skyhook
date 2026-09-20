@@ -429,10 +429,10 @@ impl App {
         // Recorded from the resolved count, so a press that stopped nothing leaves
         // no journal entry claiming otherwise. The row follows the interrupt round
         // trip, so input submitted within it can be journaled first.
-        let (id, tx) = (session.id(), self.tx.clone());
+        let tx = self.tx.clone();
         tokio::spawn(async move {
             let count = session.interrupt().await;
-            let _ = tx.send(Work::Interrupted { session: id, count });
+            let _ = tx.send(Work::Interrupted { count });
         });
     }
     pub(super) fn prompt_history(&mut self, forward: bool) {

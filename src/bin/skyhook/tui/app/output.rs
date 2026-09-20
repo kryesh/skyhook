@@ -14,8 +14,7 @@ struct OutputEntry {
     final_output: bool,
 }
 /// A refresh is tied to its job and exact attempt; a selection change clears
-/// the pending attempt and a session change clears the store, so a stale
-/// completion can never match again.
+/// the pending attempt, so a stale completion can never match again.
 #[derive(Clone)]
 pub struct OutputAttempt {
     job: JobId,
@@ -97,10 +96,6 @@ impl OutputStore {
         entry.cached = Some(value);
         changed
     }
-    pub fn clear(&mut self) {
-        self.entries.clear();
-    }
-
     #[cfg(test)]
     pub fn insert_product(&mut self, job: JobId, value: OutputView) {
         self.entries.entry(job).or_default().cached = Some(value);
@@ -160,15 +155,5 @@ mod tests {
         let (failed, _) = store.begin(job()).unwrap();
         assert!(store.complete(failed, true, Err("unavailable".into())));
         assert!(store.is_final(job()));
-    }
-    #[test]
-    fn reset_rejects_outstanding_completion() {
-        let mut store = OutputStore::default();
-        let (old, _) = store.begin(job()).unwrap();
-        store.clear();
-        let (new, _) = store.begin(job()).unwrap();
-        assert!(!store.complete(old, true, value("old")));
-        assert!(store.begin(job()).is_none());
-        assert!(store.complete(new, false, value("new")));
     }
 }

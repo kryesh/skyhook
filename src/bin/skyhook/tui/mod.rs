@@ -2,6 +2,7 @@ mod app;
 mod composer;
 mod editor;
 mod format;
+mod host;
 mod keys;
 mod model;
 mod render;
@@ -10,11 +11,8 @@ mod status;
 mod theme;
 mod tool_view;
 
-use super::{
-    cli::{ExecutionRequest, InitialInput},
-    interaction::UiInteraction,
-};
-use app::{App, PreparedObservation, Work};
+use super::cli::{ExecutionRequest, InitialInput};
+use app::{App, PreparedObservation};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -29,7 +27,6 @@ use crossterm::{
 use futures_util::StreamExt;
 use std::{
     io::{self, IsTerminal, Write},
-    sync::Arc,
     time::Duration,
 };
 use tokio::sync::mpsc;
@@ -78,8 +75,8 @@ pub async fn run(
     let (saved, warning) = state::load(&request.config.workspace);
     let model =
         super::launch::select_model(&config, request.model.as_deref(), saved.model.as_deref())?;
-    let (interaction, mut prompts) = UiInteraction::new();
-    let launch = Launch::from_request(&request.config, model, Some(Arc::new(interaction))).await?;
+    let launch = Launch::from_request(&request.config, model, None).await?;
+    let (launch, prompts) = host::with_prompts(launch);
     let session = match request.resume {
         Some(id) => Some(launch.create(Some(id)).await?),
         None => None,
@@ -88,8 +85,8 @@ pub async fn run(
         Some(session) => Some(PreparedObservation::subscribe(session).await),
         None => None,
     };
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut app = App::new(observation, launch, saved, tx.clone());
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut app = App::new(observation, launch, saved, tx);
     if let Some(warning) = warning {
         app.notice(warning);
     }
@@ -118,94 +115,43 @@ pub async fn run(
         Some(InitialInput::Prompt { text, images }) => app.start_prompt(text, images).await,
         None => {}
     }
+    let mut host = host::Host::new(app, rx, prompts);
     let result: io::Result<()> = async {
-        loop {
-            let mut immediate = false;
-            tokio::select! {
-                event = input.next() => match event {
-                    Some(Ok(event)) => {
-                        immediate = !matches!(&event, crossterm::event::Event::Mouse(mouse) if matches!(mouse.kind, crossterm::event::MouseEventKind::Moved | crossterm::event::MouseEventKind::Drag(_) | crossterm::event::MouseEventKind::ScrollUp | crossterm::event::MouseEventKind::ScrollDown | crossterm::event::MouseEventKind::ScrollLeft | crossterm::event::MouseEventKind::ScrollRight));
-                        app.event(event);
-                    },
-                    Some(Err(error)) => return Err(error),
-                    None => break,
-                },
-                event = app.recv_observation() => match event {
-                    Ok(event) => {
-                        let mut records = app.observe(event);
-                        // Reduce a burst once instead of rebuilding the projection per token.
-                        for _ in 0..255 {
-                            match app.try_recv_observation() {
-                                Ok(event) => records |= app.observe(event),
-                                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
-                                    app.resubscribe().await;
-                                    break;
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        if records { app.projection.rebuild(&app.snapshot); }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        app.resubscribe().await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => app.close_observation(),
-                },
-                Some(prompt) = prompts.recv() => app.prompt(prompt),
-                Some(work) = rx.recv() => {
-                    match work {
-                        Work::SessionReady { result: Ok(session) } => {
-                            app.session_ready(session, false).await;
-                        }
-                        Work::Started { result: Ok(session) } => {
-                            app.session_ready(Some(session), true).await;
-                        }
-                        work => app.work(work),
-                    }
-                }
-                _ = ticks.tick() => app.tick(),
-                _ = tokio::time::sleep_until(last_draw + frame_interval), if app.dirty => {},
-                _ = terminate.recv() => app.shutdown(),
-                _ = hangup.recv() => app.shutdown(),
-                _ = interrupt.recv() => app.shutdown(),
-            }
-            if app.dirty && (immediate || last_draw.elapsed() >= frame_interval) {
+        while host.settle() {
+            let app = host.app();
+            if app.dirty && last_draw.elapsed() >= frame_interval {
                 last_draw = tokio::time::Instant::now();
-                draw_terminal(&mut terminal, &mut app)?;
+                draw_terminal(&mut terminal, app)?;
                 app.dirty = false;
             }
             if let Some(text) = app.clipboard.take() {
                 copy_terminal(&text)?;
             }
-            if app.exit {
-                break;
+            let dirty = app.dirty;
+            tokio::select! {
+                event = input.next() => match event {
+                    Some(Ok(event)) => {
+                        // Clicks and typing paint at once; continuous mouse bursts coalesce.
+                        if !matches!(&event, crossterm::event::Event::Mouse(mouse) if matches!(mouse.kind, crossterm::event::MouseEventKind::Moved | crossterm::event::MouseEventKind::Drag(_) | crossterm::event::MouseEventKind::ScrollUp | crossterm::event::MouseEventKind::ScrollDown | crossterm::event::MouseEventKind::ScrollLeft | crossterm::event::MouseEventKind::ScrollRight)) {
+                            last_draw = tokio::time::Instant::now() - frame_interval;
+                        }
+                        host.app().event(event);
+                    },
+                    Some(Err(error)) => return Err(error),
+                    None => break,
+                },
+                event = host.next() => host.handle(event).await,
+                _ = ticks.tick() => host.tick(),
+                _ = tokio::time::sleep_until(last_draw + frame_interval), if dirty => {},
+                _ = terminate.recv() => host.quit(),
+                _ = hangup.recv() => host.quit(),
+                _ = interrupt.recv() => host.quit(),
             }
         }
         Ok(())
     }
     .await;
-    // Terminal EOF/errors can leave a creation or switch result queued. Closing
-    // first also makes later results shut their handles down in the worker.
-    rx.close();
-    while let Ok(work) = rx.try_recv() {
-        match work {
-            Work::Started {
-                result: Ok(session),
-                ..
-            }
-            | Work::SessionReady {
-                result: Ok(Some(session)),
-                ..
-            } => {
-                let _ = session.shutdown().await;
-            }
-            _ => {}
-        }
-    }
-    app.status.flush().await;
-    if let Some(session) = app.session() {
-        session.shutdown().await?;
-    }
+    host.close().await?;
     result?;
     Ok(())
 }

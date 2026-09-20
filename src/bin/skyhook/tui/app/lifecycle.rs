@@ -30,9 +30,8 @@ impl StartState {
 }
 
 impl App {
-    /// Invariant: at most one creation or switch is in flight. Every caller is
-    /// gated by `busy()`/`start.is_creating()`/`switching`, and `switch` defers
-    /// behind a creation, so a `Started` completion is always the current one.
+    /// Invariant: at most one creation is in flight. Every caller is gated by
+    /// `busy()`/`start.is_creating()`, so a `Started` completion is the current one.
     pub(super) fn begin_session(&mut self, action: PendingStart) {
         if matches!(self.start, StartState::RetryScript(_)) {
             self.notice("Cancelled the pending script in favor of the new action");
@@ -82,11 +81,6 @@ impl App {
             self.finish_shutdown();
             return;
         }
-        if let Some(id) = self.deferred_switch.take() {
-            self.park_action(pending);
-            self.switch(id);
-            return;
-        }
         if self.paused {
             self.park_action(pending);
             return;
@@ -119,8 +113,6 @@ impl App {
         self.notice(error);
         if self.stopping {
             self.finish_shutdown();
-        } else if let Some(id) = self.deferred_switch.take() {
-            self.switch(id);
         }
     }
     /// Submit the command-line prompt. When an image cannot be read, keep the
@@ -169,10 +161,7 @@ impl App {
                 Ok(())
             }
             .await;
-            let _ = tx.send(Work::Done {
-                session: session.id(),
-                result,
-            });
+            let _ = tx.send(Work::Done { result });
         });
     }
     pub fn shutdown(&mut self) {
@@ -181,8 +170,8 @@ impl App {
         }
         self.pause_queue();
         self.stopping = true;
-        // Creation/switch tasks own handles which must arrive before teardown.
-        if !self.start.is_creating() && self.switching.is_none() {
+        // A creation task owns a handle which must arrive before teardown.
+        if !self.start.is_creating() {
             self.finish_shutdown();
         }
         self.dirty = true;
@@ -343,31 +332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn script_creation_and_new_wait_for_inflight_creation() {
-        let (_root, mut app) = draft_fixture().await;
-        let mut rx = capture_work(&mut app);
-        app.start_script(PathBuf::from("explicit.js"));
-        assert!(app.start.is_creating());
-        app.switch(None);
-        let session = started(&mut rx).await;
-        app.session_started(PreparedObservation::subscribe(session).await);
-        let work = next_lifecycle(&mut rx).await;
-        let reset = matches!(
-            work,
-            Work::SessionReady {
-                result: Ok(None),
-                ..
-            }
-        );
-        assert!(reset, "new waits for and shuts down the created handle");
-        app.set_session(None);
-        assert!(app.session().is_none() && !app.operation);
-        assert!(matches!(app.start, StartState::Idle));
-        assert_eq!(std::fs::read_dir(&app.launch.sessions).unwrap().count(), 1);
-    }
-
-    #[tokio::test]
-    async fn shutdown_waits_for_failed_creation_and_for_new_session_reset() {
+    async fn shutdown_waits_for_failed_creation() {
         let (_root, mut app) = draft_fixture().await;
         let mut rx = capture_work(&mut app);
         block_sessions(&app);
@@ -377,23 +342,5 @@ mod tests {
         fail_creation(&mut app, &mut rx).await;
         app.work(next_lifecycle(&mut rx).await);
         assert!(app.exit && app.launch.sessions.is_file());
-
-        let (_root, mut app) = fixture().await;
-        let mut rx = capture_work(&mut app);
-        app.switch(None);
-        app.shutdown();
-        assert!(!app.exit);
-        let work = next_lifecycle(&mut rx).await;
-        let reset = matches!(
-            work,
-            Work::SessionReady {
-                result: Ok(None),
-                ..
-            }
-        );
-        assert!(reset, "shutdown waits for the reset task");
-        app.set_session(None);
-        app.work(next_lifecycle(&mut rx).await);
-        assert!(app.exit);
     }
 }

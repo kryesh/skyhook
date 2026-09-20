@@ -12,14 +12,12 @@ async fn load_output(session: &SessionHandle, query: JobOutputQuery) -> Result<O
 
 pub enum Work {
     QueueCommitted {
-        session: SessionId,
         id: QueuedInputId,
         generation: u64,
         revision: u64,
         result: Result<(), skyhook::agent::HarnessError>,
     },
     Done {
-        session: SessionId,
         result: Result<(), String>,
     },
     Output {
@@ -34,9 +32,6 @@ pub enum Work {
         at: Option<usize>,
         result: Result<Attachment, String>,
     },
-    SessionReady {
-        result: Result<Option<SessionHandle>, String>,
-    },
     Started {
         result: Result<SessionHandle, String>,
     },
@@ -46,7 +41,6 @@ pub enum Work {
         message: String,
     },
     Interrupted {
-        session: SessionId,
         count: usize,
     },
     Stopped,
@@ -61,6 +55,7 @@ pub enum Hit {
     Composer,
     Attachments,
     Attention,
+    Sessions,
     Queue,
     PromptChoice(usize),
     Latest,
@@ -70,16 +65,12 @@ impl App {
         match work {
             Work::Started { result: Err(error) } => self.start_failed(error),
             Work::QueueCommitted {
-                session,
                 id,
                 generation,
                 revision,
                 result,
-            } => {
-                let current = Some(session) == self.session_id();
-                self.queue_committed(current, id, generation, revision, result);
-            }
-            Work::Interrupted { session, count } if Some(session) == self.session_id() => {
+            } => self.queue_committed(id, generation, revision, result),
+            Work::Interrupted { count } => {
                 if count > 0 {
                     // Journal the status only for an interruption that happened.
                     self.root_notifier().send("Interrupted");
@@ -88,7 +79,7 @@ impl App {
                     self.toast("Nothing to interrupt");
                 }
             }
-            Work::Done { session, result } if Some(session) == self.session_id() => {
+            Work::Done { result } => {
                 self.operation = false;
                 self.initial_input = None;
                 if let Err(error) = result {
@@ -132,15 +123,6 @@ impl App {
                         self.editor.attach(attachment);
                     }
                     Err(error) => self.notice(error),
-                }
-            }
-            Work::SessionReady { result: Err(error) } => {
-                if let Some(restore_paused) = self.switching.take() {
-                    self.paused = restore_paused;
-                }
-                self.notice(error);
-                if self.stopping {
-                    self.finish_shutdown();
                 }
             }
             Work::StatusFailed {
@@ -397,6 +379,7 @@ impl App {
                                 Hit::Composer => self.focus = Focus::Composer,
                                 Hit::Attachments => self.command(Command::Attachments),
                                 Hit::Attention => self.activate_prompt(),
+                                Hit::Sessions => self.command(Command::Sessions),
                                 Hit::Queue => self.command(Command::Queue),
                                 Hit::PromptChoice(index) => {
                                     // A cancellation can arrive before stale hit geometry is redrawn.
@@ -541,7 +524,7 @@ mod tests {
         let (_root, mut app) = draft_fixture().await;
         app.launch.approve_all = true;
         let session = app.launch.create(None).await.unwrap();
-        app.set_session(Some(PreparedObservation::subscribe(session.clone()).await));
+        attach(&mut app, session.clone()).await;
         let launched = session.run_script(format!("return await tool.shell({});", json!({
             "command": "printf 'live stdout\\n'; printf 'live stderr\\n' >&2; while [ ! -e release ]; do sleep 0.01; done; exit 1",
             "timeout": 10,
@@ -613,7 +596,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attachment_reads_do_not_leak_into_the_next_submission_or_session() {
+    async fn attachment_reads_do_not_leak_into_the_next_submission() {
         let (_root, mut app) = draft_fixture().await;
         let text = Attachment::Text {
             file: Some(PathBuf::from("fixture.txt")),
@@ -641,9 +624,6 @@ mod tests {
             app.work(attachment(app.draft_ticket.clone()));
             assert_eq!(app.editor.attachments().len(), 1);
         };
-        stale_then_current(&mut app, draft);
-        let draft = app.draft_ticket.clone();
-        app.set_session(None);
         stale_then_current(&mut app, draft);
 
         // Tickets follow draft replacement.

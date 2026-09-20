@@ -10,6 +10,9 @@ fn leader_hints(app: &App) -> Vec<(Command, &'static str)> {
     if !app.prompts.is_empty() {
         hints.push((Command::Attention, "Questions"));
     }
+    if background_attention(app) > 0 {
+        hints.push((Command::Sessions, "Sessions"));
+    }
     hints.extend([
         (Command::Model, "Model"),
         (Command::Agents, "Inspect agent"),
@@ -28,6 +31,12 @@ fn leader_hints(app: &App) -> Vec<(Command, &'static str)> {
         hints.push((Command::Retry, "Continue"));
     }
     hints
+}
+
+/// Other open sessions waiting on the user.
+fn background_attention(app: &App) -> usize {
+    let others = app.peers.iter().filter(|peer| !peer.current);
+    others.filter(|peer| peer.attention).count()
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -76,8 +85,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (editor_lines.len() as u16 + 2 + u16::from(!app.editor.attachments().is_empty()))
             .clamp(3, 7)
             .min(height.saturating_sub(footer_height + 3).max(3));
+    let waiting = background_attention(app);
     let notice_height = u16::from(
         !app.queue.is_empty()
+            || waiting > 0
             || (!app.prompts.is_empty() && !prompt_active)
             || app.leader.is_some()
             || app.toast.is_some(),
@@ -214,7 +225,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         text(
             frame,
             r(3, 4, content_width.saturating_sub(6), 1),
-            "Start a conversation, or /sessions to resume one.",
+            "Start a conversation, or /sessions to open one.",
             p.muted,
             p.base,
         );
@@ -397,6 +408,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 None => "Reopen questions and permissions in the command palette".to_owned(),
             };
             format!("{} pending request(s) · {hint}", app.prompts.len())
+        } else if waiting > 0 {
+            let hint = app
+                .keys
+                .binding(Command::Sessions)
+                .unwrap_or("/sessions".into());
+            format!("{waiting} other session(s) need attention · {hint}")
         } else if !app.queue.is_empty() {
             format!(
                 "{} follow-up(s) queued{} · /queue",
@@ -413,6 +430,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 rect,
                 if !app.prompts.is_empty() && !prompt_active {
                     Hit::Attention
+                } else if waiting > 0 {
+                    Hit::Sessions
                 } else {
                     Hit::Queue
                 },

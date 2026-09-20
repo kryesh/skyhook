@@ -39,7 +39,8 @@ macro_rules! commands {
 commands! {
     // Canonical ID, label, default shortcut, aliases, palette visibility.
     New => ("new", "New session", "ctrl+x n", &[], true),
-    Sessions => ("sessions", "Resume session", "ctrl+x l", &[], true),
+    Sessions => ("sessions", "Switch session", "ctrl+x s", &["switch"], true),
+    Close => ("close", "Close session", "ctrl+x w", &[], true),
     Model => ("model", "Model", "ctrl+x m", &["models"], true),
     Agents => ("agents", "Inspect agent", "ctrl+x a", &[], true),
     Inspect => ("inspect", "Focus conversation", "", &[], false),

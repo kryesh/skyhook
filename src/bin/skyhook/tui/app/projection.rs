@@ -11,7 +11,7 @@ impl App {
         self.notifier().send(message);
     }
     /// Transient UI feedback; never sent to the status log or conversation.
-    pub(super) fn toast(&mut self, message: impl Into<String>) {
+    pub fn toast(&mut self, message: impl Into<String>) {
         self.toast = Some((message.into(), Instant::now()));
         self.dirty = true;
     }
@@ -107,8 +107,7 @@ impl App {
     }
 
     pub fn busy(&self) -> bool {
-        self.switching.is_some()
-            || self.start.is_creating()
+        self.start.is_creating()
             || self.stopping
             || self.operation
             || self.snapshot.revision < self.queue_activity_revision

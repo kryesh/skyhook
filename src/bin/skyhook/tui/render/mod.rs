@@ -32,7 +32,7 @@ use sidebar::*;
 use wrapping::*;
 
 use super::{
-    app::{App, Focus, Hit, MenuKind},
+    app::{App, Focus, Hit, MenuKind, SessionRef},
     model::{self, Surface, Tab},
 };
 use ratatui::{

@@ -75,21 +75,8 @@ impl App {
         self.reset_projection();
     }
 
-    /// All successful async creation/switch completions cross this gate. At
-    /// most one creation or switch is in flight (see `begin_session`/`switch`),
-    /// so every completion that arrives is the current one.
-    pub async fn session_ready(&mut self, session: Option<SessionHandle>, started: bool) {
-        let prepared = match session {
-            Some(session) => Some(PreparedObservation::subscribe(session).await),
-            None => None,
-        };
-        if started {
-            if let Some(prepared) = prepared {
-                self.session_started(prepared);
-            }
-        } else {
-            self.set_session(prepared);
-        }
+    pub async fn session_ready(&mut self, session: SessionHandle) {
+        self.session_started(PreparedObservation::subscribe(session).await);
     }
 }
 

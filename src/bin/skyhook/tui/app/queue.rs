@@ -53,9 +53,7 @@ pub(super) async fn queue_dispatcher(
                         pending.push(async move {
                             let result = receipt.await.unwrap_or(Err(HarnessError::AgentStopped));
                             let revision = session.observe().await.snapshot.revision;
-                            Work::QueueCommitted {
-                                session: session.id(), id, generation, revision, result,
-                            }
+                            Work::QueueCommitted { id, generation, revision, result }
                         });
                     }
                 }
@@ -136,7 +134,6 @@ impl App {
                 )
                 .await;
             let _ = tx.send(Work::Done {
-                session: session.id(),
                 result: result.map(|_| ()).map_err(|e| e.to_string()),
             });
         });
@@ -176,14 +173,10 @@ impl App {
             }
         }
     }
-    /// Stop dispatch, withdraw what can still be withdrawn, and keep a pending
-    /// switch from restoring an unpaused queue.
+    /// Stop dispatch and withdraw what can still be withdrawn.
     pub(super) fn pause_queue(&mut self) {
         self.paused = true;
         self.cancel_queue_delivery();
-        if let Some(restore_paused) = &mut self.switching {
-            *restore_paused = true;
-        }
     }
 
     pub(super) fn deliver_queue(&mut self) {
@@ -193,12 +186,7 @@ impl App {
                 break;
             }
         }
-        if self.start.is_creating()
-            || self.stopping
-            || self.switching.is_some()
-            || self.paused
-            || self.queue.is_empty()
-        {
+        if self.start.is_creating() || self.stopping || self.paused || self.queue.is_empty() {
             return;
         }
         let Some(session) = self.session().cloned() else {
@@ -250,11 +238,8 @@ impl App {
             self.notice("Could not deliver queued messages; resume to retry");
         }
     }
-    /// `current` is false for a receipt from the session this app switched
-    /// away from: its row could not be withdrawn, so it waited for this.
     pub(super) fn queue_committed(
         &mut self,
-        current: bool,
         id: QueuedInputId,
         generation: u64,
         revision: u64,
@@ -268,11 +253,8 @@ impl App {
         match result {
             Ok(()) => {
                 let input = self.queue.remove(index).unwrap();
-                // A row the previous session committed is that session's history.
-                if current {
-                    self.queue_activity_revision = self.queue_activity_revision.max(revision);
-                    self.commit_row(&input);
-                }
+                self.queue_activity_revision = self.queue_activity_revision.max(revision);
+                self.commit_row(&input);
             }
             Err(error) => {
                 let unknown = matches!(
@@ -408,7 +390,6 @@ mod tests {
 
     fn receipt(app: &mut App, row: &QueueDelivery, result: Result<(), HarnessError>) {
         app.work(Work::QueueCommitted {
-            session: app.session_id().unwrap(),
             id: row.id,
             generation: row.generation,
             revision: app.snapshot.revision + 1,
@@ -558,43 +539,6 @@ mod tests {
         assert!(app.queue.is_empty());
         assert_eq!(app.history, ["first"]);
         app.session().unwrap().shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn switching_sessions_keeps_every_row_until_its_receipt_arrives() {
-        let (_root, mut app) = fixture().await;
-        let mut rx = capture_work(&mut app);
-        app.status = crate::tui::status::StatusLog::new(app.tx.clone());
-        app.operation = true;
-        app.submit("committed".into());
-        app.submit(image_row());
-        // Both rows are claimed, but neither receipt is seen before the switch.
-        let receipts = [recv(&mut rx).await, recv(&mut rx).await];
-        app.submit("unsent".into());
-        app.switch(None);
-        let ready = next_lifecycle(&mut rx).await;
-        assert!(matches!(ready, Work::SessionReady { result: Ok(None) }));
-        app.set_session(None);
-        assert!(app.paused);
-        let in_flight = app.queue.iter().map(|input| input.in_flight.is_some());
-        assert_eq!(in_flight.collect::<Vec<_>>(), [true, true, false]);
-
-        receipts.into_iter().for_each(|receipt| app.work(receipt));
-        // The old session's commit is not this session's history; its failure is retained.
-        assert!(app.history.is_empty() && app.paused);
-        let queued = app.queue.iter();
-        let queued =
-            queued.map(|input| (input.submission.text.as_str(), input.in_flight.is_some()));
-        assert_eq!(
-            queued.collect::<Vec<_>>(),
-            [("image", false), ("unsent", false)]
-        );
-        let notices = notices(&app, &mut rx).await;
-        assert!(
-            notices
-                .iter()
-                .any(|notice| notice.contains("was not submitted"))
-        );
     }
 
     #[tokio::test]

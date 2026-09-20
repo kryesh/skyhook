@@ -10,7 +10,12 @@ Use `--resume SESSION_ID` to reopen a session. The CLI stores session logs and l
 saved sessions only in `<workspace>/.skyhook/sessions`, where `--workspace` selects the workspace
 (default: the current directory). It does not search parent or sibling workspaces, and ignores
 the library-only `session_root` override.
-The terminal's `/new` and session picker manage drafts and saved sessions; model selection
+The terminal keeps several sessions open at once. `/new` opens a draft beside the current
+session, and `/sessions` lists open sessions, marked with their live status, above the
+workspace's saved ones: choosing an open session switches to it, choosing a saved one opens it
+alongside. Sessions you switch away from keep working, and the notice line reports when one of
+them has a pending question or permission request or has failed. `/close` shuts down the
+current session only; quitting shuts down all of them. Model selection
 and UI state are described in the [terminal guide](terminal-interface.md#model-selection-and-ui-state).
 
 Unacknowledged background questions/completions wake their owner for another turn. Child completion

@@ -1,7 +1,7 @@
 pub use events::{Hit, Work};
 use input::InputTarget;
 use lifecycle::{PendingStart, StartState};
-pub use menus::{ConfirmAction, Item, ItemRef, Menu, MenuId, MenuKind};
+pub use menus::{ConfirmAction, Item, ItemRef, Menu, MenuId, MenuKind, SessionRef};
 use prompts::UiPrompt;
 use queue::QueueDelivery;
 pub use queue::{QueuedInput, QueuedInputId};
@@ -19,6 +19,7 @@ pub use output::OutputStore;
 mod prompts;
 mod queue;
 mod session;
+pub use session::{HostRequest, Peer};
 
 use super::{
     Launch,
@@ -88,7 +89,7 @@ fn draft_root() -> AgentId {
 }
 
 /// Pointer identity of one local asynchronous attempt: a composer draft's
-/// attachment reads, a session creation/switch, or an output refresh. Fresh on
+/// attachment reads or an output refresh. Fresh on
 /// `default()`, equal only to its clones, and never reconstructible from a
 /// later request with identical content.
 #[derive(Clone, Default)]
@@ -127,11 +128,8 @@ pub struct App {
     queue_activity_revision: u64,
     /// `Some((root, sequence))` while a root submission blocks queue dispatch.
     initial_input: Option<(AgentId, u64)>,
-    /// `Some(paused before the switch)` while a session switch is in flight.
-    switching: Option<bool>,
     start: StartState,
     attached_draft: Option<AgentId>,
-    deferred_switch: Option<Option<SessionId>>,
     pub paused: bool,
     pub operation: bool,
     pub prompts: VecDeque<UiPrompt>,
@@ -141,6 +139,10 @@ pub struct App {
     pub prompt_body_rows: usize,
     pub prompt_option_rows: usize,
     pub menu: Option<Menu>,
+    /// Taken by the host after each event.
+    pub host: Option<HostRequest>,
+    /// Every open session, this one included; kept current by the host.
+    pub peers: Vec<Peer>,
     next_menu_id: MenuId,
     // Pending attachment reads belong to one composer draft, not the next submission/session.
     // Local edits, clear, and composer-only history navigation preserve it.
@@ -211,12 +213,6 @@ impl App {
         self.history_browse = None;
     }
 
-    fn reset_session_draft(&mut self) {
-        self.advance_draft();
-        self.editor = Composer::default();
-        self.history_browse = None;
-    }
-
     pub fn new(
         observation: Option<PreparedObservation>,
         launch: Launch,
@@ -248,10 +244,8 @@ impl App {
             queue_sender: None,
             queue_activity_revision: 0,
             initial_input: None,
-            switching: None,
             start: StartState::Idle,
             attached_draft: None,
-            deferred_switch: None,
             paused: false,
             operation: false,
             prompts: VecDeque::new(),
@@ -261,6 +255,8 @@ impl App {
             prompt_body_rows: 0,
             prompt_option_rows: 0,
             menu: None,
+            host: None,
+            peers: Vec::new(),
             next_menu_id: MenuId::default(),
             draft_ticket: Token::default(),
             status: super::status::StatusLog::new(tx.clone()),
@@ -311,7 +307,7 @@ pub(super) mod tests {
     use skyhook::remote::EmbeddedShimCatalog;
     use std::sync::Arc;
     pub(super) use tokio::sync::oneshot;
-    pub(super) async fn draft_fixture() -> (tempfile::TempDir, App) {
+    pub(in super::super) async fn draft_fixture() -> (tempfile::TempDir, App) {
         let root = tempfile::tempdir().unwrap();
         let config: skyhook::config::Config = toml::from_str("[providers.test]\nkind='openai'\napi='chat_completions'\nbase_url='http://127.0.0.1:1'\n[models.first]\nprovider='test'\nmodel='fixture'\nmax_context=128000\nmax_output=4096\n").unwrap();
         let (interaction, _) = UiInteraction::new();
@@ -336,8 +332,13 @@ pub(super) mod tests {
     pub(in super::super) async fn fixture() -> (tempfile::TempDir, App) {
         let (root, mut app) = draft_fixture().await;
         let session = app.launch.create(None).await.unwrap();
-        app.set_session(Some(PreparedObservation::subscribe(session).await));
+        attach(&mut app, session).await;
         (root, app)
+    }
+    /// Replace a draft fixture with one opened on `session`.
+    pub(super) async fn attach(app: &mut App, session: SessionHandle) {
+        let observation = PreparedObservation::subscribe(session).await;
+        *app = app.sibling(Some(observation), app.launch.clone(), app.tx.clone());
     }
     /// A deterministic terminal failure, unlike a refused connection, which is
     /// transient and now retries until cancellation.
@@ -376,7 +377,7 @@ pub(super) mod tests {
             .await
             .unwrap();
         let session = harness.new_session().await.unwrap();
-        app.set_session(Some(PreparedObservation::subscribe(session).await));
+        attach(&mut app, session).await;
         (root, app)
     }
     /// An image attachment whose bytes are a minimal PNG signature.
@@ -395,10 +396,7 @@ pub(super) mod tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let work = rx.recv().await.expect("work channel open");
-                if matches!(
-                    work,
-                    Work::Started { .. } | Work::SessionReady { .. } | Work::Stopped
-                ) {
+                if matches!(work, Work::Started { .. } | Work::Stopped) {
                     return work;
                 }
             }
@@ -453,7 +451,7 @@ pub(super) mod tests {
             .unwrap();
         terminal.backend().buffer().clone()
     }
-    pub(super) fn draw(app: &mut App) -> String {
+    pub(in super::super) fn draw(app: &mut App) -> String {
         draw_buffer(app)
             .content
             .chunks(60)
@@ -580,16 +578,12 @@ pub(super) mod tests {
         draft.session_started(PreparedObservation::subscribe(session.clone()).await);
         assert_startup_warnings_ui_only(&mut draft).await;
         session.shutdown().await.unwrap();
-        drop((initial, session));
+        let mut resumed = draft.sibling(None, draft.launch.clone(), draft.tx.clone());
+        drop((initial, draft, session));
 
-        draft.set_session(None);
-        draft.rebuild_content();
-        assert!(draft.unsaved_status.is_empty());
-        let mut entries = draft.entries().iter();
-        assert!(!entries.any(|entry| entry.text().starts_with("Status · Startup warning:")));
-        let resumed = reopen(&draft, id).await;
-        draft.set_session(Some(PreparedObservation::subscribe(resumed).await));
-        assert_startup_warnings_ui_only(&mut draft).await;
-        draft.session().unwrap().shutdown().await.unwrap();
+        let session = reopen(&resumed, id).await;
+        attach(&mut resumed, session).await;
+        assert_startup_warnings_ui_only(&mut resumed).await;
+        resumed.session().unwrap().shutdown().await.unwrap();
     }
 }

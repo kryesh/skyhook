@@ -10,7 +10,7 @@ pub struct MenuId(u64);
 // the menu it was loaded for (and, for output, its job) and only fills that
 // menu while it is still the open one of the same kind.
 pub enum MenuLoaded {
-    Sessions(MenuId, Result<Vec<Item<SessionId>>, String>),
+    Sessions(MenuId, Result<Vec<Item<SessionRef>>, String>),
     Files(MenuId, Result<Vec<Item<PathBuf>>, String>),
     Output(MenuId, JobId, Result<Vec<Item<OutputAction>>, String>),
 }
@@ -24,9 +24,14 @@ pub enum DraftItem {
 #[derive(Clone)]
 pub enum ConfirmAction {
     Exit,
-    NewSession,
-    SwitchSession(SessionId),
+    CloseSession,
     CancelJob(JobId),
+}
+/// A switch-session row: an open session by host key, or one saved on disk.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SessionRef {
+    Live(u64),
+    Saved(SessionId),
 }
 #[derive(Clone)]
 pub struct Item<T> {
@@ -56,7 +61,7 @@ pub enum MenuKind {
     Commands(Vec<Item<Command>>),
     Models(Vec<Item<String>>),
     Agents(Vec<Item<AgentId>>),
-    Sessions(Vec<Item<SessionId>>),
+    Sessions(Vec<Item<SessionRef>>),
     /// Workspace files, plus the composer offset just after the `@` that opened
     /// the picker. A chosen file replaces that `@`; cancelling keeps it.
     Files(Vec<Item<PathBuf>>, Option<usize>),
@@ -165,7 +170,7 @@ impl Menu {
             })
             .collect();
         if let Some(commands) = commands {
-            // An advertised /resume must select that action, not Resume session.
+            // A typed command id selects that command ahead of label matches.
             items.sort_by_key(|item| commands[item.index].value.id() != query);
         }
         items
@@ -175,7 +180,35 @@ impl Menu {
     }
 }
 
-async fn load_sessions(root: PathBuf) -> Result<Vec<Item<SessionId>>, String> {
+/// Open sessions first, in host order, then the rest of the workspace's history.
+async fn load_sessions(root: PathBuf, peers: Vec<Peer>) -> Result<Vec<Item<SessionRef>>, String> {
+    let mut saved = load_saved(root).await?;
+    let mut items: Vec<_> = peers
+        .iter()
+        .map(|peer| {
+            let item = peer
+                .session
+                .and_then(|id| saved.iter().position(|item| item.value == id))
+                .map(|index| saved.remove(index));
+            let (label, mut detail) = match (item, peer.session) {
+                (Some(item), _) => (item.label, item.detail),
+                (None, Some(id)) => (id.to_string(), String::new()),
+                (None, None) => ("New session".to_owned(), "draft".to_owned()),
+            };
+            if peer.current {
+                detail = format!("current · {detail}");
+            }
+            Item::new(SessionRef::Live(peer.key), label, detail)
+        })
+        .collect();
+    items.extend(
+        saved
+            .into_iter()
+            .map(|item| Item::new(SessionRef::Saved(item.value), item.label, item.detail)),
+    );
+    Ok(items)
+}
+async fn load_saved(root: PathBuf) -> Result<Vec<Item<SessionId>>, String> {
     let mut entries = match tokio::fs::read_dir(&root).await {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
@@ -398,7 +431,7 @@ impl App {
                 self.notice("Queued input resumed");
             }
             Command::Retry => {
-                if self.start.is_creating() || self.stopping || self.switching.is_some()
+                if self.start.is_creating() || self.stopping
                     || !self.snapshot.activity.values().any(|activity|
                         matches!(activity, AgentActivity::Failed(_) | AgentActivity::Interrupted))
                 {
@@ -454,7 +487,7 @@ impl App {
                         Err(error) => Err(error.to_string()),
                     };
                     if owns_operation {
-                        let _ = tx.send(Work::Done { session: session.id(), result });
+                        let _ = tx.send(Work::Done { result });
                     } else if let Err(error) = result {
                         notices.send(error);
                     }
@@ -479,13 +512,18 @@ impl App {
                 }));
                 self.open("Attachments · Enter inspect · Delete remove", MenuKind::Attachments(items));
             }
-            Command::New => {
-                if self.active_work() { self.confirm(ConfirmAction::NewSession); }
-                else { self.switch(None); }
+            Command::New => self.host = Some(HostRequest::New),
+            Command::Close => {
+                if self.stopping { return; }
+                if self.active_work() { self.confirm(ConfirmAction::CloseSession); }
+                else { self.shutdown(); }
             }
             Command::Exit => {
-                if self.active_work() { self.confirm(ConfirmAction::Exit); }
-                else { self.shutdown(); }
+                if self.active_work() || self.peers.iter().any(|peer| peer.working) {
+                    self.confirm(ConfirmAction::Exit);
+                } else {
+                    self.host = Some(HostRequest::Quit);
+                }
             }
             Command::Child => {
                 if let Some(agent) = self.projection.agents.iter().find(|agent| {
@@ -499,11 +537,12 @@ impl App {
             }
             Command::Sessions => {
                 let root = self.launch.sessions.clone();
+                let peers = self.peers.clone();
                 let tx = self.tx.clone();
-                self.open("Resume session", MenuKind::Sessions(vec![]));
+                self.open("Switch session", MenuKind::Sessions(vec![]));
                 let id = self.menu.as_ref().unwrap().id;
                 tokio::spawn(async move {
-                    let result = load_sessions(root).await;
+                    let result = load_sessions(root, peers).await;
                     let _ = tx.send(Work::MenuLoaded(MenuLoaded::Sessions(id, result)));
                 });
             }
@@ -660,12 +699,10 @@ impl App {
             }
             MenuKind::Sessions(items) => {
                 if let Some(index) = selected {
-                    let id = items[index].value;
-                    if self.active_work() {
-                        self.confirm(ConfirmAction::SwitchSession(id));
-                    } else {
-                        self.switch(Some(id));
-                    }
+                    self.host = Some(match items[index].value {
+                        SessionRef::Live(key) => HostRequest::Activate(key),
+                        SessionRef::Saved(id) => HostRequest::Open(id),
+                    });
                 }
             }
             MenuKind::Files(items, at) => {
@@ -726,9 +763,8 @@ impl App {
             MenuKind::Confirm(action) => {
                 if selected == Some(1) {
                     match action {
-                        ConfirmAction::Exit => self.shutdown(),
-                        ConfirmAction::NewSession => self.switch(None),
-                        ConfirmAction::SwitchSession(id) => self.switch(Some(id)),
+                        ConfirmAction::Exit => self.host = Some(HostRequest::Quit),
+                        ConfirmAction::CloseSession => self.shutdown(),
                         ConfirmAction::CancelJob(id) => {
                             let Some(session) = self.session().cloned() else {
                                 return;
@@ -1128,7 +1164,7 @@ mod tests {
             menu.input.set(format!("/{}", spec.command));
             assert_eq!(items[menu.filtered()[0].index].value, spec.command);
         }
-        // Typing /resume must run the queue action, not open Resume session.
+        // Typing a command id runs that command.
         app.menu = None;
         app.paused = true;
         key(&mut app, KeyCode::Char('/'), M::NONE);
@@ -1148,7 +1184,7 @@ mod tests {
         }
         Work::MenuLoaded(match &menu.kind {
             MenuKind::Sessions(_) => {
-                MenuLoaded::Sessions(menu.id, result(SessionId::from_bytes([1; 16]), error))
+                MenuLoaded::Sessions(menu.id, result(SessionRef::Live(1), error))
             }
             MenuKind::Files(..) => {
                 MenuLoaded::Files(menu.id, result(PathBuf::from("current"), error))
@@ -1158,6 +1194,34 @@ mod tests {
             }
             _ => panic!("not an asynchronous menu"),
         })
+    }
+
+    #[tokio::test]
+    async fn switch_menu_lists_open_sessions_once_above_saved_ones() {
+        let (_root, app) = draft_fixture().await;
+        let mut ids = vec![];
+        for _ in 0..2 {
+            let session = app.launch.create(None).await.unwrap();
+            session.shutdown().await.unwrap();
+            ids.push(session.id());
+        }
+        let peer = |key, session| Peer {
+            key,
+            session,
+            state: model::AgentDisplayState::Ready,
+            current: false,
+            attention: false,
+            working: false,
+        };
+        let peers = vec![peer(7, Some(ids[0])), peer(8, None)];
+        let items = load_sessions(app.launch.sessions.clone(), peers).await;
+        let items: Vec<_> = items.unwrap().into_iter().map(|item| item.value).collect();
+        let expected = [
+            SessionRef::Live(7),
+            SessionRef::Live(8),
+            SessionRef::Saved(ids[1]),
+        ];
+        assert!(items == expected);
     }
 
     #[tokio::test]

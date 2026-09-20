@@ -40,8 +40,9 @@ composer; merely opening the queue or deleting an item does not pause it. Interr
 submission or delivery errors, and session-start failures also pause queue delivery. `/resume`
 clears that pause, as does normal composer Enter (even with an empty draft); slash commands
 do not automatically resume the queue. There is no standalone `/pause` command.
-Queued input lives only in the running interface: it is not saved with the session, and
-input still waiting when you switch sessions stays queued, paused, for the session you open.
+Queued input lives only in the running interface: it is not saved with the session. Each open
+session keeps its own queue, which keeps delivering while you look at another session and is
+discarded when its session is closed.
 `/retry` continues failed or interrupted turns without duplicating their original prompts.
 After a session interruption it resumes all interrupted children automatically, regardless of
 which agent is selected. Parents with pending waits stay in those waits rather than starting
@@ -121,7 +122,7 @@ The command palette and `/help` also list these shortcuts. `Ctrl+X` is a leader:
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+P`, `/` | Commands |
-| `Ctrl+X N`, `Ctrl+X L` | New session, session picker |
+| `Ctrl+X N`, `Ctrl+X S`, `Ctrl+X W` | New session, switch session, close session |
 | `Ctrl+X M`, `/model` | Model for subsequent user messages |
 | `Ctrl+X A` | Agent picker |
 | `Ctrl+X I`, `/queue` | Edit queued follow-ups |
@@ -145,8 +146,8 @@ The command palette and `/help` also list these shortcuts. `Ctrl+X` is a leader:
 | `Ctrl+X Q` | Quit |
 
 The `Ctrl+X` preview stays open until the next key; `Esc` cancels it. It shows Model
-and Inspect agent, plus Questions when requests are pending and Edit queue when
-queued messages are available. Other bound shortcuts still work even when hidden
+and Inspect agent, plus Questions when requests are pending, Sessions when another open
+session needs attention, and Edit queue when queued messages are available. Other bound shortcuts still work even when hidden
 from the preview.
 
 Type `/` in an empty composer to open the command palette. Search by command name

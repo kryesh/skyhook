@@ -230,6 +230,21 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
                     );
                 }
             }
+        } else if let MenuKind::Sessions(sessions) = &menu.kind {
+            // Open sessions carry their live status; saved ones align beneath them.
+            fill(frame, row, bg);
+            let peer = match sessions[item.index].value {
+                SessionRef::Live(key) => app.peers.iter().find(|peer| peer.key == key),
+                SessionRef::Saved(_) => None,
+            };
+            if let Some(peer) = peer {
+                app.animating |= peer.state.running();
+                let symbol = agent_symbol(peer.state, false, app.tick_count);
+                let color = agent_status_color(peer.state, p);
+                text(frame, r(row.x, y, 1, 1), symbol, color, bg);
+            }
+            let row = r(row.x + 2, y, row.width.saturating_sub(2), 1);
+            draw_menu_item(frame, row, item, &menu.kind, selected, p, bg);
         } else {
             draw_menu_item(frame, row, item, &menu.kind, selected, p, bg);
         }
