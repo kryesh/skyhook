@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e95e8dd8.js";
+            window.path_to_searchindex_js = "../searchindex-393d7e39.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -288,8 +288,17 @@ Registering a target does not change the agent’s location.</p>
 <li>Setting another named target uses its configured workspace, except that explicitly selecting the
 calling agent’s current named target retains that agent’s workspace override.</li>
 </ul>
-<p>Tools without a target selector use the calling agent’s target and workspace. An explicit
-<code>agent.workspace</code> takes precedence over the selected base; relative overrides resolve against that base.</p>
+<p>Workspace-inheriting tools such as <code>write</code>, <code>replace</code>, and <code>remove</code> use the calling agent’s
+target and workspace without accepting a target selector. Host/session tools such as <code>jobs</code>,
+<code>job_output</code>, <code>todo</code>, <code>wait</code>, and <code>targets</code> still run on the session host. <code>agent</code> selects a
+child’s future execution location; launching the child and running its provider remain host
+operations. An explicit <code>agent.workspace</code> takes precedence over the selected base; relative
+overrides resolve against that base.</p>
+<p>Diagnostics identify the operation and its subject, with the execution target when applicable.
+A working-directory override is separate from the target’s configured workspace: an absolute
+<code>cwd</code> must exist on the selected machine, not on the session host. A connection, session-storage,
+or saved-output inspection failure is not necessarily a failure of the command on the remote
+machine.</p>
 <p>Prefer these named targets to manually running <code>ssh</code>. A tool that needs an SSH route requests
 approval before any probe, authentication, or shim deployment. A saved
 <a href="permissions.html#approval-policy">route grant</a> applies across tools and workspaces, so

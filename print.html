@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e95e8dd8.js";
+            window.path_to_searchindex_js = "searchindex-393d7e39.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-8b14bb79.js"></script>
@@ -765,8 +765,17 @@ Registering a target does not change the agent’s location.</p>
 <li>Setting another named target uses its configured workspace, except that explicitly selecting the
 calling agent’s current named target retains that agent’s workspace override.</li>
 </ul>
-<p>Tools without a target selector use the calling agent’s target and workspace. An explicit
-<code>agent.workspace</code> takes precedence over the selected base; relative overrides resolve against that base.</p>
+<p>Workspace-inheriting tools such as <code>write</code>, <code>replace</code>, and <code>remove</code> use the calling agent’s
+target and workspace without accepting a target selector. Host/session tools such as <code>jobs</code>,
+<code>job_output</code>, <code>todo</code>, <code>wait</code>, and <code>targets</code> still run on the session host. <code>agent</code> selects a
+child’s future execution location; launching the child and running its provider remain host
+operations. An explicit <code>agent.workspace</code> takes precedence over the selected base; relative
+overrides resolve against that base.</p>
+<p>Diagnostics identify the operation and its subject, with the execution target when applicable.
+A working-directory override is separate from the target’s configured workspace: an absolute
+<code>cwd</code> must exist on the selected machine, not on the session host. A connection, session-storage,
+or saved-output inspection failure is not necessarily a failure of the command on the remote
+machine.</p>
 <p>Prefer these named targets to manually running <code>ssh</code>. A tool that needs an SSH route requests
 approval before any probe, authentication, or shim deployment. A saved
 <a href="#approval-policy">route grant</a> applies across tools and workspaces, so
@@ -2106,6 +2115,29 @@ All defaulted input fields, including <code>details: false</code>, are optional 
 <p>By default, hidden entries (including <code>.git</code>) and ignored files are excluded. <code>hidden: true</code>
 includes hidden entries, while <code>no_ignore: true</code> independently disables ignore files. Searches
 rooted in subdirectories inherit ancestor ignore rules; explicitly requested paths remain accessible.</p>
+<h2 id="diagnostics"><a class="header" href="#diagnostics">Diagnostics</a></h2>
+<p>Diagnostic messages identify the failed operation and its subject, such as a path, argument,
+job, or output field. Workspace-operation failures include the applicable execution target;
+host/session failures are not attributed to the caller’s remote target. “On session host” is
+shown when the viewing agent is on a different target and omitted for an agent on the host.
+Inspecting a remote job’s saved output does not connect to that machine: a retrieval failure concerns saved output,
+while a retrieved execution error retains the original operation’s context.</p>
+<p>Structured job diagnostics and explicitly registered diagnostic result fields are rendered for the
+viewing agent, exposing target aliases only when that viewer’s capabilities permit them. This is
+not a general redaction guarantee for saved output. A <code>job_output</code> call made with broader
+capabilities saves its already-rendered view as ordinary JSON. Later reads of that saved snapshot
+with narrower capabilities retain the earlier JSON unchanged, as do reads of script results that
+copy it. Arbitrary returned JSON is not inspected for diagnostics or target aliases, and
+already-committed model messages are not rewritten.</p>
+<p>An error does not by itself establish that an operation had no effects. A command may have
+started before output capture failed, a file replacement may have committed before a durability
+check failed, and a recursive removal may have deleted some entries. Messages distinguish known
+pre-execution failures from known or uncertain later effects. Do not automatically retry a
+mutation merely because its result is a failed job.</p>
+<p>Outcome distinctions still matter: a nonzero process exit is a completed command result, an
+HTTP error status is a normal HTTP result, and a <code>wait</code> timeout ends only that wait. Expected
+missing/unreadable-file results from <code>read</code> remain completed diagnostic payloads. Policy denials,
+operating-system access failures, cancellation, and interrupted execution remain distinct.</p>
 <h2 id="automatic-previews"><a class="header" href="#automatic-previews">Automatic previews</a></h2>
 <p>JavaScript receives complete result data. Model-facing previews may shorten designated output
 fields: file <code>content</code>, directory <code>entries</code>, process <code>stdout</code> and <code>stderr</code>, search <code>matches</code>, glob
@@ -2490,6 +2522,28 @@ authorization coordinator, and job supervision rather than separate tool impleme
 arguments and runs operations without requiring a session database. The SSH shim reuses that layer
 for remote built-ins while the host retains job ownership, policy decisions, and saved output.
 This separation keeps remote workers from becoming second agent runtimes.</p>
+<p>The host tracks remote readers and accepted-payload ingestion independently of callers and
+connection-pool ownership. Pool eviction does not abort this work; after routing stops, transport
+resources are released before the finite accepted-payload queue is drained. Session shutdown
+fences new connection startup and waits for tracked startup and reader/drain work before backend
+cleanup. See <a href="#connection-and-request-lifecycle">connection and request lifecycle</a>.</p>
+<p>Tool failures are structured diagnostics: a typed cause plus the operation, subject, site, and
+known effects. Tools annotate facts; <code>tool::diagnostic</code> owns the one renderer. Facts chosen nearest
+the failure win, and each boundary (planning, dispatch, remote result ingestion) only fills what is
+missing. A worker’s reported site is always rebound to the destination of the connection it arrived
+on.</p>
+<p>Diagnostics are persisted with the job and rendered per viewer. Target aliases in structured job
+diagnostics and result slots registered by their producer, such as an expected <code>read</code> failure, are
+rendered only when the viewer’s capabilities permit exposing them. Host-site wording is relative
+to the viewer’s target: “on session host” is omitted for host-local viewers and retained for remote
+viewers. Capability-sensitive enclosing output pages use private file-backed renderings rather
+than shared render caches, keeping captured output out of memory without reusing privileged
+renderings for those diagnostic slots.</p>
+<p>This rendering boundary does not guarantee that target aliases never appear in a restricted view.
+A privileged <code>job_output</code> call saves its rendered view as an ordinary JSON snapshot. Later
+restricted views of that saved result, or script results that copy it, retain the earlier rendered
+JSON unchanged. Already-committed model messages are not rewritten. Arbitrary returned JSON is not
+inspected for diagnostics or target aliases, and copied data does not acquire diagnostic provenance.</p>
 <p>Saved output and model-visible presentation are separate. Automatic previews shorten only fields
 marked <code>x-skyhook-truncatable</code> in the output schema; storing a field separately does not make it
 truncatable. Jobs persist their output schemas so resumed and remote results use the same rules.
@@ -2591,6 +2645,9 @@ the root answer, or an empty string when there is none.</p>
 before starting agents and opens fresh provider contexts; it does not reuse old network resources.
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.</p>
+<p>Session databases now use format 10 for structured diagnostics. Format 9 databases are not
+migrated and cannot be resumed with this version; retain a compatible Skyhook version to inspect
+or resume those sessions, or start a new session.</p>
 <p>Await <code>SessionHandle::shutdown()</code> before releasing the host’s session owner. Shutdown stops runtime
 producers, drains accepted job and journal work, and closes MCP and remote resources. The journal
 remains available so the host can append a final status after observing shutdown errors; await
@@ -2658,7 +2715,8 @@ a session database or run a second agent harness.</p>
 <li>Target resolution selects a validated route and execution workspace. SSH configuration comes
 from target definitions, not the user’s or system’s SSH configuration.</li>
 <li><code>RemoteManager</code> owns the session’s connection pool, keyed by resolved route identity <strong>and</strong>
-workspace. It coordinates shared startup, invalidation, and shutdown.</li>
+workspace. It coordinates shared startup, invalidation, and shutdown, and tracks startup and
+reader/drain tasks independently of pool membership and callers.</li>
 <li><code>ConnectionFactory</code> supplies the byte stream and lifetime owner. The SSH backend handles
 authentication, OpenSSH processes, platform probing, and shim deployment; it does not implement
 job supervision or saved-output storage.</li>
@@ -2673,14 +2731,27 @@ support relayed SSH streams and sensitive prompts without turning them into tool
 operations share validation and execution behavior.</p>
 <h2 id="connection-and-request-lifecycle"><a class="header" href="#connection-and-request-lifecycle">Connection and request lifecycle</a></h2>
 <p>Connection startup is shared by callers using the same pool key. Cancelling one waiter stops its
-wait, not the shared startup. Startup failure removes the failed slot; I/O or protocol failure
+wait, not the shared startup. Startup failure removes the failed slot; transport I/O or protocol failure
 during execution discards the affected pooled connection so later work can establish a new one.
 It does not transparently replay the failed tool operation.</p>
 <p>Once connected, request IDs associate output and cancellation with individual operations.
+SSH cancellation remains best-effort: the client does not await a terminal reply. Already captured
+output remains inspectable, but final worker diagnostics or structured results may be unavailable.
 Credit-based flow control bounds queued payload and relayed-stream data. A transport’s lifetime
 owner retains its underlying process resources; dropping it tears those resources down. A relayed
-connection also retains its origin connection for the lifetime of the child stream. Session
-shutdown cancels startup, clears the pool, and releases session-owned authentication resources.</p>
+connection also retains its origin connection for the lifetime of the child stream.</p>
+<p>Accepted-payload ingestion is tracked independently of pool membership and caller lifetime. Pool
+eviction does not abort the reader; dropping the last <code>PooledConnection</code> owner cancels routing
+instead. When routing ends through cancellation or failure, the reader releases the transport
+owner before draining the finite queue of already accepted payloads. The drain does not require a
+live socket or further acknowledgements, and the session tracks the reader until it finishes.
+This protects accepted output, not payloads that never reached the host or a terminal reply the
+worker has not sent.</p>
+<p>Session shutdown cancels startup and routing, fences new startup under the pool lock, and clears
+the pool. Shared startups and readers use the same session task tracker: a startup registers its
+reader before its own tracked lifetime ends, so shutdown cannot miss a reader from an in-flight
+handshake. Shutdown waits for startup and reader/drain work before backend cleanup releases
+session-owned authentication resources.</p>
 <h3 id="origin-versus-jump-hosts"><a class="header" href="#origin-versus-jump-hosts">Origin versus jump hosts</a></h3>
 <p><a href="#routing-origin-and-via">Routing</a> decides where SSH runs: on root
 or on the shim of the destination’s <code>origin</code>. Targets listed through <code>via</code> are native <code>ProxyJump</code>

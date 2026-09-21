@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e95e8dd8.js";
+            window.path_to_searchindex_js = "../searchindex-393d7e39.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -297,6 +297,28 @@ authorization coordinator, and job supervision rather than separate tool impleme
 arguments and runs operations without requiring a session database. The SSH shim reuses that layer
 for remote built-ins while the host retains job ownership, policy decisions, and saved output.
 This separation keeps remote workers from becoming second agent runtimes.</p>
+<p>The host tracks remote readers and accepted-payload ingestion independently of callers and
+connection-pool ownership. Pool eviction does not abort this work; after routing stops, transport
+resources are released before the finite accepted-payload queue is drained. Session shutdown
+fences new connection startup and waits for tracked startup and reader/drain work before backend
+cleanup. See <a href="remote-transport-and-shims.html#connection-and-request-lifecycle">connection and request lifecycle</a>.</p>
+<p>Tool failures are structured diagnostics: a typed cause plus the operation, subject, site, and
+known effects. Tools annotate facts; <code>tool::diagnostic</code> owns the one renderer. Facts chosen nearest
+the failure win, and each boundary (planning, dispatch, remote result ingestion) only fills what is
+missing. A worker’s reported site is always rebound to the destination of the connection it arrived
+on.</p>
+<p>Diagnostics are persisted with the job and rendered per viewer. Target aliases in structured job
+diagnostics and result slots registered by their producer, such as an expected <code>read</code> failure, are
+rendered only when the viewer’s capabilities permit exposing them. Host-site wording is relative
+to the viewer’s target: “on session host” is omitted for host-local viewers and retained for remote
+viewers. Capability-sensitive enclosing output pages use private file-backed renderings rather
+than shared render caches, keeping captured output out of memory without reusing privileged
+renderings for those diagnostic slots.</p>
+<p>This rendering boundary does not guarantee that target aliases never appear in a restricted view.
+A privileged <code>job_output</code> call saves its rendered view as an ordinary JSON snapshot. Later
+restricted views of that saved result, or script results that copy it, retain the earlier rendered
+JSON unchanged. Already-committed model messages are not rewritten. Arbitrary returned JSON is not
+inspected for diagnostics or target aliases, and copied data does not acquire diagnostic provenance.</p>
 <p>Saved output and model-visible presentation are separate. Automatic previews shorten only fields
 marked <code>x-skyhook-truncatable</code> in the output schema; storing a field separately does not make it
 truncatable. Jobs persist their output schemas so resumed and remote results use the same rules.

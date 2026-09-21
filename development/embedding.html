@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e95e8dd8.js";
+            window.path_to_searchindex_js = "../searchindex-393d7e39.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -248,6 +248,9 @@ the root answer, or an empty string when there is none.</p>
 before starting agents and opens fresh provider contexts; it does not reuse old network resources.
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.</p>
+<p>Session databases now use format 10 for structured diagnostics. Format 9 databases are not
+migrated and cannot be resumed with this version; retain a compatible Skyhook version to inspect
+or resume those sessions, or start a new session.</p>
 <p>Await <code>SessionHandle::shutdown()</code> before releasing the host’s session owner. Shutdown stops runtime
 producers, drains accepted job and journal work, and closes MCP and remote resources. The journal
 remains available so the host can append a final status after observing shutdown errors; await
