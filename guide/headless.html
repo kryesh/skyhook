@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
+            window.path_to_searchindex_js = "../searchindex-8253947f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -205,7 +205,7 @@ work it needs completed; outstanding jobs are cancelled and drained during shutd
 termination signals also trigger cleanup and journaled status rather than a terminal prompt.</p>
 <p>A batch job never has human interaction. Root <code>ask</code> is unavailable (also inside scripts and with <code>bg:true</code>). Child agents
 can still ask their owning parent agent. Operations requiring human approval fail immediately;
-ordinary automatically allowed operations still work. <code>--approve-all</code> (or config <code>approve_all = true</code>)
+ordinary automatically allowed operations still work. <code>--approve-all</code> (or config <code>approve_all: true</code>)
 bypasses tool approvals but does not enable questions, SSH passwords/passphrases, or host/agent
 confirmation prompts. SSH credentials that work without a prompt can still authenticate.</p>
 <p><code>exec</code> and <code>shell</code> never have stdin connected; without <code>interactive</code> they also have no

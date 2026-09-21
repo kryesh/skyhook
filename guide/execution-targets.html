@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
+            window.path_to_searchindex_js = "../searchindex-8253947f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -185,44 +185,43 @@
 <code>--capabilities</code> allowlist) to grant the target capability. It is not enabled by default.
 Without it, agents cannot use target-management tools or select another target, including from
 JavaScript. The <code>external_agent</code> example below also requires <code>ssh_agent</code>; see <a href="#agents">agents</a>.</p>
-<p>Targets are named directly under <code>[targets.&lt;name&gt;]</code>, and session tools can add or replace targets without
-modifying TOML. Skyhook never reads SSH configuration files: a target’s host, user, port,
+<p>Targets are named entries in the top-level <code>targets</code> mapping, and session tools can add or replace
+targets without modifying YAML. Skyhook never reads SSH configuration files: a target’s host, user, port,
 authentication, and options come only from its own definition. Aliases, <code>ProxyJump</code>, identities,
 and other settings in <code>~/.ssh/config</code> or <code>/etc/ssh/ssh_config</code> do not apply.</p>
 <p>When <a href="../configuration/overview.html#file-selection-and-layering">user and workspace config are layered</a>,
 a workspace entry replaces the <strong>whole target with the same name</strong>; it does not inherit user SSH,
 authentication, or routing settings. Targets with other names are retained. Repeat any
 required settings in the replacement entry.</p>
-<pre><code class="language-toml">[targets.bastion]
-type = "ssh"
-host = "bastion.example.com"
+<pre><code class="language-yaml">targets:
+  bastion:
+    type: "ssh"
+    host: "bastion.example.com"
+    ssh:
+      user: "gateway"
+      external_agent: true
 
-[targets.bastion.ssh]
-user = "gateway"
-external_agent = true
+  build:
+    type: "ssh"
+    host: "build.internal"
+    workspace: "/srv/project"
+    via: "bastion"
+    ssh:
+      auth:
+        kind: "key"
+        path: "~/.ssh/build_ed25519"
 
-[targets.build]
-type = "ssh"
-host = "build.internal"
-workspace = "/srv/project"
-via = "bastion"
-
-[targets.build.ssh.auth]
-kind = "key"
-path = "~/.ssh/build_ed25519"
-
-[targets.database]
-type = "ssh"
-host = "db.internal"
-origin = "build"
-
-[targets.database.ssh]
-# Reach the host through a gateway using the deploy user's own SSH key on build.
-options = { ProxyCommand = "sudo -n -u deploy ssh -W %h:%p gateway.internal" }
+  database:
+    type: "ssh"
+    host: "db.internal"
+    origin: "build"
+    ssh:
+      # Reach the host through a gateway using the deploy user's own SSH key on build.
+      options: { ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal" }
 </code></pre>
 <p>Targets have an explicit <code>type</code>. The built-in <code>root</code> is <code>local</code>, meaning the session host—the machine
 running the main Skyhook process. It always identifies that machine, including when an agent’s
-current target is remote. Named target configuration and <code>target_add</code> accept only <code>type = "ssh"</code>.</p>
+current target is remote. Named target configuration and <code>target_add</code> accept only <code>type: "ssh"</code>.</p>
 <h2 id="routing-origin-and-via"><a class="header" href="#routing-origin-and-via">Routing: <code>origin</code> and <code>via</code></a></h2>
 <ul>
 <li><code>origin</code> names the target that starts the SSH connection; it defaults to <code>root</code>.
@@ -232,14 +231,15 @@ hosts need no shim. A <code>via</code> target must have the same <code>origin</c
 interpreted on another machine. Omit <code>via</code>, rather than naming the origin, to connect directly
 from the origin.</li>
 </ul>
-<p>Both may be set: <code>origin = "build"</code> with <code>via = "gateway"</code> makes <code>build</code> run SSH through <code>gateway</code>,
-where <code>gateway</code> also has <code>origin = "build"</code>.</p>
+<p>Both may be set: <code>origin: "build"</code> with <code>via: "gateway"</code> makes <code>build</code> run SSH through <code>gateway</code>,
+where <code>gateway</code> also has <code>origin: "build"</code>.</p>
 <p>Registering targets never connects to them; registrations are session-wide.</p>
 <pre><code class="language-javascript">await tool.target_add({name: "database", type: "ssh", host: "db.internal", origin: "build",
   ssh: {auth: {kind: "key", path: "~/.ssh/database"}}});
 </code></pre>
 <h2 id="ssh-settings"><a class="header" href="#ssh-settings">SSH settings</a></h2>
-<p>SSH settings live under <code>ssh</code>. Every setting is optional:</p>
+<p>SSH settings live under <code>ssh</code>. Every setting is optional. <code>options</code> values must be strings;
+quote numeric-looking values, for example <code>ServerAliveInterval: "15"</code>.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -249,7 +249,7 @@ where <code>gateway</code> also has <code>origin = "build"</code>.</p>
 <tr><td><code>user</code>, <code>port</code></td><td>Remote user (default: the origin’s username) and port (1–65535, default 22).</td></tr>
 <tr><td><code>auth</code></td><td><code>default</code> offers OpenSSH’s default key files (<code>~/.ssh/id_*</code>); <code>agent</code> offers only keys already in the agent; <code>key</code> with <code>path</code> offers one private key on the SSH origin.</td></tr>
 <tr><td><code>external_agent</code></td><td>Authenticate with, and forward, the agent the origin inherited in <code>SSH_AUTH_SOCK</code> instead of a private agent Skyhook runs on the origin. Keys are never added to it. Requires the <code>ssh_agent</code> capability; see <a href="#agents">agents</a>.</td></tr>
-<tr><td><code>options</code></td><td>Extra <code>ssh_config</code> options, written verbatim as in an ssh_config file, e.g. <code>{ ProxyCommand = "sudo -n -u deploy ssh -W %h:%p gateway.internal" }</code> to reach the host through a gateway with another user’s SSH key (commands run without a terminal, so <code>sudo</code> must not prompt). Use <code>%h</code> for the target host; <code>%n</code> is Skyhook’s internal host alias. Skyhook-managed settings cannot be overridden. These are rejected: <code>Host</code>, <code>Match</code>, <code>Include</code>, <code>HostName</code>, <code>User</code>, <code>Port</code>, <code>IdentityFile</code>, <code>IdentityAgent</code>, <code>AddKeysToAgent</code>, <code>BatchMode</code>, <code>ProxyJump</code>, <code>ControlMaster</code>, <code>ControlPath</code>, <code>ControlPersist</code>, <code>ForwardAgent</code>, <code>RemoteCommand</code>, <code>RequestTTY</code>, <code>SessionType</code>, <code>CanonicalizeHostname</code>, <code>SendEnv</code>, <code>SetEnv</code>, <code>ForwardX11</code>, and <code>ForwardX11Trusted</code>. <code>ProxyCommand</code> cannot be combined with <code>via</code>.</td></tr>
+<tr><td><code>options</code></td><td>Extra <code>ssh_config</code> options, written verbatim as in an ssh_config file, e.g. <code>{ ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal" }</code> to reach the host through a gateway with another user’s SSH key (commands run without a terminal, so <code>sudo</code> must not prompt). Use <code>%h</code> for the target host; <code>%n</code> is Skyhook’s internal host alias. Skyhook-managed settings cannot be overridden. These are rejected: <code>Host</code>, <code>Match</code>, <code>Include</code>, <code>HostName</code>, <code>User</code>, <code>Port</code>, <code>IdentityFile</code>, <code>IdentityAgent</code>, <code>AddKeysToAgent</code>, <code>BatchMode</code>, <code>ProxyJump</code>, <code>ControlMaster</code>, <code>ControlPath</code>, <code>ControlPersist</code>, <code>ForwardAgent</code>, <code>RemoteCommand</code>, <code>RequestTTY</code>, <code>SessionType</code>, <code>CanonicalizeHostname</code>, <code>SendEnv</code>, <code>SetEnv</code>, <code>ForwardX11</code>, and <code>ForwardX11Trusted</code>. <code>ProxyCommand</code> cannot be combined with <code>via</code>.</td></tr>
 </tbody>
 </table>
 </div>

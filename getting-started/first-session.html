@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
+            window.path_to_searchindex_js = "../searchindex-8253947f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -186,18 +186,20 @@ location is <code>$XDG_CONFIG_HOME/skyhook</code> or <code>~/.config/skyhook</co
 <pre><code class="language-sh">config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/skyhook"
 mkdir -p "$config_dir"
 </code></pre>
-<p>Create <code>config.toml</code> in that directory with a provider and model you can access. For example:</p>
-<pre><code class="language-toml">[providers.openai]
-kind = "openai"
-base_url = "https://api.openai.com/v1"
-api = "responses"
-api_key_env = "OPENAI_API_KEY"
+<p>Create <code>config.yaml</code> in that directory with a provider and model you can access. For example:</p>
+<pre><code class="language-yaml">providers:
+  openai:
+    kind: "openai"
+    base_url: "https://api.openai.com/v1"
+    api: "responses"
+    api_key_env: "OPENAI_API_KEY"
 
-[models.default]
-provider = "openai"
-model = "gpt-5.6"
-max_context = 1050000
-max_output = 128000
+models:
+  default:
+    provider: "openai"
+    model: "gpt-5.6"
+    max_context: 1050000
+    max_output: 128000
 </code></pre>
 <p>Use a model identifier supported by your account and set its token limits explicitly; Skyhook
 does not detect them automatically. You can choose smaller budgets. For model limits, other
@@ -205,7 +207,7 @@ providers, a keyless local server, or Codex OAuth, see
 <a href="../configuration/providers-and-models.html">providers and models</a> and
 <a href="../configuration/authentication.html">authentication</a>.</p>
 <p>From a source checkout, you can instead copy the comprehensive example and edit it before running:</p>
-<pre><code class="language-sh">cp config.example.toml "$config_dir/config.toml"
+<pre><code class="language-sh">cp config.example.yaml "$config_dir/config.yaml"
 </code></pre>
 <p>The <a href="../configuration/overview.html#complete-example">full example</a> configures several providers;
 remove unused providers and models or supply their required credentials.</p>
@@ -220,12 +222,12 @@ interactive terminal. Use <code>skyhook batch</code> with <code>-p/--prompt</cod
 with redirected input/output support and automatic exit; see <a href="../guide/headless.html">Headless execution</a>.</p>
 <p>An unused startup draft creates no saved session. The first sent message or explicitly run
 script creates the session. Use <code>--workspace PATH</code> to select another workspace. Normally,
-<code>&lt;workspace&gt;/.skyhook/config.toml</code> overlays the selected user configuration. Use
-<code>--config path.toml</code> to load <strong>only</strong> that file instead, with no user/workspace config merging.
+<code>&lt;workspace&gt;/.skyhook/config.yaml</code> overlays the selected user configuration. Use
+<code>--config path.yaml</code> to load <strong>only</strong> that file instead, with no user/workspace config merging.
 See <a href="../configuration/overview.html#file-selection-and-layering">configuration layering</a>, including
 its workspace trust boundary.</p>
 <p>To inspect configuration or available skills without a session or API credentials:</p>
-<pre><code class="language-sh">skyhook dump config  # Effective TOML on stdout; diagnostics/source paths on stderr.
+<pre><code class="language-sh">skyhook dump config  # Effective YAML on stdout; diagnostics/source paths on stderr.
 skyhook dump skills  # Winning skills, frontmatter, and asset tree.
 </code></pre>
 <p>Both return nonzero on errors; skills can still list valid entries when other entries fail.

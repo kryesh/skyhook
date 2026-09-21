@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-0a4ca1d0.js";
+            window.path_to_searchindex_js = "searchindex-8253947f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-8b14bb79.js"></script>
@@ -204,7 +204,7 @@ and set up <a href="#authentication">authentication</a>.</li>
 Skyhook is licensed under <a href="https://github.com/kryesh/skyhook/blob/main/LICENSE">AGPL-3.0-only</a>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="installation"><a class="header" href="#installation">Installation</a></h1>
-<p>Skyhook is built from a source checkout with <a href="https://github.com/casey/just">just</a>. Rust 1.88 or
+<p>Skyhook is built from a source checkout with <a href="https://github.com/casey/just">just</a>. Rust 1.89 or
 newer is required. SSH support needs static Linux shims, which are cross-compiled with
 <a href="https://ziglang.org/download/">Zig</a>; install Zig yourself and make <code>zig</code> available on <code>PATH</code> (or
 set <code>CARGO_ZIGBUILD_ZIG_PATH</code>). <code>just setup</code> installs the remaining Rust-side tooling
@@ -229,18 +229,20 @@ location is <code>$XDG_CONFIG_HOME/skyhook</code> or <code>~/.config/skyhook</co
 <pre><code class="language-sh">config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/skyhook"
 mkdir -p "$config_dir"
 </code></pre>
-<p>Create <code>config.toml</code> in that directory with a provider and model you can access. For example:</p>
-<pre><code class="language-toml">[providers.openai]
-kind = "openai"
-base_url = "https://api.openai.com/v1"
-api = "responses"
-api_key_env = "OPENAI_API_KEY"
+<p>Create <code>config.yaml</code> in that directory with a provider and model you can access. For example:</p>
+<pre><code class="language-yaml">providers:
+  openai:
+    kind: "openai"
+    base_url: "https://api.openai.com/v1"
+    api: "responses"
+    api_key_env: "OPENAI_API_KEY"
 
-[models.default]
-provider = "openai"
-model = "gpt-5.6"
-max_context = 1050000
-max_output = 128000
+models:
+  default:
+    provider: "openai"
+    model: "gpt-5.6"
+    max_context: 1050000
+    max_output: 128000
 </code></pre>
 <p>Use a model identifier supported by your account and set its token limits explicitly; Skyhook
 does not detect them automatically. You can choose smaller budgets. For model limits, other
@@ -248,7 +250,7 @@ providers, a keyless local server, or Codex OAuth, see
 <a href="#providers-and-models">providers and models</a> and
 <a href="#authentication">authentication</a>.</p>
 <p>From a source checkout, you can instead copy the comprehensive example and edit it before running:</p>
-<pre><code class="language-sh">cp config.example.toml "$config_dir/config.toml"
+<pre><code class="language-sh">cp config.example.yaml "$config_dir/config.yaml"
 </code></pre>
 <p>The <a href="#complete-example">full example</a> configures several providers;
 remove unused providers and models or supply their required credentials.</p>
@@ -263,12 +265,12 @@ interactive terminal. Use <code>skyhook batch</code> with <code>-p/--prompt</cod
 with redirected input/output support and automatic exit; see <a href="#headless-execution">Headless execution</a>.</p>
 <p>An unused startup draft creates no saved session. The first sent message or explicitly run
 script creates the session. Use <code>--workspace PATH</code> to select another workspace. Normally,
-<code>&lt;workspace&gt;/.skyhook/config.toml</code> overlays the selected user configuration. Use
-<code>--config path.toml</code> to load <strong>only</strong> that file instead, with no user/workspace config merging.
+<code>&lt;workspace&gt;/.skyhook/config.yaml</code> overlays the selected user configuration. Use
+<code>--config path.yaml</code> to load <strong>only</strong> that file instead, with no user/workspace config merging.
 See <a href="#file-selection-and-layering">configuration layering</a>, including
 its workspace trust boundary.</p>
 <p>To inspect configuration or available skills without a session or API credentials:</p>
-<pre><code class="language-sh">skyhook dump config  # Effective TOML on stdout; diagnostics/source paths on stderr.
+<pre><code class="language-sh">skyhook dump config  # Effective YAML on stdout; diagnostics/source paths on stderr.
 skyhook dump skills  # Winning skills, frontmatter, and asset tree.
 </code></pre>
 <p>Both return nonzero on errors; skills can still list valid entries when other entries fail.
@@ -476,7 +478,7 @@ work it needs completed; outstanding jobs are cancelled and drained during shutd
 termination signals also trigger cleanup and journaled status rather than a terminal prompt.</p>
 <p>A batch job never has human interaction. Root <code>ask</code> is unavailable (also inside scripts and with <code>bg:true</code>). Child agents
 can still ask their owning parent agent. Operations requiring human approval fail immediately;
-ordinary automatically allowed operations still work. <code>--approve-all</code> (or config <code>approve_all = true</code>)
+ordinary automatically allowed operations still work. <code>--approve-all</code> (or config <code>approve_all: true</code>)
 bypasses tool approvals but does not enable questions, SSH passwords/passphrases, or host/agent
 confirmation prompts. SSH credentials that work without a prompt can still authenticate.</p>
 <p><code>exec</code> and <code>shell</code> never have stdin connected; without <code>interactive</code> they also have no
@@ -553,7 +555,7 @@ model failures, which retry until success or cancellation. See
 <h1 id="permissions-and-capabilities"><a class="header" href="#permissions-and-capabilities">Permissions and capabilities</a></h1>
 <h2 id="approval-policy"><a class="header" href="#approval-policy">Approval policy</a></h2>
 <p><code>--approve-all</code> or
-<code>approve_all = true</code> bypasses approval prompts. Subject to the granted capabilities, the default
+<code>approve_all: true</code> bypasses approval prompts. Subject to the granted capabilities, the default
 CLI auto-allows reads and agent operations, as well as writes inside the root workspace.
 Execution, HTTP requests, SSH access, target changes, and writes outside the root workspace
 require approval. When the <code>interactive</code> capability is granted, questions and SSH authentication
@@ -605,17 +607,18 @@ the terminal interface or root questions. Per-agent depth restrictions narrow th
 target support by including <code>"targets"</code> in a mode.</p>
 <h2 id="modes"><a class="header" href="#modes">Modes</a></h2>
 <p>A mode is a named permission preset. The root agent runs in one mode at a time:</p>
-<pre><code class="language-toml"># The mode a new session starts in; "general" when omitted.
-default_mode = "readonly"
+<pre><code class="language-yaml"># The mode a new session starts in; "general" when omitted.
+default_mode: "readonly"
 
-[modes.readonly]
-capabilities = ["read", "network"]
-instructions = "Investigate and report. Do not change anything."
-hint = "Look things up without changing anything"
+modes:
+  readonly:
+    capabilities: ["read", "network"]
+    instructions: "Investigate and report. Do not change anything."
+    hint: "Look things up without changing anything"
 
-# Built in, and listed first. Declare it only to change what it grants.
-[modes.general]
-capabilities = ["read", "write", "exec", "network", "agents", "mcp"]
+  # Built in, and listed first. Declare it only to change what it grants.
+  general:
+    capabilities: ["read", "write", "exec", "network", "agents", "mcp"]
 </code></pre>
 <p><code>capabilities</code> is required, and <code>default_mode</code> must name <code>general</code> or a declared mode. Optional <code>instructions</code> are added to the system prompt of an agent
 running in the mode; they guide the model, whereas capabilities are enforced. An optional <code>hint</code>
@@ -655,44 +658,43 @@ connections. Per-server MCP requirements are additional gates, not grants.</p>
 <code>--capabilities</code> allowlist) to grant the target capability. It is not enabled by default.
 Without it, agents cannot use target-management tools or select another target, including from
 JavaScript. The <code>external_agent</code> example below also requires <code>ssh_agent</code>; see <a href="#agents">agents</a>.</p>
-<p>Targets are named directly under <code>[targets.&lt;name&gt;]</code>, and session tools can add or replace targets without
-modifying TOML. Skyhook never reads SSH configuration files: a target’s host, user, port,
+<p>Targets are named entries in the top-level <code>targets</code> mapping, and session tools can add or replace
+targets without modifying YAML. Skyhook never reads SSH configuration files: a target’s host, user, port,
 authentication, and options come only from its own definition. Aliases, <code>ProxyJump</code>, identities,
 and other settings in <code>~/.ssh/config</code> or <code>/etc/ssh/ssh_config</code> do not apply.</p>
 <p>When <a href="#file-selection-and-layering">user and workspace config are layered</a>,
 a workspace entry replaces the <strong>whole target with the same name</strong>; it does not inherit user SSH,
 authentication, or routing settings. Targets with other names are retained. Repeat any
 required settings in the replacement entry.</p>
-<pre><code class="language-toml">[targets.bastion]
-type = "ssh"
-host = "bastion.example.com"
+<pre><code class="language-yaml">targets:
+  bastion:
+    type: "ssh"
+    host: "bastion.example.com"
+    ssh:
+      user: "gateway"
+      external_agent: true
 
-[targets.bastion.ssh]
-user = "gateway"
-external_agent = true
+  build:
+    type: "ssh"
+    host: "build.internal"
+    workspace: "/srv/project"
+    via: "bastion"
+    ssh:
+      auth:
+        kind: "key"
+        path: "~/.ssh/build_ed25519"
 
-[targets.build]
-type = "ssh"
-host = "build.internal"
-workspace = "/srv/project"
-via = "bastion"
-
-[targets.build.ssh.auth]
-kind = "key"
-path = "~/.ssh/build_ed25519"
-
-[targets.database]
-type = "ssh"
-host = "db.internal"
-origin = "build"
-
-[targets.database.ssh]
-# Reach the host through a gateway using the deploy user's own SSH key on build.
-options = { ProxyCommand = "sudo -n -u deploy ssh -W %h:%p gateway.internal" }
+  database:
+    type: "ssh"
+    host: "db.internal"
+    origin: "build"
+    ssh:
+      # Reach the host through a gateway using the deploy user's own SSH key on build.
+      options: { ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal" }
 </code></pre>
 <p>Targets have an explicit <code>type</code>. The built-in <code>root</code> is <code>local</code>, meaning the session host—the machine
 running the main Skyhook process. It always identifies that machine, including when an agent’s
-current target is remote. Named target configuration and <code>target_add</code> accept only <code>type = "ssh"</code>.</p>
+current target is remote. Named target configuration and <code>target_add</code> accept only <code>type: "ssh"</code>.</p>
 <h2 id="routing-origin-and-via"><a class="header" href="#routing-origin-and-via">Routing: <code>origin</code> and <code>via</code></a></h2>
 <ul>
 <li><code>origin</code> names the target that starts the SSH connection; it defaults to <code>root</code>.
@@ -702,14 +704,15 @@ hosts need no shim. A <code>via</code> target must have the same <code>origin</c
 interpreted on another machine. Omit <code>via</code>, rather than naming the origin, to connect directly
 from the origin.</li>
 </ul>
-<p>Both may be set: <code>origin = "build"</code> with <code>via = "gateway"</code> makes <code>build</code> run SSH through <code>gateway</code>,
-where <code>gateway</code> also has <code>origin = "build"</code>.</p>
+<p>Both may be set: <code>origin: "build"</code> with <code>via: "gateway"</code> makes <code>build</code> run SSH through <code>gateway</code>,
+where <code>gateway</code> also has <code>origin: "build"</code>.</p>
 <p>Registering targets never connects to them; registrations are session-wide.</p>
 <pre><code class="language-javascript">await tool.target_add({name: "database", type: "ssh", host: "db.internal", origin: "build",
   ssh: {auth: {kind: "key", path: "~/.ssh/database"}}});
 </code></pre>
 <h2 id="ssh-settings"><a class="header" href="#ssh-settings">SSH settings</a></h2>
-<p>SSH settings live under <code>ssh</code>. Every setting is optional:</p>
+<p>SSH settings live under <code>ssh</code>. Every setting is optional. <code>options</code> values must be strings;
+quote numeric-looking values, for example <code>ServerAliveInterval: "15"</code>.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -719,7 +722,7 @@ where <code>gateway</code> also has <code>origin = "build"</code>.</p>
 <tr><td><code>user</code>, <code>port</code></td><td>Remote user (default: the origin’s username) and port (1–65535, default 22).</td></tr>
 <tr><td><code>auth</code></td><td><code>default</code> offers OpenSSH’s default key files (<code>~/.ssh/id_*</code>); <code>agent</code> offers only keys already in the agent; <code>key</code> with <code>path</code> offers one private key on the SSH origin.</td></tr>
 <tr><td><code>external_agent</code></td><td>Authenticate with, and forward, the agent the origin inherited in <code>SSH_AUTH_SOCK</code> instead of a private agent Skyhook runs on the origin. Keys are never added to it. Requires the <code>ssh_agent</code> capability; see <a href="#agents">agents</a>.</td></tr>
-<tr><td><code>options</code></td><td>Extra <code>ssh_config</code> options, written verbatim as in an ssh_config file, e.g. <code>{ ProxyCommand = "sudo -n -u deploy ssh -W %h:%p gateway.internal" }</code> to reach the host through a gateway with another user’s SSH key (commands run without a terminal, so <code>sudo</code> must not prompt). Use <code>%h</code> for the target host; <code>%n</code> is Skyhook’s internal host alias. Skyhook-managed settings cannot be overridden. These are rejected: <code>Host</code>, <code>Match</code>, <code>Include</code>, <code>HostName</code>, <code>User</code>, <code>Port</code>, <code>IdentityFile</code>, <code>IdentityAgent</code>, <code>AddKeysToAgent</code>, <code>BatchMode</code>, <code>ProxyJump</code>, <code>ControlMaster</code>, <code>ControlPath</code>, <code>ControlPersist</code>, <code>ForwardAgent</code>, <code>RemoteCommand</code>, <code>RequestTTY</code>, <code>SessionType</code>, <code>CanonicalizeHostname</code>, <code>SendEnv</code>, <code>SetEnv</code>, <code>ForwardX11</code>, and <code>ForwardX11Trusted</code>. <code>ProxyCommand</code> cannot be combined with <code>via</code>.</td></tr>
+<tr><td><code>options</code></td><td>Extra <code>ssh_config</code> options, written verbatim as in an ssh_config file, e.g. <code>{ ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal" }</code> to reach the host through a gateway with another user’s SSH key (commands run without a terminal, so <code>sudo</code> must not prompt). Use <code>%h</code> for the target host; <code>%n</code> is Skyhook’s internal host alias. Skyhook-managed settings cannot be overridden. These are rejected: <code>Host</code>, <code>Match</code>, <code>Include</code>, <code>HostName</code>, <code>User</code>, <code>Port</code>, <code>IdentityFile</code>, <code>IdentityAgent</code>, <code>AddKeysToAgent</code>, <code>BatchMode</code>, <code>ProxyJump</code>, <code>ControlMaster</code>, <code>ControlPath</code>, <code>ControlPersist</code>, <code>ForwardAgent</code>, <code>RemoteCommand</code>, <code>RequestTTY</code>, <code>SessionType</code>, <code>CanonicalizeHostname</code>, <code>SendEnv</code>, <code>SetEnv</code>, <code>ForwardX11</code>, and <code>ForwardX11Trusted</code>. <code>ProxyCommand</code> cannot be combined with <code>via</code>.</td></tr>
 </tbody>
 </table>
 </div>
@@ -773,7 +776,7 @@ selected target and workspace. For remote execution internals and shim builds, s
 <h2 id="instructions"><a class="header" href="#instructions">Instructions</a></h2>
 <p>Skyhook loads at most <strong>one user instruction file</strong> and <strong>one file in the exact resolved
 workspace directory</strong>. It does not walk workspace ancestors for instructions. <code>--workspace PATH</code>
-selects that workspace; <code>--config</code> selects only TOML configuration and does <strong>not</strong> suppress
+selects that workspace; <code>--config</code> selects only YAML configuration and does <strong>not</strong> suppress
 instruction discovery.</p>
 <p>Within each directory, filenames are checked in this order:</p>
 <ol>
@@ -814,6 +817,11 @@ files, conventionally grouped in <code>scripts/</code>, <code>references/</code>
 └── scripts/
     └── release.py
 </code></pre>
+<p>Skill YAML frontmatter may contain arbitrary metadata, but its values must be JSON-compatible:
+mappings with string keys, sequences, strings, booleans, finite numbers, and null. Duplicate or
+non-string keys, custom tags, non-finite numbers, and YAML <code>&lt;&lt;</code> merge keys are rejected. Anchors
+and aliases are supported with bounded expansion. A <code>description</code> must be a string; a skill with
+any other non-null description is skipped with a warning.</p>
 <h2 id="loading-and-copying-assets"><a class="header" href="#loading-and-copying-assets">Loading and copying assets</a></h2>
 <p>The examples below assume the <code>release</code> skill layout shown above.</p>
 <p>Only <code>name</code> is required by the <code>skill</code> input schema. <code>path</code> and <code>to</code> are optional and nullable;
@@ -844,72 +852,111 @@ browse the root.</p>
 asset discovery, UTF-8 and binary files, image attachments, copying, and path containment.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="configuration-overview"><a class="header" href="#configuration-overview">Configuration overview</a></h1>
-<p>Skyhook uses TOML configuration. The files are not rewritten when the terminal remembers a
+<p>Skyhook uses YAML configuration. The files are not rewritten when the terminal remembers a
 model.</p>
 <h2 id="file-selection-and-layering"><a class="header" href="#file-selection-and-layering">File selection and layering</a></h2>
-<p>With <strong><code>--config path.toml</code></strong>, Skyhook loads <strong>only that file</strong>. It does not search for or merge
-user or workspace configuration, even if the explicit file fails to load.</p>
+<p>With <strong><code>--config path.yaml</code></strong>, Skyhook loads <strong>only that file</strong>. It does not search for or merge
+user or workspace configuration, even if the explicit file fails to load. The contents are always
+parsed as YAML, regardless of the filename suffix.</p>
 <p>Without <code>--config</code>, Skyhook:</p>
 <ol>
-<li>Tries <code>$XDG_CONFIG_HOME/skyhook/config.toml</code>, when that environment variable is set.</li>
-<li>On <strong>any read, TOML parse, or structural error</strong>, tries <code>$HOME/.config/skyhook/config.toml</code>.
+<li>Tries <code>$XDG_CONFIG_HOME/skyhook/config.yaml</code>, when that environment variable is set.</li>
+<li>On <strong>any read, YAML parse, or structural error</strong>, tries <code>$HOME/.config/skyhook/config.yaml</code>.
 At most one user file is selected; the two user files are never merged.</li>
-<li>Overlays <code>&lt;resolved workspace&gt;/.skyhook/config.toml</code> if it exists. <code>--workspace PATH</code>
+<li>Overlays <code>&lt;resolved workspace&gt;/.skyhook/config.yaml</code> if it exists. <code>--workspace PATH</code>
 selects the workspace; otherwise it is the invocation directory. No ancestor workspace
 configurations are loaded. An unreadable or invalid workspace file is an error.</li>
 </ol>
+<p>Automatic discovery uses only <code>config.yaml</code>, not <code>config.yml</code> or <code>config.toml</code>; there is no TOML
+fallback.</p>
 <p>Missing optional user files are fine: a complete workspace-only configuration can be used.
 A broken user file is not silently treated as missing if no fallback succeeds. The effective
 configuration must be valid; defaults are applied <strong>after merging</strong>.</p>
-<p>Tables merge recursively; arrays and scalar values replace the earlier value. The exception is
+<p>Mappings merge recursively; sequences and scalar values replace the earlier value. The exception is
 <strong>named entries under <code>targets</code> and <code>modes</code></strong>: a workspace entry replaces the <em>whole</em> user
-entry of the same name, without inheriting omitted fields. For example, <code>[targets.build]</code>
-replaces that target’s SSH, authentication, workspace, and routing settings; <code>[modes.general]</code>
-replaces that mode’s capabilities, instructions, and hint. Other named entries remain available.</p>
+entry of the same name, without inheriting omitted fields. For example, <code>targets.build</code>
+replaces that target’s SSH, authentication, workspace, and routing settings; <code>modes.general</code>
+replaces that mode’s capabilities, instructions, and hint. Other named entries remain available.
+An explicit <code>null</code> replaces the earlier value: it clears an optional field, but is not a deletion
+operator for map entries. Required fields and named entries must still have valid values.</p>
 <h3 id="example-user-models-workspace-targets"><a class="header" href="#example-user-models-workspace-targets">Example: user models, workspace targets</a></h3>
-<p>Keep provider/model definitions in the selected user <code>config.toml</code>:</p>
-<pre><code class="language-toml">[providers.openai]
-kind = "openai"
-base_url = "https://api.openai.com/v1"
-api = "responses"
-api_key_env = "OPENAI_API_KEY"
+<p>Keep provider/model definitions in the selected user <code>config.yaml</code>:</p>
+<pre><code class="language-yaml">providers:
+  openai:
+    kind: "openai"
+    base_url: "https://api.openai.com/v1"
+    api: "responses"
+    api_key_env: "OPENAI_API_KEY"
 
-[models.default]
-provider = "openai"
-model = "gpt-5.6"
-max_context = 1050000
-max_output = 128000
+models:
+  default:
+    provider: "openai"
+    model: "gpt-5.6"
+    max_context: 1050000
+    max_output: 128000
 
-[targets.bastion]
-type = "ssh"
-host = "bastion.example.com"
+targets:
+  bastion:
+    type: "ssh"
+    host: "bastion.example.com"
 
-[targets.build]
-type = "ssh"
-host = "old-build.internal"
-via = "bastion"
-
-[targets.build.ssh.auth]
-kind = "key"
-path = "~/.ssh/old-build"
+  build:
+    type: "ssh"
+    host: "old-build.internal"
+    via: "bastion"
+    ssh:
+      auth:
+        kind: "key"
+        path: "~/.ssh/old-build"
 </code></pre>
-<p>Then use this <code>&lt;workspace&gt;/.skyhook/config.toml</code>:</p>
-<pre><code class="language-toml">[modes.general]
-capabilities = ["read", "write", "exec", "targets"]
+<p>Then use this <code>&lt;workspace&gt;/.skyhook/config.yaml</code>:</p>
+<pre><code class="language-yaml">modes:
+  general:
+    capabilities: ["read", "write", "exec", "targets"]
 
-[targets.build]
-type = "ssh"
-host = "new-build.example.com"
-workspace = "/srv/project"
+targets:
+  build:
+    type: "ssh"
+    host: "new-build.example.com"
+    workspace: "/srv/project"
 </code></pre>
 <p>The effective configuration retains <code>providers.openai</code>, <code>models.default</code>, and <code>targets.bastion</code>.
 A named mode or target is replaced whole, not merged: <code>modes.general</code> grants exactly the listed
 capabilities, and <code>targets.build</code> uses the new host and workspace,
-with default authentication/routing behavior: neither the old key nor <code>via = "bastion"</code> survives.
+with default authentication/routing behavior: neither the old key nor <code>via: "bastion"</code> survives.
 If a route or key is needed, repeat it explicitly in the workspace entry.</p>
 <p><strong>Trust boundary:</strong> workspace configuration is full configuration, not a restricted project hint.
 It can change approvals, modes, provider credential commands, and MCP server startup.
 Review it before starting Skyhook in an untrusted checkout.</p>
+<h2 id="yaml-syntax-and-strings"><a class="header" href="#yaml-syntax-and-strings">YAML syntax and strings</a></h2>
+<p>Each file must contain a single YAML document with a <strong>mapping (object) at its root</strong>. Empty or
+comment-only documents, null roots, and sequence or scalar roots are rejected. An empty mapping
+(<code>{}</code>) is a valid no-op workspace overlay, but an empty effective configuration is invalid.</p>
+<p>Values must be JSON-compatible: mappings with string keys, sequences, strings, booleans, finite
+numbers, and null. Duplicate keys, non-string keys, custom tags, non-finite numbers, multiple
+documents, and YAML <code>&lt;&lt;</code> merge keys are rejected. Anchors and aliases are supported with bounded
+expansion. YAML merge keys are unrelated to Skyhook’s file layering.</p>
+<p>Use indentation for nested settings, not dotted table headers. Quote values that must stay strings,
+especially numeric-looking SSH options and environment values: <code>ServerAliveInterval: "15"</code> and
+<code>WORKERS: "4"</code>, not unquoted numbers. Actual numeric settings such as <code>max_context</code> remain numbers.</p>
+<p>For multiline instructions or shell-command strings, a literal block scalar preserves line breaks:</p>
+<pre><code class="language-yaml">modes:
+  readonly:
+    capabilities: ["read", "network"]
+    instructions: |-
+      Investigate and report.
+      Do not change anything.
+</code></pre>
+<p><code>|-</code> omits the final newline; use <code>|</code> if the string should end with a newline. Folded blocks
+(<code>&gt;</code> or <code>&gt;-</code>) turn ordinary line breaks into spaces, so use them only when that is intended.
+MCP <code>start_command</code> remains a sequence of argument strings, not a shell-command block.</p>
+<h2 id="migrating-from-toml"><a class="header" href="#migrating-from-toml">Migrating from TOML</a></h2>
+<p>Manually convert the contents of each old <code>config.toml</code> to YAML, then rename it to <code>config.yaml</code>.
+Replace table headers with nested mappings and <code>key = value</code> assignments with <code>key: value</code>;
+keep the same configuration keys, values, and model declaration order. Check quoting and multiline
+string whitespace rather than only changing punctuation. Update explicit <code>--config</code> paths too.
+Renaming alone does not convert TOML, and Skyhook does not convert files automatically or fall back
+to the old format. Use <code>skyhook dump config</code> to validate and inspect the effective YAML.</p>
 <h2 id="paths-and-environment"><a class="header" href="#paths-and-environment">Paths and environment</a></h2>
 <p>Relative MCP <code>cwd</code> values resolve against the directory of the <strong>source file defining that
 value</strong>. A user-defined <code>cwd</code> keeps its user-file base when other MCP fields are overlaid;
@@ -925,9 +972,9 @@ See <a href="#api-keys-and-environment-files">authentication</a>.</p>
 <h2 id="inspect-without-starting-a-session"><a class="header" href="#inspect-without-starting-a-session">Inspect without starting a session</a></h2>
 <pre><code class="language-sh">skyhook dump --workspace /path/to/project         # Same as dump config
 skyhook dump config --workspace /path/to/project --approve-all
-skyhook dump config --config ./standalone.toml    # Explicit file only
+skyhook dump config --config ./standalone.yaml    # Explicit file only
 </code></pre>
-<p>These commands write resolved effective TOML to stdout and source paths/diagnostics to stderr.
+<p>These commands write resolved effective YAML to stdout and source paths/diagnostics to stderr.
 They apply defaults and applicable CLI policy overrides without requiring API credentials,
 starting MCP servers, or making network requests. Exit status is zero for a valid dump and
 nonzero if valid configuration cannot be produced. See <a href="#dump">dump</a>
@@ -946,15 +993,15 @@ and authentication.</li>
 </ul>
 <h2 id="complete-example"><a class="header" href="#complete-example">Complete example</a></h2>
 <p>This is included from the repository’s single maintained
-<a href="https://github.com/kryesh/skyhook/blob/main/config.example.toml"><code>config.example.toml</code></a>.
+<a href="https://github.com/kryesh/skyhook/blob/main/config.example.yaml"><code>config.example.yaml</code></a>.
 It demonstrates multiple providers; remove unused profiles or supply their credentials before
 running a session. For a minimal configuration, follow <a href="#your-first-session">your first session</a>.</p>
-<pre><code class="language-toml"># The interface remembers the most recently selected model.
+<pre><code class="language-yaml"># The interface remembers the most recently selected model.
 # With no saved selection, the first declared model below is used.
 # Set to true to skip interactive approval for every tool call.
-approve_all = false
+approve_all: false
 # The mode a new session starts in: the built-in general, or one declared below.
-# default_mode = "general"
+# default_mode: "general"
 
 # Modes are named permission presets. A mode's capabilities are an exact allowlist ([] grants
 # none); add "targets" for remote-target tools, arguments, JavaScript APIs, and guidance.
@@ -963,130 +1010,134 @@ approve_all = false
 # A hint, on a mode or a model, offers it to agents starting a child; others cannot be chosen.
 # The terminal switches modes with Tab/Shift+Tab in the composer; --mode picks the starting one.
 # This built-in mode always exists; declare it to change what it grants:
-# [modes.general]
-# capabilities = ["read", "write", "exec", "network", "agents", "mcp"]
+# modes:
+#   general:
+#     capabilities: ["read", "write", "exec", "network", "agents", "mcp"]
 #
-# [modes.readonly]
-# capabilities = ["read", "network"]
-# instructions = "Investigate and report. Do not change anything."
-# hint = "Look things up without changing anything"
+#   readonly:
+#     capabilities: ["read", "network"]
+#     instructions: "Investigate and report. Do not change anything."
+#     hint: "Look things up without changing anything"
 
 # The CLI loads .env from its invocation directory (not --workspace or the config directory).
 # Existing process environment variables take precedence; no parent-directory search.
 # Host environment and .env values are not forwarded to remote targets.
-[providers.openai]
-kind = "openai"
-base_url = "https://api.openai.com/v1"
-api = "responses"
-api_key_env = "OPENAI_API_KEY"
+providers:
+  openai:
+    kind: "openai"
+    base_url: "https://api.openai.com/v1"
+    api: "responses"
+    api_key_env: "OPENAI_API_KEY"
 
-[providers.anthropic]
-kind = "anthropic"
-base_url = "https://api.anthropic.com/v1"
-api_key_env = "ANTHROPIC_API_KEY"
-# Alternatively, remove api_key_env and retrieve a key lazily on the first request:
-# api_key_command = "op read 'op://Private/Anthropic/api-key'"
-# Runs via /bin/sh -c on the host; trimmed stdout is cached for this provider.
-# Also supported by OpenAI-compatible providers; cannot be combined with api_key_env.
+  anthropic:
+    kind: "anthropic"
+    base_url: "https://api.anthropic.com/v1"
+    api_key_env: "ANTHROPIC_API_KEY"
+    # Alternatively, remove api_key_env and retrieve a key lazily on the first request:
+    # api_key_command: "op read 'op://Private/Anthropic/api-key'"
+    # Runs via /bin/sh -c on the host; trimmed stdout is cached for this provider.
+    # Also supported by OpenAI-compatible providers; cannot be combined with api_key_env.
 
-# Run `skyhook auth login` (or `skyhook auth login --headless`) first.
-# Credentials belong to Skyhook; official Codex client credentials are never accessed.
-[providers.codex]
-kind = "codex"
+  # Run `skyhook auth login` (or `skyhook auth login --headless`) first.
+  # Credentials belong to Skyhook; official Codex client credentials are never accessed.
+  codex:
+    kind: "codex"
 
-# Keyless local llama.cpp endpoint; the model alias matches --alias below.
-# Example text-only server (requires enough memory for the configured context):
-# llama-server --model /path/to/Qwen3.8-27B.gguf --alias qwen3.8-27b \
-#   --host 127.0.0.1 --port 8080 --ctx-size 262144 --parallel 1 --n-predict 131072
-[providers.local]
-kind = "openai"
-base_url = "http://127.0.0.1:8080/v1"
-api = "chat_completions"
-# Chat-only, per-provider. Default "reasoning_content" replays returned reasoning.
-# Use "reasoning" for that wire convention, or "unsupported" to keep it local only.
-# Other protocols replay native reasoning automatically and do not accept this option.
-# chat_reasoning_replay = "reasoning_content"
-# Defaults allow long local-model prefills. Startup applies to EACH HTTP attempt.
-# startup_timeout_secs = 600
-# read_idle_timeout_secs = 600
+  # Keyless local llama.cpp endpoint; the model alias matches --alias below.
+  # Example text-only server (requires enough memory for the configured context):
+  # llama-server --model /path/to/Qwen3.8-27B.gguf --alias qwen3.8-27b \
+  #   --host 127.0.0.1 --port 8080 --ctx-size 262144 --parallel 1 --n-predict 131072
+  local:
+    kind: "openai"
+    base_url: "http://127.0.0.1:8080/v1"
+    api: "chat_completions"
+    # Chat-only, per-provider. Default "reasoning_content" replays returned reasoning.
+    # Use "reasoning" for that wire convention, or "unsupported" to keep it local only.
+    # Other protocols replay native reasoning automatically and do not accept this option.
+    # chat_reasoning_replay: "reasoning_content"
+    # Defaults allow long local-model prefills. Startup applies to EACH HTTP attempt.
+    # startup_timeout_secs: 600
+    # read_idle_timeout_secs: 600
 
 # Published model limits; smaller budgets can be chosen for cost/latency.
-# https://developers.openai.com/api/docs/models/gpt-5.6-sol
-[models.openai]
-provider = "openai"
-model = "gpt-5.6"
-reasoning = "high"
-max_context = 1050000
-max_output = 128000
-supports_images = true
+models:
+  # https://developers.openai.com/api/docs/models/gpt-5.6-sol
+  openai:
+    provider: "openai"
+    model: "gpt-5.6"
+    reasoning: "high"
+    max_context: 1050000
+    max_output: 128000
+    supports_images: true
 
-# https://platform.claude.com/docs/en/models/sonnet-4-6/overview
-[models.sonnet]
-provider = "anthropic"
-model = "claude-sonnet-4-6"
-reasoning = "high"
-max_context = 1000000
-max_output = 128000
-supports_images = true
+  # https://platform.claude.com/docs/en/models/sonnet-4-6/overview
+  sonnet:
+    provider: "anthropic"
+    model: "claude-sonnet-4-6"
+    reasoning: "high"
+    max_context: 1000000
+    max_output: 128000
+    supports_images: true
 
-# Codex's catalog advertises a maximum context of 872000 (default: 272000).
-# https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json
-# max_output is required profile metadata, but is not sent to the Codex endpoint.
-# It does not control the 80%-of-context compaction threshold.
-[models.codex]
-provider = "codex"
-model = "gpt-5.6-sol"
-reasoning = "high"
-max_context = 872000
-max_output = 128000
-supports_images = true
+  # Codex's catalog advertises a maximum context of 872000 (default: 272000).
+  # https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json
+  # max_output is required profile metadata, but is not sent to the Codex endpoint.
+  # It does not control the 80%-of-context compaction threshold.
+  codex:
+    provider: "codex"
+    model: "gpt-5.6-sol"
+    reasoning: "high"
+    max_context: 872000
+    max_output: 128000
+    supports_images: true
 
-# https://huggingface.co/Qwen/Qwen3.8-27B
-[models.local]
-provider = "local"
-model = "qwen3.8-27b"
-# Native context; match the llama-server per-slot context, not extended-context claims.
-max_context = 262144
-# Chosen total-generation cap matching --n-predict, NOT a published hard model limit.
-# Reasoning and final text share this allowance and the overall context window.
-max_output = 131072
-# The text-only server above has no multimodal projector configured.
-supports_images = false
-# Adding a hint makes the model available to be used for delegation by other agents
-hint = "Local model, good at exploration and logic but not writing"
+  # https://huggingface.co/Qwen/Qwen3.8-27B
+  local:
+    provider: "local"
+    model: "qwen3.8-27b"
+    # Native context; match the llama-server per-slot context, not extended-context claims.
+    max_context: 262144
+    # Chosen total-generation cap matching --n-predict, NOT a published hard model limit.
+    # Reasoning and final text share this allowance and the overall context window.
+    max_output: 131072
+    # The text-only server above has no multimodal projector configured.
+    supports_images: false
+    # Adding a hint makes the model available to be used for delegation by other agents
+    hint: "Local model, good at exploration and logic but not writing"
 
 # Targets are defined only here or by target_add; SSH configuration files are never read.
 
-# [targets.bastion]
-# type = "ssh"
-# host = "bastion.example.com"
-# [targets.bastion.ssh]
-# user = "gateway"
+# targets:
+#   bastion:
+#     type: "ssh"
+#     host: "bastion.example.com"
+#     ssh:
+#       user: "gateway"
 #
-# [targets.build]
-# type = "ssh"
-# host = "build.internal"
-# workspace = "/srv/project"
-# via = "bastion"
+#   build:
+#     type: "ssh"
+#     host: "build.internal"
+#     workspace: "/srv/project"
+#     via: "bastion"
+#     ssh:
+#       user: "builder"
+#       auth:
+#         kind: "key"
+#         path: "~/.ssh/build_ed25519"
 #
-# [targets.build.ssh]
-# user = "builder"
-#
-# [targets.build.ssh.auth]
-# kind = "key"
-# path = "~/.ssh/build_ed25519"
-#
-# Start SSH on build's shim (using build's key paths and agents), with extra
-# ssh_config options. Any via jump must also use origin = "build".
-# [targets.appliance]
-# type = "ssh"
-# host = "appliance.internal"
-# origin = "build"
-# [targets.appliance.ssh]
-# Reach the host through a gateway using the deploy user's own SSH key (sudo must not prompt).
-# options = { ProxyCommand = "sudo -n -u deploy ssh -W %h:%p gateway.internal", ServerAliveInterval = "15" }
+#   # Start SSH on build's shim (using build's key paths and agents), with extra
+#   # ssh_config options. Any via jump must also use origin: "build".
+#   appliance:
+#     type: "ssh"
+#     host: "appliance.internal"
+#     origin: "build"
+#     ssh:
+#       # Reach the host through a gateway using the deploy user's own SSH key (sudo must not prompt).
+#       options:
+#         ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal"
+#         ServerAliveInterval: "15"
 
-# MCP servers are optional; an absent/empty [mcp] adds no tools or prompt guidance.
+# MCP servers are optional; an absent/empty mcp mapping adds no tools or prompt guidance.
 # Commands in this user config are trusted: startup runs without model approval,
 # only on the local root/session host, never on a selected SSH target.
 # Global "mcp" capability is required before any server is launched or contacted.
@@ -1097,32 +1148,33 @@ hint = "Local model, good at exploration and logic but not writing"
 # and are skipped. Tools are available both directly and inside script. Native
 # input schemas are kept unless open/conflicting, when input uses `arguments`.
 #
-# [mcp.files]
-# transport = "stdio"
-# start_command = ["my-mcp-server", "--root", "/srv/project"] # argv, not shell text
-# capabilities = ["read"]
-# startup_timeout_secs = 30  # Positive integer seconds; default 30.
-# call_timeout_secs = 120   # Positive integer seconds; default 120.
-# cwd = "mcp-work"          # Relative to this config file's directory.
-# env = { LOG_LEVEL = "warn" } # Startup process environment overrides, not secrets.
+# mcp:
+#   files:
+#     transport: "stdio"
+#     start_command: ["my-mcp-server", "--root", "/srv/project"] # argv, not shell text
+#     capabilities: ["read"]
+#     startup_timeout_secs: 30  # Positive integer seconds; default 30.
+#     call_timeout_secs: 120    # Positive integer seconds; default 120.
+#     cwd: "mcp-work"           # Relative to this config file's directory.
+#     env: { LOG_LEVEL: "warn" } # Startup process environment overrides, not secrets.
 #
-# [mcp.service]
-# transport = "streamable_http"
-# url = "http://127.0.0.1:8080/mcp" # Full MCP endpoint; legacy HTTP+SSE unsupported.
-# capabilities = ["read", "write"]
-# headers_env = { Authorization = "MY_MCP_AUTHORIZATION" } # Env var, not secret.
-# The variable must be set to a valid HTTP header value, e.g. Bearer ...
-# Missing/non-Unicode variables fail startup; empty values are passed through.
-# Connect first. Start this optional local command ONLY if the endpoint is unreachable,
-# never for authentication or protocol errors. cwd/env require start_command.
-# start_command = ["my-http-mcp-server", "--port", "8080"]
+#   service:
+#     transport: "streamable_http"
+#     url: "http://127.0.0.1:8080/mcp" # Full MCP endpoint; legacy HTTP+SSE unsupported.
+#     capabilities: ["read", "write"]
+#     headers_env: { Authorization: "MY_MCP_AUTHORIZATION" } # Env var, not secret.
+#     # The variable must be set to a valid HTTP header value, e.g. Bearer ...
+#     # Missing/non-Unicode variables fail startup; empty values are passed through.
+#     # Connect first. Start this optional local command ONLY if the endpoint is unreachable,
+#     # never for authentication or protocol errors. cwd/env require start_command.
+#     start_command: ["my-http-mcp-server", "--port", "8080"]
 # Stdio requires start_command and rejects url/headers_env; HTTP requires url.
 # Unknown fields/capabilities, invalid combinations, and invalid timeouts are errors.
 </code></pre>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="providers-and-models"><a class="header" href="#providers-and-models">Providers and models</a></h1>
 <p>Providers and models are separate named profiles. API secrets can be read from environment variables
-or retrieved lazily by a command; no literal API-key field is supported in TOML. <code>openai</code> requires
+or retrieved lazily by a command; no literal API-key field is supported in YAML. <code>openai</code> requires
 an explicit <code>base_url</code> and <code>api</code> (<code>chat_completions</code> or <code>responses</code>); <code>anthropic</code> requires an explicit
 <code>base_url</code>. Both accept either <code>api_key_env</code> or <code>api_key_command</code>, or neither for a keyless endpoint.
 URLs name the API root: Skyhook appends
@@ -1176,19 +1228,21 @@ Use a compatible llama.cpp build and GGUF, and configure one server slot explici
   --jinja --reasoning-format deepseek
 </code></pre>
 <p>Then configure Skyhook to match:</p>
-<pre><code class="language-toml">approve_all = false
+<pre><code class="language-yaml">approve_all: false
 
-[providers.local]
-kind = "openai"
-base_url = "http://127.0.0.1:8080/v1"
-api = "chat_completions"
+providers:
+  local:
+    kind: "openai"
+    base_url: "http://127.0.0.1:8080/v1"
+    api: "chat_completions"
 
-[models.local]
-provider = "local"
-model = "qwen3.8-27b"
-max_context = 262144
-max_output = 131072
-supports_images = false
+models:
+  local:
+    provider: "local"
+    model: "qwen3.8-27b"
+    max_context: 262144
+    max_output: 131072
+    supports_images: false
 </code></pre>
 <p>Here <strong>131,072 is a chosen total-generation cap</strong>, matching <code>--n-predict</code>, not a published
 hard output limit of Qwen3.8-27B. Qwen recommends separate reasoning and final-response budgets
@@ -1242,16 +1296,17 @@ replay their returned reasoning using <strong><code>reasoning_content</code> by 
 llama.cpp and SGLang, and accepted as an alias by current vLLM. Ordinary Chat responses without
 reasoning do not acquire an invented reasoning field. Configure a different spelling or disable
 request replay on the <strong>provider</strong>, not individual model profiles:</p>
-<pre><code class="language-toml">[providers.local]
-kind = "openai"
-base_url = "http://127.0.0.1:8080/v1"
-api = "chat_completions"
-# Optional; this is the default:
-chat_reasoning_replay = "reasoning_content"
-# Alternatives: "reasoning", or "unsupported" to keep reasoning locally only.
+<pre><code class="language-yaml">providers:
+  local:
+    kind: "openai"
+    base_url: "http://127.0.0.1:8080/v1"
+    api: "chat_completions"
+    # Optional; this is the default:
+    chat_reasoning_replay: "reasoning_content"
+    # Alternatives: "reasoning", or "unsupported" to keep reasoning locally only.
 </code></pre>
 <p>This option belongs only to OpenAI-compatible Chat Completions. Anthropic and Codex reject it as an
-unknown setting; configuring it with <code>api = "responses"</code> is also rejected. Their native reasoning
+unknown setting; configuring it with <code>api: "responses"</code> is also rejected. Their native reasoning
 replay remains automatic and independent of this option. All models using a provider share its
 Chat convention; use separate provider entries if a proxy routes to incompatible conventions.</p>
 <p>Reasoning is replayed with its owning assistant turn, including tool calls and reasoning-only turns;
@@ -1263,12 +1318,13 @@ honours <code>max_tokens</code> ignores the limit.</p>
 <p>OpenAI-compatible and Anthropic providers also accept positive <code>startup_timeout_secs</code> and
 <code>read_idle_timeout_secs</code> settings (both default to 600 seconds). Startup is a deadline for each HTTP
 attempt, while read-idle resets after each response-body chunk. For example:</p>
-<pre><code class="language-toml">[providers.local]
-kind = "openai"
-base_url = "http://127.0.0.1:8080/v1"
-api = "chat_completions"
-startup_timeout_secs = 600
-read_idle_timeout_secs = 600
+<pre><code class="language-yaml">providers:
+  local:
+    kind: "openai"
+    base_url: "http://127.0.0.1:8080/v1"
+    api: "chat_completions"
+    startup_timeout_secs: 600
+    read_idle_timeout_secs: 600
 </code></pre>
 <p>Each retry gets fresh deadlines, so these settings do not limit the total time spent on a
 response. Cancel the request to stop waiting; the server may continue processing if it does not
@@ -1280,12 +1336,13 @@ context budgeting and compaction.</p>
 <h1 id="authentication"><a class="header" href="#authentication">Authentication</a></h1>
 <h2 id="api-keys-and-environment-files"><a class="header" href="#api-keys-and-environment-files">API keys and environment files</a></h2>
 <p>Reference an environment variable with <code>api_key_env</code>, or use a command to retrieve the key:</p>
-<pre><code class="language-toml">[providers.anthropic]
-kind = "anthropic"
-base_url = "https://api.anthropic.com/v1"
-api_key_env = "ANTHROPIC_API_KEY"
-# Alternatively, remove api_key_env and use:
-# api_key_command = "op read 'op://Private/Anthropic/api-key'"
+<pre><code class="language-yaml">providers:
+  anthropic:
+    kind: "anthropic"
+    base_url: "https://api.anthropic.com/v1"
+    api_key_env: "ANTHROPIC_API_KEY"
+    # Alternatively, remove api_key_env and use:
+    # api_key_command: "op read 'op://Private/Anthropic/api-key'"
 </code></pre>
 <p><code>api_key_env</code> and <code>api_key_command</code> are mutually exclusive. Environment-variable keys are resolved
 when the provider is built and must be present and nonblank. Commands are run only on the provider’s
@@ -1327,26 +1384,27 @@ credential files. Secure Codex credential storage currently requires Unix; other
 explicitly rather than writing tokens without private file permissions.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="mcp-servers"><a class="header" href="#mcp-servers">MCP servers</a></h1>
-<p>Configure Model Context Protocol servers in the top-level <strong><code>mcp</code></strong> map, with one named
-<code>[mcp.&lt;name&gt;]</code> table per server. The map defaults to empty: no MCP connections, tools, or MCP prompt
+<p>Configure Model Context Protocol servers in the top-level <strong><code>mcp</code></strong> mapping, with one named
+mapping per server. It defaults to empty: no MCP connections, tools, or MCP prompt
 guidance are added unless servers are configured. Skyhook supports <strong>stdio</strong> and <strong>Streamable HTTP</strong>;
 legacy HTTP+SSE transport is not supported.</p>
-<pre><code class="language-toml">[mcp.files]
-transport = "stdio"
-start_command = ["my-mcp-server", "--root", "/srv/project"]
-capabilities = ["read"]
-cwd = "mcp-work"                    # Relative to the source config file's directory.
-env = { LOG_LEVEL = "warn" }       # Environment overrides for the launched process.
-startup_timeout_secs = 30           # Default; must be a positive integer.
-call_timeout_secs = 120             # Default; must be a positive integer.
+<pre><code class="language-yaml">mcp:
+  files:
+    transport: "stdio"
+    start_command: ["my-mcp-server", "--root", "/srv/project"]
+    capabilities: ["read"]
+    cwd: "mcp-work"                  # Relative to the source config file's directory.
+    env: { LOG_LEVEL: "warn" }        # Environment overrides for the launched process.
+    startup_timeout_secs: 30         # Default; must be a positive integer.
+    call_timeout_secs: 120           # Default; must be a positive integer.
 
-[mcp.service]
-transport = "streamable_http"
-url = "http://127.0.0.1:8080/mcp"    # Full MCP endpoint, not an API root.
-capabilities = ["read", "write"]
-headers_env = { Authorization = "MY_MCP_AUTHORIZATION" }
-# Optional local startup fallback, only when the endpoint is unreachable:
-# start_command = ["my-http-mcp-server", "--port", "8080"]
+  service:
+    transport: "streamable_http"
+    url: "http://127.0.0.1:8080/mcp"    # Full MCP endpoint, not an API root.
+    capabilities: ["read", "write"]
+    headers_env: { Authorization: "MY_MCP_AUTHORIZATION" }
+    # Optional local startup fallback, only when the endpoint is unreachable:
+    # start_command: ["my-http-mcp-server", "--port", "8080"]
 </code></pre>
 <h2 id="connections-and-credentials"><a class="header" href="#connections-and-credentials">Connections and credentials</a></h2>
 <p><code>start_command</code> is an argument vector, not shell text; its first element must name a nonempty
@@ -1357,20 +1415,21 @@ unreachable—not on authentication, protocol, or other server errors. <code>cwd
 resolved against the directory of the source configuration file that defines the value, not the
 agent workspace. When user and workspace config are layered, an inherited user <code>cwd</code> retains its
 user-file base; an overlaid workspace <code>cwd</code> uses <code>&lt;workspace&gt;/.skyhook</code>. Timeouts must be positive
-whole seconds. Unknown settings and invalid transport combinations are rejected.</p>
+whole seconds. Unknown settings and invalid transport combinations are rejected. Environment
+values must be strings; quote numeric-looking values such as <code>WORKERS: "4"</code>.</p>
 <p>HTTP <code>headers_env</code> maps header names to environment-variable names. The variable’s complete value
 is sent as the header (for example, <code>MY_MCP_AUTHORIZATION</code> can contain <code>Bearer ...</code>); secrets do not
-belong in TOML. Missing or non-Unicode variables, invalid header names, and values that cannot be
+belong in YAML. Missing or non-Unicode variables, invalid header names, and values that cannot be
 encoded as HTTP headers prevent that server’s connection from starting. Empty header values are
 passed through to the server. Do not put secrets in <code>start_command</code> arguments or literal <code>env</code> values.</p>
 <h2 id="trust-and-permissions"><a class="header" href="#trust-and-permissions">Trust and permissions</a></h2>
 <p><strong>Trust boundary:</strong> configured startup commands are trusted configuration, including commands
-from a workspace <code>.skyhook/config.toml</code> overlay. Review workspace config before use. They run during
+from a workspace <code>.skyhook/config.yaml</code> overlay. Review workspace config before use. They run during
 session startup without a model tool-approval prompt, only on the local root/session host—not on
 selected SSH targets. Only configure commands and endpoints you trust. Child agents share the
 session’s MCP connections rather than starting their own servers.</p>
 <p>The session must hold the global <strong><code>mcp</code> capability</strong> before any MCP server is launched or contacted,
-and before any MCP tool can be exposed or invoked. Each server’s <code>capabilities</code> array defaults to
+and before any MCP tool can be exposed or invoked. Each server’s <code>capabilities</code> sequence defaults to
 <code>[]</code> and adds requirements to that global gate. Valid names are <code>read</code>, <code>write</code>, <code>exec</code>, <code>network</code>,
 <code>targets</code>, <code>ssh_agent</code>, <code>agents</code>, <code>interactive</code>, and <code>mcp</code>. An agent must hold <strong>all</strong> listed capabilities to see
 or call a server’s tools; otherwise those tools are hidden from both the model catalog and
@@ -1562,7 +1621,7 @@ binary’s command help. <code>skyhook</code> itself requires an interactive ter
 <tr><th>Option</th><th>Meaning</th></tr>
 </thead>
 <tbody>
-<tr><td><code>-c, --config PATH</code></td><td>Use only this TOML file; disable user/workspace config searching and merging.</td></tr>
+<tr><td><code>-c, --config PATH</code></td><td>Use only this file (YAML regardless of suffix); disable user/workspace config searching and merging.</td></tr>
 <tr><td><code>-w, --workspace PATH</code></td><td>Set the workspace base directory (default <code>.</code>).</td></tr>
 <tr><td><code>--resume SESSION_ID</code></td><td>Reopen a saved session.</td></tr>
 <tr><td><code>-m, --model PROFILE</code></td><td>Choose a configured model profile for a new session. Resumed sessions retain their recorded model.</td></tr>
@@ -1610,26 +1669,26 @@ signals, and interaction restrictions.</p>
 </thead>
 <tbody>
 <tr><td><code>-w, --workspace PATH</code></td><td>Workspace whose configuration or skills to inspect (default <code>.</code>).</td></tr>
-<tr><td><code>-c, --config PATH</code></td><td><code>config</code> only: use only this TOML file, with no user/workspace merging.</td></tr>
+<tr><td><code>-c, --config PATH</code></td><td><code>config</code> only: use only this file (YAML regardless of suffix), with no user/workspace merging.</td></tr>
 <tr><td><code>-a, --approve-all</code></td><td><code>config</code> only: apply the approval override.</td></tr>
 </tbody>
 </table>
 </div>
-<pre><code class="language-sh">skyhook dump                          # Resolved effective TOML
-skyhook dump config &gt; effective.toml
+<pre><code class="language-sh">skyhook dump                          # Resolved effective YAML
+skyhook dump config &gt; effective.yaml
 skyhook dump config --workspace /path/to/project
-skyhook dump config --config ./standalone.toml --approve-all
+skyhook dump config --config ./standalone.yaml --approve-all
 skyhook dump skills --workspace /path/to/project
 </code></pre>
 <p>Both modes are inspection-only: they do not start a session, run provider credential commands,
 connect to MCP servers, access the network, or execute skill assets. API credentials are not
 required. <code>dump skills</code> rejects <code>--config</code> and <code>--approve-all</code> as irrelevant.</p>
 <h3 id="configuration-dump"><a class="header" href="#configuration-dump">Configuration dump</a></h3>
-<p>The config dump writes the resolved effective configuration as TOML to <strong>stdout</strong>. It follows
+<p>The config dump writes the resolved effective configuration as YAML to <strong>stdout</strong>. It follows
 normal <a href="#file-selection-and-layering">file selection and layering</a>,
 including explicit-file-only behavior for <code>--config</code>, and includes defaults (such as the
 built-in <code>general</code> mode) plus any <code>--approve-all</code> override. Source paths and diagnostics go to <strong>stderr</strong>,
-so redirected stdout remains TOML. It exits with status <strong>0</strong> when a valid config can be produced,
+so redirected stdout remains YAML. It exits with status <strong>0</strong> when a valid config can be produced,
 and <strong>nonzero</strong> otherwise; it does not require provider credentials to validate configuration.</p>
 <p>The dump includes literal values stored in configuration, such as MCP environment entries;
 treat its output as potentially sensitive. Environment-backed API keys are not expanded and
@@ -1803,11 +1862,19 @@ Automatic previews can truncate displayed text without discarding captured outpu
 source</strong>, not console capture.</p>
 <p>On a script execution failure, the saved script payload is <code>{value: null, console: &lt;captured text&gt;, failure: &lt;details&gt;}</code>;
 the enclosing JobView is <code>failed</code> and also carries its <code>error</code>. Console text belongs to the script
-result, not job metadata. A top-level <code>undefined</code> becomes JSON
-<code>null</code>; nested <code>undefined</code> is not coerced or removed and causes serialization failure.</p>
+result, not job metadata.</p>
+<p>Failure details do not have a fixed <code>{message, stack}</code> shape. Error objects retain available
+<code>message</code>, <code>stack</code>, and <code>cause</code> fields, together with enumerable properties; other thrown values
+can produce primitive or array details. <code>failure</code> can also be <code>null</code> on a failed job, so use the
+enclosing JobView’s <code>state</code> and <code>error</code> to determine whether execution failed.</p>
+<p>A top-level <code>undefined</code> becomes JSON <code>null</code>; nested <code>undefined</code> is not coerced or removed and
+causes serialization failure.</p>
 <h2 id="builder-execution-and-policy"><a class="header" href="#builder-execution-and-policy">Builder execution and policy</a></h2>
 <p>Builder setters and object arguments accept the same inputs; omitted values receive the tool’s
-normal defaults. Awaiting a builder executes it immediately. Returning builders recursively executes
+normal defaults. Use <code>.set(key, value)</code> to select an argument by name, for example
+<code>tool.read().set("path", "README.md")</code>. Unknown <code>.set</code> keys throw a <code>TypeError</code>; calling a
+nonexistent fluent setter produces the usual JavaScript method-call error.</p>
+<p>Awaiting a builder executes it immediately. Returning builders recursively executes
 independent branches concurrently. Calls use the same capabilities, approvals, path access checks,
 and saved-output behavior as direct tool calls. Scripts cannot invoke the <code>script</code> tool recursively.</p>
 <p>Failed tools retain any partial output (including captured process output on timeout) in the failed
@@ -1818,7 +1885,7 @@ serialization errors are not operational tool failures and still reject/throw.</
 <a href="#jobs-and-agents">jobs and agents</a> for background work and child input.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="built-in-tools"><a class="header" href="#built-in-tools">Built-in tools</a></h1>
-<p><code>read</code>, <code>search</code>, <code>glob</code>, <code>exec</code>, <code>shell</code>, <code>fetch</code>, <code>write</code>, <code>replace</code>, <code>patch</code>, <code>remove</code>, <code>script</code>, <code>targets</code>,
+<p><code>read</code>, <code>search</code>, <code>glob</code>, <code>exec</code>, <code>shell</code>, <code>fetch</code>, <code>write</code>, <code>replace</code>, <code>remove</code>, <code>script</code>, <code>targets</code>,
 <code>target_add</code>, <code>skills</code>, <code>skill</code>, <code>jobs</code>, <code>job_output</code>, <code>wait</code>, <code>ask</code>, <code>todo</code>, and <code>agent</code>. Calls use the
 <a href="#jobview-response-contract">common JobView envelope</a>; native payloads are in <code>.result</code>.
 <code>jobs()</code> lists the current agent’s active jobs, excluding the listing call and its containing script.
@@ -2198,7 +2265,7 @@ active jobs or todos, only the date remains.</p>
 <h1 id="development-setup"><a class="header" href="#development-setup">Development setup</a></h1>
 <h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
 <ul>
-<li>Rust 1.88 or newer via rustup, and <a href="https://just.systems/">just</a> on <code>PATH</code>.</li>
+<li>Rust 1.89 or newer via rustup, and <a href="https://just.systems/">just</a> on <code>PATH</code>.</li>
 <li><a href="https://ziglang.org/download/">Zig</a> on <code>PATH</code> (or <code>CARGO_ZIGBUILD_ZIG_PATH</code>) <strong>only for
 building the SSH shims</strong>.</li>
 </ul>
@@ -2282,7 +2349,7 @@ Give shared behavior one main explanation and link to it from other chapters. Ch
 claims and examples against the implementation, including defaults, limits, and failure cases.</p>
 <p>Use relative chapter links such as <code>../guide/headless.md</code> inside the book, and
 <code>https://github.com/kryesh/skyhook/blob/main/...</code> for repository files. The configuration
-overview includes the root <code>config.example.toml</code> at build time instead of maintaining a second copy.</p>
+overview includes the root <code>config.example.yaml</code> at build time instead of maintaining a second copy.</p>
 <p>Keep secrets out of <code>docs/src</code>: mdBook copies every non-Markdown file there into the output,
 ignored or not.</p>
 <h2 id="build-and-preview"><a class="header" href="#build-and-preview">Build and preview</a></h2>

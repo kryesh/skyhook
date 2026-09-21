@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
+            window.path_to_searchindex_js = "../searchindex-8253947f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -182,7 +182,7 @@
                     <main>
                         <h1 id="providers-and-models"><a class="header" href="#providers-and-models">Providers and models</a></h1>
 <p>Providers and models are separate named profiles. API secrets can be read from environment variables
-or retrieved lazily by a command; no literal API-key field is supported in TOML. <code>openai</code> requires
+or retrieved lazily by a command; no literal API-key field is supported in YAML. <code>openai</code> requires
 an explicit <code>base_url</code> and <code>api</code> (<code>chat_completions</code> or <code>responses</code>); <code>anthropic</code> requires an explicit
 <code>base_url</code>. Both accept either <code>api_key_env</code> or <code>api_key_command</code>, or neither for a keyless endpoint.
 URLs name the API root: Skyhook appends
@@ -236,19 +236,21 @@ Use a compatible llama.cpp build and GGUF, and configure one server slot explici
   --jinja --reasoning-format deepseek
 </code></pre>
 <p>Then configure Skyhook to match:</p>
-<pre><code class="language-toml">approve_all = false
+<pre><code class="language-yaml">approve_all: false
 
-[providers.local]
-kind = "openai"
-base_url = "http://127.0.0.1:8080/v1"
-api = "chat_completions"
+providers:
+  local:
+    kind: "openai"
+    base_url: "http://127.0.0.1:8080/v1"
+    api: "chat_completions"
 
-[models.local]
-provider = "local"
-model = "qwen3.8-27b"
-max_context = 262144
-max_output = 131072
-supports_images = false
+models:
+  local:
+    provider: "local"
+    model: "qwen3.8-27b"
+    max_context: 262144
+    max_output: 131072
+    supports_images: false
 </code></pre>
 <p>Here <strong>131,072 is a chosen total-generation cap</strong>, matching <code>--n-predict</code>, not a published
 hard output limit of Qwen3.8-27B. Qwen recommends separate reasoning and final-response budgets
@@ -302,16 +304,17 @@ replay their returned reasoning using <strong><code>reasoning_content</code> by 
 llama.cpp and SGLang, and accepted as an alias by current vLLM. Ordinary Chat responses without
 reasoning do not acquire an invented reasoning field. Configure a different spelling or disable
 request replay on the <strong>provider</strong>, not individual model profiles:</p>
-<pre><code class="language-toml">[providers.local]
-kind = "openai"
-base_url = "http://127.0.0.1:8080/v1"
-api = "chat_completions"
-# Optional; this is the default:
-chat_reasoning_replay = "reasoning_content"
-# Alternatives: "reasoning", or "unsupported" to keep reasoning locally only.
+<pre><code class="language-yaml">providers:
+  local:
+    kind: "openai"
+    base_url: "http://127.0.0.1:8080/v1"
+    api: "chat_completions"
+    # Optional; this is the default:
+    chat_reasoning_replay: "reasoning_content"
+    # Alternatives: "reasoning", or "unsupported" to keep reasoning locally only.
 </code></pre>
 <p>This option belongs only to OpenAI-compatible Chat Completions. Anthropic and Codex reject it as an
-unknown setting; configuring it with <code>api = "responses"</code> is also rejected. Their native reasoning
+unknown setting; configuring it with <code>api: "responses"</code> is also rejected. Their native reasoning
 replay remains automatic and independent of this option. All models using a provider share its
 Chat convention; use separate provider entries if a proxy routes to incompatible conventions.</p>
 <p>Reasoning is replayed with its owning assistant turn, including tool calls and reasoning-only turns;
@@ -323,12 +326,13 @@ honours <code>max_tokens</code> ignores the limit.</p>
 <p>OpenAI-compatible and Anthropic providers also accept positive <code>startup_timeout_secs</code> and
 <code>read_idle_timeout_secs</code> settings (both default to 600 seconds). Startup is a deadline for each HTTP
 attempt, while read-idle resets after each response-body chunk. For example:</p>
-<pre><code class="language-toml">[providers.local]
-kind = "openai"
-base_url = "http://127.0.0.1:8080/v1"
-api = "chat_completions"
-startup_timeout_secs = 600
-read_idle_timeout_secs = 600
+<pre><code class="language-yaml">providers:
+  local:
+    kind: "openai"
+    base_url: "http://127.0.0.1:8080/v1"
+    api: "chat_completions"
+    startup_timeout_secs: 600
+    read_idle_timeout_secs: 600
 </code></pre>
 <p>Each retry gets fresh deadlines, so these settings do not limit the total time spent on a
 response. Cancel the request to stop waiting; the server may continue processing if it does not

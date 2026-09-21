@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
+            window.path_to_searchindex_js = "../searchindex-8253947f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -184,7 +184,7 @@
 <h2 id="instructions"><a class="header" href="#instructions">Instructions</a></h2>
 <p>Skyhook loads at most <strong>one user instruction file</strong> and <strong>one file in the exact resolved
 workspace directory</strong>. It does not walk workspace ancestors for instructions. <code>--workspace PATH</code>
-selects that workspace; <code>--config</code> selects only TOML configuration and does <strong>not</strong> suppress
+selects that workspace; <code>--config</code> selects only YAML configuration and does <strong>not</strong> suppress
 instruction discovery.</p>
 <p>Within each directory, filenames are checked in this order:</p>
 <ol>
@@ -225,6 +225,11 @@ files, conventionally grouped in <code>scripts/</code>, <code>references/</code>
 └── scripts/
     └── release.py
 </code></pre>
+<p>Skill YAML frontmatter may contain arbitrary metadata, but its values must be JSON-compatible:
+mappings with string keys, sequences, strings, booleans, finite numbers, and null. Duplicate or
+non-string keys, custom tags, non-finite numbers, and YAML <code>&lt;&lt;</code> merge keys are rejected. Anchors
+and aliases are supported with bounded expansion. A <code>description</code> must be a string; a skill with
+any other non-null description is skipped with a warning.</p>
 <h2 id="loading-and-copying-assets"><a class="header" href="#loading-and-copying-assets">Loading and copying assets</a></h2>
 <p>The examples below assume the <code>release</code> skill layout shown above.</p>
 <p>Only <code>name</code> is required by the <code>skill</code> input schema. <code>path</code> and <code>to</code> are optional and nullable;

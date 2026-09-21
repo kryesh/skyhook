@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
+            window.path_to_searchindex_js = "../searchindex-8253947f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -183,12 +183,13 @@
                         <h1 id="authentication"><a class="header" href="#authentication">Authentication</a></h1>
 <h2 id="api-keys-and-environment-files"><a class="header" href="#api-keys-and-environment-files">API keys and environment files</a></h2>
 <p>Reference an environment variable with <code>api_key_env</code>, or use a command to retrieve the key:</p>
-<pre><code class="language-toml">[providers.anthropic]
-kind = "anthropic"
-base_url = "https://api.anthropic.com/v1"
-api_key_env = "ANTHROPIC_API_KEY"
-# Alternatively, remove api_key_env and use:
-# api_key_command = "op read 'op://Private/Anthropic/api-key'"
+<pre><code class="language-yaml">providers:
+  anthropic:
+    kind: "anthropic"
+    base_url: "https://api.anthropic.com/v1"
+    api_key_env: "ANTHROPIC_API_KEY"
+    # Alternatively, remove api_key_env and use:
+    # api_key_command: "op read 'op://Private/Anthropic/api-key'"
 </code></pre>
 <p><code>api_key_env</code> and <code>api_key_command</code> are mutually exclusive. Environment-variable keys are resolved
 when the provider is built and must be present and nonblank. Commands are run only on the provider’s

@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
+            window.path_to_searchindex_js = "../searchindex-8253947f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -197,7 +197,7 @@ binary’s command help. <code>skyhook</code> itself requires an interactive ter
 <tr><th>Option</th><th>Meaning</th></tr>
 </thead>
 <tbody>
-<tr><td><code>-c, --config PATH</code></td><td>Use only this TOML file; disable user/workspace config searching and merging.</td></tr>
+<tr><td><code>-c, --config PATH</code></td><td>Use only this file (YAML regardless of suffix); disable user/workspace config searching and merging.</td></tr>
 <tr><td><code>-w, --workspace PATH</code></td><td>Set the workspace base directory (default <code>.</code>).</td></tr>
 <tr><td><code>--resume SESSION_ID</code></td><td>Reopen a saved session.</td></tr>
 <tr><td><code>-m, --model PROFILE</code></td><td>Choose a configured model profile for a new session. Resumed sessions retain their recorded model.</td></tr>
@@ -245,26 +245,26 @@ signals, and interaction restrictions.</p>
 </thead>
 <tbody>
 <tr><td><code>-w, --workspace PATH</code></td><td>Workspace whose configuration or skills to inspect (default <code>.</code>).</td></tr>
-<tr><td><code>-c, --config PATH</code></td><td><code>config</code> only: use only this TOML file, with no user/workspace merging.</td></tr>
+<tr><td><code>-c, --config PATH</code></td><td><code>config</code> only: use only this file (YAML regardless of suffix), with no user/workspace merging.</td></tr>
 <tr><td><code>-a, --approve-all</code></td><td><code>config</code> only: apply the approval override.</td></tr>
 </tbody>
 </table>
 </div>
-<pre><code class="language-sh">skyhook dump                          # Resolved effective TOML
-skyhook dump config &gt; effective.toml
+<pre><code class="language-sh">skyhook dump                          # Resolved effective YAML
+skyhook dump config &gt; effective.yaml
 skyhook dump config --workspace /path/to/project
-skyhook dump config --config ./standalone.toml --approve-all
+skyhook dump config --config ./standalone.yaml --approve-all
 skyhook dump skills --workspace /path/to/project
 </code></pre>
 <p>Both modes are inspection-only: they do not start a session, run provider credential commands,
 connect to MCP servers, access the network, or execute skill assets. API credentials are not
 required. <code>dump skills</code> rejects <code>--config</code> and <code>--approve-all</code> as irrelevant.</p>
 <h3 id="configuration-dump"><a class="header" href="#configuration-dump">Configuration dump</a></h3>
-<p>The config dump writes the resolved effective configuration as TOML to <strong>stdout</strong>. It follows
+<p>The config dump writes the resolved effective configuration as YAML to <strong>stdout</strong>. It follows
 normal <a href="../configuration/overview.html#file-selection-and-layering">file selection and layering</a>,
 including explicit-file-only behavior for <code>--config</code>, and includes defaults (such as the
 built-in <code>general</code> mode) plus any <code>--approve-all</code> override. Source paths and diagnostics go to <strong>stderr</strong>,
-so redirected stdout remains TOML. It exits with status <strong>0</strong> when a valid config can be produced,
+so redirected stdout remains YAML. It exits with status <strong>0</strong> when a valid config can be produced,
 and <strong>nonzero</strong> otherwise; it does not require provider credentials to validate configuration.</p>
 <p>The dump includes literal values stored in configuration, such as MCP environment entries;
 treat its output as potentially sensitive. Environment-backed API keys are not expanded and

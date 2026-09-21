@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
+            window.path_to_searchindex_js = "../searchindex-8253947f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -276,11 +276,19 @@ Automatic previews can truncate displayed text without discarding captured outpu
 source</strong>, not console capture.</p>
 <p>On a script execution failure, the saved script payload is <code>{value: null, console: &lt;captured text&gt;, failure: &lt;details&gt;}</code>;
 the enclosing JobView is <code>failed</code> and also carries its <code>error</code>. Console text belongs to the script
-result, not job metadata. A top-level <code>undefined</code> becomes JSON
-<code>null</code>; nested <code>undefined</code> is not coerced or removed and causes serialization failure.</p>
+result, not job metadata.</p>
+<p>Failure details do not have a fixed <code>{message, stack}</code> shape. Error objects retain available
+<code>message</code>, <code>stack</code>, and <code>cause</code> fields, together with enumerable properties; other thrown values
+can produce primitive or array details. <code>failure</code> can also be <code>null</code> on a failed job, so use the
+enclosing JobView’s <code>state</code> and <code>error</code> to determine whether execution failed.</p>
+<p>A top-level <code>undefined</code> becomes JSON <code>null</code>; nested <code>undefined</code> is not coerced or removed and
+causes serialization failure.</p>
 <h2 id="builder-execution-and-policy"><a class="header" href="#builder-execution-and-policy">Builder execution and policy</a></h2>
 <p>Builder setters and object arguments accept the same inputs; omitted values receive the tool’s
-normal defaults. Awaiting a builder executes it immediately. Returning builders recursively executes
+normal defaults. Use <code>.set(key, value)</code> to select an argument by name, for example
+<code>tool.read().set("path", "README.md")</code>. Unknown <code>.set</code> keys throw a <code>TypeError</code>; calling a
+nonexistent fluent setter produces the usual JavaScript method-call error.</p>
+<p>Awaiting a builder executes it immediately. Returning builders recursively executes
 independent branches concurrently. Calls use the same capabilities, approvals, path access checks,
 and saved-output behavior as direct tool calls. Scripts cannot invoke the <code>script</code> tool recursively.</p>
 <p>Failed tools retain any partial output (including captured process output on timeout) in the failed

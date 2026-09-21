@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0a4ca1d0.js";
+            window.path_to_searchindex_js = "../searchindex-8253947f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -183,7 +183,7 @@
                         <h1 id="permissions-and-capabilities"><a class="header" href="#permissions-and-capabilities">Permissions and capabilities</a></h1>
 <h2 id="approval-policy"><a class="header" href="#approval-policy">Approval policy</a></h2>
 <p><code>--approve-all</code> or
-<code>approve_all = true</code> bypasses approval prompts. Subject to the granted capabilities, the default
+<code>approve_all: true</code> bypasses approval prompts. Subject to the granted capabilities, the default
 CLI auto-allows reads and agent operations, as well as writes inside the root workspace.
 Execution, HTTP requests, SSH access, target changes, and writes outside the root workspace
 require approval. When the <code>interactive</code> capability is granted, questions and SSH authentication
@@ -235,17 +235,18 @@ the terminal interface or root questions. Per-agent depth restrictions narrow th
 target support by including <code>"targets"</code> in a mode.</p>
 <h2 id="modes"><a class="header" href="#modes">Modes</a></h2>
 <p>A mode is a named permission preset. The root agent runs in one mode at a time:</p>
-<pre><code class="language-toml"># The mode a new session starts in; "general" when omitted.
-default_mode = "readonly"
+<pre><code class="language-yaml"># The mode a new session starts in; "general" when omitted.
+default_mode: "readonly"
 
-[modes.readonly]
-capabilities = ["read", "network"]
-instructions = "Investigate and report. Do not change anything."
-hint = "Look things up without changing anything"
+modes:
+  readonly:
+    capabilities: ["read", "network"]
+    instructions: "Investigate and report. Do not change anything."
+    hint: "Look things up without changing anything"
 
-# Built in, and listed first. Declare it only to change what it grants.
-[modes.general]
-capabilities = ["read", "write", "exec", "network", "agents", "mcp"]
+  # Built in, and listed first. Declare it only to change what it grants.
+  general:
+    capabilities: ["read", "write", "exec", "network", "agents", "mcp"]
 </code></pre>
 <p><code>capabilities</code> is required, and <code>default_mode</code> must name <code>general</code> or a declared mode. Optional <code>instructions</code> are added to the system prompt of an agent
 running in the mode; they guide the model, whereas capabilities are enforced. An optional <code>hint</code>
