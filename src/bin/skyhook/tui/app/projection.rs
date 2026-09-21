@@ -86,6 +86,7 @@ impl App {
                 &self.projection,
                 model::EntryView {
                     agent: &self.selected,
+                    tab: self.tab,
                     view,
                     all_details: self.details,
                 },

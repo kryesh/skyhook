@@ -162,7 +162,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         p.fg,
         p.panel,
     );
-    let tab = app.view().tab;
+    let tab = app.tab;
     let mut x = 2;
     for (label, value) in [
         ("Conversation", Tab::Conversation),
@@ -252,7 +252,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let expanded = match expanded_entry {
             Some((index, expanded)) if index == row.entry => expanded,
             _ => {
-                let expanded = entry.is_some_and(|entry| entry.is_expanded(view, app.details));
+                let expanded =
+                    entry.is_some_and(|entry| entry.is_expanded(view, app.tab, app.details));
                 expanded_entry = Some((row.entry, expanded));
                 expanded
             }
@@ -747,7 +748,7 @@ mod tests {
                 },
             );
         }
-        app.view().tab = Tab::Requests;
+        app.tab = Tab::Requests;
         app.refresh();
         for (width, header) in [(80, true), (40, false)] {
             let mut terminal = Terminal::new(TestBackend::new(width, 25)).unwrap();

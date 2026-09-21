@@ -147,12 +147,13 @@ impl ContentCache {
     ) -> ContentChanges {
         let EntryView {
             agent,
+            tab,
             view,
             all_details,
         } = presentation;
         let identity = (
             agent.clone(),
-            view.tab,
+            tab,
             all_details,
             revision,
             projection.through,
@@ -176,7 +177,7 @@ impl ContentCache {
             self.history_running = entries.iter().any(|entry| entry.running);
             self.live.clear();
         }
-        if !reset && view.tab == Tab::Conversation {
+        if !reset && tab == Tab::Conversation {
             // Retry cards live at their original journal position. Replace only
             // the affected card, including authoritative equal-length updates.
             for request in &dirty_responses {
@@ -207,7 +208,7 @@ impl ContentCache {
                 }
             }
         }
-        if view.tab == Tab::Requests && !reset {
+        if tab == Tab::Requests && !reset {
             // Elapsed time changes without a new journal record.
             if let Some(&request) = projection.active_request.get(agent)
                 && let Some(info) = projection.requests.get(&request)
@@ -221,7 +222,7 @@ impl ContentCache {
                 }
             }
         }
-        if view.tab != Tab::Conversation {
+        if tab != Tab::Conversation {
             if let Some(old) = old {
                 self.finish_reset(entries, old, &mut changes);
             }
@@ -320,6 +321,7 @@ mod tests {
     fn show<'a>(agent: &'a AgentId, view: &'a View, all_details: bool) -> EntryView<'a> {
         EntryView {
             agent,
+            tab: Tab::Conversation,
             view,
             all_details,
         }
@@ -422,20 +424,21 @@ mod tests {
             let job = job_info(&agent, id, JobRole::Tool, JobState::Completed);
             projection.jobs.insert(job.id, job);
         }
-        let view = View {
+        let view = View::default();
+        let presentation = EntryView {
             tab: Tab::Jobs,
-            ..View::default()
+            ..show(&agent, &view, true)
         };
         let (mut outputs, mut cache) = (OutputStore::default(), ContentCache::default());
         let state = (&snapshot, &projection);
-        refresh(&mut cache, state, show(&agent, &view, true), &outputs, 0);
+        refresh(&mut cache, state, presentation, &outputs, 0);
         assert_eq!(cache.entries().len(), 2);
         let unchanged = cache.entries()[1].clone();
         let job = JobId::new(1).unwrap();
         let output = serde_json::json!({"stdout": "new output", "exit_code": 0});
         outputs.insert_product(job, crate::tui::tool_view::OutputView::historical(output));
         cache.invalidate_job(job);
-        let changes = refresh(&mut cache, state, show(&agent, &view, true), &outputs, 0);
+        let changes = refresh(&mut cache, state, presentation, &outputs, 0);
         assert!(!changes.reset);
         assert_eq!(changes.dirty, vec![0]);
         assert!(cache.entries()[0].text().contains("new output"));
@@ -702,11 +705,10 @@ mod tests {
         sync(&mut cache, &snapshot, &projection, None);
         assert_eq!(cache.entries().len(), 1);
         // Switching to an empty tab invalidates retained history and old overlay.
-        let view = View {
+        let presentation = EntryView {
             tab: Tab::Requests,
-            ..View::default()
+            ..show(&agent, &view, false)
         };
-        let presentation = show(&agent, &view, false);
         cache.update(
             &snapshot,
             &projection,

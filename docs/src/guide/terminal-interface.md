@@ -37,8 +37,9 @@ error block. Partial output from the failed attempt clears when the next attempt
 successful replies have no retry labels. Retries continue until success or cancellation for
 [transient model failures](../configuration/providers-and-models.md#model-failure-recovery).
 
-The inspector provides Conversation, Requests, and Jobs tabs. Requests include compaction
-requests and token summaries; transient retries appear under the same request. Full request
+The inspector provides Conversation, Requests, and Jobs tabs. Switching agents keeps the selected
+tab, while reading positions and expanded rows remain separate for each agent. Requests include
+compaction requests and token summaries; transient retries appear under the same request. Full request
 bodies are available in the session log, not rendered in the UI. Status messages, including
 skill warnings, interruptions, and errors, appear in the conversation and are saved with the
 session, but are not sent to the model. Connection and MCP startup warnings describe this

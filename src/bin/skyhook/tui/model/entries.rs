@@ -32,6 +32,7 @@ pub fn entries(
 ) -> Vec<Entry> {
     let EntryView {
         agent,
+        tab,
         view,
         all_details,
     } = presentation;
@@ -42,7 +43,7 @@ pub fn entries(
         .flatten()
         .filter_map(|sequence| snapshot.records.get(sequence))
         .collect();
-    match view.tab {
+    match tab {
         Tab::Requests => records
             .iter()
             .filter_map(|r| {
@@ -422,6 +423,7 @@ mod tests {
         let (view, outputs) = (View::default(), OutputStore::default());
         let view = EntryView {
             agent,
+            tab: Tab::Conversation,
             view: &view,
             all_details: details,
         };

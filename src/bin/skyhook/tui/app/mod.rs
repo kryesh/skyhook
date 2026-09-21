@@ -118,6 +118,8 @@ pub struct App {
     pub snapshot: ObservationSnapshot,
     pub projection: Projection,
     pub selected: AgentId,
+    /// Shared across agents; reading and expansion state remain in `views`.
+    pub tab: Tab,
     pub views: HashMap<AgentId, View>,
     pub focus: Focus,
     pub tree_cursor: usize,
@@ -193,6 +195,7 @@ impl App {
             &Projection::default(),
             model::EntryView {
                 agent: &self.selected,
+                tab: self.tab,
                 view: &view,
                 all_details: false,
             },
@@ -235,6 +238,7 @@ impl App {
             snapshot: ObservationSnapshot::default(),
             projection: Projection::default(),
             selected: selected.clone(),
+            tab: Tab::default(),
             views: HashMap::new(),
             focus: Focus::Composer,
             tree_cursor: 0,

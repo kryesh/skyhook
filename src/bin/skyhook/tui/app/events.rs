@@ -372,7 +372,7 @@ impl App {
                                 }
                                 Hit::Tab(tab) => {
                                     self.selection = None;
-                                    self.view().tab = tab;
+                                    self.tab = tab;
                                     self.view().scroll = None;
                                     self.invalidate_content();
                                 }

@@ -418,7 +418,7 @@ impl App {
             Command::Agents => self.open("Agents", MenuKind::Agents(self.agent_items())),
             Command::Inspect => {
                 self.focus = Focus::Content;
-                self.view().tab = Tab::Conversation;
+                self.tab = Tab::Conversation;
             }
             Command::PreviousTab | Command::NextTab => {
                 self.cycle_tab(command == Command::PreviousTab);
@@ -569,7 +569,7 @@ impl App {
             }
             Command::Export => {
                 let view = model::EntryView {
-                    agent: &self.selected, view: &View::default(),
+                    agent: &self.selected, tab: Tab::Conversation, view: &View::default(),
                     all_details: true,
                 };
                 let entries = model::entries(&self.snapshot, &self.projection, view, &self.outputs, true);

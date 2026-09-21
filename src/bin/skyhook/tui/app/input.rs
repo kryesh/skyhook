@@ -13,8 +13,7 @@ impl App {
     /// The inspector tab before or after the shown one, wrapping.
     pub(super) fn cycle_tab(&mut self, backwards: bool) {
         self.selection = None;
-        let tab = self.view().tab.next(backwards);
-        self.view().tab = tab;
+        self.tab = self.tab.next(backwards);
         self.view().scroll = None;
         self.invalidate_content();
     }
@@ -357,7 +356,7 @@ impl App {
             // Borrow only metadata; do not clone the trace/document to toggle.
             let key = entry.key().clone();
             let job = entry.job_id();
-            let closing = entry.is_expanded(&self.views[&self.selected], self.details);
+            let closing = entry.is_expanded(&self.views[&self.selected], self.tab, self.details);
             let view = self.view();
             view.set_expanded(key, !closing);
             self.selection = None;
@@ -640,7 +639,7 @@ mod tests {
             (KeyCode::Left, Tab::Jobs),
         ] {
             chord(&mut app, code);
-            assert_eq!(app.view().tab, tab);
+            assert_eq!(app.tab, tab);
         }
     }
 }

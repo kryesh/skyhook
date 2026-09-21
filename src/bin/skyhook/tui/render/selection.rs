@@ -269,26 +269,27 @@ mod tests {
     fn expansion_matches_toggle_defaults_and_explicit_overrides() {
         let mut entry = expandable_entry();
         let mut view = model::View::default();
-        assert!(!entry.is_expanded(&view, false));
-        assert!(entry.is_expanded(&view, true));
-        view.tab = Tab::Jobs;
-        assert!(!entry.is_expanded(&view, true));
+        let tab = Tab::Conversation;
+        assert!(!entry.is_expanded(&view, tab, false));
+        assert!(entry.is_expanded(&view, tab, true));
+        let tab = Tab::Jobs;
+        assert!(!entry.is_expanded(&view, tab, true));
         let job = model::EntryKey::Job(skyhook::identity::JobId::new(1).unwrap());
         entry = model::Entry::expandable_text(job, entry.text().to_owned(), Surface::Tool);
-        assert!(entry.is_expanded(&view, true));
+        assert!(entry.is_expanded(&view, tab, true));
         entry = expandable_entry();
         entry.surface = Surface::Reasoning;
         entry.default_open = true;
-        assert!(entry.is_expanded(&view, false));
+        assert!(entry.is_expanded(&view, tab, false));
         view.set_expanded(entry.key().clone(), false);
-        assert!(!entry.is_expanded(&view, true));
+        assert!(!entry.is_expanded(&view, tab, true));
         // A single override cannot represent simultaneous collapsed/expanded
         // membership. Explicitly reopening replaces the collapsed override.
         view.set_expanded(entry.key().clone(), true);
         entry.default_open = false;
-        assert!(entry.is_expanded(&view, false));
+        assert!(entry.is_expanded(&view, tab, false));
         entry = model::Entry::new(entry.key().clone(), entry.text().to_owned(), entry.surface);
-        assert!(!entry.is_expanded(&view, true));
+        assert!(!entry.is_expanded(&view, tab, true));
     }
 
     #[test]

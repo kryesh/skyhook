@@ -74,7 +74,6 @@ pub enum EntryKey {
 
 #[derive(Default)]
 pub struct View {
-    pub tab: Tab,
     pub scroll: Option<usize>,
     pub row: usize,
     /// Explicit expansion overrides; absent keys follow the caller's default.
@@ -203,10 +202,10 @@ impl Entry {
     }
 
     /// One expansion policy for card layout and interactive toggling.
-    pub fn is_expanded(&self, view: &View, details: bool) -> bool {
+    pub fn is_expanded(&self, view: &View, tab: Tab, details: bool) -> bool {
         let all = details
             && (self.job_id().is_some()
-                || (view.tab == Tab::Conversation && self.surface == Surface::Tool));
+                || (tab == Tab::Conversation && self.surface == Surface::Tool));
         self.expandable() && view.is_expanded(self.key(), all || self.default_open)
     }
 
@@ -259,6 +258,7 @@ impl Entry {
 #[derive(Clone, Copy)]
 pub struct EntryView<'a> {
     pub agent: &'a AgentId,
+    pub tab: Tab,
     pub view: &'a View,
     pub all_details: bool,
 }

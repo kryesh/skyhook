@@ -183,7 +183,7 @@ pub(super) fn update_entry_rows(
 
 /// Reflow dirty entries, preserve scroll anchors, and validate active selections.
 pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
-    let tab = app.view().tab;
+    let tab = app.tab;
     let content_changed = app.content_dirty;
     let anchor =
         if app.render.agent == app.selected && (content_changed || app.render.width != width) {
@@ -303,7 +303,7 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
             expanded: app
                 .views
                 .get(&app.selected)
-                .is_some_and(|view| entry.is_expanded(view, app.details)),
+                .is_some_and(|view| entry.is_expanded(view, app.tab, app.details)),
         };
         app.render.rows.update_entry(index, sources, |block| {
             update_entry_rows(block, entry, index, settings);
