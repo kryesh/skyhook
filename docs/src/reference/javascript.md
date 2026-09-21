@@ -119,13 +119,24 @@ source**, not console capture.
 
 On a script execution failure, the saved script payload is `{value: null, console: <captured text>, failure: <details>}`;
 the enclosing JobView is `failed` and also carries its `error`. Console text belongs to the script
-result, not job metadata. A top-level `undefined` becomes JSON
-`null`; nested `undefined` is not coerced or removed and causes serialization failure.
+result, not job metadata.
+
+Failure details do not have a fixed `{message, stack}` shape. Error objects retain available
+`message`, `stack`, and `cause` fields, together with enumerable properties; other thrown values
+can produce primitive or array details. `failure` can also be `null` on a failed job, so use the
+enclosing JobView's `state` and `error` to determine whether execution failed.
+
+A top-level `undefined` becomes JSON `null`; nested `undefined` is not coerced or removed and
+causes serialization failure.
 
 ## Builder execution and policy
 
 Builder setters and object arguments accept the same inputs; omitted values receive the tool's
-normal defaults. Awaiting a builder executes it immediately. Returning builders recursively executes
+normal defaults. Use `.set(key, value)` to select an argument by name, for example
+`tool.read().set("path", "README.md")`. Unknown `.set` keys throw a `TypeError`; calling a
+nonexistent fluent setter produces the usual JavaScript method-call error.
+
+Awaiting a builder executes it immediately. Returning builders recursively executes
 independent branches concurrently. Calls use the same capabilities, approvals, path access checks,
 and saved-output behavior as direct tool calls. Scripts cannot invoke the `script` tool recursively.
 
