@@ -284,10 +284,6 @@ mod tests {
                 "replace",
                 serde_json::json!({"path": "file.js", "old": source, "new": "  replacement text  \n"}),
             ),
-            (
-                "patch",
-                serde_json::json!({"patch": "@@ -1 +1 @@\n-  old words\n+  new words  \n"}),
-            ),
         ] {
             let document = arguments(tool, &args);
             let original = document.clone();

@@ -63,7 +63,6 @@ chrono = { version = "0.4.42", default-features = false, features = [
     "clock",
     "serde",
 ] }
-diffy = "0.5.1"
 dom_smoothie = "0.18.1"
 encoding_rs = "0.8"
 fs2 = "0.4.3"

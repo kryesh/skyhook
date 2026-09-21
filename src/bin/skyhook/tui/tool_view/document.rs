@@ -101,7 +101,6 @@ impl Document {
                 let label = match name.as_str() {
                     "old" => "old (removed)",
                     "new" => "new (added)",
-                    "patch" => "patch (requested)",
                     _ => &name,
                 };
                 self.line(format!("{prefix}{label}"), Role::Label);
@@ -554,7 +553,6 @@ fn argument_policy(tool: &str, field: &str, args: &Value) -> Option<ArgumentPoli
             let language = file_language(args);
             (!language.is_empty()).then_some(language)
         }
-        (_, "patch" | "diff") => Some("diff".into()),
         (_, "argv" | "commands") => {
             return Some(ArgumentPolicy::Literal {
                 language: None,
@@ -672,8 +670,7 @@ mod tests {
                 "argv": ["printf", "  %s\t%s\n"],
                 "commands": [{"value": "  raw command  "}],
                 "raw": {"source": "  let value = 42;\n"},
-                "content": "  file contents  \n\n",
-                "patch": "@@ -1 +1 @@\n-old\n+new\n"
+                "content": "  file contents  \n\n"
             }),
         );
         for (marker, expected) in [
@@ -681,7 +678,6 @@ mod tests {
             ("array prose", Wrap::Words),
             ("printf", Wrap::Hard),
             ("let value", Wrap::Hard),
-            ("@@", Wrap::Hard),
         ] {
             assert_eq!(wrap_of(&document, marker), expected, "{marker}");
         }

@@ -1,6 +1,6 @@
 # Built-in tools
 
-`read`, `search`, `glob`, `exec`, `shell`, `fetch`, `write`, `replace`, `patch`, `remove`, `script`, `targets`,
+`read`, `search`, `glob`, `exec`, `shell`, `fetch`, `write`, `replace`, `remove`, `script`, `targets`,
 `target_add`, `skills`, `skill`, `jobs`, `job_output`, `wait`, `ask`, `todo`, and `agent`. Calls use the
 [common JobView envelope](javascript.md#jobview-response-contract); native payloads are in `.result`.
 `jobs()` lists the current agent's active jobs, excluding the listing call and its containing script.

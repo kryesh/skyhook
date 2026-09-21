@@ -1,8 +1,7 @@
-//! Atomic writes, exact replacements, unified patches, and removals.
+//! Atomic writes, exact replacements, and removals.
 use crate::tool::ToolOptions;
 use crate::tool::invocation::{LocalCatalogBuilder, LocalError};
 
-use diffy::{Patch, apply};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -68,33 +67,12 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
             let replacements = text.matches(&args.old).count();
             if replacements != args.count {
                 return Err(LocalError::Failed(format!(
-                    "expected {} matches, found {replacements}",
-                    args.count
+                    "expected {} matches, found {replacements}{}",
+                    args.count,
+                    match_lines(&text, &args.old)
                 )));
             }
             let output = text.replace(&args.old, &args.new);
-            check_write_size(&output)?;
-            atomic_write(&path, output.as_bytes()).await?;
-            Ok(EditOutput {
-                path: relative_path(&context.execution_location().workspace, &path),
-                replacements,
-                bytes: output.len(),
-            })
-        },
-    )?;
-    builder.register::<PatchArgs, EditOutput, _, _>(
-        "patch",
-        "Apply a unified patch to one UTF-8 workspace file.",
-        ToolOptions::new(vec![Capability::Write])
-            .placement(crate::tool::ToolPlacement::InheritWorkspace)
-            .path_argument("path", PathAccess::Write, PathKind::Existing),
-        |context, args| async move {
-            check_write_size(&args.patch)?;
-            let path = std::path::PathBuf::from(&args.path);
-            let text = fs::read_to_string(&path).await?;
-            let patch = Patch::from_str(&args.patch).map_err(LocalError::failed)?;
-            let replacements = patch.hunks().len();
-            let output = apply(&text, &patch).map_err(LocalError::failed)?;
             check_write_size(&output)?;
             atomic_write(&path, output.as_bytes()).await?;
             Ok(EditOutput {
@@ -140,6 +118,24 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
     Ok(())
 }
 
+/// Starting lines of the first few matches.
+fn match_lines(text: &str, old: &str) -> String {
+    const SHOWN: usize = 10;
+    let mut lines = Vec::new();
+    let (mut line, mut scanned) = (1, 0);
+    for (offset, _) in text.match_indices(old).take(SHOWN + 1) {
+        line += text[scanned..offset].matches('\n').count();
+        scanned = offset;
+        lines.push(line.to_string());
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    let more = if lines.len() > SHOWN { ", ..." } else { "" };
+    lines.truncate(SHOWN);
+    format!(" at lines {}{more}", lines.join(", "))
+}
+
 fn check_write_size(text: &str) -> Result<(), LocalError> {
     if text.len() > MAX_WRITE_BYTES {
         Err(LocalError::Failed(format!(
@@ -180,15 +176,6 @@ struct ReplaceArgs {
     /// Required number of matches. The edit fails if the actual count differs.
     #[serde(default = "default_one")]
     count: usize,
-}
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct PatchArgs {
-    /// File the unified diff applies to.
-    path: String,
-    /// Unified diff hunks for that file.
-    patch: String,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -256,6 +243,17 @@ mod tests {
     ) -> Result<ExecutionResult, ExecutionError> {
         let arguments = json!({"path": path, "content": content, "create_parents": create_parents});
         executor.run_host(&runtime.agent, "write", arguments).await
+    }
+
+    #[test]
+    fn match_lines_reports_starting_lines_and_caps_the_list() {
+        assert_eq!(match_lines("a\nb\n", "x"), "");
+        assert_eq!(match_lines("x x\na\nb\nx\n", "x"), " at lines 1, 1, 4");
+        assert_eq!(match_lines("a\nb\nc\nb\nc\n", "b\nc"), " at lines 2, 4");
+        assert_eq!(
+            match_lines(&"x\n".repeat(11), "x"),
+            " at lines 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, ..."
+        );
     }
 
     #[tokio::test]
