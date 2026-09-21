@@ -795,9 +795,9 @@ mod tests {
             SessionEvent::JobFinished {
                 job,
                 state: JobState::Interrupted,
-                error: None,
+                diagnostic: None,
+                output_diagnostic: None,
                 images: Vec::new(),
-                denial: None,
             },
         )
         .await;

@@ -130,6 +130,32 @@ arguments and runs operations without requiring a session database. The SSH shim
 for remote built-ins while the host retains job ownership, policy decisions, and saved output.
 This separation keeps remote workers from becoming second agent runtimes.
 
+The host tracks remote readers and accepted-payload ingestion independently of callers and
+connection-pool ownership. Pool eviction does not abort this work; after routing stops, transport
+resources are released before the finite accepted-payload queue is drained. Session shutdown
+fences new connection startup and waits for tracked startup and reader/drain work before backend
+cleanup. See [connection and request lifecycle](remote-transport-and-shims.md#connection-and-request-lifecycle).
+
+Tool failures are structured diagnostics: a typed cause plus the operation, subject, site, and
+known effects. Tools annotate facts; `tool::diagnostic` owns the one renderer. Facts chosen nearest
+the failure win, and each boundary (planning, dispatch, remote result ingestion) only fills what is
+missing. A worker's reported site is always rebound to the destination of the connection it arrived
+on.
+
+Diagnostics are persisted with the job and rendered per viewer. Target aliases in structured job
+diagnostics and result slots registered by their producer, such as an expected `read` failure, are
+rendered only when the viewer's capabilities permit exposing them. Host-site wording is relative
+to the viewer's target: “on session host” is omitted for host-local viewers and retained for remote
+viewers. Capability-sensitive enclosing output pages use private file-backed renderings rather
+than shared render caches, keeping captured output out of memory without reusing privileged
+renderings for those diagnostic slots.
+
+This rendering boundary does not guarantee that target aliases never appear in a restricted view.
+A privileged `job_output` call saves its rendered view as an ordinary JSON snapshot. Later
+restricted views of that saved result, or script results that copy it, retain the earlier rendered
+JSON unchanged. Already-committed model messages are not rewritten. Arbitrary returned JSON is not
+inspected for diagnostics or target aliases, and copied data does not acquire diagnostic provenance.
+
 Saved output and model-visible presentation are separate. Automatic previews shorten only fields
 marked `x-skyhook-truncatable` in the output schema; storing a field separately does not make it
 truncatable. Jobs persist their output schemas so resumed and remote results use the same rules.

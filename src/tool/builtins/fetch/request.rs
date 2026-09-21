@@ -1,6 +1,8 @@
 //! Prepare replayable uploads and dispatch authorized HTTP requests.
 use std::path::Path;
 
+use crate::tool::diagnostic::{Operation, Subject};
+
 use bytes::Bytes;
 use reqwest::{
     Method, Url,
@@ -31,7 +33,8 @@ impl FileUpload {
     fn len(&self) -> u64 {
         self.length
     }
-    async fn body(&self) -> Result<reqwest::Body, LocalError> {
+    async fn body(&self, progress: &mut FetchProgress) -> Result<reqwest::Body, LocalError> {
+        progress.local_io(Operation::ReadCapture, Subject::path(self.snapshot.path()));
         let file = tokio::fs::File::open(self.snapshot.path()).await?;
         Ok(reqwest::Body::wrap_stream(
             tokio_util::io::ReaderStream::new(file),
@@ -43,8 +46,13 @@ enum Upload {
     File(FileUpload),
 }
 
-async fn snapshot_file(path: &Path, remaining: u64) -> Result<FileUpload, LocalError> {
+async fn snapshot_file(
+    path: &Path,
+    remaining: u64,
+    progress: &mut FetchProgress,
+) -> Result<FileUpload, LocalError> {
     let sentinel = remaining + 1;
+    progress.local_io(Operation::Inspect, Subject::path(path));
     if !tokio::fs::metadata(&path).await?.is_file() {
         return Err(invalid("upload path must be a regular file"));
     }
@@ -53,6 +61,7 @@ async fn snapshot_file(path: &Path, remaining: u64) -> Result<FileUpload, LocalE
     // Avoid blocking if the path is swapped to a FIFO between metadata and open.
     #[cfg(unix)]
     options.custom_flags(libc::O_NONBLOCK);
+    progress.local_io(Operation::Read, Subject::path(path));
     let file = options.open(&path).await?;
     let metadata = file.metadata().await?;
     if !metadata.is_file() {
@@ -63,8 +72,13 @@ async fn snapshot_file(path: &Path, remaining: u64) -> Result<FileUpload, LocalE
     }
     // Snapshot once, with a bounded streaming copy. Redirect replays reopen this
     // immutable private snapshot, not a potentially changed source file.
+    progress.local_io(
+        Operation::CreateCapture,
+        Subject::Label("upload snapshot".into()),
+    );
     let snapshot = tempfile::NamedTempFile::new()?;
     let mut output = tokio::fs::File::from_std(snapshot.as_file().try_clone()?);
+    progress.local_io(Operation::Copy, Subject::path(path));
     let length = tokio::io::copy(&mut file.take(sentinel), &mut output).await?;
     output.flush().await?;
     if length > remaining {
@@ -87,7 +101,10 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, LocalError> {
         })
     })
 }
-async fn prepare_body(body: Option<&RequestBody>) -> Result<Option<Upload>, LocalError> {
+async fn prepare_body(
+    body: Option<&RequestBody>,
+    progress: &mut FetchProgress,
+) -> Result<Option<Upload>, LocalError> {
     let Some(body) = body else { return Ok(None) };
     let (bytes, content_type) = match body {
         RequestBody::Text { value } => (
@@ -112,7 +129,7 @@ async fn prepare_body(body: Option<&RequestBody>) -> Result<Option<Upload>, Loca
         RequestBody::Base64 { value } => (decode_base64(value)?, None),
         RequestBody::File { path } => {
             return Ok(Some(Upload::File(
-                snapshot_file(Path::new(path), MAX_UPLOAD_BYTES).await?,
+                snapshot_file(Path::new(path), MAX_UPLOAD_BYTES, progress).await?,
             )));
         }
     };
@@ -127,6 +144,7 @@ async fn apply_body(
     mut request: reqwest::RequestBuilder,
     body: Option<&Upload>,
     headers: &HeaderMap,
+    progress: &mut FetchProgress,
 ) -> Result<reqwest::RequestBuilder, FetchError> {
     match body {
         None => {}
@@ -141,7 +159,7 @@ async fn apply_body(
         Some(Upload::File(data)) => {
             request = request
                 .header("content-length", data.len())
-                .body(data.body().await.map_err(local_error)?);
+                .body(data.body(progress).await.map_err(local_error)?);
         }
     }
     Ok(request)
@@ -188,31 +206,35 @@ pub(super) async fn execute(
     plan: FetchPlan,
     progress: &mut FetchProgress,
 ) -> Result<FetchOutput, FetchError> {
-    progress.phase = FetchPhase::LocalIo;
     let local_io = |error: std::io::Error| FetchDiagnostic::from_io(&error, FetchPhase::LocalIo);
     if let OutputPlan::Download {
         destination,
         overwrite,
     } = &plan.output
-        && tokio::fs::try_exists(destination).await.map_err(local_io)?
     {
-        if !overwrite {
-            return Err(local_error(invalid(
-                "save_to already exists; set overwrite to replace it",
-            )));
-        }
-        if !tokio::fs::metadata(destination)
-            .await
-            .map_err(local_io)?
-            .is_file()
-        {
-            return Err(local_error(invalid("save_to must be a regular file")));
+        progress.download_io(Operation::Inspect, destination);
+        if tokio::fs::try_exists(destination).await.map_err(local_io)? {
+            if !overwrite {
+                return Err(local_error(invalid(
+                    "save_to already exists; set overwrite to replace it",
+                )));
+            }
+            if !tokio::fs::metadata(destination)
+                .await
+                .map_err(local_io)?
+                .is_file()
+            {
+                return Err(local_error(invalid("save_to must be a regular file")));
+            }
         }
     }
-    progress.phase = FetchPhase::ClientPreparation;
+    progress.phase(FetchPhase::ClientPreparation);
     let client = client(&plan.client)?;
-    progress.phase = FetchPhase::LocalIo;
-    let body = prepare_body(plan.body.as_ref())
+    progress.local_io(
+        Operation::Prepare,
+        Subject::Label("HTTP request body".into()),
+    );
+    let body = prepare_body(plan.body.as_ref(), progress)
         .await
         .map_err(local_error)?;
     let mut state = RequestState {
@@ -234,22 +256,22 @@ pub(super) async fn execute(
         }
         progress.begin_request(&state.url, &state.method);
         if state.url.origin() != authorized_origin {
-            progress.phase = FetchPhase::Authorization;
+            progress.phase(FetchPhase::Authorization);
             context
                 .authorize_network(state.url.origin().as_str())
                 .await
                 .map_err(|error| FetchError::from_tool_error(error, FetchPhase::Authorization))?;
             authorized_origin = state.url.origin();
         }
-        progress.phase = FetchPhase::Request;
+        progress.phase(FetchPhase::Request);
         let request = client
             .request(state.method.clone(), state.url.url().clone())
             .headers(state.headers.clone());
         // Reopening a snapshot is local I/O, including an outer deadline that
         // expires while open is pending; only the send is a network request.
-        progress.phase = FetchPhase::LocalIo;
-        let request = apply_body(request, state.body.as_ref(), &state.headers).await?;
-        progress.phase = FetchPhase::Request;
+        progress.phase(FetchPhase::LocalIo);
+        let request = apply_body(request, state.body.as_ref(), &state.headers, progress).await?;
+        progress.request_started();
         let response = request
             .send()
             .await
@@ -265,7 +287,7 @@ pub(super) async fn execute(
         {
             break response;
         }
-        progress.phase = FetchPhase::Redirect;
+        progress.phase(FetchPhase::Redirect);
         let Some(location) = response.headers().get("location") else {
             break response;
         };
@@ -312,7 +334,7 @@ pub(super) async fn execute(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{executor, fetch, response, server};
+    use super::super::tests::{executor, fetch, progress_for, response, server};
     use super::*;
     use serde_json::json;
 
@@ -411,13 +433,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_source_and_snapshot_failures_keep_actual_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let mut progress = progress_for(json!({"url":"http://example.org"})).1;
+        let missing = snapshot_file(&source, 100, &mut progress)
+            .await
+            .err()
+            .unwrap();
+        let error = progress.failure(local_error(missing));
+        assert_eq!(error.diagnostic().context.operation, Operation::Inspect);
+        assert_eq!(error.diagnostic().context.subject, Subject::path(&source));
+        let (diagnostic, Some(output)) = error.into_parts() else {
+            panic!("structured I/O failure")
+        };
+        assert!(
+            !diagnostic
+                .render(&Default::default())
+                .contains("server-side effects")
+        );
+        assert_eq!(output.value["diagnostic"]["os_error"]["kind"], "not_found");
+
+        tokio::fs::write(&source, b"body").await.unwrap();
+        let upload = snapshot_file(&source, 100, &mut progress).await.unwrap();
+        tokio::fs::remove_file(upload.snapshot.path())
+            .await
+            .unwrap();
+        let missing = upload.body(&mut progress).await.err().unwrap();
+        let error = progress.failure(local_error(missing));
+        assert_eq!(error.diagnostic().context.operation, Operation::ReadCapture);
+        assert_eq!(
+            error.diagnostic().context.subject,
+            Subject::path(upload.snapshot.path())
+        );
+    }
+
+    #[tokio::test]
     async fn file_upload_snapshot_is_bounded_and_immutable() {
         let root = tempfile::tempdir().unwrap();
-        assert!(snapshot_file(root.path(), MAX_UPLOAD_BYTES).await.is_err());
+        let mut progress = progress_for(json!({"url":"http://example.org"})).1;
+        assert!(
+            snapshot_file(root.path(), MAX_UPLOAD_BYTES, &mut progress)
+                .await
+                .is_err()
+        );
         let source = root.path().join("source");
         tokio::fs::write(&source, b"original").await.unwrap();
-        assert!(snapshot_file(&source, 3).await.is_err());
-        let FileUpload { snapshot, length } = snapshot_file(&source, 100).await.unwrap();
+        assert!(snapshot_file(&source, 3, &mut progress).await.is_err());
+        let FileUpload { snapshot, length } =
+            snapshot_file(&source, 100, &mut progress).await.unwrap();
         tokio::fs::write(&source, b"changed").await.unwrap();
         assert_eq!(length, 8);
         assert_eq!(tokio::fs::read(snapshot.path()).await.unwrap(), b"original");

@@ -221,6 +221,7 @@ impl HostOutput {
             .with_captures(captures)
             .with_images(output.images);
         imported.streams = output.streams;
+        imported.diagnostic = output.diagnostic;
         Ok(imported)
     }
 }

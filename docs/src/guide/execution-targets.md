@@ -121,8 +121,18 @@ Target-aware tools, including `agent`, use these rules:
 - Setting another named target uses its configured workspace, except that explicitly selecting the
   calling agent's current named target retains that agent's workspace override.
 
-Tools without a target selector use the calling agent's target and workspace. An explicit
-`agent.workspace` takes precedence over the selected base; relative overrides resolve against that base.
+Workspace-inheriting tools such as `write`, `replace`, and `remove` use the calling agent's
+target and workspace without accepting a target selector. Host/session tools such as `jobs`,
+`job_output`, `todo`, `wait`, and `targets` still run on the session host. `agent` selects a
+child's future execution location; launching the child and running its provider remain host
+operations. An explicit `agent.workspace` takes precedence over the selected base; relative
+overrides resolve against that base.
+
+Diagnostics identify the operation and its subject, with the execution target when applicable.
+A working-directory override is separate from the target's configured workspace: an absolute
+`cwd` must exist on the selected machine, not on the session host. A connection, session-storage,
+or saved-output inspection failure is not necessarily a failure of the command on the remote
+machine.
 
 Prefer these named targets to manually running `ssh`. A tool that needs an SSH route requests
 approval before any probe, authentication, or shim deployment. A saved

@@ -1,111 +1,297 @@
 //! Local tool admission and execution without host persistence.
 
-use thiserror::Error;
+use super::diagnostic::{
+    Cause, Diagnostic, DiagnosticContext, Effects, FailureSite, Operation, PathFact, PathRole,
+    Subject, safe_text,
+};
 
-#[derive(Debug, Error)]
-pub enum OperationError<O> {
-    #[error("operation denied: {0}")]
-    Denied(String),
-    #[error("tool arguments must be a JSON object")]
-    ArgumentsMustBeObject,
-    #[error("`bg` must be a boolean")]
-    InvalidBackground,
-    #[error("tool `{0}` does not support background execution")]
-    BackgroundUnsupported(String),
-    #[error("invalid tool arguments: {0}")]
-    InvalidArguments(String),
-    #[error("tool input channel is closed")]
-    InputClosed,
-    #[error("tool was cancelled")]
-    Cancelled,
-    #[error("tool was interrupted")]
-    Interrupted,
-    #[error("tool failed: {0}")]
-    Failed(String),
-    #[error("tool failed: {message}")]
-    FailedWithOutput { message: String, output: Box<O> },
-    #[error("tool I/O failed: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("tool JSON failed: {0}")]
-    Json(#[from] serde_json::Error),
+/// A failure normalized at an annotation, transport, or persistence boundary.
+/// Its cause remains authoritative: no native error is reconstructed from it.
+#[derive(Debug)]
+pub struct OperationFailure<O> {
+    pub diagnostic: Diagnostic,
+    pub output: Option<O>,
+    provenance: FailureProvenance,
 }
 
-impl<O: std::fmt::Debug> OperationError<O> {
-    pub(crate) fn invalid(error: impl std::fmt::Display) -> Self {
-        Self::InvalidArguments(error.to_string())
-    }
+/// Local handler authority, deliberately absent from wire and persistence facts.
+#[derive(Debug)]
+enum FailureProvenance {
+    Unspecified,
+    SourceFilesystemIo,
+}
 
-    pub(crate) fn failed(error: impl std::fmt::Display) -> Self {
-        Self::Failed(error.to_string())
-    }
+#[derive(Debug)]
+pub enum OperationError<O> {
+    Denied(String),
+    ArgumentsMustBeObject,
+    InvalidBackground,
+    BackgroundUnsupported(String),
+    InvalidArguments(String),
+    InputClosed,
+    Cancelled,
+    Interrupted,
+    Failed(String),
+    Io(std::io::Error),
+    Json(serde_json::Error),
+    Failure(Box<OperationFailure<O>>),
+}
 
-    pub(crate) fn concise_message(&self) -> String {
-        match self {
-            Self::Failed(message) | Self::FailedWithOutput { message, .. } => message.clone(),
-            _ => self.to_string(),
-        }
+impl<O> From<std::io::Error> for OperationError<O> {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
     }
-
-    #[must_use]
-    pub fn with_output(message: impl Into<String>, output: O) -> Self {
-        Self::FailedWithOutput {
-            message: message.into(),
-            output: Box::new(output),
-        }
+}
+impl<O> From<crate::session::SessionError> for OperationError<O> {
+    fn from(error: crate::session::SessionError) -> Self {
+        Self::from_diagnostic(Diagnostic::session(&error), None)
+    }
+}
+impl<O> From<std::sync::Arc<crate::session::SessionError>> for OperationError<O> {
+    fn from(error: std::sync::Arc<crate::session::SessionError>) -> Self {
+        Self::from_diagnostic(Diagnostic::session(&error), None)
+    }
+}
+impl<O> From<serde_json::Error> for OperationError<O> {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+impl<O: std::fmt::Debug> std::error::Error for OperationError<O> {}
+impl<O> std::fmt::Display for OperationError<O> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.diagnostic().render(&Default::default()))
     }
 }
 
 impl<O> OperationError<O> {
+    pub(crate) fn invalid(error: impl std::fmt::Display) -> Self {
+        Self::InvalidArguments(error.to_string())
+    }
+    pub(crate) fn failed(error: impl std::fmt::Display) -> Self {
+        Self::Failed(error.to_string())
+    }
+    /// Identify a source-filesystem failure at the handler boundary. Presentation
+    /// context alone never grants the read policy authority to turn it into data.
+    pub(crate) fn source_filesystem_io(error: std::io::Error) -> Self {
+        Self::Io(error)
+            .annotate(|failure| failure.provenance = FailureProvenance::SourceFilesystemIo)
+    }
+    pub(crate) fn is_source_filesystem_io(&self) -> bool {
+        matches!(self, Self::Failure(failure)
+            if matches!(failure.provenance, FailureProvenance::SourceFilesystemIo))
+    }
+
+    /// `map_err` adapter: convert a source error and attach the facts its site chose.
+    pub fn annotated<E: Into<Self>>(context: DiagnosticContext) -> impl FnOnce(E) -> Self {
+        move |error| error.into().context(context)
+    }
+    #[must_use]
+    pub fn with_output(message: impl Into<String>, output: O) -> Self {
+        Self::Failed(message.into()).with_result(output)
+    }
+    #[must_use]
+    pub fn with_result(self, output: O) -> Self {
+        self.annotate(|failure| failure.output = Some(output))
+    }
+    #[must_use]
+    pub fn context(self, context: DiagnosticContext) -> Self {
+        self.annotate(|failure| failure.diagnostic.context = context)
+    }
+    /// Fill missing boundary facts without replacing a known stage, site or effects.
+    #[must_use]
+    pub fn fallback_context(self, context: DiagnosticContext) -> Self {
+        self.annotate(|failure| failure.diagnostic.context.fallback(context))
+    }
+    #[must_use]
+    pub fn operation(self, operation: Operation, subject: Subject) -> Self {
+        self.annotate(|failure| {
+            failure.diagnostic.context.operation = operation;
+            failure.diagnostic.context.subject = subject;
+        })
+    }
+    #[must_use]
+    pub fn at(self, site: FailureSite) -> Self {
+        self.annotate(|failure| failure.diagnostic.context.site = site)
+    }
+    #[must_use]
+    pub fn effects(self, effects: Effects) -> Self {
+        self.annotate(|failure| failure.diagnostic.context.effects = effects)
+    }
+    /// Retain classification/context/output while dropping opaque I/O detail.
+    #[must_use]
+    pub(crate) fn opaque_io(self) -> Self {
+        self.annotate(|failure| failure.diagnostic.cause.redact_io_detail())
+    }
+    fn annotate(self, change: impl FnOnce(&mut OperationFailure<O>)) -> Self {
+        let mut failure = self.into_failure();
+        change(&mut failure);
+        Self::Failure(failure)
+    }
+
+    pub fn diagnostic(&self) -> Diagnostic {
+        let cause = match self {
+            Self::Failure(failure) => return failure.diagnostic.clone(),
+            Self::Denied(reason) => Cause::Denied(reason.clone()),
+            Self::ArgumentsMustBeObject => {
+                Cause::InvalidArguments("tool arguments must be a JSON object".into())
+            }
+            Self::InvalidBackground => Cause::InvalidArguments("bg must be a boolean".into()),
+            Self::BackgroundUnsupported(_) => {
+                Cause::InvalidArguments("background execution is unsupported".into())
+            }
+            Self::InvalidArguments(message) => Cause::InvalidArguments(safe_text(message)),
+            Self::InputClosed => Cause::InputClosed,
+            Self::Cancelled => Cause::Cancelled,
+            Self::Interrupted => Cause::Interrupted,
+            Self::Failed(message) => Cause::Message(safe_text(message)),
+            Self::Io(error) => Cause::io(error),
+            Self::Json(_) => Cause::Json,
+        };
+        Diagnostic::new(DiagnosticContext::default(), cause)
+    }
+
+    pub(crate) fn into_failure(self) -> Box<OperationFailure<O>> {
+        match self {
+            Self::Failure(failure) => failure,
+            error => Box::new(OperationFailure {
+                diagnostic: error.diagnostic(),
+                output: None,
+                provenance: FailureProvenance::Unspecified,
+            }),
+        }
+    }
+    /// Extract the one authoritative diagnostic and any completion evidence.
+    pub(crate) fn into_parts(self) -> (Diagnostic, Option<O>) {
+        let OperationFailure {
+            diagnostic, output, ..
+        } = *self.into_failure();
+        (diagnostic, output)
+    }
+    pub(crate) fn from_diagnostic(diagnostic: Diagnostic, output: Option<Box<O>>) -> Self {
+        Self::Failure(Box::new(OperationFailure {
+            diagnostic,
+            output: output.map(|output| *output),
+            provenance: FailureProvenance::Unspecified,
+        }))
+    }
     pub(crate) fn try_map_output<P, E>(
         self,
         convert: impl FnOnce(O) -> Result<P, E>,
     ) -> Result<OperationError<P>, E> {
-        Ok(match self {
-            Self::Denied(value) => OperationError::Denied(value),
-            Self::ArgumentsMustBeObject => OperationError::ArgumentsMustBeObject,
-            Self::InvalidBackground => OperationError::InvalidBackground,
-            Self::BackgroundUnsupported(value) => OperationError::BackgroundUnsupported(value),
-            Self::InvalidArguments(value) => OperationError::InvalidArguments(value),
-            Self::InputClosed => OperationError::InputClosed,
-            Self::Cancelled => OperationError::Cancelled,
-            Self::Interrupted => OperationError::Interrupted,
-            Self::Failed(value) => OperationError::Failed(value),
-            Self::FailedWithOutput { message, output } => OperationError::FailedWithOutput {
-                message,
-                output: Box::new(convert(*output)?),
-            },
-            Self::Io(error) => OperationError::Io(error),
-            Self::Json(error) => OperationError::Json(error),
-        })
+        let OperationFailure {
+            diagnostic,
+            output,
+            provenance,
+        } = *self.into_failure();
+        Ok(OperationError::Failure(Box::new(OperationFailure {
+            diagnostic,
+            output: output.map(convert).transpose()?,
+            provenance,
+        })))
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum AdmissionError {
-    #[error("operation denied: {0}")]
     Denied(String),
-    #[error("tool arguments must be a JSON object")]
     ArgumentsMustBeObject,
-    #[error("`bg` must be a boolean")]
     InvalidBackground,
-    #[error("tool `{0}` does not support background execution")]
     BackgroundUnsupported(String),
-    #[error("invalid tool arguments: {0}")]
     InvalidArguments(String),
-    #[error("tool was cancelled")]
     Cancelled,
-    #[error("tool failed: {0}")]
     Failed(String),
-    #[error("tool I/O failed: {0}")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
+    Annotated {
+        context: Box<DiagnosticContext>,
+        source: Box<Self>,
+    },
 }
-
+impl std::error::Error for AdmissionError {}
+impl std::fmt::Display for AdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.diagnostic().render(&Default::default()))
+    }
+}
+impl From<std::io::Error> for AdmissionError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
 impl AdmissionError {
     pub(crate) fn invalid(error: impl std::fmt::Display) -> Self {
         Self::InvalidArguments(error.to_string())
     }
+    /// `map_err` adapter: convert a source error and attach the facts its site chose.
+    pub fn annotated<E: Into<Self>>(context: DiagnosticContext) -> impl FnOnce(E) -> Self {
+        move |error| error.into().context(context)
+    }
+    #[must_use]
+    pub fn context(self, context: DiagnosticContext) -> Self {
+        let context = Box::new(context);
+        match self {
+            Self::Annotated { source, .. } => Self::Annotated { context, source },
+            source => Self::Annotated {
+                context,
+                source: Box::new(source),
+            },
+        }
+    }
+    /// Supply boundary context only when the source did not identify its own stage.
+    #[must_use]
+    pub fn fallback_context(self, context: DiagnosticContext) -> Self {
+        match self {
+            Self::Annotated { .. } => self,
+            source => source.context(context),
+        }
+    }
+    #[must_use]
+    pub fn operation(self, operation: Operation, subject: Subject) -> Self {
+        self.annotate(|context| {
+            context.operation = operation;
+            context.subject = subject;
+        })
+    }
+    #[must_use]
+    pub fn at(self, site: FailureSite) -> Self {
+        self.annotate(|context| context.site = site)
+    }
+    #[must_use]
+    pub fn effects(self, effects: Effects) -> Self {
+        self.annotate(|context| context.effects = effects)
+    }
+    fn annotate(self, change: impl FnOnce(&mut DiagnosticContext)) -> Self {
+        let mut context = self.diagnostic().context;
+        change(&mut context);
+        self.context(context)
+    }
+    pub fn unannotated(&self) -> &Self {
+        match self {
+            Self::Annotated { source, .. } => source.unannotated(),
+            source => source,
+        }
+    }
+    pub fn diagnostic(&self) -> Diagnostic {
+        let cause = match self {
+            Self::Annotated { context, source } => {
+                return Diagnostic::new(context.as_ref().clone(), source.diagnostic().cause);
+            }
+            Self::Denied(reason) => Cause::Denied(reason.clone()),
+            Self::ArgumentsMustBeObject => {
+                Cause::InvalidArguments("tool arguments must be a JSON object".into())
+            }
+            Self::InvalidBackground => Cause::InvalidArguments("bg must be a boolean".into()),
+            Self::BackgroundUnsupported(_) => {
+                Cause::InvalidArguments("background execution is unsupported".into())
+            }
+            Self::InvalidArguments(message) => Cause::InvalidArguments(safe_text(message)),
+            Self::Cancelled => Cause::Cancelled,
+            Self::Failed(message) => Cause::Message(safe_text(message)),
+            Self::Io(error) => Cause::io(error),
+        };
+        Diagnostic::new(DiagnosticContext::default(), cause)
+    }
 }
-
 impl<O> From<AdmissionError> for OperationError<O> {
     fn from(error: AdmissionError) -> Self {
         match error {
@@ -117,6 +303,7 @@ impl<O> From<AdmissionError> for OperationError<O> {
             AdmissionError::Cancelled => Self::Cancelled,
             AdmissionError::Failed(value) => Self::Failed(value),
             AdmissionError::Io(error) => Self::Io(error),
+            AdmissionError::Annotated { context, source } => Self::from(*source).context(*context),
         }
     }
 }
@@ -142,6 +329,9 @@ pub(crate) type LocalCatalog = Catalog<LocalContext, ProducedOutput>;
 impl OutputValue for ProducedOutput {
     fn from_value(value: Value) -> Self {
         Self::new(value)
+    }
+    fn with_diagnostic(self, diagnostic: Diagnostic) -> Self {
+        self.with_diagnostic(diagnostic)
     }
 }
 
@@ -318,11 +508,24 @@ impl LocalCatalog {
         }
         match path.outcome {
             PathOutcome::Ready => {
-                tool.admit(arguments)?
+                let fallback = DiagnosticContext {
+                    paths: path.paths,
+                    ..Default::default()
+                };
+                tool.admit(arguments, &original_arguments)?
                     .call(context.with_arguments(original_arguments))
                     .await
+                    .map(|mut output| {
+                        if let Some(diagnostic) = &mut output.diagnostic {
+                            diagnostic.context.fallback(fallback.clone());
+                        }
+                        output
+                    })
+                    .map_err(|error| error.fallback_context(fallback))
             }
-            PathOutcome::ReadError(value) => Ok(ProducedOutput::new(value)),
+            PathOutcome::ReadError { value, diagnostic } => {
+                Ok(ProducedOutput::new(value).with_diagnostic(*diagnostic))
+            }
         }
     }
 }
@@ -330,11 +533,15 @@ impl LocalCatalog {
 pub(crate) struct PathPreflight {
     pub(crate) permissions: Vec<PermissionUse>,
     pub(crate) outcome: PathOutcome,
+    pub(crate) paths: Vec<PathFact>,
 }
 
 pub(crate) enum PathOutcome {
     Ready,
-    ReadError(Value),
+    ReadError {
+        value: Value,
+        diagnostic: Box<Diagnostic>,
+    },
 }
 
 use crate::tool::builtins::workspace::{lexical_path, resolve_for_authorization};
@@ -350,6 +557,7 @@ pub(crate) async fn preflight_path_arguments<C: Send + 'static, O: OutputValue>(
         return Err(AdmissionError::ArgumentsMustBeObject);
     }
     let mut permissions = Vec::new();
+    let mut paths = Vec::new();
     let mut outcome = PathOutcome::Ready;
     for spec in tool.path_arguments(arguments)? {
         let Some(input) = spec.input(arguments)?.map(str::to_owned) else {
@@ -358,7 +566,16 @@ pub(crate) async fn preflight_path_arguments<C: Send + 'static, O: OutputValue>(
         let resolved = match resolve_for_authorization(workspace, &input, spec.kind).await {
             Ok(resolved) => resolved,
             Err(error) => {
-                let Some(output) = tool.read_error_output(&input, &error) else {
+                let mut context = error.diagnostic().context.path(PathRole::Requested, &input);
+                if spec.name() == "cwd" {
+                    context.subject = Subject::working_directory(lexical_path(workspace, &input)?);
+                    context.effects = Effects::NotStarted;
+                }
+                context.site =
+                    FailureSite::Execution(ExecutionLocation::named(target, workspace.to_owned()));
+                let error = error.context(context);
+                let diagnostic = error.diagnostic();
+                let Some(output) = tool.read_error_output(&input, &diagnostic) else {
                     return Err(error);
                 };
                 // Canonicalization failed, so this path is not proven to be within
@@ -373,13 +590,34 @@ pub(crate) async fn preflight_path_arguments<C: Send + 'static, O: OutputValue>(
                     PermissionUse::new(capability, resource.clone())
                         .with_grant(ApprovalGrant::exact(capability, resource)),
                 );
-                outcome = PathOutcome::ReadError(output);
+                outcome = PathOutcome::ReadError {
+                    value: output,
+                    diagnostic: Box::new(diagnostic),
+                };
                 continue;
             }
         };
         // Both the existing handler JSON and permission resource are Unicode
         // boundaries. Never authorize a replacement-character alias.
-        let value = Value::String(path_text(&resolved.path)?.to_owned());
+        let value = Value::String(
+            path_text(&resolved.path)
+                .map_err(|error| {
+                    error.context(
+                        DiagnosticContext::new(Operation::Validate, Subject::path(&resolved.path))
+                            .path(PathRole::Requested, &input)
+                            .path(PathRole::Resolved, &resolved.path),
+                    )
+                })?
+                .to_owned(),
+        );
+        paths.push(PathFact {
+            role: PathRole::Requested,
+            path: input.into(),
+        });
+        paths.push(PathFact {
+            role: PathRole::Resolved,
+            path: resolved.path.clone(),
+        });
         spec.rewrite(arguments, value)?;
         if matches!(spec.binding, crate::tool::registry::PathBinding::Pointer(_))
             || !resolved.path.starts_with(authorization_root)
@@ -390,6 +628,7 @@ pub(crate) async fn preflight_path_arguments<C: Send + 'static, O: OutputValue>(
     Ok(PathPreflight {
         permissions,
         outcome,
+        paths,
     })
 }
 

@@ -4,7 +4,10 @@ use super::{AgentCommand, SessionRuntime};
 
 mod delivery;
 mod receipt;
-use crate::tool::{ToolContext, ToolError};
+use crate::tool::{
+    ToolContext, ToolError,
+    diagnostic::{Effects, Operation, Subject},
+};
 pub(super) use receipt::PendingEventBatch;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -213,27 +216,40 @@ impl SessionRuntime {
         let deadline = args
             .timeout
             .map(|seconds| {
+                let invalid = |message: &str| {
+                    ToolError::InvalidArguments(message.into())
+                        .operation(Operation::Validate, Subject::argument(["timeout"]))
+                        .effects(Effects::NotStarted)
+                };
                 if seconds == 0 {
-                    return Err(ToolError::InvalidArguments(
-                        "timeout must be a positive integer".into(),
-                    ));
+                    return Err(invalid("timeout must be a positive integer"));
                 }
                 tokio::time::Instant::now()
                     .checked_add(std::time::Duration::from_secs(seconds))
-                    .ok_or_else(|| ToolError::InvalidArguments("timeout is too large".into()))
+                    .ok_or_else(|| invalid("timeout is too large"))
             })
             .transpose()?;
-        let sender = self
-            .agent_sender(context.agent())
-            .ok_or_else(|| ToolError::Failed("calling agent is not active".into()))?;
+        let sender = self.agent_sender(context.agent()).ok_or_else(|| {
+            ToolError::Failed("calling agent is not active".into())
+                .operation(
+                    Operation::Lookup,
+                    Subject::Label(format!("calling agent {}", context.agent())),
+                )
+                .effects(Effects::Unchanged)
+        })?;
         let mut revision = sender.wake.revision.subscribe();
         let timeout = async || match deadline {
             Some(deadline) => tokio::time::sleep_until(deadline).await,
             None => std::future::pending().await,
         };
+        let cancelled = || {
+            ToolError::Cancelled
+                .operation(Operation::Wait, Subject::Job(context.job()))
+                .effects(Effects::Unchanged)
+        };
         loop {
             if context.is_cancelled() {
-                return Err(ToolError::Cancelled);
+                return Err(cancelled());
             }
             // The agent cannot act while its foreground work is outstanding, so that
             // takes precedence; the next request carries every event together. Such
@@ -243,7 +259,7 @@ impl SessionRuntime {
             if let Some(holding) = state.holding {
                 tokio::select! {
                     biased;
-                    () = context.cancelled() => return Err(ToolError::Cancelled),
+                    () = context.cancelled() => return Err(cancelled()),
                     // Completed foreground work is something the agent acts on: its
                     // result returns with this wait's. A script's wait cannot.
                     _ = self.jobs.wait_settled(holding) => {
@@ -254,7 +270,7 @@ impl SessionRuntime {
                     }
                     () = parked => continue,
                     changed = revision.changed() => {
-                        if changed.is_err() { return Err(ToolError::Cancelled); }
+                        if changed.is_err() { return Err(cancelled()); }
                         continue;
                     }
                     () = timeout() => return Ok(WaitOutput { reason: WakeReason::Timeout }),
@@ -278,9 +294,9 @@ impl SessionRuntime {
             }
             tokio::select! {
                 biased;
-                () = context.cancelled() => return Err(ToolError::Cancelled),
+                () = context.cancelled() => return Err(cancelled()),
                 changed = revision.changed() => {
-                    if changed.is_err() { return Err(ToolError::Cancelled); }
+                    if changed.is_err() { return Err(cancelled()); }
                 }
                 () = timeout() => return Ok(WaitOutput { reason: WakeReason::Timeout }),
             }

@@ -10,7 +10,11 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 
 use super::{SshOptions, TargetConfig, TargetType};
-use crate::tool::policy::{Capability, CapabilitySet};
+use crate::tool::{
+    AdmissionError,
+    diagnostic::{Operation, Subject},
+    policy::{Capability, CapabilitySet},
+};
 
 pub const ROOT_TARGET: &str = "root";
 
@@ -63,7 +67,18 @@ impl TargetDefinition {
 
     /// The previous target in this target's route: its jump, otherwise its origin.
     pub fn parent(&self) -> Option<&str> {
-        self.via.as_deref().or(self.origin.as_deref())
+        self.parent_edge().map(|(_, name)| name)
+    }
+
+    pub(crate) fn parent_edge(&self) -> Option<(TargetEdge, &str)> {
+        self.via
+            .as_deref()
+            .map(|name| (TargetEdge::Via, name))
+            .or_else(|| {
+                self.origin
+                    .as_deref()
+                    .map(|name| (TargetEdge::Origin, name))
+            })
     }
 
     pub(crate) fn validate(&self) -> Result<(), TargetError> {
@@ -81,18 +96,8 @@ impl TargetDefinition {
         if self.via.is_some() && self.via == self.origin {
             return Err(TargetError::ViaIsOrigin(self.name.clone()));
         }
-        if let Some((key, _)) = (self.ssh.options.iter())
-            .find(|(key, value)| !crate::remote::ssh::configurable_option(key, value))
-        {
-            let field = match key.to_ascii_lowercase().as_str() {
-                "user" => "ssh.user",
-                "hostname" => "host",
-                "port" => "ssh.port",
-                "identityfile" => "ssh.auth",
-                "proxyjump" => "via",
-                _ => return Err(TargetError::InvalidSshOption(key.clone())),
-            };
-            return Err(TargetError::DedicatedSshOption(key.clone(), field));
+        for (key, value) in &self.ssh.options {
+            crate::remote::ssh::validate_option(key, value)?;
         }
         let proxy_command =
             (self.ssh.options.keys()).any(|key| key.eq_ignore_ascii_case("proxycommand"));
@@ -220,7 +225,7 @@ impl TargetRegistry {
 
     pub async fn route(&self, name: &str) -> Result<Vec<TargetDefinition>, TargetError> {
         let entries = self.entries.read().await;
-        let mut route = walk_route(&entries, name, TargetError::Unknown)?
+        let mut route = walk_route(&entries, name)?
             .into_iter()
             .cloned()
             .collect::<Vec<_>>();
@@ -298,15 +303,14 @@ impl PreparedTargetUpdate {
 }
 
 fn needs_ssh_agent(entries: &BTreeMap<String, TargetDefinition>, name: &str) -> bool {
-    walk_route(entries, name, TargetError::UnknownJump)
-        .is_ok_and(|route| route.iter().any(|hop| hop.ssh.external_agent))
+    walk_route(entries, name).is_ok_and(|route| route.iter().any(|hop| hop.ssh.external_agent))
 }
 
 fn dependants(entries: &BTreeMap<String, TargetDefinition>, changed: &str) -> Vec<String> {
     entries
         .keys()
         .filter(|name| {
-            walk_route(entries, name, TargetError::UnknownJump)
+            walk_route(entries, name)
                 .is_ok_and(|route| route.iter().any(|target| target.name == changed))
         })
         .cloned()
@@ -315,7 +319,7 @@ fn dependants(entries: &BTreeMap<String, TargetDefinition>, changed: &str) -> Ve
 
 fn validate_graph(entries: &BTreeMap<String, TargetDefinition>) -> Result<(), TargetError> {
     for (name, target) in entries {
-        let route = walk_route(entries, name, TargetError::UnknownJump)?;
+        let route = walk_route(entries, name)?;
         target.validate()?;
         // Jumps belong to the connection their origin starts, so a jump's key paths
         // and agent are never reinterpreted on another machine. The origin ends the
@@ -340,23 +344,27 @@ pub(super) fn validate_route_cycles(
     entries: &BTreeMap<String, TargetDefinition>,
 ) -> Result<(), TargetError> {
     for name in entries.keys() {
-        walk_partial_route(entries, name, None)?;
+        walk_partial_route(entries, name, MissingReference::Allow)?;
     }
     Ok(())
+}
+
+enum MissingReference {
+    Allow,
+    Reject,
 }
 
 fn walk_route<'a>(
     entries: &'a BTreeMap<String, TargetDefinition>,
     name: &str,
-    unknown: fn(String) -> TargetError,
 ) -> Result<Vec<&'a TargetDefinition>, TargetError> {
-    walk_partial_route(entries, name, Some(unknown))
+    walk_partial_route(entries, name, MissingReference::Reject)
 }
 
 fn walk_partial_route<'a>(
     entries: &'a BTreeMap<String, TargetDefinition>,
     name: &str,
-    unknown: Option<fn(String) -> TargetError>,
+    missing: MissingReference,
 ) -> Result<Vec<&'a TargetDefinition>, TargetError> {
     let mut route = Vec::new();
     let mut current = name;
@@ -366,23 +374,35 @@ fn walk_partial_route<'a>(
             return Err(TargetError::Cycle(current.to_owned()));
         }
         let Some(target) = entries.get(current) else {
-            return match unknown {
-                Some(error) => Err(error(current.to_owned())),
-                None => Ok(route),
+            return match missing {
+                MissingReference::Reject => Err(TargetError::Unknown(current.to_owned())),
+                MissingReference::Allow => Ok(route),
             };
         };
         route.push(target);
-        let Some(parent) = target.parent() else {
+        let Some((edge, parent)) = target.parent_edge() else {
             return Ok(route);
         };
+        if !entries.contains_key(parent) {
+            return match missing {
+                MissingReference::Reject => Err(TargetError::UnknownReference {
+                    target: target.name.clone(),
+                    edge,
+                    reference: parent.to_owned(),
+                }),
+                MissingReference::Allow => Ok(route),
+            };
+        }
         // Validated definitions never link to root.
         current = parent;
     }
 }
 
 fn validate_name(name: &str) -> Result<(), TargetError> {
+    if name == ROOT_TARGET {
+        return Err(TargetError::ReservedName);
+    }
     let valid = !name.is_empty()
-        && name != ROOT_TARGET
         && name.len() <= 128
         && name
             .bytes()
@@ -410,16 +430,40 @@ fn validate_endpoint(host: &str, user: Option<&str>) -> Result<(), TargetError> 
     Ok(())
 }
 
+/// The field that introduces a target reference, retained when resolution fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetEdge {
+    Origin,
+    Via,
+}
+
+impl std::fmt::Display for TargetEdge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Origin => "origin",
+            Self::Via => "via",
+        })
+    }
+}
+
 #[derive(Clone, Debug, Error)]
 pub enum TargetError {
     #[error("only the session host root may use type = local; named targets require type = ssh")]
     BuiltinOnly,
+    #[error("target name `root` is reserved for the Skyhook session host; choose a different name")]
+    ReservedName,
     #[error("invalid target name `{0}`")]
     InvalidName(String),
     #[error("invalid target hostname `{0}`")]
     InvalidHost(String),
-    #[error("SSH option `{0}` is invalid or reserved by Skyhook")]
-    InvalidSshOption(String),
+    #[error("SSH option names must be nonempty ASCII letters and digits")]
+    InvalidSshOptionName,
+    #[error("SSH option `{0}` is reserved by Skyhook")]
+    ReservedSshOption(String),
+    #[error("SSH option `{0}` requires a nonempty value")]
+    EmptySshOptionValue(String),
+    #[error("SSH option `{0}` cannot contain control characters")]
+    InvalidSshOptionValue(String),
     #[error("SSH option `{0}` is set through the `{1}` field, not ssh.options")]
     DedicatedSshOption(String, &'static str),
     #[error("target `{0}` sets ProxyCommand, which cannot be combined with via")]
@@ -441,14 +485,89 @@ pub enum TargetError {
     InvalidUser,
     #[error("unknown target `{0}`")]
     Unknown(String),
-    #[error("target references unknown jump target `{0}`")]
-    UnknownJump(String),
+    #[error("target `{target}` references unknown {edge} target `{reference}`")]
+    UnknownReference {
+        target: String,
+        edge: TargetEdge,
+        reference: String,
+    },
     #[error("target route contains a cycle at `{0}`")]
     Cycle(String),
     #[error("`root` identifies the Skyhook session host")]
     RootIsLocal,
     #[error("`root` cannot be used as a jump target")]
     RootCannotBeJump,
+}
+
+impl TargetError {
+    /// Agent-facing reasons never carry aliases or submitted values: a saved
+    /// diagnostic can later be read with fewer capabilities than its first reader.
+    pub(crate) fn into_admission_error(self) -> AdmissionError {
+        let argument = |name: &str| Subject::argument(name.split('.'));
+        let (subject, reason) = match &self {
+            Self::BuiltinOnly => (argument("type"), None),
+            Self::ReservedName => (argument("name"), None),
+            Self::InvalidName(_) => (
+                argument("name"),
+                Some(
+                    "target name must contain 1 to 128 ASCII letters, digits, underscores, hyphens, or periods",
+                ),
+            ),
+            Self::InvalidHost(_) => (
+                argument("host"),
+                Some("hostname must be nonempty and contain no whitespace or control characters"),
+            ),
+            Self::InvalidSshOptionName => (argument("ssh.options"), None),
+            Self::ReservedSshOption(_) => (
+                argument("ssh.options"),
+                Some("SSH option is reserved by Skyhook"),
+            ),
+            Self::EmptySshOptionValue(_) => (
+                argument("ssh.options"),
+                Some("SSH option requires a nonempty value"),
+            ),
+            Self::InvalidSshOptionValue(_) => (
+                argument("ssh.options"),
+                Some("SSH option value cannot contain control characters"),
+            ),
+            Self::DedicatedSshOption(_, field) => {
+                return AdmissionError::invalid(format!(
+                    "SSH option must be set through the {field} field, not ssh.options"
+                ))
+                .operation(Operation::Validate, argument("ssh.options"));
+            }
+            Self::ProxyCommandWithVia(_) => (
+                argument("ssh.options"),
+                Some("ProxyCommand cannot be combined with via"),
+            ),
+            Self::ViaIsOrigin(_) => (
+                argument("via"),
+                Some(
+                    "via cannot be the connection origin; omit via to connect directly from the origin",
+                ),
+            ),
+            Self::NameUnavailable(_) => (argument("name"), Some("target name is unavailable")),
+            Self::OriginMismatch { .. } => (
+                argument("origin"),
+                Some("target and its jump must start SSH from the same origin"),
+            ),
+            Self::InvalidUser => (argument("ssh.user"), None),
+            Self::Unknown(_) => (argument("target"), Some("unknown target")),
+            Self::UnknownReference { edge, .. } => match edge {
+                TargetEdge::Origin => (argument("origin"), Some("unknown origin target")),
+                TargetEdge::Via => (argument("via"), Some("unknown jump target")),
+            },
+            Self::Cycle(_) => (
+                Subject::Label("target route".into()),
+                Some("target route contains a cycle"),
+            ),
+            Self::RootIsLocal => (argument("target"), None),
+            Self::RootCannotBeJump => (argument("via"), None),
+        };
+        // Variants without a payload render nothing private.
+        AdmissionError::invalid(reason.map_or_else(|| self.to_string(), str::to_owned))
+            .operation(Operation::Validate, subject)
+    }
 }
 
 #[cfg(test)]
@@ -499,16 +618,62 @@ mod tests {
         assert!(json.contains("\"auth\":\"key\""));
     }
 
+    #[test]
+    fn admission_errors_never_carry_submitted_values_or_aliases() {
+        let private = || "private-submitted-target".to_owned();
+        for error in [
+            TargetError::InvalidName(private()),
+            TargetError::InvalidHost(private()),
+            TargetError::ReservedSshOption(private()),
+            TargetError::EmptySshOptionValue(private()),
+            TargetError::InvalidSshOptionValue(private()),
+            TargetError::DedicatedSshOption(private(), "ssh.auth"),
+            TargetError::ProxyCommandWithVia(private()),
+            TargetError::ViaIsOrigin(private()),
+            TargetError::NameUnavailable(private()),
+            TargetError::OriginMismatch {
+                target: private(),
+                jump: private(),
+                origin: private(),
+                jump_origin: private(),
+            },
+            TargetError::Unknown(private()),
+            TargetError::UnknownReference {
+                target: private(),
+                edge: TargetEdge::Via,
+                reference: private(),
+            },
+            TargetError::Cycle(private()),
+        ] {
+            let diagnostic = error.into_admission_error().diagnostic();
+            let saved = serde_json::to_string(&diagnostic).unwrap();
+            assert!(!saved.contains(&private()), "{saved}");
+        }
+    }
+
     #[tokio::test]
-    async fn batch_registration_is_atomic() {
+    async fn missing_route_references_identify_the_edge_and_leave_batch_unchanged() {
         let registry = TargetRegistry::from_definitions([target("first", None)]).unwrap();
         let before = registry.definitions().await;
-        let invalid = target("invalid", Some("missing"));
-        let result = registry
-            .upsert_many(vec![target("added", None), invalid])
-            .await;
-        assert!(result.is_err());
-        assert_eq!(registry.definitions().await, before);
+        for edge in [TargetEdge::Via, TargetEdge::Origin] {
+            let mut invalid = target("invalid", None);
+            match edge {
+                TargetEdge::Via => invalid.via = Some("missing".into()),
+                TargetEdge::Origin => invalid.origin = Some("missing".into()),
+            }
+            let result = registry
+                .upsert_many(vec![target("added", None), invalid])
+                .await;
+            assert!(matches!(result, Err(TargetError::UnknownReference {
+                target,
+                edge: actual,
+                reference,
+            }) if target == "invalid" && actual == edge && reference == "missing"));
+            assert_eq!(registry.definitions().await, before);
+        }
+        assert!(
+            matches!(registry.route("absent").await, Err(TargetError::Unknown(name)) if name == "absent")
+        );
     }
 
     #[tokio::test]

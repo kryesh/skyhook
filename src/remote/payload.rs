@@ -230,6 +230,7 @@ mod tests {
                 .await
                 .unwrap();
             let completion = tokio::spawn(result.finish(Ok(RemoteToolOutput {
+                diagnostic: None,
                 value: serde_json::json!({"value": "x".repeat(bytes)}),
                 images: Vec::new(),
                 captures: Vec::new(),

@@ -161,6 +161,7 @@ pub(crate) struct RemoteToolOutput {
     pub images: Vec<crate::media::ImageRef>,
     pub captures: Vec<CaptureId>,
     pub streams: crate::tool::StreamEnd,
+    pub diagnostic: Option<crate::tool::diagnostic::Diagnostic>,
 }
 
 impl From<ProducedOutput> for RemoteToolOutput {
@@ -174,14 +175,14 @@ impl From<ProducedOutput> for RemoteToolOutput {
                 .map(|capture| capture.id())
                 .collect(),
             streams: output.streams,
+            diagnostic: output.diagnostic,
         }
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct RemoteToolError {
-    pub message: String,
-    pub denial: Option<crate::tool::Denial>,
+    pub diagnostic: Box<crate::tool::diagnostic::Diagnostic>,
     pub output: Option<Box<RemoteToolOutput>>,
 }
 

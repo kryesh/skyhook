@@ -445,11 +445,7 @@ mod tests {
         let id = manager.test_create(spec).await;
         let output = ToolOutput::new(value);
         let outcome = match error {
-            Some(message) => JobOutcome::Failed {
-                message,
-                output: Some(output),
-                denial: None,
-            },
+            Some(message) => ToolError::Failed(message).with_result(output).into(),
             None => JobOutcome::Completed(output),
         };
         manager.finish(id, outcome).await.unwrap();
@@ -480,7 +476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn limits_are_per_field_and_unannotated_data_and_errors_survive_resume() {
+    async fn limits_are_per_field_and_unannotated_data_and_diagnostics_survive_resume() {
         let value = json!({"content":"line\n".repeat(150), "stdout":"é\\\"".repeat(FIELD_BYTES),
             "stderr":"e".repeat(2 * FIELD_BYTES), "metadata":"m".repeat(92000), "extra":["z".repeat(10000)], "exit_code":7});
         let schema = json!({"type":"object","properties":{
@@ -500,10 +496,13 @@ mod tests {
         for field in ["metadata", "extra", "exit_code"] {
             assert_eq!(result[field], value[field]);
         }
-        assert_eq!(view["error"], error);
+        let rendered_error = ToolError::Failed(error)
+            .diagnostic()
+            .render(&Default::default());
+        assert_eq!(view["error"], rendered_error);
         assert_eq!(
             manager.metadata(id).await.unwrap().error.as_deref(),
-            Some(error.as_str())
+            Some(rendered_error.as_str())
         );
         assert!(view.get("console").is_none() && view["presentation"]["preview"].is_null());
         assert_eq!(

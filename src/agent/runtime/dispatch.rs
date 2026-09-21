@@ -248,6 +248,7 @@ impl SessionRuntime {
                         call.arguments()
                             .get("name")
                             .and_then(serde_json::Value::as_str),
+                        executor.diagnostic_viewer(),
                     );
                     ToolResult {
                         call_id: call.id().to_owned(),

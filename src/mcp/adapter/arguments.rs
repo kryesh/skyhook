@@ -1,20 +1,23 @@
 //! Preserve upstream JSON Schema semantics while reserving the host job envelope.
-use crate::tool::AdmissionError;
+use crate::tool::{
+    AdmissionError,
+    diagnostic::{
+        ArgumentPathSegment, Effects, NoExternalArgumentSchemas, Operation, Subject,
+        safe_argument_path, safe_text, schema_argument_failure,
+    },
+};
 use serde_json::{Map, Value, json};
 
-struct NoExternalSchemas;
-
-impl jsonschema::Retrieve for NoExternalSchemas {
-    fn retrieve(
-        &self,
-        _uri: &jsonschema::Uri<String>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        Err("external MCP schema references are not permitted".into())
-    }
+fn rejected(error: AdmissionError, path: String) -> AdmissionError {
+    error
+        .operation(Operation::Validate, Subject::Argument(path))
+        .effects(Effects::NotStarted)
 }
 
 pub(super) struct Arguments {
     pub(super) schema: Value,
+    // Local references and validation paths remain in the upstream document's scope.
+    upstream_schema: Value,
     validator: jsonschema::Validator,
     pub(super) wrapped: bool,
 }
@@ -27,9 +30,14 @@ impl Arguments {
         // Never load server-supplied references from the host filesystem or
         // network, even if feature unification later enables a default resolver.
         let validator = jsonschema::options()
-            .with_retriever(NoExternalSchemas)
+            .with_retriever(NoExternalArgumentSchemas)
             .build(&original)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                format!(
+                    "invalid input schema at {}",
+                    safe_text(error.instance_path().as_str())
+                )
+            })?;
         // The registry consumes bg before validation. Unless the root explicitly
         // excludes it, preserve the entire upstream input under an envelope.
         // Pattern schemas also need wrapping because the registry's basic
@@ -63,9 +71,11 @@ impl Arguments {
                 // Older drafts ignore every $ref sibling, including an injected
                 // resource ID. Normalize the root alias before giving it scope.
                 let canonical = jsonschema::canonical::options()
-                    .with_retriever(NoExternalSchemas)
+                    .with_retriever(NoExternalArgumentSchemas)
                     .canonicalize(&original)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|_| {
+                        "legacy root-reference schema cannot be canonicalized".to_owned()
+                    })?;
                 if canonical.kind() == jsonschema::canonical::CanonicalKind::Raw {
                     return Err("legacy root-reference schema cannot be safely embedded".to_owned());
                 }
@@ -109,15 +119,21 @@ impl Arguments {
             // Do not publish an envelope with dangling references even when
             // the original document was valid in its unwrapped scope.
             jsonschema::options()
-                .with_retriever(NoExternalSchemas)
+                .with_retriever(NoExternalArgumentSchemas)
                 .build(&envelope)
-                .map_err(|error| format!("cannot embed input schema: {error}"))?;
+                .map_err(|error| {
+                    format!(
+                        "cannot embed input schema at {}",
+                        safe_text(error.instance_path().as_str())
+                    )
+                })?;
             envelope
         } else {
-            original
+            original.clone()
         };
         Ok(Self {
             schema,
+            upstream_schema: original,
             validator,
             wrapped,
         })
@@ -129,18 +145,22 @@ impl Arguments {
     ) -> Result<&'a Map<String, Value>, AdmissionError> {
         let object = value
             .as_object()
-            .ok_or(AdmissionError::ArgumentsMustBeObject)?;
+            .ok_or_else(|| rejected(AdmissionError::ArgumentsMustBeObject, String::new()))?;
         if self.wrapped {
             if let Some(name) = object.keys().find(|name| name.as_str() != "arguments") {
-                return Err(AdmissionError::InvalidArguments(format!(
-                    "unknown argument `{name}`"
-                )));
+                return Err(rejected(
+                    AdmissionError::InvalidArguments("unknown argument".into()),
+                    safe_argument_path(&self.schema, [ArgumentPathSegment::Property(name)]),
+                ));
             }
             object
                 .get("arguments")
                 .and_then(Value::as_object)
                 .ok_or_else(|| {
-                    AdmissionError::InvalidArguments("`arguments` must be an object".to_owned())
+                    rejected(
+                        AdmissionError::InvalidArguments("`arguments` must be an object".into()),
+                        "/arguments".into(),
+                    )
                 })
         } else {
             Ok(object)
@@ -148,10 +168,16 @@ impl Arguments {
     }
 
     pub(super) fn validate(&self, value: &Value) -> Result<(), AdmissionError> {
-        let object = self.extract(value)?;
-        self.validator
-            .validate(&Value::Object(object.clone()))
-            .map_err(|error| AdmissionError::InvalidArguments(error.to_string()))
+        let input = Value::Object(self.extract(value)?.clone());
+        self.validator.validate(&input).map_err(|error| {
+            let (path, expectation) =
+                schema_argument_failure(&self.upstream_schema, &input, &error);
+            let prefix = if self.wrapped { "/arguments" } else { "" };
+            rejected(
+                AdmissionError::InvalidArguments(expectation),
+                format!("{prefix}{path}"),
+            )
+        })
     }
 }
 
@@ -161,7 +187,7 @@ mod tests {
 
     fn surface(schema: &Value) -> impl Fn(&Value) -> bool {
         let validator = jsonschema::options()
-            .with_retriever(NoExternalSchemas)
+            .with_retriever(NoExternalArgumentSchemas)
             .build(schema)
             .unwrap_or_else(|error| panic!("{error}: {schema}"));
         move |instance| validator.is_valid(instance)
@@ -224,54 +250,43 @@ mod tests {
 
     #[test]
     fn local_and_recursive_references_keep_their_meaning_in_wrapped_schema() {
-        let local = |dialect| {
-            json!({"$schema":dialect, "type":"object",
-                "definitions":{"number":{"type":"integer","minimum":1}},
-                "properties":{"count":{"$ref":"#/definitions/number"}},"required":["count"]})
-        };
-        // Legacy recursive root aliases retain their constraints.
-        let recursive = |dialect| {
-            json!({"$schema":dialect, "type":"object", "additionalProperties":false,
-                "$ref":"#/definitions/node", "definitions":{"node":{
-                    "type":"object", "required":["count"],
-                    "properties":{"count":{"type":"integer","minimum":1},
-                                  "child":{"$ref":"#/definitions/node"}}}}})
-        };
-        let (draft4, draft7) = (
-            "http://json-schema.org/draft-04/schema#",
-            "http://json-schema.org/draft-07/schema#",
-        );
-        let mut cases = Vec::new();
-        for dialect in [
-            draft4,
-            draft7,
-            "https://json-schema.org/draft/2019-09/schema",
-            "https://json-schema.org/draft/2020-12/schema",
+        for (dialect, legacy) in [
+            ("http://json-schema.org/draft-04/schema#", true),
+            ("http://json-schema.org/draft-07/schema#", true),
+            ("https://json-schema.org/draft/2019-09/schema", false),
+            ("https://json-schema.org/draft/2020-12/schema", false),
         ] {
-            let valid = json!({"arguments":{"count":2}});
-            cases.push((
-                dialect,
-                local(dialect),
-                valid,
+            let check = |schema, valid, invalid| {
+                let arguments = Arguments::new(schema).unwrap();
+                let surface = surface(&arguments.schema);
+                assert!(
+                    arguments.validate(&valid).is_ok() && surface(&valid),
+                    "{dialect}"
+                );
+                assert!(
+                    arguments.validate(&invalid).is_err() && !surface(&invalid),
+                    "{dialect}"
+                );
+            };
+            check(
+                json!({"$schema":dialect, "type":"object",
+                    "definitions":{"number":{"type":"integer","minimum":1}},
+                    "properties":{"count":{"$ref":"#/definitions/number"}},"required":["count"]}),
+                json!({"arguments":{"count":2}}),
                 json!({"arguments":{"count":0}}),
-            ));
-        }
-        for dialect in [draft4, draft7] {
-            let valid = json!({"arguments":{"count":1,"child":{"count":2},"bg":"upstream"}});
-            let invalid = json!({"arguments":{"count":1,"child":{"count":0}}});
-            cases.push((dialect, recursive(dialect), valid, invalid));
-        }
-        for (dialect, schema, valid, invalid) in cases {
-            let arguments = Arguments::new(schema).unwrap();
-            let surface = surface(&arguments.schema);
-            assert!(
-                arguments.validate(&valid).is_ok() && surface(&valid),
-                "{dialect}"
             );
-            assert!(
-                arguments.validate(&invalid).is_err() && !surface(&invalid),
-                "{dialect}"
-            );
+            // Legacy recursive root aliases retain their constraints.
+            if legacy {
+                check(
+                    json!({"$schema":dialect, "type":"object", "additionalProperties":false,
+                        "$ref":"#/definitions/node", "definitions":{"node":{
+                            "type":"object", "required":["count"],
+                            "properties":{"count":{"type":"integer","minimum":1},
+                                          "child":{"$ref":"#/definitions/node"}}}}}),
+                    json!({"arguments":{"count":1,"child":{"count":2},"bg":"upstream"}}),
+                    json!({"arguments":{"count":1,"child":{"count":0}}}),
+                );
+            }
         }
     }
 
@@ -287,6 +302,94 @@ mod tests {
             json!({"type":"object","$id":"https://example.invalid/root","$ref":"child.json"}),
         ] {
             assert!(Arguments::new(schema.clone()).is_err(), "accepted {schema}");
+        }
+    }
+
+    #[test]
+    fn validation_failures_name_declared_paths_and_hide_dynamic_keys() {
+        let secret = "private-key";
+        for (schema, value, path, expectations) in [
+            (
+                json!({"type":"object", "additionalProperties":false,
+                    "properties":{"credentials":{"type":"object",
+                        "properties":{"token":{"type":"integer"}}}}}),
+                json!({"credentials":{"token":secret}}),
+                "/credentials/token",
+                vec!["expected an integer"],
+            ),
+            // Decode JSON pointers using the instance: numeric map keys are
+            // private data, but array indices and escaped schema names survive.
+            (
+                json!({"type":"object", "properties":{"credentials":{"type":"object",
+                    "additionalProperties":{"type":"object", "additionalProperties":{
+                        "type":"array", "items":{"type":"object",
+                        "properties":{"token/~":{"type":"integer"}}}}}}}}),
+                json!({"arguments":{"credentials":{(secret):{"8675309":[{"token/~":secret}]}}}}),
+                "/arguments/credentials/*/*/0/token~1~0",
+                vec!["expected an integer"],
+            ),
+            (
+                json!({"type":"object", "additionalProperties":false,
+                    "properties":{"":{"type":"integer"}}}),
+                json!({"":secret}),
+                "/",
+                vec!["expected an integer"],
+            ),
+            (
+                json!({"type":"object"}),
+                json!({"arguments":{}, (secret):secret}),
+                "/*",
+                vec!["unknown argument"],
+            ),
+            (
+                json!({"type":"object", "additionalProperties":false}),
+                json!({(secret):secret}),
+                "",
+                vec!["not allowed"],
+            ),
+            (
+                json!({"type":"object", "additionalProperties":false,
+                    "properties":{"command":{"type":"string"}}, "required":["command"]}),
+                json!({}),
+                "",
+                vec!["missing required field `command`"],
+            ),
+            (
+                json!({"type":"object", "additionalProperties":false,
+                    "$defs":{"positive":{"minimum":1}},
+                    "properties":{"count":{"$ref":"#/$defs/positive"}}}),
+                json!({"count":0}),
+                "/count",
+                vec!["minimum 1"],
+            ),
+            (
+                json!({"type":"object", "additionalProperties":false,
+                    "properties":{"mode":{"enum":["fast", "safe"]}}}),
+                json!({"mode":secret}),
+                "/mode",
+                vec!["expected one of", "fast", "safe"],
+            ),
+            (
+                json!({"type":"object", "propertyNames":{"enum":["count"]}}),
+                json!({"arguments":{(secret):secret}}),
+                "/arguments",
+                vec!["invalid property name", "expected one of", "count"],
+            ),
+        ] {
+            let error = Arguments::new(schema)
+                .unwrap()
+                .validate(&value)
+                .unwrap_err();
+            let diagnostic = error.diagnostic();
+            assert_eq!(diagnostic.context.subject, Subject::Argument(path.into()));
+            let text = diagnostic.render(&Default::default());
+            for expectation in expectations {
+                assert!(text.contains(expectation), "{text}");
+            }
+            let stored = serde_json::to_string(&diagnostic).unwrap();
+            for hidden in [secret, "8675309"] {
+                assert!(!stored.contains(hidden), "{stored}");
+            }
         }
     }
 }

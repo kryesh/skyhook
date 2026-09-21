@@ -458,9 +458,9 @@ mod tests {
         let finished = SessionEvent::JobFinished {
             job,
             state: JobState::Completed,
-            error: None,
+            diagnostic: None,
+            output_diagnostic: None,
             images: Vec::new(),
-            denial: None,
         };
         manager.test_append(owner.clone(), finished).await;
         assert!(manager.test_replay().await.has_pending(&owner).await);
@@ -473,7 +473,10 @@ mod tests {
             let (_root, manager, owner, job) = question_job().await;
             commit_pending(&manager, &owner, notification(job, JobState::WaitingInput)).await;
             if cancelled {
-                manager.finish(job, JobOutcome::Cancelled).await.unwrap();
+                manager
+                    .finish(job, ToolError::Cancelled.into())
+                    .await
+                    .unwrap();
             } else {
                 manager.resume_input(job).await.unwrap();
                 manager.test_finish(job, serde_json::json!("done")).await;

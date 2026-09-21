@@ -1,4 +1,4 @@
--- Skyhook session database (application_id 0x534B5948, user_version 9). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 10). Tables are STRICT;
 -- subtype rows key (entry, kind) -> entry(seq, kind). db/mod.rs adds append-only triggers
 -- to tables outside MUTABLE_TABLES. u64 values saturate to i64::MAX.
 
@@ -561,13 +561,94 @@ CREATE TABLE job_finish (
   kind TEXT NOT NULL DEFAULT 'job_finished' CHECK (kind = 'job_finished'),
   job INTEGER NOT NULL REFERENCES job(id),
   state TEXT NOT NULL CHECK (state IN ('completed','failed','cancelled','interrupted')),
-  error TEXT,
-  denial_code TEXT CHECK (denial_code IN ('permission_denied')),
-  denial_executed INTEGER CHECK (denial_executed IN (0,1)),
-  CHECK ((denial_code IS NULL) = (denial_executed IS NULL)),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
 CREATE INDEX job_finish_job ON job_finish(job, entry);
+
+-- Diagnostics retain typed terminal and output-persistence facts, never rendered errors.
+-- Dictionary keys are stable spellings of the shared diagnostic enums, not JSON payloads.
+CREATE TABLE diagnostic_slot (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO diagnostic_slot (name) VALUES ('diagnostic'),('output_diagnostic');
+
+CREATE TABLE diagnostic_operation (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO diagnostic_operation (name) VALUES
+  ('execute'),('validate'),('authorize'),('connect'),('inspect'),('canonicalize'),
+  ('read'),('read_directory'),('create'),('create_directories'),('write'),('copy'),
+  ('remove'),('rename'),('set_permissions'),('sync_file'),('open_directory'),
+  ('sync_directory'),('capture'),('create_capture'),('read_capture'),('write_capture'),
+  ('finish_capture'),('store_image'),('prepare'),('spawn'),('wait'),('terminate'),
+  ('deserialize'),('lookup'),('load'),('save'),('send'),('receive');
+
+CREATE TABLE diagnostic_subject (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO diagnostic_subject (name) VALUES
+  ('none'),('path'),('working_directory'),('staging_file'),('parent_directory'),('directory_entry'),
+  ('argument'),('tool'),('job'),('process'),('label');
+
+CREATE TABLE diagnostic_site (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO diagnostic_site (name) VALUES ('invocation'),('host'),('execution');
+
+CREATE TABLE diagnostic_effects (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO diagnostic_effects (name) VALUES
+  ('unknown'),('not_started'),('started'),('unchanged'),('destination_replaced'),
+  ('partial_change'),('output_incomplete'),('may_have_executed');
+
+CREATE TABLE diagnostic_cause (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO diagnostic_cause (name) VALUES
+  ('io'),('invalid_arguments'),('denied'),('cancelled'),('interrupted'),('input_closed'),('message'),('json');
+
+CREATE TABLE diagnostic_io_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO diagnostic_io_kind (name) VALUES
+  ('not_found'),('permission_denied'),('already_exists'),('invalid_input'),('invalid_data'),
+  ('timed_out'),('interrupted'),('unexpected_eof'),('broken_pipe'),('connection_refused'),
+  ('connection_reset'),('connection_aborted'),('not_connected'),('would_block'),('write_zero'),
+  ('host_unreachable'),('network_unreachable'),('network_down'),('address_in_use'),('address_not_available'),
+  ('unsupported'),('out_of_memory'),('is_a_directory'),('not_a_directory'),('directory_not_empty'),
+  ('read_only_filesystem'),('storage_full'),('other');
+
+CREATE TABLE diagnostic_path_role (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO diagnostic_path_role (name) VALUES ('requested'),('resolved');
+
+CREATE TABLE job_finish_diagnostic (
+  finish INTEGER NOT NULL REFERENCES job_finish(entry),
+  slot TEXT NOT NULL REFERENCES diagnostic_slot(name),
+  operation TEXT NOT NULL REFERENCES diagnostic_operation(name),
+  subject TEXT NOT NULL REFERENCES diagnostic_subject(name),
+  subject_path BLOB,
+  subject_text TEXT,
+  -- The subject may be an unsuccessful lookup of a job that does not exist.
+  subject_job INTEGER CHECK (subject_job > 0),
+  site TEXT NOT NULL REFERENCES diagnostic_site(name),
+  location_target INTEGER REFERENCES target(id),
+  location_workspace BLOB,
+  effects TEXT NOT NULL REFERENCES diagnostic_effects(name),
+  cause TEXT NOT NULL REFERENCES diagnostic_cause(name),
+  io_kind TEXT REFERENCES diagnostic_io_kind(name),
+  io_code INTEGER CHECK (io_code BETWEEN -2147483648 AND 2147483647),
+  io_detail TEXT,
+  cause_text TEXT,
+  PRIMARY KEY (finish, slot),
+  CHECK ((subject IN ('path','working_directory','staging_file','parent_directory','directory_entry'))
+    = (subject_path IS NOT NULL)),
+  CHECK ((subject IN ('argument','tool','label')) = (subject_text IS NOT NULL)),
+  CHECK ((subject = 'job') = (subject_job IS NOT NULL)),
+  CHECK ((site = 'execution') = (location_target IS NOT NULL)),
+  CHECK ((site = 'execution') = (location_workspace IS NOT NULL)),
+  CHECK ((cause = 'io') = (io_kind IS NOT NULL)),
+  CHECK (cause = 'io' OR io_code IS NULL),
+  CHECK (cause = 'io' OR io_detail IS NULL),
+  CHECK ((cause IN ('invalid_arguments','denied','message')) = (cause_text IS NOT NULL))
+) STRICT, WITHOUT ROWID;
+
+-- Path facts retain caller order and native bytes separately from the attempted subject.
+CREATE TABLE diagnostic_path (
+  finish INTEGER NOT NULL,
+  slot TEXT NOT NULL,
+  position INTEGER NOT NULL CHECK (position >= 0),
+  role TEXT NOT NULL REFERENCES diagnostic_path_role(name),
+  path BLOB NOT NULL,
+  PRIMARY KEY (finish, slot, position),
+  FOREIGN KEY (finish, slot) REFERENCES job_finish_diagnostic(finish, slot)
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE job_finish_image (
   finish INTEGER NOT NULL REFERENCES job_finish(entry),

@@ -1,4 +1,5 @@
 use crate::tool::ToolOptions;
+use crate::tool::diagnostic::{DiagnosticContext, Effects, Operation, Subject};
 use crate::tool::invocation::{LocalCatalogBuilder, LocalContext, LocalError};
 use crate::tool::output::ProducedOutput;
 use std::process::{ExitStatus, Stdio};
@@ -37,10 +38,11 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
         "Run an exact argument vector without shell parsing. Stdin is closed.",
         options(),
         move |context, args| async move {
-            let (program, arguments) = args
-                .argv
-                .split_first()
-                .ok_or_else(|| LocalError::InvalidArguments("argv cannot be empty".to_owned()))?;
+            let (program, arguments) = args.argv.split_first().ok_or_else(|| {
+                LocalError::InvalidArguments("argv cannot be empty".to_owned())
+                    .operation(Operation::Validate, Subject::argument(["argv"]))
+                    .effects(Effects::NotStarted)
+            })?;
             let cwd = working_directory(&args.cwd).await?;
             let mut command = Command::new(program);
             command.args(arguments).current_dir(cwd);
@@ -55,9 +57,11 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
         options(),
         move |context, args| async move {
             if args.command.is_empty() {
-                return Err(LocalError::InvalidArguments(
-                    "command cannot be empty".to_owned(),
-                ));
+                return Err(
+                    LocalError::InvalidArguments("command cannot be empty".to_owned())
+                        .operation(Operation::Validate, Subject::argument(["command"]))
+                        .effects(Effects::NotStarted),
+                );
             }
             let cwd = working_directory(&args.cwd).await?;
             let mut command = Command::new("/bin/sh");
@@ -72,11 +76,15 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
 
 async fn working_directory(cwd: &str) -> Result<&std::path::Path, LocalError> {
     let path = std::path::Path::new(cwd);
-    if !tokio::fs::metadata(path).await?.is_dir() {
-        return Err(LocalError::Failed(format!(
-            "working directory is not a directory: {}",
-            path.display()
-        )));
+    let metadata = tokio::fs::metadata(path).await.map_err(|error| {
+        LocalError::Io(error)
+            .operation(Operation::Inspect, Subject::working_directory(path))
+            .effects(Effects::NotStarted)
+    })?;
+    if !metadata.is_dir() {
+        return Err(LocalError::Failed("not a directory".to_owned())
+            .operation(Operation::Validate, Subject::working_directory(path))
+            .effects(Effects::NotStarted));
     }
     Ok(path)
 }
@@ -87,9 +95,11 @@ async fn run_process(
     timeout: Option<u64>,
 ) -> Result<ProcessResult, LocalError> {
     if timeout.is_some_and(|seconds| !(1..=3_600).contains(&seconds)) {
-        return Err(LocalError::InvalidArguments(
-            "timeout must be 1 through 3600".to_owned(),
-        ));
+        return Err(
+            LocalError::InvalidArguments("timeout must be 1 through 3600".to_owned())
+                .operation(Operation::Validate, Subject::argument(["timeout"]))
+                .effects(Effects::NotStarted),
+        );
     }
     // Override inherited/provider askpass settings even without Targets. Keep the
     // rejecting broker alive until the command and its cleanup have completed.
@@ -101,7 +111,12 @@ async fn run_process(
                 crate::remote::RejectSensitivePrompts,
             ))
             .map_err(|error| {
-                LocalError::Failed(format!("failed to start noninteractive askpass: {error}"))
+                LocalError::Io(error)
+                    .operation(
+                        Operation::Prepare,
+                        Subject::Label("noninteractive askpass".to_owned()),
+                    )
+                    .effects(Effects::NotStarted)
             })?,
         )
     };
@@ -134,22 +149,36 @@ async fn run_process(
         }
     }
     if context.is_cancelled() {
-        return Err(LocalError::Cancelled);
+        return Err(LocalError::Cancelled
+            .operation(Operation::Spawn, Subject::Process)
+            .effects(Effects::NotStarted));
     }
-    let mut child = command.spawn()?;
+    // Spawn can fail while setting up the child or loading its interpreter. In
+    // particular, ENOENT does not establish that the executable itself is absent.
+    let mut child = command.spawn().map_err(|error| {
+        LocalError::Io(error)
+            .operation(Operation::Spawn, Subject::Process)
+            .effects(Effects::NotStarted)
+    })?;
     #[cfg(unix)]
     let group = ProcessGroup(
-        i32::try_from(child.id().expect("spawned process has an ID"))
-            .map_err(|_| LocalError::Failed("process ID is out of range".to_owned()))?,
+        i32::try_from(child.id().expect("spawned process has an ID")).map_err(|_| {
+            LocalError::Failed("process ID is out of range".to_owned())
+                .context(started(Operation::Prepare, Subject::Process))
+        })?,
     );
+    let pipe_unavailable = |pipe: &str| {
+        LocalError::Failed("pipe unavailable".to_owned())
+            .context(started(Operation::Prepare, Subject::Label(pipe.to_owned())))
+    };
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| LocalError::Failed("process stdout unavailable".to_owned()))?;
+        .ok_or_else(|| pipe_unavailable(STDOUT_PIPE))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| LocalError::Failed("process stderr unavailable".to_owned()))?;
+        .ok_or_else(|| pipe_unavailable(STDERR_PIPE))?;
 
     let deadline = async {
         match timeout {
@@ -161,14 +190,19 @@ async fn run_process(
         }
     };
     // Keep cancellation and the deadline active while descendants hold output pipes open.
-    let mut stdout_capture = Capture::new(context.text_capture(TextCaptureField::Stdout).await?);
-    let mut stderr_capture = Capture::new(context.text_capture(TextCaptureField::Stderr).await?);
+    let mut stdout_capture = Capture::create(&context, TextCaptureField::Stdout).await?;
+    let mut stderr_capture = Capture::create(&context, TextCaptureField::Stderr).await?;
     let completion = {
         let execution = async {
             let (status, (), ()) = tokio::try_join!(
-                async { child.wait().await.map_err(LocalError::from) },
-                capture_stream(stdout, &mut stdout_capture),
-                capture_stream(stderr, &mut stderr_capture),
+                async {
+                    child.wait().await.map_err(LocalError::annotated(started(
+                        Operation::Wait,
+                        Subject::Process,
+                    )))
+                },
+                capture_stream(stdout, &mut stdout_capture, STDOUT_PIPE),
+                capture_stream(stderr, &mut stderr_capture, STDERR_PIPE),
             )?;
             Ok::<_, LocalError>(status)
         };
@@ -182,8 +216,14 @@ async fn run_process(
     let mut stop = async || {
         #[cfg(unix)]
         group.kill();
-        child.kill().await?;
-        child.wait().await.map_err(LocalError::from)
+        child.kill().await.map_err(LocalError::annotated(started(
+            Operation::Terminate,
+            Subject::Process,
+        )))?;
+        child.wait().await.map_err(LocalError::annotated(started(
+            Operation::Wait,
+            Subject::Process,
+        )))
     };
     let finish = async move |status: ExitStatus| {
         Ok::<_, LocalError>(ProcessResult {
@@ -208,15 +248,24 @@ async fn run_process(
                 ..finish(stop().await?).await?
             };
             Err(LocalError::with_output(
-                format!("process timed out after {seconds} seconds"),
+                format!("timed out after {seconds} seconds"),
                 output.into_output(),
-            ))
+            )
+            .context(started(Operation::Wait, Subject::Process)))
         }
         ProcessCompletion::Cancelled => {
             finish(stop().await?).await?;
-            Err(LocalError::Cancelled)
+            Err(LocalError::Cancelled.context(started(Operation::Wait, Subject::Process)))
         }
     }
+}
+
+const STDOUT_PIPE: &str = "stdout pipe";
+const STDERR_PIPE: &str = "stderr pipe";
+
+/// After spawn the command may already have had effects.
+fn started(operation: Operation, subject: Subject) -> DiagnosticContext {
+    DiagnosticContext::new(operation, subject).effects(Effects::Started)
 }
 
 enum ProcessCompletion {
@@ -243,13 +292,21 @@ impl Drop for ProcessGroup {
     }
 }
 
-async fn capture_stream<R>(mut stream: R, capture: &mut Capture) -> Result<(), LocalError>
+async fn capture_stream<R>(
+    mut stream: R,
+    capture: &mut Capture,
+    pipe: &'static str,
+) -> Result<(), LocalError>
 where
     R: AsyncRead + Unpin,
 {
     let mut buffer = vec![0_u8; PROCESS_CHUNK];
     loop {
-        let read = stream.read(&mut buffer).await?;
+        let read = stream.read(&mut buffer).await.map_err(|error| {
+            LocalError::Io(error)
+                .context(started(Operation::Read, Subject::Label(pipe.to_owned())))
+                .opaque_io()
+        })?;
         if read == 0 {
             break;
         }
@@ -339,7 +396,8 @@ mod tests {
         job::{JobState, output::OutputArgs},
         tests::TestRuntime,
         tool::{
-            executor::{ExecutionError, ToolExecutor},
+            diagnostic::{Cause, IoKind},
+            executor::ToolExecutor,
             policy::CapabilitySet,
         },
     };
@@ -446,20 +504,187 @@ mod tests {
                 .contains('\u{fffd}')
         );
 
-        let error = shell(json!({"command":"printf partial; sleep 2", "timeout":1})).await;
-        let Err(ExecutionError::Failed {
-            message,
-            output: Some(output),
-        }) = error
-        else {
-            panic!("expected failed output, got {error:?}");
-        };
-        assert!(message.contains("timed out"));
+        let error = shell(json!({"command":"printf partial; sleep 2", "timeout":1}))
+            .await
+            .expect_err("timeout must fail with partial output");
+        let (diagnostic, output) = error.into_tool_error().into_parts();
+        assert_eq!(diagnostic.context.operation, Operation::Wait);
+        assert_eq!(diagnostic.context.subject, Subject::Process);
+        assert_eq!(diagnostic.context.effects, Effects::Started);
+        assert!(matches!(&diagnostic.cause, Cause::Message(text) if text.contains("timed out")));
+        let output = output.expect("timeout must retain partial output");
         assert_eq!(output.value["timed_out"], true);
+        assert_eq!(output.value["stdout"], "partial");
         let failed_job = jobs.list(agent).await.last().unwrap().id;
         let envelope = jobs.snapshot(failed_job).await.unwrap();
         assert_eq!(envelope.state, JobState::Failed);
         assert_eq!(envelope.output.unwrap()["timed_out"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failures_before_spawn_report_their_stage_and_that_nothing_started() {
+        let runtime = TestRuntime::new().await;
+        let executor = executor(&runtime, true);
+        std::fs::write(runtime.root.path().join("file-cwd"), "not a directory").unwrap();
+        for (arguments, operation, cwd) in [
+            // A missing cwd fails path preflight; a file passes it and fails the handler.
+            (
+                json!({"command":"touch started", "cwd":"missing-cwd"}),
+                Operation::Canonicalize,
+                Some("missing-cwd"),
+            ),
+            (
+                json!({"command":"touch started", "cwd":"file-cwd"}),
+                Operation::Validate,
+                Some("file-cwd"),
+            ),
+            (
+                json!({"command":"touch started", "timeout":0}),
+                Operation::Validate,
+                None,
+            ),
+        ] {
+            let error = executor
+                .run_host(&runtime.agent, "shell", arguments)
+                .await
+                .unwrap_err();
+            let context = error.diagnostic().context;
+            assert_eq!(context.operation, operation);
+            assert_eq!(context.effects, Effects::NotStarted);
+            match cwd {
+                Some(cwd) => assert!(
+                    matches!(&context.subject, Subject::WorkingDirectory(path) if path.ends_with(cwd)),
+                    "{context:?}"
+                ),
+                None => assert_eq!(context.subject, Subject::argument(["timeout"])),
+            }
+        }
+        // Spawn ENOENT can also mean a missing interpreter, so no path is the subject.
+        let error = executor
+            .run_host(
+                &runtime.agent,
+                "exec",
+                json!({"argv":["/skyhook-test-missing-executable"]}),
+            )
+            .await
+            .unwrap_err();
+        let diagnostic = error.diagnostic();
+        assert_eq!(diagnostic.context.operation, Operation::Spawn);
+        assert_eq!(diagnostic.context.subject, Subject::Process);
+        assert_eq!(diagnostic.context.effects, Effects::NotStarted);
+        assert!(matches!(
+            diagnostic.cause,
+            Cause::Io {
+                kind: IoKind::NotFound,
+                ..
+            }
+        ));
+        assert!(!runtime.root.path().join("started").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capture_and_pipe_io_failures_keep_distinct_phases() {
+        use crate::tool::{
+            invocation::tests::{Authorizations, CapturedOutput},
+            output::{
+                OutputContext,
+                tests::{CaptureStage, FailingCapture},
+            },
+        };
+        use std::{
+            io,
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        use tokio::io::ReadBuf;
+
+        fn broken() -> io::Error {
+            io::Error::new(io::ErrorKind::BrokenPipe, "private details")
+        }
+        let opaque = Cause::Io {
+            kind: IoKind::BrokenPipe,
+            code: None,
+            detail: None,
+        };
+        let root = tempfile::tempdir().unwrap();
+        for (stage, operation) in [
+            (CaptureStage::Open, Operation::CreateCapture),
+            (CaptureStage::Write, Operation::WriteCapture),
+            (CaptureStage::Finish, Operation::FinishCapture),
+        ] {
+            let producer = OutputContext::new(Arc::new(FailingCapture::new(
+                Arc::new(CapturedOutput::default()),
+                stage,
+                0,
+                broken,
+            )));
+            let context = LocalContext::new(
+                crate::execution::ExecutionLocation::root(root.path().to_owned()),
+                [Capability::Exec, Capability::Interactive]
+                    .into_iter()
+                    .collect(),
+                Default::default(),
+                tokio_util::sync::CancellationToken::new(),
+                producer.clone(),
+                Arc::new(Authorizations::default()),
+                Value::Null,
+            );
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", "printf output"])
+                .current_dir(root.path());
+            let error =
+                tokio::time::timeout(Duration::from_secs(5), run_process(context, command, None))
+                    .await
+                    .expect("capture failure did not terminate process execution")
+                    .err()
+                    .unwrap();
+            let diagnostic = error.diagnostic();
+            assert_eq!(diagnostic.context.operation, operation);
+            assert_eq!(
+                diagnostic.context.subject,
+                Subject::Label(TextCaptureField::Stdout.pointer())
+            );
+            assert_eq!(diagnostic.context.effects, Effects::Started);
+            assert_eq!(diagnostic.cause, opaque);
+            tokio::time::timeout(Duration::from_secs(5), producer.settle())
+                .await
+                .expect("capture settlement hung")
+                .unwrap();
+        }
+
+        struct FailingPipe;
+        impl AsyncRead for FailingPipe {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                _: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Err(broken()))
+            }
+        }
+        let producer = OutputContext::new(Arc::new(CapturedOutput::default()));
+        let mut capture = Capture::new(
+            producer
+                .text_capture(TextCaptureField::Stderr)
+                .await
+                .unwrap(),
+            TextCaptureField::Stderr,
+        );
+        let diagnostic = capture_stream(FailingPipe, &mut capture, STDERR_PIPE)
+            .await
+            .unwrap_err()
+            .diagnostic();
+        assert_eq!(diagnostic.context.operation, Operation::Read);
+        assert_eq!(
+            diagnostic.context.subject,
+            Subject::Label(STDERR_PIPE.to_owned())
+        );
+        assert_eq!(diagnostic.cause, opaque);
+        drop(capture);
+        producer.settle().await.unwrap();
     }
 
     #[cfg(unix)]

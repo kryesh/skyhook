@@ -1,7 +1,8 @@
 use crate::session::{EventRecord, SessionEvent, SessionStore};
 
-use super::{DeliveryState, JobEntry, JobError, JobManager, JobOutcome, JobSpec, JobState};
+use super::{DeliveryState, JobEntry, JobError, JobManager, JobSpec, JobState};
 use crate::provider::protocol::Message;
+use crate::tool::ToolError;
 
 pub(super) async fn restore(
     store: SessionStore,
@@ -117,12 +118,17 @@ pub(super) async fn restore(
             SessionEvent::JobFinished {
                 job,
                 state,
-                error,
+                diagnostic,
+                output_diagnostic,
                 images,
-                denial,
             } => {
                 if let Some(entry) = jobs.get_mut(job) {
-                    entry.apply_finished(*state, images.clone(), error.clone(), denial.clone());
+                    entry.apply_finished(
+                        *state,
+                        images.clone(),
+                        diagnostic.clone(),
+                        output_diagnostic.clone(),
+                    );
                 }
             }
             SessionEvent::JobClaimed { job } => {
@@ -160,7 +166,7 @@ pub(super) async fn restore(
     let manager = JobManager::with_jobs(store, jobs, maximum.saturating_add(1).max(1));
     manager.inner.progress.lock().await.project(records);
     for job in active {
-        manager.finish(job, JobOutcome::Interrupted).await?;
+        manager.finish(job, ToolError::Interrupted.into()).await?;
     }
     Ok(manager)
 }
@@ -170,10 +176,10 @@ mod tests {
     use super::*;
     use crate::execution::ExecutionLocation;
     use crate::identity::JobId;
-    use crate::job::{JobRole, JobState, presented_job_schema};
+    use crate::job::{JobOutcome, JobRole, JobState, presented_job_schema};
     use crate::{
         job::output,
-        tool::{ToolError, ToolOutput, policy::CapabilitySet},
+        tool::{ToolOutput, policy::CapabilitySet},
     };
 
     /// An on-disk runtime, so `reopen` can replay its journal.
@@ -190,6 +196,124 @@ mod tests {
         drop(jobs);
         let (store, records) = SessionStore::open(root, session).await.unwrap();
         JobManager::restore(store, &records).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn diagnostic_replay_filters_targets_and_only_renders_registered_error_slots() {
+        use crate::tool::{
+            diagnostic::{
+                Cause, Diagnostic, DiagnosticContext, Effects, FailureSite, IoKind, Operation,
+                PathRole, Subject,
+            },
+            policy::Capability,
+        };
+        use serde_json::json;
+
+        let (root, jobs, agent) = runtime().await;
+        let location = ExecutionLocation::named("private-build-target", "/srv/project".into());
+        let context = DiagnosticContext::new(Operation::Read, Subject::path("missing.txt"))
+            .at(FailureSite::Execution(location))
+            .effects(Effects::NotStarted)
+            .path(PathRole::Requested, "./missing.txt")
+            .path(PathRole::Resolved, "/srv/project/missing.txt");
+        let diagnostic = Diagnostic::new(
+            context.clone(),
+            Cause::Io {
+                kind: IoKind::NotFound,
+                code: Some(2),
+                detail: None,
+            },
+        );
+        let payload = || {
+            json!({
+                "kind":"error", "path":"missing.txt",
+                "error":{"code":"not_found", "message":"producer placeholder"},
+                "opaque":{"error":{"message":"opaque user error"}},
+                // An offloaded sibling exercises whole-document render caching.
+                "text":"ordinary output\n".repeat(800),
+            })
+        };
+        let failed = jobs
+            .test_create(JobSpec::test(agent.clone(), "fixture"))
+            .await;
+        let error = ToolError::Io(std::io::Error::from_raw_os_error(2))
+            .context(context)
+            .with_result(ToolOutput::new(payload()));
+        jobs.finish(failed, error.into()).await.unwrap();
+        let read = jobs
+            .test_create(JobSpec::test(agent.clone(), "fixture"))
+            .await;
+        jobs.finish(
+            read,
+            JobOutcome::Completed(ToolOutput::new(payload()).with_diagnostic(diagnostic.clone())),
+        )
+        .await
+        .unwrap();
+        let opaque = jobs.test_create(JobSpec::test(agent, "read")).await;
+        jobs.finish(opaque, JobOutcome::Completed(ToolOutput::new(payload())))
+            .await
+            .unwrap();
+
+        // Durable facts are authoritative; the saved JSON retains only slots,
+        // never a rendering selected by an earlier reader's capabilities.
+        assert!(jobs.output(failed).test_document().unwrap()["error"].is_null());
+        assert!(jobs.output(read).test_document().unwrap()["result"]["error"]["message"].is_null());
+        assert_eq!(
+            jobs.output(opaque).test_document().unwrap()["result"]["error"]["message"],
+            "producer placeholder"
+        );
+
+        let privileged: CapabilitySet = [Capability::Targets].into_iter().collect();
+        let restricted = CapabilitySet::default();
+        // Alternating readers must never observe another capability's cached rendering.
+        let views = async |jobs: &JobManager| {
+            let mut views = Vec::new();
+            for caps in [&privileged, &restricted, &privileged] {
+                for (job, field) in [
+                    (failed, None),
+                    (read, None),
+                    (opaque, None),
+                    (failed, Some("/error")),
+                    (read, Some("/result/error/message")),
+                    (failed, Some("")),
+                    (read, Some("/result")),
+                ] {
+                    let mut query = output::OutputArgs::new(job);
+                    query.field = field.map(str::to_owned);
+                    let view = jobs.inspect_output(query, caps).await.unwrap();
+                    if job != opaque {
+                        assert_eq!(
+                            view.to_string().contains("private-build-target"),
+                            caps.contains(Capability::Targets)
+                        );
+                    }
+                    views.push(view);
+                }
+            }
+            views
+        };
+        let live = views(&jobs).await;
+        let (failed_view, read_view, opaque_view) = (&live[0], &live[1], &live[2]);
+        assert_eq!(failed_view["state"], "failed");
+        assert_eq!(failed_view["has_result"], true);
+        assert_eq!(failed_view["error"], diagnostic.render(&privileged));
+        assert_eq!(read_view["state"], "completed");
+        assert!(read_view["error"].is_null());
+        assert_eq!(read_view["result"]["error"]["code"], "not_found");
+        assert_eq!(
+            read_view["result"]["error"]["message"],
+            diagnostic.render(&privileged)
+        );
+        assert_eq!(
+            read_view["result"]["opaque"]["error"]["message"],
+            "opaque user error"
+        );
+        assert_eq!(
+            opaque_view["result"]["error"]["message"],
+            "producer placeholder"
+        );
+        let restored = reopen(jobs, root.path()).await;
+        assert_eq!(views(&restored).await, live);
     }
 
     #[tokio::test]
@@ -215,9 +339,14 @@ mod tests {
         // Simulate the persisted prefix at a crash between commit and insertion:
         // no JobManager has ever published this creation into its map.
         let jobs = reopen(JobManager::new(store), root.path()).await;
-        assert_eq!(
-            jobs.metadata(job).await.unwrap().state,
-            JobState::Interrupted
+        let interrupted = jobs.metadata(job).await.unwrap();
+        assert_eq!(interrupted.state, JobState::Interrupted);
+        assert!(
+            interrupted
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("operation interrupted")
+                    && !error.contains("session was not running"))
         );
         assert_eq!(
             jobs.test_create(JobSpec::test(agent, "next")).await.get(),
@@ -249,18 +378,9 @@ mod tests {
             .unwrap()
             .metadata_view(&capabilities)
             .into_value();
-        assert_eq!(
-            (
-                &denied["meta"]["code"],
-                &denied["meta"]["executed"],
-                &denied["error"]
-            ),
-            (
-                &"permission_denied".into(),
-                &false.into(),
-                &"user reason".into()
-            )
-        );
+        assert_eq!(denied["meta"]["code"], "permission_denied");
+        assert_eq!(denied["meta"]["executed"], false);
+        assert!(denied["error"].as_str().unwrap().contains("user reason"));
         // The persisted terminal event is the source of truth for replay.
         let restored = reopen(jobs, root.path()).await;
         let replayed = restored
@@ -354,14 +474,14 @@ mod tests {
         let entry = entries.get(&id).unwrap();
         serde_json::json!({
             "state": entry.state, "output": entry.output,
-            "images": entry.images, "error": entry.error, "denial": entry.denial,
+            "images": entry.images, "error": entry.diagnostic.as_ref().map(|diagnostic| diagnostic.render(&CapabilitySet::default())), "denied": entry.diagnostic.as_ref().is_some_and(|diagnostic| diagnostic.is_denial()),
             "pending": entry.delivery == DeliveryState::Pending,
             "resumable": entry.resume.is_some(),
         })
     }
 
     /// Case 7 is a volatile failure: persistence is unavailable, so the live
-    /// entry keeps its denial, clears partial output and is not replayed.
+    /// entry clears partial output and is not replayed.
     #[tokio::test]
     async fn outcome_application_live_replay_and_interrupted_cancellation_matrix() {
         for case in 0..8 {
@@ -383,52 +503,44 @@ mod tests {
                 ToolOutput::new(serde_json::json!({"result":"saved"}))
                     .with_images(vec![outcome_image()])
             };
-            let failed = |message: &str, output| JobOutcome::Failed {
-                message: message.into(),
-                output,
-                denial: None,
-            };
             let outcome = match case {
                 0 => JobOutcome::Completed(result()),
-                1 => failed("failed", None),
-                2 => failed("partial failure", Some(result())),
+                1 => ToolError::Failed("failed".into()).into(),
+                2 => ToolError::Failed("partial failure".into())
+                    .with_result(result())
+                    .into(),
                 3 => ToolError::Denied("denied".into()).into(),
-                4 => JobOutcome::Cancelled,
-                5 | 6 => JobOutcome::Interrupted,
+                4 => ToolError::Cancelled.with_result(result()).into(),
+                5 | 6 => ToolError::Interrupted.into(),
                 _ => {
                     let mut entries = jobs.inner.jobs.lock().await;
                     let entry = entries.get_mut(&id).unwrap();
                     entry.images = vec![outcome_image()];
-                    entry.denial = Some(crate::tool::Denial::permission_denied());
                     drop(entries);
                     jobs.fail_volatile(id, "cannot persist".into()).await;
                     let projection = stored_projection(&jobs, id).await;
-                    assert_eq!(
-                        (
-                            &projection["state"],
-                            &projection["images"],
-                            &projection["error"]
-                        ),
-                        (
-                            &"failed".into(),
-                            &serde_json::json!([]),
-                            &"cannot persist".into()
-                        )
+                    assert_eq!(projection["state"], "failed");
+                    assert_eq!(projection["images"], serde_json::json!([]));
+                    assert!(
+                        projection["error"]
+                            .as_str()
+                            .unwrap()
+                            .contains("cannot persist")
                     );
-                    assert!(projection["output"].is_null() && !projection["denial"].is_null());
+                    assert!(projection["output"].is_null());
                     continue;
                 }
             };
             jobs.finish(id, outcome).await.unwrap();
             if case == 6 {
-                jobs.finish(id, JobOutcome::Cancelled).await.unwrap();
+                jobs.finish(id, ToolError::Cancelled.into()).await.unwrap();
             }
             let projection = stored_projection(&jobs, id).await;
             assert!(projection["output"].is_null());
             assert_eq!(projection["resumable"], !matches!(case, 4 | 6));
             // Projection application must not replace the saved payload by an
             // in-memory question or materialize it into the stored entry.
-            if matches!(case, 0 | 2) {
+            if matches!(case, 0 | 2 | 4) {
                 let document = jobs.output(id).test_document().unwrap();
                 assert_eq!(document["result"], serde_json::json!({"result":"saved"}));
             }

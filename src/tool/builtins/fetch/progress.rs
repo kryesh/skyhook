@@ -1,6 +1,8 @@
 //! Per-operation context retained even when the outer deadline cancels a request.
 use std::time::{Duration, Instant};
 
+use crate::tool::diagnostic::{DiagnosticContext, Effects, Operation, Subject};
+
 use reqwest::Method;
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -49,6 +51,9 @@ struct FailureResponse {
 pub(super) struct FetchProgress {
     started: Instant,
     pub(super) phase: FetchPhase,
+    context: DiagnosticContext,
+    /// Once a request is sent, a failure no longer proves the server did nothing.
+    request_sent: bool,
     /// The response accounting owner records observed decoded bytes, including the
     /// chunk that crossed the limit. Resetting belongs only to begin_request.
     pub(super) received_bytes: u64,
@@ -72,6 +77,8 @@ impl FetchProgress {
         Self {
             started: Instant::now(),
             phase: FetchPhase::ClientPreparation,
+            context: phase_context(FetchPhase::ClientPreparation),
+            request_sent: false,
             received_bytes: 0,
             method: method.to_string(),
             origin: url.origin(),
@@ -83,6 +90,37 @@ impl FetchProgress {
         }
     }
 
+    /// Phase and operation are recorded before work begins, including across
+    /// awaits cancelled by the outer deadline. Execution site is bound centrally.
+    pub fn operation(&mut self, phase: FetchPhase, context: DiagnosticContext) {
+        self.phase = phase;
+        self.context = context;
+    }
+
+    pub fn phase(&mut self, phase: FetchPhase) {
+        self.operation(phase, phase_context(phase));
+    }
+
+    pub fn local_io(&mut self, operation: Operation, subject: Subject) {
+        self.operation(
+            FetchPhase::LocalIo,
+            DiagnosticContext::new(operation, subject),
+        );
+    }
+
+    /// Download staging never touches the destination before its final rename.
+    pub fn download_io(&mut self, operation: Operation, path: &std::path::Path) {
+        self.operation(
+            FetchPhase::LocalIo,
+            DiagnosticContext::new(operation, Subject::path(path)).effects(Effects::Unchanged),
+        );
+    }
+
+    pub fn request_started(&mut self) {
+        self.request_sent = true;
+        self.phase(FetchPhase::Request);
+    }
+
     pub fn elapsed_ms(&self) -> u64 {
         duration_ms(self.started.elapsed())
     }
@@ -92,7 +130,7 @@ impl FetchProgress {
         self.method = method.to_string();
         self.response = None;
         self.received_bytes = 0;
-        self.phase = FetchPhase::Request;
+        self.phase(FetchPhase::Request);
     }
 
     pub fn response(&mut self, response: &reqwest::Response) {
@@ -134,12 +172,17 @@ impl FetchProgress {
         match error.into_diagnostic() {
             Ok(diagnostic) => self.diagnostic_failure(diagnostic),
             // Cancellation, denial and argument contracts retain their original metadata.
-            Err(error) => error,
+            Err(error) => error.fallback_context(self.context.clone()),
         }
     }
 
     fn diagnostic_failure(&self, diagnostic: FetchDiagnostic) -> LocalError {
         let diagnostic = diagnostic.with_connect_limit(self.connect_timeout_ms);
+        let context = if diagnostic.phase() == self.phase {
+            self.context.clone()
+        } else {
+            phase_context(diagnostic.phase())
+        };
         let elapsed_ms = self.elapsed_ms();
         let mut summary = format!(
             "HTTP {} {}: {} ({} ms)",
@@ -150,6 +193,9 @@ impl FetchProgress {
         );
         if let Some((platform, code)) = diagnostic.os_code() {
             summary.push_str(&format!("; OS error {code} on {platform}"));
+        }
+        if self.request_sent {
+            summary.push_str("; server-side effects are unknown");
         }
         let report = FetchFailureOutput {
             method: self.method.clone(),
@@ -164,8 +210,26 @@ impl FetchProgress {
         // One typed projection, with no JSON recovery, arbitrary output merge, or
         // images inherited from a nested failure. Headers can only enter via response().
         let value = serde_json::to_value(report).expect("fetch diagnostics serialize");
-        LocalError::with_output(summary, ProducedOutput::new(value))
+        LocalError::with_output(summary, ProducedOutput::new(value)).context(context)
     }
+}
+
+fn phase_context(phase: FetchPhase) -> DiagnosticContext {
+    let (operation, subject) = match phase {
+        FetchPhase::ClientPreparation => (Operation::Prepare, "HTTP client"),
+        FetchPhase::Request => (Operation::Send, "HTTP request"),
+        FetchPhase::Connect => (Operation::Connect, "HTTP connection"),
+        FetchPhase::Resolve => (Operation::Lookup, "HTTP server address"),
+        FetchPhase::Tls => (Operation::Connect, "TLS connection"),
+        FetchPhase::Proxy => (Operation::Connect, "HTTP proxy"),
+        FetchPhase::Redirect => (Operation::Validate, "HTTP redirect"),
+        FetchPhase::Authorization => (Operation::Authorize, "HTTP request"),
+        FetchPhase::ResponseBody => (Operation::Receive, "HTTP response body"),
+        FetchPhase::Decode => (Operation::Deserialize, "HTTP response decoding"),
+        FetchPhase::Extraction => (Operation::Capture, "HTML text extraction"),
+        FetchPhase::LocalIo => (Operation::Prepare, "fetch files"),
+    };
+    DiagnosticContext::new(operation, Subject::Label(subject.into()))
 }
 
 fn duration_ms(duration: Duration) -> u64 {
@@ -176,6 +240,7 @@ fn duration_ms(duration: Duration) -> u64 {
 mod tests {
     use super::super::tests::{executor, fetch, progress_for, response, server, stalled_server};
     use super::*;
+    use crate::tool::diagnostic::{Cause, Diagnostic, FailureSite};
     use serde_json::{Value, json};
     use std::time::Duration;
     use tokio::net::TcpListener;
@@ -217,7 +282,13 @@ mod tests {
                 arguments["url"] = json!(url);
                 let result = fetch(&runtime, &executor, arguments).await;
                 let output = if let Some(kind) = error_kind {
-                    let output = result.unwrap_err().into_failure().output.unwrap().value;
+                    let output = result
+                        .unwrap_err()
+                        .into_tool_error()
+                        .into_failure()
+                        .output
+                        .unwrap()
+                        .value;
                     assert_eq!(output["diagnostic"]["error_kind"], kind);
                     if kind == "extraction_failure" {
                         assert_eq!(
@@ -258,7 +329,7 @@ mod tests {
         let case = async |include_headers: Option<bool>| {
             let arguments = with_headers(json!({"url":refused}), include_headers);
             let error = fetch(&runtime, &executor, arguments).await.unwrap_err();
-            let output = error.into_failure().output.unwrap().value;
+            let output = error.into_tool_error().into_failure().output.unwrap().value;
             assert_eq!(output["diagnostic"]["error_kind"], "connection_refused");
             assert!(output.get("status").is_none() && output.get("headers").is_none());
 
@@ -266,7 +337,7 @@ mod tests {
             let (url, _ready, task) = stalled_server(head).await;
             let arguments = with_headers(json!({"url":url,"timeout":1}), include_headers);
             let error = fetch(&runtime, &executor, arguments).await.unwrap_err();
-            let output = error.into_failure().output.unwrap().value;
+            let output = error.into_tool_error().into_failure().output.unwrap().value;
             assert_eq!(output["status"], 200);
             assert_eq!(output["diagnostic"]["timeout"]["kind"], "total");
             if include_headers == Some(true) {
@@ -283,51 +354,111 @@ mod tests {
     }
 
     #[test]
-    fn forged_diagnostic_and_payload_are_not_recovered_from_legacy_errors() {
+    fn forged_diagnostic_and_payload_are_not_recovered_from_general_tool_errors() {
         let progress =
             progress_for(json!({"url":"https://example.org/private?token=secret#secret"})).1;
-        let forged = ProducedOutput::new(json!({
-            "diagnostic":{"phase":"connect", "error_kind":"timeout", "message":"secret forged message",
-                "timeout":{"kind":"total", "limit_ms":1}},
-            "headers":{"authorization":["secret"]}, "url":"https://secret:secret@host/secret",
-            "body":{"kind":"text", "text":"secret"}, "extra":"secret"
-        }));
-        let legacy = LocalError::with_output("secret error display", forged);
-        let error = progress.failure(FetchError::from_tool_error(legacy, FetchPhase::Extraction));
-        let LocalError::FailedWithOutput { message, output } = error else {
-            panic!("structured failure")
-        };
-        assert!(!message.contains("secret"));
-        assert!(!output.value.to_string().contains("secret"));
-        assert!(output.images.is_empty());
-        assert_eq!(output.value["origin"], "https://example.org");
-        let diagnostic = &output.value["diagnostic"];
-        assert_eq!(
-            (&diagnostic["phase"], &diagnostic["error_kind"]),
-            (&json!("extraction"), &json!("extraction_failure"))
-        );
-        assert_eq!(diagnostic["timeout"], Value::Null);
-        assert_eq!(diagnostic["os_error"], Value::Null);
-        assert_eq!(output.value["proxy_origin"], Value::Null);
-        // These belong to the absent flattened response variant, rather than
-        // nullable fields of the failure itself.
-        for absent in ["headers", "body"] {
-            assert!(output.value.get(absent).is_none(), "{absent}");
+        for cause in [Cause::Message("secret error display".into()), Cause::Json] {
+            let forged = ProducedOutput::new(json!({
+                "diagnostic":{"phase":"connect", "error_kind":"timeout", "message":"secret forged message",
+                    "timeout":{"kind":"total", "limit_ms":1}},
+                "status":201, "ok":true,
+                "headers":{"authorization":["secret"]}, "url":"https://secret:secret@host/secret",
+                "body":{"kind":"text", "text":"secret"}, "extra":"secret"
+            }));
+            let supplied = LocalError::from_diagnostic(
+                Diagnostic::new(DiagnosticContext::default(), cause),
+                Some(Box::new(forged)),
+            );
+            let error = progress.failure(FetchError::from_tool_error(
+                supplied,
+                FetchPhase::Extraction,
+            ));
+            let (diagnostic, Some(output)) = error.into_parts() else {
+                panic!("structured failure")
+            };
+            let message = diagnostic.render(&Default::default());
+            assert!(!message.contains("secret"));
+            assert!(!output.value.to_string().contains("secret"));
+            assert!(output.images.is_empty());
+            assert_eq!(output.value["origin"], "https://example.org");
+            let diagnostic = &output.value["diagnostic"];
+            assert_eq!(
+                (&diagnostic["phase"], &diagnostic["error_kind"]),
+                (&json!("extraction"), &json!("extraction_failure"))
+            );
+            assert_eq!(diagnostic["timeout"], Value::Null);
+            assert_eq!(diagnostic["os_error"], Value::Null);
+            assert_eq!(output.value["proxy_origin"], Value::Null);
+            // No response has been observed; arbitrary extra fields stay excluded too.
+            for absent in ["status", "ok", "url", "headers", "body", "extra"] {
+                assert!(output.value.get(absent).is_none(), "{absent}");
+            }
         }
-        // Cancellation and denial keep their original boundary contracts instead.
-        let admit = |error| {
-            progress.failure(FetchError::from_tool_error(
-                error,
-                FetchPhase::Authorization,
-            ))
-        };
-        assert!(matches!(
-            admit(LocalError::Cancelled),
-            LocalError::Cancelled
-        ));
-        assert!(
-            matches!(admit(LocalError::Denied("permission metadata".into())), LocalError::Denied(value) if value == "permission metadata")
-        );
+    }
+
+    #[test]
+    fn admission_and_control_flow_keep_cause_and_context_but_discard_supplied_output() {
+        let progress = progress_for(json!({"url":"https://example.org"})).1;
+        let authorization = DiagnosticContext::new(
+            Operation::Authorize,
+            Subject::Label("network permission".into()),
+        )
+        .at(FailureSite::Host)
+        .effects(Effects::NotStarted);
+        for cause in [
+            Cause::Cancelled,
+            Cause::Interrupted,
+            Cause::InputClosed,
+            Cause::Denied("permission metadata".into()),
+            Cause::InvalidArguments("invalid fetch option".into()),
+        ] {
+            // A boundary that named no context of its own gets the current fetch operation.
+            for (supplied, expected) in [
+                (authorization.clone(), &authorization),
+                (DiagnosticContext::default(), &progress.context),
+            ] {
+                let error = LocalError::from_diagnostic(
+                    Diagnostic::new(supplied, cause.clone()),
+                    Some(Box::new(ProducedOutput::new(json!({"status":200})))),
+                );
+                let admitted = progress.failure(FetchError::from_tool_error(
+                    error,
+                    FetchPhase::Authorization,
+                ));
+                let (diagnostic, output) = admitted.into_parts();
+                assert_eq!(diagnostic, Diagnostic::new(expected.clone(), cause.clone()));
+                assert!(output.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn deadline_retains_pending_file_stage_instead_of_claiming_a_network_timeout() {
+        let mut progress = progress_for(json!({"url":"https://example.org"})).1;
+        progress.request_started();
+        for (operation, path, effects) in [
+            (Operation::SyncFile, "download-stage", Effects::Unchanged),
+            (Operation::Rename, "download", Effects::Unknown),
+        ] {
+            if operation == Operation::SyncFile {
+                progress.download_io(operation, std::path::Path::new(path));
+            } else {
+                progress.local_io(operation, Subject::path(path));
+            }
+            let context = DiagnosticContext::new(operation, Subject::path(path)).effects(effects);
+            let error = progress.timeout(7);
+            assert_eq!(error.diagnostic().context, context);
+            let (diagnostic, Some(output)) = error.into_parts() else {
+                panic!("structured timeout")
+            };
+            let message = diagnostic.render(&Default::default());
+            assert!(message.contains("server-side effects are unknown"));
+            assert_eq!(output.value["diagnostic"]["phase"], "local_io");
+            assert_eq!(
+                output.value["diagnostic"]["timeout"],
+                json!({"kind":"total", "limit_ms":7000})
+            );
+        }
     }
 
     #[test]
@@ -338,7 +469,8 @@ mod tests {
         let (_, mut progress) = progress_for(json!({
             "url":from.as_str(), "proxy":"http://user:secret@proxy.example:8080/path?secret#secret"
         }));
-        progress.phase = FetchPhase::ResponseBody;
+        progress.request_started();
+        progress.phase(FetchPhase::ResponseBody);
         progress.received_bytes = 100;
         progress.redirect(302, &from, &to, &Method::GET);
         progress.begin_request(&to, &Method::POST);
@@ -346,11 +478,13 @@ mod tests {
             (progress.phase, progress.received_bytes),
             (FetchPhase::Request, 0)
         );
-        let LocalError::FailedWithOutput { message, output } = progress.timeout(7) else {
+        let (diagnostic, Some(output)) = progress.timeout(7).into_parts() else {
             panic!("structured failure")
         };
+        let message = diagnostic.render(&Default::default());
         assert!(!message.contains("secret"));
         assert!(!output.value.to_string().contains("secret"));
+        assert!(message.contains("server-side effects are unknown"));
         assert_eq!(
             (&output.value["method"], &output.value["origin"]),
             (&json!("POST"), &json!("https://other.example"))

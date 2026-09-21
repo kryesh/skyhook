@@ -5,6 +5,9 @@ use super::*;
 use crate::tool::invocation::CANCELLATION_GRACE;
 
 impl JobManager {
+    /// Request cancellation of this job and its descendants. The returned
+    /// metadata is a snapshot, not proof that cancellation has completed; a
+    /// previously published terminal result is preserved.
     pub async fn cancel(&self, id: JobId) -> Result<JobEnvelope, JobError> {
         let watchdogs = {
             let mut jobs = self.inner.jobs.lock().await;
@@ -113,7 +116,7 @@ impl JobManager {
         if let Some(task_abort) = task_abort {
             task_abort.abort();
         }
-        if let Err(error) = self.finish(id, JobOutcome::Cancelled).await
+        if let Err(error) = self.finish(id, ToolError::Cancelled.into()).await
             && !matches!(error, JobError::AlreadyTerminal(_))
         {
             self.fail_volatile(
@@ -131,7 +134,6 @@ mod tests {
     use crate::tests::TestRuntime;
     use crate::tool::{
         ToolError, ToolOptions, ToolRegistryBuilder,
-        executor::ExecutionError,
         policy::{AuthorizationRequest, Policy, PolicyFuture},
     };
     use std::sync::atomic::AtomicBool;
@@ -160,6 +162,106 @@ mod tests {
             .expect("cancellation did not terminate the job")
             .unwrap()
             .state
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_published_results_and_denials() {
+        use crate::{
+            job::output::PendingCapture,
+            media::ImageFormat,
+            tool::{
+                StreamEnd,
+                diagnostic::{Cause, DiagnosticContext, Effects, FailureSite, Operation, Subject},
+            },
+        };
+        use std::io::Write as _;
+
+        let (_root, jobs, agent) = crate::job::tests::runtime().await;
+        let context = DiagnosticContext::new(Operation::Wait, Subject::Process)
+            .at(FailureSite::Execution(ExecutionLocation::named(
+                "worker",
+                "/workspace".into(),
+            )))
+            .effects(Effects::MayHaveExecuted);
+        let output_diagnostic = Diagnostic::new(
+            DiagnosticContext::new(Operation::ReadCapture, Subject::Process)
+                .effects(Effects::OutputIncomplete),
+            Cause::Message("partial output".into()),
+        );
+        let image = ImageRef {
+            file: Some("partial.png".into()),
+            format: ImageFormat::Png,
+            blob: jobs.store().store_blob(b"image").await.unwrap(),
+        };
+        let text = "partial output\n".repeat(4096);
+        for (error, streams) in [
+            (None, StreamEnd::Finished),
+            (
+                Some(ToolError::Denied(
+                    "permission denied after partial work".into(),
+                )),
+                StreamEnd::Finished,
+            ),
+            (Some(ToolError::Cancelled), StreamEnd::Finished),
+            (Some(ToolError::Interrupted), StreamEnd::Finished),
+            (Some(ToolError::Interrupted), StreamEnd::Cut),
+        ] {
+            let id = jobs
+                .test_create(JobSpec::test(agent.clone(), "finished"))
+                .await;
+            let saved = jobs.output(id);
+            let mut writer = PendingCapture::create(&saved, "/result/stdout", CaptureKind::Text)
+                .unwrap()
+                .open();
+            writer.write_all(text.as_bytes()).unwrap();
+            let mut output = ToolOutput::new(serde_json::json!({
+                "partial": true, "error": {"message": null},
+            }))
+            .with_captures(vec![writer.finish().unwrap()])
+            .with_images(vec![image.clone()])
+            .with_diagnostic(output_diagnostic.clone());
+            output.streams = streams;
+            let outcome = match error {
+                Some(error) => error.context(context.clone()).with_result(output).into(),
+                None => JobOutcome::Completed(output),
+            };
+            jobs.finish(id, outcome).await.unwrap();
+            let mut expected = jobs.snapshot(id).await.unwrap();
+            let document = saved.test_document();
+            let fields = saved.test_fields();
+            let view = jobs
+                .present_output(JobOutputQuery::new(id), &CapabilitySet::default())
+                .await
+                .unwrap();
+            let metadata = jobs.cancel(id).await.unwrap();
+            assert_eq!(metadata.state, expected.state);
+            // Cancellation ends an interruption's resumability, but only its
+            // terminal cause changes; prior context and output remain authoritative.
+            if expected.state == JobState::Interrupted {
+                expected.state = JobState::Cancelled;
+                let diagnostic = expected.diagnostic.as_mut().unwrap();
+                diagnostic.cause = Cause::Cancelled;
+                expected.error = Some(diagnostic.render(&CapabilitySet::default()));
+            }
+            // Even a late watchdog must not overwrite output or denial metadata.
+            jobs.force_cancel(id).await;
+            for manager in [jobs.clone(), jobs.test_replay().await] {
+                assert_eq!(manager.snapshot(id).await.unwrap(), expected);
+                assert_eq!(manager.images(id).await.unwrap(), vec![image.clone()]);
+                let saved = manager.output(id);
+                assert_eq!(saved.test_document(), document);
+                assert_eq!(saved.test_fields(), fields);
+                assert_eq!(saved.test_bytes("/result/stdout").unwrap(), text.as_bytes());
+                let after = manager
+                    .present_output(JobOutputQuery::new(id), &CapabilitySet::default())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    after["presentation"]["captures"],
+                    view["presentation"]["captures"]
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -319,7 +421,10 @@ mod tests {
             .await
             .expect("authorization did not observe cancellation")
             .unwrap();
-        assert!(matches!(result, Err(ExecutionError::Failed { .. })));
+        assert_eq!(
+            result.unwrap_err().diagnostic().cause,
+            crate::tool::diagnostic::Cause::Cancelled,
+        );
         assert_eq!(
             jobs.snapshot(awaiting).await.unwrap().state,
             JobState::Cancelled

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use libsql::Row;
 use serde::de::DeserializeOwned;
 
-use super::{Db, DbResult, corrupt};
+use super::{Db, DbResult, corrupt, diagnostic};
 use crate::{
     agent::TodoItem,
     execution::ExecutionLocation,
@@ -23,7 +23,7 @@ use crate::{
         SessionEvent,
     },
     target::{SshOptions, TargetAuth, TargetDefinition, TargetType},
-    tool::{Denial, policy::Capability},
+    tool::policy::Capability,
 };
 
 pub(in crate::session) fn parse_variant<T: DeserializeOwned>(text: String) -> DbResult<T> {
@@ -393,6 +393,7 @@ pub(in crate::session) fn decode_records(
     db: &Db,
     session: SessionId,
 ) -> DbResult<Vec<EventRecord>> {
+    let diagnostics = diagnostic::load(db)?;
     let messages = Messages::load(db)?;
     let profiles = profiles(db)?;
     let profile = |id: i64| {
@@ -799,25 +800,22 @@ pub(in crate::session) fn decode_records(
             state: parse_variant(row.get(2)?)?,
         }
     });
-    load!(
-        "SELECT entry, job, state, error, denial_code, denial_executed FROM job_finish",
-        |row| SessionEvent::JobFinished {
+    load!("SELECT entry, job, state FROM job_finish", |row| {
+        SessionEvent::JobFinished {
             job: job(row.get(1)?)?,
             state: parse_variant(row.get(2)?)?,
-            error: row.get(3)?,
+            diagnostic: diagnostics
+                .get(&(row.get::<i64>(0)?, diagnostic::Slot::Diagnostic))
+                .cloned(),
+            output_diagnostic: diagnostics
+                .get(&(row.get::<i64>(0)?, diagnostic::Slot::OutputDiagnostic))
+                .cloned(),
             images: finish_images
                 .get(&row.get::<i64>(0)?)
                 .cloned()
                 .unwrap_or_default(),
-            denial: match (row.get::<Option<String>>(4)?, row.get(5)?) {
-                (Some(code), Some(executed)) => Some(Denial {
-                    code: parse_variant(code)?,
-                    executed,
-                }),
-                _ => None,
-            },
         }
-    );
+    });
     load!(
         "SELECT entry, kind, job, notification, source FROM job_delivery",
         |row| {

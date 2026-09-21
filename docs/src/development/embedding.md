@@ -84,6 +84,10 @@ before starting agents and opens fresh provider contexts; it does not reuse old 
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.
 
+Session databases now use format 10 for structured diagnostics. Format 9 databases are not
+migrated and cannot be resumed with this version; retain a compatible Skyhook version to inspect
+or resume those sessions, or start a new session.
+
 Await `SessionHandle::shutdown()` before releasing the host's session owner. Shutdown stops runtime
 producers, drains accepted job and journal work, and closes MCP and remote resources. The journal
 remains available so the host can append a final status after observing shutdown errors; await

@@ -1,5 +1,6 @@
 //! File snapshots, directory listings, images, and expected read failures.
 use crate::tool::ToolOptions;
+use crate::tool::diagnostic::{Cause, Diagnostic, Effects, IoKind, Operation, Subject};
 use crate::tool::invocation::{LocalCatalogBuilder, LocalContext, LocalError};
 use crate::tool::output::ProducedOutput;
 
@@ -26,68 +27,105 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
             .read_error_output(read_error_output)
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .path_argument("path", PathAccess::Read, PathKind::Existing),
-        move |context, args| async move {
-                let path = std::path::PathBuf::from(&args.path);
-                if fs::metadata(&path).await?.is_dir() {
-                    let mut directory = fs::read_dir(&path).await?;
-                    let mut entries = Vec::new();
-                    while let Some(entry) = directory.next_entry().await? {
-                        let metadata = fs::symlink_metadata(entry.path()).await?;
-                        entries.push(DirectoryEntry::from_metadata(
-                            entry.file_name().to_string_lossy().into_owned(), &metadata,
-                        ));
-                    }
-                    entries.sort_by(|left, right| left.name().cmp(right.name()));
-                    let directory_path =
-                        relative_path(&context.execution_location().workspace, &path);
-                    return Ok(ProducedOutput::new(serde_json::to_value(
-                        ReadOutput::Directory {
-                            path: directory_path,
-                            entries: if args.details { DirectoryEntries::Detailed(entries) } else { DirectoryEntries::Grouped(DirectoryGroups::from(entries)) },
-                        },
-                    )?));
-                }
-
-                let output_path = relative_path(&context.execution_location().workspace, &path);
-                match read_text(&path, &context).await {
-                    Ok(TextReadOutcome::Captured(capture)) => {
-                        return Ok(ProducedOutput::new(serde_json::to_value(ReadOutput::File {
-                            path: output_path,
-                            content: String::new(),
-                        })?)
-                        .with_captures(vec![capture]));
-                    }
-                    Ok(TextReadOutcome::NotUtf8) => {}
-                    Err(error) => return Err(error),
-                }
-
-                let metadata = fs::metadata(&path).await?;
-                if metadata.len() > MAX_IMAGE_BYTES {
-                    return Err(LocalError::Failed(format!(
-                        "non-UTF-8 file exceeds the {MAX_IMAGE_BYTES}-byte image limit"
-                    )));
-                }
-                let mut input = fs::File::open(&path).await?;
-                let bytes = read_bounded(&mut input, MAX_IMAGE_BYTES as usize).await
-                    .map_err(|error| match error {
-                        BoundedReadError::Io(error) => LocalError::Io(error),
-                        error => LocalError::Failed(error.to_string()),
-                    })?;
-                let image = crate::media::Image::new(bytes).map_err(|_| {
-                    LocalError::Failed("file is neither UTF-8 nor a supported image".to_owned())
-                })?;
-                let reference = context
-                    .store_image(Some(output_path.clone()), &image)
-                    .await
-                    .map_err(LocalError::failed)?;
-                Ok(ProducedOutput::new(serde_json::to_value(ReadOutput::Image {
-                    path: output_path,
-                    image: reference.clone(),
-                })?)
-                .with_images(vec![reference]))
-        },
+        read,
     )?;
     Ok(())
+}
+
+async fn read(context: LocalContext, args: ReadArgs) -> Result<ProducedOutput, LocalError> {
+    let path = std::path::PathBuf::from(&args.path);
+    if fs::metadata(&path)
+        .await
+        .map_err(source(Operation::Inspect, &path))?
+        .is_dir()
+    {
+        let mut directory = fs::read_dir(&path)
+            .await
+            .map_err(source(Operation::ReadDirectory, &path))?;
+        let mut entries = Vec::new();
+        while let Some(entry) = directory
+            .next_entry()
+            .await
+            .map_err(source(Operation::ReadDirectory, &path))?
+        {
+            let metadata = fs::symlink_metadata(entry.path()).await.map_err(|error| {
+                LocalError::source_filesystem_io(error)
+                    .operation(Operation::Inspect, Subject::DirectoryEntry(entry.path()))
+            })?;
+            entries.push(DirectoryEntry::from_metadata(
+                entry.file_name().to_string_lossy().into_owned(),
+                &metadata,
+            ));
+        }
+        entries.sort_by(|left, right| left.name().cmp(right.name()));
+        let directory_path = relative_path(&context.execution_location().workspace, &path);
+        return Ok(ProducedOutput::new(serde_json::to_value(
+            ReadOutput::Directory {
+                path: directory_path,
+                entries: if args.details {
+                    DirectoryEntries::Detailed(entries)
+                } else {
+                    DirectoryEntries::Grouped(DirectoryGroups::from(entries))
+                },
+            },
+        )?));
+    }
+
+    let output_path = relative_path(&context.execution_location().workspace, &path);
+    match read_text(&path, &context).await {
+        Ok(TextReadOutcome::Captured(capture)) => {
+            return Ok(ProducedOutput::new(serde_json::to_value(ReadOutput::File {
+                path: output_path,
+                content: String::new(),
+            })?)
+            .with_captures(vec![capture]));
+        }
+        Ok(TextReadOutcome::NotUtf8) => {}
+        Err(error) => return Err(error),
+    }
+
+    let metadata = fs::metadata(&path)
+        .await
+        .map_err(source(Operation::Inspect, &path))?;
+    if metadata.len() > MAX_IMAGE_BYTES {
+        return Err(LocalError::Failed(format!(
+            "non-UTF-8 file is {} bytes, exceeding the {MAX_IMAGE_BYTES}-byte image limit",
+            metadata.len()
+        ))
+        .operation(Operation::Read, Subject::path(&path)));
+    }
+    let mut input = fs::File::open(&path)
+        .await
+        .map_err(source(Operation::Read, &path))?;
+    let bytes = read_bounded(&mut input, MAX_IMAGE_BYTES as usize)
+        .await
+        .map_err(|error| match error {
+            BoundedReadError::Io(error) => source(Operation::Read, &path)(error),
+            error => LocalError::Failed(error.to_string())
+                .operation(Operation::Read, Subject::path(&path)),
+        })?;
+    let image = crate::media::Image::new(bytes).map_err(|_| {
+        LocalError::Failed("file is neither UTF-8 nor a supported image".to_owned())
+            .operation(Operation::Deserialize, Subject::path(&path))
+    })?;
+    let reference = context
+        .store_image(Some(output_path.clone()), &image)
+        .await
+        .map_err(|error| error.operation(Operation::StoreImage, Subject::path(&path)))?;
+    Ok(ProducedOutput::new(serde_json::to_value(ReadOutput::Image {
+        path: output_path,
+        image: reference.clone(),
+    })?)
+    .with_images(vec![reference]))
+}
+
+/// Only failures of the requested source may complete as read-error results.
+fn source(
+    operation: Operation,
+    path: &std::path::Path,
+) -> impl FnOnce(std::io::Error) -> LocalError + use<> {
+    let subject = Subject::path(path);
+    move |error| LocalError::source_filesystem_io(error).operation(operation, subject)
 }
 
 enum TextReadOutcome {
@@ -101,22 +139,35 @@ async fn read_text(
 ) -> Result<TextReadOutcome, LocalError> {
     let mut capture = context
         .text_capture(TextCaptureField::Content)
-        .await?
+        .await
+        .map_err(|error| error.operation(Operation::CreateCapture, Subject::path(path)))?
         .open();
+    let subject = Subject::path(path);
     let path = path.to_owned();
     let cancellation = context.cancellation_token().child_token();
     let _cancel_on_drop = cancellation.clone().drop_guard();
     // Reading, capture writes and finishing run in one blocking owner; an abandoned
     // capture discards itself.
     let completed = tokio::task::spawn_blocking(move || -> Result<_, LocalError> {
-        let mut input = std::fs::File::open(path)?;
-        match copy_utf8(&mut input, |text| capture.write_text(text), &cancellation)? {
-            Utf8Read::Complete => Ok(Some(capture.finish()?)),
+        let mut input = std::fs::File::open(&path).map_err(source(Operation::Read, &path))?;
+        match copy_utf8(
+            &path,
+            &mut input,
+            |text| capture.write_text(text),
+            &cancellation,
+        )? {
+            Utf8Read::Complete => Ok(Some(capture.finish().map_err(|error| {
+                LocalError::Io(error).operation(Operation::FinishCapture, Subject::path(&path))
+            })?)),
             Utf8Read::NotUtf8 => Ok(None),
         }
     })
     .await
-    .map_err(LocalError::failed)??;
+    .map_err(|error| {
+        LocalError::failed(error)
+            .operation(Operation::Wait, subject)
+            .effects(Effects::OutputIncomplete)
+    })??;
     if let Some(completed) = completed {
         Ok(TextReadOutcome::Captured(completed))
     } else {
@@ -131,29 +182,40 @@ enum Utf8Read {
 }
 
 fn copy_utf8(
+    path: &std::path::Path,
     input: &mut impl std::io::Read,
     mut output: impl FnMut(&str) -> std::io::Result<()>,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<Utf8Read, LocalError> {
     let mut buffer = [0; 64 * 1024];
     let mut pending = Vec::new();
+    let cancelled = || {
+        LocalError::Cancelled
+            .operation(Operation::Read, Subject::path(path))
+            .effects(Effects::OutputIncomplete)
+    };
+    let capture =
+        |error| LocalError::Io(error).operation(Operation::WriteCapture, Subject::path(path));
     loop {
         if cancellation.is_cancelled() {
-            return Err(LocalError::Cancelled);
+            return Err(cancelled());
         }
-        let size = input.read(&mut buffer)?;
+        let size = input
+            .read(&mut buffer)
+            .map_err(source(Operation::Read, path))?;
         if cancellation.is_cancelled() {
-            return Err(LocalError::Cancelled);
+            return Err(cancelled());
         }
         pending.extend_from_slice(&buffer[..size]);
         match std::str::from_utf8(&pending) {
             Ok(text) => {
-                output(text)?;
+                output(text).map_err(capture)?;
                 pending.clear();
             }
             Err(error) if error.error_len().is_none() && size != 0 => {
                 let valid = error.valid_up_to();
-                output(std::str::from_utf8(&pending[..valid]).expect("validated UTF-8 prefix"))?;
+                output(std::str::from_utf8(&pending[..valid]).expect("validated UTF-8 prefix"))
+                    .map_err(capture)?;
                 pending.drain(..valid);
             }
             Err(_) => return Ok(Utf8Read::NotUtf8),
@@ -188,10 +250,16 @@ enum ReadErrorCode {
     PermissionDenied,
 }
 
-fn read_error_output(path: &str, error: &std::io::Error) -> Option<serde_json::Value> {
-    let code = match error.kind() {
-        std::io::ErrorKind::NotFound => ReadErrorCode::NotFound,
-        std::io::ErrorKind::PermissionDenied => ReadErrorCode::PermissionDenied,
+fn read_error_output(path: &str, diagnostic: &Diagnostic) -> Option<serde_json::Value> {
+    let code = match diagnostic.cause {
+        Cause::Io {
+            kind: IoKind::NotFound,
+            ..
+        } => ReadErrorCode::NotFound,
+        Cause::Io {
+            kind: IoKind::PermissionDenied,
+            ..
+        } => ReadErrorCode::PermissionDenied,
         _ => return None,
     };
     Some(
@@ -199,7 +267,9 @@ fn read_error_output(path: &str, error: &std::io::Error) -> Option<serde_json::V
             path: path.to_owned(),
             error: ReadError {
                 code,
-                message: error.to_string(),
+                // The output owns the diagnostic; presentation fills this field
+                // with the caller-capability-aware common renderer.
+                message: String::new(),
             },
         })
         .expect("read errors serialize"),
@@ -312,7 +382,7 @@ mod tests {
     use super::*;
     use crate::job::{CancellationToken, JobState};
     use crate::tool::ToolRegistryBuilder;
-    use crate::tool::executor::{ExecutionError, ToolExecutor};
+    use crate::tool::executor::ToolExecutor;
 
     fn read_executor(
         runtime: &crate::tests::TestRuntime,
@@ -349,9 +419,9 @@ mod tests {
     async fn typed_read_and_script_admission_fails_the_job_before_io_or_evaluation() {
         let runtime = crate::tests::TestRuntime::new().await;
         let (executor, _slot) = read_executor(&runtime);
-        for (index, (tool, arguments)) in [
-            ("read", json!({"path":".", "details":"invalid"})),
-            ("script", json!({"source":42})),
+        for (index, (tool, arguments, argument)) in [
+            ("read", json!({"path":".", "details":"invalid"}), "/details"),
+            ("script", json!({"source":42}), "/source"),
         ]
         .into_iter()
         .enumerate()
@@ -359,9 +429,11 @@ mod tests {
             let error = executor.run_host(&runtime.agent, tool, arguments).await;
             let error =
                 error.expect_err("typed arguments must reject before IO or script evaluation");
-            assert!(
-                matches!(&error, ExecutionError::Failed { message, .. } if message.starts_with("invalid tool arguments:")),
-                "{error}"
+            let diagnostic = error.diagnostic();
+            assert_eq!(diagnostic.context.operation, Operation::Deserialize);
+            assert_eq!(
+                diagnostic.context.subject,
+                Subject::Argument(argument.into())
             );
             let jobs = runtime.jobs.list(&runtime.agent).await;
             assert_eq!(jobs.len(), index + 1);
@@ -409,66 +481,125 @@ mod tests {
             }
         }
         let cancellation = CancellationToken::new();
-        let result = copy_utf8(&mut &b"valid\xff"[..], |_| Ok(()), &cancellation);
-        assert_eq!(result.unwrap(), Utf8Read::NotUtf8);
-        assert!(
-            matches!(copy_utf8(&mut Reader(None), |_| Ok(()), &cancellation), Err(LocalError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData)
-        );
-        let during = Reader(Some(cancellation.clone()));
+        let copy = |mut reader: &mut dyn std::io::Read| {
+            copy_utf8(
+                std::path::Path::new("input.txt"),
+                &mut reader,
+                |_| Ok(()),
+                &cancellation,
+            )
+        };
+        assert_eq!(copy(&mut &b"valid\xff"[..]).unwrap(), Utf8Read::NotUtf8);
         assert!(matches!(
-            copy_utf8(&mut { during }, |_| Ok(()), &cancellation),
-            Err(LocalError::Cancelled)
+            copy(&mut Reader(None)).unwrap_err().diagnostic().cause,
+            Cause::Io {
+                kind: IoKind::InvalidData,
+                ..
+            }
         ));
-        assert!(matches!(
-            copy_utf8(&mut &b"data"[..], |_| Ok(()), &cancellation),
-            Err(LocalError::Cancelled)
-        ));
+        // The first reader cancels during copying; the second starts cancelled.
+        for reader in [
+            &mut Reader(Some(cancellation.clone())) as &mut dyn std::io::Read,
+            &mut &b"data"[..],
+        ] {
+            assert_eq!(
+                copy(reader).unwrap_err().diagnostic().cause,
+                Cause::Cancelled
+            );
+        }
     }
 
     #[tokio::test]
-    async fn missing_reads_complete_direct_model_and_script_jobs() {
+    async fn capture_permission_failures_are_not_completed_source_read_errors() {
+        use crate::execution::ExecutionLocation;
+        use crate::tool::invocation::{
+            LocalCatalog,
+            tests::{Authorizations, CapturedOutput},
+        };
+        use crate::tool::output::OutputContext;
+        use crate::tool::output::tests::{CaptureStage, FailingCapture};
+
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("source.txt"), "captured text")
+            .await
+            .unwrap();
+        let catalog = LocalCatalog::builtins().unwrap();
+        for (stage, operation) in [
+            (CaptureStage::Open, Operation::CreateCapture),
+            (CaptureStage::Write, Operation::WriteCapture),
+            (CaptureStage::Finish, Operation::FinishCapture),
+        ] {
+            let output = OutputContext::new(Arc::new(FailingCapture::new(
+                Arc::new(CapturedOutput::default()),
+                stage,
+                0,
+                || std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            )));
+            let arguments = json!({"path":"source.txt"});
+            let context = LocalContext::new(
+                ExecutionLocation::root(root.path().to_owned()),
+                [Capability::Read].into_iter().collect(),
+                Default::default(),
+                CancellationToken::new(),
+                output.clone(),
+                Arc::new(Authorizations::default()),
+                arguments.clone(),
+            );
+            let error = catalog
+                .run("read", arguments, context, root.path())
+                .await
+                .unwrap_err();
+            assert_eq!(error.diagnostic().context.operation, operation);
+            assert!(matches!(
+                error.diagnostic().cause,
+                Cause::Io {
+                    kind: IoKind::PermissionDenied,
+                    ..
+                }
+            ));
+            output.settle().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_reads_complete_direct_and_script_jobs() {
         let runtime = crate::tests::TestRuntime::new().await;
         let (executor, _slot) = read_executor(&runtime);
-        let agent = &runtime.agent;
-        let state = async |job| runtime.jobs.snapshot(job).await.unwrap().state;
-        for path in ["missing", "missing/nested/file.txt"] {
-            let direct = executor
-                .run_host(agent, "read", json!({"path":path}))
-                .await
-                .unwrap();
-            let value = &direct.output.value;
-            assert_eq!(
-                (&value["kind"], &value["path"]),
-                (&json!("error"), &json!(path))
-            );
-            assert_eq!(value["error"]["code"], "not_found");
-            assert!(
-                value["error"]["message"]
-                    .as_str()
-                    .is_some_and(|s| !s.is_empty())
-            );
-            assert_eq!(state(direct.job).await, JobState::Completed);
-            let model = executor
-                .run_model(agent, "read", json!({"path":path}))
-                .await
-                .unwrap();
-            assert_eq!(model.output.value["state"], "completed");
-            assert_eq!(model.output.value["result"]["error"]["code"], "not_found");
-            let path = serde_json::to_string(path).unwrap();
-            let source = format!(
-                "const response = await tool.read({{path:{path}}}); return {{resolved:true, result:response.unwrap()}};"
-            );
-            let script = executor
-                .run_host(agent, "script", json!({"source": source}))
-                .await
-                .unwrap();
-            assert_eq!(script.output.value["value"]["resolved"], true);
-            assert_eq!(
-                script.output.value["value"]["result"]["error"]["code"],
-                "not_found"
-            );
-            assert_eq!(state(script.job).await, JobState::Completed);
-        }
+        let direct = executor
+            .run_host(
+                &runtime.agent,
+                "read",
+                json!({"path":"missing/nested/file.txt"}),
+            )
+            .await
+            .unwrap();
+        let value = &direct.output.value;
+        assert_eq!(value["kind"], "error");
+        assert_eq!(value["path"], "missing/nested/file.txt");
+        assert_eq!(value["error"]["code"], "not_found");
+        assert!(!value["error"]["message"].as_str().unwrap().is_empty());
+        assert_eq!(
+            runtime.jobs.snapshot(direct.job).await.unwrap().state,
+            JobState::Completed
+        );
+
+        // Script unwrap must resolve the completed read error, not throw it.
+        let script = executor
+            .run_host(
+                &runtime.agent,
+                "script",
+                json!({"source":
+                    "return (await tool.read({path:'missing'})).unwrap();"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(script.output.value["value"]["error"]["code"], "not_found");
+        assert!(script.output.value["failure"].is_null());
+        assert_eq!(
+            runtime.jobs.snapshot(script.job).await.unwrap().state,
+            JobState::Completed
+        );
     }
 
     #[tokio::test]

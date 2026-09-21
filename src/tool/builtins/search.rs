@@ -1,4 +1,5 @@
 use crate::tool::ToolOptions;
+use crate::tool::diagnostic::{DiagnosticContext, Effects, Operation, Subject};
 use crate::tool::invocation::{LocalCatalogBuilder, LocalError};
 use crate::tool::output::ProducedOutput;
 use std::{
@@ -29,13 +30,25 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
             .default_path_argument("path", ".", PathAccess::Read, PathKind::Existing),
         |context, args| async move {
             let root = PathBuf::from(&args.path);
-            let capture = context.pending_stream_capture("/result/matches", crate::tool::output::CaptureKind::Json).await?;
+            let capture = context
+                .pending_stream_capture("/result/matches", crate::tool::output::CaptureKind::Json)
+                .await
+                .map_err(|error| {
+                    error.operation(
+                        Operation::CreateCapture,
+                        Subject::Label("search matches".into()),
+                    )
+                })?;
             let workspace = context.execution_location().workspace.clone();
             tokio::task::spawn_blocking(move || {
                 search_blocking(&workspace, &root, &args, capture, &context.cancellation_token())
             })
             .await
-            .map_err(LocalError::failed)?
+            .map_err(|error| {
+                LocalError::failed(error)
+                    .operation(Operation::Wait, Subject::Label("search worker".into()))
+                    .effects(Effects::OutputIncomplete)
+            })?
             .and_then(|capture| {
                 let output = SearchOutput { matches: SearchMatches::Grouped(BTreeMap::new()) };
                 Ok(ProducedOutput::new(serde_json::to_value(output)?).with_captures(vec![capture]))
@@ -52,7 +65,13 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
             let root = PathBuf::from(&args.path);
             let capture = context
                 .pending_stream_capture("/result/paths", crate::tool::output::CaptureKind::Json)
-                .await?;
+                .await
+                .map_err(|error| {
+                    error.operation(
+                        Operation::CreateCapture,
+                        Subject::Label("glob paths".into()),
+                    )
+                })?;
             let workspace = context.execution_location().workspace.clone();
             tokio::task::spawn_blocking(move || {
                 glob_blocking(
@@ -64,18 +83,22 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
                 )
             })
             .await
-            .map_err(LocalError::failed)?
+            .map_err(|error| {
+                LocalError::failed(error)
+                    .operation(Operation::Wait, Subject::Label("glob worker".into()))
+                    .effects(Effects::OutputIncomplete)
+            })?
             .map(|capture| ProducedOutput::new(serde_json::json!({})).with_captures(vec![capture]))
         },
     )?;
     Ok(())
 }
 
-fn walk_builder(
+fn walk_builder<'a>(
     root: &Path,
     hidden: bool,
     no_ignore: bool,
-    patterns: &[String],
+    patterns: impl IntoIterator<Item = (&'a str, Subject)>,
 ) -> Result<WalkBuilder, LocalError> {
     let patterns = overrides(root, patterns)?;
     let mut walk = WalkBuilder::new(root);
@@ -101,12 +124,22 @@ fn walk_builder(
     Ok(walk)
 }
 
-fn overrides(root: &Path, patterns: &[String]) -> Result<ignore::overrides::Override, LocalError> {
+fn overrides<'a>(
+    root: &Path,
+    patterns: impl IntoIterator<Item = (&'a str, Subject)>,
+) -> Result<ignore::overrides::Override, LocalError> {
     let mut builder = OverrideBuilder::new(root);
-    for pattern in patterns {
-        builder.add(pattern).map_err(LocalError::invalid)?;
+    for (pattern, subject) in patterns {
+        // Upstream diagnostics embed the pattern; identify its argument instead.
+        builder.add(pattern).map_err(|_| {
+            LocalError::invalid("glob pattern could not be compiled")
+                .operation(Operation::Validate, subject)
+        })?;
     }
-    builder.build().map_err(LocalError::invalid)
+    builder.build().map_err(|_| {
+        LocalError::invalid("glob patterns could not be compiled")
+            .operation(Operation::Validate, Subject::Label("glob patterns".into()))
+    })
 }
 
 fn search_blocking(
@@ -129,38 +162,56 @@ fn search_blocking(
             matcher_builder.case_insensitive(true).case_smart(false);
         }
     }
-    let matcher = matcher_builder
-        .build(&args.pattern)
-        .map_err(LocalError::invalid)?;
+    let matcher = matcher_builder.build(&args.pattern).map_err(|_| {
+        LocalError::invalid("regular expression could not be compiled")
+            .operation(Operation::Validate, Subject::argument(["pattern"]))
+    })?;
 
-    let files: Box<dyn Iterator<Item = Result<PathBuf, LocalError>>> = if root.is_file() {
+    let metadata = std::fs::metadata(root).map_err(LocalError::annotated(
+        DiagnosticContext::new(Operation::Inspect, Subject::path(root)),
+    ))?;
+    let files: Box<dyn Iterator<Item = Result<PathBuf, LocalError>>> = if metadata.is_file() {
         Box::new(std::iter::once(Ok(root.to_owned())))
-    } else if root.is_dir() {
-        let walk = walk_builder(root, args.hidden, args.no_ignore, &args.glob)?;
-        Box::new(walk.build().filter_map(|entry| match entry {
+    } else if metadata.is_dir() {
+        let walk = walk_builder(
+            root,
+            args.hidden,
+            args.no_ignore,
+            args.glob.iter().enumerate().map(|(index, pattern)| {
+                (
+                    pattern.as_str(),
+                    Subject::argument(["glob", &index.to_string()]),
+                )
+            }),
+        )?;
+        Box::new(walk.build().filter_map(move |entry| match entry {
             Ok(entry) if entry.file_type().is_some_and(|kind| kind.is_file()) => {
                 Some(Ok(entry.into_path()))
             }
             Ok(_) => None,
-            Err(error) => Some(Err(LocalError::Failed(error.to_string()))),
+            Err(error) => Some(Err(walk_error(error, root))),
         }))
     } else {
-        return Err(LocalError::Failed(
-            "search root is not a file or directory".into(),
-        ));
+        return Err(LocalError::failed("search root is not a file or directory")
+            .operation(Operation::Inspect, Subject::path(root)));
     };
     let mut searcher = SearcherBuilder::new()
         .line_number(true)
         .binary_detection(BinaryDetection::quit(b'\0'))
         .heap_limit(Some(4 * 1024 * 1024))
         .build();
-    let mut matches = CapturedOutput::new(capture, !args.details)?;
+    let mut matches = CapturedOutput::new(capture, !args.details)
+        .map_err(|error| capture_error(error, Operation::WriteCapture))?;
     for path in files {
         if cancellation.is_cancelled() {
-            return Err(LocalError::Cancelled);
+            return Err(LocalError::Cancelled
+                .operation(Operation::Read, Subject::path(root))
+                .effects(Effects::OutputIncomplete));
         }
         let path = path?;
-        let checkpoint = matches.checkpoint()?;
+        let checkpoint = matches
+            .checkpoint()
+            .map_err(|error| capture_error(error, Operation::Capture))?;
         let mut sink = SearchSink {
             matcher: &matcher,
             path: relative_path(workspace, &path),
@@ -170,12 +221,16 @@ fn search_blocking(
         };
         searcher
             .search_path(&matcher, &path, &mut sink)
-            .map_err(SearchStop::into_tool_error)?;
+            .map_err(|error| error.into_tool_error(&path))?;
         if sink.binary {
-            matches.rollback(checkpoint)?;
+            matches
+                .rollback(checkpoint)
+                .map_err(|error| capture_error(error, Operation::WriteCapture))?;
         }
     }
-    Ok(matches.finish()?)
+    matches
+        .finish()
+        .map_err(|error| capture_error(error, Operation::FinishCapture))
 }
 
 fn glob_blocking(
@@ -185,26 +240,66 @@ fn glob_blocking(
     capture: PendingOutput,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<FinishedOutput, LocalError> {
-    if !root.is_dir() {
-        return Err(LocalError::Failed("glob root is not a directory".into()));
+    let metadata = std::fs::metadata(root).map_err(LocalError::annotated(
+        DiagnosticContext::new(Operation::Inspect, Subject::path(root)),
+    ))?;
+    if !metadata.is_dir() {
+        return Err(LocalError::failed("glob root is not a directory")
+            .operation(Operation::Inspect, Subject::path(root)));
     }
     let walk = walk_builder(
         root,
         args.hidden,
         args.no_ignore,
-        std::slice::from_ref(&args.pattern),
+        std::iter::once((args.pattern.as_str(), Subject::argument(["pattern"]))),
     )?;
-    let mut paths = CapturedOutput::new(capture, false)?;
+    let mut paths = CapturedOutput::new(capture, false)
+        .map_err(|error| capture_error(error, Operation::WriteCapture))?;
     for entry in walk.build() {
         if cancellation.is_cancelled() {
-            return Err(LocalError::Cancelled);
+            return Err(LocalError::Cancelled
+                .operation(Operation::ReadDirectory, Subject::path(root))
+                .effects(Effects::OutputIncomplete));
         }
-        let entry = entry.map_err(LocalError::failed)?;
+        let entry = entry.map_err(|error| walk_error(error, root))?;
         if entry.depth() != 0 && entry.file_type().is_some_and(|kind| kind.is_file()) {
-            paths.push(relative_path(workspace, entry.path()))?;
+            paths
+                .push(relative_path(workspace, entry.path()))
+                .map_err(|error| capture_error(error, Operation::WriteCapture))?;
         }
     }
-    Ok(paths.finish()?)
+    paths
+        .finish()
+        .map_err(|error| capture_error(error, Operation::FinishCapture))
+}
+
+fn walk_error(error: ignore::Error, root: &Path) -> LocalError {
+    let error = match error {
+        ignore::Error::WithPath { path, err } => return walk_error(*err, &path),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            return walk_error(*err, root);
+        }
+        ignore::Error::Partial(mut errors) if errors.len() == 1 => {
+            return walk_error(errors.remove(0), root);
+        }
+        ignore::Error::Io(error) => LocalError::Io(error),
+        ignore::Error::Loop { child, .. } => {
+            return LocalError::failed("symbolic link loop")
+                .operation(Operation::ReadDirectory, Subject::path(child))
+                .effects(Effects::OutputIncomplete);
+        }
+        // The remaining displays embed user patterns.
+        _ => LocalError::failed("directory traversal failed"),
+    };
+    error
+        .operation(Operation::ReadDirectory, Subject::path(root))
+        .effects(Effects::OutputIncomplete)
+}
+
+fn capture_error(error: std::io::Error, operation: Operation) -> LocalError {
+    LocalError::Io(error)
+        .operation(operation, Subject::Label("result capture".into()))
+        .effects(Effects::OutputIncomplete)
 }
 
 /// Streams the complete result into the owning job's capture. The handler returns
@@ -288,6 +383,7 @@ impl CapturedOutput {
 enum SearchStop {
     Cancelled,
     Io(std::io::Error),
+    Capture(std::io::Error),
 }
 
 impl grep_searcher::SinkError for SearchStop {
@@ -306,11 +402,15 @@ impl From<std::io::Error> for SearchStop {
 }
 
 impl SearchStop {
-    fn into_tool_error(self) -> LocalError {
+    fn into_tool_error(self, path: &Path) -> LocalError {
         match self {
-            Self::Cancelled => LocalError::Cancelled,
-            // Preserve the existing grep IO failure presentation.
-            Self::Io(error) => LocalError::Failed(error.to_string()),
+            Self::Cancelled => LocalError::Cancelled
+                .operation(Operation::Read, Subject::path(path))
+                .effects(Effects::OutputIncomplete),
+            Self::Io(error) => LocalError::Io(error)
+                .operation(Operation::Read, Subject::path(path))
+                .effects(Effects::OutputIncomplete),
+            Self::Capture(error) => capture_error(error, Operation::WriteCapture),
         }
     }
 }
@@ -338,14 +438,16 @@ impl Sink for SearchSink<'_> {
             .find(bytes)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         if let Some(first) = first {
-            self.matches.push_match(SearchMatch {
-                path: self.path.clone(),
-                line: matched.line_number().unwrap_or(1),
-                column: first.start() + 1,
-                text: String::from_utf8_lossy(bytes)
-                    .trim_end_matches(['\r', '\n'])
-                    .to_owned(),
-            })?;
+            self.matches
+                .push_match(SearchMatch {
+                    path: self.path.clone(),
+                    line: matched.line_number().unwrap_or(1),
+                    column: first.start() + 1,
+                    text: String::from_utf8_lossy(bytes)
+                        .trim_end_matches(['\r', '\n'])
+                        .to_owned(),
+                })
+                .map_err(SearchStop::Capture)?;
         }
         Ok(true)
     }
@@ -456,34 +558,54 @@ fn common_matcher() -> RegexMatcherBuilder {
 pub(crate) fn output_matcher(
     pattern: &str,
 ) -> Result<grep_regex::RegexMatcher, crate::tool::invocation::AdmissionError> {
-    common_matcher()
-        .build(pattern)
-        .map_err(crate::tool::invocation::AdmissionError::invalid)
+    common_matcher().build(pattern).map_err(|_| {
+        crate::tool::invocation::AdmissionError::invalid("regular expression could not be compiled")
+            .operation(Operation::Validate, Subject::argument(["pattern"]))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tool::ToolRegistryBuilder;
+    use crate::tool::diagnostic::{Cause, IoKind};
+    use crate::tool::output::OutputSink;
+    use crate::tool::output::tests::{CaptureStage, FailingCapture};
     use serde_json::{Value, json};
+    use std::sync::Arc;
 
     struct CaptureFixture {
         runtime: tokio::runtime::Runtime,
-        sink: std::sync::Arc<crate::tool::invocation::tests::CapturedOutput>,
+        sink: Arc<crate::tool::invocation::tests::CapturedOutput>,
         output: crate::tool::output::OutputContext,
     }
 
     impl CaptureFixture {
         fn new() -> Self {
+            Self::with_sink(|sink| sink)
+        }
+
+        fn with_sink(
+            wrap: impl FnOnce(
+                Arc<crate::tool::invocation::tests::CapturedOutput>,
+            ) -> Arc<dyn OutputSink>,
+        ) -> Self {
             let runtime = tokio::runtime::Runtime::new().unwrap();
-            let sink =
-                std::sync::Arc::new(crate::tool::invocation::tests::CapturedOutput::default());
-            let output = crate::tool::output::OutputContext::new(sink.clone());
+            let sink = Arc::new(crate::tool::invocation::tests::CapturedOutput::default());
+            let output = crate::tool::output::OutputContext::new(wrap(sink.clone()));
             Self {
                 runtime,
                 sink,
                 output,
             }
+        }
+
+        fn settle(&self) -> std::io::Result<()> {
+            self.runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), self.output.settle())
+                    .await
+                    .expect("capture settlement timed out")
+            })
         }
 
         fn pending(&self) -> PendingOutput {
@@ -507,7 +629,7 @@ mod tests {
             fixture.pending(),
             &tokio_util::sync::CancellationToken::new(),
         )?;
-        fixture.runtime.block_on(fixture.output.settle())?;
+        fixture.settle()?;
         Ok(serde_json::from_slice(&fixture.sink.bytes())?)
     }
 
@@ -531,6 +653,148 @@ mod tests {
     }
 
     #[test]
+    fn root_metadata_failures_preserve_io_causes() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input");
+        std::fs::write(&input, "needle").unwrap();
+        let search: SearchArgs = serde_json::from_value(json!({"pattern":"needle"})).unwrap();
+        let glob: GlobArgs = serde_json::from_value(json!({"pattern":"*"})).unwrap();
+        for (path, kind) in [
+            (root.path().join("missing"), std::io::ErrorKind::NotFound),
+            (input.join("child"), std::io::ErrorKind::NotADirectory),
+        ] {
+            let fixture = CaptureFixture::new();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            for result in [
+                search_blocking(root.path(), &path, &search, fixture.pending(), &cancel),
+                glob_blocking(root.path(), &path, &glob, fixture.pending(), &cancel),
+            ] {
+                let error = result.unwrap_err();
+                let diagnostic = error.diagnostic();
+                assert_eq!(diagnostic.context.operation, Operation::Inspect);
+                assert_eq!(diagnostic.context.subject, Subject::path(&path));
+                assert!(matches!(diagnostic.cause,
+                    Cause::Io { kind: actual, code: Some(_), .. } if actual == kind.into()));
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_patterns_identify_arguments_without_echoing_values() {
+        let root = tempfile::tempdir().unwrap();
+        let fixture = CaptureFixture::new();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let invalid = "private-pattern-[z-a]";
+        let search = |arguments: Value| {
+            let args: SearchArgs = serde_json::from_value(arguments).unwrap();
+            search_blocking(
+                root.path(),
+                root.path(),
+                &args,
+                fixture.pending(),
+                &cancellation,
+            )
+            .unwrap_err()
+        };
+        let glob: GlobArgs = serde_json::from_value(json!({"pattern":invalid})).unwrap();
+        for (error, argument) in [
+            (search(json!({"pattern":invalid})), "/pattern"),
+            (
+                search(json!({"pattern":"needle", "glob":["*.rs", invalid]})),
+                "/glob/1",
+            ),
+            (
+                glob_blocking(
+                    root.path(),
+                    root.path(),
+                    &glob,
+                    fixture.pending(),
+                    &cancellation,
+                )
+                .unwrap_err(),
+                "/pattern",
+            ),
+            (output_matcher(invalid).unwrap_err().into(), "/pattern"),
+        ] {
+            let diagnostic = error.diagnostic();
+            assert!(matches!(diagnostic.cause, Cause::InvalidArguments(_)));
+            assert_eq!(diagnostic.context.operation, Operation::Validate);
+            assert_eq!(
+                diagnostic.context.subject,
+                Subject::Argument(argument.into())
+            );
+            // Upstream compile errors echo the pattern; ours must not.
+            assert!(!error.to_string().contains("private-pattern"));
+        }
+    }
+
+    #[test]
+    fn walk_and_source_failures_preserve_paths_and_io_causes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("missing");
+        let source = || std::fs::read(&path).unwrap_err();
+        let walked = walk_error(
+            ignore::Error::WithDepth {
+                depth: 1,
+                err: Box::new(ignore::Error::WithPath {
+                    path: path.clone(),
+                    err: Box::new(ignore::Error::Io(source())),
+                }),
+            },
+            root.path(),
+        );
+        let read = SearchStop::Io(source()).into_tool_error(&path);
+        for (error, operation) in [(walked, Operation::ReadDirectory), (read, Operation::Read)] {
+            let diagnostic = error.diagnostic();
+            assert_eq!(diagnostic.context.operation, operation);
+            assert_eq!(diagnostic.context.subject, Subject::path(&path));
+            assert_eq!(diagnostic.context.effects, Effects::OutputIncomplete);
+            assert_eq!(diagnostic.cause, Cause::io(&source()));
+        }
+    }
+
+    #[test]
+    fn capture_failures_preserve_their_phase() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input");
+        std::fs::write(&input, "needle\n".repeat(20_000)).unwrap();
+        let args: SearchArgs = serde_json::from_value(json!({"pattern":"needle"})).unwrap();
+        for (stage, failure, skip) in [
+            (CaptureStage::Write, Operation::WriteCapture, 1),
+            (CaptureStage::Finish, Operation::FinishCapture, 0),
+        ] {
+            let fixture = CaptureFixture::with_sink(|captured| {
+                Arc::new(FailingCapture::new(captured, stage, skip, || {
+                    std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+                }))
+            });
+            let error = search_blocking(
+                root.path(),
+                &input,
+                &args,
+                fixture.pending(),
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .unwrap_err();
+            let diagnostic = error.diagnostic();
+            assert_eq!(diagnostic.context.operation, failure);
+            assert_eq!(
+                diagnostic.context.subject,
+                Subject::Label("result capture".into())
+            );
+            assert_eq!(diagnostic.context.effects, Effects::OutputIncomplete);
+            assert!(matches!(
+                diagnostic.cause,
+                Cause::Io {
+                    kind: IoKind::PermissionDenied,
+                    ..
+                }
+            ));
+            fixture.settle().unwrap();
+        }
+    }
+
+    #[test]
     fn cancellation_before_first_file_is_typed() {
         let root = tempfile::tempdir().unwrap();
         let input = root.path().join("input");
@@ -541,7 +805,9 @@ mod tests {
         let output = CaptureFixture::new();
         let capture = output.pending();
         let result = search_blocking(root.path(), &input, &args, capture, &cancellation);
-        assert!(matches!(result, Err(LocalError::Cancelled)));
+        let diagnostic = result.unwrap_err().diagnostic();
+        assert_eq!(diagnostic.cause, Cause::Cancelled);
+        assert_eq!(diagnostic.context.effects, Effects::OutputIncomplete);
     }
 
     #[tokio::test]
@@ -702,5 +968,6 @@ mod tests {
         );
         let paths = glob(root, root, json!({"pattern":"*.rs"}));
         assert_eq!(paths, ["binary.rs", "lower.rs", "upper.rs"]);
+        assert!(glob(root, root, json!({"pattern":"*.missing"})).is_empty());
     }
 }

@@ -5,7 +5,7 @@ mod planning;
 mod results;
 
 pub use results::{ExecutionError, ExecutionResult};
-pub(crate) use results::{ExecutionFailure, StartedExecution, persist_completion};
+pub(crate) use results::{StartedExecution, persist_completion};
 
 use serde_json::Value;
 use std::{path::PathBuf, sync::Arc};
@@ -19,6 +19,10 @@ use crate::{
     tool::{
         ToolPlacement,
         authorization::{AuthorizationCoordinator, AuthorizationError, AuthorizationSubject},
+        diagnostic::{
+            Cause, Diagnostic, DiagnosticContext, Effects, FailureSite, Operation, PathFact,
+            Subject,
+        },
         policy::{Capability, CapabilitySet, PermissionUse, Policy, ResourceId},
     },
 };
@@ -50,6 +54,7 @@ struct InvocationPlan {
     caller_location: ExecutionLocation,
     execution_location: ExecutionLocation,
     permissions: Vec<PermissionUse>,
+    path_facts: Vec<PathFact>,
     parent: Option<JobId>,
     authorization_scope: Option<u64>,
     background: bool,
@@ -62,7 +67,7 @@ struct InvocationPlan {
 enum InvocationDispatch<R> {
     /// Admission failures are reported by the job, after approval, as a handler would.
     Local(Result<super::registry::AdmittedInvocation, super::AdmissionError>),
-    ReadError(ToolOutput),
+    ReadError(Box<ToolOutput>),
     Remote {
         remote: R,
         arguments: Value,
@@ -171,6 +176,10 @@ impl ToolExecutor {
         &self.shared.registry
     }
 
+    pub(crate) fn diagnostic_viewer(&self) -> super::diagnostic::DiagnosticViewer<'_> {
+        super::diagnostic::DiagnosticViewer::new(&self.capabilities, &self.caller_location)
+    }
+
     #[must_use]
     pub fn jobs(&self) -> &JobManager {
         &self.shared.jobs
@@ -217,11 +226,28 @@ impl ToolExecutor {
         arguments: Value,
         parent: Option<JobId>,
     ) -> Result<ExecutionResult, ExecutionError> {
+        let host = self
+            .shared
+            .registry
+            .get(name)
+            .is_none_or(|tool| tool.placement() == ToolPlacement::Host);
+        let stage = |operation, location: &ExecutionLocation| {
+            DiagnosticContext::new(operation, Subject::Tool(name.to_owned()))
+                .at(FailureSite::bound(location, host))
+        };
         let plan = self
             .plan_registered(kind, agent, name, arguments, parent)
-            .await?;
+            .await
+            .map_err(|error| {
+                let fallback = stage(Operation::Validate, &self.caller_location);
+                error.contextualize(fallback, &self.capabilities)
+            })?;
         let result_policy = plan.tool.result_policy();
-        let started = self.start(plan).await?;
+        let fallback = stage(Operation::Prepare, &plan.execution_location);
+        let started = self
+            .start(plan)
+            .await
+            .map_err(|error| error.contextualize(fallback, &self.capabilities))?;
         match kind {
             InvocationKind::Model if result_policy != super::ToolResultPolicy::JobView => {
                 self.collect_model_started(started).await

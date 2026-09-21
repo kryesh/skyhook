@@ -291,6 +291,12 @@ struct TurnContext<'a> {
     capabilities: CapabilitySet,
 }
 
+impl TurnContext<'_> {
+    fn diagnostic_viewer(&self) -> crate::tool::diagnostic::DiagnosticViewer<'_> {
+        crate::tool::diagnostic::DiagnosticViewer::new(&self.capabilities, self.location)
+    }
+}
+
 type LiveAgents = HashMap<AgentId, LiveAgent>;
 
 impl SessionRuntime {

@@ -8,13 +8,13 @@ use super::manager::McpManager;
 use crate::{
     session::SessionStore,
     tool::{
-        ToolOptions, ToolPlacement, ToolRegistryBuilder,
+        RegistryError, ToolOptions, ToolPlacement, ToolRegistryBuilder,
         policy::{Capability, ResourceId},
     },
 };
 use arguments::Arguments;
 use naming::tool_names;
-use result::{map_error, map_result};
+use result::map_result;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -80,12 +80,15 @@ pub fn register(
                             arguments,
                             context.cancellation_token(),
                         )
-                        .await
-                        .map_err(map_error)?;
+                        .await?;
                     map_result(result, &store).await
                 }
             },
         ) {
+            let error = match error {
+                RegistryError::Schema(_) => "input schema cannot be registered".to_owned(),
+                error => error.to_string(),
+            };
             warnings.push(format!(
                 "MCP tool {}/{} skipped: {error}",
                 discovered.server, tool.name

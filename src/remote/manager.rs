@@ -8,6 +8,7 @@ use futures_util::future::{BoxFuture, FutureExt as _, Shared};
 use tokio::sync::Mutex;
 
 use crate::{
+    execution::ExecutionLocation,
     job::CancellationToken,
     remote::{EmbeddedShimCatalog, SensitivePromptHandler},
     target::{ResolvedRoute, RouteIdentity},
@@ -26,6 +27,7 @@ pub(crate) struct RemoteManager {
 struct RemoteInner {
     factory: Arc<dyn super::backend::ConnectionFactory>,
     shutdown: CancellationToken,
+    tasks: tokio_util::task::TaskTracker,
     pool: Mutex<HashMap<ConnectionKey, Arc<PooledSlot>>>,
     prompts: Arc<dyn SensitivePromptHandler>,
     authorization: AuthorizationCoordinator,
@@ -56,11 +58,14 @@ impl PreparedConnection {
         arguments: serde_json::Value,
         context: &ToolContext,
     ) -> Result<ToolOutput, RemoteError> {
-        let result = self.connection.execute(name, arguments, context).await;
-        if matches!(
-            result,
-            Err(RemoteError::Io { .. } | RemoteError::Protocol(_))
-        ) {
+        let destination =
+            ExecutionLocation::named(self.key.route.destination(), self.key.workspace.clone());
+        let result = self
+            .connection
+            .execute(name, arguments, context, destination)
+            .await;
+        // Worker I/O failures do not imply that the pooled transport failed.
+        if self.connection.is_failed().await {
             self.manager.discard(&self).await;
         }
         result
@@ -77,6 +82,7 @@ impl RemoteManager {
             inner: Arc::new(RemoteInner {
                 factory: Arc::new(super::ssh::Backend::new(catalog, prompts.clone())),
                 shutdown: CancellationToken::new(),
+                tasks: tokio_util::task::TaskTracker::new(),
                 pool: Mutex::new(HashMap::new()),
                 prompts,
                 authorization,
@@ -94,7 +100,14 @@ impl RemoteManager {
     }
     pub(crate) async fn shutdown(&self) {
         self.inner.shutdown.cancel();
-        self.inner.pool.lock().await.clear();
+        {
+            let mut pool = self.inner.pool.lock().await;
+            pool.clear();
+            self.inner.tasks.close();
+        }
+        // Startups register readers before their own tracked lifetime ends, so
+        // shutdown cannot miss a reader published by an in-flight handshake.
+        self.inner.tasks.wait().await;
         self.inner.factory.shutdown().await;
     }
 
@@ -122,12 +135,15 @@ impl RemoteManager {
             };
             let slot = {
                 let mut pool = self.inner.pool.lock().await;
+                if self.inner.shutdown.is_cancelled() {
+                    return Err(RemoteError::Cancelled);
+                }
                 if let Some(existing) = pool.get(&key) {
                     existing.clone()
                 } else {
                     let manager = self.clone();
                     let workspace = workspace.to_path_buf();
-                    let startup = tokio::spawn(async move {
+                    let startup = self.inner.tasks.spawn(async move {
                         let connect = async { manager.connect(&route, &workspace).await };
                         tokio::select! { result = connect => result, () = manager.inner.shutdown.cancelled() => Err(RemoteError::Cancelled) }
                     });
@@ -236,6 +252,8 @@ impl RemoteManager {
                 target,
                 self.inner.authorization.clone(),
                 self.inner.prompts.clone(),
+                &self.inner.tasks,
+                self.inner.shutdown.child_token(),
             )
             .await?,
         ))
@@ -301,7 +319,7 @@ pub(crate) mod tests {
             });
             Box::pin(async move {
                 if !self.invalid.load(Ordering::SeqCst) {
-                    return Ok(test_transport());
+                    return Ok(test_transport(None));
                 }
                 Ok(Transport {
                     input: Box::new(tokio::io::sink()),
@@ -391,14 +409,222 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn evicted_connections_drain_accepted_output_before_shutdown() {
+        use crate::{
+            remote::{
+                client::tests::{fixture_context, write_result},
+                protocol::{PayloadEvent, RequestId},
+            },
+            session::{AppendBoundary, SessionEvent},
+            tool::output::{CaptureEvent, CaptureId},
+        };
+
+        struct ControlledFactory(std::sync::Mutex<Option<Transport>>);
+        impl ConnectionFactory for ControlledFactory {
+            fn connect(
+                &self,
+                _: ConnectionRequest,
+            ) -> BoxFuture<'_, Result<Transport, RemoteError>> {
+                let transport = self.0.lock().unwrap().take().unwrap();
+                Box::pin(async { Ok(transport) })
+            }
+        }
+
+        tokio::time::timeout(FIVE_SECONDS, async {
+            for successful in [true, false] {
+                let runtime = crate::tests::TestRuntime::new().await;
+                runtime
+                    .jobs
+                    .test_create(crate::job::JobSpec::test(runtime.agent.clone(), "payload"))
+                    .await;
+                let context = fixture_context(&runtime);
+                let saved = runtime.jobs.output(context.job());
+                let (client, mut shim) = tokio::io::duplex(4096);
+                let (output, input) = tokio::io::split(client);
+                let (owner, dropped) = tokio::sync::oneshot::channel::<()>();
+                let manager = manager(Arc::new(ControlledFactory(std::sync::Mutex::new(Some(
+                    Transport {
+                        input: Box::new(input),
+                        output: Box::new(output),
+                        owner: Box::new(owner),
+                    },
+                )))));
+                let cancellation = CancellationToken::new();
+                let connecting =
+                    manager.connection(build_route(), Path::new("/build"), &cancellation);
+                let handshake = async {
+                    assert!(matches!(
+                        read_frame::<_, Request>(&mut shim).await.unwrap(),
+                        Some(Request::Hello)
+                    ));
+                    write_frame(&mut shim, &Response::Ready).await.unwrap();
+                };
+                let (prepared, ()) = tokio::join!(connecting, handshake);
+                let prepared = prepared.unwrap();
+                let abandoned = tokio::spawn({
+                    let prepared = prepared.clone();
+                    let context = context.clone();
+                    async move {
+                        prepared
+                            .execute("read".into(), serde_json::json!({}), &context)
+                            .await
+                    }
+                });
+                assert!(matches!(
+                    read_frame::<_, Request>(&mut shim).await.unwrap(),
+                    Some(Request::Tool { .. })
+                ));
+                context.cancellation_token().cancel();
+                assert!(matches!(
+                    read_frame::<_, Request>(&mut shim).await.unwrap(),
+                    Some(Request::Cancel { .. })
+                ));
+                assert!(matches!(
+                    abandoned.await.unwrap(),
+                    Err(RemoteError::Cancelled)
+                ));
+
+                let caller = fixture_context(&runtime);
+                let completing =
+                    prepared
+                        .clone()
+                        .execute("read".into(), serde_json::json!({}), &caller);
+                tokio::pin!(completing);
+                if successful {
+                    // Register B, but do not poll its returned result until failure is
+                    // published. Its success must still evict this broken transport.
+                    tokio::select! {
+                        result = &mut completing => panic!("unexpected completion: {result:?}"),
+                        request = read_frame::<_, Request>(&mut shim) => {
+                            assert!(matches!(request.unwrap(), Some(Request::Tool { .. })));
+                        }
+                    }
+                }
+
+                // Hold the shared database connection at an existing persistence gate.
+                // A's capture open blocks; both accepted data chunks remain queued.
+                let (reached, resume) = runtime.store.pause_append_at(AppendBoundary::Write).await;
+                let accepted = runtime
+                    .store
+                    .accept_append(runtime.agent.clone(), SessionEvent::AgentInterrupted)
+                    .await
+                    .unwrap();
+                reached.await.unwrap();
+                for event in [
+                    CaptureEvent::Open {
+                        id: CaptureId::FIRST,
+                        field: "/result/content".into(),
+                        kind: crate::job::output::CaptureKind::Text,
+                    },
+                    CaptureEvent::Write {
+                        id: CaptureId::FIRST,
+                        data: b"accepted ".to_vec(),
+                    },
+                    CaptureEvent::Write {
+                        id: CaptureId::FIRST,
+                        data: b"after cancellation".to_vec(),
+                    },
+                ] {
+                    write_frame(
+                        &mut shim,
+                        &Response::Payload {
+                            request_id: RequestId::FIRST,
+                            event: PayloadEvent::Capture(event),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                if successful {
+                    write_result(
+                        &mut shim,
+                        RequestId::new(2).unwrap(),
+                        Ok(crate::remote::protocol::RemoteToolOutput {
+                            diagnostic: None,
+                            value: serde_json::json!("second"),
+                            images: Vec::new(),
+                            captures: Vec::new(),
+                            streams: Default::default(),
+                        }),
+                    )
+                    .await;
+                }
+                drop(shim);
+                while !prepared.connection.is_failed().await {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    dropped.await.is_err(),
+                    "transport owner must stop before persistence drains"
+                );
+                let result = (&mut completing).await;
+                if successful {
+                    assert_eq!(result.unwrap().value, "second");
+                } else {
+                    assert_eq!(
+                        result
+                            .unwrap_err()
+                            .into_tool_error()
+                            .diagnostic()
+                            .context
+                            .effects,
+                        crate::tool::diagnostic::Effects::NotStarted
+                    );
+                }
+                assert!(!manager.is_current(&prepared).await);
+                let connection = Arc::downgrade(&prepared.connection);
+                drop(prepared);
+                assert!(
+                    connection.upgrade().is_none(),
+                    "no caller or pool owner may be needed to drain"
+                );
+
+                let closing = manager.shutdown();
+                tokio::pin!(closing);
+                assert!(
+                    futures_util::poll!(&mut closing).is_pending(),
+                    "session shutdown must await the accepted payload drain"
+                );
+                resume.send(()).unwrap();
+                drop(accepted);
+                closing.await;
+                assert_eq!(
+                    saved.test_bytes("/result/content").unwrap(),
+                    b"accepted after cancellation"
+                );
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn every_factory_uses_common_handshake_and_failed_slots_are_retryable() {
         let factory = Arc::new(RecordingFactory::default());
         factory.invalid.store(true, Ordering::SeqCst);
         let manager = manager(factory.clone());
         let cancellation = CancellationToken::new();
         let connect = || manager.connection(build_route(), Path::new("/build"), &cancellation);
+        let error = connect()
+            .await
+            .err()
+            .unwrap()
+            .into_tool_error()
+            .diagnostic();
+        assert_eq!(
+            error.context.operation,
+            crate::tool::diagnostic::Operation::Receive
+        );
+        assert_eq!(
+            error.context.site,
+            crate::tool::diagnostic::FailureSite::Host
+        );
+        assert_eq!(
+            error.context.effects,
+            crate::tool::diagnostic::Effects::NotStarted
+        );
         assert!(
-            matches!(connect().await, Err(RemoteError::Protocol(message)) if message == "invalid shim handshake")
+            matches!(error.cause, crate::tool::diagnostic::Cause::Message(message) if message.contains("invalid shim handshake"))
         );
         assert_eq!(factory.rejected_owners.load(Ordering::SeqCst), 1);
         assert!(manager.inner.pool.lock().await.is_empty());

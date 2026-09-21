@@ -82,7 +82,7 @@ impl PresentedOutput {
             Err(error) => crate::job::JobView::failure(
                 error.to_string(),
                 None,
-                None,
+                false,
                 crate::job::JobMetadata::default(),
             )
             .into_value(),

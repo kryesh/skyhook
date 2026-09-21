@@ -3,6 +3,7 @@
 pub(crate) mod authorization;
 mod coerce;
 mod context;
+pub mod diagnostic;
 pub(crate) use context::StreamEnd;
 pub mod executor;
 pub(crate) mod invocation;
@@ -13,7 +14,7 @@ pub mod builtins;
 pub mod javascript;
 pub mod policy;
 
-pub use context::{Denial, DenialCode, ToolContext, ToolError, ToolOutput};
+pub use context::{DenialCode, ToolContext, ToolError, ToolOutput};
 pub use invocation::AdmissionError;
 pub(crate) use registry::job_view_type;
 pub use registry::{

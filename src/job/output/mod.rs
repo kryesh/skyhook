@@ -17,7 +17,7 @@ use super::{JobError, JobManager, JobRole, JobState, OutputPresentation, views};
 use crate::{
     identity::JobId,
     session::{CaptureRow, SharedDb},
-    tool::{ToolError, policy::CapabilitySet},
+    tool::{ToolError, diagnostic::DiagnosticViewer, policy::CapabilitySet},
 };
 use base64::Engine as _;
 use schemars::JsonSchema;
@@ -70,6 +70,8 @@ pub(crate) struct Saved {
     /// Pointers the document references, in pointer order.
     fields: Vec<String>,
     captures: BTreeMap<String, CaptureRow>,
+    /// Capability-filtered slots must never reuse capability-independent render caches.
+    diagnostic_fields: BTreeSet<String>,
 }
 
 impl Saved {
@@ -85,10 +87,71 @@ impl Saved {
             output: output.clone(),
             document,
             fields,
+            diagnostic_fields: BTreeSet::new(),
             captures: captures
                 .into_iter()
                 .map(|capture| (capture.pointer.clone(), capture))
                 .collect(),
+        })
+    }
+
+    /// Replace only registered presentation-owned slots before selection or
+    /// paging. No inference from tool names or traversal of user error objects.
+    fn present_diagnostics(
+        &mut self,
+        diagnostic: Option<&crate::tool::diagnostic::Diagnostic>,
+        output_diagnostic: Option<&crate::tool::diagnostic::Diagnostic>,
+        viewer: DiagnosticViewer<'_>,
+    ) -> Result<(), ToolError> {
+        let Some(mut document) = self.document.take() else {
+            return Ok(());
+        };
+        for (field, diagnostic) in [
+            ("/error", diagnostic),
+            ("/result/error/message", output_diagnostic),
+        ] {
+            let Some(diagnostic) = diagnostic else {
+                continue;
+            };
+            // A producer can have offloaded a containing value. Hydrate only
+            // that ancestor before replacing its registered diagnostic slot.
+            let ancestor = self
+                .fields
+                .iter()
+                .find(|stored| {
+                    field == stored.as_str()
+                        || field
+                            .strip_prefix(stored.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+                .cloned();
+            if let Some(ancestor) = &ancestor {
+                hydrate_field(self, &mut document, ancestor)?;
+            }
+            if let Some(value) = document.pointer_mut(field) {
+                *value = Value::String(diagnostic.render_for(viewer));
+                self.diagnostic_fields.insert(field.to_owned());
+                if let Some(ancestor) = ancestor {
+                    self.fields.retain(|stored| stored != &ancestor);
+                }
+                self.captures.retain(|pointer, _| {
+                    pointer != field
+                        && !field
+                            .strip_prefix(pointer.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                });
+            }
+        }
+        self.document = Some(document);
+        Ok(())
+    }
+
+    fn cacheable(&self, field: &str) -> bool {
+        !self.diagnostic_fields.iter().any(|diagnostic| {
+            diagnostic == field
+                || diagnostic
+                    .strip_prefix(field)
+                    .is_some_and(|rest| rest.starts_with('/'))
         })
     }
 
@@ -542,12 +605,13 @@ impl JobManager {
 
     /// Return the state and presentation from the same job snapshot. Explicit
     /// field/page queries always retain full output, even under Automatic policy.
-    pub(crate) async fn present_output_with(
+    pub(crate) async fn present_output_with<'a>(
         &self,
         args: OutputArgs,
-        capabilities: &CapabilitySet,
+        viewer: impl Into<DiagnosticViewer<'a>>,
         options: OutputOptions,
     ) -> Result<PresentedOutput, ToolError> {
+        let viewer = viewer.into();
         let (acknowledge, presentation) = match options {
             OutputOptions::Host { presentation } => (false, presentation),
             OutputOptions::Model { presentation } => (true, presentation),
@@ -609,7 +673,7 @@ impl JobManager {
         };
         if last_message.is_some() {
             envelope.output = None;
-            let mut view = envelope.metadata_view(capabilities);
+            let mut view = envelope.metadata_view(viewer);
             view.meta.as_mut().expect("metadata view").last_message = last_message;
             if acknowledge {
                 self.claim(args.job)
@@ -627,13 +691,19 @@ impl JobManager {
         let question = envelope.state == JobState::WaitingInput;
         let live_question = envelope.output.take();
         let mut view = if !acknowledge || explicit || presentation == OutputPresentation::Full {
-            envelope.metadata_view(capabilities)
+            envelope.metadata_view(viewer)
         } else {
-            envelope.response_view(capabilities)
+            envelope.response_view(viewer)
         };
         let mut annotations = views::Presentation::default();
         let output = self.output(args.job);
-        let saved = blocking(move || Saved::load(&output).map(std::sync::Arc::new)).await?;
+        let mut saved = blocking(move || Saved::load(&output)).await?;
+        saved.present_diagnostics(
+            envelope.diagnostic.as_ref(),
+            envelope.output_diagnostic.as_ref(),
+            viewer,
+        )?;
+        let saved = std::sync::Arc::new(saved);
         let captures = captures::available_captures(&saved, terminal);
         let incomplete_capture = terminal
             && captures.iter().any(|capture| {
@@ -782,6 +852,15 @@ impl JobManager {
             } else {
                 None
             };
+            if let (Some(output), Some(diagnostic)) =
+                (&mut envelope.output, &envelope.output_diagnostic)
+            {
+                views::render_output_diagnostic(
+                    output,
+                    diagnostic,
+                    (&CapabilitySet::default()).into(),
+                );
+            }
         }
         Ok(())
     }
@@ -839,8 +918,8 @@ fn materialize_field(
             None => render(saved, field, value, &mut &mut *out, cancellation),
         }
     };
-    // Only a value enclosing stored fields can be large; render it to the
-    // database once rather than into memory on every page.
+    // Values enclosing stored fields need disk-backed rendering. Reuse a saved
+    // rendering only when its contents are independent of the reader.
     let encloses_stored = saved.fields.iter().any(|stored| {
         field.is_empty()
             || stored
@@ -849,14 +928,15 @@ fn materialize_field(
     });
     let db = &saved.output.db;
     let job = saved.output.job.get();
-    if encloses_stored {
+    if encloses_stored && saved.cacheable(field) {
         if let Some(capture) = db.rendering(job, field).map_err(database)? {
             return Ok(Source::Capture(reader::CaptureReader::new(
                 db.clone(),
                 capture,
             )));
         }
-        // A concurrent page may be rendering it; fall back to memory then.
+        // Cache reservations are optional: contention or an unavailable cache
+        // can still use private disk storage, without buffering the whole output.
         if let Ok(pending) = PendingCapture::rendering(&saved.output, field) {
             let mut writer = pending.open();
             write(&mut writer)?;
@@ -866,6 +946,15 @@ fn materialize_field(
                 capture,
             )));
         }
+    }
+    if encloses_stored {
+        // Capability-sensitive renderings must never be persisted under a shared
+        // field key. The anonymous file also disappears on errors or cancellation.
+        let mut writer = std::io::BufWriter::new(tempfile::tempfile()?);
+        write(&mut writer)?;
+        let mut file = writer.into_inner().map_err(|error| error.into_error())?;
+        std::io::Seek::rewind(&mut file)?;
+        return Ok(Source::Temporary(file));
     }
     let mut bytes = Vec::new();
     write(&mut bytes)?;
@@ -1129,12 +1218,8 @@ mod tests {
             for terminal in [false, true] {
                 if terminal {
                     let outcome = match outcome {
-                        "cancelled" => JobOutcome::Cancelled,
-                        "failed" => JobOutcome::Failed {
-                            message: "injected failure".into(),
-                            output: None,
-                            denial: None,
-                        },
+                        "cancelled" => ToolError::Cancelled.into(),
+                        "failed" => ToolError::Failed("injected failure".into()).into(),
                         _ => JobOutcome::Completed(crate::tool::ToolOutput::new(
                             json!({"abandoned":null}),
                         )),
@@ -1172,11 +1257,10 @@ mod tests {
             let outcome = match state {
                 JobState::Completed => JobOutcome::Completed(output.unwrap()),
                 JobState::Failed => JobOutcome::Failed {
-                    message: "failure".into(),
+                    diagnostic: ToolError::Failed("failure".into()).diagnostic(),
                     output,
-                    denial: None,
                 },
-                _ => JobOutcome::Cancelled,
+                _ => ToolError::Cancelled.into(),
             };
             let (_root, manager, id) = fixture(None).await;
             manager.finish(id, outcome).await.unwrap();
@@ -1214,7 +1298,10 @@ mod tests {
                 .len()
         };
         assert_eq!(lines(&model(&manager, query.clone()).await), 50);
-        manager.finish(id, JobOutcome::Cancelled).await.unwrap();
+        manager
+            .finish(id, ToolError::Cancelled.into())
+            .await
+            .unwrap();
         let view = model(&manager, OutputArgs::new(id)).await;
         assert!(view["result"].is_null());
         assert!(!view["has_result"].as_bool().unwrap());
@@ -1270,6 +1357,64 @@ mod tests {
             assert_eq!(page["lines"], json!([&expected[offset..next]]));
             args.start = Some(1);
             args.offset = Some(next);
+        }
+
+        // Root rendering must stay disk-backed even while another page owns the
+        // cache reservation. Its continuations must match the shared rendering.
+        let output = manager.output(id);
+        let mut saved = Saved::load(&output).unwrap();
+        let cancellation = super::super::CancellationToken::default();
+        let pending = PendingCapture::rendering(&output, "").unwrap();
+        let mut selection = Selection {
+            field: String::new(),
+            matcher: None,
+            context: 0,
+            start: 1,
+            offset: 0,
+        };
+        let mut pages = Vec::new();
+        for _ in 0..2 {
+            let mut source = field_source(&saved, "", &cancellation).unwrap().unwrap();
+            assert!(matches!(&source, Source::Temporary(_)));
+            // Projection reads a prefix before indexing, unlike explicit pages.
+            let mut first = [0];
+            source.read_exact(&mut first).unwrap();
+            assert_eq!(&first, b"{");
+            let page = reader::page(Some(source), &selection, 100, true, &cancellation).unwrap();
+            pages.push((selection.clone(), page.clone()));
+            selection.start = page.next_start.unwrap();
+            selection.offset = page.next_offset;
+        }
+        assert!(selection.offset > 0);
+        drop(pending);
+        for (selection, expected) in pages {
+            let source = field_source(&saved, "", &cancellation).unwrap().unwrap();
+            assert!(matches!(&source, Source::Capture(_)));
+            assert_eq!(
+                reader::page(Some(source), &selection, 100, true, &cancellation).unwrap(),
+                expected
+            );
+        }
+
+        // Presented diagnostics bypass even a finished shared rendering. Keep
+        // paging/privacy coverage here without loading a whole rendered document.
+        saved.diagnostic_fields.insert("/error".into());
+        selection.start = 1;
+        selection.offset = 0;
+        selection.matcher = Some(std::sync::Arc::new(
+            crate::tool::builtins::search::output_matcher("viewer-rendering").unwrap(),
+        ));
+        for message in [
+            "privileged viewer-rendering",
+            "restricted viewer-rendering",
+            "privileged viewer-rendering",
+        ] {
+            saved.document.as_mut().unwrap()["error"] = json!(message);
+            let source = field_source(&saved, "", &cancellation).unwrap().unwrap();
+            assert!(matches!(&source, Source::Temporary(_)));
+            let page = reader::page(Some(source), &selection, 100, true, &cancellation).unwrap();
+            assert_eq!(page.lines.len(), 1);
+            assert!(page.lines[0].contains(message));
         }
     }
 

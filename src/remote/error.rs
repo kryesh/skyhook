@@ -2,8 +2,13 @@
 use crate::{
     remote::ArtifactError,
     target::TargetError,
-    tool::{ToolError, ToolOutput, authorization::AuthorizationError},
+    tool::{
+        ToolError, ToolOutput,
+        authorization::AuthorizationError,
+        diagnostic::{Cause, Diagnostic, DiagnosticContext},
+    },
 };
+use std::{io, sync::Arc};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Error)]
@@ -12,11 +17,10 @@ pub enum RemoteError {
     Target(#[from] TargetError),
     #[error(transparent)]
     Artifact(#[from] ArtifactError),
-    #[error("could not start transport process: {message}")]
-    Start {
-        kind: std::io::ErrorKind,
-        message: String,
-    },
+    #[error(transparent)]
+    Session(std::sync::Arc<crate::session::SessionError>),
+    #[error("could not start transport process: {source}")]
+    Start { source: Arc<io::Error> },
     #[error("target connection was denied: {0}")]
     ApprovalDenied(String),
     #[error("target connection returned an invalid approval grant: {0}")]
@@ -33,25 +37,33 @@ pub enum RemoteError {
     Deployment(String),
     #[error("remote protocol failed: {0}")]
     Protocol(String),
-    #[error("remote operation denied: {0}")]
-    OperationDenied(String),
-    #[error("remote tool failed: {message}")]
+    #[error("{}", diagnostic.render(&Default::default()))]
     Remote {
-        message: String,
+        diagnostic: Box<Diagnostic>,
         output: Option<Box<ToolOutput>>,
     },
     #[error("target route is empty")]
     EmptyRoute,
-    #[error("{message}")]
-    Io {
-        kind: std::io::ErrorKind,
-        message: String,
-    },
+    #[error("{source}")]
+    Io { source: Arc<io::Error> },
     #[error("{0}")]
     Json(String),
 }
 
 impl RemoteError {
+    /// Fill missing boundary facts without replacing those the source selected.
+    #[must_use]
+    pub(crate) fn fallback_context(self, context: DiagnosticContext) -> Self {
+        let (diagnostic, output) = self
+            .into_tool_error()
+            .fallback_context(context)
+            .into_parts();
+        Self::Remote {
+            diagnostic: Box::new(diagnostic),
+            output: output.map(Box::new),
+        }
+    }
+
     pub(crate) fn authorization(error: AuthorizationError) -> Self {
         match error {
             AuthorizationError::Denied(reason) => Self::ApprovalDenied(reason),
@@ -61,39 +73,37 @@ impl RemoteError {
         }
     }
 
-    pub(crate) fn start(error: std::io::Error) -> Self {
+    pub(crate) fn start(error: io::Error) -> Self {
         Self::Start {
-            kind: error.kind(),
-            message: error.to_string(),
+            source: Arc::new(error),
         }
     }
 
-    pub(super) fn io(error: std::io::Error) -> Self {
+    pub(super) fn io(error: io::Error) -> Self {
         Self::Io {
-            kind: error.kind(),
-            message: error.to_string(),
+            source: Arc::new(error),
         }
     }
 
     #[must_use]
     pub fn into_tool_error(self) -> ToolError {
         match self {
-            Self::OperationDenied(reason) => ToolError::Denied(reason),
-            Self::Remote {
-                message,
-                output: Some(output),
-            } => ToolError::with_output(message, *output),
-            Self::Remote {
-                message,
-                output: None,
-            } => ToolError::Failed(message),
+            Self::Target(error) => error.into_admission_error().into(),
+            Self::ApprovalDenied(reason) => ToolError::Denied(reason),
+            Self::Cancelled => ToolError::Cancelled,
+            Self::Session(source) => ToolError::from(source),
+            Self::Remote { diagnostic, output } => ToolError::from_diagnostic(*diagnostic, output),
+            Self::Start { source } | Self::Io { source } => ToolError::from_diagnostic(
+                Diagnostic::new(DiagnosticContext::default(), Cause::io(&source)),
+                None,
+            ),
             error => ToolError::Failed(error.to_string()),
         }
     }
 }
 
-impl From<std::io::Error> for RemoteError {
-    fn from(error: std::io::Error) -> Self {
+impl From<io::Error> for RemoteError {
+    fn from(error: io::Error) -> Self {
         Self::io(error)
     }
 }
@@ -101,5 +111,26 @@ impl From<std::io::Error> for RemoteError {
 impl From<serde_json::Error> for RemoteError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_io_cause_survives_remote_error_conversion() {
+        for boundary in [RemoteError::start, RemoteError::io] {
+            for error in [
+                io::Error::from_raw_os_error(libc::ENOENT),
+                io::Error::new(io::ErrorKind::PermissionDenied, "transport denied"),
+            ] {
+                let expected = Cause::io(&error);
+                assert_eq!(
+                    boundary(error).into_tool_error().diagnostic().cause,
+                    expected
+                );
+            }
+        }
     }
 }

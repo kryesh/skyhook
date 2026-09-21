@@ -10,6 +10,8 @@ use std::{error::Error, fmt, io};
 use schemars::JsonSchema;
 use serde::Serialize;
 
+use crate::tool::diagnostic::{Cause, IoKind};
+
 use super::LocalError;
 
 /// The operation which was in progress, not a guess at a transport substage.
@@ -52,41 +54,13 @@ pub(super) enum FetchErrorKind {
     Unknown,
 }
 
-/// A bounded, version-independent vocabulary rather than `ErrorKind`'s Debug text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum FetchIoKind {
-    NotFound,
-    PermissionDenied,
-    ConnectionRefused,
-    ConnectionReset,
-    ConnectionAborted,
-    NotConnected,
-    HostUnreachable,
-    NetworkUnreachable,
-    NetworkDown,
-    AddressInUse,
-    AddressNotAvailable,
-    BrokenPipe,
-    TimedOut,
-    UnexpectedEof,
-    Interrupted,
-    WouldBlock,
-    InvalidInput,
-    InvalidData,
-    WriteZero,
-    Unsupported,
-    OutOfMemory,
-    Other,
-}
-
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub(super) struct FetchOsError {
     /// OS on the execution target; numeric codes are not portable across OSes.
     platform: String,
     code: Option<i32>,
     #[schemars(with = "String")]
-    kind: FetchIoKind,
+    kind: IoKind,
 }
 
 /// Safe text is a closed vocabulary, never a caller-provided string or an error display.
@@ -95,6 +69,7 @@ pub(super) enum DiagnosticMessage {
     Standard,
     ResponseExceedsMaxBytes,
     TextExtractionUnsupported,
+    Extraction(super::fetch_text::ExtractionFailure),
     MaximumRedirectsExceeded,
     InvalidRedirectLocationHeader,
     InvalidRedirectUrl,
@@ -115,6 +90,32 @@ impl DiagnosticMessage {
             Self::ResponseExceedsMaxBytes => "response exceeds max_bytes",
             Self::TextExtractionUnsupported => {
                 "text extraction is unsupported for this binary content type"
+            }
+            Self::Extraction(reason) => {
+                use super::fetch_text::ExtractionFailure;
+                match reason {
+                    ExtractionFailure::RawSizeLimit => {
+                        "HTML exceeds the 10 MiB extraction input limit; use text:false to retrieve the response without extraction."
+                    }
+                    ExtractionFailure::DecodedSizeLimit => {
+                        "Decoded HTML exceeds the 10 MiB extraction limit; use text:false to retrieve the response without extraction."
+                    }
+                    ExtractionFailure::ElementLimit => {
+                        "HTML exceeds the 50,000-element extraction limit; use text:false to retrieve the response without extraction."
+                    }
+                    ExtractionFailure::Parser => {
+                        "The HTML parser could not extract an article; use text:false to retrieve the original response."
+                    }
+                    ExtractionFailure::Empty => {
+                        "HTML extraction produced no readable text; use text:false to retrieve the original response."
+                    }
+                    ExtractionFailure::WorkerUnavailable => {
+                        "The HTML extraction worker is unavailable; retry or use text:false to retrieve the response without extraction."
+                    }
+                    ExtractionFailure::WorkerFailed => {
+                        "The HTML extraction worker did not complete; retry or use text:false to retrieve the response without extraction."
+                    }
+                }
             }
             Self::MaximumRedirectsExceeded => "maximum redirects exceeded",
             Self::InvalidRedirectLocationHeader => "invalid redirect location header",
@@ -178,6 +179,10 @@ impl FetchDiagnostic {
             timeout: Some(TimeoutAttribution::Total { limit_ms }),
             ..Self::new(phase, FetchErrorKind::Timeout)
         }
+    }
+
+    pub fn phase(&self) -> FetchPhase {
+        self.phase
     }
 
     pub fn message(&self) -> &'static str {
@@ -267,8 +272,8 @@ impl FetchDiagnostic {
 }
 
 /// Fetch-local errors preserve typed diagnostics until progress performs the single
-/// tool-output projection. Generic errors are admitted only at named legacy/permission
-/// boundaries; arbitrary output payloads and error displays never become evidence.
+/// tool-output projection. Generic errors are admitted only at named local-I/O,
+/// validation and permission boundaries; arbitrary output and displays are not evidence.
 #[derive(Debug)]
 pub(super) enum FetchError {
     Diagnostic(FetchDiagnostic),
@@ -284,22 +289,42 @@ impl From<FetchDiagnostic> for FetchError {
 }
 
 impl FetchError {
-    /// Explicit admission for authorization, validation and the legacy fetch_text
-    /// API. Never inspect diagnostic JSON, preserve arbitrary outputs, or copy display text.
+    /// Admit only typed evidence at permission/validation boundaries. Existing
+    /// generic payloads and error displays are never accepted as fetch evidence.
     pub fn from_tool_error(error: LocalError, phase: FetchPhase) -> Self {
-        match error {
-            LocalError::Io(error) => FetchDiagnostic::from_io(&error, phase).into(),
-            LocalError::Failed(_) | LocalError::FailedWithOutput { .. } | LocalError::Json(_) => {
+        // Inspect native sources before normalization discards the wrapped evidence.
+        if let LocalError::Io(error) = error {
+            return FetchDiagnostic::from_io(&error, phase).into();
+        }
+        // General tool output is not authoritative HTTP response evidence.
+        let (diagnostic, _) = error.into_parts();
+        match diagnostic.cause {
+            Cause::Io { kind, code, .. } => {
+                let error_kind = if kind == IoKind::TimedOut {
+                    FetchErrorKind::Timeout
+                } else {
+                    transport_kind(kind).unwrap_or_else(|| fallback(phase))
+                };
+                FetchDiagnostic {
+                    os_error: Some(FetchOsError {
+                        platform: std::env::consts::OS.into(),
+                        code,
+                        kind,
+                    }),
+                    ..FetchDiagnostic::new(phase, error_kind)
+                }
+                .into()
+            }
+            Cause::Message(_) | Cause::Json => {
                 Self::Diagnostic(FetchDiagnostic::new(phase, fallback(phase)))
             }
-            LocalError::Cancelled
-            | LocalError::Interrupted
-            | LocalError::Denied(_)
-            | LocalError::InvalidArguments(_)
-            | LocalError::ArgumentsMustBeObject
-            | LocalError::InvalidBackground
-            | LocalError::BackgroundUnsupported(_)
-            | LocalError::InputClosed => Self::Passthrough(error),
+            Cause::Cancelled
+            | Cause::Interrupted
+            | Cause::Denied(_)
+            | Cause::InvalidArguments(_)
+            | Cause::InputClosed => {
+                Self::Passthrough(LocalError::from_diagnostic(diagnostic, None))
+            }
         }
     }
 
@@ -480,9 +505,9 @@ impl Evidence {
             }
             evidence.tls |= error.is::<rustls::Error>();
             if let Some(error) = error.downcast_ref::<io::Error>() {
-                let kind = io_kind(error.kind());
-                evidence.timed_out |= kind == FetchIoKind::TimedOut;
-                evidence.unexpected_eof |= kind == FetchIoKind::UnexpectedEof;
+                let kind = IoKind::from(error.kind());
+                evidence.timed_out |= kind == IoKind::TimedOut;
+                evidence.unexpected_eof |= kind == IoKind::UnexpectedEof;
                 if let Some(cause) = transport_kind(kind) {
                     evidence.transport_kind = Some(cause);
                 }
@@ -514,40 +539,13 @@ impl Evidence {
     }
 }
 
-fn transport_kind(kind: FetchIoKind) -> Option<FetchErrorKind> {
+fn transport_kind(kind: IoKind) -> Option<FetchErrorKind> {
     match kind {
-        FetchIoKind::ConnectionRefused => Some(FetchErrorKind::ConnectionRefused),
-        FetchIoKind::HostUnreachable => Some(FetchErrorKind::HostUnreachable),
-        FetchIoKind::NetworkUnreachable => Some(FetchErrorKind::NetworkUnreachable),
-        FetchIoKind::ConnectionReset => Some(FetchErrorKind::ConnectionReset),
+        IoKind::ConnectionRefused => Some(FetchErrorKind::ConnectionRefused),
+        IoKind::HostUnreachable => Some(FetchErrorKind::HostUnreachable),
+        IoKind::NetworkUnreachable => Some(FetchErrorKind::NetworkUnreachable),
+        IoKind::ConnectionReset => Some(FetchErrorKind::ConnectionReset),
         _ => None,
-    }
-}
-
-fn io_kind(kind: io::ErrorKind) -> FetchIoKind {
-    match kind {
-        io::ErrorKind::NotFound => FetchIoKind::NotFound,
-        io::ErrorKind::PermissionDenied => FetchIoKind::PermissionDenied,
-        io::ErrorKind::ConnectionRefused => FetchIoKind::ConnectionRefused,
-        io::ErrorKind::ConnectionReset => FetchIoKind::ConnectionReset,
-        io::ErrorKind::ConnectionAborted => FetchIoKind::ConnectionAborted,
-        io::ErrorKind::NotConnected => FetchIoKind::NotConnected,
-        io::ErrorKind::HostUnreachable => FetchIoKind::HostUnreachable,
-        io::ErrorKind::NetworkUnreachable => FetchIoKind::NetworkUnreachable,
-        io::ErrorKind::NetworkDown => FetchIoKind::NetworkDown,
-        io::ErrorKind::AddrInUse => FetchIoKind::AddressInUse,
-        io::ErrorKind::AddrNotAvailable => FetchIoKind::AddressNotAvailable,
-        io::ErrorKind::BrokenPipe => FetchIoKind::BrokenPipe,
-        io::ErrorKind::TimedOut => FetchIoKind::TimedOut,
-        io::ErrorKind::UnexpectedEof => FetchIoKind::UnexpectedEof,
-        io::ErrorKind::Interrupted => FetchIoKind::Interrupted,
-        io::ErrorKind::WouldBlock => FetchIoKind::WouldBlock,
-        io::ErrorKind::InvalidInput => FetchIoKind::InvalidInput,
-        io::ErrorKind::InvalidData => FetchIoKind::InvalidData,
-        io::ErrorKind::WriteZero => FetchIoKind::WriteZero,
-        io::ErrorKind::Unsupported => FetchIoKind::Unsupported,
-        io::ErrorKind::OutOfMemory => FetchIoKind::OutOfMemory,
-        _ => FetchIoKind::Other,
     }
 }
 
@@ -555,6 +553,33 @@ fn io_kind(kind: io::ErrorKind) -> FetchIoKind {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn normalized_io_classifies_by_typed_kind_and_keeps_the_os_code() {
+        use crate::tool::diagnostic::{Diagnostic, DiagnosticContext};
+
+        for (kind, expected) in [
+            (IoKind::TimedOut, FetchErrorKind::Timeout),
+            (IoKind::ConnectionReset, FetchErrorKind::ConnectionReset),
+            (IoKind::InvalidInput, FetchErrorKind::ResponseBodyFailure),
+        ] {
+            let cause = Cause::Io {
+                kind,
+                code: Some(12345),
+                detail: None,
+            };
+            let error = LocalError::from_diagnostic(
+                Diagnostic::new(DiagnosticContext::default(), cause),
+                None,
+            );
+            let admitted = FetchError::from_tool_error(error, FetchPhase::ResponseBody)
+                .into_diagnostic()
+                .unwrap();
+            assert_eq!(admitted.error_kind, expected);
+            assert_eq!(admitted.os_error.as_ref().unwrap().kind, kind);
+            assert_eq!(admitted.os_code(), Some((std::env::consts::OS, 12345)));
+        }
+    }
 
     #[test]
     fn timeout_attribution_is_coherent_and_enrichment_is_evidence_limited() {
@@ -605,7 +630,7 @@ mod tests {
         let os_error = FetchOsError {
             platform: "test".into(),
             code: None,
-            kind: FetchIoKind::Other,
+            kind: IoKind::Other,
         };
         assert_eq!(serde_json::to_value(os_error).unwrap()["code"], json!(null));
         let connect = TimeoutAttribution::Connect { limit_ms: None };
@@ -648,23 +673,51 @@ mod tests {
                 "Establishing the proxy connection timed out.",
             ),
         ] {
-            let diagnostic = FetchDiagnostic::from_io(&error, phase);
-            assert_eq!(
-                (diagnostic.phase, diagnostic.error_kind),
-                (expected_phase, kind)
-            );
-            assert_eq!(diagnostic.message(), message);
-            let value = serde_json::to_value(diagnostic).unwrap();
-            assert!(!value.to_string().contains("secret"));
-            let timeout = if kind == Kind::Timeout {
-                json!({"kind":"unknown"})
-            } else {
-                serde_json::Value::Null
-            };
-            assert_eq!(value["timeout"], timeout);
+            for diagnostic in [
+                FetchDiagnostic::from_io(&error, phase),
+                FetchError::from_tool_error(LocalError::Io(error), phase)
+                    .into_diagnostic()
+                    .unwrap(),
+            ] {
+                assert_eq!(
+                    (diagnostic.phase, diagnostic.error_kind),
+                    (expected_phase, kind)
+                );
+                assert_eq!(diagnostic.message(), message);
+                let value = serde_json::to_value(diagnostic).unwrap();
+                assert!(!value.to_string().contains("secret"));
+                let timeout = if kind == Kind::Timeout {
+                    json!({"kind":"unknown"})
+                } else {
+                    serde_json::Value::Null
+                };
+                assert_eq!(value["timeout"], timeout);
+            }
         }
-        let os = io::Error::other(io::Error::from_raw_os_error(12345));
-        let diagnostic = FetchDiagnostic::from_io(&os, FetchPhase::LocalIo);
-        assert_eq!(diagnostic.os_code(), Some((std::env::consts::OS, 12345)));
+        for (code, kind) in [
+            (12345, Kind::LocalIo),
+            #[cfg(unix)]
+            (libc::ECONNRESET, Kind::ConnectionReset),
+        ] {
+            let os = io::Error::other(io::Error::from_raw_os_error(code));
+            for diagnostic in [
+                FetchDiagnostic::from_io(&os, Phase::LocalIo),
+                FetchError::from_tool_error(LocalError::Io(os), Phase::LocalIo)
+                    .into_diagnostic()
+                    .unwrap(),
+            ] {
+                assert_eq!(
+                    (diagnostic.phase, diagnostic.error_kind),
+                    (Phase::LocalIo, kind)
+                );
+                assert_eq!(diagnostic.os_code(), Some((std::env::consts::OS, code)));
+                if kind == Kind::ConnectionReset {
+                    assert_eq!(
+                        diagnostic.os_error.as_ref().unwrap().kind,
+                        IoKind::ConnectionReset
+                    );
+                }
+            }
+        }
     }
 }

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use libsql::Value;
 use serde::Serialize;
 
-use super::{Db, DbResult, corrupt, params, rejected};
+use super::{Db, DbResult, corrupt, diagnostic::Slot, params, rejected};
 use crate::{
     identity::AgentId,
     media::{AttachmentRef, BlobRef, ImageRef},
@@ -35,12 +35,12 @@ fn digest(value: &impl Serialize) -> DbResult<Vec<u8>> {
 }
 
 #[cfg(unix)]
-fn path_bytes(path: &std::path::Path) -> Vec<u8> {
+pub(super) fn path_bytes(path: &std::path::Path) -> Vec<u8> {
     std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()).to_vec()
 }
 
 #[cfg(not(unix))]
-fn path_bytes(path: &std::path::Path) -> Vec<u8> {
+pub(super) fn path_bytes(path: &std::path::Path) -> Vec<u8> {
     path.to_string_lossy().into_owned().into_bytes()
 }
 
@@ -453,9 +453,9 @@ impl Encoder {
             SessionEvent::JobFinished {
                 job,
                 state,
-                error,
+                diagnostic,
+                output_diagnostic,
                 images,
-                denial,
             } => {
                 // Retained jobs reopen after a running reset; only an interrupted
                 // outcome may be followed directly by cancellation.
@@ -477,22 +477,18 @@ impl Encoder {
                         )));
                     }
                 }
-                let (code, executed) = match denial {
-                    Some(denial) => (Some(variant(&denial.code)?), Some(denial.executed)),
-                    None => (None, None),
-                };
                 db.execute(
-                    "INSERT INTO job_finish (entry, job, state, error, denial_code, \
-                     denial_executed) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        seq,
-                        job.get(),
-                        variant(state)?,
-                        error.clone(),
-                        code,
-                        executed
-                    ],
+                    "INSERT INTO job_finish (entry, job, state) VALUES (?1, ?2, ?3)",
+                    params![seq, job.get(), variant(state)?],
                 )?;
+                for (slot, diagnostic) in [
+                    (Slot::Diagnostic, diagnostic),
+                    (Slot::OutputDiagnostic, output_diagnostic),
+                ] {
+                    if let Some(diagnostic) = diagnostic {
+                        self.diagnostic(db, seq, slot, diagnostic)?;
+                    }
+                }
                 for (position, image) in images.iter().enumerate() {
                     image_row(db, "job_finish_image", "finish", seq, position, image)?;
                 }
@@ -557,7 +553,7 @@ impl Encoder {
         Ok(())
     }
 
-    fn target(&self, db: &Db, name: &str) -> DbResult<i64> {
+    pub(super) fn target(&self, db: &Db, name: &str) -> DbResult<i64> {
         db.execute(
             "INSERT INTO target (name) VALUES (?1) ON CONFLICT (name) DO NOTHING",
             params![name],
@@ -1298,16 +1294,16 @@ mod tests {
         one!(SessionEvent::JobFinished {
             job,
             state: JobState::Interrupted,
-            error: Some("stopped".into()),
+            diagnostic: None,
+            output_diagnostic: None,
             images: vec![png.clone()],
-            denial: Some(crate::tool::Denial::permission_denied()),
         });
         one!(SessionEvent::JobFinished {
             job,
             state: JobState::Cancelled,
-            error: None,
+            diagnostic: None,
+            output_diagnostic: None,
             images: Vec::new(),
-            denial: None,
         });
         let resource = crate::tool::policy::ResourceId::mcp("server", "tool");
         let grant = one!(SessionEvent::ApprovalGranted {

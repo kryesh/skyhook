@@ -9,7 +9,10 @@ use tokio::sync::Mutex;
 use crate::{
     identity::{AgentId, JobId},
     session::{CompactionCheckpoint, EventRecord, SessionError, SessionEvent, SessionStore},
-    tool::ToolError,
+    tool::{
+        ToolError,
+        diagnostic::{Effects, Operation, Subject},
+    },
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -107,10 +110,15 @@ impl TodoStore {
     }
 
     pub fn validate(items: &[TodoItem]) -> Result<(), ToolError> {
-        if items.iter().any(|item| item.text.trim().is_empty()) {
-            return Err(ToolError::InvalidArguments(
-                "todo text cannot be blank".to_owned(),
-            ));
+        if let Some(index) = items.iter().position(|item| item.text.trim().is_empty()) {
+            return Err(
+                ToolError::InvalidArguments("todo text cannot be blank".to_owned())
+                    .operation(
+                        Operation::Validate,
+                        Subject::Label(format!("todo item at index {index}")),
+                    )
+                    .effects(Effects::NotStarted),
+            );
         }
         Ok(())
     }
@@ -176,6 +184,8 @@ impl TodoStore {
                     ToolError::InvalidArguments(
                         "job does not identify an initialized child agent".to_owned(),
                     )
+                    .operation(Operation::Lookup, Subject::Job(job))
+                    .effects(Effects::Unchanged)
                 })?;
             if agent.session() != caller.session()
                 || agent.depth() <= caller.depth()
@@ -183,7 +193,9 @@ impl TodoStore {
             {
                 return Err(ToolError::InvalidArguments(
                     "todo inspection is limited to descendants".to_owned(),
-                ));
+                )
+                .operation(Operation::Inspect, Subject::Job(job))
+                .effects(Effects::Unchanged));
             }
             agent
         } else {
@@ -195,5 +207,42 @@ impl TodoStore {
                 .get(agent)
                 .map_or_else(Vec::new, |state| state.items.clone()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejections_identify_the_blank_item_and_the_rejected_job() {
+        let item = |text: &str| TodoItem {
+            text: text.into(),
+            status: TodoStatus::Pending,
+        };
+        let blank = TodoStore::validate(&[item("task"), item("  ")]).unwrap_err();
+        assert_eq!(
+            blank.diagnostic().context.subject,
+            Subject::Label("todo item at index 1".into())
+        );
+
+        let fixture = crate::session::fixture::MemorySession::new().await;
+        let todos = TodoStore::restore(fixture.store, &[]);
+        let job = JobId::new(17).unwrap();
+        let missing = todos.inspect(&fixture.agent, Some(job)).await.unwrap_err();
+        todos
+            .register(fixture.agent.child(1), Some(job), None)
+            .await
+            .unwrap();
+        let sibling = fixture.agent.child(2);
+        let forbidden = todos.inspect(&sibling, Some(job)).await.unwrap_err();
+        for (error, operation) in [
+            (missing, Operation::Lookup),
+            (forbidden, Operation::Inspect),
+        ] {
+            let context = error.diagnostic().context;
+            assert_eq!(context.operation, operation);
+            assert_eq!(context.subject, Subject::Job(job));
+        }
     }
 }

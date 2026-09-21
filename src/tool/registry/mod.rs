@@ -36,11 +36,15 @@ pub(crate) type AdmittedInvocation = Invocation<ToolContext, ToolOutput>;
 
 pub trait OutputValue: std::fmt::Debug + Send + 'static {
     fn from_value(value: Value) -> Self;
+    fn with_diagnostic(self, diagnostic: super::diagnostic::Diagnostic) -> Self;
 }
 
 impl OutputValue for ToolOutput {
     fn from_value(value: Value) -> Self {
         Self::new(value)
+    }
+    fn with_diagnostic(self, diagnostic: super::diagnostic::Diagnostic) -> Self {
+        self.with_diagnostic(diagnostic)
     }
 }
 
@@ -295,7 +299,7 @@ struct ToolExecution {
     placement: ToolPlacement,
     permission_resource: Option<ResourceId>,
     path_arguments: Vec<PathArgument>,
-    read_error_output: Option<fn(&str, &std::io::Error) -> Option<Value>>,
+    read_error_output: Option<fn(&str, &super::diagnostic::Diagnostic) -> Option<Value>>,
     target_authentication: bool,
     validator: Option<ArgumentValidator>,
     permissions: Option<ArgumentPermissions>,
@@ -312,7 +316,7 @@ impl ToolOptions {
     /// Built-in read only: expected OS read failures are successful structured results.
     pub(crate) fn read_error_output(
         mut self,
-        convert: fn(&str, &std::io::Error) -> Option<Value>,
+        convert: fn(&str, &super::diagnostic::Diagnostic) -> Option<Value>,
     ) -> Self {
         self.execution.read_error_output = Some(convert);
         self
@@ -602,17 +606,29 @@ impl<C: Send + 'static, O: OutputValue> CatalogEntry<C, O> {
 
     pub async fn call(&self, context: C, arguments: Value) -> Result<O, OperationError<O>> {
         self.validate_arguments(&arguments)?;
-        self.admit(arguments)?.call(context).await
+        self.admit(arguments.clone(), &arguments)?
+            .call(context)
+            .await
     }
 
     /// Admit handler input before allocating a job or requesting approval.
     /// Native-path consumers retain wire spelling before IO; other consumers
-    /// retain path-rewritten input. Neither reconstructs the typed value later.
-    pub(crate) fn admit(&self, arguments: Value) -> Result<Invocation<C, O>, AdmissionError> {
-        // The declared path argument, in its wire spelling, names the failed read.
-        let read_path = self.execution.read_error_output.and_then(|convert| {
-            let spec = self.execution.path_arguments.first()?;
-            let path = spec.input(&arguments).ok().flatten()?.to_owned();
+    /// retain path-rewritten input. Expected read errors retain the requested path
+    /// separately so authorization rewrites cannot change their result path.
+    pub(crate) fn admit(
+        &self,
+        arguments: Value,
+        requested_arguments: &Value,
+    ) -> Result<Invocation<C, O>, AdmissionError> {
+        let convert = self.execution.read_error_output.and_then(|convert| {
+            let path = self
+                .execution
+                .path_arguments
+                .first()?
+                .input(requested_arguments)
+                .ok()
+                .flatten()?
+                .to_owned();
             Some((path, convert))
         });
         let admitted = (self.admit)(arguments)?;
@@ -620,11 +636,15 @@ impl<C: Send + 'static, O: OutputValue> CatalogEntry<C, O> {
             Box::pin(async move {
                 match admitted.call(context).await {
                     Err(error) => {
-                        match read_path.and_then(|(path, convert)| match &error {
-                            OperationError::Io(error) => convert(&path, error),
-                            _ => None,
-                        }) {
-                            Some(output) => Ok(O::from_value(output)),
+                        let diagnostic = error.diagnostic();
+                        let output = convert.and_then(|(path, convert)| {
+                            error
+                                .is_source_filesystem_io()
+                                .then(|| convert(&path, &diagnostic))
+                                .flatten()
+                        });
+                        match output {
+                            Some(output) => Ok(O::from_value(output).with_diagnostic(diagnostic)),
                             None => Err(error),
                         }
                     }
@@ -665,11 +685,14 @@ impl<C: Send + 'static, O: OutputValue> CatalogEntry<C, O> {
         self.execution.placement
     }
 
-    pub(crate) fn read_error_output(&self, path: &str, error: &AdmissionError) -> Option<Value> {
-        match error {
-            AdmissionError::Io(error) => self.execution.read_error_output?(path, error),
-            _ => None,
-        }
+    /// Convert an error at a known source-filesystem boundary, such as path
+    /// preflight. Handler failures must first establish their source provenance.
+    pub(crate) fn read_error_output(
+        &self,
+        path: &str,
+        diagnostic: &super::diagnostic::Diagnostic,
+    ) -> Option<Value> {
+        self.execution.read_error_output?(path, diagnostic)
     }
 
     pub(crate) fn path_arguments(
@@ -1040,7 +1063,7 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         .map_err(|error| RegistryError::Schema(error.to_string()))?;
         let handler = Arc::new(handler);
         self.register_admission(name, description, input_schema, options, move |arguments| {
-            let input = serde_json::from_value::<I>(arguments).map_err(AdmissionError::invalid)?;
+            let input = super::diagnostic::deserialize_arguments::<I>(arguments)?;
             let handler = handler.clone();
             Ok(Invocation(Box::new(move |context| {
                 Box::pin(handler(context, input))
@@ -1213,10 +1236,64 @@ mod admission_tests {
     use crate::job::{JobOutcome, JobSpec, output};
     use std::io::Write as _;
 
+    #[derive(serde::Deserialize, JsonSchema)]
+    struct Empty {}
+
+    #[tokio::test]
+    async fn completed_read_errors_require_source_provenance_and_registered_policy() {
+        use crate::tool::diagnostic::{Operation, Subject};
+        use serde_json::json;
+
+        for (opt_in, source) in [(true, true), (true, false), (false, true)] {
+            let mut options =
+                ToolOptions::default().path_argument("path", PathAccess::Read, PathKind::Existing);
+            if opt_in {
+                options =
+                    options.read_error_output(|path, _| Some(json!({"kind":"error", "path":path})));
+            }
+            let mut builder = CatalogBuilder::<(), ToolOutput>::default();
+            builder
+                .register_dynamic(
+                    "read",
+                    "read policy fixture",
+                    json!({"type":"object", "properties":{"path":{"type":"string"}}}),
+                    options,
+                    move |_, _| async move {
+                        // Labels describe failures; only source provenance and opt-in
+                        // authorize completed read errors, not the tool name or operation.
+                        Err(if source {
+                            ToolError::source_filesystem_io(
+                                std::io::ErrorKind::PermissionDenied.into(),
+                            )
+                            .operation(Operation::StoreImage, Subject::Label("source".into()))
+                        } else {
+                            ToolError::Io(std::io::ErrorKind::PermissionDenied.into())
+                                .operation(Operation::Read, Subject::path("source"))
+                        })
+                    },
+                )
+                .unwrap();
+            let registry = builder.build();
+            let result = registry
+                .get("read")
+                .unwrap()
+                .admit(
+                    json!({"path":"/resolved/source"}),
+                    &json!({"path":"requested"}),
+                )
+                .unwrap()
+                .call(())
+                .await;
+            assert_eq!(result.is_ok(), opt_in && source);
+            if let Ok(output) = result {
+                assert_eq!(output.value, json!({"kind":"error", "path":"requested"}));
+                assert!(output.diagnostic.is_some());
+            }
+        }
+    }
+
     #[test]
     fn javascript_job_namespace_is_reserved_but_unwrap_is_an_ordinary_tool_name() {
-        #[derive(serde::Deserialize, JsonSchema)]
-        struct Empty {}
         let mut builder = ToolRegistryBuilder::default();
         let registered = builder.register::<Empty, Value, _, _>(
             "job",
@@ -1271,14 +1348,7 @@ mod admission_tests {
                 "contracts",
                 "serde contracts",
                 ToolOptions::default(),
-                |_, _| async {
-                    Ok(Output {
-                        emitted: None,
-                        defaulted: false,
-                        skipped: None,
-                        choice: Choice::Empty,
-                    })
-                },
+                |_, _| async { unreachable!("schema-only fixture") },
             )
             .unwrap();
         let spec = builder
@@ -1373,11 +1443,11 @@ mod admission_tests {
         assert_eq!(captures.len(), 1);
         assert!(captures[0].matches(job, "/result/content"));
         assert!(output.take_captures().is_empty());
-        lease.fail(JobOutcome::Cancelled).await;
+        lease.fail(ToolError::Cancelled.into()).await;
     }
 
-    #[tokio::test]
-    async fn conditional_nested_inputs_follow_capabilities_and_must_name_objects() {
+    #[test]
+    fn conditional_nested_inputs_follow_capabilities_and_must_name_objects() {
         #[derive(serde::Deserialize, JsonSchema)]
         struct Inner {
             #[serde(rename = "value")]
@@ -1388,7 +1458,6 @@ mod admission_tests {
             #[serde(rename = "inner")]
             _inner: Inner,
         }
-        let runtime = crate::tests::TestRuntime::new().await;
         let options = |pointer: &str| {
             let extra = serde_json::json!({"type": "boolean"});
             ToolOptions::default().conditional_nested_input(
@@ -1415,9 +1484,9 @@ mod admission_tests {
                 .is_err()
         );
         let registry = builder.build();
-        let tool = registry.get("nested").unwrap();
         let extra = |capabilities: &CapabilitySet| {
-            let spec = tool.spec(capabilities, &runtime.agent).unwrap();
+            let surface = registry.surface(capabilities);
+            let spec = surface.get("nested").unwrap();
             spec.input_schema["$defs"]["Inner"]["properties"]
                 .get("extra")
                 .is_some()
@@ -1431,8 +1500,8 @@ mod admission_tests {
     /// schemars lists an internally tagged variant's fields before its tag; the
     /// registered schema leads with the tag so a schema-constrained decoder can
     /// still choose that variant after writing the tag.
-    #[tokio::test]
-    async fn registered_schemas_lead_tagged_variants_with_their_tag() {
+    #[test]
+    fn registered_schemas_lead_tagged_variants_with_their_tag() {
         #[derive(serde::Deserialize, JsonSchema)]
         #[serde(tag = "kind", rename_all = "snake_case")]
         enum Auth {
@@ -1447,19 +1516,14 @@ mod admission_tests {
             #[serde(rename = "auth")]
             _auth: Auth,
         }
-        let runtime = crate::tests::TestRuntime::new().await;
         let mut builder = ToolRegistryBuilder::default();
         let handler = |_, _: Input| async { Ok(String::new()) };
         let options = ToolOptions::default();
         builder
             .register::<Input, String, _, _>("tagged", "Tagged", options, handler)
             .unwrap();
-        let registry = builder.build();
-        let spec = registry
-            .get("tagged")
-            .unwrap()
-            .spec(&CapabilitySet::default(), &runtime.agent)
-            .unwrap();
+        let surface = builder.build().surface(&CapabilitySet::default());
+        let spec = surface.get("tagged").unwrap();
         let variants = spec.input_schema["$defs"]["Auth"]["oneOf"]
             .as_array()
             .unwrap();
@@ -1473,8 +1537,6 @@ mod admission_tests {
 
     #[tokio::test]
     async fn presented_registration_derives_contract_and_projection() {
-        #[derive(serde::Deserialize, JsonSchema)]
-        struct Input {}
         let runtime = crate::tests::TestRuntime::new().await;
         let source = runtime
             .jobs
@@ -1498,7 +1560,7 @@ mod admission_tests {
         let expected = projected.view().clone();
         let mut builder = ToolRegistryBuilder::default();
         builder
-            .register_presented::<Input, _, _>(
+            .register_presented::<Empty, _, _>(
                 "inspect_source",
                 "Canonical projection independent of tool name",
                 ToolOptions::default(),
@@ -1507,29 +1569,13 @@ mod admission_tests {
                     async move { Ok(projected) }
                 },
             )
-            .unwrap()
-            .register_dynamic(
-                "schema_control",
-                "Schema reference",
-                serde_json::json!({"type":"object"}),
-                ToolOptions::default()
-                    .generated_output_schema(|_| crate::job::presented_job_schema(false)),
-                |_, _| async { Ok(ToolOutput::new(Value::Null)) },
-            )
             .unwrap();
-        let registry = builder.build();
-        let surface = registry.surface(&CapabilitySet::default());
-        let spec = surface.get("inspect_source").unwrap();
-        assert_eq!(spec.result_policy, ToolResultPolicy::JobView);
+        let executor = runtime.executor(builder);
+        let tool = executor.registry().get("inspect_source").unwrap();
+        assert_eq!(tool.result_policy(), ToolResultPolicy::JobView);
         assert_eq!(
-            spec.output_schema,
-            surface.get("schema_control").unwrap().output_schema
-        );
-        let executor = crate::tool::executor::ToolExecutor::new(
-            registry,
-            Arc::new(crate::tool::policy::AllowAll),
-            runtime.jobs.clone(),
-            runtime.root.path().to_path_buf(),
+            tool.output_schema(&capabilities),
+            Some(crate::job::presented_job_schema(false))
         );
         let model = executor.run_model(&runtime.agent, "inspect_source", serde_json::json!({}));
         assert_eq!(model.await.unwrap().output.value, expected);
@@ -1537,18 +1583,13 @@ mod admission_tests {
 
     #[test]
     fn presented_registration_rejects_workspace_placement_and_read_error_outputs() {
-        #[derive(serde::Deserialize, JsonSchema)]
-        struct Input {}
-        fn read_error(_: &str, _: &std::io::Error) -> Option<Value> {
-            None
-        }
         for options in [
             ToolOptions::default().placement(ToolPlacement::InheritWorkspace),
             ToolOptions::default().placement(ToolPlacement::TargetedWorkspace),
-            ToolOptions::default().read_error_output(read_error),
+            ToolOptions::default().read_error_output(|_, _| None),
         ] {
             let mut builder = ToolRegistryBuilder::default();
-            let result = builder.register_presented::<Input, _, _>(
+            let result = builder.register_presented::<Empty, _, _>(
                 "presented",
                 "rejected",
                 options,

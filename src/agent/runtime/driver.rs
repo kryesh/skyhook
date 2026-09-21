@@ -257,7 +257,10 @@ impl SessionRuntime {
                     options,
                 } => (content, done, options),
                 AgentCommand::JobsReady => {
-                    let content = match self.pending_event_content(&id, &turn.capabilities).await {
+                    let content = match self
+                        .pending_event_content(&id, turn.diagnostic_viewer())
+                        .await
+                    {
                         Ok((content, messages)) if !content.is_empty() => {
                             pending_events = Some(messages);
                             content
@@ -816,7 +819,8 @@ mod tests {
             let child = session.root.child(1);
             assert_eq!(requests.lock().unwrap().len(), 2, "no automatic replay");
             if aborted {
-                assert_eq!(failed.error.as_deref(), Some("provider aborted response"));
+                assert!(matches!(&failed.diagnostic.as_ref().unwrap().cause,
+                    crate::tool::diagnostic::Cause::Message(message) if message == "provider aborted response"));
                 // A rejected model selection neither replays nor unparks the child.
                 let sender = session.runtime.agents.read().unwrap()[&child]
                     .sender

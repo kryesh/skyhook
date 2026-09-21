@@ -136,11 +136,9 @@ mod tests {
             // document uses a captured-field placeholder.
             let (expected, outcome) = if failure {
                 let expected = json!({"value": null, "console": "captured console\n", "failure": {"message": "failed"}});
-                let outcome = crate::job::JobOutcome::Failed {
-                    message: "failed".into(),
-                    output: Some(output),
-                    denial: None,
-                };
+                let outcome = crate::tool::ToolError::Failed("failed".into())
+                    .with_result(output)
+                    .into();
                 (expected, outcome)
             } else {
                 (

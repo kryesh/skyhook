@@ -1,16 +1,16 @@
 //! Snapshot and present durable child messages and job notifications.
 
 use super::{PendingEventBatch, SessionRuntime};
-use crate::provider::protocol::UserContent;
+use crate::{provider::protocol::UserContent, tool::diagnostic::DiagnosticViewer};
 
 impl SessionRuntime {
-    pub(in crate::agent::runtime) async fn pending_event_content(
+    pub(in crate::agent::runtime) async fn pending_event_content<'a>(
         &self,
         agent: &crate::identity::AgentId,
-        capabilities: &crate::tool::policy::CapabilitySet,
+        viewer: impl Into<DiagnosticViewer<'a>>,
     ) -> Result<(Vec<UserContent>, PendingEventBatch), crate::agent::runtime::HarnessError> {
         let pending = self.jobs.pending_delivery(agent).await?;
-        let content = self.job_event_content(&pending, capabilities).await;
+        let content = self.job_event_content(&pending, viewer.into()).await;
         // Never hold an empty receipt's delivery gate across a model request.
         let jobs = (!content.is_empty()).then_some(pending);
         let batch = PendingEventBatch {
@@ -25,7 +25,7 @@ impl SessionRuntime {
     async fn job_event_content(
         &self,
         pending: &crate::job::PendingDelivery,
-        capabilities: &crate::tool::policy::CapabilitySet,
+        viewer: DiagnosticViewer<'_>,
     ) -> Vec<UserContent> {
         let mut presented = Vec::new();
         for message in pending.messages() {
@@ -38,7 +38,7 @@ impl SessionRuntime {
                 .jobs
                 .present_output_with(
                     crate::job::output::OutputArgs::new(job.id),
-                    capabilities,
+                    viewer,
                     crate::job::output::OutputOptions::Host {
                         presentation: crate::job::OutputPresentation::Automatic,
                     },
@@ -48,7 +48,7 @@ impl SessionRuntime {
             {
                 Ok(view) => presented.push(view),
                 Err(error) => presented.push(
-                    serde_json::json!({"id":job.id,"state":job.state,"error":error.to_string()}),
+                    serde_json::json!({"id":job.id,"state":job.state,"error":error.diagnostic().render_for(viewer)}),
                 ),
             }
         }

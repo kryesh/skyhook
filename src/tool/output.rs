@@ -313,6 +313,7 @@ pub(crate) struct ProducedOutput {
     pub(crate) images: Vec<ImageRef>,
     pub(crate) captures: Vec<FinishedOutput>,
     pub(crate) streams: StreamEnd,
+    pub(crate) diagnostic: Option<crate::tool::diagnostic::Diagnostic>,
 }
 
 impl ProducedOutput {
@@ -322,7 +323,17 @@ impl ProducedOutput {
             images: Vec::new(),
             captures: Vec::new(),
             streams: StreamEnd::Finished,
+            diagnostic: None,
         }
+    }
+
+    /// Register the builtin read result's error-message slot for presentation.
+    pub(crate) fn with_diagnostic(
+        mut self,
+        diagnostic: crate::tool::diagnostic::Diagnostic,
+    ) -> Self {
+        self.diagnostic = Some(diagnostic);
+        self
     }
 
     pub(crate) fn with_captures(mut self, captures: Vec<FinishedOutput>) -> Self {
@@ -668,12 +679,76 @@ impl<T: CaptureTarget> AsyncProducer<T> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::{
         future::{Future, poll_fn},
+        sync::atomic::{AtomicUsize, Ordering},
         task::Poll,
     };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum CaptureStage {
+        Open,
+        Write,
+        Finish,
+    }
+
+    impl CaptureStage {
+        fn matches(self, event: &OutputEvent) -> bool {
+            matches!(
+                (self, event),
+                (Self::Open, OutputEvent::Capture(CaptureEvent::Open { .. }))
+                    | (
+                        Self::Write,
+                        OutputEvent::Capture(CaptureEvent::Write { .. })
+                    )
+                    | (
+                        Self::Finish,
+                        OutputEvent::Capture(CaptureEvent::Finish { .. })
+                    )
+            )
+        }
+    }
+
+    /// Forward events until the selected stage has occurred `skip` times, then fail
+    /// that stage. An error factory preserves native OS codes or custom opaque detail
+    /// so each consumer can assert its own handling without duplicating a sink.
+    pub(crate) struct FailingCapture {
+        sink: Arc<dyn OutputSink>,
+        stage: CaptureStage,
+        skip: usize,
+        matches: AtomicUsize,
+        error: Box<dyn Fn() -> io::Error + Send + Sync>,
+    }
+
+    impl FailingCapture {
+        pub(crate) fn new(
+            sink: Arc<dyn OutputSink>,
+            stage: CaptureStage,
+            skip: usize,
+            error: impl Fn() -> io::Error + Send + Sync + 'static,
+        ) -> Self {
+            Self {
+                sink,
+                stage,
+                skip,
+                matches: AtomicUsize::new(0),
+                error: Box::new(error),
+            }
+        }
+    }
+
+    impl OutputSink for FailingCapture {
+        fn send(&self, event: OutputEvent) -> io::Result<()> {
+            if self.stage.matches(&event)
+                && self.matches.fetch_add(1, Ordering::SeqCst) >= self.skip
+            {
+                return Err((self.error)());
+            }
+            self.sink.send(event)
+        }
+    }
 
     struct ChannelSink(tokio::sync::mpsc::Sender<OutputEvent>);
 

@@ -26,7 +26,8 @@ use crate::{
     provider::protocol::Message,
     session::{EventRecord, SessionError, SessionEvent, SessionStore},
     tool::{
-        ToolOutput,
+        ToolError, ToolOutput,
+        diagnostic::Diagnostic,
         policy::{Capability, CapabilitySet},
     },
 };
@@ -117,34 +118,31 @@ impl JobState {
 
 pub(crate) enum JobOutcome {
     Completed(ToolOutput),
+    /// The cause decides whether the job failed, was cancelled, or was interrupted.
     Failed {
-        message: String,
+        diagnostic: Diagnostic,
         output: Option<ToolOutput>,
-        denial: Option<crate::tool::Denial>,
     },
-    Cancelled,
-    Interrupted,
+}
+
+impl JobOutcome {
+    fn state(&self) -> JobState {
+        use crate::tool::diagnostic::Cause;
+        match self {
+            Self::Completed(_) => JobState::Completed,
+            Self::Failed { diagnostic, .. } => match diagnostic.cause {
+                Cause::Cancelled => JobState::Cancelled,
+                Cause::Interrupted => JobState::Interrupted,
+                _ => JobState::Failed,
+            },
+        }
+    }
 }
 
 impl From<crate::tool::ToolError> for JobOutcome {
     fn from(error: crate::tool::ToolError) -> Self {
-        use crate::tool::{Denial, ToolError};
-        let message = match &error {
-            crate::tool::ToolError::Denied(reason) => reason.clone(),
-            error => error.concise_message(),
-        };
-        let (output, denial) = match error {
-            ToolError::Cancelled => return Self::Cancelled,
-            ToolError::Interrupted => return Self::Interrupted,
-            ToolError::Denied(_) => (None, Some(Denial::permission_denied())),
-            ToolError::FailedWithOutput { output, .. } => (Some(*output), None),
-            _ => (None, None),
-        };
-        Self::Failed {
-            message,
-            output,
-            denial,
-        }
+        let (diagnostic, output) = error.into_parts();
+        Self::Failed { diagnostic, output }
     }
 }
 
@@ -187,8 +185,8 @@ struct JobEntry {
     state: JobState,
     output: Option<Value>,
     images: Vec<ImageRef>,
-    error: Option<String>,
-    denial: Option<crate::tool::Denial>,
+    diagnostic: Option<Diagnostic>,
+    output_diagnostic: Option<Diagnostic>,
     accepts_input: bool,
     resume: Option<ResumeHandler>,
     input: mpsc::Sender<Value>,
@@ -232,8 +230,8 @@ impl JobEntry {
                 state: JobState::Queued,
                 output: None,
                 images: Vec::new(),
-                error: None,
-                denial: None,
+                diagnostic: None,
+                output_diagnostic: None,
                 accepts_input: spec.accepts_input,
                 resume: None,
                 input,
@@ -262,8 +260,8 @@ impl JobEntry {
     fn clear_invocation_output(&mut self) {
         self.output = None;
         self.images.clear();
-        self.error = None;
-        self.denial = None;
+        self.diagnostic = None;
+        self.output_diagnostic = None;
     }
 
     /// Install all reported-outcome metadata together; callers establish
@@ -272,14 +270,14 @@ impl JobEntry {
         &mut self,
         state: JobState,
         images: Vec<ImageRef>,
-        error: Option<String>,
-        denial: Option<crate::tool::Denial>,
+        diagnostic: Option<Diagnostic>,
+        output_diagnostic: Option<Diagnostic>,
     ) {
         self.state = state;
         self.output = None;
         self.images = images;
-        self.error = error;
-        self.denial = denial;
+        self.diagnostic = diagnostic;
+        self.output_diagnostic = output_diagnostic;
         // A new delivery even after an earlier question was acknowledged.
         self.pend_delivery();
         if state == JobState::Cancelled {
@@ -325,9 +323,13 @@ impl JobEntry {
             name: self.name.clone(),
             state: self.state,
             output: None,
-            error: self.error.clone(),
+            error: self
+                .diagnostic
+                .as_ref()
+                .map(|diagnostic| diagnostic.render(&CapabilitySet::default())),
+            diagnostic: self.diagnostic.clone(),
+            output_diagnostic: self.output_diagnostic.clone(),
             location: self.location.clone(),
-            denial: self.denial.clone(),
         }
     }
 
@@ -458,6 +460,49 @@ impl JobManager {
     }
 }
 
+/// Why a destination cannot accept input in its current lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputUnavailableReason {
+    State(JobState),
+    CancellationRequested,
+    ResumeUnavailable,
+}
+
+impl std::fmt::Display for InputUnavailableReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::State(state) => {
+                let state = match state.presented() {
+                    JobState::Queued | JobState::AwaitingApproval => "queued",
+                    JobState::Running => "running",
+                    JobState::WaitingInput => "waiting for input",
+                    JobState::Completed => "completed",
+                    JobState::Failed => "failed",
+                    JobState::Cancelled => "cancelled",
+                    JobState::Interrupted => "interrupted",
+                };
+                write!(formatter, "job is {state}")
+            }
+            Self::CancellationRequested => formatter.write_str("cancellation has been requested"),
+            Self::ResumeUnavailable => {
+                formatter.write_str("no retained resume handler is available")
+            }
+        }
+    }
+}
+
+/// Internal detail may carry persisted input, so only its classification is kept.
+impl<O> From<JobError> for crate::tool::invocation::OperationError<O> {
+    fn from(error: JobError) -> Self {
+        match error {
+            JobError::Session(error) => error.into(),
+            JobError::InputClosed(_) => Self::InputClosed,
+            JobError::Internal(_) => Self::failed("job lifecycle operation failed"),
+            error => Self::failed(error),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum JobError {
     #[error(transparent)]
@@ -468,8 +513,11 @@ pub enum JobError {
     AlreadyTerminal(JobId),
     #[error("job {0} is not terminal")]
     NotTerminal(JobId),
-    #[error("job {0} is not running")]
-    NotRunning(JobId),
+    #[error("job {job} input unavailable: {reason}")]
+    InputUnavailable {
+        job: JobId,
+        reason: InputUnavailableReason,
+    },
     #[error("job {0} does not accept input")]
     InputUnsupported(JobId),
     #[error("job {0} input channel is closed")]

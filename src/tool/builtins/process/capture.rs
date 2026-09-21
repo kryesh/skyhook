@@ -1,6 +1,7 @@
 use crate::{
-    tool::invocation::LocalError,
-    tool::output::{AsyncOutput, FinishedOutput, PendingOutput},
+    tool::diagnostic::{Operation, Subject},
+    tool::invocation::{LocalContext, LocalError},
+    tool::output::{AsyncOutput, FinishedOutput, PendingOutput, TextCaptureField},
 };
 
 /// The decoder tail belongs to the same owner as the text writer, not the
@@ -8,14 +9,37 @@ use crate::{
 pub(super) struct Capture {
     writer: AsyncOutput,
     pending: Vec<u8>,
+    field: TextCaptureField,
 }
 
 impl Capture {
-    pub(super) fn new(writer: PendingOutput) -> Self {
+    pub(super) fn new(writer: PendingOutput, field: TextCaptureField) -> Self {
         Self {
             writer: writer.open_async(),
             pending: Vec::new(),
+            field,
         }
+    }
+
+    pub(super) async fn create(
+        context: &LocalContext,
+        field: TextCaptureField,
+    ) -> Result<Self, LocalError> {
+        let writer = context.text_capture(field).await.map_err(|error| {
+            LocalError::from(error)
+                .context(super::started(
+                    Operation::CreateCapture,
+                    Subject::Label(field.pointer()),
+                ))
+                .opaque_io()
+        })?;
+        Ok(Self::new(writer, field))
+    }
+
+    /// Storage errors may echo captured output, so only their classification is kept.
+    fn failed(&self, operation: Operation) -> impl FnOnce(std::io::Error) -> LocalError + use<> {
+        let context = super::started(operation, Subject::Label(self.field.pointer()));
+        move |error| LocalError::Io(error).context(context).opaque_io()
     }
 
     pub(super) async fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), LocalError> {
@@ -44,8 +68,10 @@ impl Capture {
         self.pending.drain(..consumed);
         // This await first transfers all decoded text to the shared writer,
         // before that writer can suspend on storage IO.
-        self.writer.write_text(&text).await?;
-        Ok(())
+        self.writer
+            .write_text(&text)
+            .await
+            .map_err(self.failed(Operation::WriteCapture))
     }
 
     pub(super) async fn finish(mut self) -> Result<Option<FinishedOutput>, LocalError> {
@@ -53,8 +79,10 @@ impl Capture {
         // No recovery after arbitrary IO errors or a dropped finalizer is claimed.
         self.writer
             .write_text(&String::from_utf8_lossy(&self.pending))
-            .await?;
-        Ok(self.writer.finish_nonempty().await?)
+            .await
+            .map_err(self.failed(Operation::WriteCapture))?;
+        let failed = self.failed(Operation::FinishCapture);
+        self.writer.finish_nonempty().await.map_err(failed)
     }
 }
 
@@ -78,7 +106,7 @@ mod tests {
             .text_capture(TextCaptureField::Stdout)
             .await
             .unwrap();
-        let mut capture = Capture::new(writer);
+        let mut capture = Capture::new(writer, TextCaptureField::Stdout);
         for chunk in chunks {
             capture.write_bytes(chunk).await.unwrap();
         }

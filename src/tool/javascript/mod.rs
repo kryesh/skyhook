@@ -8,5 +8,5 @@ mod runtime;
 
 pub use runtime::JsError;
 
-pub(crate) use result::{ScriptResult, script_output};
-pub(crate) use runtime::{CapturedJsError, evaluate_captured};
+pub(crate) use result::ScriptResult;
+pub(crate) use runtime::evaluate_captured;

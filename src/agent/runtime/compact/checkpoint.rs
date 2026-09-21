@@ -201,7 +201,7 @@ impl SessionRuntime {
                 .jobs
                 .present_output_with(
                     crate::job::output::OutputArgs::new(job),
-                    &turn.capabilities,
+                    turn.diagnostic_viewer(),
                     crate::job::output::OutputOptions::Host {
                         presentation: crate::job::OutputPresentation::Full,
                     },

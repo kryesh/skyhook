@@ -1002,9 +1002,9 @@ mod tests {
                     SessionEvent::JobFinished {
                         job,
                         state: crate::job::JobState::Interrupted,
-                        error: Some("interrupted while the session was not running".into()),
+                        diagnostic: Some(crate::tool::ToolError::Interrupted.diagnostic()),
+                        output_diagnostic: None,
                         images: Vec::new(),
-                        denial: None,
                     },
                 ),
                 (

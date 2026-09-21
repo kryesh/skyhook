@@ -4,7 +4,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::tool::{
-    RegistryError, ToolError, ToolOptions, ToolRegistryBuilder, executor::ToolExecutor,
+    RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
+    diagnostic::{Effects, Operation, Subject},
+    executor::ToolExecutor,
 };
 
 pub(crate) fn install_script_tool(
@@ -27,30 +29,16 @@ pub(crate) fn install_script_tool(
                     .and_then(|slot| slot.get().cloned())
                     .ok_or_else(|| {
                         ToolError::Failed("script executor is not initialized".to_owned())
+                            .operation(Operation::Prepare, Subject::Label("script executor".into()))
+                            .effects(Effects::NotStarted)
                     })?
                     .with_location(context.caller_location().clone())
                     .with_capabilities(context.capabilities().clone());
-                crate::tool::javascript::evaluate_captured(args.source, executor, context)
-                    .await
-                    .map_err(script_error)
+                crate::tool::javascript::evaluate_captured(args.source, executor, context).await
             }
         },
     )?;
     Ok(())
-}
-
-fn script_error(captured: crate::tool::javascript::CapturedJsError) -> ToolError {
-    use crate::tool::javascript::{JsError, script_output};
-    let crate::tool::javascript::CapturedJsError { error, console } = captured;
-    let (message, details) = match error {
-        JsError::Cancelled => return ToolError::Cancelled,
-        JsError::Failure { message, details } => (message, Some(details)),
-        error => (error.to_string(), None),
-    };
-    ToolError::with_output(
-        message,
-        script_output(serde_json::Value::Null, details, console.map(|c| *c)),
-    )
 }
 
 #[derive(Deserialize, JsonSchema)]

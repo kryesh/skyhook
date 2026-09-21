@@ -1,6 +1,6 @@
 //! OpenSSH configuration generated only from target definitions.
 use crate::remote::{RemoteError, SensitivePromptHandler, backend::ProcessEnvironment};
-use crate::target::{TargetAuth, TargetDefinition};
+use crate::target::{TargetAuth, TargetDefinition, TargetError};
 use std::{io::Write as _, path::Path, sync::Arc};
 use tokio::process::Command;
 /// OpenSSH config and forwarded environment are UTF-8 protocols. Reject a
@@ -88,21 +88,16 @@ impl SshConfig {
     }
 }
 
-/// Options with a dedicated target field, or refused because they forward local
-/// environment (SendEnv * would include .env secrets) or X11, multiplex connections,
-/// replace the worker command, disable prompts, or read other configuration.
+/// Options refused because they forward local environment (SendEnv * would include
+/// .env secrets) or X11, multiplex connections, replace the worker command,
+/// disable prompts, or read other configuration.
 const MANAGED_OPTIONS: &[&str] = &[
     "host",
     "match",
     "include",
-    "hostname",
-    "user",
-    "port",
-    "identityfile",
     "identityagent",
     "addkeystoagent",
     "batchmode",
-    "proxyjump",
     "controlmaster",
     "controlpath",
     "controlpersist",
@@ -117,15 +112,35 @@ const MANAGED_OPTIONS: &[&str] = &[
     "forwardx11trusted",
 ];
 
-/// Whether a target may set this ssh_config option.
-pub(crate) fn configurable_option(key: &str, value: &str) -> bool {
-    !key.is_empty()
-        && key.bytes().all(|byte| byte.is_ascii_alphanumeric())
-        && !MANAGED_OPTIONS
-            .iter()
-            .any(|option| key.eq_ignore_ascii_case(option))
-        && !value.is_empty()
-        && !value.chars().any(char::is_control)
+/// Validate target options without retaining their potentially sensitive values.
+pub(crate) fn validate_option(key: &str, value: &str) -> Result<(), TargetError> {
+    if key.is_empty() || !key.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(TargetError::InvalidSshOptionName);
+    }
+    let field = match key.to_ascii_lowercase().as_str() {
+        "user" => Some("ssh.user"),
+        "hostname" => Some("host"),
+        "port" => Some("ssh.port"),
+        "identityfile" => Some("ssh.auth"),
+        "proxyjump" => Some("via"),
+        _ => None,
+    };
+    if let Some(field) = field {
+        return Err(TargetError::DedicatedSshOption(key.to_owned(), field));
+    }
+    if MANAGED_OPTIONS
+        .iter()
+        .any(|option| key.eq_ignore_ascii_case(option))
+    {
+        return Err(TargetError::ReservedSshOption(key.to_owned()));
+    }
+    if value.is_empty() {
+        return Err(TargetError::EmptySshOptionValue(key.to_owned()));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(TargetError::InvalidSshOptionValue(key.to_owned()));
+    }
+    Ok(())
 }
 
 fn write_auth(
@@ -203,10 +218,7 @@ pub(crate) fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        remote::prompt::RejectSensitivePrompts,
-        target::{TargetError, TargetSource},
-    };
+    use crate::{remote::prompt::RejectSensitivePrompts, target::TargetSource};
     use serde_json::json;
 
     fn target(name: &str, config: serde_json::Value) -> Result<TargetDefinition, TargetError> {
@@ -280,11 +292,24 @@ mod tests {
         let forwarding = json!({"type": "ssh", "host": "x", "ssh": {"options": {"SendEnv": "*"}}});
         assert!(matches!(
             target("x", forwarding),
-            Err(TargetError::InvalidSshOption(_))
+            Err(TargetError::ReservedSshOption(_))
         ));
-        for (key, value) in [("proxyjump", "a"), ("Server Alive", "1"), ("LogLevel", "")] {
-            assert!(!configurable_option(key, value), "{key}");
-        }
+        assert!(matches!(
+            validate_option("proxyjump", "a"),
+            Err(TargetError::DedicatedSshOption(_, "via"))
+        ));
+        assert!(matches!(
+            validate_option("Server Alive", "1"),
+            Err(TargetError::InvalidSshOptionName)
+        ));
+        assert!(matches!(
+            validate_option("LogLevel", ""),
+            Err(TargetError::EmptySshOptionValue(_))
+        ));
+        assert!(matches!(
+            validate_option("ProxyCommand", "nc\n"),
+            Err(TargetError::InvalidSshOptionValue(_))
+        ));
         // Managed options with a field of their own name it.
         let user = json!({"type": "ssh", "host": "x", "ssh": {"options": {"User": "debian"}}});
         let error = target("x", user).unwrap_err().to_string();

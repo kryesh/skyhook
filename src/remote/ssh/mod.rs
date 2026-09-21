@@ -6,7 +6,7 @@ mod process;
 
 pub(crate) use askpass::AskpassServer;
 pub(crate) use authentication::WorkerAuthentication;
-pub(crate) use config::configurable_option;
+pub(crate) use config::validate_option;
 pub(crate) use process::open;
 
 pub(crate) fn run_askpass_helper(

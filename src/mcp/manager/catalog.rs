@@ -1,6 +1,10 @@
 //! Bounded startup-only tool discovery, including pagination and capability negotiation.
 use super::super::transport::Client;
 use super::McpError;
+use crate::tool::{
+    ToolError,
+    diagnostic::{DiagnosticContext, Operation, Subject},
+};
 use rmcp::model::{PaginatedRequestParams, Tool};
 use std::collections::HashSet;
 
@@ -32,7 +36,14 @@ pub(super) fn bounded_json_size(value: &impl serde::Serialize, limit: usize) -> 
     Some(counter.bytes)
 }
 
-pub(super) async fn discover(client: &Client) -> Result<Vec<Tool>, McpError> {
+pub(super) async fn discover(client: &Client) -> Result<Vec<Tool>, ToolError> {
+    // Keep the known discovery operation separate from the sanitized SDK cause.
+    let failure = |error: McpError| {
+        ToolError::from(error).context(DiagnosticContext::new(
+            Operation::Read,
+            Subject::Label("MCP tools/list discovery".into()),
+        ))
+    };
     // A resources/prompts-only server must not receive unsupported tools/list.
     if client
         .peer_info()
@@ -53,17 +64,23 @@ pub(super) async fn discover(client: &Client) -> Result<Vec<Tool>, McpError> {
         let page = client
             .list_tools(params)
             .await
-            .map_err(|_| McpError::Startup("tools/list failed".into()))?;
+            .map_err(|error| failure(super::request_error(error)))?;
         for tool in page.tools {
             let size = bounded_json_size(&tool, MAX_TOOL_BYTES).ok_or_else(|| {
-                McpError::Startup("tool schema/metadata exceeds size limit".into())
+                failure(McpError::Startup(
+                    "tool schema/metadata exceeds size limit".into(),
+                ))
             })?;
             bytes += size;
             if tools.len() >= MAX_TOOLS || bytes > MAX_CATALOG_BYTES {
-                return Err(McpError::Startup("tool catalog exceeds size limit".into()));
+                return Err(failure(McpError::Startup(
+                    "tool catalog exceeds size limit".into(),
+                )));
             }
             if !names.insert(tool.name.to_string()) {
-                return Err(McpError::Startup("duplicate tool name in discovery".into()));
+                return Err(failure(McpError::Startup(
+                    "duplicate tool name in discovery".into(),
+                )));
             }
             tools.push(tool);
         }
@@ -71,18 +88,20 @@ pub(super) async fn discover(client: &Client) -> Result<Vec<Tool>, McpError> {
             return Ok(tools);
         };
         if next.len() > 4096 {
-            return Err(McpError::Startup(
+            return Err(failure(McpError::Startup(
                 "tools/list cursor exceeds size limit".into(),
-            ));
+            )));
         }
         if !cursors.insert(next.clone()) {
-            return Err(McpError::Startup("repeated tools/list cursor".into()));
+            return Err(failure(McpError::Startup(
+                "repeated tools/list cursor".into(),
+            )));
         }
         cursor = Some(next);
     }
-    Err(McpError::Startup(
+    Err(failure(McpError::Startup(
         "tools/list pagination limit exceeded".into(),
-    ))
+    )))
 }
 
 #[cfg(test)]
@@ -92,7 +111,9 @@ mod tests {
     use super::super::tests::assert_process_reaped;
     use super::super::tests::{Fixture, connect, shutdown};
     use super::*;
+    use crate::tool::diagnostic::Cause;
     use serde_json::{Value, json};
+    use std::time::Duration;
 
     #[tokio::test]
     async fn discovery_limits_skip_and_reap_unusable_servers() {
@@ -116,6 +137,48 @@ mod tests {
             assert_process_reaped(fixture.pid()).await;
         }
         shutdown(&manager).await;
+
+        // A failed tools/list also rejects the server, retaining discovery context
+        // and the safe protocol code rather than the server's message or payload.
+        let fixture = &fixtures[0];
+        let mut config = fixture.config();
+        config
+            .env
+            .insert("MCP_TEST_DISCOVERY".into(), "rpc_error".into());
+        let connected = tokio::time::timeout(
+            Duration::from_secs(10),
+            super::super::connection::connect_one(
+                "fixture".into(),
+                config.try_into().unwrap(),
+                Default::default(),
+            ),
+        )
+        .await
+        .expect("discovery failure and cleanup are bounded")
+        .expect("server startup was attempted");
+        let Err(error) = connected.1 else {
+            panic!("failed tools/list must reject the server");
+        };
+        let diagnostic = error.diagnostic();
+        assert_eq!(
+            diagnostic.context,
+            DiagnosticContext::new(
+                Operation::Read,
+                Subject::Label("MCP tools/list discovery".into()),
+            ),
+        );
+        assert_eq!(
+            diagnostic.cause,
+            Cause::Message("server JSON-RPC error -32602".into()),
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("tools/list discovery"), "{rendered}");
+        assert!(rendered.contains("-32602"), "{rendered}");
+        for secret in ["private-discovery-message", "private-discovery-payload"] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        #[cfg(unix)]
+        assert_process_reaped(fixture.pid()).await;
     }
 
     #[test]

@@ -123,7 +123,7 @@ impl CompletionPermit {
             match worker.join().await {
                 Ok(Ok(output)) => JobOutcome::Completed(output),
                 Ok(Err(error)) => error.into(),
-                Err(error) if error.is_cancelled() => JobOutcome::Cancelled,
+                Err(error) if error.is_cancelled() => ToolError::Cancelled.into(),
                 Err(_) => ToolError::Failed(panic_message.to_owned()).into(),
             }
         });
@@ -137,7 +137,7 @@ impl Drop for CompletionPermit {
         self.cancellation.cancel();
         // Outside a running runtime only cancellation is possible; replay recovers.
         if tokio::runtime::Handle::try_current().is_ok() {
-            spawn_completion(jobs, self.id, async { JobOutcome::Cancelled });
+            spawn_completion(jobs, self.id, async { ToolError::Cancelled.into() });
         }
     }
 }
@@ -301,8 +301,13 @@ mod tests {
             jobs.drain_supervisors().await;
             let result = jobs.metadata(id).await.unwrap();
             assert_eq!(result.state, expected, "{tool}");
-            if error.is_some() {
-                assert_eq!(result.error.as_deref(), error);
+            if let Some(error) = error {
+                assert!(
+                    result
+                        .error
+                        .as_deref()
+                        .is_some_and(|message| message.contains(error))
+                );
             }
             if tool == "rejected" {
                 assert!(!cancellation.is_cancelled());

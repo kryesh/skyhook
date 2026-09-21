@@ -1,6 +1,6 @@
 //! Bounded response decoding and optional readability extraction for `fetch`.
 
-use dom_smoothie::{Config, Readability, TextMode};
+use dom_smoothie::{Config, Readability, ReadabilityError, TextMode};
 use encoding_rs::{Encoding, UTF_8};
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -168,46 +168,74 @@ pub(super) struct ExtractableHtml {
     url: HttpRequestUrl,
 }
 
+/// Closed extraction evidence; parser displays and document content never cross
+/// this boundary. These reasons are projected into fetch's existing diagnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExtractionFailure {
+    RawSizeLimit,
+    DecodedSizeLimit,
+    ElementLimit,
+    Parser,
+    Empty,
+    WorkerUnavailable,
+    WorkerFailed,
+}
+
+impl From<ReadabilityError> for ExtractionFailure {
+    fn from(error: ReadabilityError) -> Self {
+        match error {
+            ReadabilityError::TooManyElements(..) => Self::ElementLimit,
+            ReadabilityError::BadDocumentURL | ReadabilityError::GrabFailed => Self::Parser,
+        }
+    }
+}
+
 impl ExtractableHtml {
-    /// Callers admit only HTML-classified entities; `None` is a budget rejection.
-    pub(super) fn admit(entity: ResponseEntity, url: &HttpRequestUrl) -> Option<Self> {
+    /// Callers admit only HTML-classified entities. Byte budgets are independent
+    /// of the parser's element budget and the request's max_bytes setting.
+    pub(super) fn admit(
+        entity: ResponseEntity,
+        url: &HttpRequestUrl,
+    ) -> Result<Self, ExtractionFailure> {
         if entity.bytes.len() > MAX_RAW_HTML_BYTES {
-            return None;
+            return Err(ExtractionFailure::RawSizeLimit);
         }
         let html = entity.decode();
         // Raw bytes have been dropped before any semaphore wait or worker queue.
-        (html.len() <= MAX_DECODED_HTML_BYTES).then(|| Self {
+        if html.len() > MAX_DECODED_HTML_BYTES {
+            return Err(ExtractionFailure::DecodedSizeLimit);
+        }
+        Ok(Self {
             html,
             url: url.clone(),
         })
     }
 }
 
-/// Failure details are never surfaced: callers report one classified diagnostic.
-pub(super) async fn extract(input: ExtractableHtml) -> Option<ExtractedText> {
-    let permit = EXTRACTORS.acquire().await.ok()?;
+pub(super) async fn extract(input: ExtractableHtml) -> Result<ExtractedText, ExtractionFailure> {
+    let permit = EXTRACTORS
+        .acquire()
+        .await
+        .map_err(|_| ExtractionFailure::WorkerUnavailable)?;
     tokio::task::spawn_blocking(move || {
         // A cancelled waiter cannot release parser capacity while this worker runs.
         let _permit = permit;
         parse(input)
     })
     .await
-    .ok()?
+    .map_err(|_| ExtractionFailure::WorkerFailed)?
 }
 
-fn parse(input: ExtractableHtml) -> Option<ExtractedText> {
+fn parse(input: ExtractableHtml) -> Result<ExtractedText, ExtractionFailure> {
     let config = Config {
         text_mode: TextMode::Formatted,
         max_elements_to_parse: MAX_HTML_ELEMENTS,
         ..Config::default()
     };
-    let mut reader = Readability::new(input.html, Some(input.url.as_str()), Some(config)).ok()?;
-    let article = reader.parse().ok()?;
-    let text = article.text_content.trim().to_owned();
-    if text.is_empty() {
-        return None;
-    }
-    Some(ExtractedText {
+    let mut reader = Readability::new(input.html, Some(input.url.as_str()), Some(config))?;
+    let article = reader.parse()?;
+    let text = extracted_content(&article.text_content)?;
+    Ok(ExtractedText {
         text,
         metadata: ExtractionMetadata {
             engine: "dom_smoothie".into(),
@@ -218,6 +246,14 @@ fn parse(input: ExtractableHtml) -> Option<ExtractedText> {
             language: article.lang,
         },
     })
+}
+
+fn extracted_content(content: &str) -> Result<String, ExtractionFailure> {
+    let text = content.trim();
+    if text.is_empty() {
+        return Err(ExtractionFailure::Empty);
+    }
+    Ok(text.to_owned())
 }
 
 #[cfg(test)]
@@ -314,11 +350,27 @@ mod tests {
         assert_eq!(exact.html.len(), MAX_DECODED_HTML_BYTES);
         assert_eq!(exact.url.as_str(), "https://example.com/base/page");
         let oversized = html(vec![b'a'; MAX_RAW_HTML_BYTES + 1]);
-        assert!(ExtractableHtml::admit(oversized, &url).is_none());
+        assert!(matches!(
+            ExtractableHtml::admit(oversized, &url),
+            Err(ExtractionFailure::RawSizeLimit)
+        ));
         // Replacement characters expand below the raw limit but past the decoded one.
         let replacements = html(vec![0xff; MAX_DECODED_HTML_BYTES / 3 + 1]);
         assert!(replacements.bytes().len() <= MAX_RAW_HTML_BYTES);
-        assert!(ExtractableHtml::admit(replacements, &url).is_none());
+        assert!(matches!(
+            ExtractableHtml::admit(replacements, &url),
+            Err(ExtractionFailure::DecodedSizeLimit)
+        ));
+    }
+
+    #[test]
+    fn parser_failure_and_empty_extracted_content_are_distinct() {
+        assert!(matches!(
+            parse(admitted("<html><body></body></html>".into())),
+            Err(ExtractionFailure::Parser)
+        ));
+        assert_eq!(extracted_content(" \n\t "), Err(ExtractionFailure::Empty));
+        assert_eq!(extracted_content("  article  ").unwrap(), "article");
     }
 
     #[test]
@@ -368,6 +420,9 @@ mod tests {
                 .contains("Readable content")
         );
         let oversized = admitted("<i></i>".repeat(MAX_HTML_ELEMENTS + 1));
-        assert!(extract(oversized).await.is_none());
+        assert!(matches!(
+            extract(oversized).await,
+            Err(ExtractionFailure::ElementLimit)
+        ));
     }
 }

@@ -1,25 +1,20 @@
 //! Preserve MCP result envelopes and persist bounded image attachments.
-use super::super::manager::McpError;
 use crate::{
     media::{
         BlobDigest, Image, ImageFormat, ImageRef, MAX_IMAGE_BYTES, MAX_IMAGE_BYTES_PER_SUBMISSION,
         MAX_IMAGES_PER_SUBMISSION, MediaError, decode_base64_bounded,
     },
     session::SessionStore,
-    tool::{ToolError, ToolOutput},
+    tool::{
+        ToolError, ToolOutput,
+        diagnostic::{DiagnosticContext, Effects, Operation, Subject},
+    },
 };
 #[cfg(test)]
 use base64::Engine as _;
 use rmcp::model::{Annotations, CallToolResult, ContentBlock, MetaObject, ResultType};
 use serde::Serialize;
 use serde_json::Value;
-
-pub(super) fn map_error(error: McpError) -> ToolError {
-    match error {
-        McpError::Cancelled => ToolError::Cancelled,
-        other => ToolError::Failed(other.to_string()),
-    }
-}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -142,17 +137,25 @@ pub(super) async fn map_result(
         let SanitizedBlock::Image(block) = &mut sanitized.content[index] else {
             continue;
         };
-        let reference =
-            match import_image(&source, &block.mime_type, images.len(), total_bytes, store).await {
-                Ok(reference) => reference,
-                Err(error) => {
-                    let message = error.to_string();
-                    block.status = ImageStatus::Failed {
-                        message: message.clone(),
-                    };
-                    return Err(ToolError::with_output(message, output(&sanitized, images)?));
-                }
-            };
+        let subject = Subject::Label(format!("MCP image block {index}"));
+        let reference = match import_image(
+            &source,
+            &block.mime_type,
+            images.len(),
+            total_bytes,
+            store,
+            &subject,
+        )
+        .await
+        {
+            Ok(reference) => reference,
+            Err(error) => {
+                block.status = ImageStatus::Failed {
+                    message: error.to_string(),
+                };
+                return Err(error.with_result(output(&sanitized, images)?));
+            }
+        };
         total_bytes += reference.blob.bytes;
         block.status = ImageStatus::Imported {
             image: McpImage::new(index, &reference),
@@ -173,17 +176,28 @@ async fn import_image(
     image_count: usize,
     total_bytes: u64,
     store: &SessionStore,
+    subject: &Subject,
 ) -> Result<ImageRef, ToolError> {
+    let context = |operation| {
+        DiagnosticContext::new(operation, subject.clone()).effects(Effects::OutputIncomplete)
+    };
+    let import_context = context(Operation::Deserialize);
     let limit = usize::try_from(MAX_IMAGE_BYTES).expect("image limit fits usize");
-    let bytes = decode_base64_bounded(source, limit).map_err(|error| match error {
-        MediaError::TooLarge => ToolError::Failed("MCP images exceed attachment limits".to_owned()),
-        other => ToolError::Failed(format!("invalid MCP image encoding: {other}")),
+    let bytes = decode_base64_bounded(source, limit).map_err(|error| {
+        match error {
+            MediaError::TooLarge => {
+                ToolError::Failed("MCP images exceed attachment limits".to_owned())
+            }
+            other => ToolError::Failed(format!("invalid MCP image encoding: {other}")),
+        }
+        .context(import_context.clone())
     })?;
     let total_bytes = total_bytes + bytes.len() as u64;
     if image_count >= MAX_IMAGES_PER_SUBMISSION || total_bytes > MAX_IMAGE_BYTES_PER_SUBMISSION {
-        return Err(ToolError::Failed(
-            "MCP images exceed attachment limits".to_owned(),
-        ));
+        return Err(
+            ToolError::Failed("MCP images exceed attachment limits".to_owned())
+                .context(import_context),
+        );
     }
     // The declared type governs admission; bytes of another format are invalid
     // rather than silently re-typed.
@@ -193,23 +207,24 @@ async fn import_image(
         "image/gif" => ImageFormat::Gif,
         "image/webp" => ImageFormat::WebP,
         _ => {
-            return Err(ToolError::Failed(format!(
-                "unsupported MCP image type: {mime_type}"
-            )));
+            return Err(
+                ToolError::Failed("unsupported MCP image type".into()).context(import_context)
+            );
         }
     };
     let image = Image::new(bytes)
         .ok()
         .filter(|image| image.format() == declared)
         .ok_or_else(|| {
-            ToolError::Failed(format!(
-                "invalid MCP image: data is not a valid {mime_type} image"
-            ))
+            ToolError::Failed(
+                "invalid MCP image: data does not match its declared image type".into(),
+            )
+            .context(import_context)
         })?;
     store
         .store_image(None, &image)
         .await
-        .map_err(|error| ToolError::Failed(error.to_string()))
+        .map_err(|error| ToolError::from(error).context(context(Operation::StoreImage)))
 }
 
 #[cfg(test)]
@@ -230,10 +245,10 @@ mod tests {
     }
 
     fn failed(mapped: Result<ToolOutput, ToolError>) -> (String, ToolOutput) {
-        let Err(ToolError::FailedWithOutput { message, output }) = mapped else {
-            panic!("MCP error must retain output")
-        };
-        (message, *output)
+        let error = mapped.expect_err("MCP error must retain output");
+        let message = error.to_string();
+        let (_, output) = error.into_parts();
+        (message, output.expect("MCP error must retain output"))
     }
 
     #[tokio::test]
@@ -256,11 +271,6 @@ mod tests {
             assert_eq!(output.value, value);
             assert!(output.images.is_empty());
         }
-        assert!(matches!(
-            map_error(McpError::Cancelled),
-            ToolError::Cancelled
-        ));
-        assert!(matches!(map_error(McpError::Timeout), ToolError::Failed(_)));
     }
 
     #[tokio::test]
@@ -359,18 +369,17 @@ mod tests {
         );
         // Valid PNG bytes under an unsupported or mismatched declaration are rejected.
         for (mime, message) in [
-            ("image/svg+xml", "unsupported MCP image type: image/svg+xml"),
+            ("image/svg+xml", "unsupported MCP image type"),
             (
                 "image/jpeg",
-                "invalid MCP image: data is not a valid image/jpeg image",
+                "invalid MCP image: data does not match its declared image type",
             ),
         ] {
             let result = json!({"content":[{"type":"image","mimeType":mime,"data":PNG}]});
             let (error, output) = failed(map(&result, &runtime).await);
-            let message = format!("tool failed: {message}");
-            assert_eq!(error, message);
+            assert!(error.contains(message), "{error}");
             assert!(output.images.is_empty());
-            assert_eq!(output.value["content"][0]["imageError"], message);
+            assert_eq!(output.value["content"][0]["imageError"], error);
             assert_eq!(output.value["content"][0]["mimeType"], mime);
         }
     }
@@ -397,5 +406,30 @@ mod tests {
             }
             assert_eq!(output.value["content"][2]["text"], "preserved");
         }
+    }
+
+    #[tokio::test]
+    async fn image_storage_failure_preserves_the_envelope() {
+        let runtime = TestRuntime::new().await;
+        runtime.store.outputs().test_batch(
+            "CREATE TEMP TRIGGER reject_mcp_image BEFORE INSERT ON blob \
+             BEGIN SELECT RAISE(ABORT, 'rejected'); END;",
+        );
+        let upstream = json!({"content":[
+            {"type":"image", "mimeType":"image/png", "data":PNG},
+            {"type":"text", "text":"unchanged content"}
+        ], "isError":false, "structuredContent":{"retained":true}});
+        let error = map(&upstream, &runtime).await.unwrap_err();
+        let context = error.diagnostic().context;
+        assert_eq!(context.operation, Operation::StoreImage);
+        assert_eq!(context.effects, Effects::OutputIncomplete);
+        let (_, output) = failed(Err(error));
+        assert!(output.images.is_empty());
+        assert!(output.value["content"][0].get("data").is_none());
+        assert_eq!(output.value["content"][1], upstream["content"][1]);
+        assert_eq!(
+            output.value["structuredContent"],
+            upstream["structuredContent"]
+        );
     }
 }

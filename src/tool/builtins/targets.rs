@@ -7,7 +7,8 @@ use crate::{
         SshOptions, TargetConfig, TargetDefinition, TargetRecord, TargetRouter, TargetSource,
     },
     tool::{
-        AdmissionError, RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
+        RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
+        diagnostic::{Effects, deserialize_arguments},
         policy::{Capability, PermissionUse, ResourceId},
     },
 };
@@ -107,7 +108,9 @@ ssh.options can run commands, so it also requires exec."#,
             )
             .argument_permissions(|_, arguments| {
                 let args: TargetAddArgs =
-                    serde_json::from_value(arguments.clone()).map_err(AdmissionError::invalid)?;
+                    deserialize_arguments(arguments.clone()).map_err(|error| {
+                        error.effects(Effects::Unchanged)
+                    })?;
                 Ok(add_permissions(&args.config.ssh))
             }),
         move |context, args| {
@@ -116,7 +119,10 @@ ssh.options can run commands, so it also requires exec."#,
             async move {
                 let definition =
                     TargetDefinition::from_config(args.name, args.config, TargetSource::Session)
-                        .map_err(ToolError::invalid)?;
+                        .map_err(|error| {
+                            ToolError::from(error.into_admission_error())
+                                .effects(Effects::Unchanged)
+                        })?;
                 let added = router
                     .add(definition, context.invocation_subject()?, &store)
                     .await
@@ -144,6 +150,72 @@ fn add_permissions(ssh: &SshOptions) -> Vec<PermissionUse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn saved_target_failures_hide_submitted_aliases_from_reduced_capabilities() {
+        use crate::{
+            remote::{
+                EmbeddedShimCatalog, PendingHandshakeFactory, RejectSensitivePrompts, RemoteManager,
+            },
+            target::TargetRegistry,
+            tests::TestRuntime,
+            tool::{
+                authorization::AuthorizationCoordinator,
+                diagnostic::{FailureSite, Subject},
+                policy::{AllowAll, CapabilitySet},
+            },
+        };
+        use std::sync::{Arc, atomic::Ordering};
+
+        let runtime = TestRuntime::new().await;
+        let authorization = AuthorizationCoordinator::new(Arc::new(AllowAll));
+        let factory = PendingHandshakeFactory::new();
+        let remote = RemoteManager::new(
+            EmbeddedShimCatalog::default(),
+            Arc::new(RejectSensitivePrompts),
+            authorization.clone(),
+        )
+        .with_connection_factory(factory.clone());
+        let router = TargetRouter::new(TargetRegistry::default(), remote, authorization);
+        let mut builder = ToolRegistryBuilder::default();
+        register(&mut builder, runtime.store.clone(), router.clone()).unwrap();
+        let mut privileged = CapabilitySet::default();
+        privileged.insert(Capability::Targets);
+        let executor = runtime
+            .executor(builder)
+            .with_capabilities(privileged.clone());
+        let mut reduced = privileged.clone();
+        reduced.remove(Capability::Targets);
+        for (arguments, field) in [
+            (
+                serde_json::json!({"name":"private requested","type":"ssh","host":"host"}),
+                "name",
+            ),
+            (
+                serde_json::json!({"name":"private-requested","type":"ssh","host":"host","via":"private-jump"}),
+                "via",
+            ),
+            (
+                serde_json::json!({"name":"private-requested","type":"ssh","host":"host","origin":"private-origin"}),
+                "origin",
+            ),
+        ] {
+            let result = executor
+                .run_model(&runtime.agent, "target_add", arguments)
+                .await
+                .unwrap();
+            assert!(result.is_error);
+            let envelope = runtime.jobs.snapshot(result.job).await.unwrap();
+            let diagnostic = envelope.diagnostic.as_ref().unwrap();
+            assert_eq!(diagnostic.context.subject, Subject::argument([field]));
+            assert_eq!(diagnostic.context.site, FailureSite::Host);
+            assert_eq!(diagnostic.context.effects, Effects::Unchanged);
+            let inspection = envelope.response_view(&reduced).into_value();
+            assert!(!inspection.to_string().contains("private"), "{inspection}");
+        }
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 0);
+        router.shutdown().await;
+    }
 
     #[test]
     fn target_views_keep_null_routing_and_detailed_defaults() {

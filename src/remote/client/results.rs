@@ -7,7 +7,10 @@ use crate::{
         flow::{CHUNK_BYTES, Credits, WINDOW},
         protocol::{ImageId, PayloadEvent, PayloadId, PayloadOpen, RemoteToolOutput},
     },
-    tool::output::{CaptureEvent, OutputEvent, OutputSink},
+    tool::{
+        diagnostic::{DiagnosticContext, FailureSite, Operation, Subject},
+        output::{CaptureEvent, OutputEvent, OutputSink},
+    },
 };
 use tokio::{
     io::{AsyncSeekExt as _, AsyncWriteExt as _},
@@ -61,20 +64,21 @@ impl Results {
             .reserve()
             .map_err(|_| protocol("payload flow-control overflow"))?;
         if let std::collections::hash_map::Entry::Vacant(entry) = self.transfers.entry(request_id) {
-            let context = state
+            let (context, destination) = state
                 .lock()
                 .await
                 .pending
                 .get(&request_id)
-                .map(|pending| pending.context.clone())
+                .map(|pending| (pending.context.clone(), pending.destination.clone()))
                 .ok_or_else(|| protocol("payload for unknown request"))?;
             let (sender, receiver) = mpsc::channel(WINDOW + 1);
             let writer = writer.clone();
             let stopped = self.stopped.clone();
             self.tasks.spawn(async move {
                 let result = Ingestion::new(&context)
-                    .run(context, writer, receiver, stopped)
-                    .await;
+                    .run(context, destination, writer, receiver, stopped)
+                    .await
+                    .map_err(|error| host_output_error(error, Operation::Receive));
                 (request_id, result)
             });
             entry.insert(Transfer::Receiving(sender));
@@ -112,8 +116,12 @@ impl Results {
         state: &Mutex<ConnectionState>,
         completed: Result<(RequestId, Result<ReceivedResult, RemoteError>), tokio::task::JoinError>,
     ) -> Result<(), RemoteError> {
-        let (request_id, result) =
-            completed.map_err(|error| RemoteError::ConnectionTask(error.to_string()))?;
+        let (request_id, result) = completed.map_err(|_| {
+            host_output_error(
+                RemoteError::ConnectionTask("remote output persistence task failed".into()),
+                Operation::Receive,
+            )
+        })?;
         self.transfers.remove(&request_id);
         let result = result?;
         let pending = state
@@ -125,6 +133,13 @@ impl Results {
         let _ = pending.sender.send(Ok(result));
         Ok(())
     }
+}
+
+fn host_output_error(error: impl Into<RemoteError>, operation: Operation) -> RemoteError {
+    error.into().fallback_context(
+        DiagnosticContext::new(operation, Subject::Label("remote output".into()))
+            .at(FailureSite::Host),
+    )
 }
 
 fn protocol(message: &str) -> RemoteError {
@@ -176,6 +191,7 @@ impl Ingestion {
     async fn run(
         mut self,
         context: ToolContext,
+        destination: ExecutionLocation,
         writer: Arc<Mutex<RequestWriter>>,
         mut receiver: mpsc::Receiver<Message>,
         stopped: tokio_util::sync::CancellationToken,
@@ -201,10 +217,10 @@ impl Ingestion {
                                 self.receive(&context, event).await?;
                             }
                         }
-                        return Err(error.into());
+                        return Err(transport_error(error, Operation::Send));
                     }
                 }
-                Message::Terminal => return self.finish(),
+                Message::Terminal => return self.finish(&destination),
             }
         }
         Err(protocol("payload stream closed before terminal response"))
@@ -225,7 +241,15 @@ impl Ingestion {
                 let captures = self.captures.clone();
                 tokio::task::spawn_blocking(move || captures.send(OutputEvent::Capture(event)))
                     .await
-                    .map_err(|error| RemoteError::ConnectionTask(error.to_string()))??;
+                    .map_err(|_| {
+                        host_output_error(
+                            RemoteError::ConnectionTask(
+                                "remote capture persistence task failed".into(),
+                            ),
+                            Operation::Capture,
+                        )
+                    })?
+                    .map_err(|error| host_output_error(error, Operation::Capture))?;
             }
             PayloadEvent::Open(PayloadOpen::Image { id, file }) => {
                 let std::collections::hash_map::Entry::Vacant(entry) = self.images.entry(id) else {
@@ -275,7 +299,9 @@ impl Ingestion {
                 let ResultPayload::Receiving(file) = &mut self.result else {
                     return Err(protocol("data for inactive result"));
                 };
-                file.write_all(&data).await?;
+                file.write_all(&data)
+                    .await
+                    .map_err(|error| host_output_error(error, Operation::WriteCapture))?;
             }
             PayloadEvent::Finish {
                 id: PayloadId::Result,
@@ -283,22 +309,43 @@ impl Ingestion {
                 let ResultPayload::Receiving(mut file) = std::mem::take(&mut self.result) else {
                     return Err(protocol("finish for inactive result"));
                 };
-                file.flush().await?;
-                file.rewind().await?;
+                file.flush()
+                    .await
+                    .map_err(|error| host_output_error(error, Operation::FinishCapture))?;
+                file.rewind()
+                    .await
+                    .map_err(|error| host_output_error(error, Operation::ReadCapture))?;
                 let file = file.into_std().await;
                 let result = tokio::task::spawn_blocking(move || {
                     serde_json::from_reader(std::io::BufReader::new(file))
                 })
                 .await
-                .map_err(|error| RemoteError::ConnectionTask(error.to_string()))?
-                .map_err(|error| RemoteError::Protocol(error.to_string()))?;
+                .map_err(|_| {
+                    host_output_error(
+                        RemoteError::ConnectionTask("remote result decoding task failed".into()),
+                        Operation::Deserialize,
+                    )
+                })?
+                .map_err(|error| {
+                    host_output_error(
+                        RemoteError::Protocol(error.to_string()),
+                        Operation::Deserialize,
+                    )
+                })?;
                 self.result = ResultPayload::Finished(result);
             }
         }
         Ok(())
     }
 
-    fn output(&mut self, output: RemoteToolOutput) -> Result<ToolOutput, RemoteError> {
+    fn output(
+        &mut self,
+        mut output: RemoteToolOutput,
+        location: &ExecutionLocation,
+    ) -> Result<ToolOutput, RemoteError> {
+        if let Some(diagnostic) = &mut output.diagnostic {
+            diagnostic.bind_worker(location);
+        }
         let captures = self.captures.select(output.captures)?;
         let images = output
             .images
@@ -313,10 +360,11 @@ impl Ingestion {
             .with_images(images)
             .with_captures(captures);
         local.streams = output.streams;
+        local.diagnostic = output.diagnostic;
         Ok(local)
     }
 
-    fn finish(mut self) -> Result<ReceivedResult, RemoteError> {
+    fn finish(mut self, location: &ExecutionLocation) -> Result<ReceivedResult, RemoteError> {
         if self
             .images
             .values()
@@ -330,20 +378,19 @@ impl Ingestion {
             ));
         };
         Ok(match result {
-            Ok(output) => ReceivedResult(Ok(self.output(output)?)),
+            Ok(output) => ReceivedResult(Ok(self.output(output, location)?)),
             Err(mut error) => {
                 let error_output = error
                     .output
                     .take()
-                    .map(|output| self.output(*output))
+                    .map(|output| self.output(*output, location))
                     .transpose()?;
-                ReceivedResult(Err(if error.denial.is_some() {
-                    RemoteError::OperationDenied(error.message)
-                } else {
-                    RemoteError::Remote {
-                        message: error.message,
-                        output: error_output.map(Box::new),
-                    }
+                // A shim's internal root (and any other claimed site) is relative
+                // to this routed invocation, not evidence of a host-side location.
+                error.diagnostic.bind_worker(location);
+                ReceivedResult(Err(RemoteError::Remote {
+                    diagnostic: error.diagnostic,
+                    output: error_output.map(Box::new),
                 }))
             }
         })
@@ -386,6 +433,79 @@ mod tests {
         PayloadEvent::Capture(CaptureEvent::Finish {
             id: CaptureId::new(id).unwrap(),
         })
+    }
+
+    #[tokio::test]
+    async fn wire_diagnostics_bind_only_to_the_trusted_invocation_location() {
+        use crate::{
+            execution::ExecutionLocation,
+            tool::diagnostic::{Cause, Diagnostic, IoKind},
+        };
+
+        let runtime = crate::tests::TestRuntime::new().await;
+        let context = fixture_context(&runtime);
+        let trusted = ExecutionLocation::named("bastion", "/trusted/workspace".into());
+        for claimed in [
+            FailureSite::Invocation,
+            FailureSite::Host,
+            FailureSite::Execution(ExecutionLocation::root("/worker/root".into())),
+            FailureSite::Execution(ExecutionLocation::named("forged", "/forged".into())),
+        ] {
+            for failed in [false, true] {
+                let diagnostic = Diagnostic::new(
+                    DiagnosticContext::new(Operation::Read, Subject::path("missing"))
+                        .at(claimed.clone())
+                        .effects(Effects::Unchanged),
+                    Cause::Io {
+                        kind: IoKind::NotFound,
+                        code: Some(2),
+                        detail: None,
+                    },
+                );
+                let output = RemoteToolOutput {
+                    diagnostic: Some(diagnostic.clone()),
+                    value: json!({"kind":"error", "error":{"message":"unrendered"}}),
+                    images: Vec::new(),
+                    captures: Vec::new(),
+                    streams: StreamEnd::Cut,
+                };
+                let result = if failed {
+                    Err(RemoteToolError {
+                        diagnostic: Box::new(diagnostic),
+                        output: Some(Box::new(output)),
+                    })
+                } else {
+                    Ok(output)
+                };
+                let mut ingest = Ingestion::new(&context);
+                ingest.result = ResultPayload::Finished(
+                    serde_json::from_slice(&serde_json::to_vec(&result).unwrap()).unwrap(),
+                );
+                let output = match ingest.finish(&trusted).unwrap().0 {
+                    Ok(output) => output,
+                    Err(error) => {
+                        let (diagnostic, output) = error.into_tool_error().into_parts();
+                        assert_eq!(diagnostic.context.operation, Operation::Read);
+                        assert_eq!(diagnostic.context.subject, Subject::path("missing"));
+                        assert_eq!(diagnostic.context.effects, Effects::Unchanged);
+                        assert_eq!(
+                            diagnostic.context.site,
+                            FailureSite::Execution(trusted.clone())
+                        );
+                        output.unwrap()
+                    }
+                };
+                assert_eq!(output.streams, StreamEnd::Cut);
+                let diagnostic = output.diagnostic.unwrap();
+                assert_eq!(diagnostic.context.operation, Operation::Read);
+                assert_eq!(diagnostic.context.subject, Subject::path("missing"));
+                assert_eq!(diagnostic.context.effects, Effects::Unchanged);
+                assert_eq!(
+                    diagnostic.context.site,
+                    FailureSite::Execution(trusted.clone())
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -487,6 +607,7 @@ mod tests {
                 String::new()
             };
             let output = RemoteToolOutput {
+                diagnostic: None,
                 value: json!({"content":"", "empty":"", "replaced":"", "partial":"", "large": large}),
                 images: vec![valid.clone(), invalid],
                 captures: selected
@@ -497,8 +618,9 @@ mod tests {
             };
             let result = if failed {
                 Err(RemoteToolError {
-                    message: "failure with output".into(),
-                    denial: None,
+                    diagnostic: Box::new(
+                        crate::tool::ToolError::Failed("failure with output".into()).diagnostic(),
+                    ),
                     output: Some(Box::new(output)),
                 })
             } else {
@@ -529,7 +651,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let received = ingest.finish();
+            let received = ingest.finish(context.execution_location());
             if !valid_selection {
                 assert!(received.is_err());
                 continue;
@@ -583,7 +705,14 @@ mod tests {
             let call_connection = connection.clone();
             let call_context = context.clone();
             let call = tokio::spawn(async move {
-                call_tool(&call_connection, "read".into(), json!({}), &call_context).await
+                call_tool(
+                    &call_connection,
+                    "read".into(),
+                    json!({}),
+                    &call_context,
+                    call_context.execution_location().clone(),
+                )
+                .await
             });
             assert!(matches!(
                 bounded(read_frame::<_, Request>(&mut requests))
@@ -630,6 +759,7 @@ mod tests {
                     &mut peer,
                     RequestId::FIRST,
                     Ok(RemoteToolOutput {
+                        diagnostic: None,
                         value: json!({}),
                         images: Vec::new(),
                         captures: Vec::new(),

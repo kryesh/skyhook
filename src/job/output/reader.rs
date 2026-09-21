@@ -11,6 +11,8 @@ const READ_AHEAD: usize = 256 * 1024;
 /// A pageable field: a stored capture, or a value rendered on demand.
 pub(crate) enum Source {
     Capture(CaptureReader),
+    /// Private renderings never enter shared storage; closing the file discards them.
+    Temporary(std::fs::File),
     Memory(Cursor<Vec<u8>>),
 }
 
@@ -39,6 +41,31 @@ impl Source {
                         + usize::from(extent.bytes > 0 && !extent.ends_line),
                 }
             }
+            Self::Temporary(file) => {
+                let position = file.stream_position()?;
+                file.rewind()?;
+                let mut reader = BufReader::new(file);
+                let mut index = LineIndex {
+                    bytes: 0,
+                    total_lines: 0,
+                };
+                let mut ends_line = true;
+                loop {
+                    check_cancelled(cancellation)?;
+                    let bytes = reader.fill_buf()?;
+                    if bytes.is_empty() {
+                        break;
+                    }
+                    index.bytes += bytes.len() as u64;
+                    index.total_lines += bytes.iter().filter(|&&byte| byte == b'\n').count();
+                    ends_line = bytes.last() == Some(&b'\n');
+                    let count = bytes.len();
+                    reader.consume(count);
+                }
+                index.total_lines += usize::from(!ends_line);
+                reader.seek(SeekFrom::Start(position))?;
+                index
+            }
             Self::Memory(cursor) => {
                 let bytes = cursor.get_ref();
                 LineIndex {
@@ -60,7 +87,7 @@ impl Source {
                     .map_err(std::io::Error::other)?;
                 Ok((offset, usize::try_from(line).unwrap_or(usize::MAX)))
             }
-            Self::Memory(_) => Ok((0, 1)),
+            Self::Temporary(_) | Self::Memory(_) => Ok((0, 1)),
         }
     }
 
@@ -98,6 +125,7 @@ impl Read for Source {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Capture(capture) => capture.read(buffer),
+            Self::Temporary(file) => file.read(buffer),
             Self::Memory(cursor) => cursor.read(buffer),
         }
     }
@@ -107,6 +135,7 @@ impl Seek for Source {
     fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
         match self {
             Self::Capture(capture) => capture.seek(position),
+            Self::Temporary(file) => file.seek(position),
             Self::Memory(cursor) => cursor.seek(position),
         }
     }

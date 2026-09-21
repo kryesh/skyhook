@@ -332,23 +332,11 @@ impl<W: AsyncWrite + Unpin + Send + 'static> LocalAuthorizer for ForwardAuthoriz
     }
 }
 
-fn remote_error(error: LocalError) -> RemoteToolError {
-    match error {
-        LocalError::Denied(message) => RemoteToolError {
-            message,
-            denial: Some(crate::tool::Denial::permission_denied()),
-            output: None,
-        },
-        LocalError::FailedWithOutput { message, output } => RemoteToolError {
-            message,
-            denial: None,
-            output: Some(Box::new((*output).into())),
-        },
-        error => RemoteToolError {
-            message: error.to_string(),
-            denial: None,
-            output: None,
-        },
+pub(super) fn remote_error(error: LocalError) -> RemoteToolError {
+    let (diagnostic, output) = error.into_parts();
+    RemoteToolError {
+        diagnostic: Box::new(diagnostic),
+        output: output.map(|output| Box::new(output.into())),
     }
 }
 
@@ -413,6 +401,8 @@ mod tests {
                 "remote",
                 authorization.clone(),
                 Arc::new(RejectSensitivePrompts),
+                &tokio_util::task::TaskTracker::new(),
+                CancellationToken::new(),
             )
             .await
             .unwrap();
@@ -461,7 +451,14 @@ mod tests {
             let name = name.to_owned();
             lease
                 .start_supervised(async move {
-                    let result = connection.execute(name, arguments, &context).await;
+                    let result = connection
+                        .execute(
+                            name,
+                            arguments,
+                            &context,
+                            context.execution_location().clone(),
+                        )
+                        .await;
                     if context.is_cancelled() {
                         Err(crate::tool::ToolError::Cancelled)
                     } else {
@@ -621,6 +618,14 @@ mod tests {
         let result = worker.result(job).await;
         assert_eq!(result.state, JobState::Completed);
         assert_eq!(result.output.unwrap()["kind"], "error");
+        // The completed read error is bound to the invocation's trusted location.
+        assert_eq!(
+            result.output_diagnostic.unwrap().context.site,
+            crate::tool::diagnostic::FailureSite::Execution(ExecutionLocation::named(
+                "remote",
+                std::fs::canonicalize(".").unwrap(),
+            )),
+        );
         worker.finish().await;
     }
 

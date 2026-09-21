@@ -7,7 +7,11 @@ mod catalog;
 mod connection;
 
 use super::config::McpServerConfig;
-use crate::tool::policy::{Capability, CapabilitySet};
+use crate::tool::{
+    ToolError,
+    diagnostic::{DiagnosticContext, Effects, Operation, Subject},
+    policy::{Capability, CapabilitySet},
+};
 use catalog::bounded_json_size;
 use connection::{Server, connect_one};
 use futures_util::{StreamExt, stream};
@@ -30,16 +34,52 @@ pub enum McpError {
     Configuration(String),
     #[error("MCP startup failed: {0}")]
     Startup(String),
-    #[error("MCP operation cancelled; an in-flight call may have executed")]
+    #[error("MCP operation cancelled")]
     Cancelled,
-    #[error("MCP operation timed out; an in-flight call may have executed")]
+    #[error("MCP operation timed out")]
     Timeout,
     #[error("MCP manager is shut down")]
     Closed,
-    #[error("MCP tool is not in the startup catalog: {server}/{tool}")]
+    #[error("MCP tool is not in the startup catalog")]
     UnknownTool { server: String, tool: String },
     #[error("MCP request failed: {0}")]
     Request(String),
+    #[error("server JSON-RPC error {0}")]
+    JsonRpc(i32),
+    #[error("MCP I/O failed: {}", .0.kind())]
+    Io(#[source] std::io::Error),
+    #[error("MCP HTTP request failed with status {0}")]
+    HttpStatus(u16),
+    #[error("MCP transport closed")]
+    TransportClosed,
+    #[error("unexpected MCP response")]
+    UnexpectedResponse,
+    #[error("MCP transport failed")]
+    Transport,
+    #[error("MCP authentication required")]
+    AuthenticationRequired,
+    #[error("MCP authorization scope is insufficient")]
+    InsufficientScope,
+    #[error("MCP session expired")]
+    SessionExpired,
+    #[error("MCP response could not be decoded")]
+    Decode,
+    #[error("MCP protocol versions are incompatible")]
+    ProtocolVersion,
+    #[error("MCP subscription buffer was exceeded")]
+    SubscriptionLagged,
+    #[error("MCP input-required round limit was exceeded")]
+    InputRequiredRoundsExceeded,
+}
+
+impl From<McpError> for ToolError {
+    fn from(error: McpError) -> Self {
+        match error {
+            McpError::Cancelled => Self::Cancelled,
+            McpError::Io(error) => Self::Io(error),
+            other => Self::Failed(other.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +226,25 @@ impl McpManager {
         tool: &str,
         arguments: Map<String, Value>,
         cancel: CancellationToken,
+    ) -> Result<CallToolResult, ToolError> {
+        let mut stage = (Operation::Prepare, Effects::NotStarted);
+        self.call_staged(server, tool, arguments, cancel, &mut stage)
+            .await
+            .map_err(|error| {
+                let subject = Subject::Label(format!("MCP server {server}, tool {tool}"));
+                ToolError::from(error)
+                    .context(DiagnosticContext::new(stage.0, subject).effects(stage.1))
+            })
+    }
+
+    /// `stage` names the step a failure interrupted and what it left behind.
+    async fn call_staged(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: Map<String, Value>,
+        cancel: CancellationToken,
+        stage: &mut (Operation, Effects),
     ) -> Result<CallToolResult, McpError> {
         if self.closed.is_cancelled() {
             return Err(McpError::Closed);
@@ -217,24 +276,27 @@ impl McpManager {
         let send = server
             .peer
             .send_cancellable_request(request, PeerRequestOptions::default());
+        // Once submission starts, neither cancellation nor a failed transport
+        // proves that the server did not execute the request. Never replay it.
+        *stage = (Operation::Send, Effects::MayHaveExecuted);
         let handle = guarded(&self.closed, &cancel, deadline, send)
             .await?
             .map_err(request_error)?;
+        *stage = (Operation::Receive, Effects::MayHaveExecuted);
         let mut handle = CancelOnDrop(Some(handle));
         let response = &mut handle.0.as_mut().expect("active request").rx;
         let result = match guarded(&self.closed, &cancel, deadline, response).await {
             Ok(Ok(Ok(ServerResult::CallToolResult(result)))) => {
                 if bounded_json_size(&result, MAX_RESULT_BYTES).is_none() {
+                    *stage = (Operation::Receive, Effects::OutputIncomplete);
                     Err(McpError::Request("tool result exceeds size limit".into()))
                 } else {
                     Ok(result)
                 }
             }
-            Ok(Ok(Ok(_))) => Err(McpError::Request(
-                "unexpected response to tools/call".into(),
-            )),
+            Ok(Ok(Ok(_))) => Err(McpError::UnexpectedResponse),
             Ok(Ok(Err(error))) => Err(request_error(error)),
-            Ok(Err(_)) => Err(McpError::Request("transport closed".into())),
+            Ok(Err(_)) => Err(McpError::TransportClosed),
             Err(error) => Err(error),
         };
         if !matches!(
@@ -278,17 +340,19 @@ async fn guarded<T>(
     }
 }
 
-// SDK transport diagnostics can contain credential-bearing URLs. Never expose
-// them to the model or logs; only bounded remote JSON-RPC messages are retained.
+// SDK diagnostics and JSON-RPC messages may echo credential-bearing URLs or
+// request arguments. Keep only typed classifications and protocol error codes.
 fn request_error(error: ServiceError) -> McpError {
     match error {
-        ServiceError::McpError(error) => {
-            let message: String = error.message.chars().take(1024).collect();
-            McpError::Request(format!("server JSON-RPC error {}: {message}", error.code.0))
-        }
+        ServiceError::McpError(error) => McpError::JsonRpc(error.code.0),
+        ServiceError::TransportSend(error) => super::transport::transport_error(error),
+        ServiceError::TransportClosed => McpError::TransportClosed,
+        ServiceError::UnexpectedResponse => McpError::UnexpectedResponse,
+        ServiceError::SubscriptionLagged { .. } => McpError::SubscriptionLagged,
+        ServiceError::InputRequiredRoundsExceeded { .. } => McpError::InputRequiredRoundsExceeded,
         ServiceError::Timeout { .. } => McpError::Timeout,
         ServiceError::Cancelled { .. } => McpError::Cancelled,
-        _ => McpError::Request("MCP transport or protocol failure".into()),
+        _ => McpError::Transport,
     }
 }
 
@@ -296,6 +360,7 @@ fn request_error(error: ServiceError) -> McpError {
 mod tests {
     use super::*;
     use crate::mcp::{config::McpServerConfig, manager::McpManager};
+    use crate::tool::diagnostic::Cause;
     use serde_json::{Map, Value, json};
     use std::{collections::BTreeMap, path::Path, time::Duration};
     use tempfile::TempDir;
@@ -350,6 +415,11 @@ def handle(request):
         if mode == 'repeated_cursor':
             result = {'tools': [], 'nextCursor': 'repeat'}
             send({'jsonrpc': '2.0', 'id': ident, 'result': result})
+            return
+        if mode == 'rpc_error':
+            send({'jsonrpc': '2.0', 'id': ident,
+                  'error': {'code': -32602, 'message': 'private-discovery-message',
+                            'data': {'secret': 'private-discovery-payload'}}})
             return
         cursor = params.get('cursor')
         if cursor is None:
@@ -461,10 +531,19 @@ for line in sys.stdin:
     pub(super) async fn fixture_call(
         manager: &McpManager,
         tool: &str,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResult, ToolError> {
         manager
             .call("fixture", tool, Map::new(), CancellationToken::new())
             .await
+    }
+
+    fn stage(error: ToolError) -> (Operation, Effects) {
+        let context = error.diagnostic().context;
+        (context.operation, context.effects)
+    }
+
+    fn is(error: &ToolError, expected: McpError) -> bool {
+        error.diagnostic().cause == ToolError::from(expected).diagnostic().cause
     }
 
     pub(super) async fn shutdown(manager: &McpManager) {
@@ -588,26 +667,43 @@ for line in sys.stdin:
         let error = fixture_call(&manager, "rpc_error")
             .await
             .expect_err("JSON-RPC error must fail the call");
-        assert!(
-            error.to_string().contains("fixture protocol error"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("-32602"), "{error}");
         // A failed call must not poison a healthy server session.
         assert!(fixture_call(&manager, "echo").await.is_ok());
         // Pre-cancelled and unknown calls are not sent to the server.
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let result = manager.call("fixture", "slow", Map::new(), cancel).await;
-        assert!(matches!(result, Err(McpError::Cancelled)), "{result:?}");
+        let error = manager
+            .call("fixture", "slow", Map::new(), cancel)
+            .await
+            .unwrap_err();
+        assert!(is(&error, McpError::Cancelled), "{error:?}");
+        assert_eq!(stage(error), (Operation::Prepare, Effects::NotStarted));
+        // Cancellation while waiting for a call slot is also definitely pre-send.
+        let permits = manager.servers["fixture"]
+            .calls
+            .acquire_many(16)
+            .await
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let call = manager.call("fixture", "slow", Map::new(), cancel.clone());
+        tokio::pin!(call);
+        assert!(futures_util::poll!(&mut call).is_pending());
+        cancel.cancel();
+        let error = call.await.unwrap_err();
+        assert!(is(&error, McpError::Cancelled), "{error:?}");
+        assert_eq!(stage(error), (Operation::Prepare, Effects::NotStarted));
         assert!(!fixture.directory.path().join("started").exists());
-        let result = fixture_call(&manager, "not-advertised").await;
-        assert!(
-            matches!(result, Err(McpError::UnknownTool { .. })),
-            "{result:?}"
-        );
+        drop(permits);
+        let error = fixture_call(&manager, "not-advertised").await.unwrap_err();
+        let unknown = McpError::UnknownTool {
+            server: "fixture".into(),
+            tool: "not-advertised".into(),
+        };
+        assert!(is(&error, unknown), "{error:?}");
         shutdown(&manager).await;
-        let result = fixture_call(&manager, "echo").await;
-        assert!(matches!(result, Err(McpError::Closed)), "{result:?}");
+        let error = fixture_call(&manager, "echo").await.unwrap_err();
+        assert!(is(&error, McpError::Closed), "{error:?}");
     }
 
     #[tokio::test]
@@ -628,7 +724,17 @@ for line in sys.stdin:
         })
         .await
         .expect("cancellation interrupts the pending tool call");
-        assert!(matches!(result, Err(McpError::Cancelled)), "{result:?}");
+        let error = result.unwrap_err();
+        let diagnostic = error.diagnostic();
+        assert_eq!(diagnostic.cause, Cause::Cancelled);
+        assert_eq!(
+            diagnostic.context,
+            DiagnosticContext::new(
+                Operation::Receive,
+                Subject::Label("MCP server fixture, tool slow".into())
+            )
+            .effects(Effects::MayHaveExecuted)
+        );
         wait_for_file(Path::new(&cancelled)).await;
         fixture_call(&manager, "echo").await.unwrap();
 
@@ -657,14 +763,16 @@ for line in sys.stdin:
         let result = tokio::time::timeout(Duration::from_secs(5), call)
             .await
             .expect("configured timeout must stop a pending call");
-        assert!(matches!(result, Err(McpError::Timeout)), "{result:?}");
+        let error = result.unwrap_err();
+        assert!(is(&error, McpError::Timeout), "{error:?}");
+        assert_eq!(stage(error), (Operation::Receive, Effects::MayHaveExecuted));
         // The timed-out call was already sent.
         wait_for_file(&fixture.directory.path().join("started")).await;
         // The session stays usable; under load an echo may itself exceed the short timeout.
         let echo = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match fixture_call(&manager, "echo").await {
-                    Err(McpError::Timeout) => {}
+                    Err(error) if is(&error, McpError::Timeout) => {}
                     other => break other,
                 }
             }
@@ -682,6 +790,10 @@ for line in sys.stdin:
         assert!(
             error.to_string().contains("result exceeds size limit"),
             "{error}"
+        );
+        assert_eq!(
+            stage(error),
+            (Operation::Receive, Effects::OutputIncomplete)
         );
         shutdown(&manager).await;
     }
@@ -727,9 +839,17 @@ for line in sys.stdin:
         let secret = "https://user:password@example.invalid/mcp?token=private-secret";
         let error = std::io::Error::other(secret);
         let error = DynamicTransportError::new::<FixtureTransport, RoleClient>(error);
-        let rendered = request_error(ServiceError::TransportSend(error)).to_string();
+        let error = request_error(ServiceError::TransportSend(error));
+        assert!(matches!(&error, McpError::Io(error) if error.get_ref().is_none()));
+        let rendered = ToolError::from(error).to_string();
         for leaked in ["private-secret", "password", "example.invalid"] {
             assert!(!rendered.contains(leaked));
         }
+        // JSON-RPC messages are server-controlled; only the code is retained.
+        let rpc = rmcp::model::ErrorData::invalid_params(secret, Some(json!({"secret":secret})));
+        assert!(matches!(
+            request_error(ServiceError::McpError(rpc)),
+            McpError::JsonRpc(-32602)
+        ));
     }
 }

@@ -66,7 +66,7 @@ impl ToolExecutor {
         let route = router
             .resolve(selected, &self.capabilities)
             .await
-            .map_err(ToolError::invalid)?;
+            .map_err(|error| ToolError::from(error.into_admission_error()))?;
         let definition = route.destination();
         Ok(SelectedLocation {
             location: ExecutionLocation::select(
@@ -141,17 +141,35 @@ impl ToolExecutor {
             .await?;
         let selected = self
             .resolve_workspace_invocation(&tool, &original_arguments)
-            .await?;
+            .await
+            .map_err(|error| {
+                error.contextualize(
+                    DiagnosticContext::new(Operation::Lookup, Subject::argument(["target"]))
+                        .at(FailureSite::Host),
+                    &self.capabilities,
+                )
+            })?;
         if tool.placement() == ToolPlacement::TargetedWorkspace {
             arguments
                 .as_object_mut()
                 .ok_or(ToolError::ArgumentsMustBeObject)?
                 .remove("target");
         }
-        tool.validate_arguments(&arguments)?;
+        // Validation failures belong to the selected location, not the caller's.
+        let invalid = |error: ExecutionError| {
+            error.contextualize(
+                DiagnosticContext::new(Operation::Validate, Subject::Tool(name.to_owned())).at(
+                    FailureSite::bound(&selected.location, tool.placement() == ToolPlacement::Host),
+                ),
+                &self.capabilities,
+            )
+        };
+        tool.validate_arguments(&arguments)
+            .map_err(|error| invalid(error.into()))?;
         let PathPreflight {
             permissions: path_permissions,
             outcome,
+            paths: path_facts,
         } = if selected.route.is_none() {
             preflight_path_arguments(
                 &tool,
@@ -160,11 +178,13 @@ impl ToolExecutor {
                 &self.shared.root_location.workspace,
                 &mut arguments,
             )
-            .await?
+            .await
+            .map_err(|error| invalid(error.into()))?
         } else {
             PathPreflight {
                 permissions: Vec::new(),
                 outcome: PathOutcome::Ready,
+                paths: Vec::new(),
             }
         };
         // Remote location frames spell the workspace as text. Local handlers use
@@ -212,11 +232,13 @@ impl ToolExecutor {
         // Schema-valid input that the typed handler rejects still owns a job,
         // approval, and failure. A remote dispatch admits only on its destination.
         let dispatch = match (outcome, selected.route) {
-            (PathOutcome::ReadError(output), _) => {
-                InvocationDispatch::ReadError(ToolOutput::new(output))
-            }
+            (PathOutcome::ReadError { value, diagnostic }, _) => InvocationDispatch::ReadError(
+                Box::new(ToolOutput::new(value).with_diagnostic(*diagnostic)),
+            ),
             (PathOutcome::Ready, Some(remote)) => InvocationDispatch::Remote { remote, arguments },
-            (PathOutcome::Ready, None) => InvocationDispatch::Local(tool.admit(arguments)),
+            (PathOutcome::Ready, None) => {
+                InvocationDispatch::Local(tool.admit(arguments, &original_arguments))
+            }
         };
         Ok(InvocationPlan {
             origin: if matches!(kind, InvocationKind::Model) {
@@ -231,6 +253,7 @@ impl ToolExecutor {
             caller_location: self.caller_location.clone(),
             execution_location: selected.location,
             permissions,
+            path_facts,
             parent,
             authorization_scope,
             background,
@@ -430,9 +453,9 @@ pub(super) mod tests {
                     .run_host(&runtime.agent, "network_test", arguments)
                     .await
                     .unwrap_err();
-                assert!(
-                    matches!(error, ExecutionError::UnavailableTool(_)),
-                    "{error:?}"
+                assert_eq!(
+                    error.diagnostic().cause,
+                    Cause::Message("tool `network_test` is unavailable in this context".into())
                 );
                 assert!(policy.requests.lock().unwrap().is_empty());
             }
@@ -447,8 +470,8 @@ pub(super) mod tests {
             .await
             .unwrap_err();
         assert!(matches!(
-            error,
-            ExecutionError::Tool(ToolError::InvalidArguments(_))
+            error.diagnostic().cause,
+            Cause::InvalidArguments(_)
         ));
         assert!(policy.requests.lock().unwrap().is_empty());
     }
@@ -568,7 +591,10 @@ pub(super) mod tests {
             .run_host(&runtime.agent, "network_test", arguments)
             .await
             .unwrap_err();
-        assert!(matches!(error, ExecutionError::Denied(_)), "{error:?}");
+        assert!(
+            matches!(error.diagnostic().cause, Cause::Denied(_)),
+            "{error:?}"
+        );
         let all = policy.requests.lock().unwrap();
         assert_eq!(all.len(), 4);
         for request in &all[..3] {
@@ -621,7 +647,7 @@ pub(super) mod tests {
                 .execute_model(runtime.agent.clone(), "read", arguments, None)
                 .await
                 .unwrap_err();
-            assert!(matches!(error, ExecutionError::Denied(_)));
+            assert!(matches!(error.diagnostic().cause, Cause::Denied(_)));
         }
     }
 
@@ -653,12 +679,19 @@ pub(super) mod tests {
             )
         };
         let error = read("missing/nested").await.unwrap_err();
-        assert!(
-            matches!(error, ExecutionError::Tool(ToolError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound)
-        );
         assert!(matches!(
-            read(".").await.unwrap_err(),
-            ExecutionError::Failed { .. }
+            error.diagnostic().cause,
+            Cause::Io {
+                kind: crate::tool::diagnostic::IoKind::NotFound,
+                ..
+            }
+        ));
+        assert!(matches!(
+            read(".").await.unwrap_err().diagnostic().cause,
+            Cause::Io {
+                kind: crate::tool::diagnostic::IoKind::PermissionDenied,
+                ..
+            }
         ));
     }
 
@@ -708,7 +741,7 @@ pub(super) mod tests {
                 .run_host(&runtime.agent, "network_test", arguments)
                 .await;
             assert!(
-                matches!(result, Err(ExecutionError::Tool(ToolError::InvalidArguments(message))) if message.contains("losslessly"))
+                matches!(result.unwrap_err().diagnostic().cause, Cause::InvalidArguments(message) if message.contains("losslessly"))
             );
             assert!(policy.requests.lock().unwrap().is_empty());
         }
@@ -744,10 +777,14 @@ pub(super) mod tests {
             .unwrap();
         let policy = RecordingPolicy::allowing();
         let executor = runtime.executor_with_policy(builder, policy.clone());
-        let expected = serde_json::from_value::<Count>(serde_json::json!({"count": 300}))
-            .err()
-            .unwrap()
-            .to_string();
+        let expected = crate::tool::diagnostic::deserialize_arguments::<Count>(
+            serde_json::json!({"count": 300}),
+        )
+        .err()
+        .unwrap();
+        let Cause::InvalidArguments(expected) = expected.diagnostic().cause else {
+            panic!("typed admission classification must be retained");
+        };
         // The permissive JSON schema accepts this value; `u8` does not.
         let arguments = serde_json::json!({"count": 300});
         let plan = plan(&executor, &runtime.agent, "count", arguments.clone()).await;
@@ -757,7 +794,7 @@ pub(super) mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&error, ExecutionError::Failed { message, .. } if message.contains(&expected)),
+            matches!(error.diagnostic().cause, Cause::InvalidArguments(message) if message == expected),
             "{error:?}"
         );
         assert_eq!(policy.requests.lock().unwrap().len(), 1);

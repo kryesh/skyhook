@@ -1,6 +1,7 @@
 //! Collect job outcomes, import remote payloads, and present execution failures.
 
 use super::*;
+use crate::tool::diagnostic::safe_text;
 use thiserror::Error;
 
 #[derive(Clone, Copy)]
@@ -28,7 +29,7 @@ impl ToolExecutor {
             .jobs
             .present_output_with(
                 crate::job::output::OutputArgs::new(job),
-                &self.capabilities,
+                self.diagnostic_viewer(),
                 crate::job::output::OutputOptions::Model {
                     presentation: crate::job::OutputPresentation::Automatic,
                 },
@@ -74,7 +75,9 @@ impl ToolExecutor {
         let StartedExecution { job, background } = started;
         if background {
             let envelope = self.shared.jobs.metadata(job).await?;
-            let value = envelope.metadata_view(&self.capabilities).into_value();
+            let value = envelope
+                .metadata_view(self.diagnostic_viewer())
+                .into_value();
             return Ok(ExecutionResult {
                 job,
                 background: true,
@@ -84,6 +87,7 @@ impl ToolExecutor {
         }
         let mut envelope = self.shared.jobs.wait_foreground(job).await?;
         self.shared.jobs.hydrate_envelope(&mut envelope).await?;
+        envelope.render_diagnostics(self.diagnostic_viewer());
         if !envelope.state.is_terminal() {
             return Ok(ExecutionResult {
                 job,
@@ -91,8 +95,12 @@ impl ToolExecutor {
                 is_error: false,
                 output: ToolOutput::new(
                     match purpose {
-                        CollectionPurpose::Public(_) => envelope.response_view(&self.capabilities),
-                        CollectionPurpose::Native => envelope.metadata_view(&self.capabilities),
+                        CollectionPurpose::Public(_) => {
+                            envelope.response_view(self.diagnostic_viewer())
+                        }
+                        CollectionPurpose::Native => {
+                            envelope.metadata_view(self.diagnostic_viewer())
+                        }
                     }
                     .into_value(),
                 ),
@@ -105,15 +113,13 @@ impl ToolExecutor {
             // invocation's state, not the target's, determines is_error.
             let is_error = envelope.state != JobState::Completed;
             let value = if !is_error && policy == crate::tool::ToolResultPolicy::JobView {
-                envelope
-                    .output
-                    .take()
-                    .ok_or_else(|| ExecutionError::Failed {
-                        message: "job-output query completed without a response".into(),
-                        output: None,
-                    })?
+                envelope.output.take().ok_or_else(|| {
+                    ToolError::Failed("job-output query completed without a response".into())
+                })?
             } else {
-                envelope.response_view(&self.capabilities).into_value()
+                envelope
+                    .response_view(self.diagnostic_viewer())
+                    .into_value()
             };
             return Ok(ExecutionResult {
                 job,
@@ -129,21 +135,19 @@ impl ToolExecutor {
                 is_error: false,
                 output: ToolOutput::new(envelope.output.unwrap_or(Value::Null)).with_images(images),
             })
-        } else if envelope.denial.is_some() {
-            Err(ExecutionError::Denied(
-                envelope
-                    .error
-                    .unwrap_or_else(|| "operation denied".to_owned()),
-            ))
         } else {
-            Err(ExecutionError::Failed {
-                message: envelope
-                    .error
-                    .unwrap_or_else(|| format!("job ended as {:?}", envelope.state)),
-                output: envelope
-                    .output
-                    .map(|value| ToolOutput::new(value).with_images(images))
-                    .map(Box::new),
+            let diagnostic = envelope.diagnostic.unwrap_or_else(|| {
+                Diagnostic::new(
+                    DiagnosticContext::default(),
+                    Cause::Message(format!("job ended as {:?}", envelope.state)),
+                )
+            });
+            let output = envelope
+                .output
+                .map(|value| Box::new(ToolOutput::new(value).with_images(images)));
+            Err(ExecutionError::Failure {
+                failure: ToolError::from_diagnostic(diagnostic, output).into_failure(),
+                capabilities: self.capabilities.clone(),
             })
         }
     }
@@ -177,6 +181,11 @@ pub struct ExecutionResult {
 
 #[derive(Debug, Error)]
 pub enum ExecutionError {
+    #[error("{}", failure.diagnostic.render(capabilities))]
+    Failure {
+        failure: Box<crate::tool::invocation::OperationFailure<ToolOutput>>,
+        capabilities: CapabilitySet,
+    },
     #[error("unknown tool `{0}`")]
     UnknownTool(String),
     #[error("tool `{0}` is unavailable in this context")]
@@ -187,17 +196,24 @@ pub enum ExecutionError {
     ScriptUnavailable(String),
     #[error(transparent)]
     Tool(#[from] ToolError),
-    #[error(transparent)]
-    Job(#[from] JobError),
     #[error("tool authorization denied: {0}")]
     Denied(String),
-    #[error("tool execution failed: {message}")]
-    Failed {
-        message: String,
-        output: Option<Box<ToolOutput>>,
-    },
-    #[error("could not serialize tool result: {0}")]
-    Json(#[from] serde_json::Error),
+}
+
+impl From<JobError> for ExecutionError {
+    fn from(error: JobError) -> Self {
+        // Job state lives on the session host; the caller names the failed stage.
+        Self::Tool(
+            ToolError::from(error)
+                .fallback_context(DiagnosticContext::default().at(FailureSite::Host)),
+        )
+    }
+}
+
+impl From<serde_json::Error> for ExecutionError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Tool(error.into())
+    }
 }
 
 impl From<crate::tool::AdmissionError> for ExecutionError {
@@ -214,9 +230,14 @@ impl ExecutionError {
         tool: &str,
         parent: Option<JobId>,
         name: Option<&str>,
+        viewer: crate::tool::diagnostic::DiagnosticViewer<'_>,
     ) -> ToolOutput {
-        let failure = self.into_failure();
-        let (value, images) = failure.output.map_or((None, Vec::new()), |output| {
+        let message = match &self {
+            Self::Failure { .. } | Self::Tool(_) => self.diagnostic().render_for(viewer),
+            error => error.to_string(),
+        };
+        let (diagnostic, output) = self.into_tool_error().into_parts();
+        let (value, images) = output.map_or((None, Vec::new()), |output| {
             (Some(output.value), output.images)
         });
         let metadata = crate::job::JobMetadata {
@@ -225,39 +246,46 @@ impl ExecutionError {
             name: name.map(str::to_owned),
             ..Default::default()
         };
-        let view = crate::job::JobView::failure(failure.message, value, failure.denial, metadata);
+        let view = crate::job::JobView::failure(message, value, diagnostic.is_denial(), metadata);
         ToolOutput::new(view.into_value()).with_images(images)
     }
 
-    pub(crate) fn into_failure(self) -> super::ExecutionFailure {
-        let message = self.concise_message();
-        let denial = matches!(&self, Self::Denied(_) | Self::Tool(ToolError::Denied(_)))
-            .then(crate::tool::Denial::permission_denied);
-        let output = match self {
-            Self::Failed { output, .. } => output.map(|output| *output),
-            Self::Tool(ToolError::FailedWithOutput { output, .. }) => Some(*output),
-            _ => None,
-        };
-        ExecutionFailure {
-            message,
-            output,
-            denial,
-        }
-    }
-
-    pub(crate) fn concise_message(&self) -> String {
+    pub(crate) fn diagnostic(&self) -> Diagnostic {
         match self {
-            Self::Tool(error) => error.concise_message(),
-            Self::Failed { message, .. } => message.clone(),
-            _ => self.to_string(),
+            Self::Failure { failure, .. } => failure.diagnostic.clone(),
+            Self::Tool(error) => error.diagnostic(),
+            Self::Denied(reason) => {
+                Diagnostic::new(DiagnosticContext::default(), Cause::Denied(reason.clone()))
+            }
+            error => Diagnostic::new(
+                DiagnosticContext::default(),
+                Cause::Message(safe_text(&error.to_string())),
+            ),
         }
     }
-}
 
-pub(crate) struct ExecutionFailure {
-    pub message: String,
-    pub output: Option<ToolOutput>,
-    pub denial: Option<crate::tool::Denial>,
+    /// Complete missing boundary facts; those chosen nearer the failure win.
+    pub(super) fn contextualize(
+        self,
+        fallback: DiagnosticContext,
+        capabilities: &CapabilitySet,
+    ) -> Self {
+        let mut failure = self.into_tool_error().into_failure();
+        failure.diagnostic.context.fallback(fallback);
+        Self::Failure {
+            failure,
+            capabilities: capabilities.clone(),
+        }
+    }
+
+    /// Normalize once for tool adapters, preserving typed causes and partial results.
+    pub(crate) fn into_tool_error(self) -> ToolError {
+        match self {
+            Self::Failure { failure, .. } => ToolError::Failure(failure),
+            Self::Tool(error) => error,
+            error => ToolError::from_diagnostic(error.diagnostic(), None),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -303,10 +331,10 @@ mod tests {
                 crate::tool::ToolOptions::default(),
                 |_, args| async move {
                     if args.fail {
-                        Err(ToolError::FailedWithOutput {
-                            message: "expected failure".into(),
-                            output: Box::new(ToolOutput::new(json!({"partial": null}))),
-                        })
+                        Err(ToolError::with_output(
+                            "expected failure",
+                            ToolOutput::new(json!({"partial": null})),
+                        ))
                     } else {
                         Ok(Payload {
                             text: "x".repeat(PAYLOAD_BYTES),
@@ -318,60 +346,78 @@ mod tests {
             .unwrap();
         crate::tool::builtins::jobs::register(&mut builder, runtime.jobs.clone()).unwrap();
         let executor = runtime.executor(builder);
-        let call = |kind, tool: &'static str, args| {
-            executor.execute_as(kind, runtime.agent.clone(), tool, args, None)
-        };
-        for kind in [InvocationKind::Script, InvocationKind::Model] {
-            let response = call(kind, "payload", json!({})).await.unwrap();
-            assert!(!response.is_error);
-            let view = response.output.value;
-            assert_eq!(view.as_object().unwrap().len(), 7);
-            assert!(view["id"].as_u64().unwrap() > 0);
-            assert_eq!(view["state"], "completed");
-            assert_eq!(view["has_result"], true);
-            assert_eq!(view.get("error"), Some(&Value::Null));
-            assert_eq!(view.get("meta"), Some(&Value::Null));
-            assert_eq!(view["result"].get("nullable"), Some(&Value::Null));
-            let length = view["result"]["text"].as_str().unwrap().len();
-            if matches!(kind, InvocationKind::Script) {
-                assert_eq!(length, PAYLOAD_BYTES);
-                assert_eq!(view.get("presentation"), Some(&Value::Null));
-            } else {
-                assert!(length < PAYLOAD_BYTES);
-                assert_eq!(
-                    view["presentation"]["truncated"][0]["field"],
-                    "/result/text"
-                );
-                assert!(view["presentation"]["preview"].is_null());
-            }
-
-            let failure = call(kind, "payload", json!({"fail":true})).await.unwrap();
-            assert!(failure.is_error);
-            let target = failure.job;
-            let inspection = call(kind, "job_output", json!({"job":target}))
-                .await
-                .unwrap();
-            assert!(!inspection.is_error, "the inspection itself succeeded");
-            for response in [failure, inspection] {
+        for location in [
+            ExecutionLocation::root(runtime.root.path().to_owned()),
+            ExecutionLocation::named("worker", "/remote".into()),
+        ] {
+            let executor = executor.clone().with_location(location.clone());
+            let call = |kind, tool: &'static str, args| {
+                executor.execute_as(kind, runtime.agent.clone(), tool, args, None)
+            };
+            for kind in [InvocationKind::Script, InvocationKind::Model] {
+                let response = call(kind, "payload", json!({})).await.unwrap();
+                assert!(!response.is_error);
                 let view = response.output.value;
-                assert_eq!(view["id"], target.get());
-                assert_eq!(view["state"], "failed");
-                assert_eq!(view["error"], "expected failure");
-                assert_eq!(view["result"], partial);
+                assert_eq!(view.as_object().unwrap().len(), 7);
+                assert!(view["id"].as_u64().unwrap() > 0);
+                assert_eq!(view["state"], "completed");
+                assert_eq!(view["has_result"], true);
+                assert_eq!(view.get("error"), Some(&Value::Null));
+                assert_eq!(view.get("meta"), Some(&Value::Null));
+                assert_eq!(view["result"].get("nullable"), Some(&Value::Null));
+                let length = view["result"]["text"].as_str().unwrap().len();
+                if matches!(kind, InvocationKind::Script) {
+                    assert_eq!(length, PAYLOAD_BYTES);
+                    assert_eq!(view.get("presentation"), Some(&Value::Null));
+                } else {
+                    assert!(length < PAYLOAD_BYTES);
+                    assert_eq!(
+                        view["presentation"]["truncated"][0]["field"],
+                        "/result/text"
+                    );
+                    assert!(view["presentation"]["preview"].is_null());
+                }
+
+                let failure = call(kind, "payload", json!({"fail":true})).await.unwrap();
+                assert!(failure.is_error);
+                let target = failure.job;
+                let inspection = call(kind, "job_output", json!({"job":target}))
+                    .await
+                    .unwrap();
+                assert!(!inspection.is_error, "the inspection itself succeeded");
+                let expected_error = runtime
+                    .jobs
+                    .metadata(target)
+                    .await
+                    .unwrap()
+                    .rendered_error(executor.diagnostic_viewer())
+                    .unwrap();
+                assert_eq!(
+                    expected_error.contains("on session host"),
+                    !location.is_root()
+                );
+                for response in [failure, inspection] {
+                    let view = response.output.value;
+                    assert_eq!(view["id"], target.get());
+                    assert_eq!(view["state"], "failed");
+                    assert_eq!(view["error"], expected_error);
+                    assert_eq!(view["result"], partial);
+                }
+                let invalid = call(kind, "job_output", json!({"job":999999}))
+                    .await
+                    .unwrap();
+                assert!(
+                    invalid.is_error,
+                    "an invalid inspection is an invocation failure"
+                );
             }
-            let invalid = call(kind, "job_output", json!({"job":999999}))
-                .await
-                .unwrap();
-            assert!(
-                invalid.is_error,
-                "an invalid inspection is an invocation failure"
-            );
         }
         let response = ExecutionError::UnknownTool("missing".into())
             .into_response(
                 "missing",
                 Some(JobId::new(7).unwrap()),
                 Some("requested-name"),
+                executor.diagnostic_viewer(),
             )
             .value;
         assert_eq!(response.get("id"), Some(&Value::Null));

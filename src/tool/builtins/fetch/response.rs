@@ -1,6 +1,8 @@
 //! Bounded response streaming, atomic downloads, and response decoding.
 use std::{collections::BTreeMap, path::PathBuf};
 
+use crate::tool::diagnostic::{DiagnosticContext, Effects, Operation, Subject};
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
 use reqwest::{Method, header::HeaderMap};
@@ -32,7 +34,12 @@ struct PendingDownload {
 }
 
 impl PendingDownload {
-    fn new(destination: PathBuf, overwrite: bool) -> Result<Self, FetchError> {
+    fn new(
+        destination: PathBuf,
+        overwrite: bool,
+        progress: &mut FetchProgress,
+    ) -> Result<Self, FetchError> {
+        progress.download_io(Operation::CreateCapture, &destination);
         let temp = tempfile::NamedTempFile::new_in(destination.parent().ok_or_else(|| {
             FetchError::from_tool_error(invalid("save_to has no parent"), FetchPhase::LocalIo)
         })?)
@@ -52,12 +59,14 @@ impl PendingDownload {
     async fn finish(
         mut self,
         context: &LocalContext,
-        received: u64,
+        progress: &mut FetchProgress,
     ) -> Result<ResponseBody, FetchError> {
         let path = self.destination.to_string_lossy().into_owned();
         // Keep the owner intact across every await: cancellation must drop its
         // writer field before its temporary-file field, not reverse-order locals.
+        progress.download_io(Operation::FinishCapture, self.temp.path());
         self.writer.flush().await.map_err(local_io)?;
+        progress.download_io(Operation::SyncFile, self.temp.path());
         self.writer.sync_all().await.map_err(local_io)?;
         if context.is_cancelled() {
             return Err(FetchError::from_tool_error(
@@ -73,6 +82,7 @@ impl PendingDownload {
             overwrite,
         } = self;
         drop(writer);
+        progress.local_io(Operation::Rename, Subject::path(&destination));
         if overwrite {
             temp.persist(&destination).map_err(|e| local_io(e.error))?;
         } else {
@@ -81,13 +91,17 @@ impl PendingDownload {
         }
         Ok(ResponseBody::File {
             path,
-            bytes: received,
+            bytes: progress.received_bytes,
         })
     }
 }
 
 impl BodySink {
-    fn new(output: OutputPlan, limit: u64) -> Result<Self, FetchError> {
+    fn new(
+        output: OutputPlan,
+        limit: u64,
+        progress: &mut FetchProgress,
+    ) -> Result<Self, FetchError> {
         match output {
             OutputPlan::Inline(mode) => Ok(Self::Memory {
                 bytes: Vec::new(),
@@ -97,7 +111,7 @@ impl BodySink {
             OutputPlan::Download {
                 destination,
                 overwrite,
-            } => PendingDownload::new(destination, overwrite).map(Self::Download),
+            } => PendingDownload::new(destination, overwrite, progress).map(Self::Download),
         }
     }
 
@@ -112,7 +126,7 @@ impl BodySink {
                 bytes.extend_from_slice(chunk);
             }
             Self::Download(download) => {
-                progress.phase = FetchPhase::LocalIo;
+                progress.download_io(Operation::WriteCapture, download.temp.path());
                 download.writer.write_all(chunk).await.map_err(local_io)?;
             }
         }
@@ -128,16 +142,13 @@ impl BodySink {
     ) -> Result<ResponseBody, FetchError> {
         match self {
             Self::Memory { bytes, mode, .. } => {
-                progress.phase = match mode {
+                progress.phase(match mode {
                     InlineMode::ExtractText => FetchPhase::Extraction,
                     _ => FetchPhase::Decode,
-                };
+                });
                 response_body(bytes, content_type, url, mode).await
             }
-            Self::Download(download) => {
-                progress.phase = FetchPhase::LocalIo;
-                download.finish(context, progress.received_bytes).await
-            }
+            Self::Download(download) => download.finish(context, progress).await,
         }
     }
 }
@@ -222,7 +233,7 @@ pub(super) async fn read_body(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    progress.phase = FetchPhase::ResponseBody;
+    progress.phase(FetchPhase::ResponseBody);
     // Content-Length is decoded length when known; the streamed count remains authoritative.
     if *method != Method::HEAD
         && response
@@ -231,11 +242,17 @@ pub(super) async fn read_body(
     {
         return Err(response_exceeds_max_bytes());
     }
-    progress.phase = FetchPhase::LocalIo;
-    let mut sink = BodySink::new(output, max_bytes)?;
+    let mut sink = BodySink::new(output, max_bytes, progress)?;
     let mut stream = response.bytes_stream();
     loop {
-        progress.phase = FetchPhase::ResponseBody;
+        match &sink {
+            BodySink::Memory { .. } => progress.phase(FetchPhase::ResponseBody),
+            BodySink::Download(download) => progress.operation(
+                FetchPhase::ResponseBody,
+                DiagnosticContext::new(Operation::Receive, Subject::path(&download.destination))
+                    .effects(Effects::Unchanged),
+            ),
+        }
         let Some(chunk) = stream.next().await else {
             break;
         };
@@ -279,12 +296,10 @@ async fn response_body(
     if matches!(mode, InlineMode::ExtractText) {
         match entity.class() {
             ContentClass::Html => {
-                let extracted = match ExtractableHtml::admit(entity, url) {
-                    Some(input) => fetch_text::extract(input).await,
-                    None => None,
-                };
-                let extracted =
-                    extracted.ok_or_else(|| extraction_failure(DiagnosticMessage::Standard))?;
+                let extraction_error =
+                    |reason| extraction_failure(DiagnosticMessage::Extraction(reason));
+                let input = ExtractableHtml::admit(entity, url).map_err(extraction_error)?;
+                let extracted = fetch_text::extract(input).await.map_err(extraction_error)?;
                 return Ok(ResponseBody::Text {
                     text: extracted.text,
                     metadata: Some(extracted.metadata),
@@ -312,7 +327,9 @@ async fn response_body(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{executor, fetch, progress_for, response, server, stalled_server};
+    use super::super::tests::{
+        executor, fetch, progress_for, read_request, response, server, stalled_server,
+    };
     use super::*;
     use serde_json::json;
     use std::time::Duration;
@@ -348,6 +365,104 @@ mod tests {
         let mut tiny = Vec::new();
         reserve_bounded(&mut tiny, 1, small_limit).unwrap();
         assert_eq!(tiny.capacity(), 1);
+    }
+
+    #[tokio::test]
+    async fn extraction_failure_keeps_its_reason_and_the_response_payload() {
+        let runtime = crate::tests::TestRuntime::new().await;
+        let executor = executor(&runtime);
+        let html = "<html><body></body></html>";
+        let (url, task) = server(vec![response(
+            "201 Created",
+            "Content-Type: text/html\r\n",
+            html,
+        )])
+        .await;
+        let error = fetch(&runtime, &executor, json!({"url":url, "text":true}))
+            .await
+            .unwrap_err();
+        task.await.unwrap();
+        let output = error.into_tool_error().into_failure().output.unwrap().value;
+        assert_eq!(output["status"], 201);
+        assert_eq!(output["received_bytes"], html.len());
+        assert_eq!(output["diagnostic"]["phase"], "extraction");
+        let message = output["diagnostic"]["message"].as_str().unwrap();
+        assert!(message.contains("parser could not extract"), "{message}");
+    }
+
+    #[test]
+    fn download_staging_failure_identifies_destination_and_unchanged_effects() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("missing").join("download");
+        let mut progress = progress_for(json!({"url":"http://example.org"})).1;
+        let error = PendingDownload::new(destination.clone(), false, &mut progress)
+            .err()
+            .unwrap();
+        let error = progress.failure(error);
+        let context = error.diagnostic().context;
+        assert_eq!(context.operation, Operation::CreateCapture);
+        assert_eq!(context.subject, Subject::path(&destination));
+        assert_eq!(context.effects, Effects::Unchanged);
+        let (_, Some(output)) = error.into_parts() else {
+            panic!("structured staging failure")
+        };
+        assert_eq!(output.value["diagnostic"]["phase"], "local_io");
+        assert_eq!(output.value["diagnostic"]["os_error"]["kind"], "not_found");
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn download_publication_failure_keeps_response_and_existing_destination() {
+        let runtime = crate::tests::TestRuntime::new().await;
+        let destination = runtime.root.path().join("raced-download");
+        let raced = destination.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            // The observed request proves destination preflight has finished;
+            // publication must still reject a newly created destination.
+            tokio::fs::write(raced, b"keep original").await.unwrap();
+            socket
+                .write_all(response("200 OK", "", "replacement").as_bytes())
+                .await
+                .unwrap();
+        });
+        let executor = executor(&runtime);
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            fetch(
+                &runtime,
+                &executor,
+                json!({"url":url,"save_to":"raced-download"}),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let context = error.diagnostic().context;
+        assert_eq!(context.operation, Operation::Rename);
+        assert_eq!(context.subject, Subject::path(&destination));
+        assert_eq!(context.effects, Effects::Unknown);
+        assert!(
+            error
+                .to_string()
+                .contains("server-side effects are unknown")
+        );
+        let failure = error.into_tool_error().into_failure();
+        let output = failure.output.unwrap().value;
+        assert_eq!(output["status"], 200);
+        assert_eq!(output["received_bytes"], 11);
+        assert_eq!(output["diagnostic"]["phase"], "local_io");
+        assert_eq!(
+            tokio::fs::read(destination).await.unwrap(),
+            b"keep original"
+        );
     }
 
     #[cfg(unix)]

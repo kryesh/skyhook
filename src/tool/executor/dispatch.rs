@@ -54,14 +54,22 @@ impl ToolExecutor {
             let error = match error {
                 AuthorizationError::Cancelled => return Err(self.cancelled(lease).await),
                 AuthorizationError::Denied(reason) => ExecutionError::Denied(reason),
-                AuthorizationError::InvalidGrant(_) => ExecutionError::Failed {
-                    message: "operation could not be started".to_owned(),
-                    output: None,
-                },
+                AuthorizationError::InvalidGrant(_) => {
+                    ToolError::Failed("operation could not be started".to_owned()).into()
+                }
                 AuthorizationError::Unavailable => {
                     ExecutionError::UnavailableTool(plan.tool.name().to_owned())
                 }
-            };
+            }
+            .contextualize(
+                DiagnosticContext::new(
+                    Operation::Authorize,
+                    Subject::Tool(plan.tool.name().to_owned()),
+                )
+                .at(FailureSite::Host)
+                .effects(Effects::NotStarted),
+                &self.capabilities,
+            );
             return Err(self.fail_start(lease, error).await);
         }
         // Route preparation may reauthorize a changed route, and seals its own
@@ -86,18 +94,14 @@ impl ToolExecutor {
                     },
                     Err(RemoteError::Cancelled) => return Err(self.cancelled(lease).await),
                     Err(error) => {
-                        let error = match error {
-                            RemoteError::ApprovalDenied(reason) => ExecutionError::Denied(reason),
-                            RemoteError::ApprovalInvalidGrant(_)
-                            | RemoteError::ApprovalUnavailable => ExecutionError::Failed {
-                                message: "target is unavailable in this context".to_owned(),
-                                output: None,
-                            },
-                            error => ExecutionError::Failed {
-                                message: error.to_string(),
-                                output: None,
-                            },
-                        };
+                        let error = ExecutionError::Tool(error.into_tool_error()).contextualize(
+                            DiagnosticContext::new(
+                                Operation::Connect,
+                                Subject::Tool(plan.tool.name().to_owned()),
+                            )
+                            .at(FailureSite::Host),
+                            &self.capabilities,
+                        );
                         return Err(self.fail_start(lease, error).await);
                     }
                 }
@@ -130,40 +134,52 @@ impl ToolExecutor {
         let job = context.job();
         lease
             .start_supervised(async move {
-                if let Some(router) = authentication {
-                    context.process_environment.extend(
-                        router
-                            .environment()
-                            .await
-                            .map_err(|e| e.into_tool_error())?,
-                    );
-                }
-                if context.is_cancelled() {
-                    return Err(ToolError::Cancelled);
-                }
                 let cancellation = context.cancellation_token();
-                let result = match dispatch {
-                    InvocationDispatch::Local(admitted) => admitted?.call(context).await,
-                    InvocationDispatch::ReadError(output) => Ok(output),
-                    InvocationDispatch::Remote {
-                        remote: connection,
-                        arguments,
-                    } => {
-                        let result = connection
-                            .execute(tool.name().to_owned(), arguments, &context)
-                            .await;
-                        if context.is_cancelled() {
-                            Err(ToolError::Cancelled)
-                        } else {
-                            result.map_err(crate::remote::RemoteError::into_tool_error)
-                        }
+                let mut fallback = DiagnosticContext::new(
+                    Operation::Execute,
+                    Subject::Tool(tool.name().to_owned()),
+                )
+                .at(FailureSite::bound(
+                    context.execution_location(),
+                    tool.placement() == ToolPlacement::Host,
+                ));
+                fallback.paths = plan.path_facts;
+                let result = async {
+                    if let Some(router) = authentication {
+                        context.process_environment.extend(
+                            router
+                                .environment()
+                                .await
+                                .map_err(|e| e.into_tool_error())?,
+                        );
                     }
-                };
-                if cancellation.is_cancelled() {
-                    Err(ToolError::Cancelled)
-                } else {
-                    result
+                    if context.is_cancelled() {
+                        return Err(ToolError::Cancelled.effects(Effects::NotStarted));
+                    }
+                    match dispatch {
+                        InvocationDispatch::Local(admitted) => match admitted {
+                            Ok(admitted) => admitted.call(context).await,
+                            Err(error) => Err(error.into()),
+                        },
+                        InvocationDispatch::ReadError(output) => Ok(*output),
+                        InvocationDispatch::Remote {
+                            remote: connection,
+                            arguments,
+                        } => connection
+                            .execute(tool.name().to_owned(), arguments, &context)
+                            .await
+                            .map_err(crate::remote::RemoteError::into_tool_error),
+                    }
                 }
+                .await;
+                let result = result.map(|mut output| {
+                    if let Some(diagnostic) = &mut output.diagnostic {
+                        diagnostic.context.fallback(fallback.clone());
+                    }
+                    output
+                });
+                cancellation_result(result, cancellation.is_cancelled())
+                    .map_err(|error| error.fallback_context(fallback))
             })
             .await?;
         Ok(StartedExecution {
@@ -173,11 +189,8 @@ impl ToolExecutor {
     }
 
     async fn cancelled(&self, lease: crate::job::JobLease) -> ExecutionError {
-        lease.fail(JobOutcome::Cancelled).await;
-        ExecutionError::Failed {
-            message: "tool was cancelled".to_owned(),
-            output: None,
-        }
+        lease.fail(ToolError::Cancelled.into()).await;
+        ExecutionError::Tool(ToolError::Cancelled)
     }
 
     async fn fail_start(
@@ -185,24 +198,40 @@ impl ToolExecutor {
         lease: crate::job::JobLease,
         error: ExecutionError,
     ) -> ExecutionError {
-        let message = match &error {
-            ExecutionError::Denied(reason)
-            | ExecutionError::Failed {
-                message: reason, ..
-            } => reason.clone(),
-            ExecutionError::UnavailableTool(name) => {
-                format!("tool `{name}` is unavailable in this context")
-            }
-            error => error.to_string(),
-        };
-        let outcome = if matches!(error, ExecutionError::Denied(_)) {
-            ToolError::Denied(message).into()
-        } else {
-            ToolError::Failed(message).into()
-        };
+        let outcome = ToolError::from_diagnostic(error.diagnostic(), None).into();
         lease.fail(outcome).await;
         error
     }
+}
+
+/// Cancellation determines the outcome, not whether already observed effects or
+/// output happened. Apply its precedence once, before binding failure facts.
+fn cancellation_result(
+    result: Result<ToolOutput, ToolError>,
+    cancelled: bool,
+) -> Result<ToolOutput, ToolError> {
+    if !cancelled {
+        return result;
+    }
+    let (mut diagnostic, output) = match result {
+        Err(error) => error.into_parts(),
+        Ok(output) => {
+            // A completed read error remains data within the cancelled outcome.
+            // Its marker renders that payload; the outer cause describes cancellation.
+            let context = output
+                .diagnostic
+                .as_ref()
+                .map_or_else(DiagnosticContext::default, |diagnostic| {
+                    diagnostic.context.clone()
+                });
+            (Diagnostic::new(context, Cause::Cancelled), Some(output))
+        }
+    };
+    diagnostic.cause = Cause::Cancelled;
+    if diagnostic.context.effects == Effects::Unknown {
+        diagnostic.context.effects = Effects::MayHaveExecuted;
+    }
+    Err(ToolError::from_diagnostic(diagnostic, output.map(Box::new)))
 }
 
 #[cfg(test)]
@@ -278,26 +307,101 @@ mod tests {
         tokio::spawn(async move { executor.run_host(&agent, "custom_remote", arguments).await })
     }
 
+    #[test]
+    fn cancellation_retains_partial_output_and_failure_context() {
+        use crate::tool::diagnostic::{Cause, Effects, Operation, Subject};
+
+        for error in [
+            ToolError::Cancelled,
+            ToolError::Failed("transport closed".into()),
+        ] {
+            let error = error
+                .operation(Operation::Receive, Subject::Process)
+                .effects(Effects::MayHaveExecuted)
+                .with_result(ToolOutput::new(serde_json::json!({"partial":true})));
+            let context = error.diagnostic().context;
+            let (diagnostic, output) = cancellation_result(Err(error), true)
+                .unwrap_err()
+                .into_parts();
+            assert_eq!(diagnostic.cause, Cause::Cancelled);
+            assert_eq!(diagnostic.context, context);
+            assert_eq!(output.unwrap().value, serde_json::json!({"partial":true}));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_dispatch_keeps_a_completed_read_error_as_output() {
+        use crate::tool::diagnostic::{Cause, Effects, Operation, Subject};
+        use std::time::Duration;
+
+        let runtime = crate::tests::TestRuntime::new().await;
+        let (entered, mut started) = tokio::sync::mpsc::unbounded_channel();
+        let mut read_diagnostic =
+            ToolError::source_filesystem_io(std::io::ErrorKind::NotFound.into())
+                .operation(Operation::Read, Subject::path("missing"))
+                .effects(Effects::Unchanged)
+                .diagnostic();
+        let output = ToolOutput::new(serde_json::json!({
+            "kind":"error", "path":"missing", "error":{"code":"not_found", "message":""}
+        }))
+        .with_diagnostic(read_diagnostic.clone());
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register_dynamic(
+                "read_error",
+                "gated completion",
+                serde_json::json!({"type":"object","properties":{}}),
+                ToolOptions::default().placement(ToolPlacement::InheritWorkspace),
+                move |invocation, _| {
+                    let entered = entered.clone();
+                    let output = output.clone();
+                    async move {
+                        entered.send(invocation.job()).unwrap();
+                        invocation.cancellation_token().cancelled().await;
+                        Ok(output)
+                    }
+                },
+            )
+            .unwrap();
+        let executor = runtime.executor(builder);
+        let agent = runtime.agent.clone();
+        let running = tokio::spawn(async move {
+            executor
+                .run_host(&agent, "read_error", serde_json::json!({}))
+                .await
+        });
+        let job = tokio::time::timeout(Duration::from_secs(5), started.recv())
+            .await
+            .expect("handler must enter actual dispatch")
+            .unwrap();
+        runtime.jobs.cancel(job).await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("cooperative cancellation must finish")
+            .unwrap()
+            .unwrap_err();
+        let (diagnostic, output) = error.into_tool_error().into_parts();
+        read_diagnostic.context.site =
+            FailureSite::Execution(ExecutionLocation::root(runtime.root.path().to_owned()));
+        assert_eq!(diagnostic.cause, Cause::Cancelled);
+        assert_eq!(diagnostic.context, read_diagnostic.context);
+
+        // The completed read error stays data inside the cancelled outcome.
+        let saved = runtime.jobs.snapshot(job).await.unwrap();
+        assert_eq!(saved.state, JobState::Cancelled);
+        assert_eq!(saved.diagnostic.as_ref(), Some(&diagnostic));
+        assert_eq!(saved.output_diagnostic.as_ref(), Some(&read_diagnostic));
+        assert!(output.is_some());
+    }
+
     #[tokio::test]
     async fn approved_remote_jobs_are_running_during_shared_connection_startup() {
-        use crate::remote::{ConnectionFactory, ConnectionRequest, backend::Transport};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct PendingConnection(AtomicUsize);
-        impl ConnectionFactory for PendingConnection {
-            fn connect(
-                &self,
-                _: ConnectionRequest,
-            ) -> futures_util::future::BoxFuture<'static, Result<Transport, RemoteError>>
-            {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Box::pin(std::future::pending())
-            }
-        }
+        use crate::remote::PendingHandshakeFactory;
+        use std::sync::atomic::Ordering;
 
         let runtime = crate::tests::TestRuntime::new().await;
         let authorization = AuthorizationCoordinator::new(Arc::new(crate::tool::policy::AllowAll));
-        let factory = Arc::new(PendingConnection(AtomicUsize::new(0)));
+        let factory = PendingHandshakeFactory::new();
         let remote = crate::remote::RemoteManager::new(
             crate::remote::EmbeddedShimCatalog::default(),
             Arc::new(crate::remote::RejectSensitivePrompts),
@@ -317,7 +421,7 @@ mod tests {
                 let jobs = runtime.jobs.list(&runtime.agent).await;
                 if jobs.len() == 5
                     && jobs.iter().all(|job| job.state == JobState::Running)
-                    && factory.0.load(Ordering::SeqCst) == 1
+                    && factory.starts.load(Ordering::SeqCst) == 1
                 {
                     break;
                 }
@@ -340,13 +444,7 @@ mod tests {
             requests: std::sync::Mutex::new(Vec::new()),
             release: tokio::sync::Notify::new(),
         });
-        let root = runtime.root.path().to_path_buf();
-        let executor = ToolExecutor::new(
-            remote_tool(Vec::new()).build(),
-            policy.clone(),
-            runtime.jobs.clone(),
-            root,
-        );
+        let executor = runtime.executor_with_policy(remote_tool(Vec::new()), policy.clone());
         let executor = remote_executor(executor, router(targets(), policy.clone()));
         let running = spawn_remote(&executor, &runtime.agent);
         while policy.requests.lock().unwrap().is_empty() {

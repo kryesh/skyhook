@@ -8,6 +8,7 @@ use crate::{
     target::TargetRouter,
     tool::{
         PathKind, RegistryError, ToolContext, ToolError, ToolOptions, ToolPlacement,
+        diagnostic::{DiagnosticContext, Effects, FailureSite, Operation, Subject},
         invocation::{AdmissionError, LocalCatalogBuilder, LocalError},
         policy::{Capability, PathAccess, PermissionUse, ResourceId},
     },
@@ -60,7 +61,9 @@ async fn write(path: &std::path::Path, bytes: &[u8]) -> Result<String, Admission
     {
         return Err(AdmissionError::InvalidArguments(
             "to must name a file, not a directory".into(),
-        ));
+        )
+        .operation(Operation::Validate, Subject::path(path))
+        .effects(Effects::Unchanged));
     }
     atomic_write(path, bytes).await?;
     Ok(path.to_string_lossy().into_owned())
@@ -74,7 +77,13 @@ pub(super) async fn copy(
 ) -> Result<String, ToolError> {
     let caller = context.caller_location();
     if caller.is_root() {
-        let resolved = resolve_for_authorization(&caller.workspace, to, PathKind::Writable).await?;
+        let resolved = resolve_for_authorization(&caller.workspace, to, PathKind::Writable)
+            .await
+            .map_err(|error| {
+                error
+                    .at(FailureSite::Execution(caller.clone()))
+                    .effects(Effects::Unchanged)
+            })?;
         let mut permissions = vec![PermissionUse::new(
             Capability::Write,
             ResourceId::workspace(&caller.target, &caller.workspace),
@@ -93,8 +102,16 @@ pub(super) async fn copy(
                 permissions,
                 serde_json::json!({"to": resolved.path}),
             )
-            .await?;
-        return write(&resolved.path, bytes).await.map_err(Into::into);
+            .await
+            .map_err(|error| {
+                error
+                    .operation(Operation::Authorize, Subject::path(&resolved.path))
+                    .at(FailureSite::Execution(caller.clone()))
+                    .effects(Effects::Unchanged)
+            })?;
+        return write(&resolved.path, bytes)
+            .await
+            .map_err(|error| ToolError::from(error).at(FailureSite::Execution(caller.clone())));
     }
     router
         .authorize_transfer(
@@ -106,11 +123,25 @@ pub(super) async fn copy(
             )],
             serde_json::json!({"to": to}),
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            error
+                .operation(Operation::Authorize, Subject::path(to))
+                .at(FailureSite::Execution(caller.clone()))
+                .effects(Effects::Unchanged)
+        })?;
     let route = router
         .resolve(&caller.target, context.capabilities())
         .await
-        .map_err(ToolError::failed)?;
+        .map_err(|error| {
+            ToolError::from(error.into_admission_error())
+                .operation(
+                    Operation::Lookup,
+                    Subject::Label("copy destination target".into()),
+                )
+                .at(FailureSite::Host)
+                .effects(Effects::Unchanged)
+        })?;
     router
         .authorize_transfer(
             context,
@@ -118,11 +149,29 @@ pub(super) async fn copy(
             route.permissions(),
             route.authorization_arguments(),
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            error
+                .operation(
+                    Operation::Authorize,
+                    Subject::Label("target connection".into()),
+                )
+                .at(FailureSite::Execution(caller.clone()))
+                .effects(Effects::Unchanged)
+        })?;
     let connection = router
         .prepare(route, &caller.workspace, context.invocation_subject()?)
         .await
-        .map_err(ToolError::failed)?;
+        .map_err(|error| {
+            error.into_tool_error().fallback_context(
+                DiagnosticContext::new(
+                    Operation::Connect,
+                    Subject::working_directory(&caller.workspace),
+                )
+                .at(FailureSite::Execution(caller.clone()))
+                .effects(Effects::Unchanged),
+            )
+        })?;
     // The worker resolves `to` and requests path permissions on its own filesystem.
     // Base64 keeps the maximum 8 MiB asset safely below the protocol's 16 MiB frame limit.
     let result = connection
@@ -135,8 +184,22 @@ pub(super) async fn copy(
             context,
         )
         .await
-        .map_err(ToolError::failed)?;
-    Ok(serde_json::from_value::<CopyOutput>(result.value)?.to)
+        .map_err(|error| {
+            error.into_tool_error().fallback_context(
+                DiagnosticContext::new(Operation::Copy, Subject::path(to))
+                    .at(FailureSite::Execution(caller.clone())),
+            )
+        })?;
+    Ok(serde_json::from_value::<CopyOutput>(result.value)
+        .map_err(|error| {
+            ToolError::from(error)
+                .operation(
+                    Operation::Deserialize,
+                    Subject::Label("skill copy result".into()),
+                )
+                .at(FailureSite::Host)
+        })?
+        .to)
 }
 
 #[cfg(test)]
@@ -153,6 +216,7 @@ mod tests {
         tests::RecordingPolicy,
         tool::{
             authorization::AuthorizationCoordinator,
+            diagnostic::Cause,
             executor::ToolExecutor,
             policy::{CapabilitySet, PolicyDecision},
         },
@@ -174,16 +238,36 @@ mod tests {
         })
     }
 
+    enum TransportReply {
+        ConnectionFailure(RemoteError),
+        Worker(LocalError),
+    }
+
+    impl Default for TransportReply {
+        fn default() -> Self {
+            Self::ConnectionFailure(RemoteError::Protocol("fixture transport reached".into()))
+        }
+    }
+
     #[derive(Default)]
-    struct RecordingFactory(Mutex<Vec<ConnectionRequest>>);
+    struct RecordingFactory {
+        requests: Mutex<Vec<ConnectionRequest>>,
+        reply: Mutex<TransportReply>,
+    }
 
     impl ConnectionFactory for RecordingFactory {
         fn connect(
             &self,
             request: ConnectionRequest,
         ) -> futures_util::future::BoxFuture<'static, Result<Transport, RemoteError>> {
-            self.0.lock().unwrap().push(request);
-            Box::pin(async { Err(RemoteError::Protocol("fixture transport reached".into())) })
+            self.requests.lock().unwrap().push(request);
+            let reply = std::mem::take(&mut *self.reply.lock().unwrap());
+            Box::pin(async move {
+                match reply {
+                    TransportReply::ConnectionFailure(error) => Err(error),
+                    TransportReply::Worker(error) => Ok(crate::remote::test_transport(Some(error))),
+                }
+            })
         }
     }
 
@@ -253,7 +337,7 @@ mod tests {
         }
 
         fn connections(&self) -> Vec<ConnectionRequest> {
-            std::mem::take(&mut *self.factory.0.lock().unwrap())
+            std::mem::take(&mut *self.factory.requests.lock().unwrap())
         }
     }
 
@@ -275,10 +359,13 @@ mod tests {
             Value::Null,
             json!("references/note.txt"),
             json!("assets/pixel.png"),
+            json!("assets/payload.bin"),
         ] {
-            fixture
+            let result = fixture
                 .skill(json!({"name":"mixed-assets","path":path,"to":null}))
                 .await;
+            assert_eq!(result["state"], "completed", "{result}");
+            assert!(result["error"].is_null(), "{result}");
         }
         fixture
             .executor
@@ -312,6 +399,67 @@ mod tests {
         );
         assert!(!fixture.runtime.root.path().join("copied.bin").exists());
         fixture.manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn remote_callers_receive_host_context_for_skill_source_failures() {
+        let fixture = Fixture::new(RecordingPolicy::allowing(), remote_caller).await;
+        for to in [Value::Null, json!("copied.bin")] {
+            let result = fixture
+                .skill(json!({"name":"mixed-assets", "path":"missing.bin", "to":to}))
+                .await;
+            let error = result["error"].as_str().unwrap();
+            // The source lives on the host, not at the remote caller's location.
+            assert!(error.contains("session host"), "{error}");
+        }
+        assert!(fixture.connections().is_empty());
+        fixture.manager.shutdown().await;
+    }
+
+    async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(20), future)
+            .await
+            .expect("remote skill copy stalled")
+    }
+
+    #[tokio::test]
+    async fn remote_copy_connection_and_worker_denials_retain_classification() {
+        for (reply, operation) in [
+            (
+                TransportReply::ConnectionFailure(RemoteError::ApprovalDenied(
+                    "connection denied".into(),
+                )),
+                Operation::Connect,
+            ),
+            (
+                TransportReply::Worker(
+                    LocalError::Denied("worker denied".into())
+                        .operation(Operation::Authorize, Subject::path("copied.bin"))
+                        .effects(Effects::Unchanged),
+                ),
+                Operation::Authorize,
+            ),
+        ] {
+            let fixture = Fixture::new(RecordingPolicy::allowing(), remote_caller).await;
+            *fixture.factory.reply.lock().unwrap() = reply;
+            let error = bounded(fixture.executor.run_host(
+                &fixture.runtime.agent,
+                "skill",
+                copy("copied.bin"),
+            ))
+            .await
+            .unwrap_err()
+            .into_tool_error();
+            let diagnostic = error.diagnostic();
+            assert!(matches!(diagnostic.cause, Cause::Denied(_)));
+            assert_eq!(diagnostic.context.operation, operation);
+            assert_eq!(
+                diagnostic.context.site,
+                FailureSite::Execution(remote_caller(fixture.runtime.root.path()))
+            );
+            assert_eq!(fixture.connections().len(), 1);
+            fixture.manager.shutdown().await;
+        }
     }
 
     #[tokio::test]

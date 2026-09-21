@@ -17,6 +17,7 @@ use crate::{
     provider::protocol::UserContent,
     tool::{
         RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
+        diagnostic::{Effects, FailureSite, Operation, Subject},
         policy::{Capability, CapabilitySet, Mode},
     },
 };
@@ -134,10 +135,13 @@ fn register_todo(
                 let runtime = runtime.ok_or_else(runtime_unavailable)?;
                 if let Some(items) = input.items {
                     if input.job.is_some() {
-                        return Err(ToolError::InvalidArguments("items and job cannot be combined".to_owned()));
+                        return Err(invalid_argument("job", "items and job cannot be combined"));
                     }
                     TodoStore::validate(&items)?;
-                    runtime.todos.replace(context.agent(), items).await.map_err(|error| tool_error(&error))?;
+                    runtime.todos.replace(context.agent(), items).await.map_err(|error| {
+                        harness_error(error.into())
+                            .operation(Operation::Save, Subject::Label(format!("todos for agent {}", context.agent()))).effects(Effects::Unknown)
+                    })?;
                     Ok(TodoOutput::Updated { updated: true })
                 } else {
                     Ok(TodoOutput::Items { items: runtime.todos.inspect(context.agent(), input.job).await?.items })
@@ -235,17 +239,18 @@ fn register_child_agent(
                 let runtime = runtime.ok_or_else(runtime_unavailable)?;
                 let hinted = |name: &String| runtime.harness.model_profiles.get(name).is_some_and(|profile| profile.hint.is_some());
                 if let Some(name) = input.model.as_ref().filter(|name| !hinted(name)) {
-                    return Err(ToolError::InvalidArguments(format!("unknown model `{name}`")));
+                    return Err(invalid_argument("model", format!("unknown model `{name}`")));
                 }
                 let capabilities = match &input.mode {
                     None => context.capabilities().clone(),
                     Some(name) => {
                         let offered = |mode: &&Mode| offers_mode(mode, context.capabilities());
                         if runtime.modes.get(name).filter(offered).is_none() {
-                            return Err(ToolError::InvalidArguments(format!("unknown mode `{name}`")));
+                            return Err(invalid_argument("mode", format!("unknown mode `{name}`")));
                         }
                         // Interaction follows the caller, as the root's follows the host.
-                        let granted = runtime.mode_capabilities(name).map_err(|error| tool_error(&error))?;
+                        let granted = runtime.mode_capabilities(name).map_err(|error| harness_error(error)
+                            .operation(Operation::Prepare, Subject::argument(["mode"])).effects(Effects::NotStarted))?;
                         &granted & context.capabilities()
                     }
                 };
@@ -255,29 +260,32 @@ fn register_child_agent(
                     TodoStore::validate(items)?;
                 }
                 if input.depth >= available_depth {
-                    return Err(ToolError::InvalidArguments(format!(
+                    return Err(invalid_argument("depth", format!(
                         "depth must be less than the caller's available depth of {available_depth}"
                     )));
                 }
                 // A reused name is a follow-up aimed at the wrong tool.
-                if let Some(name) = runtime.jobs.metadata(context.job()).await.map_err(|error| tool_error(&error))?.name
+                if let Some(name) = runtime.jobs.metadata(context.job()).await.map_err(|error| harness_error(error.into())
+                    .operation(Operation::Inspect, Subject::Job(context.job())).effects(Effects::Unchanged))?.name
                     && let Some(id) = runtime.jobs.child_name_owner(context.agent(), &name, context.job()).await
                 {
                     return Err(ToolError::InvalidArguments(format!(
                         "child `{name}` already exists as job {id}; message it with tool.job({id}).send({{value: ...}}), or pick another name"
-                    )));
+                    )).operation(Operation::Validate, Subject::Job(id)).effects(Effects::NotStarted));
                 }
                 let child = runtime.next_child(context.agent()).await;
                 let model = input.model
                     .or_else(|| runtime.agents()
                         .get(context.agent()).map(|agent| agent.model_profile.clone()))
-                    .ok_or_else(|| ToolError::Failed("parent agent is no longer running".into()))?;
+                    .ok_or_else(|| ToolError::Failed("parent agent is no longer running".into())
+                        .operation(Operation::Lookup, Subject::Label(format!("parent agent {}", context.agent()))).effects(Effects::NotStarted))?;
                 let target = input.target.as_deref().unwrap_or(&context.caller_location().target);
                 let definition = if target == crate::target::ROOT_TARGET {
                     None
                 } else {
                     let route = runtime.router.resolve(target, context.capabilities()).await;
-                    Some(route.map_err(|error| tool_error(&error))?.destination().clone())
+                    Some(route.map_err(|error| ToolError::from(error.into_admission_error())
+                        .operation(Operation::Lookup, Subject::argument(["target"])).effects(Effects::NotStarted))?.destination().clone())
                 };
                 let mut location = crate::execution::ExecutionLocation::select(
                     context.caller_location(),
@@ -290,7 +298,7 @@ fn register_child_agent(
                 );
                 if let Some(workspace) = input.workspace {
                     if workspace.as_os_str().is_empty() {
-                        return Err(ToolError::InvalidArguments("workspace cannot be empty".to_owned()));
+                        return Err(invalid_argument("workspace", "workspace cannot be empty"));
                     }
                     location.workspace = location.workspace.join(workspace);
                 }
@@ -303,10 +311,12 @@ fn register_child_agent(
                     location,
                     mode: input.mode,
                     capabilities,
-                }).await.map_err(|error| tool_error(&error))?;
+                }).await.map_err(|error| harness_error(error)
+                    .operation(Operation::Create, Subject::Label(format!("child agent {child}"))).effects(Effects::Unknown))?;
                 // Associate immediately so a failed first turn is selectable for retry
                 // even when it never emitted visible assistant text.
-                runtime.jobs.set_child_agent(context.job(), child.clone()).await.map_err(|error| tool_error(&error))?;
+                runtime.jobs.set_child_agent(context.job(), child.clone()).await.map_err(|error| harness_error(error.into())
+                    .operation(Operation::Save, Subject::Job(context.job())).effects(Effects::Started))?;
                 // Only this child session may opt its terminal job into resumption.
                 let handler = child_resume_handler(
                     Arc::downgrade(&runtime),
@@ -315,7 +325,8 @@ fn register_child_agent(
                     context.execution_location().clone(),
                     context.caller_location().clone(),
                 );
-                runtime.jobs.set_resume_handler(context.job(), handler).await.map_err(|error| tool_error(&error))?;
+                runtime.jobs.set_resume_handler(context.job(), handler).await.map_err(|error| harness_error(error.into())
+                    .operation(Operation::Prepare, Subject::Job(context.job())).effects(Effects::Started))?;
                 run_child_request(
                     &runtime, &context, &child, &sender,
                     vec![UserContent::Text { text: input.prompt }],
@@ -348,7 +359,13 @@ pub(super) fn child_resume_handler(
                 .shutting_down
                 .load(std::sync::atomic::Ordering::Acquire)
             {
-                return Err(ToolError::Cancelled);
+                return Err(ToolError::Cancelled
+                    .operation(
+                        Operation::Prepare,
+                        Subject::Label(format!("child agent {child}")),
+                    )
+                    .at(FailureSite::Host)
+                    .effects(Effects::NotStarted));
             }
             let sender = match runtime.agent_sender(&child) {
                 Some(sender) => sender,
@@ -366,7 +383,15 @@ pub(super) fn child_resume_handler(
                         capabilities: runtime.capabilities.clone(),
                     })
                     .await
-                    .map_err(|error| tool_error(&error))?,
+                    .map_err(|error| {
+                        harness_error(error)
+                            .operation(
+                                Operation::Create,
+                                Subject::Label(format!("retained child agent {child}")),
+                            )
+                            .at(FailureSite::Host)
+                            .effects(Effects::Unknown)
+                    })?,
             };
             let context = crate::tool::ToolContext::new(
                 authorization,
@@ -399,7 +424,7 @@ async fn send_child_input(
         done: Some(done),
     };
     let sent = sender.send(input).await;
-    sent.map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?;
+    sent.map_err(|_| ToolError::Failed("child agent stopped before accepting input".to_owned()))?;
     Ok(received)
 }
 
@@ -410,24 +435,40 @@ async fn run_child_request(
     sender: &super::AgentSender,
     content: Vec<UserContent>,
 ) -> Result<String, ToolError> {
+    let job = context.job();
+    // Resumption runs this outside dispatch, which would otherwise bind the host site.
+    let failure = |operation, effects| {
+        move |error: ToolError| {
+            error
+                .operation(operation, Subject::Job(job))
+                .at(FailureSite::Host)
+                .effects(effects)
+        }
+    };
     let completion_gate = runtime
         .agents()
         .get(child)
-        .ok_or_else(|| ToolError::Failed("child agent stopped".into()))?
+        .ok_or_else(|| {
+            failure(Operation::Lookup, Effects::NotStarted)(ToolError::Failed(
+                "child agent stopped".into(),
+            ))
+        })?
         .control
         .completion_gate
         .clone();
     *completion_gate.lock().await = true;
-    let mut done_rx = send_child_input(sender, content).await?;
+    let mut done_rx = send_child_input(sender, content)
+        .await
+        .map_err(failure(Operation::Send, Effects::NotStarted))?;
     loop {
         tokio::select! {
             result = &mut done_rx => {
                 let text = result
-                    .map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?
-                    .map_err(|failure| match failure {
+                    .map_err(|_| failure(Operation::Receive, Effects::Started)(ToolError::Failed("child agent stopped before returning a result".to_owned())))?
+                    .map_err(|error| failure(Operation::Wait, Effects::Started)(match error {
                         RequestFailure::Interrupted => ToolError::Interrupted,
                         RequestFailure::Failed(message) => ToolError::Failed(message),
-                    })?;
+                    }))?;
                 let inputs = context.drain_input_or_close().await;
                 if inputs.is_empty() { return Ok(text); }
                 // Owner input continues this invocation instead of finishing the job, so
@@ -435,7 +476,8 @@ async fn run_child_request(
                 runtime.jobs.notify_owner(context.job()).await;
                 *completion_gate.lock().await = true;
                 let content = inputs.iter().map(owner_input).collect();
-                done_rx = send_child_input(sender, content).await?;
+                done_rx = send_child_input(sender, content).await.map_err(|error| failure(Operation::Send, Effects::NotStarted)(error)
+                    .with_result(crate::tool::ToolOutput::new(json!(text))))?;
             }
             value = context.receive() => {
                 let value = match value {
@@ -443,11 +485,11 @@ async fn run_child_request(
                     Err(error) => {
                         runtime.questions.cancel_child_question(context.job()).await;
                         runtime.interrupt_tree(child).await;
-                        return Err(error);
+                        return Err(failure(Operation::Receive, Effects::Started)(error));
                     }
                 };
                 if !runtime.questions.answer_child_question(context.job(), value.clone()).await
-                    .map_err(|error| tool_error(&error))?
+                    .map_err(|error| failure(Operation::Send, Effects::Unknown)(harness_error(error)))?
                 {
                     let mut active = completion_gate.lock().await;
                     if !*active {
@@ -455,7 +497,7 @@ async fn run_child_request(
                         // it, so an answer published without a wake needs its wake here.
                         runtime.jobs.notify_owner(context.job()).await;
                         *active = true;
-                        done_rx = send_child_input(sender, vec![owner_input(&value)]).await?;
+                        done_rx = send_child_input(sender, vec![owner_input(&value)]).await.map_err(failure(Operation::Send, Effects::NotStarted))?;
                         continue;
                     }
                     // Owner updates use the same request-boundary mailbox as
@@ -466,19 +508,40 @@ async fn run_child_request(
                         content: vec![owner_input(&value)],
                         cancellation: Default::default(),
                         committed,
-                    }])).await.map_err(|_| ToolError::Failed("child agent stopped".to_owned()))?;
+                    }])).await.map_err(|_| failure(Operation::Send, Effects::NotStarted)(ToolError::Failed("child agent stopped before accepting owner input".to_owned())))?;
                 }
             }
         }
     }
 }
 
-fn runtime_unavailable() -> ToolError {
-    ToolError::Failed("session runtime is unavailable".to_owned())
+fn invalid_argument(argument: &str, message: impl Into<String>) -> ToolError {
+    ToolError::InvalidArguments(message.into())
+        .operation(Operation::Validate, Subject::argument([argument]))
+        .effects(Effects::NotStarted)
 }
 
-fn tool_error(error: &impl ToString) -> ToolError {
-    ToolError::Failed(error.to_string())
+fn runtime_unavailable() -> ToolError {
+    ToolError::Failed("session runtime is unavailable".to_owned())
+        .operation(
+            Operation::Lookup,
+            Subject::Label("session runtime".to_owned()),
+        )
+        // Also returned by resumption, which dispatch does not bind.
+        .at(FailureSite::Host)
+        .effects(Effects::NotStarted)
+}
+
+pub(super) fn harness_error(error: crate::agent::HarnessError) -> ToolError {
+    use crate::agent::HarnessError;
+    match error {
+        HarnessError::Interrupted => ToolError::Interrupted,
+        HarnessError::Io(error) => ToolError::Io(error),
+        HarnessError::Session(error) => error.into(),
+        HarnessError::Job(error) => error.into(),
+        HarnessError::Execution(error) => error.into_tool_error(),
+        error => ToolError::failed(error),
+    }
 }
 
 #[cfg(test)]
@@ -753,6 +816,51 @@ for line in sys.stdin:
         shutdown_session(session).await;
     }
 
+    #[tokio::test]
+    async fn child_target_lookup_preserves_safe_admission_diagnostics() {
+        use crate::tool::diagnostic::{Cause, Effects, Operation, Subject};
+
+        let root = tempfile::tempdir().unwrap();
+        let harness = builder(root.path(), Requests::default())
+            .capabilities(Capability::ALL.into_iter().collect())
+            .build()
+            .await
+            .unwrap();
+        let session = harness.new_session().await.unwrap();
+        for inherited in [false, true] {
+            let mut executor = session.runtime.executor.clone();
+            let mut args = json!({"prompt":"no"});
+            if inherited {
+                executor = executor
+                    .with_capabilities(CapabilitySet::default())
+                    .with_location(ExecutionLocation::named(
+                        "private-missing-target",
+                        root.path().to_path_buf(),
+                    ));
+            } else {
+                executor = executor.with_capabilities(Capability::ALL.into_iter().collect());
+                args["target"] = json!("private-missing-target");
+            }
+            let error = bounded(executor.execute(session.root.clone(), "agent", args, None))
+                .await
+                .unwrap_err();
+            let diagnostic = error.diagnostic();
+            assert_eq!(
+                diagnostic.cause,
+                Cause::InvalidArguments("unknown target".into())
+            );
+            assert_eq!(diagnostic.context.operation, Operation::Lookup);
+            assert_eq!(diagnostic.context.subject, Subject::argument(["target"]));
+            assert_eq!(diagnostic.context.effects, Effects::NotStarted);
+            assert!(
+                !diagnostic
+                    .render(&CapabilitySet::default())
+                    .contains("private-missing-target")
+            );
+        }
+        shutdown_session(session).await;
+    }
+
     /// A child in a mode is held to it: depth still withholds `agents`, a mode it could
     /// not hold is unknown to it, and a restart returns it to the mode as pinned.
     #[tokio::test]
@@ -1014,8 +1122,10 @@ for line in sys.stdin:
                     .execute(session.root.clone(), "script", arguments, None)
                     .await;
                 if !enabled && !background {
-                    use crate::tool::executor::ExecutionError::Failed;
-                    assert!(matches!(result, Err(Failed { .. })));
+                    assert!(matches!(
+                        result.unwrap_err().diagnostic().cause,
+                        crate::tool::diagnostic::Cause::Message(_)
+                    ));
                     continue;
                 }
                 let output = terminal(&session, result.unwrap().job).await;

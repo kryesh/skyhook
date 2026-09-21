@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use crate::tool::diagnostic::opaque_io;
 use futures_util::{Stream, StreamExt, TryStreamExt, stream::BoxStream};
 use reqwest::header::{HeaderName, HeaderValue};
 use rmcp::{
@@ -17,7 +18,7 @@ use rmcp::{
     model::{ClientJsonRpcMessage, ClientRequest, ErrorData, JsonRpcMessage, ServerJsonRpcMessage},
     service::{ClientInitializeError, RunningService},
     transport::{
-        StreamableHttpClientTransport,
+        DynamicTransportError, StreamableHttpClientTransport,
         common::client_side_sse::NeverRetry,
         streamable_http_client::{
             StreamableHttpClient, StreamableHttpClientTransportConfig, StreamableHttpError,
@@ -112,9 +113,7 @@ impl OwnedProcess {
         command.stderr(Stdio::null());
         #[cfg(unix)]
         command.process_group(0);
-        let child = command
-            .spawn()
-            .map_err(|e| McpError::Startup(format!("could not spawn MCP command: {}", e.kind())))?;
+        let child = command.spawn().map_err(McpError::Io)?;
         #[cfg(unix)]
         let group = child.id().and_then(|id| i32::try_from(id).ok());
         Ok(Self {
@@ -186,6 +185,72 @@ fn unreachable(error: &ClientInitializeError) -> bool {
         source = current.source();
     }
     false
+}
+
+/// Inspect concrete SDK causes, never SDK Display strings: they may carry full
+/// endpoints, headers, server-controlled messages, or rejected request values.
+pub(super) fn transport_error(error: DynamicTransportError) -> McpError {
+    let error = match error.error.downcast::<io::Error>() {
+        Ok(error) => return McpError::Io(opaque_io(*error)),
+        Err(error) => error,
+    };
+    let Some(error) = error.downcast_ref::<HttpError>() else {
+        return McpError::Transport;
+    };
+    match error {
+        StreamableHttpError::Client(error) => http_error(error),
+        StreamableHttpError::Io(error) => McpError::Io(opaque_io(error)),
+        StreamableHttpError::AuthRequired(_) => McpError::AuthenticationRequired,
+        StreamableHttpError::InsufficientScope(_) => McpError::InsufficientScope,
+        StreamableHttpError::SessionExpired => McpError::SessionExpired,
+        StreamableHttpError::SessionRecoveryTimeout
+        | StreamableHttpError::ControlRequestTimeout => McpError::Timeout,
+        StreamableHttpError::UnexpectedEndOfStream
+        | StreamableHttpError::TransportChannelClosed => McpError::TransportClosed,
+        StreamableHttpError::Deserialize(_) => McpError::Decode,
+        StreamableHttpError::UnexpectedServerResponse(_)
+        | StreamableHttpError::UnexpectedContentType(_)
+        | StreamableHttpError::MissingSessionIdInResponse => McpError::UnexpectedResponse,
+        _ => McpError::Transport,
+    }
+}
+
+fn http_error(error: &reqwest::Error) -> McpError {
+    if let Some(status) = error.status() {
+        return McpError::HttpStatus(status.as_u16());
+    }
+    if error.is_timeout() {
+        return McpError::Timeout;
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(error) = source {
+        if let Some(error) = error.downcast_ref::<io::Error>() {
+            return McpError::Io(opaque_io(error));
+        }
+        source = error.source();
+    }
+    if error.is_decode() {
+        McpError::Decode
+    } else {
+        McpError::Transport
+    }
+}
+
+fn initialize_error(error: ClientInitializeError) -> McpError {
+    match error {
+        ClientInitializeError::TransportError { error, .. } => transport_error(error),
+        ClientInitializeError::JsonRpcError(error) => McpError::JsonRpc(error.code.0),
+        ClientInitializeError::ConnectionClosed(_) => McpError::TransportClosed,
+        ClientInitializeError::Cancelled => McpError::Cancelled,
+        ClientInitializeError::NoCompatibleProtocolVersion { .. }
+        | ClientInitializeError::NoPreferredProtocolVersion => McpError::ProtocolVersion,
+        ClientInitializeError::LegacyFallbackFailed { fallback, .. } => initialize_error(*fallback),
+        ClientInitializeError::ExpectedInitResponse(_)
+        | ClientInitializeError::ExpectedInitResult(_)
+        | ClientInitializeError::ConflictInitResponseId(..)
+        | ClientInitializeError::UncorrelatedErrorResponse { .. } => McpError::UnexpectedResponse,
+        _ => McpError::Transport,
+    }
 }
 
 fn http_config(
@@ -287,6 +352,10 @@ impl BoundedHttpClient {
                 response.error_for_status().unwrap_err().without_url(),
             ));
         }
+        let status_error = response
+            .error_for_status_ref()
+            .err()
+            .map(reqwest::Error::without_url);
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -356,8 +425,11 @@ impl BoundedHttpClient {
                 None,
             ));
         }
+        if let Some(error) = status_error {
+            return Err(StreamableHttpError::Client(error));
+        }
         Err(StreamableHttpError::UnexpectedServerResponse(
-            format!("invalid MCP HTTP response (status {status})").into(),
+            "invalid MCP HTTP response".into(),
         ))
     }
 }
@@ -517,7 +589,7 @@ pub(crate) async fn connect(
             let stdin = child.stdin.take().expect("piped stdin");
             ().serve((BoundedLines::new(stdout), stdin))
                 .await
-                .map_err(|_| McpError::Startup("stdio MCP initialization failed".into()))
+                .map_err(initialize_error)
         }
         McpConnection::Http {
             endpoint,
@@ -530,7 +602,7 @@ pub(crate) async fn connect(
                 .retry(reqwest::retry::never())
                 .connect_timeout(Duration::from_secs(3))
                 .build()
-                .map_err(|_| McpError::Startup("could not build MCP HTTP client".into()))?;
+                .map_err(|error| http_error(&error))?;
             let client = BoundedHttpClient {
                 inner: client,
                 timeout: config.call_timeout().max(config.startup_timeout()),
@@ -540,16 +612,10 @@ pub(crate) async fn connect(
                 Err(error) if unreachable(&error) => match start_if_unreachable {
                     Some(command) => command,
                     None => {
-                        return Err(McpError::Startup(
-                            "HTTP MCP initialization failed (server not launchable)".into(),
-                        ));
+                        return Err(initialize_error(*error));
                     }
                 },
-                Err(_) => {
-                    return Err(McpError::Startup(
-                        "HTTP MCP initialization failed (server not launchable)".into(),
-                    ));
-                }
+                Err(error) => return Err(initialize_error(*error)),
             };
             *process = Some(OwnedProcess::spawn(command, false)?);
             // Retry only establishment, before any tool has been advertised or
@@ -559,11 +625,7 @@ pub(crate) async fn connect(
                 match http_connect(client.clone(), transport.clone()).await {
                     Ok(service) => return Ok(service),
                     Err(error) if unreachable(&error) => {}
-                    Err(_) => {
-                        return Err(McpError::Startup(
-                            "launched HTTP MCP server failed initialization".into(),
-                        ));
-                    }
+                    Err(error) => return Err(initialize_error(*error)),
                 }
             }
         }

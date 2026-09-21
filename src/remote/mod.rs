@@ -17,6 +17,8 @@ pub mod worker;
 pub use artifact::{ArtifactError, EmbeddedShim, EmbeddedShimCatalog};
 #[cfg(test)]
 pub(crate) use backend::{ConnectionFactory, ConnectionRequest};
+#[cfg(test)]
+pub(crate) use client::test_transport;
 pub use manager::RemoteError;
 #[cfg(test)]
 pub(crate) use manager::tests::PendingHandshakeFactory;

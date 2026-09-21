@@ -1,5 +1,6 @@
 //! Bounded HTTP requests. Redirects are deliberately handled here, never by reqwest.
 use crate::tool::ToolOptions;
+use crate::tool::diagnostic::deserialize_arguments;
 use crate::tool::invocation::{LocalCatalogBuilder, LocalContext, LocalError};
 use crate::tool::output::ProducedOutput;
 use std::collections::BTreeMap;
@@ -196,18 +197,18 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
         "HTTP(S) from the selected target. HTTP error statuses are normal results. Safe redirects follow GET/HEAD only; no HTTPS downgrade or retries.",
         ToolOptions::new(vec![Capability::Network])
             .argument_validator(|arguments| {
-                let args: FetchArgs = serde_json::from_value(arguments.clone()).map_err(crate::tool::invocation::AdmissionError::invalid)?;
+                let args: FetchArgs = deserialize_arguments(arguments.clone())?;
                 FetchPlan::try_from(args).map(drop)
             })
             // These callbacks still parse wire data to discover permissions and paths;
             // they do not construct or discard the retained domain plan.
             .argument_permissions(|location, arguments| {
-                let args: FetchArgs = serde_json::from_value(arguments.clone()).map_err(crate::tool::invocation::AdmissionError::invalid)?;
+                let args: FetchArgs = deserialize_arguments(arguments.clone())?;
                 let url = HttpRequestUrl::parse(&args.url)?;
                 Ok(vec![PermissionUse::new(Capability::Network, ResourceId::network(&location.target, url.origin().as_str()))])
             })
             .argument_paths(|arguments| {
-                let args: FetchArgs = serde_json::from_value(arguments.clone()).map_err(crate::tool::invocation::AdmissionError::invalid)?;
+                let args: FetchArgs = deserialize_arguments(arguments.clone())?;
                 let mut paths = Vec::new();
                 if args.save_to.is_some() { paths.push(PathArgument::pointer("/save_to", PathAccess::Write, PathKind::Writable)); }
                 if matches!(args.body, Some(RequestBody::File { .. })) {
@@ -223,7 +224,7 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
                 plan.client.connect_timeout, plan.client.proxy_origin());
             let outcome = tokio::select! {
                 biased;
-                () = context.cancelled() => return Err(LocalError::Cancelled),
+                () = context.cancelled() => Ok(Err(diagnostics::FetchError::Passthrough(LocalError::Cancelled))),
                 result = tokio::time::timeout(timeout, execute(&context, plan, &mut progress)) => result,
             };
             match outcome {

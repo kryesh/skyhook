@@ -753,7 +753,11 @@ mod tests {
         assert!(partial.report.diagnostics.is_empty());
         assert!(matches!(
             TargetRegistry::from_definitions(partial.config.targets.definitions().unwrap()),
-            Err(TargetError::UnknownJump(name)) if name == "b"
+            Err(TargetError::UnknownReference {
+                edge: crate::target::TargetEdge::Via,
+                reference: name,
+                ..
+            }) if name == "b"
         ));
         write(&f.local, targets(&[("b", Some("c")), ("c", None)]));
         let resolved = f.resolve().await.unwrap();

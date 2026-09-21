@@ -8,6 +8,7 @@ pub use config::{
     SshOptions, TargetAuth, TargetConfig, TargetConfigType, TargetType, TargetsConfig,
 };
 pub use registry::{
-    ROOT_TARGET, TargetDefinition, TargetError, TargetRecord, TargetRegistry, TargetSource,
+    ROOT_TARGET, TargetDefinition, TargetEdge, TargetError, TargetRecord, TargetRegistry,
+    TargetSource,
 };
 pub(crate) use router::{ResolvedRoute, RouteIdentity, TargetRouter};

@@ -15,8 +15,9 @@ use super::{bridge::HostResponse, console::ConsoleOutput};
 
 use crate::{
     media::ImageRef,
+    tool::diagnostic::{Effects, FailureSite, Operation, Subject},
     tool::executor::ToolExecutor,
-    tool::{ToolContext, ToolOutput},
+    tool::{ToolContext, ToolError, ToolOutput},
 };
 
 const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
@@ -44,48 +45,122 @@ pub enum JsError {
     InvalidOutput(String),
 }
 
-/// Evaluation errors retain finalized console evidence until the builtin projects
-/// its failure result. This is private artifact ownership, not a public JS error shape.
-#[derive(Debug, Error)]
-#[error("{error}")]
-pub(crate) struct CapturedJsError {
-    pub(crate) error: JsError,
-    pub(crate) console: Option<Box<crate::job::output::CompletedCapture>>,
-}
-
 /// Execute into the owning job's capture; native callers hydrate only when collecting the job.
 pub(crate) async fn evaluate_captured(
     source: String,
     executor: ToolExecutor,
     context: ToolContext,
-) -> Result<ToolOutput, CapturedJsError> {
-    let uncaptured = |error| CapturedJsError {
-        error,
-        console: None,
-    };
+) -> Result<ToolOutput, ToolError> {
     let capture = context
         .text_capture(crate::job::output::TextCaptureField::Console)
         .await
-        .map_err(|error| uncaptured(JsError::Execution(error.to_string())))?;
+        .map_err(|error| {
+            console_failure(error, Operation::CreateCapture, Effects::NotStarted)
+                .with_result(super::result::script_output(Value::Null, None, None))
+        })?;
     let console = Arc::new(std::sync::Mutex::new(ConsoleOutput::new(capture.open())));
     let result = evaluate_inner(source, executor, context, console.clone()).await;
-    let console = console
-        .lock()
-        .expect("console lock poisoned")
-        .finish()
-        .map_err(|error| uncaptured(JsError::Execution(error.to_string())))?;
-    match result {
-        Ok(mut output) => {
+    let console = console.lock().expect("console lock poisoned").finish();
+    finish_evaluation(result, console)
+}
+
+fn finish_evaluation(
+    result: Result<ToolOutput, ToolError>,
+    console: std::io::Result<Option<crate::job::output::CompletedCapture>>,
+) -> Result<ToolOutput, ToolError> {
+    match (result, console) {
+        (Ok(mut output), Ok(console)) => {
             let result = super::result::script_output(output.value, None, console);
             output.value = result.value;
             output.captures.extend(result.captures);
             Ok(output)
         }
-        Err(error) => Err(CapturedJsError {
-            error,
-            console: console.map(Box::new),
-        }),
+        (Err(error), Ok(console)) => {
+            let (diagnostic, mut output) = error.into_parts();
+            if let (Some(output), Some(console)) = (&mut output, console) {
+                output
+                    .value
+                    .as_object_mut()
+                    .expect("script result is an object")
+                    .remove("console");
+                output.captures.push(console);
+            }
+            Err(ToolError::from_diagnostic(diagnostic, output.map(Box::new)))
+        }
+        (Ok(output), Err(error)) => Err(console_failure(
+            error.into(),
+            Operation::FinishCapture,
+            Effects::OutputIncomplete,
+        )
+        .with_result(
+            super::result::script_output(output.value, None, None).with_images(output.images),
+        )),
+        (Err(error), Err(secondary)) => {
+            // Keep the primary outcome and summary. A JS stack can retain secondary
+            // storage evidence; outcomes without one still record incomplete output.
+            let secondary = console_failure(
+                secondary.into(),
+                Operation::FinishCapture,
+                Effects::OutputIncomplete,
+            );
+            let (mut diagnostic, mut output) = error.into_parts();
+            diagnostic.context.effects = Effects::OutputIncomplete;
+            if let Some(Value::String(stack)) = output
+                .as_mut()
+                .and_then(|output| output.value.pointer_mut("/failure/stack"))
+            {
+                stack.push('\n');
+                stack.push_str(&secondary.to_string());
+            }
+            Err(ToolError::from_diagnostic(diagnostic, output.map(Box::new)))
+        }
     }
+}
+
+/// Rendered into script-visible text as well as returned, so the site is explicit.
+fn console_failure(error: ToolError, operation: Operation, effects: Effects) -> ToolError {
+    error
+        .operation(operation, Subject::Label("script console".into()))
+        .at(FailureSite::Host)
+        .effects(effects)
+}
+
+fn javascript_error(error: JsError) -> ToolError {
+    let (operation, subject, effects) = match &error {
+        JsError::SourceTooLarge => (
+            Operation::Validate,
+            "JavaScript source",
+            Effects::NotStarted,
+        ),
+        JsError::Initialization(_) => (
+            Operation::Prepare,
+            "JavaScript runtime",
+            Effects::NotStarted,
+        ),
+        JsError::Execution(_) | JsError::Cancelled => {
+            (Operation::Execute, "JavaScript source", Effects::Unknown)
+        }
+        JsError::Failure { .. } => (Operation::Execute, "JavaScript source", Effects::Started),
+        JsError::InvalidOutput(_) => (
+            Operation::Deserialize,
+            "JavaScript result",
+            Effects::OutputIncomplete,
+        ),
+    };
+    let error = match error {
+        JsError::Cancelled => ToolError::Cancelled,
+        JsError::Failure { message, details } => ToolError::with_output(
+            message,
+            super::result::script_output(Value::Null, Some(details), None),
+        ),
+        error => ToolError::with_output(
+            error.to_string(),
+            super::result::script_output(Value::Null, None, None),
+        ),
+    };
+    error
+        .operation(operation, Subject::Label(subject.into()))
+        .effects(effects)
 }
 
 async fn evaluate_inner(
@@ -93,12 +168,12 @@ async fn evaluate_inner(
     executor: ToolExecutor,
     context: ToolContext,
     console: Arc<std::sync::Mutex<ConsoleOutput>>,
-) -> Result<ToolOutput, JsError> {
+) -> Result<ToolOutput, ToolError> {
     if source.len() > MAX_SOURCE_BYTES {
-        return Err(JsError::SourceTooLarge);
+        return Err(javascript_error(JsError::SourceTooLarge));
     }
-    let runtime =
-        AsyncRuntime::new().map_err(|error| JsError::Initialization(error.to_string()))?;
+    let runtime = AsyncRuntime::new()
+        .map_err(|error| javascript_error(JsError::Initialization(error.to_string())))?;
     let cancellation = context.clone();
     runtime
         .set_interrupt_handler(Some(Box::new(move || cancellation.is_cancelled())))
@@ -116,13 +191,12 @@ async fn evaluate_inner(
         .with::<intrinsic::MapSet>()
         .build_async(&runtime)
         .await
-        .map_err(|error| JsError::Initialization(error.to_string()))?;
+        .map_err(|error| javascript_error(JsError::Initialization(error.to_string())))?;
     let surface = Arc::new(executor.surface_for_agent(context.agent()));
     let builders = surface.script_manifests();
     let builders = serde_json::to_string(&builders)
-        .map_err(|error| JsError::Initialization(error.to_string()))?;
-    let source = source.trim();
-    let script = wrapper_script(source, &builders);
+        .map_err(|error| javascript_error(JsError::Initialization(error.to_string())))?;
+    let script = wrapper_script(&source, &builders);
     let marker_end = script
         .find(USER_SOURCE_MARKER)
         .expect("script wrapper contains its source marker")
@@ -157,15 +231,17 @@ async fn evaluate_inner(
                 }
             }
         }))
-        .map_err(|error| error.to_string())?;
-        js.globals().set("sleep", sleep).map_err(|error| error.to_string())?;
+        .map_err(|error| JsError::Initialization(error.to_string()))?;
+        js.globals().set("sleep", sleep).map_err(|error| JsError::Initialization(error.to_string()))?;
         let log = Function::new(js.clone(), move |text: String| {
-            console.lock().expect("console lock poisoned").log(&text).map_err(|e| bridge_error(&e))
+            console.lock().expect("console lock poisoned").log(&text).map_err(|error| {
+                bridge_error(&console_failure(error.into(), Operation::WriteCapture, Effects::OutputIncomplete))
+            })
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| JsError::Initialization(error.to_string()))?;
         js.globals()
             .set("__skyhookConsoleLog", log)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| JsError::Initialization(error.to_string()))?;
         let host_context = context.clone();
         let host_executor = executor.clone();
         let host_images = images.clone();
@@ -205,6 +281,7 @@ async fn evaluate_inner(
                                     &name,
                                     Some(host_context.job()),
                                     requested_name.as_deref(),
+                                    host_context.diagnostic_viewer(),
                                 ),
                             };
                             let annotations = schema
@@ -237,31 +314,37 @@ async fn evaluate_inner(
                 }
             }),
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| JsError::Initialization(error.to_string()))?;
         js.globals()
             .set("__skyhookHostCall", host_call)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| JsError::Initialization(error.to_string()))?;
         let promise = js
             .eval::<Promise<'_>, _>(script)
             .catch(&js)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| JsError::Execution(error.to_string()))?;
         promise
             .into_future::<String>()
             .await
             .catch(&js)
-            .map_err(|error| error.to_string())
+            .map_err(|error| JsError::Execution(error.to_string()))
     });
     let result = execution.await;
     if cancelled.is_cancelled() {
-        return Err(JsError::Cancelled);
+        return Err(javascript_error(JsError::Cancelled));
     }
     let encoded = result.map_err(|error| {
-        JsError::Execution(map_script_lines(&error, user_start_line, user_line_count))
+        javascript_error(match error {
+            JsError::Execution(message) => {
+                JsError::Execution(map_script_lines(&message, user_start_line, user_line_count))
+            }
+            error => error,
+        })
     })?;
     let envelope: super::outcome::Envelope = serde_json::from_str(&encoded)
-        .map_err(|error| JsError::InvalidOutput(error.to_string()))?;
+        .map_err(|error| javascript_error(JsError::InvalidOutput(error.to_string())))?;
     if !envelope.ok {
-        let details = envelope.error;
+        let mut details = envelope.error;
+        map_failure_stack_lines(&mut details, user_start_line, user_line_count);
         let message = details.get("message").and_then(Value::as_str).map_or_else(
             || details.to_string(),
             |message| {
@@ -271,19 +354,30 @@ async fn evaluate_inner(
                 )
             },
         );
-        return Err(JsError::Failure {
+        return Err(javascript_error(JsError::Failure {
             message: map_script_lines(&message, user_start_line, user_line_count),
             details,
-        });
+        }));
     }
     let (value, presentation) = (envelope.value, envelope.presentation);
-    presentation_jobs
-        .save_script_presentation(script_job, presentation)
-        .await
-        .map_err(|error| JsError::Execution(error.to_string()))?;
     let mut images = std::mem::take(&mut *returned_images.lock().await);
     images.sort();
     images.dedup();
+    presentation_jobs
+        .save_script_presentation(script_job, presentation)
+        .await
+        .map_err(|error| {
+            error
+                .operation(
+                    Operation::Save,
+                    Subject::Label("script presentation".into()),
+                )
+                .effects(Effects::OutputIncomplete)
+                .with_result(
+                    super::result::script_output(value.clone(), None, None)
+                        .with_images(images.clone()),
+                )
+        })?;
     Ok(ToolOutput::new(value).with_images(images))
 }
 
@@ -292,6 +386,27 @@ fn bridge_error(error: &impl ToString) -> rquickjs::Error {
 }
 
 const USER_SOURCE_MARKER: &str = "// __skyhook_user_source__\n";
+
+// Only exception stacks belong to this wrapper. Nested JobViews and partial
+// outputs remain untouched, even if they contain similar location text.
+fn map_failure_stack_lines(details: &mut Value, user_start: usize, user_lines: usize) {
+    match details {
+        Value::Object(error) => {
+            if let Some(Value::String(stack)) = error.get_mut("stack") {
+                *stack = map_script_lines(stack, user_start, user_lines);
+            }
+            if let Some(cause) = error.get_mut("cause") {
+                map_failure_stack_lines(cause, user_start, user_lines);
+            }
+        }
+        Value::Array(errors) => {
+            for error in errors {
+                map_failure_stack_lines(error, user_start, user_lines);
+            }
+        }
+        _ => {}
+    }
+}
 
 fn map_script_lines(error: &str, user_start: usize, user_lines: usize) -> String {
     let user_end = user_start.saturating_add(user_lines.saturating_sub(1));
@@ -343,17 +458,21 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::tool::{ToolOptions, ToolRegistryBuilder, executor::ToolExecutor};
+    use crate::tool::{
+        ToolOptions, ToolRegistryBuilder,
+        diagnostic::{Cause, IoKind},
+        executor::ToolExecutor,
+    };
 
     // Tests may eagerly inspect the console; production hydrates job captures on collection.
     async fn evaluate(
         source: impl Into<String>,
         executor: ToolExecutor,
         context: ToolContext,
-    ) -> Result<ToolOutput, JsError> {
+    ) -> Result<ToolOutput, ToolError> {
         let saved = executor.jobs().output(context.job());
         let captured = evaluate_captured(source.into(), executor, context).await;
-        let mut output = captured.map_err(|captured| captured.error)?;
+        let mut output = captured?;
         let console = saved
             .test_bytes("/result/console")
             .map(|bytes| String::from_utf8(bytes).expect("console is UTF-8"))
@@ -391,7 +510,7 @@ mod tests {
     }
 
     /// Evaluates `source` against an executor with no registered tools.
-    async fn plain(source: &str) -> Result<ToolOutput, JsError> {
+    async fn plain(source: &str) -> Result<ToolOutput, ToolError> {
         let (_scope, executor, context) = test_runtime(ToolRegistryBuilder::default()).await;
         evaluate(source, executor, context).await
     }
@@ -399,10 +518,9 @@ mod tests {
     #[tokio::test]
     async fn local_source_and_sleep_limits_fail_before_user_effects() {
         let oversized = " ".repeat(MAX_SOURCE_BYTES + 1);
-        assert!(matches!(
-            plain(&oversized).await,
-            Err(JsError::SourceTooLarge)
-        ));
+        let diagnostic = plain(&oversized).await.unwrap_err().diagnostic();
+        assert_eq!(diagnostic.context.operation, Operation::Validate);
+        assert_eq!(diagnostic.context.effects, Effects::NotStarted);
         let output = plain(
             r#"
             const errors = [];
@@ -428,7 +546,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             cancellation.cancel();
         });
-        assert!(matches!(result, Err(JsError::Cancelled)));
+        assert_eq!(result.unwrap_err().diagnostic().cause, Cause::Cancelled);
         // Far below the script's sleep, yet generous under load.
         let unawaited = plain("sleep(60000); return 'finished';");
         let output = tokio::time::timeout(std::time::Duration::from_secs(20), unawaited);
@@ -559,9 +677,11 @@ return {visible: typeof tool.script, direct, deniedResponse, denied};
         )
         .await
         .unwrap_err();
-        let JsError::Failure { details, .. } = error else {
+        let (diagnostic, Some(output)) = error.into_parts() else {
             panic!("expected nested failure details")
         };
+        assert!(matches!(diagnostic.cause, Cause::Message(_)));
+        let details = &output.value["failure"];
         assert_eq!(
             (&details["code"], &details["executed"]),
             (&json!("permission_denied"), &json!(false))
@@ -627,6 +747,171 @@ return {first, second, started};
     }
 
     #[tokio::test]
+    async fn script_failure_stack_and_summary_use_submitted_source_lines() {
+        for (source, line) in [
+            ("\n\nawait Promise.resolve();\nthrow new Error('boom');", 4),
+            (
+                "\n\nfunction fail() {\n  throw new Error('boom');\n}\nfail();",
+                4,
+            ),
+            (
+                "\n\nthrow new Error('outer', {cause:new Error('inner')});",
+                3,
+            ),
+        ] {
+            let (diagnostic, Some(output)) = plain(source).await.unwrap_err().into_parts() else {
+                panic!("expected JavaScript failure output");
+            };
+            let Cause::Message(message) = diagnostic.cause else {
+                panic!("expected JavaScript failure");
+            };
+            let details = &output.value["failure"];
+            let stack = details["stack"].as_str().unwrap();
+            assert!(
+                stack.contains(&format!("skyhook-script:{line}:")),
+                "{stack}"
+            );
+            assert!(
+                message.contains(&format!("skyhook-script:{line}:")),
+                "{message}"
+            );
+            if let Some(cause) = details.get("cause") {
+                assert!(
+                    cause["stack"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&format!("skyhook-script:{line}:"))
+                );
+            }
+        }
+        let (diagnostic, Some(_)) = plain("\n\nconst value = ;").await.unwrap_err().into_parts()
+        else {
+            panic!("expected JavaScript syntax failure output");
+        };
+        let Cause::Message(message) = diagnostic.cause else {
+            panic!("expected JavaScript syntax failure");
+        };
+        assert!(message.contains("skyhook-script:3:"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn script_capture_initialization_failure_is_host_io_before_javascript() {
+        let (_scope, executor, context) = test_runtime(ToolRegistryBuilder::default()).await;
+        let _reserved = context
+            .text_capture(crate::job::output::TextCaptureField::Console)
+            .await
+            .unwrap();
+        let error = evaluate_captured(
+            "throw new Error('must not execute');".into(),
+            executor,
+            context,
+        )
+        .await
+        .unwrap_err();
+        let diagnostic = error.diagnostic();
+        assert_eq!(diagnostic.context.operation, Operation::CreateCapture);
+        assert_eq!(diagnostic.context.effects, Effects::NotStarted);
+        assert!(matches!(diagnostic.cause, Cause::Io { .. }));
+    }
+
+    #[test]
+    fn script_console_finalization_preserves_primary_failure_and_known_output() {
+        let details = json!({"message": "primary failure", "stack": "skyhook-script:3:1"});
+        // One primary with a stack to extend and one without any output.
+        for error in [
+            javascript_error(JsError::Failure {
+                message: "primary failure".into(),
+                details: details.clone(),
+            }),
+            javascript_error(JsError::Cancelled),
+        ] {
+            let (expected, expected_output) = error.into_parts();
+            // Check both successful and failed console finalization against the same primary.
+            let primary =
+                ToolError::from_diagnostic(expected.clone(), expected_output.clone().map(Box::new));
+            let (diagnostic, mut output) = finish_evaluation(
+                Err(primary),
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            )
+            .unwrap_err()
+            .into_parts();
+            let mut incomplete = expected.clone();
+            incomplete.context.effects = Effects::OutputIncomplete;
+            assert_eq!(diagnostic, incomplete);
+            if let Some(stack) = output
+                .as_mut()
+                .and_then(|output| output.value.pointer_mut("/failure/stack"))
+            {
+                let text = stack.as_str().unwrap();
+                assert!(
+                    text.starts_with(details["stack"].as_str().unwrap()),
+                    "{text}"
+                );
+                assert!(text.contains("broken pipe"), "{text}");
+                *stack = details["stack"].clone();
+            }
+            assert_eq!(
+                output.map(|output| output.value),
+                expected_output.as_ref().map(|output| output.value.clone())
+            );
+            let primary =
+                ToolError::from_diagnostic(expected.clone(), expected_output.clone().map(Box::new));
+            let (diagnostic, output) = finish_evaluation(Err(primary), Ok(None))
+                .unwrap_err()
+                .into_parts();
+            assert_eq!(diagnostic, expected);
+            assert_eq!(
+                output.map(|output| output.value),
+                expected_output.map(|output| output.value)
+            );
+        }
+        let (diagnostic, output) = finish_evaluation(
+            Ok(ToolOutput::new(json!({"computed": 42}))),
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        )
+        .unwrap_err()
+        .into_parts();
+        assert_eq!(diagnostic.context.operation, Operation::FinishCapture);
+        assert_eq!(diagnostic.context.effects, Effects::OutputIncomplete);
+        assert!(matches!(
+            diagnostic.cause,
+            Cause::Io {
+                kind: IoKind::BrokenPipe,
+                ..
+            }
+        ));
+        assert_eq!(
+            output.unwrap().value,
+            json!({"value":{"computed":42},"console":"","failure":null})
+        );
+    }
+
+    #[test]
+    fn script_line_mapping_preserves_nested_tool_responses_and_partial_output() {
+        let response = json!({
+            "state": "failed",
+            "error": "eval_script:102: child failure",
+            "result": {"stack": "eval_script:102:"},
+            "meta": {"target": "remote", "code": "permission_denied", "executed": false},
+        });
+        let mut details = json!({
+            "message": "failed",
+            "stack": "at eval_script:102:4\nat eval_script:9:1",
+            "cause": {"stack": "at eval_script:103:5"},
+            "response": response,
+            "output": response["result"],
+        });
+        map_failure_stack_lines(&mut details, 100, 5);
+        assert_eq!(
+            details["stack"],
+            "at skyhook-script:3:4\nat eval_script:9:1"
+        );
+        assert_eq!(details["cause"]["stack"], "at skyhook-script:4:5");
+        assert_eq!(details["response"], response);
+        assert_eq!(details["output"], response["result"]);
+    }
+
+    #[tokio::test]
     async fn script_errors_preserve_captured_console() {
         let runtime = TestRuntime::new().await;
         let mut builder = ToolRegistryBuilder::default();
@@ -644,16 +929,22 @@ return {first, second, started};
                 "undefined at $.nested",
             ),
         ] {
-            let error = executor.run_host(&runtime.agent, "script", json!({"source": source}));
-            let crate::tool::executor::ExecutionError::Failed {
-                message,
-                output: Some(output),
-            } = error.await.unwrap_err()
-            else {
-                panic!("expected script failure with captured output");
-            };
+            let error = executor
+                .run_host(&runtime.agent, "script", json!({"source": source}))
+                .await
+                .unwrap_err();
+            let diagnostic = error.diagnostic();
+            assert_eq!(diagnostic.context.operation, Operation::Execute);
+            assert_eq!(diagnostic.context.site, FailureSite::Host);
+            assert!(
+                matches!(&diagnostic.cause, Cause::Message(message) if message.contains(expected))
+            );
+            let output = error
+                .into_tool_error()
+                .into_failure()
+                .output
+                .expect("script failure retains captured output");
             assert_eq!(output.value["console"], "before error\n");
-            assert!(message.contains(expected));
         }
     }
 

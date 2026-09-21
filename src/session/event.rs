@@ -248,10 +248,11 @@ pub enum SessionEvent {
     JobFinished {
         job: JobId,
         state: JobState,
-        error: Option<String>,
-        images: Vec<ImageRef>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        denial: Option<crate::tool::Denial>,
+        diagnostic: Option<crate::tool::diagnostic::Diagnostic>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_diagnostic: Option<crate::tool::diagnostic::Diagnostic>,
+        images: Vec<ImageRef>,
     },
     JobClaimed {
         job: JobId,

@@ -4,8 +4,11 @@ use serde_json::Value;
 
 use crate::{
     identity::JobId,
-    job::{JobManager, presented_job_schema},
-    tool::{RegistryError, ToolError, ToolOptions, ToolRegistryBuilder},
+    job::{JobError, JobManager, presented_job_schema},
+    tool::{
+        RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
+        diagnostic::{DiagnosticContext, Effects, Operation, Subject},
+    },
 };
 
 pub(crate) fn register(
@@ -21,14 +24,20 @@ pub(crate) fn register(
             let jobs = list.clone();
             async move {
                 let current = jobs
-                    .snapshot(context.job())
+                    .metadata(context.job())
                     .await
-                    .map_err(ToolError::failed)?;
+                    .map_err(|error| {
+                        job_failure(error, Operation::Inspect, context.job())
+                            .effects(Effects::Unchanged)
+                    })?;
                 let containing_script = if let Some(parent) = current.parent {
                     let parent = jobs
-                        .snapshot(parent)
+                        .metadata(parent)
                         .await
-                        .map_err(ToolError::failed)?;
+                        .map_err(|error| {
+                            job_failure(error, Operation::Inspect, parent)
+                                .effects(Effects::Unchanged)
+                        })?;
                     (parent.role == crate::job::JobRole::Script).then_some(parent.id)
                 } else {
                     None
@@ -43,7 +52,7 @@ pub(crate) fn register(
                 Ok(Value::Array(
                     envelopes
                         .iter()
-                        .map(|job| job.metadata_view(context.capabilities()).into_value())
+                        .map(|job| job.metadata_view(context.diagnostic_viewer()).into_value())
                         .collect(),
                 ))
             }
@@ -58,12 +67,16 @@ pub(crate) fn register(
             let jobs = output.clone();
             async move {
                 args.cancellation = Some(context.cancellation_token());
+                let job = args.job;
                 jobs.present_output_with(
                     args,
-                    context.capabilities(),
+                    context.diagnostic_viewer(),
                     crate::job::output::OutputOptions::Model { presentation: crate::job::OutputPresentation::Full },
                 )
                 .await
+                .map_err(|error| {
+                    error.fallback_context(DiagnosticContext::new(Operation::Read, Subject::Job(job)))
+                })
             }
         },
     )?;
@@ -79,7 +92,7 @@ pub(crate) fn register(
             async move {
                 jobs.send(args.job, args.value)
                     .await
-                    .map_err(ToolError::failed)?;
+                    .map_err(|error| job_failure(error, Operation::Send, args.job))?;
                 Ok(serde_json::json!({"accepted": true}))
             }
         },
@@ -97,12 +110,27 @@ pub(crate) fn register(
             async move {
                 jobs.cancel(args.job)
                     .await
-                    .map_err(ToolError::failed)
-                    .map(|job| job.metadata_view(context.capabilities()).into_value())
+                    .map_err(|error| job_failure(error, Operation::Terminate, args.job))
+                    .map(|job| job.metadata_view(context.diagnostic_viewer()).into_value())
             }
         },
     )?;
     Ok(())
+}
+
+/// Convert at the host job boundary, before opaque persistence failures can
+/// expose stored input or be mistaken for a rejected, unstarted mutation.
+fn job_failure(error: JobError, operation: Operation, job: JobId) -> ToolError {
+    let effects = match &error {
+        JobError::Unknown(_)
+        | JobError::InputUnavailable { .. }
+        | JobError::InputUnsupported(_)
+        | JobError::InputClosed(_) => Effects::NotStarted,
+        _ => Effects::Unknown,
+    };
+    ToolError::from(error)
+        .operation(operation, Subject::Job(job))
+        .effects(effects)
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -140,10 +168,11 @@ mod tests {
         job::{JobOutcome, JobRole, JobSpec, JobState},
         media::ImageRef,
         provider::protocol::{Message, ModelRequest, ToolResult},
-        session::SessionStore,
+        session::{SessionError, SessionStore},
         tests::TestRuntime,
         tool::{
             ToolOutput, ToolRegistryBuilder,
+            diagnostic::Cause,
             executor::{ExecutionResult, ToolExecutor},
             policy::{AllowAll, Capability, CapabilitySet},
         },
@@ -156,6 +185,69 @@ mod tests {
             .iter()
             .map(|job| job["id"].clone())
             .collect()
+    }
+
+    #[test]
+    fn job_failure_retains_canonical_cause_and_boundary_mutation_evidence() {
+        let job = JobId::new(42).unwrap();
+        let session_error = || {
+            SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private persisted input",
+            ))
+        };
+        let cases = [
+            (
+                JobError::Session(session_error()),
+                ToolError::from(session_error()).diagnostic().cause,
+                Effects::Unknown,
+            ),
+            (
+                JobError::Internal("private lifecycle details".into()),
+                Cause::Message("job lifecycle operation failed".into()),
+                Effects::Unknown,
+            ),
+            (
+                JobError::Unknown(job),
+                ToolError::failed(JobError::Unknown(job)).diagnostic().cause,
+                Effects::NotStarted,
+            ),
+        ];
+        for (error, cause, effects) in cases {
+            let diagnostic = job_failure(error, Operation::Send, job).diagnostic();
+            assert_eq!(diagnostic.context.operation, Operation::Send);
+            assert_eq!(diagnostic.context.subject, Subject::Job(job));
+            assert_eq!(diagnostic.context.effects, effects);
+            assert_eq!(diagnostic.cause, cause);
+        }
+    }
+
+    #[tokio::test]
+    async fn job_output_failures_name_the_requested_job_on_the_host() {
+        let runtime = TestRuntime::new().await;
+        let (executor, _slot) = executor(runtime.jobs.clone(), runtime.root.path());
+        let unknown = JobId::new(999_999).unwrap();
+        for (query, operation, subject) in [
+            (
+                json!({"job": unknown}),
+                Operation::Read,
+                Subject::Job(unknown),
+            ),
+            (
+                json!({"job": unknown, "pattern":"["}),
+                Operation::Validate,
+                Subject::argument(["pattern"]),
+            ),
+        ] {
+            let error = executor
+                .run_host(&runtime.agent, "job_output", query)
+                .await
+                .unwrap_err();
+            let context = error.diagnostic().context;
+            assert_eq!(context.operation, operation);
+            assert_eq!(context.subject, subject);
+            assert_eq!(context.site, crate::tool::diagnostic::FailureSite::Host);
+        }
     }
 
     #[tokio::test]
@@ -428,11 +520,11 @@ mod tests {
         // Consume the lease before reopening; it retains the manager and journal lock.
         let output = ToolOutput::new(json!({"image":image})).with_images(vec![image]);
         lease
-            .fail(JobOutcome::Failed {
-                message: "failed after producing an image".into(),
-                output: Some(output),
-                denial: None,
-            })
+            .fail(
+                ToolError::Failed("failed after producing an image".into())
+                    .with_result(output)
+                    .into(),
+            )
             .await;
         let id = runtime.store.id();
         drop((runtime.jobs, runtime.store));

@@ -10,7 +10,8 @@ a session database or run a second agent harness.
 - Target resolution selects a validated route and execution workspace. SSH configuration comes
   from target definitions, not the user's or system's SSH configuration.
 - `RemoteManager` owns the session's connection pool, keyed by resolved route identity **and**
-  workspace. It coordinates shared startup, invalidation, and shutdown.
+  workspace. It coordinates shared startup, invalidation, and shutdown, and tracks startup and
+  reader/drain tasks independently of pool membership and callers.
 - `ConnectionFactory` supplies the byte stream and lifetime owner. The SSH backend handles
   authentication, OpenSSH processes, platform probing, and shim deployment; it does not implement
   job supervision or saved-output storage.
@@ -27,15 +28,30 @@ operations share validation and execution behavior.
 ## Connection and request lifecycle
 
 Connection startup is shared by callers using the same pool key. Cancelling one waiter stops its
-wait, not the shared startup. Startup failure removes the failed slot; I/O or protocol failure
+wait, not the shared startup. Startup failure removes the failed slot; transport I/O or protocol failure
 during execution discards the affected pooled connection so later work can establish a new one.
 It does not transparently replay the failed tool operation.
 
 Once connected, request IDs associate output and cancellation with individual operations.
+SSH cancellation remains best-effort: the client does not await a terminal reply. Already captured
+output remains inspectable, but final worker diagnostics or structured results may be unavailable.
 Credit-based flow control bounds queued payload and relayed-stream data. A transport's lifetime
 owner retains its underlying process resources; dropping it tears those resources down. A relayed
-connection also retains its origin connection for the lifetime of the child stream. Session
-shutdown cancels startup, clears the pool, and releases session-owned authentication resources.
+connection also retains its origin connection for the lifetime of the child stream.
+
+Accepted-payload ingestion is tracked independently of pool membership and caller lifetime. Pool
+eviction does not abort the reader; dropping the last `PooledConnection` owner cancels routing
+instead. When routing ends through cancellation or failure, the reader releases the transport
+owner before draining the finite queue of already accepted payloads. The drain does not require a
+live socket or further acknowledgements, and the session tracks the reader until it finishes.
+This protects accepted output, not payloads that never reached the host or a terminal reply the
+worker has not sent.
+
+Session shutdown cancels startup and routing, fences new startup under the pool lock, and clears
+the pool. Shared startups and readers use the same session task tracker: a startup registers its
+reader before its own tracked lifetime ends, so shutdown cannot miss a reader from an in-flight
+handshake. Shutdown waits for startup and reader/drain work before backend cleanup releases
+session-owned authentication resources.
 
 ### Origin versus jump hosts
 

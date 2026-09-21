@@ -12,7 +12,8 @@ use tokio::fs;
 
 use crate::tool::{
     AdmissionError, RegistryError, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder,
-    policy::Capability,
+    diagnostic::{DiagnosticContext, FailureSite, Operation, Subject, deserialize_arguments},
+    policy::{Capability, CapabilitySet},
 };
 use crate::{
     media::{ImageRef, MAX_IMAGE_BYTES},
@@ -110,10 +111,10 @@ impl HostSkills {
         let workspace = match fs::canonicalize(workspace).await {
             Ok(workspace) => workspace,
             Err(error) => {
-                warnings.push(format!(
-                    "Cannot resolve skill workspace {}: {error}",
-                    workspace.display()
-                ));
+                warnings.push(host_warning(ToolError::from(error).operation(
+                    Operation::Canonicalize,
+                    Subject::working_directory(workspace),
+                )));
                 workspace.to_path_buf()
             }
         };
@@ -143,22 +144,15 @@ impl HostSkills {
                 .unwrap_or_else(|error| format!("[cannot render YAML: {error}]"));
             // The canonical root may have been replaced since discovery; links are not followed.
             let listed = match fs::symlink_metadata(&entry.root).await {
-                Ok(metadata) if !metadata.is_dir() => Err(ToolError::Failed(
-                    "skill root is no longer a directory".to_owned(),
-                )),
+                Ok(metadata) if !metadata.is_dir() => {
+                    Err(ToolError::failed("skill root is no longer a directory")
+                        .operation(Operation::ReadDirectory, Subject::path(&entry.root)))
+                }
                 _ => asset_tree(&entry.root, true, Some(&mut unreadable)).await,
             };
-            errors.extend(
-                unreadable.drain(..).map(|error| {
-                    format!("Cannot list assets for skill `{}` at {error}", entry.name)
-                }),
-            );
+            errors.extend(unreadable.drain(..).map(host_warning));
             let assets = listed.unwrap_or_else(|error| {
-                errors.push(format!(
-                    "Cannot list assets for skill `{}` at {}: {error}",
-                    entry.name,
-                    entry.root.display()
-                ));
+                errors.push(host_warning(error));
                 String::new()
             });
             text.push_str(&format!(
@@ -195,9 +189,10 @@ impl HostSkills {
     }
 
     fn get(&self, name: &str) -> Result<&SkillEntry, ToolError> {
-        self.entries
-            .get(name)
-            .ok_or_else(|| ToolError::Failed(format!("unknown skill `{name}`")))
+        self.entries.get(name).ok_or_else(|| {
+            ToolError::failed("unknown skill")
+                .operation(Operation::Lookup, Subject::argument(["name"]))
+        })
     }
 }
 
@@ -205,6 +200,18 @@ fn user_skills_root() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .map(|home| PathBuf::from(home).join(".agents/skills"))
+}
+
+/// Discovery and describe report outside tool dispatch, which would otherwise bind the site.
+fn host_warning(error: ToolError) -> String {
+    error
+        .at(FailureSite::Host)
+        .diagnostic()
+        .render(&CapabilitySet::default())
+}
+
+fn at(operation: Operation, path: &Path) -> DiagnosticContext {
+    DiagnosticContext::new(operation, Subject::path(path))
 }
 
 async fn scan_root(
@@ -216,7 +223,9 @@ async fn scan_root(
         Ok(directory) => directory,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
         Err(error) => {
-            warnings.push(format!("Cannot scan skills at {}: {error}", root.display()));
+            warnings.push(host_warning(
+                ToolError::Io(error).context(at(Operation::ReadDirectory, root)),
+            ));
             return;
         }
     };
@@ -226,7 +235,9 @@ async fn scan_root(
             Ok(Some(entry)) => paths.push(entry.path()),
             Ok(None) => break,
             Err(error) => {
-                warnings.push(format!("Cannot scan skills at {}: {error}", root.display()));
+                warnings.push(host_warning(
+                    ToolError::Io(error).context(at(Operation::ReadDirectory, root)),
+                ));
                 break;
             }
         }
@@ -237,17 +248,18 @@ async fn scan_root(
             Ok(entry) => {
                 entries.insert(entry.name.clone(), entry);
             }
-            Err(error) => warnings.push(format!("Skipping skill at {}: {error}", path.display())),
+            Err(error) => warnings.push(host_warning(error)),
         }
     }
 }
 
-async fn load_skill(path: &Path) -> Result<SkillEntry, String> {
+async fn load_skill(path: &Path) -> Result<SkillEntry, ToolError> {
     let metadata = fs::metadata(path)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(ToolError::annotated(at(Operation::Inspect, path)))?;
     if !metadata.is_dir() {
-        return Err("entry is not a directory".to_owned());
+        return Err(ToolError::failed("entry is not a directory")
+            .operation(Operation::Load, Subject::path(path)));
     }
     let name = path
         .file_name()
@@ -258,39 +270,61 @@ async fn load_skill(path: &Path) -> Result<SkillEntry, String> {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
         })
-        .ok_or_else(|| "skill directory name is invalid".to_owned())?
+        .ok_or_else(|| {
+            ToolError::failed("skill directory name is invalid")
+                .operation(Operation::Validate, Subject::path(path))
+        })?
         .to_owned();
     let root = fs::canonicalize(path)
         .await
-        .map_err(|error| error.to_string())?;
-    let instruction_path = fs::canonicalize(path.join("SKILL.md"))
-        .await
-        .map_err(|error| error.to_string())?;
+        .map_err(ToolError::annotated(at(Operation::Canonicalize, path)))?;
+    let instruction_path = path.join("SKILL.md");
+    let instruction_path =
+        fs::canonicalize(&instruction_path)
+            .await
+            .map_err(ToolError::annotated(at(
+                Operation::Canonicalize,
+                &instruction_path,
+            )))?;
     if !instruction_path.starts_with(&root) {
-        return Err("SKILL.md escapes its skill directory".to_owned());
+        return Err(ToolError::failed("SKILL.md escapes its skill directory")
+            .operation(Operation::Validate, Subject::path(&instruction_path)));
     }
     let metadata = fs::metadata(&instruction_path)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(ToolError::annotated(at(
+            Operation::Inspect,
+            &instruction_path,
+        )))?;
     if !metadata.is_file() {
-        return Err("SKILL.md is not a regular file".to_owned());
+        return Err(ToolError::failed("SKILL.md is not a regular file")
+            .operation(Operation::Read, Subject::path(&instruction_path)));
     }
+    let exceeds = || {
+        ToolError::failed(format!("SKILL.md exceeds {MAX_INLINE_BYTES} bytes"))
+            .operation(Operation::Read, Subject::path(&instruction_path))
+    };
     if metadata.len() > MAX_INLINE_BYTES {
-        return Err(format!("SKILL.md exceeds {MAX_INLINE_BYTES} bytes"));
+        return Err(exceeds());
     }
     let mut input = fs::File::open(&instruction_path)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(ToolError::annotated(at(Operation::Read, &instruction_path)))?;
     let bytes = read_bounded(&mut input, MAX_INLINE_BYTES as usize)
         .await
         .map_err(|error| match error {
-            BoundedReadError::TooLarge { .. } => {
-                format!("SKILL.md exceeds {MAX_INLINE_BYTES} bytes")
+            BoundedReadError::TooLarge { .. } => exceeds(),
+            BoundedReadError::Io(error) => {
+                ToolError::Io(error).context(at(Operation::Read, &instruction_path))
             }
-            BoundedReadError::Io(error) => error.to_string(),
         })?;
-    let instructions = String::from_utf8(bytes).map_err(|error| error.to_string())?;
-    let (description, frontmatter) = parse_instructions(&instructions)?;
+    let instructions = String::from_utf8(bytes).map_err(|error| {
+        ToolError::failed(error.utf8_error())
+            .operation(Operation::Deserialize, Subject::path(&instruction_path))
+    })?;
+    let (description, frontmatter) = parse_instructions(&instructions).map_err(|error| {
+        ToolError::failed(error).operation(Operation::Deserialize, Subject::path(&instruction_path))
+    })?;
     Ok(SkillEntry {
         name,
         description,
@@ -370,8 +404,7 @@ pub(super) fn register(
         "Load complete skill instructions and discover assets. Select a relative path to list a directory (use `.` for the root), read text, attach a supported image, or inspect binary metadata. Supply `to` to copy a file into the workspace.",
         // Copy permissions are scoped to the caller by skill_transfer, not this host tool.
         ToolOptions::new(vec![Capability::Read]).argument_validator(|arguments| {
-            let args: SkillArgs = serde_json::from_value(arguments.clone())
-                .map_err(AdmissionError::invalid)?;
+            let args: SkillArgs = deserialize_arguments(arguments.clone())?;
             SkillRequest::try_from(args).map(drop)
         }),
         move |context, args| {
@@ -391,7 +424,7 @@ pub(super) fn register(
                     SkillOperation::Inspect { asset } => inspect_asset(entry, asset, &store).await,
                     SkillOperation::Copy { asset, destination } => {
                         let source = resolve_asset(entry, &asset).await?;
-                        let metadata = fs::metadata(&source).await?;
+                        let metadata = fs::metadata(&source).await.map_err(ToolError::annotated(at(Operation::Inspect, &source)))?;
                         let bytes = read_asset(&source, &metadata, MAX_COPY_BYTES).await?;
                         let destination = super::skill_transfer::copy(&router, &context, &destination, &bytes).await?;
                         skill_output(SkillOutput::Copied {
@@ -412,20 +445,26 @@ async fn read_asset(
     maximum: usize,
 ) -> Result<Vec<u8>, ToolError> {
     if !metadata.is_file() {
-        return Err(ToolError::Failed(
-            "skill asset is not a file; directories cannot be copied".to_owned(),
-        ));
+        return Err(ToolError::failed("skill asset is not a regular file")
+            .operation(Operation::Read, Subject::path(source)));
     }
-    let exceeds = || ToolError::Failed(format!("skill asset exceeds {maximum} bytes"));
+    let exceeds = || {
+        ToolError::failed(format!("skill asset exceeds {maximum} bytes"))
+            .operation(Operation::Read, Subject::path(source))
+    };
     if metadata.len() > maximum as u64 {
         return Err(exceeds());
     }
-    let mut input = fs::File::open(source).await?;
+    let mut input = fs::File::open(source)
+        .await
+        .map_err(ToolError::annotated(at(Operation::Read, source)))?;
     read_bounded(&mut input, maximum)
         .await
         .map_err(|error| match error {
             BoundedReadError::TooLarge { .. } => exceeds(),
-            BoundedReadError::Io(error) => error.into(),
+            BoundedReadError::Io(error) => {
+                ToolError::Io(error).context(at(Operation::Read, source))
+            }
         })
 }
 
@@ -435,7 +474,9 @@ async fn inspect_asset(
     store: &SessionStore,
 ) -> Result<ToolOutput, ToolError> {
     let source = resolve_asset(entry, &asset).await?;
-    let metadata = fs::metadata(&source).await?;
+    let metadata = fs::metadata(&source)
+        .await
+        .map_err(ToolError::annotated(at(Operation::Inspect, &source)))?;
     if metadata.is_dir() {
         return skill_output(SkillOutput::Directory {
             name: entry.name.clone(),
@@ -450,11 +491,13 @@ async fn inspect_asset(
     )
     .await?;
     if crate::media::ImageFormat::sniff(&bytes).is_some() {
-        let image = crate::media::Image::new(bytes).map_err(ToolError::failed)?;
+        let image = crate::media::Image::new(bytes).map_err(|error| {
+            ToolError::failed(error).operation(Operation::Deserialize, Subject::path(&source))
+        })?;
         let image = store
             .store_image(Some(asset.clone()), &image)
             .await
-            .map_err(ToolError::failed)?;
+            .map_err(ToolError::annotated(at(Operation::StoreImage, &source)))?;
         return Ok(skill_output(SkillOutput::Image {
             name: entry.name.clone(),
             path: asset,
@@ -464,9 +507,10 @@ async fn inspect_asset(
     }
     if let Some(content) = text_content(&bytes) {
         if bytes.len() as u64 > MAX_INLINE_BYTES {
-            return Err(ToolError::Failed(format!(
+            return Err(ToolError::failed(format!(
                 "text skill asset exceeds {MAX_INLINE_BYTES} bytes; use `to` to copy it"
-            )));
+            ))
+            .operation(Operation::Read, Subject::path(&source)));
         }
         return skill_output(SkillOutput::Text {
             name: entry.name.clone(),
@@ -499,12 +543,14 @@ fn text_content(bytes: &[u8]) -> Option<&str> {
 async fn asset_tree(
     root: &Path,
     exclude_instructions: bool,
-    mut unreadable: Option<&mut Vec<String>>,
+    mut unreadable: Option<&mut Vec<ToolError>>,
 ) -> Result<String, ToolError> {
     let mut tree = String::new();
     let mut pending = vec![(root.to_path_buf(), String::new(), true, true)];
     while let Some((path, prefix, last, is_root)) = pending.pop() {
-        let metadata = fs::symlink_metadata(&path).await?;
+        let metadata = fs::symlink_metadata(&path)
+            .await
+            .map_err(ToolError::annotated(at(Operation::Inspect, &path)))?;
         let is_symlink = metadata.file_type().is_symlink();
         let is_directory = metadata.is_dir() && !is_symlink;
         if !is_root {
@@ -531,17 +577,26 @@ async fn asset_tree(
                 if !is_root {
                     tree.insert_str(tree.len() - 1, " [unreadable]");
                 }
-                unreadable.push(format!("{}: {error}", path.display()));
+                unreadable.push(ToolError::Io(error).context(at(Operation::ReadDirectory, &path)));
                 continue;
             }
-            (Err(error), None) => return Err(error.into()),
+            (Err(error), None) => {
+                return Err(ToolError::Io(error).context(at(Operation::ReadDirectory, &path)));
+            }
         };
         let mut children = Vec::new();
-        while let Some(child) = directory.next_entry().await? {
+        while let Some(child) = directory
+            .next_entry()
+            .await
+            .map_err(ToolError::annotated(at(Operation::ReadDirectory, &path)))?
+        {
             if is_root && exclude_instructions && child.file_name() == "SKILL.md" {
                 continue;
             }
-            let kind = child.file_type().await?;
+            let kind = child
+                .file_type()
+                .await
+                .map_err(ToolError::annotated(at(Operation::Inspect, &child.path())))?;
             children.push((!kind.is_dir(), child.file_name(), child.path()));
         }
         // Directories first, then other entries; each group is name-sorted.
@@ -590,12 +645,15 @@ fn check_asset_syntax(asset: &str) -> Result<(), ToolError> {
 
 // Canonicalization checks actual symlink containment at use time; it is not TOCTOU immunity.
 async fn resolve_asset(entry: &SkillEntry, asset: &str) -> Result<PathBuf, ToolError> {
-    check_asset_syntax(asset)?;
-    let source = fs::canonicalize(entry.root.join(asset)).await?;
+    check_asset_syntax(asset)
+        .map_err(|error| error.operation(Operation::Validate, Subject::argument(["path"])))?;
+    let source = entry.root.join(asset);
+    let source = fs::canonicalize(&source)
+        .await
+        .map_err(ToolError::annotated(at(Operation::Canonicalize, &source)))?;
     if !source.starts_with(&entry.root) {
-        return Err(ToolError::Failed(
-            "skill asset escapes its skill directory".to_owned(),
-        ));
+        return Err(ToolError::failed("skill asset escapes its skill directory")
+            .operation(Operation::Validate, Subject::path(&source)));
     }
     Ok(source)
 }
@@ -663,7 +721,7 @@ mod tests {
     use crate::{
         session::SessionStore,
         tests::TestRuntime,
-        tool::{ToolRegistryBuilder, executor::ExecutionError, policy::AllowAll},
+        tool::{ToolRegistryBuilder, diagnostic::Cause, policy::AllowAll},
     };
 
     #[test]
@@ -731,6 +789,25 @@ mod tests {
             let error = parse_instructions(&format!("---\n{yaml}\n---\nBody")).unwrap_err();
             assert!(error.starts_with("invalid YAML frontmatter:"), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn discovery_warnings_identify_the_operation_and_instruction_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join(".agents/skills/missing-instructions");
+        fs::create_dir_all(&missing).await.unwrap();
+        let error = load_skill(&missing).await.err().unwrap();
+        let diagnostic = error.diagnostic();
+        assert_eq!(diagnostic.context.operation, Operation::Canonicalize);
+        assert_eq!(
+            diagnostic.context.subject,
+            Subject::path(missing.join("SKILL.md"))
+        );
+        let skills = HostSkills::discover_from(temp.path(), None).await;
+        // Discovery is already host-facing; keep the subject without repeating the site.
+        assert!(matches!(skills.warnings(), [warning]
+            if warning.contains("SKILL.md") && !warning.contains("session host")));
+        assert!(skills.summaries().is_empty());
     }
 
     #[tokio::test]
@@ -922,10 +999,10 @@ mod tests {
             json!({"name":"mixed-assets", "to":"copied"}),
             json!({"name":"mixed-assets", "path":"", "to":"copied"}),
         ] {
-            let result = strict.run_host(agent, "skill", args).await;
+            let error = strict.run_host(agent, "skill", args).await.unwrap_err();
             assert!(matches!(
-                result,
-                Err(ExecutionError::Tool(ToolError::InvalidArguments(_)))
+                error.diagnostic().cause,
+                Cause::InvalidArguments(_)
             ));
         }
         assert!(!runtime.root.path().join("copied").exists());

@@ -334,11 +334,22 @@ impl Projection {
                     }
                 }
                 SessionEvent::JobFinished {
-                    job, state, error, ..
+                    job,
+                    state,
+                    diagnostic,
+                    ..
                 } => {
+                    let capabilities = self
+                        .agents
+                        .iter()
+                        .find(|agent| agent.id == record.agent)
+                        .map(|agent| agent.capabilities.iter().copied().collect())
+                        .unwrap_or_else(skyhook::tool::policy::CapabilitySet::empty);
                     if let Some(info) = self.jobs.get_mut(job) {
                         info.state = *state;
-                        info.error = error.clone();
+                        info.error = diagnostic
+                            .as_ref()
+                            .map(|diagnostic| diagnostic.render(&capabilities));
                     }
                 }
                 SessionEvent::AgentCompleted => self.complete_agent(&record.agent),

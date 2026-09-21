@@ -156,52 +156,59 @@ impl JobManager {
         let operation = self.operation(id).await?.lock_owned().await;
         self.spawn_owned(operation, "finalization publication", move |manager| async move {
             let _delivery = manager.inner.delivery_operation.lock().await;
-            let agent = {
+            let state = outcome.state();
+            let (output, mut diagnostic) = match outcome {
+                JobOutcome::Completed(output) => (Some(output), None),
+                JobOutcome::Failed { diagnostic, output } => (output, Some(diagnostic)),
+            };
+            let (agent, published) = {
                 let jobs = manager.inner.jobs.lock().await;
                 let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
                 if entry.state.is_terminal()
-                    && !(entry.state == JobState::Interrupted
-                        && matches!(outcome, JobOutcome::Cancelled))
+                    && !(entry.state == JobState::Interrupted && state == JobState::Cancelled)
                 {
                     return Err(JobError::AlreadyTerminal(id));
                 }
-                entry.agent.clone()
-            };
-            let (state, output, error, denial) = match outcome {
-                JobOutcome::Completed(output) => (JobState::Completed, Some(output), None, None),
-                JobOutcome::Failed {
-                    message,
-                    output,
-                    denial,
-                } => (JobState::Failed, output, Some(message), denial),
-                JobOutcome::Cancelled => (
-                    JobState::Cancelled,
-                    None,
-                    Some("tool was cancelled".to_owned()),
-                    None,
-                ),
-                JobOutcome::Interrupted => (
-                    JobState::Interrupted,
-                    None,
-                    Some("interrupted while the session was not running".to_owned()),
-                    None,
-                ),
-            };
-            let capture_complete = output
-                .as_ref()
-                .is_some_and(|output| output.streams == crate::tool::StreamEnd::Finished);
-            let (output, images, captures) =
-                output.map_or((None, Vec::new(), Vec::new()), |mut output| {
-                    let captures = output.take_captures();
-                    (Some(output.value), output.images, captures)
+                let published = (entry.state == JobState::Interrupted).then(|| {
+                    if let (Some(diagnostic), Some(previous)) =
+                        (&mut diagnostic, &entry.diagnostic)
+                    {
+                        diagnostic.context.fallback(previous.context.clone());
+                    }
+                    (entry.images.clone(), entry.output_diagnostic.clone())
                 });
-            let saved = manager.output(id);
-            // Captures have independent pointer/type metadata. A failed tool need not
-            // produce a result, and unfinished JSON captures are not valid result trees.
-            let document = serde_json::json!({"capture_complete":capture_complete, "has_result":output.is_some(), "result":output, "error":error});
-            output::blocking(move || output::save_completed(&saved, &document, captures))
-                .await
-                .map_err(|e| JobError::Internal(e.to_string()))?;
+                (entry.agent.clone(), published)
+            };
+            // Cancelling an interruption ends resumability, not its published
+            // output. Leave the saved document and capture references untouched;
+            // hydrating and resaving them would lose completeness and may be huge.
+            let (images, output_diagnostic) = if let Some(published) = published {
+                published
+            } else {
+                let capture_complete = output
+                    .as_ref()
+                    .is_some_and(|output| output.streams == crate::tool::StreamEnd::Finished);
+                let (mut output, images, captures, output_diagnostic) =
+                    output.map_or((None, Vec::new(), Vec::new(), None), |mut output| {
+                        let captures = output.take_captures();
+                        (Some(output.value), output.images, captures, output.diagnostic)
+                    });
+                // Diagnostic facts, not an early capability-specific rendering, are
+                // authoritative. Saved documents keep only the registered slot.
+                if output_diagnostic.is_some()
+                    && let Some(message) = output.as_mut().and_then(|output| output.pointer_mut("/error/message"))
+                {
+                    *message = Value::Null;
+                }
+                let saved = manager.output(id);
+                // Captures have independent pointer/type metadata. A failed tool need not
+                // produce a result, and unfinished JSON captures are not valid result trees.
+                let document = serde_json::json!({"capture_complete":capture_complete, "has_result":output.is_some(), "result":output, "error":null});
+                output::blocking(move || output::save_completed(&saved, &document, captures))
+                    .await
+                    .map_err(|e| JobError::Internal(e.to_string()))?;
+                (images, output_diagnostic)
+            };
             manager.inner
                 .store
                 .append(
@@ -209,9 +216,9 @@ impl JobManager {
                     SessionEvent::JobFinished {
                         job: id,
                         state,
-                        error: error.clone(),
+                        diagnostic: diagnostic.clone(),
+                        output_diagnostic: output_diagnostic.clone(),
                         images: images.clone(),
-                        denial: denial.clone(),
                     },
                 )
                 .await?;
@@ -223,7 +230,7 @@ impl JobManager {
                 {
                     return Err(JobError::AlreadyTerminal(id));
                 }
-                entry.apply_finished(state, images, error, denial);
+                entry.apply_finished(state, images, diagnostic, output_diagnostic);
                 (entry.notify.clone(), entry.background)
             };
             notify.notify_waiters();
@@ -268,12 +275,19 @@ impl JobManager {
             if entry.state.is_terminal() {
                 return;
             }
-            // Persistence failure does not reclassify authority: keep the denial.
             entry.apply_finished(
                 JobState::Failed,
                 Vec::new(),
-                Some(error),
-                entry.denial.clone(),
+                Some(
+                    crate::tool::ToolError::Failed(error)
+                        .operation(
+                            crate::tool::diagnostic::Operation::Save,
+                            crate::tool::diagnostic::Subject::Job(id),
+                        )
+                        .at(crate::tool::diagnostic::FailureSite::Host)
+                        .diagnostic(),
+                ),
+                None,
             );
             Some((entry.agent.clone(), entry.notify.clone(), entry.background))
         };

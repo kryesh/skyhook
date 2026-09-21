@@ -97,6 +97,10 @@ impl ToolContext {
         &self.caller_location
     }
 
+    pub(crate) fn diagnostic_viewer(&self) -> super::diagnostic::DiagnosticViewer<'_> {
+        super::diagnostic::DiagnosticViewer::new(self.capabilities(), self.caller_location())
+    }
+
     /// Identity/provenance for legitimate resumed job contexts. This is not
     /// invocation authority; APIs requiring that must use invocation_subject.
     pub(crate) fn job_subject(&self) -> &super::authorization::AuthorizationSubject {
@@ -256,6 +260,8 @@ pub struct ToolOutput {
     pub(crate) captures: Vec<crate::job::output::CompletedCapture>,
     #[serde(skip)]
     pub(crate) streams: StreamEnd,
+    #[serde(skip)]
+    pub(crate) diagnostic: Option<crate::tool::diagnostic::Diagnostic>,
 }
 
 impl ToolOutput {
@@ -266,7 +272,17 @@ impl ToolOutput {
             images: Vec::new(),
             captures: Vec::new(),
             streams: StreamEnd::Finished,
+            diagnostic: None,
         }
+    }
+
+    /// Register the builtin read result's error-message slot for presentation.
+    pub(crate) fn with_diagnostic(
+        mut self,
+        diagnostic: crate::tool::diagnostic::Diagnostic,
+    ) -> Self {
+        self.diagnostic = Some(diagnostic);
+        self
     }
 
     pub(crate) fn with_captures(
@@ -288,28 +304,12 @@ impl ToolOutput {
     }
 }
 
-/// Metadata for a rejected operation. The enclosing script may already have run other work.
-#[derive(
-    Clone, Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq,
-)]
-pub struct Denial {
-    pub code: DenialCode,
-    pub executed: bool,
-}
 #[derive(
     Clone, Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DenialCode {
     PermissionDenied,
-}
-impl Denial {
-    pub(crate) const fn permission_denied() -> Self {
-        Self {
-            code: DenialCode::PermissionDenied,
-            executed: false,
-        }
-    }
 }
 
 pub type ToolError = crate::tool::invocation::OperationError<ToolOutput>;

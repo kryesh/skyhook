@@ -9,6 +9,7 @@ use futures_util::FutureExt;
 use libsql::{Builder, Connection, OpenFlags, Row, Value};
 
 mod decode;
+mod diagnostic;
 mod encode;
 mod output;
 mod state;
@@ -22,7 +23,7 @@ pub use state::SessionSummary;
 pub(super) use state::{interrupted_work, summary};
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 9;
+pub(super) const USER_VERSION: i64 = 10;
 const SCHEMA: &str = include_str!("../schema.sql");
 /// Payload tables outside the append-only ledger: blob writes and output upserts.
 const MUTABLE_TABLES: [&str; 6] = [
@@ -327,7 +328,7 @@ mod tests {
     };
 
     pub(super) struct Fixture {
-        db: Db,
+        pub(super) db: Db,
         encoder: Encoder,
         pub(super) records: Vec<EventRecord>,
         session: SessionId,
@@ -502,9 +503,9 @@ mod tests {
         let finished = |state| SessionEvent::JobFinished {
             job,
             state,
-            error: None,
+            diagnostic: None,
+            output_diagnostic: None,
             images: Vec::new(),
-            denial: None,
         };
         one!(finished(JobState::Completed));
         fixture.reject(root.clone(), finished(JobState::Failed));
@@ -600,9 +601,9 @@ mod tests {
         let finished = |state| SessionEvent::JobFinished {
             job,
             state,
-            error: None,
+            diagnostic: None,
+            output_diagnostic: None,
             images: Vec::new(),
-            denial: None,
         };
         let state = |state| SessionEvent::JobStateChanged { job, state };
         let generation = |fixture: &Fixture| {

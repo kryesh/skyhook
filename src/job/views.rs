@@ -1,6 +1,7 @@
 //! Job presentation and live metadata queries.
 
 use super::*;
+use crate::tool::diagnostic::DiagnosticViewer;
 
 /// An agent's live work, as an interrupt and a `wait` each need to see it.
 #[derive(Default)]
@@ -104,10 +105,16 @@ pub struct JobEnvelope {
     pub name: Option<String>,
     pub state: JobState,
     pub output: Option<Value>,
+    /// Host projection derived from diagnostic facts, never persisted as authority.
+    /// Capability-aware views re-render the facts rather than using this cache.
     pub error: Option<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) diagnostic: Option<Diagnostic>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) output_diagnostic: Option<Diagnostic>,
     pub location: ExecutionLocation,
-    #[serde(flatten)]
-    pub denial: Option<crate::tool::Denial>,
 }
 
 /// The single public wire contract for both model and JavaScript job responses.
@@ -159,17 +166,24 @@ impl Presentation {
     }
 }
 
+impl JobMetadata {
+    /// A policy denial is marked so callers can branch without parsing the message.
+    fn mark_denied(&mut self, denied: bool) {
+        if denied {
+            self.code = Some(crate::tool::DenialCode::PermissionDenied);
+            self.executed = Some(false);
+        }
+    }
+}
+
 impl JobView {
     pub(crate) fn failure(
         message: String,
         output: Option<Value>,
-        denial: Option<crate::tool::Denial>,
+        denied: bool,
         mut metadata: JobMetadata,
     ) -> Self {
-        if let Some(denial) = denial {
-            metadata.code = Some(denial.code);
-            metadata.executed = Some(denial.executed);
-        }
+        metadata.mark_denied(denied);
         Self {
             id: None,
             state: JobState::Failed,
@@ -217,20 +231,42 @@ pub(crate) struct ActiveJobLocation {
 }
 
 impl JobEnvelope {
+    pub(crate) fn render_diagnostics<'a>(&mut self, viewer: impl Into<DiagnosticViewer<'a>>) {
+        let viewer = viewer.into();
+        self.error = self
+            .diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.render_for(viewer));
+        if let (Some(output), Some(diagnostic)) = (&mut self.output, &self.output_diagnostic) {
+            render_output_diagnostic(output, diagnostic, viewer);
+        }
+    }
+
+    pub(crate) fn rendered_error<'a>(
+        &self,
+        viewer: impl Into<DiagnosticViewer<'a>>,
+    ) -> Option<String> {
+        let viewer = viewer.into();
+        self.diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.render_for(viewer))
+            .or_else(|| self.error.clone())
+    }
+
     /// Ordinary foreground responses omit redundant launch metadata on success.
-    pub(crate) fn response_view(&self, capabilities: &CapabilitySet) -> JobView {
-        let failed = self.error.is_some()
-            || self.denial.is_some()
-            || (self.state.is_terminal() && self.state != JobState::Completed);
-        self.view(capabilities, failed)
+    pub(crate) fn response_view<'a>(&self, viewer: impl Into<DiagnosticViewer<'a>>) -> JobView {
+        let failed =
+            self.error.is_some() || (self.state.is_terminal() && self.state != JobState::Completed);
+        self.view(viewer.into(), failed)
     }
 
     /// Explicit inspection and background handles always retain launch metadata.
-    pub(crate) fn metadata_view(&self, capabilities: &CapabilitySet) -> JobView {
-        self.view(capabilities, true)
+    pub(crate) fn metadata_view<'a>(&self, viewer: impl Into<DiagnosticViewer<'a>>) -> JobView {
+        self.view(viewer.into(), true)
     }
 
-    fn view(&self, capabilities: &CapabilitySet, metadata: bool) -> JobView {
+    fn view(&self, viewer: DiagnosticViewer<'_>, metadata: bool) -> JobView {
+        let capabilities = viewer.capabilities;
         let waiting = self.state == JobState::WaitingInput;
         JobView {
             id: Some(self.id),
@@ -239,20 +275,28 @@ impl JobEnvelope {
             result: if waiting {
                 Value::Null
             } else {
-                self.output.clone().unwrap_or(Value::Null)
+                let mut result = self.output.clone().unwrap_or(Value::Null);
+                if let Some(diagnostic) = &self.output_diagnostic {
+                    render_output_diagnostic(&mut result, diagnostic, viewer);
+                }
+                result
             },
-            error: self.error.clone(),
-            meta: metadata.then(|| JobMetadata {
-                parent: self.parent,
-                tool: Some(self.tool.clone()),
-                name: self.name.clone().filter(|name| !name.is_empty()),
-                target: capabilities
-                    .contains(Capability::Targets)
-                    .then(|| self.location.target.clone()),
-                workspace: Some(self.location.workspace.to_string_lossy().into_owned()),
-                last_message: None,
-                code: self.denial.as_ref().map(|denial| denial.code.clone()),
-                executed: self.denial.as_ref().map(|denial| denial.executed),
+            error: self.rendered_error(viewer),
+            meta: metadata.then(|| {
+                let mut metadata = JobMetadata {
+                    parent: self.parent,
+                    tool: Some(self.tool.clone()),
+                    name: self.name.clone().filter(|name| !name.is_empty()),
+                    target: capabilities
+                        .contains(Capability::Targets)
+                        .then(|| self.location.target.clone()),
+                    workspace: Some(self.location.workspace.to_string_lossy().into_owned()),
+                    last_message: None,
+                    code: None,
+                    executed: None,
+                };
+                metadata.mark_denied(self.diagnostic.as_ref().is_some_and(Diagnostic::is_denial));
+                metadata
             }),
             presentation: Presentation {
                 question: waiting.then(|| self.output.clone()).flatten(),
@@ -260,6 +304,18 @@ impl JobEnvelope {
             }
             .into_option(),
         }
+    }
+}
+
+/// Only a producer-registered read error slot is presentation-owned. Arbitrary
+/// user JSON, including similarly shaped errors, remains opaque.
+pub(super) fn render_output_diagnostic(
+    result: &mut Value,
+    diagnostic: &Diagnostic,
+    viewer: DiagnosticViewer<'_>,
+) {
+    if let Some(message) = result.pointer_mut("/error/message") {
+        *message = Value::String(diagnostic.render_for(viewer));
     }
 }
 
@@ -520,8 +576,9 @@ mod tests {
             state: JobState::Completed,
             output,
             error: None,
+            diagnostic: None,
+            output_diagnostic: None,
             location: ExecutionLocation::root(std::path::PathBuf::from("/work")),
-            denial: None,
         }
     }
 
@@ -617,15 +674,14 @@ mod tests {
     fn failures_include_metadata_with_or_without_admission() {
         let mut job = envelope(Some(Value::Null));
         job.state = JobState::Failed;
-        job.error = Some("failed".into());
-        job.denial = Some(crate::tool::Denial::permission_denied());
+        job.diagnostic = Some(crate::tool::ToolError::Denied("failed".into()).diagnostic());
         let view = job.response_view(&CapabilitySet::default()).into_value();
         assert_eq!(view["meta"]["code"], "permission_denied");
         assert_eq!(view["meta"]["executed"], false);
         let failure = JobView::failure(
             "denied".into(),
             Some(Value::Null),
-            job.denial,
+            true,
             JobMetadata::default(),
         )
         .into_value();

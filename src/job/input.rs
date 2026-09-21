@@ -78,6 +78,8 @@ impl JobManager {
         Ok(())
     }
 
+    /// Accept input into the current mailbox or start a retained resumption.
+    /// Success does not confirm that the worker has consumed or acted on it.
     pub async fn send(&self, id: JobId, mut value: Value) -> Result<(), JobError> {
         loop {
             // Serialize resumption against finishing and other senders.
@@ -97,7 +99,10 @@ impl JobManager {
                     return self.resume_locked(id, Some(value), guard).await;
                 }
                 if !matches!(entry.state, JobState::Running | JobState::WaitingInput) {
-                    return Err(JobError::NotRunning(id));
+                    return Err(JobError::InputUnavailable {
+                        job: id,
+                        reason: InputUnavailableReason::State(entry.state),
+                    });
                 }
                 entry.input.clone()
             };
@@ -199,8 +204,9 @@ impl JobManager {
             }
             match self.resume_locked(id, None, guard).await {
                 Ok(()) => resumed += 1,
-                // Cancellation can invalidate eligibility without the operation lock.
-                Err(JobError::NotRunning(_) | JobError::Unknown(_)) => continue,
+                // Cancellation or handler removal can invalidate eligibility
+                // without the operation lock.
+                Err(JobError::InputUnavailable { .. } | JobError::Unknown(_)) => continue,
                 Err(error) => return Err(error),
             }
         }
@@ -225,16 +231,27 @@ impl JobManager {
                 if !entry.accepts_input {
                     return Err(JobError::InputUnsupported(id));
                 }
+                if entry.cancellation.is_cancelled() {
+                    return Err(JobError::InputUnavailable {
+                        job: id,
+                        reason: InputUnavailableReason::CancellationRequested,
+                    });
+                }
                 if !matches!(
                     entry.state,
                     JobState::Completed | JobState::Failed | JobState::Interrupted
-                ) || entry.cancellation.is_cancelled()
-                {
-                    return Err(JobError::NotRunning(id));
+                ) {
+                    return Err(JobError::InputUnavailable {
+                        job: id,
+                        reason: InputUnavailableReason::State(entry.state),
+                    });
                 }
                 (
                     entry.agent.clone(),
-                    entry.resume.clone().ok_or(JobError::NotRunning(id))?,
+                    entry.resume.clone().ok_or(JobError::InputUnavailable {
+                        job: id,
+                        reason: InputUnavailableReason::ResumeUnavailable,
+                    })?,
                     entry.suspended(),
                 )
             };
@@ -318,7 +335,7 @@ impl JobManager {
                 let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
                 entry.state = JobState::WaitingInput;
                 entry.output = Some(output);
-                entry.error = None;
+                entry.diagnostic = None;
                 entry.pend_delivery();
                 entry.background = true;
                 entry.notify.clone()
@@ -405,11 +422,7 @@ mod tests {
 
         jobs.finish(
             first,
-            JobOutcome::Failed {
-                message: "launch failed before installing a child".into(),
-                output: None,
-                denial: None,
-            },
+            crate::tool::ToolError::Failed("launch failed before installing a child".into()).into(),
         )
         .await
         .unwrap();
@@ -475,6 +488,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_reports_lifecycle_state_or_missing_resume_without_replacing_output() {
+        let (_root, jobs, agent) = super::super::tests::runtime().await;
+        for state in [JobState::Queued, JobState::AwaitingApproval] {
+            let lease = jobs
+                .test_lease(JobSpec {
+                    accepts_input: true,
+                    ..JobSpec::test(agent.clone(), "pending")
+                })
+                .await;
+            if state == JobState::AwaitingApproval {
+                jobs.transition(lease.id(), state).await.unwrap();
+            }
+            let error = jobs
+                .send(lease.id(), serde_json::json!("not accepted"))
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                JobError::InputUnavailable { job, reason: InputUnavailableReason::State(actual) }
+                    if job == lease.id() && actual == state
+            ));
+            assert!(error.to_string().contains("queued"));
+            assert!(!error.to_string().contains("approval"));
+        }
+        for outcome in [
+            JobOutcome::Completed(ToolOutput::new(serde_json::json!({"retained": true}))),
+            ToolError::Interrupted.into(),
+        ] {
+            let (lease, calls) = retained(&jobs, &agent).await;
+            jobs.finish(lease.id(), outcome).await.unwrap();
+            jobs.clear_resume_handler(lease.id()).await;
+            let before = jobs.snapshot(lease.id()).await.unwrap();
+            assert!(matches!(
+                jobs.send(lease.id(), serde_json::json!("not accepted")).await,
+                Err(JobError::InputUnavailable { job, reason: InputUnavailableReason::ResumeUnavailable })
+                    if job == lease.id()
+            ));
+            assert_eq!(jobs.snapshot(lease.id()).await.unwrap(), before);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn session_retry_skips_children_changed_after_its_snapshot() {
         for state in [JobState::Running, JobState::Completed, JobState::Cancelled] {
             let (_root, jobs, owner) = super::super::tests::runtime().await;
@@ -525,7 +581,7 @@ mod tests {
         for cancel in [false, true] {
             let (_root, jobs, agent) = super::super::tests::runtime().await;
             let (lease, calls) = retained(&jobs, &agent).await;
-            jobs.finish(lease.id(), JobOutcome::Interrupted)
+            jobs.finish(lease.id(), ToolError::Interrupted.into())
                 .await
                 .unwrap();
             let sent = if cancel {
@@ -536,7 +592,13 @@ mod tests {
                 jobs.send(lease.id(), serde_json::json!("retry")).await
             };
             if cancel {
-                assert!(matches!(sent, Err(JobError::NotRunning(_))));
+                assert!(matches!(
+                    sent,
+                    Err(JobError::InputUnavailable {
+                        reason: InputUnavailableReason::State(JobState::Cancelled),
+                        ..
+                    })
+                ));
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
             } else {
                 sent.unwrap();
@@ -554,11 +616,8 @@ mod tests {
         lease.take_input().close();
         let send = jobs.send(lease.id(), serde_json::json!("not lost"));
         tokio::pin!(send);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), &mut send)
-                .await
-                .is_err()
-        );
+        // Poll through the closed-mailbox check to its lifecycle notification.
+        assert!(futures_util::poll!(&mut send).is_pending());
         jobs.test_finish(lease.id(), serde_json::Value::Null).await;
         tokio::time::timeout(Duration::from_secs(2), send)
             .await

@@ -6,6 +6,7 @@ use crate::{
     remote::{PreparedConnection, RemoteError, RemoteManager},
     tool::{
         authorization::{AuthorizationCoordinator, AuthorizationSubject},
+        diagnostic::{DiagnosticContext, Effects, FailureSite, Operation, Subject},
         policy::{ApprovalGrant, Capability, CapabilitySet, PermissionUse, ResourceId},
     },
 };
@@ -166,23 +167,37 @@ impl TargetRouter {
         subject: &AuthorizationSubject,
         store: &crate::session::SessionStore,
     ) -> Result<TargetDefinition, RemoteError> {
+        let rejected =
+            |error: TargetError| registration_error(error, Operation::Validate, Effects::Unchanged);
         let mutation = self.mutation.clone().write_owned().await;
         // Without ssh_agent, targets reached through an external agent are invisible:
         // they can be neither replaced nor used as a via or origin. The mutation gate
         // keeps the registry unchanged until staging.
         if !subject.capabilities.contains(Capability::SshAgent) {
             if self.targets.needs_ssh_agent(&definition.name).await {
-                return Err(TargetError::NameUnavailable(definition.name).into());
+                return Err(rejected(TargetError::NameUnavailable(definition.name)));
             }
-            if let Some(parent) = definition.parent()
+            if let Some((edge, parent)) = definition.parent_edge()
                 && self.targets.needs_ssh_agent(parent).await
             {
-                return Err(TargetError::UnknownJump(parent.to_owned()).into());
+                return Err(rejected(TargetError::UnknownReference {
+                    target: definition.name.clone(),
+                    edge,
+                    reference: parent.to_owned(),
+                }));
             }
         }
-        let prepared = self.targets.prepare_upsert_many(vec![definition]).await?;
+        let prepared = self
+            .targets
+            .prepare_upsert_many(vec![definition])
+            .await
+            .map_err(rejected)?;
         if subject.cancellation.is_cancelled() {
-            return Err(RemoteError::Cancelled);
+            return Err(registration_error(
+                RemoteError::Cancelled,
+                Operation::Prepare,
+                Effects::Unchanged,
+            ));
         }
         // The staged definition carries its allocated revision.
         let targets = prepared.definitions().to_vec();
@@ -200,9 +215,16 @@ impl TargetRouter {
                     crate::session::SessionEvent::TargetsUpserted { targets },
                 )
                 .await
-                .map_err(|e| RemoteError::Io {
-                    kind: std::io::ErrorKind::Other,
-                    message: e.to_string(),
+                .map_err(|error| {
+                    let effects = match &error {
+                        crate::session::SessionError::AppendIndeterminate(_) => Effects::Unknown,
+                        _ => Effects::Unchanged,
+                    };
+                    registration_error(
+                        RemoteError::Session(Arc::new(error)),
+                        Operation::Save,
+                        effects,
+                    )
                 })?;
             let (_, invalidated) = prepared.publish().await;
             router
@@ -216,7 +238,13 @@ impl TargetRouter {
             Ok(destination)
         })
         .await
-        .map_err(|error| RemoteError::Protocol(format!("target publication owner lost: {error}")))?
+        .map_err(|_| {
+            registration_error(
+                RemoteError::Protocol("target publication owner lost".into()),
+                Operation::Wait,
+                Effects::MayHaveExecuted,
+            )
+        })?
     }
 
     pub fn targets(&self) -> &TargetRegistry {
@@ -276,6 +304,20 @@ impl TargetRouter {
     }
 }
 
+/// Registration happens on the session host. Target validation keeps the argument
+/// it rejected; other failures are attributed to the registration stage.
+fn registration_error(
+    error: impl Into<RemoteError>,
+    operation: Operation,
+    effects: Effects,
+) -> RemoteError {
+    error.into().fallback_context(
+        DiagnosticContext::new(operation, Subject::Label("target registration".into()))
+            .at(FailureSite::Host)
+            .effects(effects),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -292,7 +334,10 @@ mod tests {
         },
         session::{AppendBoundary, SessionStore},
         tests::RecordingPolicy,
-        tool::policy::PolicyDecision,
+        tool::{
+            diagnostic::{Cause, Diagnostic},
+            policy::PolicyDecision,
+        },
     };
 
     const BOUNDARIES: [AppendBoundary; 2] = [AppendBoundary::Write, AppendBoundary::Publication];
@@ -394,18 +439,22 @@ mod tests {
         // Hidden targets can be neither replaced nor routed through.
         let (_directory, store) = ephemeral_store().await;
         let subject = subject_for(&store);
-        let replaced = router.add(target("external", None), &subject, &store).await;
-        assert!(matches!(
-            replaced,
-            Err(RemoteError::Target(TargetError::NameUnavailable(_)))
-        ));
-        let routed = router
-            .add(target("new", Some("behind")), &subject, &store)
-            .await;
-        assert!(matches!(
-            routed,
-            Err(RemoteError::Target(TargetError::UnknownJump(_)))
-        ));
+        let mut via = target("new", None);
+        via.via = Some("behind".into());
+        let mut origin = target("new", None);
+        origin.origin = Some("behind".into());
+        for (definition, argument) in [
+            (target("external", None), "name"),
+            (via, "via"),
+            (origin, "origin"),
+        ] {
+            let error = router.add(definition, &subject, &store).await.unwrap_err();
+            let diagnostic = error.into_tool_error().diagnostic();
+            assert!(matches!(diagnostic.cause, Cause::InvalidArguments(_)));
+            assert_eq!(diagnostic.context.subject, Subject::argument([argument]));
+            assert_eq!(diagnostic.context.site, FailureSite::Host);
+            assert_eq!(diagnostic.context.effects, Effects::Unchanged);
+        }
     }
 
     async fn ephemeral_store() -> (tempfile::TempDir, SessionStore) {
@@ -644,6 +693,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_registration_changes_nothing_and_never_connects() {
+        let (_root, store) = ephemeral_store().await;
+        let factory = PendingHandshakeFactory::new();
+        let router = router(
+            TargetRegistry::default(),
+            recording([]),
+            Some(factory.clone()),
+        );
+        let subject = subject_for(&store);
+        subject.cancellation.cancel();
+        let error = router
+            .add(target("cancelled", None), &subject, &store)
+            .await
+            .unwrap_err();
+        let diagnostic = error.into_tool_error().diagnostic();
+        assert_eq!(diagnostic.cause, Cause::Cancelled);
+        assert_eq!(diagnostic.context.site, FailureSite::Host);
+        assert_eq!(diagnostic.context.effects, Effects::Unchanged);
+        assert!(router.targets.get("cancelled").await.is_err());
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 0);
+        router.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn failed_or_indeterminate_target_append_releases_guards_without_publication() {
         for boundary in BOUNDARIES {
             let (_root, store) = ephemeral_store().await;
@@ -651,12 +724,15 @@ mod tests {
             let targets = registry(&[("build", None)]);
             let router = router(targets.clone(), recording([]), None);
             store.fail_append_at(boundary).await;
-            assert!(
-                router
-                    .add(target("build", None), &subject_for(&store), &store,)
-                    .await
-                    .is_err()
-            );
+            let error = router
+                .add(target("build", None), &subject_for(&store), &store)
+                .await
+                .unwrap_err();
+            let diagnostic = error.into_tool_error().diagnostic();
+            assert_eq!(diagnostic.context.site, FailureSite::Host);
+            assert_eq!(diagnostic.context.operation, Operation::Save);
+            // No live publication occurred, but persistence may have committed.
+            assert_eq!(diagnostic.context.effects, Effects::Unknown);
             assert_eq!(targets.get("build").await.unwrap(), original);
             assert!(router.mutation.try_write().is_ok());
             let recovery = match store.drain().await {
@@ -665,6 +741,11 @@ mod tests {
             };
             assert_eq!(recovery.identity.session, store.id());
             assert!(!recovery.reason.is_empty());
+            assert_eq!(
+                diagnostic.cause,
+                Diagnostic::session(&crate::session::SessionError::AppendIndeterminate(recovery))
+                    .cause
+            );
             router.shutdown().await;
         }
         // A mismatched session rejects append after normalization and graph validation.
@@ -672,12 +753,18 @@ mod tests {
         let targets = registry(&[("first", None)]);
         let before = targets.definitions().await;
         let router = router(targets.clone(), recording([]), None);
-        assert!(
-            router
-                .add(target("second", None), &subject(), &store,)
-                .await
-                .is_err()
+        let error = router
+            .add(target("second", None), &subject(), &store)
+            .await
+            .unwrap_err();
+        let diagnostic = error.into_tool_error().diagnostic();
+        assert_eq!(
+            diagnostic.cause,
+            Diagnostic::session(&crate::session::SessionError::WrongSession).cause
         );
+        assert_eq!(diagnostic.context.operation, Operation::Save);
+        assert_eq!(diagnostic.context.site, FailureSite::Host);
+        assert_eq!(diagnostic.context.effects, Effects::Unchanged);
         assert_eq!(targets.definitions().await, before);
     }
 }

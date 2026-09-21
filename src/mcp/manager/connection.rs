@@ -4,6 +4,7 @@ use super::super::{
     transport::{self, Client, OwnedProcess},
 };
 use super::{McpError, catalog::discover};
+use crate::tool::ToolError;
 use rmcp::{Peer, RoleClient, model::Tool};
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore};
@@ -62,7 +63,7 @@ pub(super) async fn connect_one(
     name: String,
     config: McpServerConfig,
     cancel: CancellationToken,
-) -> Option<(String, Result<(Vec<Tool>, Server), McpError>)> {
+) -> Option<(String, Result<(Vec<Tool>, Server), ToolError>)> {
     if cancel.is_cancelled() {
         return None;
     }
@@ -74,9 +75,9 @@ pub(super) async fn connect_one(
     };
     let result = tokio::select! {
         biased;
-        _ = cancel.cancelled() => Err(McpError::Cancelled),
+        _ = cancel.cancelled() => Err(McpError::Cancelled.into()),
         result = tokio::time::timeout(config.startup_timeout(), startup) => {
-            result.unwrap_or(Err(McpError::Timeout))
+            result.unwrap_or(Err(McpError::Timeout.into()))
         }
     };
     match result {

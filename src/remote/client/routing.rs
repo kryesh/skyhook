@@ -10,11 +10,20 @@ pub(super) async fn route_responses<R>(
     host: (&Arc<Mutex<RequestWriter>>, &AuthorizationCoordinator),
     target: String,
     prompts: Arc<dyn SensitivePromptHandler>,
+    shutdown: CancellationToken,
+    owner: Box<dyn Send>,
 ) where
     R: AsyncRead + Unpin,
 {
     let mut results = super::results::Results::default();
-    let Err(error) = route(output, state, host, target, prompts, &mut results).await;
+    let error = tokio::select! {
+        Err(error) = route(output, state, host, target, prompts, &mut results) => error,
+        () = shutdown.cancelled() => RemoteError::Cancelled,
+    };
+    // Stop transport resources before draining: persistence must not need a live
+    // socket or acknowledgements, and eviction must not abort accepted payloads.
+    drop(owner);
+    let error = transport_error(error, Operation::Receive);
     {
         let mut state = state.lock().await;
         state.failure.get_or_insert_with(|| error.clone());
@@ -63,7 +72,7 @@ where
             }
         };
         let response = response
-            .map_err(RemoteError::io)?
+            .map_err(|error| transport_error(error, Operation::Receive))?
             .ok_or_else(|| RemoteError::Protocol("shim closed before replying".to_owned()))?;
         match response {
             Response::Payload { request_id, event } => {
@@ -135,7 +144,8 @@ where
                         &mut writer.lock().await.input,
                         &Request::SensitiveAnswer { prompt_id, answer },
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| transport_error(error, Operation::Send))?;
                     Ok(Some(prompt_id))
                 });
                 prompt_tasks.insert(prompt_id, cancellation);
@@ -195,7 +205,8 @@ where
                             reason,
                         },
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| transport_error(error, Operation::Send))?;
                     Ok(None)
                 });
             }
@@ -239,6 +250,7 @@ mod tests {
         let call = PendingCall {
             sender,
             context: context.clone(),
+            destination: context.execution_location().clone(),
         };
         state
             .lock()
@@ -281,7 +293,16 @@ mod tests {
         let reader = tokio::spawn(async move {
             let prompts = Arc::new(crate::remote::RejectSensitivePrompts);
             let callbacks = (&writer, &authorization);
-            route_responses(responses, &state, callbacks, "build".into(), prompts).await;
+            route_responses(
+                responses,
+                &state,
+                callbacks,
+                "build".into(),
+                prompts,
+                CancellationToken::new(),
+                Box::new(()),
+            )
+            .await;
         });
         let prompt = Response::SensitivePrompt {
             prompt_id: PROMPT,
@@ -328,9 +349,18 @@ mod tests {
         drop(replies);
         write_frame(&mut requests, &prompt).await.unwrap();
         let failure = tokio::time::timeout(Duration::from_secs(2), first_result).await;
+        let error = failure
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .into_tool_error()
+            .diagnostic();
+        assert_eq!(error.context.operation, Operation::Send);
+        assert_eq!(error.context.site, FailureSite::Host);
+        assert_eq!(error.context.effects, Effects::MayHaveExecuted);
         assert!(matches!(
-            failure.unwrap().unwrap(),
-            Err(RemoteError::Io { .. })
+            error.cause,
+            crate::tool::diagnostic::Cause::Io { .. }
         ));
         reader.await.unwrap();
     }
@@ -339,7 +369,7 @@ mod tests {
     async fn invalid_or_closed_response_fails_pending_requests() {
         let runtime = crate::tests::TestRuntime::new().await;
         let context = fixture_context(&runtime);
-        for orphan in [true, false] {
+        for (orphan, invalid_frame) in [(true, false), (false, false), (false, true)] {
             let (mut peer, stream) = tokio::io::duplex(4096);
             let state = Arc::new(Mutex::new(ConnectionState::default()));
             let receiver = register(&state, 1, &context).await;
@@ -350,11 +380,30 @@ mod tests {
                 };
                 write_frame(&mut peer, &orphaned).await.unwrap();
             }
+            if invalid_frame {
+                use tokio::io::AsyncWriteExt as _;
+                peer.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
+            }
             drop(peer);
-            assert!(matches!(
-                receiver.await.unwrap(),
-                Err(RemoteError::Protocol(_))
-            ));
+            let error = receiver
+                .await
+                .unwrap()
+                .unwrap_err()
+                .into_tool_error()
+                .diagnostic();
+            assert_eq!(error.context.operation, Operation::Receive);
+            assert_eq!(error.context.site, FailureSite::Host);
+            assert_eq!(
+                error.context.subject,
+                Subject::Label("remote transport".into())
+            );
+            assert_eq!(error.context.effects, Effects::MayHaveExecuted);
+            if invalid_frame {
+                assert!(matches!(
+                    error.cause,
+                    crate::tool::diagnostic::Cause::Io { .. }
+                ));
+            }
             reader.await.unwrap();
         }
     }

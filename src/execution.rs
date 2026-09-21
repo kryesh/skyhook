@@ -19,7 +19,7 @@ pub struct ExecutionLocation {
 /// A Unicode workspace keeps its plain string spelling. A Unix workspace that is
 /// not Unicode is journaled as its native bytes instead of failing the record;
 /// text boundaries (permissions, remote frames) still reject such a path.
-mod native_path {
+pub(crate) mod native_path {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::{
         borrow::Cow,
@@ -33,7 +33,7 @@ mod native_path {
         Native { native_bytes: Vec<u8> },
     }
 
-    pub(super) fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
         match path.to_str() {
             Some(text) => Spelling::Text(Cow::Borrowed(text)),
             #[cfg(unix)]
@@ -50,7 +50,7 @@ mod native_path {
         .serialize(serializer)
     }
 
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<PathBuf, D::Error> {
         match Spelling::deserialize(deserializer)? {

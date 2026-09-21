@@ -36,6 +36,34 @@ By default, hidden entries (including `.git`) and ignored files are excluded. `h
 includes hidden entries, while `no_ignore: true` independently disables ignore files. Searches
 rooted in subdirectories inherit ancestor ignore rules; explicitly requested paths remain accessible.
 
+## Diagnostics
+
+Diagnostic messages identify the failed operation and its subject, such as a path, argument,
+job, or output field. Workspace-operation failures include the applicable execution target;
+host/session failures are not attributed to the caller's remote target. “On session host” is
+shown when the viewing agent is on a different target and omitted for an agent on the host.
+Inspecting a remote job's saved output does not connect to that machine: a retrieval failure concerns saved output,
+while a retrieved execution error retains the original operation's context.
+
+Structured job diagnostics and explicitly registered diagnostic result fields are rendered for the
+viewing agent, exposing target aliases only when that viewer's capabilities permit them. This is
+not a general redaction guarantee for saved output. A `job_output` call made with broader
+capabilities saves its already-rendered view as ordinary JSON. Later reads of that saved snapshot
+with narrower capabilities retain the earlier JSON unchanged, as do reads of script results that
+copy it. Arbitrary returned JSON is not inspected for diagnostics or target aliases, and
+already-committed model messages are not rewritten.
+
+An error does not by itself establish that an operation had no effects. A command may have
+started before output capture failed, a file replacement may have committed before a durability
+check failed, and a recursive removal may have deleted some entries. Messages distinguish known
+pre-execution failures from known or uncertain later effects. Do not automatically retry a
+mutation merely because its result is a failed job.
+
+Outcome distinctions still matter: a nonzero process exit is a completed command result, an
+HTTP error status is a normal HTTP result, and a `wait` timeout ends only that wait. Expected
+missing/unreadable-file results from `read` remain completed diagnostic payloads. Policy denials,
+operating-system access failures, cancellation, and interrupted execution remain distinct.
+
 ## Automatic previews
 
 JavaScript receives complete result data. Model-facing previews may shorten designated output
